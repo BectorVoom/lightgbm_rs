@@ -46,6 +46,15 @@ pub enum ConfigError {
         /// A human-readable description of the violated bound (e.g. `> 0`, `(0, 1]`).
         bound: String,
     },
+
+    /// A cross-parameter conflict detected in `CheckParamConflict` that the C++
+    /// reference treats as a `Log::Fatal` (e.g. multiclass objective/num_class
+    /// or objective/metric mismatch).
+    #[error("configuration conflict: {detail}")]
+    Conflict {
+        /// A human-readable description of the conflict.
+        detail: String,
+    },
 }
 
 /// Top-level error type for the `lgbm-core` crate boundary.
