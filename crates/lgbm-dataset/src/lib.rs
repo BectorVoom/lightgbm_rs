@@ -10,8 +10,10 @@
 //! metadata, the `Dataset` construct/finish-load pipeline, and ingestion; their
 //! `pub mod` declarations are added here as they land.
 
+pub mod bin;
 pub mod bin_mapper;
 pub mod error;
 
+pub use bin::{Bin, BinValue, create_dense_bin, create_sparse_bin};
 pub use bin_mapper::{BinMapper, BinType, MissingType};
 pub use error::DatasetError;
