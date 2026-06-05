@@ -323,7 +323,14 @@ struct SplitCfg {
   int num_bin;
   int offset;
   int default_bin;
+  // AUTHORITATIVE C++ dispatch flags (feature_histogram.hpp:284-285), derived
+  // from missing_type + num_bin>2 by the caller — NOT the Phase-4
+  // `default_bin < num_bin` heuristic (removed Plan 05-01, RESEARCH Pitfall 1):
+  //   skip_default_bin == (num_bin > 2 && missing_type == Zero)
+  //   na_as_missing    == (num_bin > 2 && missing_type == NaN)
+  // both false for missing_type == None.
   bool skip_default_bin;
+  bool na_as_missing;
 };
 
 // The decoded winner (mirrors the Rust SplitInfo).
@@ -767,6 +774,7 @@ void EmitSCase(std::ofstream& out, const SCaseSpec& cs) {
   out << "SCASE name=" << cs.name << " num_bin=" << cs.cfg.num_bin
       << " offset=" << cs.cfg.offset << " default_bin=" << cs.cfg.default_bin
       << " skip_default_bin=" << (cs.cfg.skip_default_bin ? 1 : 0)
+      << " na_as_missing=" << (cs.cfg.na_as_missing ? 1 : 0)
       << " use_l1=" << (use_l1 ? 1 : 0)
       << " min_data_in_leaf=" << cs.cfg.min_data_in_leaf
       << " min_sum_hessian_in_leaf=" << F64Bits(cs.cfg.min_sum_hessian_in_leaf)
@@ -818,11 +826,12 @@ void EmitSCase(std::ofstream& out, const SCaseSpec& cs) {
 std::vector<SCaseSpec> BuildSplitCorpus() {
   std::vector<SCaseSpec> cases;
   auto cfg = [](int nb, int mdl, double msh, double l1, double l2, double mgts,
-                int off, int defb, bool skip) {
+                int off, int defb, bool skip, bool na = false) {
     SplitCfg c;
     c.num_bin = nb; c.min_data_in_leaf = mdl; c.min_sum_hessian_in_leaf = msh;
     c.lambda_l1 = l1; c.lambda_l2 = l2; c.min_gain_to_split = mgts;
     c.offset = off; c.default_bin = defb; c.skip_default_bin = skip;
+    c.na_as_missing = na;
     return c;
   };
 
@@ -894,6 +903,41 @@ std::vector<SCaseSpec> BuildSplitCorpus() {
     s.sum_hessian = 4.0;
     s.num_data = 8;
     s.note = "gates-reject-all";
+    cases.push_back(s);
+  }
+  // (f) skip_default_bin==false DIVERGENCE case (Plan 05-01, RESEARCH Pitfall 1).
+  //     A numeric feature with missing_type == None, num_bin > 2, and
+  //     default_bin (2) < num_bin (4). The OLD Phase-4 heuristic
+  //     `default_bin < num_bin` would set SKIP_DEFAULT_BIN = true and SKIP bin 2
+  //     during the scan; the AUTHORITATIVE flag for missing_type == None is
+  //     `skip_default_bin = false` (and na_as_missing = false), so bin 2 MUST
+  //     participate in BOTH the forward and reverse accumulation.
+  //
+  //     g/h are hand-picked (brute-force verified) so the WINNING SplitInfo
+  //     genuinely DIFFERS between the authoritative (skip=false) and the old
+  //     heuristic (skip=true): the unique best split is the boundary
+  //     {0,1,2} | {3} (threshold = 2). With skip_default_bin == FALSE the FORWARD
+  //     branch reaches t = 2 (accumulating bin 2 into the left side) and records
+  //     it FIRST among equal-gain candidates, so `default_left = 0`. With
+  //     skip_default_bin == TRUE (the old heuristic) the forward branch SKIPS
+  //     t == default_bin == 2 (a `continue`), so the SAME boundary is found only
+  //     by the REVERSE branch (right = {3}, recorded as t-1+offset), yielding the
+  //     opposite `default_left = 1`. Same threshold + gain, OPPOSITE default_left
+  //     — a real, observable divergence the old heuristic would have gotten wrong.
+  {
+    SCaseSpec s;
+    s.name = "skip_default_bin_false";
+    // num_bin=4, offset=0, default_bin=2, skip=false, na=false (missing_type==None).
+    s.cfg = cfg(4, 1, 0.0, 0.0, 0.0, 0.0, 0, 2, /*skip=*/false, /*na=*/false);
+    // 5 rows per bin, hess=5 each (cnt_factor = 20/20 = 1). bins 0,1,2 negative
+    // grad, bin 3 the least-negative — the best split isolates {0,1,2} from {3}
+    // at threshold 2, which the forward branch reaches only by accumulating the
+    // default bin (bin 2).
+    s.hist = {-10.0, 5.0, -10.0, 5.0, -10.0, 5.0, 1.0, 5.0};
+    s.sum_gradient = -10.0 - 10.0 - 10.0 + 1.0;  // = -29.0
+    s.sum_hessian = 20.0;
+    s.num_data = 20;
+    s.note = "missing_type-None-defbin2-NOT-skipped-default_left-divergence";
     cases.push_back(s);
   }
   return cases;

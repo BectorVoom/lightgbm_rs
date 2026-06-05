@@ -253,6 +253,7 @@ struct SplitGolden {
     offset: i32,
     default_bin: i32,
     skip_default_bin: bool,
+    na_as_missing: bool,
     use_l1: bool,
     min_data_in_leaf: i32,
     min_sum_hessian_in_leaf: f64,
@@ -298,6 +299,7 @@ fn parse_split(text: &str) -> Vec<SplitGolden> {
         let offset = parse_i64(&t, "offset") as i32;
         let default_bin = parse_i64(&t, "default_bin") as i32;
         let skip_default_bin = parse_i64(&t, "skip_default_bin") != 0;
+        let na_as_missing = parse_i64(&t, "na_as_missing") != 0;
         let use_l1 = parse_i64(&t, "use_l1") != 0;
         let min_data_in_leaf = parse_i64(&t, "min_data_in_leaf") as i32;
         let min_sum_hessian_in_leaf = parse_f64_field(&t, "min_sum_hessian_in_leaf");
@@ -329,6 +331,7 @@ fn parse_split(text: &str) -> Vec<SplitGolden> {
             offset,
             default_bin,
             skip_default_bin,
+            na_as_missing,
             use_l1,
             min_data_in_leaf,
             min_sum_hessian_in_leaf,
@@ -523,8 +526,35 @@ fn kernel_parity_split_bit_exact_on_cpu() {
     let backend = CpuBackend;
     let mut saw_reverse_winner = false;
     let mut saw_forward_winner = false;
+    let mut saw_skip_default_bin_false_divergence = false;
 
     for c in &cases {
+        // The deferred NA_AS_MISSING forward branch (RESEARCH A5) must be false on
+        // every committed case — this layer only threads the flag and validates it
+        // off; a captured `na_as_missing=1` case would (correctly) be a typed error
+        // in the kernel, so the golden must never carry one until that branch lands.
+        assert!(
+            !c.na_as_missing,
+            "SPLIT case `{}`: na_as_missing must be false on every committed case \
+             (the NA_AS_MISSING forward branch is deferred, RESEARCH A5)",
+            c.name
+        );
+
+        // Divergence-case coverage (Plan 05-01, RESEARCH Pitfall 1): a case where
+        // the OLD heuristic `default_bin < num_bin` would have set SKIP_DEFAULT_BIN
+        // but the authoritative flag is false (missing_type == None). Assert the
+        // case is genuinely a divergence: skip is false WHILE default_bin < num_bin.
+        if c.name == "skip_default_bin_false" {
+            assert!(
+                !c.skip_default_bin && c.default_bin < c.num_bin,
+                "SPLIT `skip_default_bin_false`: must have skip_default_bin==false \
+                 AND default_bin ({}) < num_bin ({}) to exercise the divergence",
+                c.default_bin,
+                c.num_bin
+            );
+            saw_skip_default_bin_false_divergence = true;
+        }
+
         // (1) PER-CANDIDATE gain MATH bit-exact (localizes to the scan).
         let (rev, fwd) = replicate_candidates(c);
         if let Err(m) = compare_exact_f64_bits(&rev, &c.cand_rev) {
@@ -553,6 +583,8 @@ fn kernel_parity_split_bit_exact_on_cpu() {
                 c.offset,
                 c.default_bin as u32,
                 0,
+                c.skip_default_bin,
+                c.na_as_missing,
                 c.sum_gradient,
                 c.sum_hessian,
                 c.num_data,
@@ -610,6 +642,13 @@ fn kernel_parity_split_bit_exact_on_cpu() {
     // Coverage: BOTH threshold-recording branches must be exercised by a winner.
     assert!(saw_reverse_winner, "split golden must have a REVERSE-branch winner (default_left=1)");
     assert!(saw_forward_winner, "split golden must have a FORWARD-branch winner (default_left=0)");
+    // Coverage: the skip_default_bin==false divergence case (Plan 05-01) must be
+    // present and replay bit-exact (RESEARCH Pitfall 1).
+    assert!(
+        saw_skip_default_bin_false_divergence,
+        "split golden must contain the `skip_default_bin_false` divergence case \
+         (default_bin < num_bin but skip_default_bin==false, missing_type==None)"
+    );
 }
 
 // ===========================================================================
@@ -925,6 +964,8 @@ mod hip {
                 c.num_bin as u32,
                 c.offset,
                 c.default_bin as u32,
+                c.skip_default_bin,
+                c.na_as_missing,
                 c.sum_gradient as f32,
                 c.sum_hessian as f32,
                 c.num_data,
@@ -944,6 +985,8 @@ mod hip {
                     c.offset,
                     c.default_bin as u32,
                     0,
+                    c.skip_default_bin,
+                    c.na_as_missing,
                     c.sum_gradient,
                     c.sum_hessian,
                     c.num_data,
