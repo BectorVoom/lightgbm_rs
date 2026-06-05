@@ -72,7 +72,7 @@
 
 ### Prediction
 
-- [ ] **PRD-01**: Raw score prediction (sum of tree outputs)
+- [x] **PRD-01**: Raw score prediction (sum of tree outputs)
 - [ ] **PRD-02**: Transformed prediction (`ConvertOutput` sigmoid/softmax)
 - [ ] **PRD-03**: Leaf index prediction (`pred_leaf`)
 - [ ] **PRD-04**: Feature contributions / TreeSHAP (`predict_contrib`) over full tree node/cover structure
@@ -164,7 +164,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | ORA-03 | Phase 2 | Bin stage covered for default config (02-06 + 02-07 Construct/grouping parity); remaining stages pending later phases |
 | DAT-08 | Phase 3 | Complete |
 | DAT-09 | Phase 3 | Complete |
-| PRD-01 | Phase 3 | Pending |
+| PRD-01 | Phase 3 | Complete |
 | PRD-02 | Phase 3 | Pending |
 | PRD-03 | Phase 3 | Pending |
 | PRD-06 | Phase 3 | Pending |
