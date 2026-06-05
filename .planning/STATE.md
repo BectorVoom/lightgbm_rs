@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 02 verification gaps_found (CR-01/CR-02)
-last_updated: "2026-06-05T08:30:00Z"
-last_activity: 2026-06-05 -- Phase 02 verified gaps_found (3/5); awaiting gap closure for default-config binning divergence
+stopped_at: Completed 02-06-PLAN.md (gap closure — GAP-1/GAP-2 closed; phase ready to re-verify)
+last_updated: "2026-06-05T08:23:00Z"
+last_activity: 2026-06-05 -- Plan 02-06 executed (default-config scaled-filter_cnt gap closure)
 progress:
   total_phases: 8
   completed_phases: 1
-  total_plans: 8
-  completed_plans: 7
-  percent: 44
+  total_plans: 9
+  completed_plans: 9
+  percent: 50
 ---
 
 # Project State
@@ -25,25 +25,25 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 02 (dataset-binning-determinism-root) — GAPS FOUND (verification 3/5)
-Plan: 5 of 5 plans executed; phase NOT complete (goal not met)
-Status: All 5 plans executed, but phase verification found 2 blocking gaps. Awaiting gap closure.
-Last activity: 2026-06-05 -- Phase 02 verification: gaps_found (CR-01 default-config binning divergence)
+Phase: 02 (dataset-binning-determinism-root) — GAP CLOSURE DONE (ready to re-verify)
+Plan: 6 of 6 executed (gap-closure plan)
+Status: All 6 plans executed; GAP-1 + GAP-2 closed. Phase ready for re-verification.
+Last activity: 2026-06-05 -- Plan 02-06 executed (default-config scaled-filter_cnt gap closure)
 
-Progress: [████████░░] 5/5 plans executed — verification gaps_found, phase pending
+Progress: [██████████] 6/6 plans executed — both blocking verification gaps closed; re-verify next
 
 ### Resume
 
-Phase 02 plans 02-01..02-05 all executed, BUT phase verification (02-VERIFICATION.md) found 2 blocking gaps that violate the determinism-root goal — DO NOT advance to Phase 3 until closed:
+Plan 02-06 closed both blocking phase-02 verification gaps:
 
-- **GAP-1 (CR-01, blocker):** `ingest.rs::build_mapper` (line ~94) passes raw `cfg.min_data_in_leaf` as `min_split_data` to `find_bin_numeric`, but C++ `DatasetLoader::ConstructFromSampleData` (dataset_loader.cpp:623) passes a SCALED `filter_cnt = (min_data_in_leaf * total_sample_size) / num_dist_data`. With `feature_pre_filter=true` + `min_data_in_leaf=20` (both defaults), the `need_filter`/`is_trivial_` decision diverges from C++ on every default ingest, cascading into bin stores, EFB `used_features`, and all downstream splits. Same flaw at `bin_mapper.rs:635 find_bin_from_column`. Confirmed against C++ source by verifier.
-- **GAP-2 (CR-02, blocker):** the default `feature_pre_filter=true` path is untested on BOTH sides (every ingest test forces `false`; the C++ golden generator uses `pre_filter=false`), so `cargo test --workspace` is green only because all tests avoid the divergent path — a false positive for a determinism-root phase.
+- **GAP-1 (CR-01/IN-02, SC#1, DAT-01) CLOSED:** `ingest.rs::build_mapper` now feeds the SCALED `filter_cnt = (min_data_in_leaf * sample_cnt) / num_rows` (via the new `bin_mapper.rs::scaled_filter_cnt` single-source-of-truth helper) to `find_bin_numeric` instead of raw `cfg.min_data_in_leaf`; `find_bin_from_column` routes through the SAME helper; CSR/CSC inherit the fix via `finish_from_columns -> build_mapper` (convention confirmed identical to dense in c_api.cpp).
+- **GAP-2 (CR-02, SC#5 / ORA-03 bin stage, DAT-07) CLOSED:** new `default_config_ingest_parity.rs` + `default_config_ingest.txt` golden cover the DEFAULT `feature_pre_filter=true`, sample_cnt<num_rows path. Fails-before (`feature 1: is_trivial_ true != golden false`) / passes-after. Engineered feature f1 flips is_trivial_ between filter_cnt=5 and raw 20.
 
-Fix: correct the `filter_cnt` derivation (both sites) AND add a default-config ingest parity golden that fails before / passes after. Then re-verify.
+`cargo test --workspace` fully green (lgbm-dataset 75 lib + all integration; core; oracle; xtask — 0 failed); pre_filter=false suites (ingest_equivalence, example_dataset_parity) unchanged and passing; bin-capture idempotent (no existing golden mutated, example COUNTS line unchanged).
 
-Next: `/gsd-plan-phase 02 --gaps` → `/gsd-execute-phase 02 --gaps-only`.
+Next: `/gsd-verify-phase 02` (re-run phase verification — expect SC#1 + SC#5 to flip to PASS).
 
-Verified PASS: SC#2 (ingest + immutable store), SC#3 (missing/categorical routing), SC#4 (EFB grouping). FAILED: SC#1 (bit-identical binning on default path), SC#5 (per-stage parity coverage of default path). DAT-01/DAT-07 downgraded to PARTIAL.
+Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorical routing), SC#4 (EFB grouping). RE-AFFIRMED this plan: SC#1 (is_trivial_ on default path), SC#5 (per-stage parity covers default path). DAT-01/DAT-07 move PARTIAL -> SATISFIED for the default-config divergence (pending formal re-verify).
 
 - EFB (Plan 02-05): `MultiValBin` dense/sparse storage (+1 push), `efb.rs` (`fast_feature_bundling`/`find_groups`/`get_conflict_count`/`fix_sample_indices` — ALL randomness via `lgbm_core::Random::new(num_data)`, STABLE sorts, element-wise parallel-vector swap), and the `Dataset::construct_bundled` `enable_bundle` dispatch with real<->packed feature maps (`used_feature_map_`/`real_feature_idx_`). EFB layer-3 golden (feature->group membership + per-group `bin_offsets_`/`num_total_bin_`/`group_is_multi_val` + per-row bundled indices) bit-identical to C++ on the D-06 #4 mutually-exclusive sparse corpus + a no-bundle control. EFB capture = HEADER-ONLY verbatim transcription of `dataset.cpp` (external_libs unvendored → both nominal capture paths infeasible; human-approved). bin-capture idempotent.
 
@@ -78,6 +78,7 @@ Verified PASS: SC#2 (ingest + immutable store), SC#3 (missing/categorical routin
 **Plan 02-03:** 2 tasks (~9 min), 9 files (4 created + 5 modified), categorical `find_bin_categorical` (stable descending-count fold + f32 0.99 cut + fold-break + NaN dummy bin) + categorical `value_to_bin` + completed MissingType routing; 6-case categorical (layers 1+3 + per-row) + 8-case missing (layer 1 + per-row) golden replay (bit-exact); 7 new inline + 2 integration tests (35→42 lib); `cargo test --workspace` green; bin-capture idempotent.
 **Plan 02-04:** 3 tasks (~35 min), 12 files (9 created + 3 modified), `Metadata` (f32 query-weight derivation) + `from_mat`/`from_csr`/`from_csc` ingestion (validated entries, single widen site, Phase-1-RNG sampling); dense/CSR/CSC bit-identical (zero-heavy column) + metadata golden + end-to-end example-dataset parity (regression + binary, 28 features each, layers 1+2 bit-exact); 14 new inline + 3 integration test files (42→56 lib); `cargo test --workspace` green; bin-capture idempotent.
 **Plan 02-05:** 4 tasks (Tasks 1-2 prior agent + Tasks 3-4 continuation), 8 files (2 created + ~6 modified), `MultiValBin` dense/sparse + `efb.rs` (FastFeatureBundling/FindGroups/GetConflictCount/FixSampleIndices, Phase-1 RNG + stable sorts) + `construct_bundled` enable_bundle dispatch with real<->packed feature maps; EFB layer-3 golden (3 cases: 2 mutually-exclusive sparse bundling + no-bundle control) bit-exact (membership + bin_offsets_ + num_total_bin_ + per-row bundled indices); EFB capture = header-only verbatim transcription of dataset.cpp; 1 Rule-1 bug fixed (real-vs-packed indexing); `cargo test --workspace` green; bin-capture idempotent.
+**Plan 02-06 (gap closure):** 3 tasks (~18 min), 6 files (2 created + 4 modified), `scaled_filter_cnt` single-source-of-truth helper (exact C++ integer-truncation, num_rows==0 Rust-only guard) routed from both `ingest.rs::build_mapper` and `bin_mapper.rs::find_bin_from_column`; CSR/CSC inherit via finish_from_columns. New default-config (feature_pre_filter=true, sample_cnt=50<num_rows=200, min_data_in_leaf=20 -> filter_cnt=5) ingest parity golden + test: fails-before (`feature 1: is_trivial_ true != golden false`) / passes-after; engineered feature f1 flips is_trivial_ between filter_cnt=5 and raw 20. GAP-1 (CR-01/IN-02, SC#1, DAT-01) + GAP-2 (CR-02, SC#5/ORA-03, DAT-07) closed. New golden dispatched from fixed argv[8] before the variadic example tail (kFirstExampleArgv 9->10) so no existing golden mutated. 1 new unit test + 1 integration test (75 lib); `cargo test --workspace` green; bin-capture idempotent.
 
 **Recent Trend:**
 
@@ -105,6 +106,7 @@ Recent decisions affecting current work:
 - [Phase 2 exec, 2026-06-05]: **Categorical folding + missing routing locked (DAT-03, DAT-04)** — `find_bin_categorical` transcribes the descending-count fold via the STABLE `slice::sort_by` (mirrors `SortForPair(is_reverse=true)`; equal-count ties keep ascending-value order), the f32 `0.99` cut (`RoundInt((rest as f32 * 0.99f) ...)` — NOT `0.99_f64`, which would shift the cut), the `min_data_in_bin && cur_cat_idx>1` fold-break, and the NaN dummy bin 0; `categorical_2_bin_` is a by-key `HashMap` (fold order is sort-driven). Missing routing (None/Zero/NaN, signed +0/-0 identical, all-missing single bin) proven bit-identical to C++ across a 6-case categorical (layers 1+3 + per-row) + 8-case missing (layer 1 + per-row) golden battery.
 - [Phase 2 exec, 2026-06-05]: **`autobins = false` on lgbm-dataset** — the locked module path `src/bin/{mod,dense_bin,sparse_bin}.rs` collides with Cargo's binary-target convention (Cargo tried to compile the storage module files as `main`-bearing binaries). Disabling binary auto-discovery preserves the path; the crate ships no binaries.
 - [Phase 2 exec, 2026-06-05]: **EFB grouping locked (DAT-05)** — `efb.rs` transcribes `FastFeatureBundling`/`FindGroups`/`GetConflictCount`/`FixSampleIndices` verbatim with ALL randomness via `lgbm_core::Random::new(num_data)` (group search `.sample` + shuffle `.next_short`), STABLE sorts only, and element-wise parallel-vector swap (`features_in_group` + `group_is_multi_val` per iter — the C++ `std::swap` on `vector<bool>` hazard). `Dataset::construct_bundled` dispatches on `cfg.enable_bundle` and stores `used_feature_map_` (real->packed) + `real_feature_idx_` (packed->real) so the shuffled bundled grouping pushes each feature to its correct group. EFB layer-3 golden (feature->group membership + per-group `bin_offsets_`/`num_total_bin_`/`group_is_multi_val` + per-row bundled bin index) bit-identical to C++ on the D-06 #4 mutually-exclusive sparse corpus + a no-bundle control. EFB capture = HEADER-ONLY verbatim transcription of `dataset.cpp` (both nominal capture paths infeasible because external_libs are unvendored — human-approved). Fixed a Rule-1 real-vs-packed indexing bug surfaced by the per-row golden.
+- [Phase 2 exec, 2026-06-05]: **Scaled pre-filter threshold locked (GAP-1/GAP-2, SC#1/SC#5)** — the default in-memory ingest path now feeds the SCALED `filter_cnt = (min_data_in_leaf * total_sample_cnt) / num_rows` (i64 integer truncation, exact analog of `dataset_loader.cpp:623-624`) to `find_bin_numeric`, computed once in `bin_mapper.rs::scaled_filter_cnt` and called from BOTH `ingest.rs::build_mapper` and `bin_mapper.rs::find_bin_from_column` (no divergent raw-forwarding copy). `from_csr`/`from_csc` inherit via `finish_from_columns -> build_mapper` (CSR/CSC use the identical dense convention `total_sample_size=sample_cnt`, `num_dist_data=total_nrow`, confirmed in c_api.cpp). `num_rows==0` returns raw `min_data_in_leaf` as a Rust-only, parity-unobservable empty-matrix guard (no C++ analog — C++ never reaches FindBin with zero rows). Proven by a default-config (feature_pre_filter=true, sample_cnt=50<num_rows=200, min_data_in_leaf=20 -> filter_cnt=5) ingest parity golden that FAILS before and PASSES after, asserting `is_trivial_` + STORED per-row bins (read from `feature_group().bin_data()`, NOT recomputed). Golden cells are f32-representable (from_mat takes &[f32]) so the f32->f64 widen does not drift boundaries.
 - [Phase 2 exec, 2026-06-05]: **Ingestion API locked (D-05, DAT-06/07)** — `from_mat`/`from_csr`/`from_csc` are single validated public entries (validate ALL caller input first → typed `DatasetError`, never panic; Security V5 / T-02-10..13) wiring sample→`find_bin`→`construct`→`push`→`finish_load`. f32→f64 widening at ONE `widen()` site; sparse gather is dense-by-column (absent==0.0, Open Q2). Dense/CSR/CSC of the same matrix bin bit-identically (tolerance-free internal invariant). `Metadata` query weights computed in f32 (`CalculateQueryWeights` verbatim). End-to-end real example-dataset (regression + binary) binning bit-identical to C++ for all 28 features × both datasets (layers 1+2). Example fixtures COPIED into the committed dir, never the untracked LightGBM/ tree.
 
 ### Pending Todos
@@ -129,6 +131,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T08:30:00Z
-Stopped at: Completed 02-05-PLAN.md (Phase 02 complete)
+Last session: 2026-06-05T08:23:00Z
+Stopped at: Completed 02-06-PLAN.md (gap closure — GAP-1/GAP-2 closed; phase ready to re-verify)
 Resume file: None
