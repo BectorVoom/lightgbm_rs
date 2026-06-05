@@ -1739,6 +1739,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lgbm-dataset"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lgbm-core",
+ "thiserror",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"

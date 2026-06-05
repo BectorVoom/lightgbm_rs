@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/lgbm-core",
     "crates/lgbm-compute",
+    "crates/lgbm-dataset",
     "crates/oracle-harness",
     "xtask",
 ]
