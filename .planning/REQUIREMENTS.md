@@ -38,7 +38,7 @@
 - [ ] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against
 - [ ] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
 - [ ] **TRL-04**: Split-gain scan with exact gain formula and tie-breaking (`lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`)
-- [ ] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing
+- [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing
 - [ ] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
 - [ ] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction
 - [ ] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
@@ -178,7 +178,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | TRL-02 | Phase 5 | Pending |
 | TRL-03 | Phase 5 | Pending |
 | TRL-04 | Phase 5 | Pending |
-| TRL-05 | Phase 5 | Pending |
+| TRL-05 | Phase 5 | Complete |
 | TRL-07 | Phase 5 | Pending |
 | TRL-08 | Phase 5 | Pending |
 | TRL-09 | Phase 5 | Pending |

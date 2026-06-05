@@ -179,7 +179,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1** *(spine prerequisites — parallel; no shared files)*
 
-  - [ ] 05-01-PLAN.md — Phase-4 boundary re-open: thread authoritative `skip_default_bin`/`na_as_missing` through `Backend::find_best_split` (replace the `cfg_skip_default_bin` heuristic) + `skip_default_bin==false` divergence golden (TRL-05 enabler)
+  - [x] 05-01-PLAN.md — Phase-4 boundary re-open: thread authoritative `skip_default_bin`/`na_as_missing` through `Backend::find_best_split` (replace the `cfg_skip_default_bin` heuristic) + `skip_default_bin==false` divergence golden (TRL-05 enabler)
   - [ ] 05-02-PLAN.md — Enabling slice: new `lgbm-treelearner` crate + `TreeLearnerError` + reuse `SplitInfo` + `split_gt` tie-break + `Tree::split` mutation/growth arrays + `learner-capture`/`learner_parity` Wave-0 harness (failing end-to-end test in place)
 
 **Wave 2** *(blocked on 05-01 + 05-02 — the keystone spine)*
@@ -249,7 +249,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
+| 5. Tree Learner + Split Finding | 1/4 | In Progress|  |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |
