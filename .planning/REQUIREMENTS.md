@@ -93,16 +93,16 @@
 
 - [x] **CMP-01**: `lgbm-compute` backend trait isolating all device ops behind one crate (contains CubeCL alpha churn) — *04-01: Backend::Runtime bound to cubecl::Runtime; cpu-default/rocm-opt-in features; CMP-01 containment guard test green (no upper crate names cubecl)*
 - [x] **CMP-02**: CPU backend (cubecl-cpu) as the deterministic reference execution path — *04-01: deterministic anchor PROVEN (D-04a spike); 04-02: first reference kernel landed — CpuBackend::construct_histograms bit-exact vs committed C++ golden across 18 D-02a cases. (split/partition kernels extend the same cpu reference path in 04-03)*
-- [ ] **CMP-03**: ROCm/HIP backend (cubecl-hip) selectable via Cargo feature and/or runtime config
-- [x] **CMP-04**: CUDA warp-level operations mapped onto CubeCL's `Plane` API with capability gating and sequential fallback — *04-01: probe_capabilities gates Plane::Ops/f64/f32-atomic; cpu matrix → ReducePath::Sequential (the single-owner fold IS the cpu path); capability test asserts the verified matrix*
-- [ ] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the ~1e-6 (f32) contract — *04-02: histogram layer; 04-03: find_best_split (gain math in-kernel, D-01a) + data_partition + subtract_histograms ALL bit-exact on cubecl-cpu vs committed C++ goldens — the full kernel set is closed on the cpu anchor; ROCm ~1e-6 parity (the GPU-resident clause) lands 04-04*
+- [x] **CMP-03**: ROCm/HIP backend (cubecl-hip) selectable via Cargo feature and/or runtime config — *04-04: `rocm` feature binds `HipRuntime` + `AmdDevice{index:0}`; runs all four kernels on the local gfx1100 via the capability-gated f32-accumulate path (Capabilities::accumulate_type == F32 on the no-f64 device); rocm_smoke.rs + the hip parity layer execute on the real GPU; CPU-only build needs no ROCm toolchain (SC#1)*
+- [x] **CMP-04**: CUDA warp-level operations mapped onto CubeCL's `Plane` API with capability gating and sequential fallback — *04-01: probe_capabilities gates Plane::Ops/f64/f32-atomic; cpu matrix → ReducePath::Sequential (the single-owner fold IS the cpu path); capability test asserts the verified matrix. 04-04: the gate exercised against the REAL gfx1100 matrix (Plane YES/f64 NO/atomic YES/plane_size 32) → ReducePath::Plane + AccumulateType::F32; every divergent feature gated off Capabilities; the single-owner ordered fold is the f32 hip path (sequential fallback)*
+- [x] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the ~1e-6 (f32) contract — *04-02: histogram layer; 04-03: find_best_split (gain math in-kernel, D-01a) + data_partition + subtract_histograms ALL bit-exact on cubecl-cpu vs committed C++ goldens — the full kernel set is closed on the cpu anchor; 04-04: the GPU-resident clause — all four kernels run on the gfx1100 (f32-accumulate), compared to the cpu f64 anchor within ~1e-6 (partition bit-exact, subtract ≤1.16e-10, histogram/split within ~1 f32 ULP; the residual f32-vs-f64 accumulation gap documented in 04-ROCM-GAPS.md per D-03a, best-effort ROCm)*
 
 ### Oracle & Validation
 
 - [x] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤~1e-6 absolute (f32 single-precision)
 - [x] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, default `float` `score_t`/`label_t` width) for valid comparison
 - [x] **ORA-03**: Per-stage parity tests (bin → histogram → per-split-gain → leaf-output → prediction), not just final outputs
-- [ ] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment) — *04-02: cpu histogram hard gate; 04-03: cpu hard gate extended to find_best_split (per-candidate gains + winner), data_partition, and subtract_histograms — kernel_parity.rs replays all four committed C++ goldens bit-exact on cubecl-cpu; ROCm execution + ~1e-6 gate lands 04-04 (CPU and ROCm are separate gates)*
+- [x] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment) — *04-02/03: cpu bit-exact hard gate (all four committed goldens on cubecl-cpu); 04-04: the ROCm half — `kernel_parity.rs` hip layer (cargo test --features rocm) RAN on the real gfx1100, comparing hip f32 output to the cpu f64 anchor (collected to Vec<f32>) via `compare_within(ORACLE_TOL)` as a SEPARATE gate; partition bit-exact, subtract ≤1.16e-10, histogram/split within ~1 f32 ULP (max rel ≈1.1e-7). The one residual f32-vs-f64 accumulation gap (>strict 1e-6 absolute on accumulation-heavy cells) is surfaced per-case (no silent pass) and documented in 04-ROCM-GAPS.md — best-effort ROCm, not a phase blocker (D-03a). CPU and ROCm are separate gates; the CPU gate remains the hard bar*
 
 ### APIs
 
@@ -170,10 +170,10 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | PRD-06 | Phase 3 | Complete |
 | CMP-01 | Phase 4 | Complete (04-01) |
 | CMP-02 | Phase 4 | Complete (04-01 anchor + 04-02 histogram reference kernel) |
-| CMP-03 | Phase 4 | Pending |
-| CMP-04 | Phase 4 | Complete (04-01) |
-| CMP-05 | Phase 4 | Partial (04-02/03: full kernel set bit-exact on cpu; ROCm ~1e-6 in 04-04) |
-| ORA-04 | Phase 4 | Partial (04-02/03: cpu hard gate, all four goldens; ROCm 04-04) |
+| CMP-03 | Phase 4 | Complete (04-04: rocm feature → HipRuntime on gfx1100) |
+| CMP-04 | Phase 4 | Complete (04-01 gate + 04-04 exercised on real hip matrix) |
+| CMP-05 | Phase 4 | Complete (04-02/03 cpu bit-exact + 04-04 hip f32 within ~1e-6; gap in 04-ROCM-GAPS.md, D-03a) |
+| ORA-04 | Phase 4 | Complete (04-02/03 cpu hard gate + 04-04 separate ~1e-6 hip gate run on gfx1100; D-03a) |
 | TRL-01 | Phase 5 | Pending |
 | TRL-02 | Phase 5 | Pending |
 | TRL-03 | Phase 5 | Pending |

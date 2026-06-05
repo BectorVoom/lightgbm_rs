@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace
 - [x] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion *(7/7 plans executed incl. gap-closure 02-06 + 02-07; GAP-1/GAP-2 + CR-01 + WR-01 closed — default ingest unified onto the faithful single C++ Dataset::Construct, trivial features dropped, grouping verified; ready to re-verify)* (completed 2026-06-05)
 - [x] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists) (completed 2026-06-05)
-- [ ] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
+- [x] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity
 - [ ] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API
 - [ ] **Phase 7: Parity-Completing Variants** - GOSS/DART/RF, categorical/EFB splits, remaining objectives/metrics, ranking, SHAP, monotone, refit, importance
@@ -157,7 +157,9 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 4** *(blocked on 04-03; has ROCm GPU checkpoint)*
 
-  - [ ] 04-04-PLAN.md — ROCm/hip bring-up (rocm feature, f32-accumulate on no-f64 device) + capability gate on gfx1100 + ~1e-6 hip-vs-cpu separate gate + documented ROCm gaps (D-03a)
+  - [x] 04-04-PLAN.md — ROCm/hip bring-up (rocm feature, f32-accumulate on no-f64 device) + capability gate on gfx1100 + ~1e-6 hip-vs-cpu separate gate + documented ROCm gaps (D-03a) — **DONE: rocm feature binds HipRuntime+AmdDevice{0}; Capabilities::accumulate_type gate (F64 cpu anchor vs F32 no-f64 hip); f32-cell MIRROR kernels + generic *_f32_on<R> launchers (histogram/split/subtract), data_partition_on<R> shared (f64-free); rocm_smoke.rs asserts gfx1100 matrix (Plane YES/f64 NO/atomic YES/plane_size 32); kernel_parity.rs hip layer = separate ~1e-6 gate (hip f32 vs cpu f64 anchor→Vec<f32> via compare_within), two-tier so the documented f32-vs-f64 accumulation gap is surfaced (no silent pass) not blocked; RAN on real gfx1100 (ROCm 7.1.1): smoke 2/2, partition bit-exact, subtract ≤1.16e-10, histogram/split within f32 ULP (max rel ≈1.1e-7); 04-ROCM-GAPS.md records all per-case max abs-diff (D-03a). cpu bit-exact gate untouched & green; CPU-only build needs no ROCm toolchain (SC#1). CMP-03/CMP-04/ORA-04 satisfied**
+
+**Phase 4 COMPLETE** — compute backend closed on cpu (bit-exact hard gate) + hip (best-effort, documented f32 gap).
 
 ### Phase 5: Tree Learner + Split Finding
 

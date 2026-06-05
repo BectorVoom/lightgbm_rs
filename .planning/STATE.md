@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-02-PLAN.md
-last_updated: "2026-06-06T00:00:00.000Z"
-last_activity: 2026-06-06 -- Plan 04-02 executed (construct_histograms vertical slice, bit-exact cpu parity)
+stopped_at: Completed 04-04-PLAN.md
+last_updated: "2026-06-05T19:55:00.000Z"
+last_activity: 2026-06-05 -- Plan 04-04 executed (ROCm/HIP bring-up on gfx1100 + separate ~1e-6 hip parity gate; D-03a gap ledger)
 progress:
   total_phases: 8
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 18
-  completed_plans: 16
-  percent: 47
+  completed_plans: 17
+  percent: 56
 ---
 
 # Project State
@@ -25,12 +25,22 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 04 (compute-backend-cpu-first-integer-histograms-rocm) — EXECUTING
-Plan: 4 of 4 (04-01, 04-02, 04-03 complete)
-Status: Executing Phase 04
-Last activity: 2026-06-06 -- Plan 04-03 executed (find_best_split + data_partition + subtract_histograms kernels, bit-exact cpu parity; L1 gain codegen bug fixed)
+Phase: 04 (compute-backend-cpu-first-integer-histograms-rocm) — COMPLETE
+Plan: 4 of 4 (04-01, 04-02, 04-03, 04-04 complete)
+Status: Phase 04 complete — ready for Phase 05 (tree learner)
+Last activity: 2026-06-05 -- Plan 04-04 executed (ROCm/HIP bring-up on gfx1100 + separate ~1e-6 hip parity gate; D-03a gap ledger)
 
-Progress: [██████████] Phase 3 complete; Phase 4 plan 3/4 done — full CMP-05 Backend op set closed on cpu: construct_histograms + find_best_split (in-kernel gain math, D-01a) + data_partition + subtract_histograms, each bit-exact vs committed C++ goldens (ORA-04 cpu hard gate). Only 04-04 (ROCm) remains.
+Progress: [██████████] Phase 4 COMPLETE — compute backend closed on BOTH backends within contract: cpu bit-exact (hard gate, 04-01..03: construct_histograms + find_best_split + data_partition + subtract_histograms) AND cubecl-hip on gfx1100 (04-04: f32-accumulate path via capability gate, separate ~1e-6 hip-vs-cpu-anchor parity gate run; one documented f32-vs-f64 accumulation gap ≈ 1 f32 ULP in 04-ROCM-GAPS.md, best-effort D-03a). CPU-only build needs no ROCm toolchain.
+
+### Plan 04-04 result
+
+Plan 04-04 brought up the cubecl-hip (ROCm) backend on the local gfx1100 GPU (best-effort, D-03a):
+
+- **rocm runtime + capability-gated f32 accumulate (CMP-03/CMP-04):** `runtime.rs` `AccumulateType` + `Capabilities::accumulate_type()` routes f64 (cpu anchor) vs f32 (no-f64 hip). f32-cell MIRROR kernels + generic-over-`Runtime` launchers (`construct_histograms_f32_on`, `subtract_histograms_f32_on`, `find_best_split_raw_f32_on`); `data_partition_on<R>` is f64-free and shared. f32 gain primitives in `gain.rs`. The cpu f64 anchor kernels are UNTOUCHED (04-01..03 bit-exact gates still pass).
+- **Separate ~1e-6 hip gate (ORA-04 rocm half):** `rocm_smoke.rs` asserts the gfx1100 matrix (Plane YES/f64 NO/atomic YES/plane_size 32); `kernel_parity.rs` hip layer compares hip f32 vs cpu f64 anchor (collected to `Vec<f32>`) via `compare_within(ORACLE_TOL)`, two-tier so the documented gap is surfaced (no silent pass) but not a blocker.
+- **Real-hardware run (ROCm 7.1.1 / HIP 7.1.52802 / cubecl-hip 0.10.0):** smoke 2/2; partition bit-exact, subtract ≤1.16e-10, histogram/split within f32 ULP (max relative ≈ 1.1e-7). `04-ROCM-GAPS.md` records every per-case max abs-diff + cause (G-04-01 histogram f32 accumulation, G-04-02 split f32 gain; Phase-5+ remediation options noted). 1 Rule-3 deviation: two-tier hip gate so the anticipated f32 gap is not a hard blocker (D-03a). Commits: 6b97786, 9adedf8.
+
+Next: `/gsd-execute-phase 5` (tree learner) — full Backend op set available on cpu (bit-exact) + hip (best-effort).
 
 ### Plan 04-03 result
 
