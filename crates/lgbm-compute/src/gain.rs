@@ -124,6 +124,74 @@ pub fn calculate_splitted_leaf_output(
     }
 }
 
+// ===========================================================================
+// f32 mirrors of the gain primitives for the no-f64 hip device (CMP-04).
+//
+// IDENTICAL formula structure and gate ORDER as the f64 anchors above — the ONLY
+// difference is the scalar type (`f32` vs `f64`), since hip (gfx1100) cannot
+// allocate f64 (RESEARCH Pitfall 2/3). The hip parity gate compares the f32 hip
+// result to the f64 cpu anchor (collected to f32) within `ORACLE_TOL = 1e-6`,
+// absorbing the f32-vs-f64 accumulation divergence (the divergence the contract
+// was designed for; D-03a). These are gated on `Capabilities.has_f64 == false`.
+// ===========================================================================
+
+/// f32 mirror of [`threshold_l1`] (the no-f64 hip path).
+#[cube]
+pub fn threshold_l1_f32(s: f32, l1: f32) -> f32 {
+    let reg_s = f32::max(0.0, f32::abs(s) - l1);
+    let pos = select(s > 0.0, 1.0, 0.0);
+    let neg = select(s < 0.0, 1.0, 0.0);
+    (pos - neg) * reg_s
+}
+
+/// f32 mirror of [`get_leaf_gain`] (the no-f64 hip path).
+#[cube]
+pub fn get_leaf_gain_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+) -> f32 {
+    if use_l1 {
+        let sg_l1 = threshold_l1_f32(sum_gradients, l1);
+        (sg_l1 * sg_l1) / (sum_hessians + l2)
+    } else {
+        (sum_gradients * sum_gradients) / (sum_hessians + l2)
+    }
+}
+
+/// f32 mirror of [`get_split_gains`] (the no-f64 hip path).
+#[cube]
+pub fn get_split_gains_f32(
+    use_l1: bool,
+    sum_left_gradients: f32,
+    sum_left_hessians: f32,
+    sum_right_gradients: f32,
+    sum_right_hessians: f32,
+    l1: f32,
+    l2: f32,
+) -> f32 {
+    get_leaf_gain_f32(use_l1, sum_left_gradients, sum_left_hessians, l1, l2)
+        + get_leaf_gain_f32(use_l1, sum_right_gradients, sum_right_hessians, l1, l2)
+}
+
+/// f32 mirror of [`calculate_splitted_leaf_output`] (the no-f64 hip path).
+#[cube]
+pub fn calculate_splitted_leaf_output_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+) -> f32 {
+    if use_l1 {
+        -threshold_l1_f32(sum_gradients, l1) / (sum_hessians + l2)
+    } else {
+        -sum_gradients / (sum_hessians + l2)
+    }
+}
+
 /// The minimal gain-config surface passed into [`crate::Backend::find_best_split`]
 /// (extracted from `lgbm_core::Config`; we do NOT pass `&Config` into the
 /// kernel — keep it small and `Copy`).

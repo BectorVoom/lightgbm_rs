@@ -48,15 +48,49 @@ pub enum ReducePath {
     Plane,
 }
 
+/// The histogram/gain accumulation cell type, selected from the probed
+/// [`Capabilities`] (CMP-04, RESEARCH Pitfall 2/3).
+///
+/// Gated EXPLICITLY on `has_f64`: cubecl-cpu supports f64 → the bit-exact f64
+/// anchor; cubecl-hip (gfx1100) does NOT support f64 → the kernels accumulate in
+/// f32, accepting the ~1e-6-tolerated divergence from the cpu f64 anchor (the
+/// divergence the oracle contract was designed to absorb, D-03a). Every divergent
+/// feature is gated off [`Capabilities`] — nothing is assumed present on both
+/// backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccumulateType {
+    /// f64 cells — the cpu bit-exact anchor (`has_f64 == true`).
+    F64,
+    /// f32 cells — the no-f64 hip path (`has_f64 == false`).
+    F32,
+}
+
 impl Capabilities {
     /// Derive the reduce path: `Plane` iff plane collectives are available,
-    /// else `Sequential`.
+    /// else `Sequential`. On cubecl-cpu `has_plane == false` so this is
+    /// `Sequential` (the single-owner ordered fold IS the cpu path); on hip
+    /// `has_plane == true`, but the single-owner ordered fold is still used FIRST
+    /// for parity simplicity (RESEARCH Open Q2 RESOLVED), with the Plane
+    /// reduction left as an optional optimization gated by this flag.
     #[must_use]
     pub fn reduce_path(&self) -> ReducePath {
         if self.has_plane {
             ReducePath::Plane
         } else {
             ReducePath::Sequential
+        }
+    }
+
+    /// Derive the accumulation cell type: f64 iff the device supports f64
+    /// (cpu anchor), else f32 (the no-f64 hip path). This is THE capability gate
+    /// that routes the histogram/split/subtract accumulation between the f64
+    /// anchor kernel and the f32 hip mirror (CMP-04, Pitfall 3).
+    #[must_use]
+    pub fn accumulate_type(&self) -> AccumulateType {
+        if self.has_f64 {
+            AccumulateType::F64
+        } else {
+            AccumulateType::F32
         }
     }
 }
@@ -116,9 +150,29 @@ pub fn cpu_client() -> ComputeClient<cubecl::cpu::CpuRuntime> {
 /// Construct a compute client for the ROCm/HIP runtime (opt-in, gfx-class GPUs).
 ///
 /// Compiled only when the `rocm` feature is enabled, so the default build never
-/// references `cubecl::hip` and needs no ROCm toolchain (SC#1, CMP-03).
+/// references `cubecl::hip` and needs no ROCm toolchain (SC#1, CMP-03). Binds
+/// [`cubecl::hip::HipRuntime`] + `AmdDevice { index: 0 }` (the local gfx1100).
+///
+/// On this device [`probe_capabilities`] reports `has_f64 == false` and
+/// `has_plane == true` (RESEARCH Pitfall 2). The histogram/split/subtract
+/// accumulation MUST therefore route through the f32-cell kernels
+/// ([`crate::kernels::histogram::construct_histograms_f32_on`],
+/// [`crate::kernels::subtract::subtract_histograms_f32_on`],
+/// [`crate::kernels::split::find_best_split_raw_f32_on`]) selected by
+/// [`Capabilities::accumulate_type`] == [`AccumulateType::F32`]; `data_partition`
+/// is f64-free and runs the SAME kernel
+/// ([`crate::kernels::partition::data_partition_on`]) on both backends. The f32
+/// path accepts the ~1e-6-tolerated divergence from the f64 cpu anchor (Pitfall
+/// 3, D-03a — documented in `04-ROCM-GAPS.md`, never silent-passed).
 #[cfg(feature = "rocm")]
 #[must_use]
 pub fn rocm_client() -> ComputeClient<cubecl::hip::HipRuntime> {
     cubecl::hip::HipRuntime::client(&cubecl::hip::AmdDevice::new(0))
 }
+
+/// The active CubeCL runtime type for the `rocm` feature build (gfx-class GPUs).
+///
+/// Re-exported behind this crate's seam so no upstream crate names a cubecl
+/// runtime (CMP-01).
+#[cfg(feature = "rocm")]
+pub type RocmRuntime = cubecl::hip::HipRuntime;

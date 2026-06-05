@@ -94,6 +94,29 @@ pub fn data_partition_cpu(
     threshold: u32,
     most_freq_bin: u32,
 ) -> Result<(Vec<u32>, usize), ComputeError> {
+    data_partition_on(client, bins, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+}
+
+/// Host-side `data_partition` on ANY runtime (generic over `R: Runtime`).
+///
+/// `data_partition` is **f64-free** (the routing kernel reads/writes only `u32`),
+/// so the SAME kernel runs bit-identically on the cubecl-cpu anchor AND the
+/// cubecl-hip GPU — no f32/f64 split is needed (CMP-03/CMP-04). The cpu entry
+/// [`data_partition_cpu`] delegates here; the hip path calls this directly.
+///
+/// # Errors
+/// - [`ComputeError::Runtime`] if `num_bin == 0` or `threshold >= num_bin`.
+/// - [`ComputeError::BinIndexOutOfRange`] for any `bins[i] >= num_bin`.
+#[allow(clippy::too_many_arguments)]
+pub fn data_partition_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    bins: &[u32],
+    num_bin: u32,
+    min_bin: u32,
+    max_bin: u32,
+    threshold: u32,
+    most_freq_bin: u32,
+) -> Result<(Vec<u32>, usize), ComputeError> {
     // --- V5 boundary validation (T-04-01) ---
     if num_bin == 0 {
         return Err(ComputeError::Runtime {

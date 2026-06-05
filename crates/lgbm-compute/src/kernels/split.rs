@@ -65,7 +65,8 @@ use lgbm_core::types::K_EPSILON;
 
 use crate::error::ComputeError;
 use crate::gain::{
-    calculate_splitted_leaf_output, get_split_gains, GainConfig, SplitInfo,
+    calculate_splitted_leaf_output, calculate_splitted_leaf_output_f32, get_split_gains,
+    get_split_gains_f32, GainConfig, SplitInfo,
 };
 use crate::runtime::ActiveRuntime;
 
@@ -76,6 +77,12 @@ use crate::runtime::ActiveRuntime;
 #[cube]
 fn round_int(x: f64) -> i32 {
     i32::cast_from(x + f64::cast_from(0.5f32))
+}
+
+/// f32 mirror of [`round_int`] for the no-f64 hip path: `(int)(x + 0.5f)`.
+#[cube]
+fn round_int_f32(x: f32) -> i32 {
+    i32::cast_from(x + 0.5f32)
 }
 
 /// The single-owner ordered best-split scan (REVERSE + FORWARD branches).
@@ -315,6 +322,181 @@ pub fn find_best_split_kernel(
     out[11] = right_output;
 }
 
+/// f32-cell mirror of [`find_best_split_kernel`] for the no-f64 hip device
+/// (CMP-04). The scan structure, gate ORDER, branchless-`select` encoding, and
+/// monotone-`done` flag are IDENTICAL to the f64 kernel — the ONLY difference is
+/// the accumulation/gain cell type (`f32` instead of `f64`), since hip (gfx1100)
+/// cannot allocate f64 (RESEARCH Pitfall 2/3). The `out` protocol is the same 12
+/// cells, here in f32. The hip parity gate compares these to the f64 cpu anchor
+/// (collected to f32) within `ORACLE_TOL = 1e-6` (D-03a).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_split_kernel_f32(
+    hist: &Array<f32>,
+    out: &mut Array<f32>,
+    num_bin: i32,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f32,
+    lambda_l1: f32,
+    lambda_l2: f32,
+    min_gain_shift: f32,
+    sum_gradient: f32,
+    sum_hessian: f32,
+    num_data: i32,
+    rev_count: i32,
+    fwd_count: i32,
+) {
+    let l1 = lambda_l1;
+    let l2 = lambda_l2;
+    let use_l1_b = use_l1 != 0;
+    let skip_def = skip_default_bin != 0;
+
+    let cnt_factor = f32::cast_from(num_data) / sum_hessian;
+
+    let mut best_sum_left_gradient = 0.0f32;
+    let mut best_sum_left_hessian = 0.0f32;
+    let mut best_gain = 0.0f32;
+    let mut best_left_count = 0i32;
+    let mut best_threshold = 0i32;
+    let mut is_splittable = 0.0f32;
+    let mut best_default_left = 1.0f32;
+
+    // ====================== REVERSE branch (:854-936) ======================
+    {
+        let mut sum_right_gradient = 0.0f32;
+        let mut sum_right_hessian = f32::cast_from(K_EPSILON); // kEpsilon (:856)
+        let mut right_count = 0i32;
+
+        let t_start = num_bin - 1 - offset;
+        let count = rev_count;
+        let mut done = false;
+
+        for k in 0..count {
+            let t = t_start - k;
+            let skip = skip_def && (t + offset) == default_bin;
+            let active = !skip && !done;
+            let bi = (t as usize) * 2;
+            let g = hist[bi];
+            let h = hist[bi + 1];
+            sum_right_gradient += select(active, g, 0.0);
+            sum_right_hessian += select(active, h, 0.0);
+            right_count += select(active, round_int_f32(h * cnt_factor), 0i32);
+
+            let left_count = num_data - right_count;
+            let sum_left_hessian = sum_hessian - sum_right_hessian;
+            let sum_left_gradient = sum_gradient - sum_right_gradient;
+            let cont = right_count < min_data_in_leaf
+                || sum_right_hessian < min_sum_hessian_in_leaf;
+            let brk = left_count < min_data_in_leaf
+                || sum_left_hessian < min_sum_hessian_in_leaf;
+            done = done || (active && !cont && brk);
+            let consider = active && !cont && !done;
+
+            let current_gain = get_split_gains_f32(
+                use_l1_b,
+                sum_left_gradient,
+                sum_left_hessian,
+                sum_right_gradient,
+                sum_right_hessian,
+                l1,
+                l2,
+            );
+            let valid = consider && current_gain > min_gain_shift;
+            is_splittable = select(valid, 1.0, is_splittable);
+            let cand_gain = select(valid, current_gain, 0.0);
+            let take = cand_gain > best_gain;
+            best_left_count = select(take, left_count, best_left_count);
+            best_sum_left_gradient = select(take, sum_left_gradient, best_sum_left_gradient);
+            best_sum_left_hessian = select(take, sum_left_hessian, best_sum_left_hessian);
+            best_threshold = select(take, t - 1 + offset, best_threshold);
+            best_gain = select(take, cand_gain, best_gain);
+            best_default_left = select(take, 1.0, best_default_left);
+        }
+    }
+
+    // ====================== FORWARD branch (:937-1029) =====================
+    {
+        let mut sum_left_gradient = 0.0f32;
+        let mut sum_left_hessian = f32::cast_from(K_EPSILON); // kEpsilon (:939)
+        let mut left_count = 0i32;
+
+        let count = fwd_count;
+        let mut done = false;
+
+        for t in 0..count {
+            let skip = skip_def && (t + offset) == default_bin;
+            let active = !skip && !done;
+            let bi = (t as usize) * 2;
+            let g = hist[bi];
+            let h = hist[bi + 1];
+            sum_left_gradient += select(active, g, 0.0);
+            sum_left_hessian += select(active, h, 0.0);
+            left_count += select(active, round_int_f32(h * cnt_factor), 0i32);
+
+            let right_count = num_data - left_count;
+            let sum_right_hessian = sum_hessian - sum_left_hessian;
+            let sum_right_gradient = sum_gradient - sum_left_gradient;
+            let cont = left_count < min_data_in_leaf
+                || sum_left_hessian < min_sum_hessian_in_leaf;
+            let brk = right_count < min_data_in_leaf
+                || sum_right_hessian < min_sum_hessian_in_leaf;
+            done = done || (active && !cont && brk);
+            let consider = active && !cont && !done;
+
+            let current_gain = get_split_gains_f32(
+                use_l1_b,
+                sum_left_gradient,
+                sum_left_hessian,
+                sum_right_gradient,
+                sum_right_hessian,
+                l1,
+                l2,
+            );
+            let valid = consider && current_gain > min_gain_shift;
+            is_splittable = select(valid, 1.0, is_splittable);
+            let cand_gain = select(valid, current_gain, 0.0);
+            let take = cand_gain > best_gain;
+            best_left_count = select(take, left_count, best_left_count);
+            best_sum_left_gradient = select(take, sum_left_gradient, best_sum_left_gradient);
+            best_sum_left_hessian = select(take, sum_left_hessian, best_sum_left_hessian);
+            best_threshold = select(take, t + offset, best_threshold);
+            best_gain = select(take, cand_gain, best_gain);
+            best_default_left = select(take, 0.0, best_default_left);
+        }
+    }
+
+    // ---- finalization (feature_histogram.hpp:1031-1056) -------------------
+    let eps = f32::cast_from(K_EPSILON);
+    let left_output = calculate_splitted_leaf_output_f32(
+        use_l1_b,
+        best_sum_left_gradient,
+        best_sum_left_hessian,
+        l1,
+        l2,
+    );
+    let right_sum_gradient = sum_gradient - best_sum_left_gradient;
+    let right_sum_hessian = sum_hessian - best_sum_left_hessian;
+    let right_output =
+        calculate_splitted_leaf_output_f32(use_l1_b, right_sum_gradient, right_sum_hessian, l1, l2);
+
+    out[0] = is_splittable;
+    out[1] = f32::cast_from(best_threshold);
+    out[2] = best_gain;
+    out[3] = f32::cast_from(best_left_count);
+    out[4] = f32::cast_from(num_data - best_left_count);
+    out[5] = best_sum_left_gradient;
+    out[6] = best_sum_left_hessian - eps;
+    out[7] = right_sum_gradient;
+    out[8] = right_sum_hessian - eps;
+    out[9] = best_default_left;
+    out[10] = left_output;
+    out[11] = right_output;
+}
+
 /// Host-side `find_best_split` on the cpu reference runtime.
 ///
 /// Validates inputs (V5, threat T-04-01) BEFORE the unsafe launch, computes
@@ -483,6 +665,119 @@ pub fn find_best_split_cpu(
     } else {
         Ok(SplitInfo::none())
     }
+}
+
+/// Host-side `find_best_split` in **f32 cells** on ANY runtime (the no-f64 hip
+/// path; CMP-03/CMP-04). Mirrors [`find_best_split_cpu`]'s host pre-step
+/// (`BeforeNumerical` `min_gain_shift`, the `2*kEpsilon` entry bump) and V5
+/// validation, but in f32, and returns the RAW 12 `out` cells the f32 scan wrote
+/// `[is_splittable, threshold, gain, left_count, right_count, left_sum_gradient,
+///  left_sum_hessian, right_sum_gradient, right_sum_hessian, default_left,
+///  left_output, right_output]`. The hip parity gate compares these to the cpu
+/// f64 anchor's raw cells (collected to f32) within `ORACLE_TOL = 1e-6`.
+///
+/// Generic over `R: Runtime` so it runs on the cubecl-cpu client (f32 reference)
+/// AND the cubecl-hip client (the real GPU).
+///
+/// # Errors
+/// Same as [`find_best_split_cpu`] (length / num_bin / sum_hessian / scope
+/// validation, V5).
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist: &[f32],
+    cfg: &GainConfig,
+    num_bin: u32,
+    offset: i32,
+    default_bin: u32,
+    sum_gradient: f32,
+    sum_hessian: f32,
+    num_data: i32,
+) -> Result<Vec<f32>, ComputeError> {
+    // --- V5 boundary validation (T-04-01) ---
+    if num_bin == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split_f32: num_bin must be > 0".to_string(),
+        });
+    }
+    let expected = 2usize
+        .checked_mul(num_bin as usize)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!("num_bin {num_bin} overflows the histogram length"),
+        })?;
+    if hist.len() != expected {
+        return Err(ComputeError::LengthMismatch {
+            expected,
+            actual: hist.len(),
+        });
+    }
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split_f32: sum_hessian must be > 0".to_string(),
+        });
+    }
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split_f32: max_delta_step / path_smooth are Phase-7+ scope"
+                .to_string(),
+        });
+    }
+
+    // BeforeNumerical (host, f32): gain_shift over the un-bumped leaf totals.
+    let use_l1 = cfg.use_l1();
+    let gain_shift = crate::gain::get_leaf_gain_f32(
+        use_l1,
+        sum_gradient,
+        sum_hessian,
+        cfg.lambda_l1 as f32,
+        cfg.lambda_l2 as f32,
+    );
+    let min_gain_shift = gain_shift + cfg.min_gain_to_split as f32;
+
+    let two_eps = 2.0f32 * f32::from(K_EPSILON);
+    let sum_hessian_bumped = sum_hessian + two_eps;
+
+    let num_bin_i = num_bin as i32;
+    let rev_count = (num_bin_i - 1).max(0);
+    let fwd_count = (num_bin_i - 1 - offset).max(0);
+
+    let out_len = 12usize;
+    let h_hist = client.create_from_slice(f32::as_bytes(hist));
+    let zeros = vec![0.0f32; out_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+
+    // SAFETY: identical handle/length correspondence to `find_best_split_cpu` —
+    // `h_hist` sized `2*num_bin`, `h_out` sized 12 f32 cells, both outliving the
+    // launch; the scan reads `hist[(t<<1)+1]` only for in-range `t`. cubecl
+    // `unsafe` confined here (CMP-01).
+    unsafe {
+        find_best_split_kernel_f32::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_hist, hist.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            num_bin as i32,
+            offset,
+            default_bin as i32,
+            if cfg_skip_default_bin(default_bin, num_bin) { 1u32 } else { 0u32 },
+            if use_l1 { 1u32 } else { 0u32 },
+            cfg.min_data_in_leaf,
+            cfg.min_sum_hessian_in_leaf as f32,
+            cfg.lambda_l1 as f32,
+            cfg.lambda_l2 as f32,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian_bumped,
+            num_data,
+            rev_count,
+            fwd_count,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).to_vec())
 }
 
 /// Whether the scan must skip the default bin. C++ instantiates
