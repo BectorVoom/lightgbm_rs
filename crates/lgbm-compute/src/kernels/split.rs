@@ -543,11 +543,25 @@ pub fn find_best_split_cpu(
     offset: i32,
     default_bin: u32,
     _most_freq_bin: u32,
+    skip_default_bin: bool,
+    na_as_missing: bool,
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
 ) -> Result<SplitInfo, ComputeError> {
     // --- V5 boundary validation (T-04-01) ---
+    // NA_AS_MISSING forward-branch (feature_histogram.hpp:945-961) is deferred
+    // (RESEARCH A5) — this layer threads the flag and validates it false on every
+    // captured case, but the NaN-missing forward preamble kernel body is NOT yet
+    // transcribed. Surface a TYPED error rather than silently mis-computing
+    // (T-05-01-01): the unimplemented branch can never produce a wrong SplitInfo.
+    if na_as_missing {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                     implemented"
+                .to_string(),
+        });
+    }
     if num_bin == 0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_split: num_bin must be > 0".to_string(),
@@ -634,7 +648,7 @@ pub fn find_best_split_cpu(
             num_bin as i32,
             offset,
             default_bin as i32,
-            if cfg_skip_default_bin(default_bin, num_bin) { 1u32 } else { 0u32 },
+            if skip_default_bin { 1u32 } else { 0u32 },
             if use_l1 { 1u32 } else { 0u32 },
             cfg.min_data_in_leaf,
             cfg.min_sum_hessian_in_leaf,
@@ -713,11 +727,22 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
     num_bin: u32,
     offset: i32,
     default_bin: u32,
+    skip_default_bin: bool,
+    na_as_missing: bool,
     sum_gradient: f32,
     sum_hessian: f32,
     num_data: i32,
 ) -> Result<Vec<f32>, ComputeError> {
     // --- V5 boundary validation (T-04-01) ---
+    // NA_AS_MISSING forward branch deferred (RESEARCH A5) — typed error, never a
+    // silent wrong answer (T-05-01-01). Signature-consistent with the f64 path.
+    if na_as_missing {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split_f32: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                     implemented"
+                .to_string(),
+        });
+    }
     if num_bin == 0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_split_f32: num_bin must be > 0".to_string(),
@@ -784,7 +809,7 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
             num_bin as i32,
             offset,
             default_bin as i32,
-            if cfg_skip_default_bin(default_bin, num_bin) { 1u32 } else { 0u32 },
+            if skip_default_bin { 1u32 } else { 0u32 },
             if use_l1 { 1u32 } else { 0u32 },
             cfg.min_data_in_leaf,
             cfg.min_sum_hessian_in_leaf as f32,
@@ -803,39 +828,16 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
     Ok(f32::from_bytes(&bytes).to_vec())
 }
 
-/// Whether the scan must skip the default bin (the `SKIP_DEFAULT_BIN` template
-/// bool of `FindBestThresholdSequentially`).
-///
-/// AUTHORITATIVE C++ PREDICATE (WR-04): `FuncForNumricalL3`
-/// (feature_histogram.hpp:396-429) sets `SKIP_DEFAULT_BIN == true` for the
-/// numeric (non-quantized) path **iff**
-///
-/// ```text
-/// meta_->num_bin > 2 && meta_->missing_type == MissingType::Zero
-/// ```
-///
-/// (When `missing_type == NaN` with `num_bin > 2` it instead sets
-/// `NA_AS_MISSING == true, SKIP_DEFAULT_BIN == false`; when
-/// `missing_type == None` both are false.) The flag is therefore a function of
-/// `missing_type`, NOT of `default_bin` vs `num_bin`.
-///
-/// PHASE-4 HEURISTIC + PRECONDITION: this layer does not yet carry
-/// `missing_type` into the kernel surface, so it approximates the predicate as
-/// `default_bin < num_bin`. This is only sound under the Phase-4 precondition
-/// that captured cases set `default_bin < num_bin` **iff** the C++ predicate
-/// above holds — which the committed golden corpus satisfies (verified by the
-/// bit-exact parity gate, including `default_bin_skip`). It is NOT a faithful
-/// transcription of the C++ dispatch.
-///
-/// FOLLOW-UP (Phase-5, recorded in 04-REVIEW-FIX.md): thread the authoritative
-/// `skip_default_bin` (derived from `missing_type` + `num_bin > 2`) from the
-/// caller through `find_best_split_cpu` / `Backend::find_best_split` instead of
-/// re-deriving it here, and add a golden where `default_bin < num_bin` but
-/// `skip_default_bin == false` to exercise the divergence. Not done in Phase-4
-/// because it changes the public trait signature and the current parity is green.
-fn cfg_skip_default_bin(default_bin: u32, num_bin: u32) -> bool {
-    default_bin < num_bin
-}
+// The Phase-4 `cfg_skip_default_bin(default_bin, num_bin)` heuristic
+// (`default_bin < num_bin`) was REMOVED in Phase-5 (Plan 05-01, RESEARCH
+// Pitfall 1). The authoritative `SKIP_DEFAULT_BIN`/`NA_AS_MISSING` flags
+// (`feature_histogram.hpp:284-285`: `num_bin > 2 && missing_type == Zero` for
+// skip, `num_bin > 2 && missing_type == NaN` for na_as_missing, both false for
+// `missing_type == None`) are now derived in the learner from
+// `bin_mapper.missing_type()` and threaded through `Backend::find_best_split` /
+// `find_best_split_cpu` / `find_best_split_raw_f32_on` as explicit params, so the
+// kernel dispatch matches C++ exactly instead of approximating it from the bin
+// layout.
 
 #[cfg(test)]
 mod tests {
@@ -881,6 +883,8 @@ mod tests {
             0,
             num_bin, // default_bin == num_bin -> not skipped
             0,
+            false, // skip_default_bin
+            false, // na_as_missing
             sum_gradient,
             sum_hessian,
             num_data,
@@ -908,7 +912,7 @@ mod tests {
             path_smooth: 0.0,
         };
         let si = find_best_split_cpu(
-            &client, &hist, &cfg, num_bin, 0, num_bin, 0, 4.0, 4.0, 8,
+            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, 4.0, 4.0, 8,
         )
         .expect("call ok");
         assert_eq!(si.gain, f64::NEG_INFINITY, "no split -> kMinScore");
@@ -935,11 +939,57 @@ mod tests {
             0,
             4,
             0,
+            false,
+            false,
             1.0,
             1.0,
             4,
         )
         .unwrap_err();
         assert!(matches!(err, ComputeError::LengthMismatch { .. }));
+    }
+
+    /// `na_as_missing == true` is a TYPED error (the NA_AS_MISSING forward branch
+    /// is deferred, RESEARCH A5) — never a panic, never a wrong SplitInfo
+    /// (T-05-01-01). This is asserted BEFORE any length/num_bin validation so the
+    /// deferral is unambiguous even on otherwise-valid input.
+    #[test]
+    fn find_best_split_na_as_missing_is_typed_error() {
+        let client = cpu_client();
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+        };
+        let err = find_best_split_cpu(
+            &client,
+            &hist,
+            &cfg,
+            num_bin,
+            0,
+            num_bin,
+            0,
+            false, // skip_default_bin
+            true,  // na_as_missing -> deferred typed error
+            -1.0,
+            20.0,
+            20,
+        )
+        .expect_err("na_as_missing must be a typed error, not a wrong split");
+        match err {
+            ComputeError::Runtime { detail } => {
+                assert!(
+                    detail.contains("na_as_missing"),
+                    "error must name na_as_missing, got: {detail}"
+                );
+            }
+            other => panic!("expected ComputeError::Runtime, got {other:?}"),
+        }
     }
 }

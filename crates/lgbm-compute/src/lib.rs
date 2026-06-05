@@ -81,6 +81,16 @@ pub trait Backend {
     /// - `offset` / `default_bin` / `most_freq_bin` — the Phase-2
     ///   `FeatureGroup`/`Bin` bin-layout descriptors driving the
     ///   `SKIP_DEFAULT_BIN` continue and the threshold offset arithmetic.
+    /// - `skip_default_bin` / `na_as_missing` — the AUTHORITATIVE C++ dispatch
+    ///   flags (`feature_histogram.hpp:284-285`), derived by the caller from the
+    ///   feature's `missing_type` + `num_bin > 2`
+    ///   (`skip == (num_bin > 2 && missing_type == Zero)`,
+    ///   `na_as_missing == (num_bin > 2 && missing_type == NaN)`, both false for
+    ///   `missing_type == None`). These REPLACE the Phase-4
+    ///   `cfg_skip_default_bin(default_bin, num_bin)` heuristic (RESEARCH
+    ///   Pitfall 1). `na_as_missing == true` is currently a typed
+    ///   [`ComputeError::Runtime`] (the NA_AS_MISSING forward branch is deferred,
+    ///   RESEARCH A5 — never a silent wrong answer).
     /// - `sum_gradient` / `sum_hessian` / `num_data` — the leaf totals.
     ///
     /// Returns a [`SplitInfo`]; `gain == f64::NEG_INFINITY` (C++ `kMinScore`)
@@ -89,7 +99,8 @@ pub trait Backend {
     /// # Errors
     /// [`ComputeError::LengthMismatch`] if `hist.len() != 2 * num_bin`, or
     /// [`ComputeError::Runtime`] for `num_bin == 0`, non-positive `sum_hessian`,
-    /// or unsupported non-default gain params (V5, T-04-01).
+    /// `na_as_missing == true` (deferred branch), or unsupported non-default gain
+    /// params (V5, T-04-01).
     #[allow(clippy::too_many_arguments)]
     fn find_best_split(
         &self,
@@ -100,6 +111,8 @@ pub trait Backend {
         offset: i32,
         default_bin: u32,
         most_freq_bin: u32,
+        skip_default_bin: bool,
+        na_as_missing: bool,
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
@@ -190,6 +203,8 @@ impl Backend for CpuBackend {
         offset: i32,
         default_bin: u32,
         most_freq_bin: u32,
+        skip_default_bin: bool,
+        na_as_missing: bool,
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
@@ -202,6 +217,8 @@ impl Backend for CpuBackend {
             offset,
             default_bin,
             most_freq_bin,
+            skip_default_bin,
+            na_as_missing,
             sum_gradient,
             sum_hessian,
             num_data,
