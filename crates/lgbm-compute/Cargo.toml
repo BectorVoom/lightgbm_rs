@@ -5,4 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cubecl.workspace = true
+cubecl = { workspace = true, features = ["cpu"] }
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+thiserror = { workspace = true }
+
+[features]
+# `cpu` (default) keeps the cubecl-cpu reference runtime always available — it is
+# the D-04 deterministic anchor, not an optional path. `rocm` is opt-in so a
+# CPU-only build needs no ROCm toolchain present (SC#1, CMP-03 prep).
+default = ["cpu"]
+cpu = []
+rocm = ["cubecl/hip"]
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

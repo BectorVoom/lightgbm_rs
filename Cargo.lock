@@ -1729,6 +1729,10 @@ name = "lgbm-compute"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "lgbm-core",
+ "lgbm-dataset",
+ "oracle-harness",
+ "thiserror",
 ]
 
 [[package]]
