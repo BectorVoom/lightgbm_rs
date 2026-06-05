@@ -158,3 +158,55 @@ reference source.
 ```bash
 cargo run -p xtask -- bin-capture
 ```
+
+## Model / Predict Golden Set (Phase 3, D-05 / PRD-01..PRD-06)
+
+Captured by `cargo run -p xtask -- model-capture` into
+`crates/lgbm-model/tests/fixtures/models/{regression,binary,multiclass,categorical,subrange}/`.
+Each corpus directory holds the authoritative C++ `version=v4` `model.txt`
+(`Booster.save_model()`) plus per-corpus predict-vector goldens:
+`raw.txt` (PRD-01 raw scores), `transformed.txt` (PRD-02 — sigmoid for binary,
+softmax for multiclass, identity for regression), `leaf.txt` (PRD-03 leaf
+indices), and (for `subrange`) `subrange.txt` (PRD-06 raw scores for
+representative `(start_iteration, num_iteration)` slices incl. `-1 == all
+remaining`). The fixed-double `%g` battery for the `format.rs` DAT-09 formatter
+is `models/format_golden.txt` (G17 = `{:.17g}`, G6 = `{:g}`). Float golden
+vectors are `;`-separated raw f64 bit patterns (decimal `u64`) for bit-exact
+replay; leaf indices are `;`-separated decimal `u32`.
+
+- **Training tool (capture-time only):** pip `lightgbm` `4.6.0`
+(RESEARCH Open Q2 path B). NOT a dependency of the shipped crate and NEVER read
+at `cargo test` time — the fixtures are committed.
+- **Train seed:** `2147483647` (`0x7FFFFFFF`).
+- **Deterministic train params:** `deterministic=true force_row_wise=true
+num_threads=1 bagging_freq=0 bagging_fraction=1.0 feature_fraction=1.0
+num_boost_round=10 num_leaves=31 min_data_in_leaf=20` (NO data subsampling), so
+re-running `model-capture` is byte-idempotent (empty `git diff`).
+- **Corpora:** regression (`objective=regression`), binary
+(`objective=binary`), multiclass (`objective=multiclass num_class=3`, label
+derived deterministically by tertile-bucketing a stable feature), categorical
+(`objective=binary` with 4 integerized `categorical_feature` columns),
+subrange (a regression model exercising the PRD-06 sub-range slices). The
+regression/binary inputs are the COPIED Phase-2 example matrices under
+`crates/lgbm-dataset/tests/fixtures/examples/` — NEVER the untracked
+`LightGBM/` tree.
+
+### Capture-path resolution: PATH B (pip lightgbm train + dump), human-approved
+
+RESEARCH Open Q2 (the FIRST planning gate) offered (A) verbatim transcription of
+`SaveModelToString` + a train stub vs (B) pip `lightgbm` train + dump. **Path A
+is infeasible standalone here** (Phase 3 has no Rust trainer and the C++ trainer
+is unbuildable — `external_libs/{fmt,fast_double_parser,...}` are empty), so a
+trained `.txt` must come from a prebuilt `lib_lightgbm`. **Path B was selected
+and approved:** the pip wheel ships `lib_lightgbm` with `fmt` baked in, so its
+`save_model()` IS the authoritative v4 format with correct `%.17g`. The exact
+tool version + train params are pinned above; the produced fixtures were
+human-approved as numerically identical to `lib_lightgbm` (03-VALIDATION.md
+Manual-Only Verifications). The capture interpreter is resolved from
+`$LGBM_CAPTURE_PYTHON` (a venv with `pip install lightgbm`).
+
+### Exact model-capture command
+
+```bash
+LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- model-capture
+```

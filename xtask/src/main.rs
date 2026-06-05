@@ -48,16 +48,31 @@ pub const LIGHTGBM_COMMIT: &str = "195c26fc7b00eb0fec252dfe841e2e66d6833954";
 /// Pinned LightGBM version (`LightGBM/VERSION.txt`).
 pub const LIGHTGBM_VERSION: &str = "4.6.0.99";
 
+/// The recorded train seed for the Phase-3 model corpus (D-05). Like the other
+/// master seeds it is the SINGLE source of randomness for `model-capture`
+/// (combined with `deterministic=true force_row_wise=true num_threads=1` and NO
+/// data subsampling), so the captured `.txt` models + predict goldens are
+/// byte-idempotent (empty `git diff` on re-run). Recorded in REFERENCE_MANIFEST.md.
+pub const MODEL_TRAIN_SEED: i32 = 0x7FFF_FFFF;
+
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-3 model
+/// corpus (RESEARCH Open Q2 path B). The prebuilt wheel ships `lib_lightgbm`
+/// with `fmt` baked in, so its `save_model()` output IS the authoritative
+/// `version=v4` model text with correct `%.17g` floats. Pinned here + in the
+/// manifest; `model-capture` asserts the installed version matches.
+pub const MODEL_LIGHTGBM_VERSION: &str = "4.6.0";
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("regen") => regen(),
         Some("bin-capture") => bin_capture(),
+        Some("model-capture") => model_capture(),
         Some(other) => {
-            bail!("unknown subcommand `{other}` (try: regen | bin-capture)");
+            bail!("unknown subcommand `{other}` (try: regen | bin-capture | model-capture)");
         }
         None => {
-            eprintln!("usage: cargo run -p xtask -- <regen | bin-capture>");
+            eprintln!("usage: cargo run -p xtask -- <regen | bin-capture | model-capture>");
             Ok(())
         }
     }
@@ -317,6 +332,154 @@ fn bin_capture() -> Result<()> {
     Ok(())
 }
 
+/// Regenerate the Phase-3 model + predict golden corpus (D-05, PRD-01..PRD-06).
+///
+/// RESEARCH Open Q2 capture-path resolution: **path B (human-approved)**. The
+/// full `lib_lightgbm` is unbuildable here (`external_libs/{fmt,...}` are empty),
+/// and Phase 3 has no Rust trainer yet, so the authoritative reference model
+/// `.txt` is produced by a pip-installed `lightgbm` (its prebuilt wheel ships
+/// `lib_lightgbm` with `fmt` baked in → `save_model()` IS the authoritative
+/// `version=v4` text with correct `%.17g` floats). This subcommand shells out to
+/// `xtask/py/model_capture.py`, which TRAINS the 5-corpus D-05 set
+/// (regression / binary / multiclass / categorical / subrange) on the reused
+/// Phase-2 example matrices with `deterministic=true force_row_wise=true
+/// num_threads=1 seed=MODEL_TRAIN_SEED` and NO subsampling, then dumps each
+/// `model.txt` + per-corpus predict-vector goldens (raw / transformed / leaf /
+/// sub-range) and the `format_golden.txt` `%g` battery. Byte-idempotent.
+///
+/// The pip `lightgbm` is a CAPTURE-time tool only — never a dependency of the
+/// shipped crate and never read at `cargo test` time (the fixtures are
+/// committed). The interpreter is resolved from `$LGBM_CAPTURE_PYTHON` (or a few
+/// common venv locations / `python3`); it must have `lightgbm` importable.
+fn model_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/model_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Fixtures live under the TRACKED crate dir — NEVER the untracked LightGBM/ tree.
+    let models_dir = root.join("crates/lgbm-model/tests/fixtures/models");
+    std::fs::create_dir_all(&models_dir)
+        .with_context(|| format!("creating models fixtures dir {}", models_dir.display()))?;
+
+    // The reused Phase-2 example matrices (COPIED into the committed fixtures dir).
+    let reg_train = root.join("crates/lgbm-dataset/tests/fixtures/examples/regression.train");
+    let bin_train = root.join("crates/lgbm-dataset/tests/fixtures/examples/binary.train");
+    for ex in [&reg_train, &bin_train] {
+        if !ex.is_file() {
+            bail!(
+                "example fixture {} not found (it is the committed Phase-2 input matrix)",
+                ex.display()
+            );
+        }
+    }
+
+    // Verify the interpreter has the recorded lightgbm version before training.
+    eprintln!(
+        "xtask model-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        MODEL_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = MODEL_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python (e.g. a venv) with \
+         `pip install lightgbm` of that version. `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!("xtask model-capture: training the D-05 corpus + dumping goldens ...");
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&models_dir)
+            .arg(&reg_train)
+            .arg(&bin_train)
+            .arg(MODEL_TRAIN_SEED.to_string())
+            .arg(MODEL_LIGHTGBM_VERSION),
+        "model_capture.py",
+    )?;
+
+    // Assert every required output landed.
+    for corpus in ["regression", "binary", "multiclass", "categorical", "subrange"] {
+        let cdir = models_dir.join(corpus);
+        for f in ["model.txt", "raw.txt", "transformed.txt", "leaf.txt"] {
+            let p = cdir.join(f);
+            if !p.is_file() {
+                bail!("capture completed but {} was not written", p.display());
+            }
+        }
+    }
+    let subrange = models_dir.join("subrange/subrange.txt");
+    if !subrange.is_file() {
+        bail!("capture completed but {} was not written", subrange.display());
+    }
+    let format_golden = models_dir.join("format_golden.txt");
+    if !format_golden.is_file() {
+        bail!("capture completed but {} was not written", format_golden.display());
+    }
+
+    // Refresh the shared reference manifest (idempotent — pure function of the
+    // recorded constants).
+    let manifest_path = root
+        .join("crates/oracle-harness/fixtures")
+        .join("REFERENCE_MANIFEST.md");
+    write_manifest(&manifest_path)?;
+
+    eprintln!(
+        "xtask model-capture: done. Wrote 5 corpora + format_golden.txt under {} and refreshed {}.",
+        models_dir.display(),
+        manifest_path.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- model-capture` and confirm \
+         `git diff --stat crates/lgbm-model/tests/fixtures/models \
+         crates/oracle-harness/fixtures/REFERENCE_MANIFEST.md` is empty (byte-idempotent)."
+    );
+    Ok(())
+}
+
+/// Resolve a python interpreter that can run the capture (lightgbm importable).
+///
+/// Order: `$LGBM_CAPTURE_PYTHON`, then a few common venv locations, then
+/// `python3` on PATH. Returns a clear (non-panic) error naming the override.
+fn resolve_capture_python() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("LGBM_CAPTURE_PYTHON") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!(
+            "$LGBM_CAPTURE_PYTHON points at {} which is not a file",
+            path.display()
+        );
+    }
+    let candidates = [
+        PathBuf::from("/tmp/lgbm-capture-venv/bin/python"),
+        PathBuf::from("python3"),
+    ];
+    for c in &candidates {
+        // A bare `python3` (no `/`) is resolved via PATH by Command; accept it.
+        if c.components().count() == 1 || c.is_file() {
+            return Ok(c.clone());
+        }
+    }
+    bail!(
+        "no capture python found. Set $LGBM_CAPTURE_PYTHON to a python with \
+         `pip install lightgbm` (e.g. a venv)."
+    );
+}
+
 /// Verify a C++ toolchain and CMake are present, returning a clear (non-panic)
 /// error if absent (RESEARCH §Environment).
 fn verify_toolchain() -> Result<()> {
@@ -544,6 +707,58 @@ reference source.\n\
 \n\
 ```bash\n\
 cargo run -p xtask -- bin-capture\n\
+```\n\
+\n\
+## Model / Predict Golden Set (Phase 3, D-05 / PRD-01..PRD-06)\n\
+\n\
+Captured by `cargo run -p xtask -- model-capture` into\n\
+`crates/lgbm-model/tests/fixtures/models/{{regression,binary,multiclass,categorical,subrange}}/`.\n\
+Each corpus directory holds the authoritative C++ `version=v4` `model.txt`\n\
+(`Booster.save_model()`) plus per-corpus predict-vector goldens:\n\
+`raw.txt` (PRD-01 raw scores), `transformed.txt` (PRD-02 — sigmoid for binary,\n\
+softmax for multiclass, identity for regression), `leaf.txt` (PRD-03 leaf\n\
+indices), and (for `subrange`) `subrange.txt` (PRD-06 raw scores for\n\
+representative `(start_iteration, num_iteration)` slices incl. `-1 == all\n\
+remaining`). The fixed-double `%g` battery for the `format.rs` DAT-09 formatter\n\
+is `models/format_golden.txt` (G17 = `{{:.17g}}`, G6 = `{{:g}}`). Float golden\n\
+vectors are `;`-separated raw f64 bit patterns (decimal `u64`) for bit-exact\n\
+replay; leaf indices are `;`-separated decimal `u32`.\n\
+\n\
+- **Training tool (capture-time only):** pip `lightgbm` `{model_lgbm_version}`\n\
+  (RESEARCH Open Q2 path B). NOT a dependency of the shipped crate and NEVER read\n\
+  at `cargo test` time — the fixtures are committed.\n\
+- **Train seed:** `{model_train_seed}` (`0x{model_train_seed_hex:08X}`).\n\
+- **Deterministic train params:** `deterministic=true force_row_wise=true\n\
+  num_threads=1 bagging_freq=0 bagging_fraction=1.0 feature_fraction=1.0\n\
+  num_boost_round=10 num_leaves=31 min_data_in_leaf=20` (NO data subsampling), so\n\
+  re-running `model-capture` is byte-idempotent (empty `git diff`).\n\
+- **Corpora:** regression (`objective=regression`), binary\n\
+  (`objective=binary`), multiclass (`objective=multiclass num_class=3`, label\n\
+  derived deterministically by tertile-bucketing a stable feature), categorical\n\
+  (`objective=binary` with 4 integerized `categorical_feature` columns),\n\
+  subrange (a regression model exercising the PRD-06 sub-range slices). The\n\
+  regression/binary inputs are the COPIED Phase-2 example matrices under\n\
+  `crates/lgbm-dataset/tests/fixtures/examples/` — NEVER the untracked\n\
+  `LightGBM/` tree.\n\
+\n\
+### Capture-path resolution: PATH B (pip lightgbm train + dump), human-approved\n\
+\n\
+RESEARCH Open Q2 (the FIRST planning gate) offered (A) verbatim transcription of\n\
+`SaveModelToString` + a train stub vs (B) pip `lightgbm` train + dump. **Path A\n\
+is infeasible standalone here** (Phase 3 has no Rust trainer and the C++ trainer\n\
+is unbuildable — `external_libs/{{fmt,fast_double_parser,...}}` are empty), so a\n\
+trained `.txt` must come from a prebuilt `lib_lightgbm`. **Path B was selected\n\
+and approved:** the pip wheel ships `lib_lightgbm` with `fmt` baked in, so its\n\
+`save_model()` IS the authoritative v4 format with correct `%.17g`. The exact\n\
+tool version + train params are pinned above; the produced fixtures were\n\
+human-approved as numerically identical to `lib_lightgbm` (03-VALIDATION.md\n\
+Manual-Only Verifications). The capture interpreter is resolved from\n\
+`$LGBM_CAPTURE_PYTHON` (a venv with `pip install lightgbm`).\n\
+\n\
+### Exact model-capture command\n\
+\n\
+```bash\n\
+LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- model-capture\n\
 ```\n",
         commit = LIGHTGBM_COMMIT,
         version = LIGHTGBM_VERSION,
@@ -554,6 +769,9 @@ cargo run -p xtask -- bin-capture\n\
         total = N_RNG_CASES + N_SAMPLE_CASES,
         bin_master_seed = BIN_MASTER_SEED,
         bin_master_seed_hex = BIN_MASTER_SEED as u32,
+        model_train_seed = MODEL_TRAIN_SEED,
+        model_train_seed_hex = MODEL_TRAIN_SEED as u32,
+        model_lgbm_version = MODEL_LIGHTGBM_VERSION,
     );
     std::fs::write(path, content)
         .with_context(|| format!("writing manifest {}", path.display()))?;
