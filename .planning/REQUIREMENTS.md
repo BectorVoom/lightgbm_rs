@@ -101,7 +101,7 @@
 
 - [x] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤~1e-6 absolute (f32 single-precision)
 - [x] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, default `float` `score_t`/`label_t` width) for valid comparison
-- [ ] **ORA-03**: Per-stage parity tests (bin → histogram → per-split-gain → leaf-output → prediction), not just final outputs
+- [x] **ORA-03**: Per-stage parity tests (bin → histogram → per-split-gain → leaf-output → prediction), not just final outputs
 - [ ] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment)
 
 ### APIs

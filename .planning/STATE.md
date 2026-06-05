@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 02-07-PLAN.md (CR-01 + WR-01 closure — default ingest routes through faithful Construct; phase ready to re-verify)
-last_updated: "2026-06-05T09:40:00.000Z"
-last_activity: 2026-06-05 -- Plan 02-07 executed (default-ingest Construct parity / CR-01 closure)
+status: verifying
+stopped_at: Completed 02-06-PLAN.md (gap closure — GAP-1/GAP-2 closed; phase ready to re-verify)
+last_updated: "2026-06-05T09:35:26.337Z"
+last_activity: 2026-06-05
 progress:
   total_phases: 8
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 10
   completed_plans: 10
-  percent: 13
+  percent: 25
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 02 (dataset-binning-determinism-root) — GAP CLOSURE DONE (ready to re-verify)
-Plan: 7 of 7 executed (CR-01 + WR-01 closure plan)
+Phase: 3
+Plan: Not started
 Status: All 7 plans executed; CR-01 (default-ingest Construct divergence) + WR-01 (silent-skip) closed. Phase ready for re-verification.
-Last activity: 2026-06-05 -- Plan 02-07 executed (default-ingest Construct parity / CR-01 closure)
+Last activity: 2026-06-05
 
 Progress: [██████████] 7/7 plans executed — CR-01 blocker + WR-01 closed; re-verify next
 
@@ -62,7 +62,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 
 **Velocity:**
 
-- Total plans completed: 1 (tracked)
+- Total plans completed: 8 (tracked)
 - Average duration: ~3 min
 - Total execution time: <1 hour
 
@@ -72,6 +72,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 |-------|-------|-------|----------|
 | 01-oracle-contract-foundations | 3/3 | ~2 sessions | ~1 session |
 | 02-dataset-binning-determinism-root | 5/5 | ~65 min + continuation | ~16 min |
+| 02 | 7 | - | - |
 
 **Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 **Plan 01-03:** 2 TDD tasks, 3 files modified, 7 new tests (49 → 56); deterministic alias resolution + empty==absent reads; `cargo test --workspace` green.
