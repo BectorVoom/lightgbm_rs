@@ -22,6 +22,7 @@
 //! helper. The `SerialTreeLearner` orchestrator (the `learner` module) lands in
 //! Plan 03 against these contracts.
 
+pub mod col_sampler;
 pub mod data_partition;
 pub mod error;
 pub mod fix_histogram;
@@ -30,10 +31,11 @@ pub mod leaf_splits;
 pub mod learner;
 pub mod split_info;
 
+pub use col_sampler::ColSampler;
 pub use data_partition::DataPartition;
 pub use error::TreeLearnerError;
 pub use fix_histogram::fix_histogram;
 pub use histogram_pool::HistogramPool;
 pub use leaf_splits::LeafSplits;
-pub use learner::{FeatureColumn, SerialTreeLearner};
+pub use learner::{BuildStrategy, FeatureColumn, SerialTreeLearner};
 pub use split_info::{split_gt, SplitInfo};

@@ -39,11 +39,36 @@ use lgbm_compute::ComputeClientReexport as ComputeClient;
 use lgbm_dataset::bin_mapper::MissingType;
 use lgbm_model::Tree;
 
+use crate::col_sampler::ColSampler;
 use crate::data_partition::DataPartition;
 use crate::error::TreeLearnerError;
 use crate::histogram_pool::HistogramPool;
 use crate::leaf_splits::LeafSplits;
 use crate::split_info::{split_gt, SplitInfo};
+
+/// The histogram-build strategy (`force_row_wise` / `force_col_wise`, TRL-09).
+///
+/// In C++ this selects between row-major and column-major histogram accumulation
+/// in `GetShareStates` (`serial_tree_learner.cpp:81-112`). The two differ ONLY in
+/// the ORDER bins are accumulated, NOT the result (Pitfall 5): on the
+/// single-thread deterministic anchor the Phase-4 `construct_histograms`
+/// whole-kernel op produces the SAME f64 cells for either strategy, so this is a
+/// config FLAG over the shared Backend path (RESEARCH A1 / Open Q2 — verified
+/// empirically by the `learner_parity_row_vs_col` golden, which asserts both
+/// strategies grow a tree bit-identical to each other and to C++).
+///
+/// If a future backend's column-major accumulation ever diverged from the
+/// row-major cells at the `construct_histograms` layer, that would be a Phase-4
+/// boundary re-open (threat T-05-04-02) — the learner does not silently ship a
+/// divergent tree; the row==col equality gate would fail loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildStrategy {
+    /// `force_row_wise=true` — the Plan-03 spine default.
+    #[default]
+    RowWise,
+    /// `force_col_wise=true` — observationally identical on the anchor (A1).
+    ColWise,
+}
 
 /// C++ `kMinScore = -inf` (`meta.h:50`) — the "never chosen" gain sentinel used
 /// for the max_depth / both-children-too-small gates.
@@ -126,6 +151,13 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     max_depth: i32,
     /// The spine's per-feature columns (set via [`with_features`](Self::with_features)).
     features: Vec<FeatureColumn>,
+    /// `force_row_wise` / `force_col_wise` (TRL-09). Default `RowWise` (spine).
+    strategy: BuildStrategy,
+    /// Feature-subsampling config (TRL-08): `(feature_fraction,
+    /// feature_fraction_bynode, feature_fraction_seed)`. `None` ⇒ the spine path
+    /// (`feature_fraction == feature_fraction_bynode == 1.0`, no subsampling, the
+    /// `ColSampler` is never built so the Plan-03 behavior is bit-identical).
+    col_sampling: Option<(f64, f64, i32)>,
 }
 
 /// The per-split snapshot the spine emits for the D-06 golden: for each candidate
@@ -155,6 +187,22 @@ pub struct FeatureSplitRecord {
     pub split: SplitInfo,
 }
 
+/// The `ColSampler` selection trace for one tree (TRL-08 RNG call-sequence
+/// golden). Records the per-tree `ResetByTree` selection and every per-node
+/// `GetByNode` selection IN DRAW ORDER (smaller-leaf then larger-leaf per split),
+/// so the parity golden can assert the exact selected feature indices.
+#[derive(Debug, Clone, Default)]
+pub struct ColSamplerTrace {
+    /// `is_feature_used_bytree()` after `ResetByTree` — the selected REAL feature
+    /// indices for this tree (ascending).
+    pub bytree_selected: Vec<i32>,
+    /// Per-node `GetByNode` selections in DRAW ORDER. Each entry is the selected
+    /// REAL feature indices (ascending) for one `get_by_node` call — the order is
+    /// smaller-leaf then larger-leaf within each split decision
+    /// (serial_tree_learner.cpp:479,487).
+    pub bynode_selected: Vec<Vec<i32>>,
+}
+
 impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// Construct the learner over a `Backend` + its client and the gain/cap config.
     ///
@@ -174,6 +222,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             num_leaves,
             max_depth,
             features: Vec::new(),
+            strategy: BuildStrategy::RowWise,
+            col_sampling: None,
         }
     }
 
@@ -205,10 +255,52 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         &mut self,
         gradients: &[f32],
         hessians: &[f32],
-        _is_first_tree: bool,
+        is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>), TreeLearnerError> {
+        let (tree, snaps, _trace) = self.train_inner(gradients, hessians, is_first_tree)?;
+        Ok((tree, snaps))
+    }
+
+    /// Like [`train_with_snapshots`](Self::train_with_snapshots) but also returns
+    /// the [`ColSamplerTrace`] — the per-tree + per-node feature-subsampling
+    /// selections in DRAW ORDER (TRL-08 RNG call-sequence golden). On the spine
+    /// (`feature_fraction == feature_fraction_bynode == 1.0`) the trace records
+    /// every feature as selected and no per-node draws (the sampler is inactive).
+    #[allow(clippy::type_complexity)]
+    pub fn train_with_col_sampler_trace(
+        &mut self,
+        gradients: &[f32],
+        hessians: &[f32],
+        is_first_tree: bool,
+    ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace), TreeLearnerError> {
+        self.train_inner(gradients, hessians, is_first_tree)
+    }
+
+    /// The shared growth driver behind [`train`](Self::train),
+    /// [`train_with_snapshots`](Self::train_with_snapshots), and
+    /// [`train_with_col_sampler_trace`](Self::train_with_col_sampler_trace).
+    #[allow(clippy::type_complexity)]
+    fn train_inner(
+        &mut self,
+        gradients: &[f32],
+        hessians: &[f32],
+        _is_first_tree: bool,
+    ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace), TreeLearnerError> {
         let num_data = gradients.len() as i32;
         let features = self.features.clone();
+
+        // force_row_wise / force_col_wise (TRL-09, A1 / Open Q2): the two strategies
+        // differ ONLY in the histogram-build ORDER, not the result. On the
+        // single-thread deterministic anchor the Phase-4 `construct_histograms`
+        // whole-kernel op produces the SAME f64 cells for either, so `self.strategy`
+        // does NOT route a distinct compute path here — both `RowWise` and `ColWise`
+        // drive the identical `backend.construct_histograms` call below and therefore
+        // grow a bit-identical tree (asserted by `learner_parity_row_vs_col`). If a
+        // backend's column-major accumulation ever diverged at that layer, the
+        // row==col equality gate would fail loudly (threat T-05-04-02) — we never
+        // silently ship a divergent tree. `_strategy` is read here to make the
+        // (verified) no-op explicit rather than dead.
+        let _strategy: BuildStrategy = self.strategy;
 
         // ---- V5 boundary validation (T-05-03-01/02/03) ----
         if hessians.len() != gradients.len() {
@@ -249,6 +341,33 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
 
         // ---- BeforeTrain (serial_tree_learner.cpp:205-208, 288-...) ----
+        // ColSampler.ResetByTree (col_sampler.hpp:74-89) happens HERE, once per
+        // tree (BeforeTrain). The spine path (`col_sampling == None`) builds no
+        // sampler and gates nothing — Plan-03 behavior is bit-identical.
+        let mut trace = ColSamplerTrace::default();
+        let num_features = features.len();
+        // valid_feature_indices_ = 0..num_features on the spine (every feature is
+        // valid — no trivial-feature dropping at this layer); InnerFeatureIndex is
+        // the identity.
+        let valid_feature_indices: Vec<i32> = features.iter().map(|f| f.real_feature_index).collect();
+        let mut col_sampler = self.col_sampling.map(|(ff, ffn, seed)| {
+            // num_features here is the COUNT of feature columns; is_feature_used_ is
+            // indexed by real_feature_index, so size it to cover the max index + 1.
+            let max_real = valid_feature_indices.iter().copied().max().unwrap_or(-1);
+            let nf = (max_real + 1).max(num_features as i32) as usize;
+            ColSampler::new(ff, ffn, seed, valid_feature_indices.clone(), nf)
+        });
+        // Record the per-tree selection (ResetByTree result) for the TRL-08 golden.
+        if let Some(cs) = col_sampler.as_ref() {
+            trace.bytree_selected = valid_feature_indices
+                .iter()
+                .copied()
+                .filter(|&f| cs.is_feature_used_bytree(f))
+                .collect();
+        } else {
+            trace.bytree_selected = valid_feature_indices.clone();
+        }
+
         let mut data_partition = DataPartition::new(num_data, self.num_leaves);
         // The spine processes one feature column at a time, so each pool slot holds
         // the widest single-feature histogram (2 * max num_bin).
@@ -308,7 +427,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             );
             if did {
                 // FindBestSplits: build smaller histogram (and larger via subtract),
-                // then per-feature find_best_split + cross-feature argmax.
+                // then per-feature find_best_split + cross-feature argmax. The
+                // per-node ColSampler draws (smaller-then-larger) happen INSIDE
+                // find_best_splits in the exact C++ order (T-05-04-01).
                 let snap = self.find_best_splits(
                     &features,
                     gradients,
@@ -321,6 +442,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     right_leaf,
                     &mut best_split_per_leaf,
                     &mut best_split_feature,
+                    col_sampler.as_mut(),
+                    &mut trace,
                 )?;
                 snapshots.push(snap);
             }
@@ -360,7 +483,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             right_leaf = new_right;
         }
 
-        Ok((tree, snapshots))
+        Ok((tree, snapshots, trace))
     }
 
     /// `BeforeFindBestSplit` gates (`serial_tree_learner.cpp:343-378`): apply the
@@ -427,6 +550,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         right_leaf: i32,
         best_split_per_leaf: &mut [SplitInfo],
         best_split_feature: &mut [i32],
+        col_sampler: Option<&mut ColSampler>,
+        trace: &mut ColSamplerTrace,
     ) -> Result<SplitSnapshot, TreeLearnerError> {
         // Determine which leaf is the SMALLER child (built directly) vs the LARGER
         // (derived by subtraction). On the root, smaller = left, no subtraction.
@@ -440,6 +565,46 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             } else {
                 (right_leaf, left_leaf, true) // smaller = right
             }
+        };
+
+        // ColSampler.GetByNode draw ORDER (serial_tree_learner.cpp:479,487): the
+        // SMALLER leaf is drawn FIRST (always), the LARGER leaf SECOND (only when a
+        // larger child exists, i.e. not the root). Each call advances the shared
+        // PRNG once. The raw per-node selection is recorded in the trace (the
+        // TRL-08 golden asserts these), then combined with the per-tree
+        // is_feature_used_bytree flag to form the effective scan mask. On the spine
+        // (`col_sampler == None`) no draw happens and every feature is used.
+        let has_larger = use_subtract && larger_leaf >= 0;
+        let (smaller_node_mask, larger_node_mask) = if let Some(cs) = col_sampler {
+            let smaller_raw = cs.get_by_node();
+            trace
+                .bynode_selected
+                .push(mask_to_indices(&smaller_raw, features));
+            let larger_raw = if has_larger {
+                let l = cs.get_by_node();
+                trace.bynode_selected.push(mask_to_indices(&l, features));
+                Some(l)
+            } else {
+                None
+            };
+            // Combine each per-node mask with the per-tree bytree flag:
+            // is_feature_used[f] = is_feature_used_bytree(f) && node_selected(f).
+            let combine = |node: &[i8]| -> Vec<i8> {
+                features
+                    .iter()
+                    .map(|f| {
+                        let fi = f.real_feature_index;
+                        let used = cs.is_feature_used_bytree(fi)
+                            && node.get(fi as usize).copied().unwrap_or(0) != 0;
+                        i8::from(used)
+                    })
+                    .collect()
+            };
+            let smaller_eff = combine(&smaller_raw);
+            let larger_eff = larger_raw.as_deref().map(combine);
+            (Some(smaller_eff), larger_eff)
+        } else {
+            (None, None)
         };
 
         // The smaller leaf's seeded sums vs the larger leaf's (the LeafSplits
@@ -464,6 +629,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             None,
             best_split_per_leaf,
             best_split_feature,
+            smaller_node_mask.as_deref(),
         )?;
 
         // The larger leaf: build via subtraction if applicable.
@@ -479,6 +645,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 Some(smaller_leaf),
                 best_split_per_leaf,
                 best_split_feature,
+                larger_node_mask.as_deref(),
             )?;
         }
 
@@ -512,6 +679,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         subtract_from: Option<i32>,
         best_split_per_leaf: &mut [SplitInfo],
         best_split_feature: &mut [i32],
+        used_features: Option<&[i8]>,
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
         let leaf_rows = data_partition.indices_in_leaf(leaf);
         let sum_g = leaf_splits.sum_gradients;
@@ -535,7 +703,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return Ok(records);
         }
 
-        for f in features {
+        for (fpos, f) in features.iter().enumerate() {
+            // ColSampler gate (serial_tree_learner.cpp: `if (!is_feature_used[fi])
+            // continue;`): skip a feature this node did NOT select. The mask is
+            // positionally aligned to `features` (built in the same order). On the
+            // spine (`used_features == None`) every feature is scanned.
+            if let Some(mask) = used_features {
+                if mask.get(fpos).copied().unwrap_or(1) == 0 {
+                    continue;
+                }
+            }
             // Per-feature ORDERED gradient/hessian for this leaf's rows (the
             // construct_histograms input — ordered to mirror the C++ ordered fold).
             let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
@@ -856,6 +1033,42 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self.features = features;
         self
     }
+
+    /// Select the histogram-build strategy (`force_row_wise` / `force_col_wise`,
+    /// TRL-09). Default [`BuildStrategy::RowWise`]. On the single-thread anchor both
+    /// strategies route through the SAME `construct_histograms` op and produce
+    /// bit-identical trees (A1) — this flag exists to drive + assert that equality.
+    pub fn with_strategy(mut self, strategy: BuildStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Enable per-tree / per-node feature subsampling (TRL-08) with
+    /// `(feature_fraction, feature_fraction_bynode, feature_fraction_seed)`. A
+    /// `feature_fraction == feature_fraction_bynode == 1.0` is equivalent to NOT
+    /// calling this (the spine path — no RNG advance, all features used).
+    pub fn with_feature_fraction(
+        mut self,
+        feature_fraction: f64,
+        feature_fraction_bynode: f64,
+        feature_fraction_seed: i32,
+    ) -> Self {
+        self.col_sampling = Some((feature_fraction, feature_fraction_bynode, feature_fraction_seed));
+        self
+    }
+}
+
+/// Convert a `ColSampler::get_by_node` mask (indexed by REAL feature index) into
+/// the ascending list of SELECTED real feature indices, restricted to the feature
+/// columns the learner actually holds. Used for the TRL-08 per-node golden trace.
+fn mask_to_indices(mask: &[i8], features: &[FeatureColumn]) -> Vec<i32> {
+    let mut out: Vec<i32> = features
+        .iter()
+        .map(|f| f.real_feature_index)
+        .filter(|&fi| mask.get(fi as usize).copied().unwrap_or(0) != 0)
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// `ArrayArgs<SplitInfo>::ArgMax(best_split_per_leaf_)`
