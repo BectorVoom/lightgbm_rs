@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-06-05T22:25:19.842Z"
+stopped_at: Completed 05-02-PLAN.md
+last_updated: "2026-06-05T22:37:42.912Z"
 last_activity: 2026-06-05 -- Phase 05 execution started
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 22
-  completed_plans: 19
+  completed_plans: 20
   percent: 50
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 05 (tree-learner-split-finding) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-06-05 -- Phase 05 execution started
 
@@ -162,6 +162,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 03 P03 | ~12 min | 2 tasks | 6 files |
 | Phase 04 P01 | ~8 min | 3 tasks | 10 files |
 | Phase 05 P01 | 7min | 2 tasks | 5 files |
+| Phase 05 P02 | 8min | 3 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -194,6 +195,9 @@ Recent decisions affecting current work:
 - [Phase 4 exec, 2026-06-05]: **D-04a SETTLED — cubecl-cpu IS a bit-exact deterministic anchor.** The single-owner ordered f64 fold (`#[cube]` kernel launched with `CubeCount::Static(1,1,1)` + `CubeDim::new_1d(1)`, so exactly one cube unit owns the entire fold) is byte-identical across 25 launches AND bit-exact (`to_bits()`) vs a hand-computed sequential f64 fold in C++ `dense_bin.hpp:120-135` order (f32 read / f64 accumulate, `hist_t=double`, stride-2 `[grad,hess]` at `bin<<1`). This empirically confirms the D-04 anchor assumption despite cubecl-cpu spawning one OS worker thread per cube unit (RESEARCH Pitfall 1) — the ~1e-6 fallback and a separate scalar reference are NOT needed. The kernel MUST zero-initialize `out` explicitly (`client.create_from_slice(&zeros)`) because `client.empty()` returns recycled uninitialized pool memory (Rule-1 bug the spike caught).
 - [Phase 4 exec, 2026-06-05]: **CMP-04 capability gate locked (cpu matrix).** `probe_capabilities` queries `client.features().plane.contains(Plane::Ops)` (false on cpu), `client.features().supports_type(f64)` (true), `client.properties().atomic_type_usage(f32_atomic).contains(AtomicUsage::Add)` (false), and `client.properties().hardware.plane_size_max` (1) → `ReducePath::Sequential`. The Sequential single-owner fold IS the cpu path, not a fallback. cubecl type names confined to `lgbm-compute` (`cpu` default feature, `rocm` opt-in via `cubecl/hip` behind `#[cfg]`); CMP-01 guard test enforces no upper crate names cubecl.
 - [Phase 05]: 05-01: skip_default_bin==false divergence is observable in default_left (not threshold/gain) — skip=false lets FORWARD reach t=2 (default_left=0), old heuristic skip=true defers to REVERSE (default_left=1) for the same boundary; na_as_missing==true is a typed ComputeError::Runtime (deferred NA_AS_MISSING branch)
+- [Phase ?]: Tree::split stores learner-computed leaf outputs (does not compute gain); owns only the C++ parallel-array rewiring + decision_type bit-packing
+- [Phase ?]: Tree growth-time arrays (leaf_depth/leaf_parent/split_feature_inner/threshold_in_bin) are NOT serialized; a loaded tree carries parser-default values, so the serialized form remains the identity contract
+- [Phase ?]: lgbm-treelearner re-exports the single canonical lgbm_compute::gain::SplitInfo and adds only the split_gt operator> tie-break; no duplicate struct, no compute-runtime dependency (CMP-01)
 
 ### Pending Todos
 
@@ -217,6 +221,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T22:25:19.836Z
-Stopped at: Completed 05-01-PLAN.md
+Last session: 2026-06-05T22:37:29.363Z
+Stopped at: Completed 05-02-PLAN.md
 Resume file: None
