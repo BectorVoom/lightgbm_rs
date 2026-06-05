@@ -12,16 +12,15 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 
 ### Validated
 
-<!-- Shipped and confirmed valuable. The Rust deliverable currently contains only a hello-world scaffold, so nothing is validated yet. -->
+<!-- Shipped and confirmed valuable. -->
 
-(None yet — ship to validate)
+- [x] Dataset + binned columnar store (BinMapper, FeatureGroup, MultiValBin) matching C++ binning bit-for-bit — *Validated in Phase 2: dataset-binning-determinism-root (bit-exact ValueToBin, dense/CSR/CSC ingest, missing/categorical routing, EFB grouping, per-stage parity; default ingest unified onto the faithful single C++ `Dataset::Construct`)*
 
 ### Active
 
 <!-- v1 = full single-machine parity. All hypotheses until shipped and oracle-validated. -->
 
 - [ ] Cargo workspace split into loosely-coupled crates (core data, boosting, tree-learner, objectives/metrics, compute backend, Python bindings)
-- [ ] Dataset + binned columnar store (BinMapper, FeatureGroup, MultiValBin) matching C++ binning bit-for-bit
 - [ ] GBDT training loop (gradient boosting) with ~1e-6 (f32) oracle parity
 - [ ] DART, Random Forest, and GOSS boosting/sample strategies
 - [ ] Histogram-based serial tree learner with split-gain scan, data partition, leaf splits
@@ -52,7 +51,7 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 ## Context
 
 - **Reference codebase mapped:** `.planning/codebase/` documents the Microsoft C++ LightGBM core (ARCHITECTURE, STRUCTURE, STACK, CONVENTIONS, CONCERNS, INTEGRATIONS, TESTING). GPU-relevant subsystems are flagged there. The C++ tree is read-only reference, not a build target.
-- **Current Rust crate:** greenfield — `src/main.rs` is hello-world, `Cargo.toml` declares only `cubecl = "0.10.0"`, edition 2024.
+- **Current Rust crate:** Cargo workspace underway. Phase 1 (oracle-contract foundations) and Phase 2 (dataset + binning, determinism root) complete — `crates/lgbm-dataset` provides a bit-exact BinMapper, dense/sparse columnar bin store, missing/categorical encoding, EFB, metadata, and dense/CSR/CSC ingestion, with an `oracle-harness` + `xtask` C++ golden-capture pipeline. Next: Phase 3 (tree model + model-text I/O + predict parity).
 - **Key C++ subsystems to port:** `boosting/` (GBDT/DART/RF/GOSS), `treelearner/` (histograms, split finding, gradient discretizer), `io/` (Dataset, Bin, FeatureGroup, Metadata), `objective/`, `metric/`, model text serialization.
 - **Numerical fidelity is the hardest part:** even at `f32` / ~1e-6, floating-point reductions are non-associative, so matching the C++ reference on ROCm vs a C++ CPU reference still requires care in binning and accumulation — not an afterthought. The target is single-precision parity, matching the C++ `float` defaults rather than a double-precision 1e-12 bound.
 
@@ -96,4 +95,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-05 — revised numerical contract to f32 / ~1e-6 (Phase 1 discuss)*
+*Last updated: 2026-06-05 — Phase 2 (dataset + binning, determinism root) complete; dataset/binning requirement validated*
