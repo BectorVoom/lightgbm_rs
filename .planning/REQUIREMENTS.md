@@ -77,7 +77,7 @@
 - [x] **PRD-03**: Leaf index prediction (`pred_leaf`)
 - [ ] **PRD-04**: Feature contributions / TreeSHAP (`predict_contrib`) over full tree node/cover structure
 - [ ] **PRD-05**: Prediction early stopping (`pred_early_stop`, `_freq`, `_margin`)
-- [ ] **PRD-06**: Sub-range prediction (`start_iteration` / `num_iteration`)
+- [x] **PRD-06**: Sub-range prediction (`start_iteration` / `num_iteration`)
 
 ### Constraints & Advanced Parity
 
@@ -167,7 +167,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | PRD-01 | Phase 3 | Complete |
 | PRD-02 | Phase 3 | Complete |
 | PRD-03 | Phase 3 | Complete |
-| PRD-06 | Phase 3 | Pending |
+| PRD-06 | Phase 3 | Complete |
 | CMP-01 | Phase 4 | Pending |
 | CMP-02 | Phase 4 | Pending |
 | CMP-03 | Phase 4 | Pending |
