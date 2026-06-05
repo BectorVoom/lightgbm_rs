@@ -1,8 +1,11 @@
 // bin_capture.cpp
 //
-// Dev-only C++ capture harness for the LightGBM-rs binning oracle (Phase 2,
-// golden layers 1 + 2 — numeric features only; categorical -> Plan 03, EFB ->
-// Plan 05).
+// Dev-only C++ capture harness for the LightGBM-rs binning oracle (Phase 2):
+//   - numeric golden layers 1 + 2 (Plan 01),
+//   - bin-storage layout (Plan 02),
+//   - categorical folding layers 1 + 3 + per-row index (Plan 03, DAT-04),
+//   - missing-value routing layer 1 + per-row index (Plan 03, DAT-03).
+// EFB -> Plan 05.
 //
 // WHY THIS IS A FOCUSED, SELF-CONTAINED TRANSCRIPTION (not a compile of the
 // in-tree bin.cpp):
@@ -61,6 +64,8 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -79,7 +84,27 @@ inline bool CheckDoubleEqualOrdered(double a, double b) {
   return b <= upper;
 }
 
-// ---- A minimal BinMapper holding only what layers 1+2 need ----------------
+// ---- RoundInt (common.h:904) ----------------------------------------------
+inline int RoundInt(double x) { return static_cast<int>(x + 0.5f); }
+
+// ---- SortForPair (common.h:611-632), the desc-count case (is_reverse=true) -
+template <typename T1, typename T2>
+void SortForPairDesc(std::vector<T1>* keys, std::vector<T2>* values) {
+  std::vector<std::pair<T1, T2>> arr;
+  auto& ref_key = *keys;
+  auto& ref_value = *values;
+  for (size_t i = 0; i < keys->size(); ++i) arr.emplace_back(ref_key[i], ref_value[i]);
+  std::stable_sort(arr.begin(), arr.end(),
+                   [](const std::pair<T1, T2>& a, const std::pair<T1, T2>& b) {
+                     return a.first > b.first;  // count descending
+                   });
+  for (size_t i = 0; i < arr.size(); ++i) {
+    ref_key[i] = arr[i].first;
+    ref_value[i] = arr[i].second;
+  }
+}
+
+// ---- A minimal BinMapper holding what layers 1+3 need ----------------------
 struct BinMapper {
   int num_bin_ = 1;
   MissingType missing_type_ = MT_None;
@@ -89,22 +114,33 @@ struct BinMapper {
   BinType bin_type_ = NumericalBin;
   uint32_t default_bin_ = 0;
   uint32_t most_freq_bin_ = 0;
+  // categorical map (layer 3): bin -> category and category -> bin.
+  std::vector<int> bin_2_categorical_;
+  std::unordered_map<int, uint32_t> categorical_2_bin_;
 
-  // ValueToBin (bin.h:612-650), numeric branch.
+  // ValueToBin (bin.h:612-650), numeric + categorical branches.
   uint32_t ValueToBin(double value) const {
     if (std::isnan(value)) {
       if (bin_type_ == CategoricalBin) return 0;
       else if (missing_type_ == MT_NaN) return static_cast<uint32_t>(num_bin_ - 1);
       else value = 0.0;
     }
-    int l = 0, r = num_bin_ - 1;
-    if (missing_type_ == MT_NaN) r -= 1;
-    while (l < r) {
-      int m = (r + l - 1) / 2;
-      if (value <= bin_upper_bound_[m]) r = m;
-      else l = m + 1;
+    if (bin_type_ == NumericalBin) {
+      int l = 0, r = num_bin_ - 1;
+      if (missing_type_ == MT_NaN) r -= 1;
+      while (l < r) {
+        int m = (r + l - 1) / 2;
+        if (value <= bin_upper_bound_[m]) r = m;
+        else l = m + 1;
+      }
+      return static_cast<uint32_t>(l);
+    } else {
+      int int_value = static_cast<int>(value);
+      if (int_value < 0) return 0;
+      auto it = categorical_2_bin_.find(int_value);
+      if (it != categorical_2_bin_.end()) return it->second;
+      return 0;
     }
-    return static_cast<uint32_t>(l);
   }
 };
 
@@ -114,6 +150,19 @@ bool NeedFilter(const std::vector<int>& cnt_in_bin, int total_cnt, int filter_cn
   for (size_t i = 0; i + 1 < cnt_in_bin.size(); ++i) {
     sum_left += cnt_in_bin[i];
     if (sum_left >= filter_cnt && total_cnt - sum_left >= filter_cnt) return false;
+  }
+  return true;
+}
+
+// ---- NeedFilter (bin.cpp:63-73), categorical branch -----------------------
+bool NeedFilterCat(const std::vector<int>& cnt_in_bin, int total_cnt, int filter_cnt) {
+  if (cnt_in_bin.size() <= 2) {
+    for (size_t i = 0; i + 1 < cnt_in_bin.size(); ++i) {
+      int sum_left = cnt_in_bin[i];
+      if (sum_left >= filter_cnt && total_cnt - sum_left >= filter_cnt) return false;
+    }
+  } else {
+    return false;
   }
   return true;
 }
@@ -397,6 +446,123 @@ BinMapper FindBinNumeric(std::vector<double> values, int max_bin, int min_data_i
   }
   bm.is_trivial_ = is_trivial_;
   bm.missing_type_ = missing_type_;
+  return bm;
+}
+
+// ---- BinMapper::FindBin categorical branch (bin.cpp:311-506, arm 410-476) --
+// Verbatim transcription. Shares the numeric distinct-value prefix, then the
+// int conversion + descending-count fold. No fast_double_parser/fmt dependency.
+BinMapper FindBinCategorical(std::vector<double> values, int max_bin, int min_data_in_bin,
+                             int min_split_data, bool pre_filter, bool use_missing,
+                             bool zero_as_missing, size_t total_sample_cnt) {
+  BinMapper bm;
+  int num_sample_values_in = static_cast<int>(values.size());
+  int non_na_cnt = 0;
+  for (int i = 0; i < num_sample_values_in; ++i) {
+    if (!std::isnan(values[i])) values[non_na_cnt++] = values[i];
+  }
+  int na_cnt = 0;
+  MissingType missing_type_;
+  if (!use_missing) missing_type_ = MT_None;
+  else if (zero_as_missing) missing_type_ = MT_Zero;
+  else if (non_na_cnt == num_sample_values_in) missing_type_ = MT_None;
+  else { missing_type_ = MT_NaN; na_cnt = num_sample_values_in - non_na_cnt; }
+
+  int num_sample_values = non_na_cnt;
+  values.resize(num_sample_values);
+  bm.bin_type_ = CategoricalBin;
+  int zero_cnt = static_cast<int>(total_sample_cnt - num_sample_values - na_cnt);
+
+  std::vector<double> distinct_values;
+  std::vector<int> counts;
+  std::stable_sort(values.begin(), values.end());
+  if (num_sample_values == 0 || (values[0] > 0.0 && zero_cnt > 0)) {
+    distinct_values.push_back(0.0); counts.push_back(zero_cnt);
+  }
+  if (num_sample_values > 0) { distinct_values.push_back(values[0]); counts.push_back(1); }
+  for (int i = 1; i < num_sample_values; ++i) {
+    if (!CheckDoubleEqualOrdered(values[i - 1], values[i])) {
+      if (values[i - 1] < 0.0 && values[i] > 0.0) {
+        distinct_values.push_back(0.0); counts.push_back(zero_cnt);
+      }
+      distinct_values.push_back(values[i]); counts.push_back(1);
+    } else {
+      distinct_values.back() = values[i]; ++counts.back();
+    }
+  }
+  if (num_sample_values > 0 && values[num_sample_values - 1] < 0.0 && zero_cnt > 0) {
+    distinct_values.push_back(0.0); counts.push_back(zero_cnt);
+  }
+
+  // categorical branch (bin.cpp:410-476).
+  std::vector<int> distinct_values_int;
+  std::vector<int> counts_int;
+  for (size_t i = 0; i < distinct_values.size(); ++i) {
+    int val = static_cast<int>(distinct_values[i]);
+    if (val < 0) {
+      na_cnt += counts[i];
+    } else {
+      if (distinct_values_int.empty() || val != distinct_values_int.back()) {
+        distinct_values_int.push_back(val);
+        counts_int.push_back(counts[i]);
+      } else {
+        counts_int.back() += counts[i];
+      }
+    }
+  }
+  std::vector<int> cnt_in_bin;
+  bm.num_bin_ = 1;
+  int used_cnt = 0;
+  int rest_cnt = static_cast<int>(total_sample_cnt - na_cnt);
+  if (rest_cnt > 0) {
+    SortForPairDesc<int, int>(&counts_int, &distinct_values_int);
+    int cut_cnt = static_cast<int>(RoundInt((total_sample_cnt - na_cnt) * 0.99f));
+    size_t cur_cat_idx = 0;
+    int distinct_cnt = static_cast<int>(distinct_values_int.size());
+    if (na_cnt > 0) ++distinct_cnt;
+    max_bin = std::min(distinct_cnt, max_bin);
+    // dummy bin for NaN.
+    bm.bin_2_categorical_.push_back(-1);
+    bm.categorical_2_bin_[-1] = 0;
+    cnt_in_bin.push_back(0);
+    bm.num_bin_ = 1;
+    while (cur_cat_idx < distinct_values_int.size() &&
+           (used_cnt < cut_cnt || bm.num_bin_ < max_bin)) {
+      if (counts_int[cur_cat_idx] < min_data_in_bin && cur_cat_idx > 1) break;
+      bm.bin_2_categorical_.push_back(distinct_values_int[cur_cat_idx]);
+      bm.categorical_2_bin_[distinct_values_int[cur_cat_idx]] =
+          static_cast<uint32_t>(bm.num_bin_);
+      used_cnt += counts_int[cur_cat_idx];
+      cnt_in_bin.push_back(counts_int[cur_cat_idx]);
+      ++bm.num_bin_;
+      ++cur_cat_idx;
+    }
+    if (cur_cat_idx == distinct_values_int.size() && na_cnt == 0) {
+      missing_type_ = MT_None;
+    } else {
+      missing_type_ = MT_NaN;
+    }
+    cnt_in_bin[0] = static_cast<int>(total_sample_cnt - used_cnt);
+  }
+  bm.missing_type_ = missing_type_;
+
+  bool is_trivial_ = bm.num_bin_ <= 1;
+  if (!is_trivial_ && pre_filter &&
+      NeedFilterCat(cnt_in_bin, static_cast<int>(total_sample_cnt), min_split_data)) {
+    is_trivial_ = true;
+  }
+  if (!is_trivial_) {
+    bm.default_bin_ = bm.ValueToBin(0);
+    bm.most_freq_bin_ = static_cast<uint32_t>(ArgMax(cnt_in_bin));
+    double max_sparse_rate = static_cast<double>(cnt_in_bin[bm.most_freq_bin_]) / total_sample_cnt;
+    if (bm.most_freq_bin_ != bm.default_bin_ && max_sparse_rate < 0.7) {
+      bm.most_freq_bin_ = bm.default_bin_;
+    }
+    bm.sparse_rate_ = static_cast<double>(cnt_in_bin[bm.most_freq_bin_]) / total_sample_cnt;
+  } else {
+    bm.sparse_rate_ = 1.0;
+  }
+  bm.is_trivial_ = is_trivial_;
   return bm;
 }
 
@@ -907,12 +1073,241 @@ std::vector<StorageCaseSpec> BuildStorageCorpus(int master_seed) {
   return cases;
 }
 
+// ===========================================================================
+// Categorical corpus (golden layers 1 + 3 + per-row index, DAT-04). Builds the
+// categorical BinMapper over the FULL column (sample_cnt = all rows so the map
+// is self-contained for replay), then dumps layer 1 (num_bin/missing_type/
+// default_bin/most_freq_bin/is_trivial), layer 3 (categorical_2_bin_ as sorted
+// key:bin pairs + bin_2_categorical_), and the per-row ValueToBin vector.
+// ===========================================================================
+
+struct CatCaseSpec {
+  std::string name;
+  std::vector<double> column;  // integer-valued categories as f64
+  int max_bin;
+  int min_data_in_bin;
+  bool use_missing;
+  bool zero_as_missing;
+  bool pre_filter;
+  int min_split_data;
+};
+
+void EmitCatCase(std::ofstream& out, const CatCaseSpec& cs) {
+  const int num_rows = static_cast<int>(cs.column.size());
+  BinMapper bm = FindBinCategorical(cs.column, cs.max_bin, cs.min_data_in_bin,
+                                    cs.min_split_data, cs.pre_filter, cs.use_missing,
+                                    cs.zero_as_missing, static_cast<size_t>(num_rows));
+
+  out << "CCASE name=" << cs.name << " max_bin=" << cs.max_bin
+      << " min_data_in_bin=" << cs.min_data_in_bin
+      << " use_missing=" << (cs.use_missing ? 1 : 0)
+      << " zero_as_missing=" << (cs.zero_as_missing ? 1 : 0)
+      << " pre_filter=" << (cs.pre_filter ? 1 : 0)
+      << " min_split_data=" << cs.min_split_data << " num_rows=" << num_rows << "\n";
+
+  out << "VALUES ";
+  for (int i = 0; i < num_rows; ++i) {
+    if (i) out << ";";
+    out << F64Bits(cs.column[i]);
+  }
+  out << "\n";
+
+  out << "MAPPER num_bin=" << bm.num_bin_ << " bin_type=" << static_cast<int>(bm.bin_type_)
+      << " missing_type=" << static_cast<int>(bm.missing_type_)
+      << " default_bin=" << bm.default_bin_ << " most_freq_bin=" << bm.most_freq_bin_
+      << " is_trivial=" << (bm.is_trivial_ ? 1 : 0) << "\n";
+
+  // layer 3: categorical_2_bin_ as sorted key:bin pairs (sorted by key for a
+  // stable, diff-friendly, order-independent dump).
+  std::vector<std::pair<int, uint32_t>> c2b(bm.categorical_2_bin_.begin(),
+                                            bm.categorical_2_bin_.end());
+  std::sort(c2b.begin(), c2b.end(),
+            [](const std::pair<int, uint32_t>& a, const std::pair<int, uint32_t>& b) {
+              return a.first < b.first;
+            });
+  out << "C2B ";
+  for (size_t i = 0; i < c2b.size(); ++i) {
+    if (i) out << ";";
+    out << c2b[i].first << ":" << c2b[i].second;
+  }
+  out << "\n";
+
+  out << "B2C ";
+  for (size_t i = 0; i < bm.bin_2_categorical_.size(); ++i) {
+    if (i) out << ";";
+    out << bm.bin_2_categorical_[i];
+  }
+  out << "\n";
+
+  out << "ASSIGN ";
+  for (int i = 0; i < num_rows; ++i) {
+    if (i) out << ";";
+    out << bm.ValueToBin(cs.column[i]);
+  }
+  out << "\n";
+}
+
+std::vector<CatCaseSpec> BuildCatCorpus(int master_seed) {
+  std::vector<CatCaseSpec> cases;
+  CaseGen gen(master_seed);
+
+  auto cat = [&](const std::string& name, std::vector<double> col, int max_bin,
+                 int min_data_in_bin, bool use_missing, bool zero_as_missing,
+                 bool pre_filter, int min_split) {
+    CatCaseSpec cs;
+    cs.name = name;
+    cs.column = std::move(col);
+    cs.max_bin = max_bin;
+    cs.min_data_in_bin = min_data_in_bin;
+    cs.use_missing = use_missing;
+    cs.zero_as_missing = zero_as_missing;
+    cs.pre_filter = pre_filter;
+    cs.min_split_data = min_split;
+    cases.push_back(std::move(cs));
+  };
+
+  // (1) basic multi-categorical with varied counts (desc-count fold + ties).
+  {
+    std::vector<double> col;
+    for (int i = 0; i < 8; ++i) col.push_back(5.0);
+    for (int i = 0; i < 5; ++i) col.push_back(2.0);
+    for (int i = 0; i < 5; ++i) col.push_back(9.0);  // tie with 2 on count
+    for (int i = 0; i < 1; ++i) col.push_back(0.0);
+    cat("cat_basic", col, 256, 1, true, false, false, 1);
+  }
+  // (2) rare level triggers the min_data_in_bin fold-break.
+  {
+    std::vector<double> col;
+    for (int i = 0; i < 10; ++i) col.push_back(10.0);
+    for (int i = 0; i < 10; ++i) col.push_back(20.0);
+    for (int i = 0; i < 10; ++i) col.push_back(30.0);
+    col.push_back(40.0);  // rare -> fold-break with min_data_in_bin=5
+    cat("cat_rare_foldbreak", col, 256, 5, true, false, false, 1);
+  }
+  // (3) negative / out-of-range categories -> NaN accumulation.
+  {
+    std::vector<double> col = {-1.0, -1.0, 3.0, 3.0, 3.0, 7.0, 7.0, -5.0, 0.0, 0.0};
+    cat("cat_negative", col, 256, 1, true, false, false, 1);
+  }
+  // (4) high-cardinality: many distinct categories, max_bin caps the fold.
+  {
+    std::vector<double> col;
+    for (int c = 0; c < 50; ++c) {
+      int reps = gen.NextInt(1, 6);
+      for (int r = 0; r < reps; ++r) col.push_back(static_cast<double>(c));
+    }
+    cat("cat_high_cardinality", col, 16, 1, true, false, false, 1);
+  }
+  // (5) the 0.99f cut binds: one dominant category + a long rare tail.
+  {
+    std::vector<double> col;
+    for (int i = 0; i < 99; ++i) col.push_back(1.0);
+    col.push_back(2.0);
+    cat("cat_099_cut", col, 8, 1, true, false, false, 1);
+  }
+  // (6) all categories consumed, no NaN -> missing_type None.
+  {
+    std::vector<double> col = {0.0, 1.0, 2.0, 3.0, 1.0, 2.0, 0.0, 3.0};
+    cat("cat_no_missing", col, 256, 1, true, false, false, 1);
+  }
+
+  return cases;
+}
+
+// ===========================================================================
+// Missing-edge corpus (golden layer 1 + per-row index, DAT-03). Sweeps NaN per
+// MissingType (None/Zero/NaN via use_missing/zero_as_missing), +0.0/-0.0 signed
+// zeros, all-missing, single-value. Numeric mapper (missing routing lives on the
+// numeric path). Builds over the FULL column (sample_cnt = all rows).
+// ===========================================================================
+
+struct MissCaseSpec {
+  std::string name;
+  std::vector<double> column;
+  int max_bin;
+  bool use_missing;
+  bool zero_as_missing;
+};
+
+void EmitMissCase(std::ofstream& out, const MissCaseSpec& cs) {
+  const int num_rows = static_cast<int>(cs.column.size());
+  BinMapper bm = FindBinNumeric(cs.column, cs.max_bin, /*min_data_in_bin=*/1,
+                                /*min_split_data=*/1, /*pre_filter=*/false,
+                                cs.use_missing, cs.zero_as_missing,
+                                static_cast<size_t>(num_rows), /*forced=*/{});
+
+  out << "MCASE name=" << cs.name << " max_bin=" << cs.max_bin
+      << " use_missing=" << (cs.use_missing ? 1 : 0)
+      << " zero_as_missing=" << (cs.zero_as_missing ? 1 : 0)
+      << " num_rows=" << num_rows << "\n";
+
+  out << "VALUES ";
+  for (int i = 0; i < num_rows; ++i) {
+    if (i) out << ";";
+    out << F64Bits(cs.column[i]);
+  }
+  out << "\n";
+
+  out << "MAPPER num_bin=" << bm.num_bin_ << " bin_type=" << static_cast<int>(bm.bin_type_)
+      << " missing_type=" << static_cast<int>(bm.missing_type_)
+      << " default_bin=" << bm.default_bin_ << " most_freq_bin=" << bm.most_freq_bin_
+      << " is_trivial=" << (bm.is_trivial_ ? 1 : 0) << "\n";
+
+  out << "ASSIGN ";
+  for (int i = 0; i < num_rows; ++i) {
+    if (i) out << ";";
+    out << bm.ValueToBin(cs.column[i]);
+  }
+  out << "\n";
+}
+
+std::vector<MissCaseSpec> BuildMissCorpus(int /*master_seed*/) {
+  std::vector<MissCaseSpec> cases;
+  const double qnan = std::numeric_limits<double>::quiet_NaN();
+  auto miss = [&](const std::string& name, std::vector<double> col, int max_bin,
+                  bool use_missing, bool zero_as_missing) {
+    MissCaseSpec cs;
+    cs.name = name;
+    cs.column = std::move(col);
+    cs.max_bin = max_bin;
+    cs.use_missing = use_missing;
+    cs.zero_as_missing = zero_as_missing;
+    cases.push_back(std::move(cs));
+  };
+
+  // A base column with NaNs swept across the three MissingType resolutions.
+  std::vector<double> with_nan = {1.0, 2.0, qnan, 3.0, qnan, 4.0, 5.0, 2.0, 1.0, 3.0};
+  miss("nan_missing_none_nouse", with_nan, 16, /*use_missing=*/false, false);  // -> None
+  miss("nan_missing_nan", with_nan, 16, /*use_missing=*/true, false);          // -> NaN top bin
+  miss("nan_zero_as_missing", with_nan, 16, /*use_missing=*/true, true);       // -> Zero
+
+  // signed zeros: +0.0 and -0.0 must route identically.
+  std::vector<double> signed_zero = {0.0, -0.0, 1.0, -1.0, 0.0, 2.0, -2.0, -0.0, 3.0, -3.0};
+  miss("signed_zero_use", signed_zero, 16, true, false);
+  miss("signed_zero_zero_as_missing", signed_zero, 16, true, true);
+
+  // all-missing column -> single-bin (NaN) mapper, never a panic.
+  miss("all_missing", {qnan, qnan, qnan, qnan, qnan}, 16, true, false);
+
+  // single distinct value (no missing).
+  miss("single_value", {7.0, 7.0, 7.0, 7.0, 7.0}, 16, true, false);
+
+  // zero_as_missing with explicit zeros in the data.
+  miss("zeros_as_missing", {0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 0.0, 6.0}, 16, true, true);
+
+  return cases;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  // argv: <out_path> <master_seed> [<storage_out_path>]
-  if (argc != 3 && argc != 4) {
-    std::cerr << "usage: bin_capture <out_path> <master_seed> [<storage_out_path>]\n";
+  // argv:
+  //   <numeric_out> <master_seed>
+  //   <numeric_out> <master_seed> <storage_out>
+  //   <numeric_out> <master_seed> <storage_out> <categorical_out> <missing_out>
+  if (argc != 3 && argc != 4 && argc != 6) {
+    std::cerr << "usage: bin_capture <numeric_out> <master_seed> "
+                 "[<storage_out> [<categorical_out> <missing_out>]]\n";
     return 2;
   }
   const std::string out_path = argv[1];
@@ -942,7 +1337,7 @@ int main(int argc, char** argv) {
   }
   std::cerr << "bin_capture: wrote " << corpus.size() << " numeric cases to " << out_path << "\n";
 
-  if (argc == 4) {
+  if (argc >= 4) {
     const std::string store_path = argv[3];
     std::ofstream sout(store_path, std::ios::binary | std::ios::trunc);
     if (!sout) {
@@ -962,6 +1357,51 @@ int main(int argc, char** argv) {
       return 1;
     }
     std::cerr << "bin_capture: wrote " << scorpus.size() << " storage cases to " << store_path << "\n";
+  }
+
+  if (argc == 6) {
+    // (a) categorical corpus (layers 1 + 3 + per-row index, DAT-04).
+    const std::string cat_path = argv[4];
+    std::ofstream cout(cat_path, std::ios::binary | std::ios::trunc);
+    if (!cout) {
+      std::cerr << "error: cannot open categorical output file: " << cat_path << "\n";
+      return 1;
+    }
+    std::vector<CatCaseSpec> ccorpus = BuildCatCorpus(master_seed);
+    cout << "# LightGBM-rs categorical folding golden set (layers 1+3 + per-row index, DAT-04)\n";
+    cout << "# Verbatim transcription of bin.cpp/bin.h categorical FindBin+ValueToBin\n";
+    cout << "# (external_libs unbuildable here; see file header + REFERENCE_MANIFEST.md).\n";
+    cout << "MASTER_SEED " << master_seed << "\n";
+    cout << "COUNTS cases=" << ccorpus.size() << "\n";
+    for (const auto& cs : ccorpus) EmitCatCase(cout, cs);
+    cout.flush();
+    if (!cout) {
+      std::cerr << "error: failed while writing categorical output\n";
+      return 1;
+    }
+    std::cerr << "bin_capture: wrote " << ccorpus.size() << " categorical cases to " << cat_path
+              << "\n";
+
+    // (b) missing-edge corpus (layer 1 + per-row index, DAT-03).
+    const std::string miss_path = argv[5];
+    std::ofstream mout(miss_path, std::ios::binary | std::ios::trunc);
+    if (!mout) {
+      std::cerr << "error: cannot open missing output file: " << miss_path << "\n";
+      return 1;
+    }
+    std::vector<MissCaseSpec> mcorpus = BuildMissCorpus(master_seed);
+    mout << "# LightGBM-rs missing-value routing golden set (layer 1 + per-row index, DAT-03)\n";
+    mout << "# Numeric FindBin/ValueToBin missing routing across use_missing/zero_as_missing.\n";
+    mout << "MASTER_SEED " << master_seed << "\n";
+    mout << "COUNTS cases=" << mcorpus.size() << "\n";
+    for (const auto& cs : mcorpus) EmitMissCase(mout, cs);
+    mout.flush();
+    if (!mout) {
+      std::cerr << "error: failed while writing missing output\n";
+      return 1;
+    }
+    std::cerr << "bin_capture: wrote " << mcorpus.size() << " missing cases to " << miss_path
+              << "\n";
   }
   return 0;
 }
