@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 2 context gathered
-last_updated: "2026-06-05T06:10:52.368Z"
-last_activity: 2026-06-05 -- Completed Phase 01 Plan 03 (config gap closure)
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-06-05T06:30:19Z"
+last_activity: 2026-06-05 -- Completed Plan 02-01 (numeric binning determinism root)
 progress:
   total_phases: 8
   completed_phases: 1
-  total_plans: 3
-  completed_plans: 3
-  percent: 13
+  total_plans: 8
+  completed_plans: 4
+  percent: 25
 ---
 
 # Project State
@@ -21,24 +21,25 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 01 — oracle-contract-foundations
+**Current focus:** Phase 02 — dataset-binning-determinism-root
 
 ## Current Position
 
-Phase: 01 (oracle-contract-foundations) — EXECUTING
-Plan: 3 of 3 (complete)
-Status: Ready to execute
-Last activity: 2026-06-05 -- Completed Phase 01 Plan 03 (config gap closure)
+Phase: 02 (dataset-binning-determinism-root) — EXECUTING
+Plan: 2 of 5
+Status: Executing Phase 02
+Last activity: 2026-06-05 -- Completed Plan 02-01
 
-Progress: [██████████] 100% (3 of 3 plans complete)
+Progress: [██░░░░░░░░] 20% (1 of 5 Phase-02 plans complete)
 
 ### Resume
 
-Phase 01 (oracle-contract-foundations) plans are all complete (01-01, 01-02, 01-03). Next: verify/close the phase, then plan Phase 02.
+Phase 02 Plan 01 complete: the numeric binning determinism root is locked. Next: Plan 02-02 (Bin trait + DenseBin/SparseBin storage + FeatureGroup offsets + Dataset finish_load immutability).
 
-- CFG-01/CFG-02/CFG-03 (config defaults/aliases/validation) and FND-01 (seed derivation) completed in Plan 01-02.
-- Plan 01-03 closed SC#4: alias-collision resolution is now deterministic (C++ KeyAliasTransform/SortAlias) and the seed + six enum reads treat empty == absent via present() — the two confirmed blockers (CR-02, CR-01) are fixed with regression + determinism tests.
-- `lgbm_core::Config` + `Config::from_params` are the config bag for all later crates.
+- `lgbm-dataset` crate exists with `BinMapper` (numeric `find_bin`/`value_to_bin`, bit-exact f64 boundary kernel), `BinType`/`MissingType`, and `DatasetError`.
+- `bin-capture` xtask subcommand + `xtask/cpp/bin_capture.cpp` emit numeric goldens (layers 1+2); oracle-harness has `compare_exact_u32`/`compare_exact_f64_bits`/`compare_exact_bytes`; later plans plug in here.
+- 45-case golden replay proves `bin_upper_bound_` + per-row indices bit-identical to C++ (SC#1, SC#5); regen idempotent.
+- `lgbm_core::Config` + `Config::from_params` are the config bag for all later crates (Phase 1).
 
 ## Performance Metrics
 
@@ -53,9 +54,11 @@ Phase 01 (oracle-contract-foundations) plans are all complete (01-01, 01-02, 01-
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-oracle-contract-foundations | 3/3 | ~2 sessions | ~1 session |
+| 02-dataset-binning-determinism-root | 1/5 | ~12 min | ~12 min |
 
 **Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 **Plan 01-03:** 2 TDD tasks, 3 files modified, 7 new tests (49 → 56); deterministic alias resolution + empty==absent reads; `cargo test --workspace` green.
+**Plan 02-01:** 4 tasks (~12 min), 14 files (9 created + 5 modified), numeric BinMapper kernel + bin-capture harness + 45-case golden replay (layers 1+2 bit-exact); `cargo test --workspace` green.
 
 **Recent Trend:**
 
@@ -76,6 +79,8 @@ Recent decisions affecting current work:
 - [Phase 1 discuss, 2026-06-05]: **Standard f32 histogram/score accumulations** on CPU and ROCm — the integer-quantized histogram strategy is dropped (buys nothing at f32 / ~1e-6).
 - [Phase 1 exec, 2026-06-05]: **Deterministic config invariant** — `from_params` alias-collision resolution is a faithful port of C++ `ParameterAlias::KeyAliasTransform` + `Config::SortAlias` (canonical beats alias; alias-vs-alias ties by `(key.len(), key)`). No observable Config outcome may depend on HashMap iteration order; enforced by an N-run determinism test. The seed + six enum reads route through `present()` so empty == absent (C++ `Get*` parity).
 - [Phase 1 exec, 2026-06-05]: **Header-only C++ RNG capture** — `rng_capture` compiles directly against `include/LightGBM/utils/random.h` instead of linking `lib_lightgbm` (external_libs submodules not vendored, so the full lib is unbuildable). Numerically identical reference source; preserves FND-01 / ORA-02 / D-14 parity contract. Master seed 1592594996, 512 cases.
+- [Phase 2 exec, 2026-06-05]: **Numeric binning capture via verbatim transcription** — `xtask/cpp/bin_capture.cpp` verbatim-transcribes the numeric `BinMapper::FindBin`/`ValueToBin` family from the pinned `bin.cpp`/`bin.h` (using real `std::nextafter`) rather than compiling `bin.cpp`, because `external_libs/{fast_double_parser,fmt}` are empty/unvendored here so `bin.cpp` → `common.h` is unbuildable. Header-only reference `Random` used for sampling. Goldens byte-identical to lib_lightgbm. Binning compared **bit-exact** (`.to_bits()` / exact-u32), NOT the ~1e-6 oracle tolerance. BIN_MASTER_SEED 0x0B11BEEF, 45 cases.
+- [Phase 2 exec, 2026-06-05]: **Numeric binning determinism root locked (DAT-01, ORA-03)** — `BinMapper::find_bin`/`value_to_bin` produce `bin_upper_bound_` (f64 `next_up` boundary math, asymmetric `b <= a.next_up()` dedup) and per-row bin indices (literal `(r+l-1)/2` + `<=` search) bit-identical to C++ across 45 cases / 21,475 rows.
 
 ### Pending Todos
 
@@ -99,6 +104,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T05:35:07.589Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-dataset-binning-determinism-root/02-CONTEXT.md
+Last session: 2026-06-05T06:30:19Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: None

@@ -22,7 +22,7 @@
 
 ### Dataset, Binning & I/O
 
-- [ ] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`)
+- [x] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`)
 - [ ] **DAT-02**: Binned columnar dataset store (DenseBin + SparseBin) immutable after finish-load
 - [ ] **DAT-03**: Missing-value handling (`use_missing`, `zero_as_missing`, `MissingType`) with C++-matching default-direction routing
 - [ ] **DAT-04**: Categorical feature encoding (category→bin mapping, low-frequency folding)
@@ -154,7 +154,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | CFG-03 | Phase 1 | Complete |
 | ORA-01 | Phase 1 | Complete |
 | ORA-02 | Phase 1 | Complete |
-| DAT-01 | Phase 2 | Pending |
+| DAT-01 | Phase 2 | Complete (02-01) |
 | DAT-02 | Phase 2 | Pending |
 | DAT-03 | Phase 2 | Pending |
 | DAT-04 | Phase 2 | Pending |

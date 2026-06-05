@@ -68,7 +68,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1**
 
-  - [ ] 02-01-PLAN.md — Crate scaffold + golden-capture harness + numeric BinMapper (FindBin/ValueToBin) golden layers 1+2
+  - [x] 02-01-PLAN.md — Crate scaffold + golden-capture harness + numeric BinMapper (FindBin/ValueToBin) golden layers 1+2
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -190,7 +190,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
-| 2. Dataset + Binning | 0/5 | Plans complete | - |
+| 2. Dataset + Binning | 1/5 | In progress | - |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
