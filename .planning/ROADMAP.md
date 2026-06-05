@@ -141,7 +141,23 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. CUDA warp-level reductions are expressed via CubeCL's `Plane` API with startup capability-gating (`Plane::Ops`, f64, atomics) and a deterministic sequential fallback when a capability is absent.
   5. The oracle suite executes and passes on the ROCm backend for the histogram/split/partition kernels (mandated test environment), with CPU-runtime and ROCm treated as separate gates.
 
-**Plans**: TBD
+**Plans**: 4 plans
+
+**Wave 1** (foundation + D-04a determinism spike FIRST)
+
+  - [ ] 04-01-PLAN.md — ComputeError + cpu/rocm runtime selection + startup capability gate + minimal histogram kernel + the D-04a bit-determinism spike (RUN FIRST) + CMP-01 containment guard
+
+**Wave 2** *(blocked on 04-01)*
+
+  - [ ] 04-02-PLAN.md — First vertical slice: construct_histograms whole-kernel op + xtask kernel-capture (header-only C++ transcription) + committed histogram golden + bit-exact cubecl-cpu parity
+
+**Wave 3** *(blocked on 04-02)*
+
+  - [ ] 04-03-PLAN.md — find_best_split (gain math inside kernel, verbatim) + data_partition + subtract_histograms (A3 in-scope) + split/partition/subtract goldens + bit-exact cpu parity
+
+**Wave 4** *(blocked on 04-03; has ROCm GPU checkpoint)*
+
+  - [ ] 04-04-PLAN.md — ROCm/hip bring-up (rocm feature, f32-accumulate on no-f64 device) + capability gate on gfx1100 + ~1e-6 hip-vs-cpu separate gate + documented ROCm gaps (D-03a)
 
 ### Phase 5: Tree Learner + Split Finding
 
@@ -217,7 +233,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
-| 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
+| 4. Compute Backend (CPU-first → ROCm) | 0/4 | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
