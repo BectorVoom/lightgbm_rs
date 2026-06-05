@@ -17,6 +17,7 @@ pub mod error;
 pub mod feature_group;
 pub mod ingest;
 pub mod metadata;
+pub mod multi_val_bin;
 
 pub use bin::{Bin, BinValue, create_dense_bin, create_sparse_bin};
 pub use bin_mapper::{BinMapper, BinType, MissingType};
@@ -25,3 +26,4 @@ pub use error::DatasetError;
 pub use feature_group::FeatureGroup;
 pub use ingest::{from_csc, from_csr, from_mat};
 pub use metadata::Metadata;
+pub use multi_val_bin::{MultiValBin, MultiValWidth};

@@ -376,4 +376,74 @@ mod tests {
         assert_eq!(bd.data(0), 0, "most-freq skipped");
         assert_eq!(bd.data(1), 2, "bin 1 + offset(1), no -1");
     }
+
+    #[test]
+    fn multi_val_push_emits_bin_plus_one_reserving_bin_zero() {
+        // EFB multi-val branch: a non-most-freq value pushes `bin + 1` into the
+        // per-sub-feature store so bin 0 stays reserved for the implicit
+        // most-freq (feature_group.h:253-267, RESEARCH §10). Build a 2-feature
+        // dense-multi-val group (low sparse rate -> offset=0, is_multi_val=true).
+        // feature 0: bounds [1,2,inf], most_freq_bin=0.
+        //   value 1.5 -> value_to_bin = bin 1; most_freq(0) != bin => not skipped;
+        //   most_freq==0 => bin -= 1 => 0; multi-val => push(row, bin + 1) = 1.
+        let f0 = mapper(3, 0, vec![1.0, 2.0, f64::INFINITY]);
+        let f1 = mapper(3, 0, vec![1.0, 2.0, f64::INFINITY]);
+        let mut fg = FeatureGroup::new(2, true, vec![f0, f1], 2, 1);
+        assert!(fg.is_multi_val(), "2-feature group with is_multi_val=true");
+        fg.push_data(0, 0, 1.5); // feature 0, row 0 -> bin 1 -> -1 -> 0 -> +1 = 1
+        fg.push_data(0, 1, 100.0); // feature 0, row 1 -> bin 2 -> -1 -> 1 -> +1 = 2
+        fg.finish_load();
+        let store = fg.multi_bin_data(0).unwrap();
+        assert_eq!(store.data(0), 1, "bin 1 -> -1 -> 0 -> +1 reserves bin 0");
+        assert_eq!(store.data(1), 2, "bin 2 -> -1 -> 1 -> +1");
+    }
+
+    #[test]
+    fn multi_val_push_skips_most_freq_leaving_bin_zero() {
+        // The most-freq value is skipped entirely in the multi-val branch, so its
+        // cell stays the default 0 (the implicit most-freq slot reserved by +1).
+        let f0 = mapper(3, 0, vec![1.0, 2.0, f64::INFINITY]);
+        let f1 = mapper(3, 0, vec![1.0, 2.0, f64::INFINITY]);
+        let mut fg = FeatureGroup::new(2, true, vec![f0, f1], 2, 1);
+        fg.push_data(0, 0, 0.5); // bin 0 == most_freq => SKIP (no push)
+        fg.finish_load();
+        let store = fg.multi_bin_data(0).unwrap();
+        assert_eq!(store.data(0), 0, "most-freq skipped -> bin 0 reserved");
+    }
+
+    #[test]
+    fn offset_zero_dense_multi_val_path_when_sum_sparse_rate_below_quarter() {
+        // The `offset=0` dense-multi-val path triggers when
+        // `sum_sparse_rate < multi_val_bin_sparse_threshold (0.25)` AND
+        // is_multi_val (feature_group.h:51-57, RESEARCH §9). With sparse_rate 0.0
+        // (< 0.25) and is_multi_val=true, offset becomes 0, so a most_freq_bin==0
+        // feature contributes `num_bin - 0 = num_bin` (no -1) and bin_offsets_
+        // start at 0.
+        let f0 = mapper(5, 0, vec![1.0, 2.0, 3.0, 4.0, f64::INFINITY]); // most_freq 0
+        let f1 = mapper(4, 1, vec![1.0, 2.0, 3.0, f64::INFINITY]); // most_freq 1
+        // group_id=1 (not 0) avoids the force-one-bin special case.
+        let fg = FeatureGroup::new(2, true, vec![f0, f1], 8, 1);
+        // offset=0 => f0 contributes 5 - 0 = 5; f1 contributes 4.
+        //   num_total_bin_ = 0; bin_offsets_ = [0]; -> [0, 5, 9].
+        assert_eq!(fg.bin_offsets_[0], 0, "offset=0 dense-multi-val seeds at 0");
+        assert_eq!(fg.bin_offsets_, vec![0, 5, 9]);
+        assert_eq!(fg.num_total_bin_, 9);
+    }
+
+    #[test]
+    fn offset_one_when_sum_sparse_rate_at_or_above_quarter() {
+        // Conversely, when sum_sparse_rate >= 0.25 the dense-multi-val path is NOT
+        // taken: offset stays 1, so a most_freq_bin==0 feature contributes
+        // `num_bin - 1` and bin_offsets_ start at 1.
+        let mut f0 = mapper(5, 0, vec![1.0, 2.0, 3.0, 4.0, f64::INFINITY]);
+        let mut f1 = mapper(4, 1, vec![1.0, 2.0, 3.0, f64::INFINITY]);
+        f0.sparse_rate_ = 0.5; // mean 0.375 >= 0.25
+        f1.sparse_rate_ = 0.25;
+        let fg = FeatureGroup::new(2, true, vec![f0, f1], 8, 1);
+        // offset=1 => f0 (most_freq 0): 5 - 1 = 4; f1: 4.
+        //   num_total_bin_ = 1; bin_offsets_ = [1] -> [1, 5, 9].
+        assert_eq!(fg.bin_offsets_[0], 1, "offset=1 (not dense-multi-val)");
+        assert_eq!(fg.bin_offsets_, vec![1, 5, 9]);
+        assert_eq!(fg.num_total_bin_, 9);
+    }
 }
