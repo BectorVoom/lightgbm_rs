@@ -16,9 +16,9 @@
 
 ### Configuration
 
-- [ ] **CFG-01**: Config struct accepting the ~110 in-scope single-machine hyperparameters
-- [ ] **CFG-02**: Parameter alias resolution (e.g. `num_iteration`/`n_estimators`/`num_boost_round`) as a data table matching `config_auto.cpp`
-- [ ] **CFG-03**: Parameter validation mirroring C++ `Config::Set` CHECK constraints, surfaced as typed `Result` errors
+- [x] **CFG-01**: Config struct accepting the ~110 in-scope single-machine hyperparameters
+- [x] **CFG-02**: Parameter alias resolution (e.g. `num_iteration`/`n_estimators`/`num_boost_round`) as a data table matching `config_auto.cpp`
+- [x] **CFG-03**: Parameter validation mirroring C++ `Config::Set` CHECK constraints, surfaced as typed `Result` errors
 
 ### Dataset, Binning & I/O
 
@@ -149,9 +149,9 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | FND-02 | Phase 1 | Complete |
 | FND-03 | Phase 1 | Complete |
 | FND-04 | Phase 1 | Complete |
-| CFG-01 | Phase 1 | Pending |
-| CFG-02 | Phase 1 | Pending |
-| CFG-03 | Phase 1 | Pending |
+| CFG-01 | Phase 1 | Complete |
+| CFG-02 | Phase 1 | Complete |
+| CFG-03 | Phase 1 | Complete |
 | ORA-01 | Phase 1 | Complete |
 | ORA-02 | Phase 1 | Complete |
 | DAT-01 | Phase 2 | Pending |

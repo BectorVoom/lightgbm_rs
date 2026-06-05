@@ -44,7 +44,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-  - [ ] 01-02-PLAN.md — Hand-ported flat Config: struct/defaults + verbatim alias table + seed derivation + typed CHECK validation + drift-checker
+  - [x] 01-02-PLAN.md — Hand-ported flat Config: struct/defaults + verbatim alias table + seed derivation + typed CHECK validation + drift-checker
 
 ### Phase 2: Dataset + Binning (determinism root)
 
@@ -165,7 +165,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Oracle Contract + Foundations | 1/2 | In Progress|  |
+| 1. Oracle Contract + Foundations | 2/2 | Plans complete | 2026-06-05 |
 | 2. Dataset + Binning | 0/TBD | Not started | - |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |

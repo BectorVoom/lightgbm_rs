@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Plan 01-01 complete (Random LCG bit-for-bit parity proven against committed C++ golden set); ready for Plan 01-02"
-last_updated: "2026-06-05T04:09:59.217Z"
-last_activity: "2026-06-05 -- Plan 01-01 complete: workspace + Random LCG port + oracle harness + randomized C++ RNG golden set committed; rng_parity green"
+stopped_at: "Plan 01-02 complete (config slice: flat Config + verbatim alias table + from_params pipeline + D-14 randomized validation + drift-checker); phase 01 plans complete"
+last_updated: "2026-06-05T00:00:00.000Z"
+last_activity: "2026-06-05 -- Plan 01-02 complete: config slice landed; lgbm-core 14 unit + 26 integration green, oracle-harness config_drift 3/3, cargo test --workspace green"
 progress:
   total_phases: 8
   completed_phases: 0
   total_plans: 2
-  completed_plans: 1
-  percent: 50
+  completed_plans: 2
+  percent: 100
 ---
 
 # Project State
@@ -25,19 +25,19 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 01 (oracle-contract-foundations) — EXECUTING
-Plan: 2 of 2 — NOT STARTED (Plan 01-01 complete)
-Status: Plan 01-01 complete — virtual workspace + bit-for-bit Random LCG port + oracle harness + committed randomized C++ RNG golden set; full suite green (lgbm-core 14, oracle-harness comparator 5 + rng_parity 1)
-Last activity: 2026-06-05 -- Plan 01-01 completed and committed
+Phase: 01 (oracle-contract-foundations) — EXECUTING (all plans complete)
+Plan: 2 of 2 — COMPLETE
+Status: Plan 01-02 complete — flat Config struct (config.h defaults 1:1), verbatim alias_table() port, from_params pipeline (alias -> six sub-seeds in exact order -> CHECK validation -> CheckParamConflict mutations), D-14 randomized in-scope/boundary/invalid validation (deterministic, panic-free), and a drift-checker proving Rust covers the in-scope C++ params/aliases. Full suite green (lgbm-core 14 unit + 26 integration, oracle-harness config_drift 3/3, cargo test --workspace green).
+Last activity: 2026-06-05 -- Plan 01-02 completed and committed
 
-Progress: [█████░░░░░] 50% (1 of 2 plans complete)
+Progress: [██████████] 100% (2 of 2 plans complete)
 
 ### Resume
 
-To start Plan 01-02 (config slice):
+Phase 01 (oracle-contract-foundations) plans are complete. Next: verify/close the phase, then plan Phase 02.
 
-1. Execute `.planning/phases/01-oracle-contract-foundations/01-02-PLAN.md`.
-2. Plan 01-02 extends `lgbm-core::error::ConfigError` variants and builds on the established virtual workspace + error layering from Plan 01-01.
+- CFG-01/CFG-02/CFG-03 (config defaults/aliases/validation) and FND-01 (seed derivation) completed in Plan 01-02.
+- `lgbm_core::Config` + `Config::from_params` are the config bag for all later crates.
 
 ## Performance Metrics
 
@@ -51,7 +51,9 @@ To start Plan 01-02 (config slice):
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01-oracle-contract-foundations | 2/2 | ~2 sessions | ~1 session |
+
+**Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 
 **Recent Trend:**
 
