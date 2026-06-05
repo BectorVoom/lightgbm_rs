@@ -175,7 +175,20 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Numerical threshold splits route missing/zero exactly as C++; data partition (row→leaf) feeds the subtraction trick correctly.
   5. Per-tree/per-node feature subsampling (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`) selects the same features via RNG parity, and both `force_row_wise`/`force_col_wise` strategies produce matching trees.
 
-**Plans**: TBD
+**Plans**: 4 plans
+
+**Wave 1** *(spine prerequisites — parallel; no shared files)*
+
+  - [ ] 05-01-PLAN.md — Phase-4 boundary re-open: thread authoritative `skip_default_bin`/`na_as_missing` through `Backend::find_best_split` (replace the `cfg_skip_default_bin` heuristic) + `skip_default_bin==false` divergence golden (TRL-05 enabler)
+  - [ ] 05-02-PLAN.md — Enabling slice: new `lgbm-treelearner` crate + `TreeLearnerError` + reuse `SplitInfo` + `split_gt` tie-break + `Tree::split` mutation/growth arrays + `learner-capture`/`learner_parity` Wave-0 harness (failing end-to-end test in place)
+
+**Wave 2** *(blocked on 05-01 + 05-02 — the keystone spine)*
+
+  - [ ] 05-03-PLAN.md — Faithful tree-learner spine (`force_row_wise`, `feature_fraction=1.0`, numeric, `missing_type=None`): leaf-wise loop + subtraction trick + FixHistogram + HistogramPool (D-05 full mirror) + DataPartition + LeafSplits; per-split (full per-bin gain arrays, D-06) + full-tree (`%.17g`, D-07) parity + D-02a two-transcription cross-check (TRL-01,02,03,04,05,07)
+
+**Wave 3** *(blocked on 05-03 — parity additions on the proven spine)*
+
+  - [ ] 05-04-PLAN.md — `force_col_wise`==`force_row_wise`==C++ tree (TRL-09) + per-tree/per-node feature subsampling RNG parity via `ColSampler` (TRL-08) + captured real iter-1 g/h full-tree parity (D-03)
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
 
