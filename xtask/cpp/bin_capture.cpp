@@ -754,6 +754,12 @@ uint64_t F64Bits(double d) {
   return b;
 }
 
+uint32_t F32Bits(float f) {
+  uint32_t b;
+  std::memcpy(&b, &f, sizeof(b));
+  return b;
+}
+
 // A small deterministic case generator reusing the reference Random LCG so the
 // corpus is reproducible from MASTER_SEED.
 struct CaseGen {
@@ -1298,6 +1304,148 @@ std::vector<MissCaseSpec> BuildMissCorpus(int /*master_seed*/) {
   return cases;
 }
 
+// ===========================================================================
+// Metadata golden (DAT-06): a small MASTER_SEED-derived labels/weights/
+// init_score/query-boundary set + the C++ Metadata::CalculateQueryWeights
+// output (mean weight per group, computed in label_t==float arithmetic).
+// Transcribed VERBATIM from src/io/metadata.cpp:742-756 — accumulate in float,
+// divide by the (int) group size (converts to float). Bit-exact via F32Bits.
+// ===========================================================================
+
+struct MetaCaseSpec {
+  std::string name;
+  std::vector<float> label;
+  std::vector<float> weights;            // empty -> no weights
+  std::vector<double> init_score;        // empty -> no init scores
+  std::vector<int32_t> query_boundaries; // empty -> no groups (prefix-sum form)
+};
+
+// C++ Metadata::CalculateQueryWeights (metadata.cpp:742-756), verbatim.
+std::vector<float> CalculateQueryWeights(const std::vector<float>& weights,
+                                         const std::vector<int32_t>& query_boundaries) {
+  std::vector<float> query_weights;
+  if (weights.size() == 0 || query_boundaries.size() == 0) {
+    return query_weights;  // empty (C++ early-return)
+  }
+  const int32_t num_queries = static_cast<int32_t>(query_boundaries.size()) - 1;
+  query_weights = std::vector<float>(num_queries);
+  for (int32_t i = 0; i < num_queries; ++i) {
+    query_weights[i] = 0.0f;
+    for (int32_t j = query_boundaries[i]; j < query_boundaries[i + 1]; ++j) {
+      query_weights[i] += weights[j];
+    }
+    query_weights[i] /= (query_boundaries[i + 1] - query_boundaries[i]);
+  }
+  return query_weights;
+}
+
+void EmitMetaCase(std::ofstream& out, const MetaCaseSpec& cs) {
+  std::vector<float> qw = CalculateQueryWeights(cs.weights, cs.query_boundaries);
+
+  out << "MCASE name=" << cs.name << " num_rows=" << cs.label.size() << "\n";
+
+  out << "LABEL ";
+  for (size_t i = 0; i < cs.label.size(); ++i) {
+    if (i) out << ";";
+    out << F32Bits(cs.label[i]);
+  }
+  out << "\n";
+
+  out << "WEIGHTS ";
+  for (size_t i = 0; i < cs.weights.size(); ++i) {
+    if (i) out << ";";
+    out << F32Bits(cs.weights[i]);
+  }
+  out << "\n";
+
+  out << "INIT_SCORE ";
+  for (size_t i = 0; i < cs.init_score.size(); ++i) {
+    if (i) out << ";";
+    out << F64Bits(cs.init_score[i]);
+  }
+  out << "\n";
+
+  out << "QUERY_BOUNDARIES ";
+  for (size_t i = 0; i < cs.query_boundaries.size(); ++i) {
+    if (i) out << ";";
+    out << cs.query_boundaries[i];
+  }
+  out << "\n";
+
+  out << "QUERY_WEIGHTS ";
+  for (size_t i = 0; i < qw.size(); ++i) {
+    if (i) out << ";";
+    out << F32Bits(qw[i]);
+  }
+  out << "\n";
+}
+
+std::vector<MetaCaseSpec> BuildMetaCorpus(int master_seed) {
+  std::vector<MetaCaseSpec> cases;
+  CaseGen gen(master_seed);
+
+  // (1) randomized ranking case: groups of varying size with random weights.
+  {
+    MetaCaseSpec cs;
+    cs.name = "ranking_random";
+    const int num_groups = 5;
+    int32_t boundary = 0;
+    cs.query_boundaries.push_back(0);
+    for (int g = 0; g < num_groups; ++g) {
+      const int group_size = gen.NextInt(1, 8);
+      for (int i = 0; i < group_size; ++i) {
+        cs.label.push_back(static_cast<float>(gen.NextInt(0, 4)));
+        cs.weights.push_back(static_cast<float>(gen.NextUnit() * 4.0 + 0.1));
+        cs.init_score.push_back(gen.NextUnit() * 2.0 - 1.0);
+      }
+      boundary += group_size;
+      cs.query_boundaries.push_back(boundary);
+    }
+    cases.push_back(std::move(cs));
+  }
+
+  // (2) curated even/odd groups: integer weights so the mean is exact in f32.
+  {
+    MetaCaseSpec cs;
+    cs.name = "groups_int_weights";
+    cs.label = {1.0f, 0.0f, 1.0f, 0.0f, 1.0f};
+    cs.weights = {1.0f, 3.0f, 2.0f, 4.0f, 6.0f};
+    cs.init_score = {0.1, 0.2, 0.3, 0.4, 0.5};
+    cs.query_boundaries = {0, 2, 5};  // means: (1+3)/2=2, (2+4+6)/3=4
+    cases.push_back(std::move(cs));
+  }
+
+  // (3) labels only, no weights, no groups (the common non-ranking case ->
+  //     empty query_weights).
+  {
+    MetaCaseSpec cs;
+    cs.name = "labels_only";
+    cs.label = {0.0f, 1.0f, 0.0f, 1.0f};
+    cases.push_back(std::move(cs));
+  }
+
+  // (4) weights but no groups -> still empty query_weights.
+  {
+    MetaCaseSpec cs;
+    cs.name = "weights_no_groups";
+    cs.label = {1.0f, 2.0f, 3.0f};
+    cs.weights = {0.5f, 1.5f, 2.5f};
+    cases.push_back(std::move(cs));
+  }
+
+  // (5) fractional weights that exercise f32 rounding in the mean.
+  {
+    MetaCaseSpec cs;
+    cs.name = "groups_frac_weights";
+    cs.label = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    cs.weights = {0.1f, 0.2f, 0.3f, 0.7f, 0.9f, 1.1f};
+    cs.query_boundaries = {0, 3, 6};  // means in f32: (0.1+0.2+0.3)/3, (0.7+0.9+1.1)/3
+    cases.push_back(std::move(cs));
+  }
+
+  return cases;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1305,9 +1453,12 @@ int main(int argc, char** argv) {
   //   <numeric_out> <master_seed>
   //   <numeric_out> <master_seed> <storage_out>
   //   <numeric_out> <master_seed> <storage_out> <categorical_out> <missing_out>
-  if (argc != 3 && argc != 4 && argc != 6) {
+  //   ... <missing_out> <metadata_out>
+  //   ... <metadata_out> <example_out> <example_in1> [<example_in2> ...]
+  if (argc != 3 && argc != 4 && argc != 6 && argc != 7 && argc < 9) {
     std::cerr << "usage: bin_capture <numeric_out> <master_seed> "
-                 "[<storage_out> [<categorical_out> <missing_out>]]\n";
+                 "[<storage_out> [<categorical_out> <missing_out> "
+                 "[<metadata_out> [<example_out> <example_in>...]]]]\n";
     return 2;
   }
   const std::string out_path = argv[1];
@@ -1359,7 +1510,7 @@ int main(int argc, char** argv) {
     std::cerr << "bin_capture: wrote " << scorpus.size() << " storage cases to " << store_path << "\n";
   }
 
-  if (argc == 6) {
+  if (argc >= 6) {
     // (a) categorical corpus (layers 1 + 3 + per-row index, DAT-04).
     const std::string cat_path = argv[4];
     std::ofstream cout(cat_path, std::ios::binary | std::ios::trunc);
@@ -1401,6 +1552,30 @@ int main(int argc, char** argv) {
       return 1;
     }
     std::cerr << "bin_capture: wrote " << mcorpus.size() << " missing cases to " << miss_path
+              << "\n";
+  }
+
+  if (argc >= 7) {
+    // metadata corpus (labels/weights/init_score/query + CalculateQueryWeights).
+    const std::string meta_path = argv[6];
+    std::ofstream mout(meta_path, std::ios::binary | std::ios::trunc);
+    if (!mout) {
+      std::cerr << "error: cannot open metadata output file: " << meta_path << "\n";
+      return 1;
+    }
+    std::vector<MetaCaseSpec> mcorpus = BuildMetaCorpus(master_seed);
+    mout << "# LightGBM-rs metadata golden set (DAT-06: query-weight derivation)\n";
+    mout << "# Verbatim transcription of metadata.cpp CalculateQueryWeights (label_t==float\n";
+    mout << "# mean per group). f32 values are raw IEEE bits (u32 dec); init_score is f64 bits.\n";
+    mout << "MASTER_SEED " << master_seed << "\n";
+    mout << "COUNTS cases=" << mcorpus.size() << "\n";
+    for (const auto& cs : mcorpus) EmitMetaCase(mout, cs);
+    mout.flush();
+    if (!mout) {
+      std::cerr << "error: failed while writing metadata output\n";
+      return 1;
+    }
+    std::cerr << "bin_capture: wrote " << mcorpus.size() << " metadata cases to " << meta_path
               << "\n";
   }
   return 0;

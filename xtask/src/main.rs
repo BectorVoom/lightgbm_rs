@@ -204,6 +204,7 @@ fn bin_capture() -> Result<()> {
     let storage_fixture_path = fixtures_dir.join("bin_storage_layout.txt");
     let categorical_fixture_path = fixtures_dir.join("categorical_folding.txt");
     let missing_fixture_path = fixtures_dir.join("missing_edge_cases.txt");
+    let metadata_fixture_path = fixtures_dir.join("metadata.txt");
 
     eprintln!("xtask bin-capture: configuring C++ capture build ...");
     run(
@@ -237,7 +238,8 @@ fn bin_capture() -> Result<()> {
             .arg(BIN_MASTER_SEED.to_string())
             .arg(&storage_fixture_path)
             .arg(&categorical_fixture_path)
-            .arg(&missing_fixture_path),
+            .arg(&missing_fixture_path)
+            .arg(&metadata_fixture_path),
         "bin_capture",
     )?;
 
@@ -246,6 +248,7 @@ fn bin_capture() -> Result<()> {
         &storage_fixture_path,
         &categorical_fixture_path,
         &missing_fixture_path,
+        &metadata_fixture_path,
     ] {
         if !p.is_file() {
             bail!("capture completed but {} was not written", p.display());
@@ -260,11 +263,12 @@ fn bin_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask bin-capture: done. Wrote {}, {}, {}, and {}.",
+        "xtask bin-capture: done. Wrote {}, {}, {}, {}, and {}.",
         fixture_path.display(),
         storage_fixture_path.display(),
         categorical_fixture_path.display(),
-        missing_fixture_path.display()
+        missing_fixture_path.display(),
+        metadata_fixture_path.display()
     );
     eprintln!(
         "Re-run `cargo run -p xtask -- bin-capture` and confirm \
