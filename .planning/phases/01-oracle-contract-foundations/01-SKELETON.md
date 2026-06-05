@@ -7,7 +7,7 @@
 
 > The smallest user-visible capability that exercises the full numerical-fidelity stack.
 
-A developer can run the ported `Random` LCG (and construct a validated `Config`) and have the oracle harness prove the output matches a pinned C++ LightGBM 4.6 reference bit-for-bit, reading a committed golden with no C++ toolchain — i.e. the parity-proving spine (workspace → RNG/config → oracle comparison) is real and falsifiable.
+A developer can run the ported `Random` LCG (and construct a validated `Config`) and have the oracle harness prove the output matches a pinned C++ LightGBM 4.6 reference bit-for-bit across a RANDOMIZED, diverse set of inputs (many LCG seeds + randomized `N,K` straddling the `Sample` branch boundary, plus randomized config inputs), reading committed goldens with no C++ toolchain — i.e. the parity-proving spine (workspace → RNG/config → oracle comparison) is real, falsifiable, and validated over varied distributions rather than a single point.
 
 ## Architectural Decisions
 
@@ -21,7 +21,7 @@ A developer can run the ported `Random` LCG (and construct a validated `Config`)
 | Config | Single flat `Config` struct mirroring C++ `Config` 1:1 (same field names/defaults); verbatim alias table; `from_params` pipeline (seeds → members → CHECK validation → conflict mutations); hand-ported, drift-checker test (NOT codegen) | D-11/D-12/D-13; readable, cross-checkable, guarded against upstream drift |
 | Errors | `thiserror` domain errors at the `lgbm-core` boundary; `anyhow` in harness/xtask/tests | FND-04; C++ `Log::Fatal` sites become typed `Result` errors, never panics on user input |
 | Compute seam | All CubeCL usage confined behind one `lgbm-compute` `Backend` trait skeleton (no kernels this phase) | CMP-01; isolates CubeCL alpha churn from every crate above it |
-| C++ reference + goldens | Built from the in-repo `LightGBM/` submodule (commit `195c26fc...`, VERSION 4.6.0.99) via CMake with `deterministic=true force_row_wise=true num_threads=1` + fixed seed + default `float` width; goldens captured once via a standalone C++ harness linking `lib_lightgbm`, committed as fixtures; normal `cargo test` reads fixtures with NO C++ toolchain; regen is idempotent | D-05/D-06/D-07, ORA-01/ORA-02; reproducible from the repo, version-locked |
+| C++ reference + goldens | Built from the in-repo `LightGBM/` submodule (commit `195c26fc...`, VERSION 4.6.0.99) via CMake with `deterministic=true force_row_wise=true num_threads=1` + default `float` width; oracle inputs are a RANDOMIZED, diverse set derived from ONE recorded master seed (committed in the manifest, re-rollable) — many LCG seeds + randomized `N,K` straddling the `Sample` boundary for RNG, randomized in-scope/boundary/invalid params for config; the C++ reference is run ONCE over the set, the `(input → output)` pairs committed as fixtures; normal `cargo test` reads fixtures with NO C++ toolchain; regen is idempotent (same master seed → identical fixtures) | D-05/D-06/D-07/D-14, ORA-01/ORA-02; reproducible from the repo, version-locked, fidelity proven across varied distributions not a single point |
 
 ## Stack Touched in Phase 1
 
@@ -29,9 +29,9 @@ A developer can run the ported `Random` LCG (and construct a validated `Config`)
 
 - [x] Project scaffold — virtual workspace, edition 2024, pinned toolchain, `Cargo.lock` committed, lint via `cargo build/test`
 - [x] Parity primitive — bit-exact `Random` LCG (real arithmetic, not a stub)
-- [x] Configuration layer — flat `Config` with alias resolution, seed derivation via the RNG, and typed validation
-- [x] Oracle comparison — abs-diff ~1e-6 comparator + RNG bit-for-bit golden comparison against the pinned C++ reference
-- [x] Reproducible reference — committed golden + pinned reference manifest + idempotent regen `xtask` (documented full-stack regen command: `cargo run -p xtask -- regen`)
+- [x] Configuration layer — flat `Config` with alias resolution, seed derivation via the RNG, and typed validation across randomized in-scope/boundary/invalid inputs (D-14)
+- [x] Oracle comparison — abs-diff ~1e-6 comparator (float comparisons) + RNG bit-for-bit golden comparison against the pinned C++ reference over a randomized, diverse golden set (D-14)
+- [x] Reproducible reference — committed randomized golden set + pinned reference manifest (commit + flags + master seed + case count) + idempotent regen `xtask` deriving the set from one recorded master seed (documented full-stack regen command: `cargo run -p xtask -- regen`)
 
 ## Out of Scope (Deferred to Later Slices)
 
@@ -58,3 +58,4 @@ Each later phase adds one vertical, oracle-validated slice on top of this skelet
 - Phase 6: first end-to-end f32 ~1e-6 train→predict (GBDT spine + core objectives/metrics)
 - Phase 7: parity-completing variants (GOSS/DART/RF, categorical, remaining objectives/metrics, SHAP, monotone)
 - Phase 8: PyO3 Python bindings over the validated Rust facade
+</content>

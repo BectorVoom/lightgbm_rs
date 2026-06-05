@@ -38,7 +38,7 @@ created: 2026-06-05
 
 | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| FND-01 | — | LCG reproduces 100k C++ draws bit-for-bit (RandInt16/32, NextFloat, NextInt, Sample across branch) | golden/unit | `cargo test -p oracle-harness rng_parity` | ❌ W0 | ⬜ pending |
+| FND-01 / D-14 | — | LCG reproduces the RANDOMIZED C++ golden set bit-for-bit (many seeds + randomized N,K straddling the Sample branch; integer exact, NextFloat exact-bit f32) — derived from one recorded master seed | golden/unit | `cargo test -p oracle-harness rng_parity` | ❌ W0 | ⬜ pending |
 | FND-01 | — | Seed derivation order matches C++ `Config::Set` | unit | `cargo test -p lgbm-core seed_derivation` | ❌ W0 | ⬜ pending |
 | FND-02 | — | Workspace builds under edition 2024 | smoke | `cargo build --workspace` | ❌ W0 | ⬜ pending |
 | FND-03 | — | f32 type aliases + constants match meta.h | unit | `cargo test -p lgbm-core types` | ❌ W0 | ⬜ pending |
@@ -46,9 +46,9 @@ created: 2026-06-05
 | CFG-01 | — | Config struct holds in-scope params with C++ defaults | unit | `cargo test -p lgbm-core config_defaults` | ❌ W0 | ⬜ pending |
 | CFG-02 | — | Alias resolution matches `alias_table()` | unit | `cargo test -p lgbm-core alias_resolution` | ❌ W0 | ⬜ pending |
 | CFG-01/CFG-02 | — | Drift-checker: Rust covers all in-scope params/aliases in config_auto.cpp | unit | `cargo test -p oracle-harness config_drift` | ❌ W0 | ⬜ pending |
-| CFG-03 | T-1-01 | Each CHECK_* constraint returns typed Err on violation (no panic on hostile input) | unit | `cargo test -p lgbm-core config_validation` | ❌ W0 | ⬜ pending |
-| ORA-01 | — | abs-diff comparator flags > ~1e-6 | unit | `cargo test -p oracle-harness comparator` | ❌ W0 | ⬜ pending |
-| ORA-02 | — | Reference manifest (commit hash, flags) checked in and regen is idempotent | golden/script | `cargo test -p oracle-harness reference_manifest` | ❌ W0 | ⬜ pending |
+| CFG-03 / D-14 | T-1-01 | Each CHECK_* constraint returns typed Err on violation across a RANDOMIZED in-scope/boundary/invalid input set (no panic on hostile input; deterministic fixed in-test seed) | unit | `cargo test -p lgbm-core config_validation` | ❌ W0 | ⬜ pending |
+| ORA-01 | — | abs-diff comparator flags > ~1e-6 (float comparisons), reporting first offending index across the golden set | unit | `cargo test -p oracle-harness comparator` | ❌ W0 | ⬜ pending |
+| ORA-02 / D-14 | — | Reference manifest (commit hash, flags, master seed, generated case count) checked in and regen is idempotent (same master seed → identical fixtures) | golden/script | `cargo test -p oracle-harness reference_manifest` | ❌ W0 | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -56,12 +56,12 @@ created: 2026-06-05
 
 ## Wave 0 Requirements
 
-- [ ] `crates/oracle-harness/fixtures/rng_sequence.*` — committed 100k-draw golden (FND-01) — requires C++ harness + regen
-- [ ] `crates/oracle-harness/tests/rng_parity.rs` — FND-01
+- [ ] `crates/oracle-harness/fixtures/rng_sequence.*` — committed RANDOMIZED golden set (many seeds + randomized N,K) derived from one recorded master seed (FND-01 / D-14) — requires C++ harness + regen
+- [ ] `crates/oracle-harness/tests/rng_parity.rs` — replays EVERY committed randomized case (FND-01 / D-14)
 - [ ] `crates/lgbm-core/src/...` + unit tests — FND-01/03/04, CFG-01/02/03
 - [ ] `crates/oracle-harness/tests/config_drift.rs` — CFG drift (D-11)
 - [ ] `crates/oracle-harness/tests/comparator.rs` — ORA-01
-- [ ] Reference manifest file (commit hash + deterministic flags) — ORA-02
+- [ ] Reference manifest file (commit hash + deterministic flags + master seed + generated case count) — ORA-02 / D-14
 - [ ] Framework install: none (libtest is built in)
 
 ---
@@ -70,7 +70,7 @@ created: 2026-06-05
 
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
-| Initial golden capture from C++ reference build | FND-01 / ORA-02 | Requires building the pinned C++ LightGBM 4.6 submodule and running the capture harness once on the developer's machine | Build `lib_lightgbm` at pinned commit, run capture xtask/CMake target, commit emitted fixtures + manifest |
+| Initial randomized golden-set capture from C++ reference build | FND-01 / ORA-02 / D-14 | Requires building the pinned C++ LightGBM 4.6 submodule and running the capture harness once on the developer's machine; the randomized case set is derived deterministically from one recorded master seed (no wall-clock/OS entropy) | Build `lib_lightgbm` at pinned commit, run capture xtask/CMake target (which derives the randomized seed/(N,K) set from the recorded master seed), commit emitted fixtures + manifest (incl. master seed + case count) |
 
 *All other phase behaviors have automated verification.*
 
@@ -86,3 +86,4 @@ created: 2026-06-05
 - [ ] `nyquist_compliant: true` set in frontmatter
 
 **Approval:** pending
+</content>
