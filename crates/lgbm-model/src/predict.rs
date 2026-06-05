@@ -713,6 +713,10 @@ mod tests {
             cat_threshold: vec![],
             shrinkage: 1.0,
             is_linear: false,
+            leaf_depth: vec![1, 1],
+            leaf_parent: vec![0, 0],
+            split_feature_inner: vec![-1],
+            threshold_in_bin: vec![0],
         }
     }
 

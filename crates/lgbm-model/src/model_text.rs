@@ -329,6 +329,10 @@ mod tests {
             cat_threshold: vec![],
             shrinkage: 0.1,
             is_linear: false,
+            leaf_depth: vec![1, 1],
+            leaf_parent: vec![0, 0],
+            split_feature_inner: vec![-1],
+            threshold_in_bin: vec![0],
         };
         let block = format!("Tree=0\n{}\n", tree.to_string());
         let size = block.len();
