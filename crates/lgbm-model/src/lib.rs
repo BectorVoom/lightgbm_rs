@@ -19,9 +19,12 @@
 //! Later plans add `tree`, `ensemble`, `model_text`, and `predict`; their
 //! `pub mod` declarations are added here as they land.
 
+pub mod ensemble;
 pub mod error;
 pub mod format;
+pub mod model_text;
 pub mod tree;
 
+pub use ensemble::GbdtModel;
 pub use error::ModelError;
 pub use tree::Tree;
