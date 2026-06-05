@@ -1,3 +1,124 @@
 //! Runtime selection + startup capability gate (CMP-03 / CMP-04).
 //!
-//! Filled in Task 2 of plan 04-01.
+//! This module is the one place that names a concrete CubeCL runtime (CMP-01):
+//! the `cpu` feature binds [`cubecl::cpu::CpuRuntime`] (the D-04 deterministic
+//! anchor) and the opt-in `rocm` feature binds the HIP runtime. A CPU-only
+//! build needs no ROCm toolchain (SC#1).
+//!
+//! The startup capability gate ([`probe_capabilities`]) queries the active
+//! runtime's [`Features`]/[`DeviceProperties`] exactly once and selects a
+//! [`ReducePath`]. Per RESEARCH Pitfall 2 the capability matrix is asymmetric —
+//! `Plane::Ops`/f64/f32-atomic differ between cubecl-cpu and cubecl-hip — so
+//! every divergent feature is gated explicitly. On cubecl-cpu the
+//! `Plane::Ops` feature is *absent* (`plane_size = 1`), so the
+//! [`ReducePath::Sequential`] single-owner ordered fold IS the CPU path, not a
+//! fallback option.
+
+use cubecl::ir::features::{AtomicUsage, Plane};
+use cubecl::ir::{ElemType, FloatKind, StorageType, Type};
+use cubecl::prelude::*;
+
+/// The device capabilities probed once at backend startup (CMP-04).
+///
+/// Mirrors the verified asymmetric matrix (RESEARCH Pitfall 2):
+/// - cubecl-cpu: `has_plane=false`, `has_f64=true`, `has_f32_atomic=false`, `plane_size=1`
+/// - cubecl-hip (gfx1100): `has_plane=true`, `has_f64=false`, `has_f32_atomic=true`, `plane_size=32`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Whether warp/plane collective ops (`Plane::Ops`) are available.
+    pub has_plane: bool,
+    /// Whether f64 storage/arithmetic is supported (true on cpu, false on hip).
+    pub has_f64: bool,
+    /// Whether f32 atomic-add is registered (false on cpu, true on hip).
+    pub has_f32_atomic: bool,
+    /// The maximum plane (warp) size; 1 on cubecl-cpu, 32 on gfx1100 (wave32).
+    pub plane_size: u32,
+}
+
+/// The reduction strategy selected from the probed [`Capabilities`].
+///
+/// On cubecl-cpu the only available path is [`ReducePath::Sequential`] (the
+/// single-owner ordered f64 fold that is the deterministic anchor). On a
+/// plane-capable runtime [`ReducePath::Plane`] may be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReducePath {
+    /// Single-owner ordered fold (cubecl-cpu anchor; the C++ `num_threads=1` order).
+    Sequential,
+    /// Warp/plane collective reduction (plane-capable runtimes only).
+    Plane,
+}
+
+impl Capabilities {
+    /// Derive the reduce path: `Plane` iff plane collectives are available,
+    /// else `Sequential`.
+    #[must_use]
+    pub fn reduce_path(&self) -> ReducePath {
+        if self.has_plane {
+            ReducePath::Plane
+        } else {
+            ReducePath::Sequential
+        }
+    }
+}
+
+/// The f64 scalar storage type used to query f64 support.
+fn f64_type() -> Type {
+    Type::new(StorageType::Scalar(ElemType::Float(FloatKind::F64)))
+}
+
+/// The scalar (vector-size 1) f32 atomic type used to query atomic-add support.
+fn f32_atomic_type() -> Type {
+    Type::new(StorageType::Atomic(ElemType::Float(FloatKind::F32))).with_vector_size(1)
+}
+
+/// Probe the active runtime's capabilities via the verified cubecl 0.10.0 API
+/// (CMP-04). Queried once at backend startup.
+///
+/// - `has_plane`  ← `client.features().plane.contains(Plane::Ops)`
+/// - `has_f64`    ← `client.features().supports_type(f64)`
+/// - `has_f32_atomic` ← `client.properties().atomic_type_usage(f32_atomic).contains(AtomicUsage::Add)`
+/// - `plane_size` ← `client.properties().hardware.plane_size_max`
+#[must_use]
+pub fn probe_capabilities<R: Runtime>(client: &ComputeClient<R>) -> Capabilities {
+    let has_plane = client.features().plane.contains(Plane::Ops);
+    let has_f64 = client.features().supports_type(f64_type());
+    let has_f32_atomic = client
+        .properties()
+        .atomic_type_usage(f32_atomic_type())
+        .contains(AtomicUsage::Add);
+    let plane_size = client.properties().hardware.plane_size_max;
+
+    Capabilities {
+        has_plane,
+        has_f64,
+        has_f32_atomic,
+        plane_size,
+    }
+}
+
+/// The active CubeCL runtime for the `cpu` feature build (the D-04 anchor).
+///
+/// Re-exported behind this crate's seam so no upstream crate names a cubecl
+/// runtime (CMP-01).
+#[cfg(feature = "cpu")]
+pub type ActiveRuntime = cubecl::cpu::CpuRuntime;
+
+/// Construct a compute client for the cpu reference runtime.
+///
+/// This is the runtime-selection entry for the default (cpu) build. The opt-in
+/// `rocm` path ([`rocm_client`]) is compiled only under `#[cfg(feature = "rocm")]`.
+#[cfg(feature = "cpu")]
+#[must_use]
+pub fn cpu_client() -> ComputeClient<cubecl::cpu::CpuRuntime> {
+    cubecl::cpu::CpuRuntime::client(&cubecl::cpu::CpuDevice)
+}
+
+/// Construct a compute client for the ROCm/HIP runtime (opt-in, gfx-class GPUs).
+///
+/// Compiled only when the `rocm` feature is enabled, so the default build never
+/// references `cubecl::hip` and needs no ROCm toolchain (SC#1, CMP-03).
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn rocm_client() -> ComputeClient<cubecl::hip::HipRuntime> {
+    cubecl::hip::HipRuntime::client(&cubecl::hip::AmdDevice::new(0))
+}
