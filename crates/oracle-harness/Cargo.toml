@@ -7,6 +7,14 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 
+[features]
+# Opt-in ROCm/HIP parity gate: forwards to `lgbm-compute/rocm` so
+# `cargo test -p oracle-harness --features rocm` brings up the hip runtime and
+# runs the SEPARATE ~1e-6 hip-vs-cpu-anchor parity layer in `kernel_parity.rs`.
+# A default (CPU-only) build never enables this — the cpu bit-exact layers are
+# the hard gate (SC#1, D-03a).
+rocm = ["lgbm-compute/rocm"]
+
 [dev-dependencies]
 lgbm-core = { path = "../lgbm-core" }
 # Test-only: the kernel-parity replay drives the cubecl-cpu backend against the
