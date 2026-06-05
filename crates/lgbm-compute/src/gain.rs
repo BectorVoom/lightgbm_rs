@@ -281,6 +281,14 @@ impl SplitInfo {
     /// field at its C++ default. Mirrors the freshly-constructed C++ `SplitInfo`
     /// after `FindBestThreshold` sets `output->gain = kMinScore` and finds no
     /// improving candidate.
+    ///
+    /// INVARIANT (WR-03): on a no-split result `default_left` is a **don't-care
+    /// sentinel**, not a meaningful routing decision. We hard-code `true` to
+    /// match the C++ default-constructed `SplitInfo::default_left = true`
+    /// (`split_info.hpp`), but consumers MUST gate on `gain != kMinScore`
+    /// (equivalently `is_splittable`) before reading `default_left`; it carries
+    /// no information when no split was found. The bit-exact parity gate only
+    /// asserts `default_left` on splittable winners for this reason.
     pub fn none() -> Self {
         Self {
             threshold: 0,
