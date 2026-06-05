@@ -67,7 +67,10 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
 
     // --- Stage 2: seed derivation (EXACT C++ order) --------------------------
     // config.cpp lines 259-268. A fresh Random(seed); int_max = i16::MAX.
-    if let Some(seed_str) = resolved.get("seed") {
+    // `present()` treats an absent OR empty value as "not provided" (C++ Get*
+    // guard `count(name) > 0 && !empty()`), so {seed:""} keeps the default seed
+    // and skips derivation entirely — the six sub-seeds keep their defaults.
+    if let Some(seed_str) = present(&resolved, "seed") {
         let seed = parse_int("seed", seed_str)?;
         cfg.seed = seed;
         let mut rand = Random::new(seed);
@@ -82,24 +85,26 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
 
     // --- Enum-typed parses (config.cpp GetTaskType/GetBoostingType/... ) ------
     // These run BEFORE GetMembersFromString in C++ (config.cpp lines 270-279).
-    if let Some(v) = resolved.get("task") {
+    // All six enum reads route through `present()` so an empty-string value is
+    // treated as ABSENT (no-op, default stands), matching the C++ Get* guard.
+    if let Some(v) = present(&resolved, "task") {
         cfg.task = parse_task(v)?;
     }
-    if let Some(v) = resolved.get("boosting") {
+    if let Some(v) = present(&resolved, "boosting") {
         cfg.boosting = parse_boosting(v)?;
     }
-    if let Some(v) = resolved.get("data_sample_strategy") {
+    if let Some(v) = present(&resolved, "data_sample_strategy") {
         cfg.data_sample_strategy = parse_data_sample_strategy(v)?;
     }
-    if let Some(v) = resolved.get("objective") {
+    if let Some(v) = present(&resolved, "objective") {
         // No closed enum in C++ (ParseObjectiveAlias is a passthrough for
         // unknowns), but the validation tests expect "nonsense" → UnknownValue.
         cfg.objective = parse_objective(v)?;
     }
-    if let Some(v) = resolved.get("device_type") {
+    if let Some(v) = present(&resolved, "device_type") {
         cfg.device_type = parse_device_type(v)?;
     }
-    if let Some(v) = resolved.get("tree_learner") {
+    if let Some(v) = present(&resolved, "tree_learner") {
         cfg.tree_learner = parse_tree_learner(v)?;
     }
 
