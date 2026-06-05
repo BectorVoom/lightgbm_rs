@@ -438,7 +438,13 @@ end of parameters\n
 
 **This table is empty of `[ASSUMED]` claims** — every behavioral statement cites a specific C++ source line. The capture-feasibility and feature-importance items are surfaced as Open Questions, not assumptions.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All four open questions are closed by the Phase-3 plans (planning gate, not an execution blocker):
+> - **Q1 (raw-row predict path)** — RESOLVED: 03-02-T3 + PATTERNS `predict.rs` materialize raw `f64` rows directly, bypassing `Dataset::construct` (mirror C++ `Predictor`).
+> - **Q2 (golden-capture path)** — RESOLVED: 03-01-T3 `checkpoint:decision` (blocking-human) selects path B (pip `lightgbm` train+dump) with transcription fallback; provenance recorded in `REFERENCE_MANIFEST.md`.
+> - **Q3 (`feature_importances:` round-trip)** — RESOLVED: 03-02-T2 recomputes `FeatureImportance` (split-count default) with the byte-exact golden as arbiter.
+> - **Q4 (three formatters)** — RESOLVED: 03-01-T2 implements `format_g17` (`{:.17g}`) + `format_g6` (`{:g}`) with the shrinkage/ostream case settled against the golden.
 
 1. **Does `lgbm-dataset` expose RAW per-row feature values for the predict path (D-02a)?**
    - What we know: D-02a requires prediction on raw `f64` feature values against stored real thresholds — NOT the binned representation. The Phase-2 `from_mat`/`from_csr`/`from_csc` produce a `FinishedDataset` of *binned* columns.
