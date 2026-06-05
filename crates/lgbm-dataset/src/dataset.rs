@@ -38,9 +38,17 @@ pub struct Dataset {
     /// C++ `std::vector<int> feature2group_` — real feature index -> group id.
     /// In the one-feature-per-group default `feature2group_[f] == f`.
     feature2group_: Vec<i32>,
-    /// C++ `std::vector<int> feature2subfeature_` — real feature -> sub-feature
+    /// C++ `std::vector<int> feature2subfeature_` — packed feature -> sub-feature
     /// index within its group (0 in the default path).
     feature2subfeature_: Vec<i32>,
+    /// C++ `std::vector<int> real_feature_idx_` — packed feature index -> real
+    /// (original) feature index. In the one-feature-per-group default this is the
+    /// identity; in the EFB-bundled path the shuffle reorders it.
+    real_feature_idx_: Vec<i32>,
+    /// C++ `std::vector<int> used_feature_map_` — real feature index -> packed
+    /// feature index (-1 for trivial/unused features). The inverse of
+    /// `real_feature_idx_`; lets callers push by REAL feature index.
+    used_feature_map_: Vec<i32>,
 }
 
 /// The per-column SAMPLE inputs Exclusive Feature Bundling consumes (mirrors the
@@ -81,12 +89,17 @@ impl Dataset {
         // One-feature-per-group: feature f lives at group f, sub-feature 0.
         let feature2group_ = (0..num_features_).collect();
         let feature2subfeature_ = vec![0; num_features_ as usize];
+        // packed index == real index (identity) in the no-bundle default.
+        let real_feature_idx_ = (0..num_features_).collect();
+        let used_feature_map_ = (0..num_features_).collect();
         Ok(Dataset {
             num_data_: num_data,
             num_features_,
             feature_groups_,
             feature2group_,
             feature2subfeature_,
+            real_feature_idx_,
+            used_feature_map_,
         })
     }
 
@@ -155,6 +168,8 @@ impl Dataset {
         let mut feature2group_ = vec![-1i32; num_features_ as usize];
         let mut feature2subfeature_ = vec![-1i32; num_features_ as usize];
         let mut real_feature_idx_ = vec![-1i32; num_features_ as usize];
+        // real feature index -> packed index (C++ used_feature_map_), -1 if unused.
+        let mut used_feature_map_ = vec![-1i32; num_total_features as usize];
 
         let mut feature_groups_ = Vec::with_capacity(features_in_group.len());
         let mut cur_fidx = 0i32;
@@ -163,6 +178,7 @@ impl Dataset {
             let mut cur_bin_mappers = Vec::with_capacity(cur_features.len());
             for (j, &real_fidx) in cur_features.iter().enumerate() {
                 real_feature_idx_[cur_fidx as usize] = real_fidx;
+                used_feature_map_[real_fidx as usize] = cur_fidx;
                 feature2group_[cur_fidx as usize] = i as i32;
                 feature2subfeature_[cur_fidx as usize] = j as i32;
                 cur_bin_mappers.push(
@@ -188,41 +204,65 @@ impl Dataset {
             feature_groups_,
             feature2group_,
             feature2subfeature_,
+            real_feature_idx_,
+            used_feature_map_,
         })
     }
 
-    /// Push a single feature value at `(row, feature)`. Routes through the owning
-    /// `FeatureGroup::push_data` via the `feature2group_` / `feature2subfeature_`
-    /// maps (in the one-feature-per-group default this is group=feature, sub=0).
-    pub fn push_value(&mut self, feature: usize, row: i32, value: f64) {
-        let group = self.feature2group_[feature] as usize;
-        let sub = self.feature2subfeature_[feature] as usize;
+    /// Push a single feature value at `(real_feature, row)`. Translates the REAL
+    /// feature index to its packed index via `used_feature_map_` (C++
+    /// `Dataset::PushOneRow`/`used_feature_map_`), then routes through the owning
+    /// `FeatureGroup::push_data` via `feature2group_`/`feature2subfeature_`. In the
+    /// one-feature-per-group default the real index == packed index; in the
+    /// EFB-bundled path the shuffle makes them differ, so the translation is
+    /// load-bearing.
+    pub fn push_value(&mut self, real_feature: usize, row: i32, value: f64) {
+        let packed = self.used_feature_map_[real_feature];
+        if packed < 0 {
+            return; // trivial / unused feature has no store
+        }
+        let group = self.feature2group_[packed as usize] as usize;
+        let sub = self.feature2subfeature_[packed as usize] as usize;
         self.feature_groups_[group].push_data(sub, row, value);
     }
 
-    /// Real feature index -> group id (C++ `feature2group_`).
-    pub fn feature_to_group(&self, feature: usize) -> i32 {
-        self.feature2group_[feature]
+    /// Real feature index -> group id (via `used_feature_map_`); -1 if the feature
+    /// is trivial/unused (no group).
+    pub fn feature_to_group(&self, real_feature: usize) -> i32 {
+        let packed = self.used_feature_map_[real_feature];
+        if packed < 0 {
+            -1
+        } else {
+            self.feature2group_[packed as usize]
+        }
     }
 
-    /// Real feature index -> sub-feature index within its group.
-    pub fn feature_to_subfeature(&self, feature: usize) -> i32 {
-        self.feature2subfeature_[feature]
+    /// Real feature index -> sub-feature index within its group; -1 if unused.
+    pub fn feature_to_subfeature(&self, real_feature: usize) -> i32 {
+        let packed = self.used_feature_map_[real_feature];
+        if packed < 0 {
+            -1
+        } else {
+            self.feature2subfeature_[packed as usize]
+        }
     }
 
-    /// Push a full row (one value per feature).
+    /// Push a full row (one value per REAL feature). Each value is routed through
+    /// [`Dataset::push_value`] (real -> packed translation), so this is correct in
+    /// both the no-bundle and EFB-bundled paths. The row width is the number of
+    /// REAL features (`used_feature_map_.len()`).
     pub fn push_row(&mut self, row: i32, values: &[f64]) -> Result<(), DatasetError> {
-        if values.len() as i32 != self.num_features_ {
+        if values.len() != self.used_feature_map_.len() {
             return Err(DatasetError::ShapeMismatch {
                 detail: format!(
-                    "row has {} values, expected num_features={}",
+                    "row has {} values, expected num_real_features={}",
                     values.len(),
-                    self.num_features_
+                    self.used_feature_map_.len()
                 ),
             });
         }
         for (feature, &v) in values.iter().enumerate() {
-            self.feature_groups_[feature].push_data(0, row, v);
+            self.push_value(feature, row, v);
         }
         Ok(())
     }
@@ -241,6 +281,8 @@ impl Dataset {
             feature_groups_: self.feature_groups_,
             feature2group_: self.feature2group_,
             feature2subfeature_: self.feature2subfeature_,
+            real_feature_idx_: self.real_feature_idx_,
+            used_feature_map_: self.used_feature_map_,
         }
     }
 
@@ -265,6 +307,8 @@ pub struct FinishedDataset {
     feature_groups_: Vec<FeatureGroup>,
     feature2group_: Vec<i32>,
     feature2subfeature_: Vec<i32>,
+    real_feature_idx_: Vec<i32>,
+    used_feature_map_: Vec<i32>,
 }
 
 impl FinishedDataset {
@@ -288,14 +332,32 @@ impl FinishedDataset {
         &self.feature_groups_[group]
     }
 
-    /// Real feature index -> group id (C++ `feature2group_`), for EFB goldens.
-    pub fn feature_to_group(&self, feature: usize) -> i32 {
-        self.feature2group_[feature]
+    /// Real feature index -> group id (via `used_feature_map_`), for EFB goldens.
+    /// -1 if the feature is trivial/unused.
+    pub fn feature_to_group(&self, real_feature: usize) -> i32 {
+        let packed = self.used_feature_map_[real_feature];
+        if packed < 0 {
+            -1
+        } else {
+            self.feature2group_[packed as usize]
+        }
     }
 
-    /// Real feature index -> sub-feature index within its group.
-    pub fn feature_to_subfeature(&self, feature: usize) -> i32 {
-        self.feature2subfeature_[feature]
+    /// Real feature index -> sub-feature index within its group; -1 if unused.
+    pub fn feature_to_subfeature(&self, real_feature: usize) -> i32 {
+        let packed = self.used_feature_map_[real_feature];
+        if packed < 0 {
+            -1
+        } else {
+            self.feature2subfeature_[packed as usize]
+        }
+    }
+
+    /// Packed feature index -> real (original) feature index (C++
+    /// `real_feature_idx_`). The inverse of `feature_to_group`'s lookup; useful
+    /// for dumping group-major membership in the EFB golden order.
+    pub fn real_feature_idx(&self, packed: usize) -> i32 {
+        self.real_feature_idx_[packed]
     }
 }
 
