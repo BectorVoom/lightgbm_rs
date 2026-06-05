@@ -34,7 +34,7 @@
 use lgbm_core::config::Config;
 
 pub use crate::bin_mapper::{create_sample_indices, sample_count};
-use crate::bin_mapper::BinMapper;
+use crate::bin_mapper::{scaled_filter_cnt, BinMapper};
 use crate::dataset::FinishedDataset;
 use crate::error::DatasetError;
 use crate::metadata::Metadata;
@@ -87,11 +87,17 @@ fn build_mapper(column: &[f64], cfg: &Config) -> BinMapper {
     );
     let sampled: Vec<f64> = indices.iter().map(|&i| column[i as usize]).collect();
     let total_sample_cnt = sampled.len();
+    // SCALED pre-filter threshold via the SINGLE source-of-truth helper (shared
+    // with bin_mapper.rs::find_bin_from_column) — C++ feeds the SCALED filter_cnt,
+    // NOT the raw min_data_in_leaf, to FindBin (dataset_loader.cpp:623-624). Here
+    // total_sample_cnt = k (the sampled count) and num_rows = total_nrow, matching
+    // the dense c_api convention (CSR/CSC use the identical convention).
+    let filter_cnt = scaled_filter_cnt(cfg.min_data_in_leaf, total_sample_cnt as i32, total_nrow);
     BinMapper::find_bin_numeric(
         sampled,
         cfg.max_bin,
         cfg.min_data_in_bin,
-        cfg.min_data_in_leaf,
+        filter_cnt,
         cfg.feature_pre_filter,
         cfg.use_missing,
         cfg.zero_as_missing,

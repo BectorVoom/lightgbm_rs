@@ -631,12 +631,19 @@ impl BinMapper {
     /// `column` is the full per-row feature column (f64-widened). Sampling clamps
     /// `k = min(num_rows, bin_construct_sample_cnt)` and gathers the sampled rows'
     /// values; `total_sample_cnt = k` (matching the C-API in-memory sample path).
+    ///
+    /// The pre-filter threshold passed to `find_bin_numeric` is the SCALED
+    /// `filter_cnt` computed by [`scaled_filter_cnt`] from the raw
+    /// `min_data_in_leaf` (this is the SINGLE filter_cnt site shared with
+    /// `ingest.rs::build_mapper`) — NOT the raw `min_data_in_leaf`. C++
+    /// `DatasetLoader::ConstructFromSampleData` (dataset_loader.cpp:623-624)
+    /// performs the same scaling before `FindBin`.
     #[allow(clippy::too_many_arguments)]
     pub fn find_bin_from_column(
         column: &[f64],
         max_bin: i32,
         min_data_in_bin: i32,
-        min_split_data: i32,
+        min_data_in_leaf: i32,
         pre_filter: bool,
         use_missing: bool,
         zero_as_missing: bool,
@@ -648,11 +655,14 @@ impl BinMapper {
         let indices = create_sample_indices(total_nrow, bin_construct_sample_cnt, data_random_seed);
         let sampled: Vec<f64> = indices.iter().map(|&i| column[i as usize]).collect();
         let total_sample_cnt = sampled.len();
+        // SINGLE source-of-truth scaled filter_cnt (shared with build_mapper):
+        // total_sample_size = k (the sampled count), num_dist_data = total_nrow.
+        let filter_cnt = scaled_filter_cnt(min_data_in_leaf, total_sample_cnt as i32, total_nrow);
         BinMapper::find_bin_numeric(
             sampled,
             max_bin,
             min_data_in_bin,
-            min_split_data,
+            filter_cnt,
             pre_filter,
             use_missing,
             zero_as_missing,
@@ -671,6 +681,43 @@ fn arg_max(v: &[i32]) -> usize {
         }
     }
     best
+}
+
+/// SINGLE source of truth for the SCALED pre-filter threshold C++
+/// `DatasetLoader::ConstructFromSampleData` feeds `FindBin`
+/// (`dataset_loader.cpp:623-624`):
+///
+/// ```text
+/// const data_size_t filter_cnt = static_cast<data_size_t>(
+///     static_cast<double>(config_.min_data_in_leaf * total_sample_size) / num_dist_data);
+/// ```
+///
+/// For the in-memory sample path (`c_api.cpp:1360-1374` dense, `:1425-1452` CSR,
+/// `:1488-1521` CSC — all identical) `total_sample_size = sample_cnt` (the count
+/// of sampled rows, `k`) and `num_dist_data = total_nrow` (the full row count).
+///
+/// # Integer-truncation semantics
+///
+/// C++ multiplies two `int`s, widens to `double`, divides, then truncates back to
+/// `data_size_t` (`int32`). For the in-range integer magnitudes here the i64
+/// integer divide is bit-identical to the double divide-then-truncate (the
+/// product fits in 53 mantissa bits, so the double is exact and truncation toward
+/// zero matches integer division for non-negative operands). We compute it in
+/// `i64` to avoid the intermediate `i32` overflow C++ technically risks.
+///
+/// # `num_rows == 0` guard (RUST-ONLY, parity-unobservable)
+///
+/// When `num_rows == 0` we return `min_data_in_leaf` to avoid a divide-by-zero.
+/// This branch has NO C++ analog: C++ never reaches `FindBin` with an empty
+/// dataset (zero rows), so the value returned here is never observed against the
+/// reference — it exists solely as a defensive guard on the degenerate
+/// empty-matrix edge.
+pub fn scaled_filter_cnt(min_data_in_leaf: i32, total_sample_cnt: i32, num_rows: i32) -> i32 {
+    if num_rows == 0 {
+        // Rust-only defensive branch; no C++ analog (see doc above).
+        return min_data_in_leaf;
+    }
+    ((min_data_in_leaf as i64 * total_sample_cnt as i64) / num_rows as i64) as i32
 }
 
 /// C++ `NeedFilter` (`bin.cpp:54-76`), numerical branch (categorical wired later).
@@ -1181,6 +1228,20 @@ mod tests {
             m.is_trivial_,
             "feature with no valid split given min_split_data=50 must be filtered trivial"
         );
+    }
+
+    #[test]
+    fn scaled_filter_cnt_matches_cpp_integer_truncation() {
+        // dataset_loader.cpp:623-624: filter_cnt = (int)((double)(min_data_in_leaf
+        // * total_sample_size) / num_dist_data). For the default-config divergence
+        // case: (20 * 50) / 200 = 5 (NOT the raw 20).
+        assert_eq!(scaled_filter_cnt(20, 50, 200), 5, "(20*50)/200 = 5");
+        // When all rows are sampled (sample_cnt == num_rows) the scale is 1:1.
+        assert_eq!(scaled_filter_cnt(20, 200, 200), 20, "(20*200)/200 = 20");
+        // Integer truncation toward zero: (20 * 49) / 200 = 980/200 = 4.9 -> 4.
+        assert_eq!(scaled_filter_cnt(20, 49, 200), 4, "truncates 4.9 -> 4");
+        // num_rows == 0 guard (Rust-only, parity-unobservable): returns raw.
+        assert_eq!(scaled_filter_cnt(20, 0, 0), 20, "empty-matrix guard returns raw");
     }
 
     // -----------------------------------------------------------------------
