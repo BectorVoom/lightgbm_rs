@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 4 context gathered
-last_updated: "2026-06-05T12:47:43.906Z"
-last_activity: 2026-06-05 -- Phase 04 planning complete
+stopped_at: Completed 04-01-PLAN.md
+last_updated: "2026-06-05T18:40:48.000Z"
+last_activity: 2026-06-05 -- Plan 04-01 executed (compute foundation + D-04a spike PASS)
 progress:
   total_phases: 8
   completed_phases: 3
-  total_plans: 14
-  completed_plans: 14
-  percent: 38
+  total_plans: 18
+  completed_plans: 15
+  percent: 42
 ---
 
 # Project State
@@ -21,16 +21,28 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 4 — Compute Backend (CPU-first integer histograms → ROCm)
+**Current focus:** Phase 04 — compute-backend-cpu-first-integer-histograms-rocm
 
 ## Current Position
 
-Phase: 4
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-06-05 -- Phase 04 planning complete
+Phase: 04 (compute-backend-cpu-first-integer-histograms-rocm) — EXECUTING
+Plan: 2 of 4 (04-01 complete)
+Status: Executing Phase 04
+Last activity: 2026-06-05 -- Plan 04-01 executed (compute foundation + D-04a spike PASS)
 
-Progress: [██████████] Phase 3 complete — 4/4 plans executed & verified; PRD-01/02/03/06 + DAT-08/DAT-09 all PASS
+Progress: [██████████] Phase 3 complete; Phase 4 plan 1/4 done — D-04a bit-determinism bet SETTLED (cubecl-cpu fold bit-exact), ComputeError + runtime/capability gate + CMP-01 guard in place
+
+### Plan 04-01 result
+
+Plan 04-01 built the Phase-4 compute foundation and settled the load-bearing D-04a determinism bet BEFORE the kernel suite:
+
+- **D-04a SETTLED (keystone):** the cubecl-cpu single-owner ordered f64 fold (`CubeDim::new_1d(1)`, transcribing `dense_bin.hpp:120-135`) is byte-identical across 25 launches AND bit-exact (`to_bits()`) vs a hand-computed C++-order sequential f64 fold. The bit-exact anchor assumption holds — no ~1e-6 fallback, no separate scalar reference. 04-02/04-03 may build on it.
+- **ComputeError** thiserror boundary (BinIndexOutOfRange/LengthMismatch/CapabilityUnavailable/Runtime, V5/T-04-01); `lgbm-compute` now has cpu-default / rocm-opt-in features.
+- **Capability gate (CMP-04)** reports the verified asymmetric cpu matrix (plane=false, f64=true, atomic=false, size=1 → Sequential).
+- **CMP-01 containment guard** green (no upper crate names cubecl).
+- 1 Rule-1 bug fixed: `client.empty()` returns recycled uninitialized pool memory → zero-init `out` (the spike caught it). `cargo test --workspace` green. Commits: 0021114, ef69c91, c9669f6.
+
+Next: `/gsd-execute-phase 4` plan 04-02 (full histogram kernel + C++-transcription golden capture).
 
 ### Resume
 
@@ -110,6 +122,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 03 P01 | ~20 min | 4 tasks | 29 files |
 | Phase 03 P02 | ~7 min | 3 tasks | 8 files |
 | Phase 03 P03 | ~12 min | 2 tasks | 6 files |
+| Phase 04 P01 | ~8 min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -139,6 +152,8 @@ Recent decisions affecting current work:
 - [Phase 03]: parameters tail (incl pandas_categorical) preserved verbatim on round-trip
 - [Phase 03]: Tree parser stricter than C++: validates array lengths + node indices before indexing
 - [Phase ?]: 03-03: ConvertOutput parsed from objective= line (not Config); non-core objectives -> ModelError; softmax max-subtraction; leaf per-(iter x class) stride
+- [Phase 4 exec, 2026-06-05]: **D-04a SETTLED — cubecl-cpu IS a bit-exact deterministic anchor.** The single-owner ordered f64 fold (`#[cube]` kernel launched with `CubeCount::Static(1,1,1)` + `CubeDim::new_1d(1)`, so exactly one cube unit owns the entire fold) is byte-identical across 25 launches AND bit-exact (`to_bits()`) vs a hand-computed sequential f64 fold in C++ `dense_bin.hpp:120-135` order (f32 read / f64 accumulate, `hist_t=double`, stride-2 `[grad,hess]` at `bin<<1`). This empirically confirms the D-04 anchor assumption despite cubecl-cpu spawning one OS worker thread per cube unit (RESEARCH Pitfall 1) — the ~1e-6 fallback and a separate scalar reference are NOT needed. The kernel MUST zero-initialize `out` explicitly (`client.create_from_slice(&zeros)`) because `client.empty()` returns recycled uninitialized pool memory (Rule-1 bug the spike caught).
+- [Phase 4 exec, 2026-06-05]: **CMP-04 capability gate locked (cpu matrix).** `probe_capabilities` queries `client.features().plane.contains(Plane::Ops)` (false on cpu), `client.features().supports_type(f64)` (true), `client.properties().atomic_type_usage(f32_atomic).contains(AtomicUsage::Add)` (false), and `client.properties().hardware.plane_size_max` (1) → `ReducePath::Sequential`. The Sequential single-owner fold IS the cpu path, not a fallback. cubecl type names confined to `lgbm-compute` (`cpu` default feature, `rocm` opt-in via `cubecl/hip` behind `#[cfg]`); CMP-01 guard test enforces no upper crate names cubecl.
 
 ### Pending Todos
 
@@ -162,6 +177,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T12:08:35.738Z
-Stopped at: Phase 4 context gathered
-Resume file: .planning/phases/04-compute-backend-cpu-first-integer-histograms-rocm/04-CONTEXT.md
+Last session: 2026-06-05T18:40:48.000Z
+Stopped at: Completed 04-01-PLAN.md
+Resume file: None

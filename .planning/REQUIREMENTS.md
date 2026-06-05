@@ -91,10 +91,10 @@
 
 ### Compute Backend (CubeCL)
 
-- [ ] **CMP-01**: `lgbm-compute` backend trait isolating all device ops behind one crate (contains CubeCL alpha churn)
-- [ ] **CMP-02**: CPU backend (cubecl-cpu) as the deterministic reference execution path
+- [x] **CMP-01**: `lgbm-compute` backend trait isolating all device ops behind one crate (contains CubeCL alpha churn) — *04-01: Backend::Runtime bound to cubecl::Runtime; cpu-default/rocm-opt-in features; CMP-01 containment guard test green (no upper crate names cubecl)*
+- [ ] **CMP-02**: CPU backend (cubecl-cpu) as the deterministic reference execution path — *04-01: deterministic anchor PROVEN (D-04a spike: single-owner ordered f64 fold bit-exact across 25 launches + vs C++-order sequential fold); full reference kernel suite lands 04-02/04-03*
 - [ ] **CMP-03**: ROCm/HIP backend (cubecl-hip) selectable via Cargo feature and/or runtime config
-- [ ] **CMP-04**: CUDA warp-level operations mapped onto CubeCL's `Plane` API with capability gating and sequential fallback
+- [x] **CMP-04**: CUDA warp-level operations mapped onto CubeCL's `Plane` API with capability gating and sequential fallback — *04-01: probe_capabilities gates Plane::Ops/f64/f32-atomic; cpu matrix → ReducePath::Sequential (the single-owner fold IS the cpu path); capability test asserts the verified matrix*
 - [ ] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the ~1e-6 (f32) contract
 
 ### Oracle & Validation
@@ -168,10 +168,10 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | PRD-02 | Phase 3 | Complete |
 | PRD-03 | Phase 3 | Complete |
 | PRD-06 | Phase 3 | Complete |
-| CMP-01 | Phase 4 | Pending |
-| CMP-02 | Phase 4 | Pending |
+| CMP-01 | Phase 4 | Complete (04-01) |
+| CMP-02 | Phase 4 | Partial (04-01: anchor proven; suite 04-02/03) |
 | CMP-03 | Phase 4 | Pending |
-| CMP-04 | Phase 4 | Pending |
+| CMP-04 | Phase 4 | Complete (04-01) |
 | CMP-05 | Phase 4 | Pending |
 | ORA-04 | Phase 4 | Pending |
 | TRL-01 | Phase 5 | Pending |

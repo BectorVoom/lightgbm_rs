@@ -145,7 +145,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1** (foundation + D-04a determinism spike FIRST)
 
-  - [ ] 04-01-PLAN.md — ComputeError + cpu/rocm runtime selection + startup capability gate + minimal histogram kernel + the D-04a bit-determinism spike (RUN FIRST) + CMP-01 containment guard
+  - [x] 04-01-PLAN.md — ComputeError + cpu/rocm runtime selection + startup capability gate + minimal histogram kernel + the D-04a bit-determinism spike (RUN FIRST) + CMP-01 containment guard — **DONE: D-04a SETTLED (cubecl-cpu fold bit-exact, 25 launches + vs C++-order sequential); CMP-01/02/04 foundation in place; cargo test --workspace green**
 
 **Wave 2** *(blocked on 04-01)*
 
