@@ -34,7 +34,9 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. The Cargo workspace (loosely-coupled crates by responsibility) builds under edition 2024 with `Cargo.lock` and `rust-toolchain.toml` committed; `thiserror` domain errors exist at crate boundaries and `anyhow` propagates at app/test layers.
   4. A config struct accepts the ~110 in-scope hyperparameters, resolves aliases (`num_iteration`/`n_estimators`/`num_boost_round`, etc.) via a data table matching `config_auto.cpp`, and rejects invalid combos with typed `Result` errors mirroring C++ `Config::Set` CHECK constraints.
   5. The f32 single-precision data-type contract and ~1e-6 oracle tolerance (standard f32 histogram/score accumulations, no integer-quantized reduction strategy) is documented as a Key Decision in PROJECT.md so no later phase targets an unfalsifiable invariant.
-**Plans**: TBD
+**Plans**: 2 plans
+  - [ ] 01-01-PLAN.md — Walking-skeleton spine: virtual workspace + f32 types/errors + bit-exact Random LCG + oracle comparator + pinned C++ RNG golden/manifest
+  - [ ] 01-02-PLAN.md — Hand-ported flat Config: struct/defaults + verbatim alias table + seed derivation + typed CHECK validation + drift-checker
 
 ### Phase 2: Dataset + Binning (determinism root)
 **Goal**: A binned, immutable columnar dataset whose bin boundaries and bin assignments are bit-identical to C++ — the determinism root every downstream split inherits.
@@ -134,7 +136,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Oracle Contract + Foundations | 0/TBD | Not started | - |
+| 1. Oracle Contract + Foundations | 0/2 | Planned | - |
 | 2. Dataset + Binning | 0/TBD | Not started | - |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
