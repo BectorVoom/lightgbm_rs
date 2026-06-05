@@ -1,3 +1,7 @@
 //! `#[cube]` compute kernels (CMP-05).
 //!
-//! Filled in Task 3 of plan 04-01.
+//! This plan (04-01) ships the minimal `construct_histograms` kernel that
+//! settles the D-04a bit-determinism bet; `find_best_split` / `data_partition`
+//! / `subtract_histograms` land in 04-02/04-03.
+
+pub mod histogram;
