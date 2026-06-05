@@ -39,6 +39,20 @@ pub enum Mismatch {
         /// Tolerance that was exceeded.
         tol: f32,
     },
+    /// An exact-equality comparison diverged at `index`. Used by the binning
+    /// goldens (bin-index vectors, f64-bit boundary arrays, storage bytes) which
+    /// are compared bit-exact, NOT within the `~1e-6` oracle tolerance.
+    ///
+    /// The diverging values are rendered as strings so the same variant serves
+    /// `u32`, raw-`f64`-bits, and `u8` comparisons with one first-divergence shape.
+    ExactMismatch {
+        /// First offending index.
+        index: usize,
+        /// Rust value at that index (rendered).
+        rust: String,
+        /// C++ golden value at that index (rendered).
+        cpp: String,
+    },
 }
 
 impl fmt::Display for Mismatch {
@@ -57,6 +71,10 @@ impl fmt::Display for Mismatch {
             } => write!(
                 f,
                 "value mismatch at index {index}: rust={rust}, cpp={cpp}, abs_diff={abs_diff} > tol={tol}"
+            ),
+            Mismatch::ExactMismatch { index, rust, cpp } => write!(
+                f,
+                "exact mismatch at index {index}: rust={rust}, cpp={cpp}"
             ),
         }
     }
@@ -91,4 +109,118 @@ pub fn compare_within(rust: &[f32], cpp: &[f32], tol: f32) -> Result<(), Mismatc
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Exact-equality comparators for the binning goldens (Phase 2).
+//
+// Binning is compared bit-exact — bin-index vectors, the f64 `bin_upper_bound_`
+// array (via `.to_bits()`), and storage-layout bytes — NOT within the `~1e-6`
+// oracle tolerance. Each reports the first divergence as
+// [`Mismatch::ExactMismatch`] so a parity failure localizes to one index.
+// ---------------------------------------------------------------------------
+
+/// Compares two `u32` slices (e.g. per-row bin-index vectors) for exact
+/// equality, returning the first divergence (or a length mismatch).
+pub fn compare_exact_u32(rust: &[u32], cpp: &[u32]) -> Result<(), Mismatch> {
+    if rust.len() != cpp.len() {
+        return Err(Mismatch::LengthMismatch {
+            rust_len: rust.len(),
+            cpp_len: cpp.len(),
+        });
+    }
+    for (index, (&r, &c)) in rust.iter().zip(cpp.iter()).enumerate() {
+        if r != c {
+            return Err(Mismatch::ExactMismatch {
+                index,
+                rust: r.to_string(),
+                cpp: c.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Compares two `f64` slices (e.g. `bin_upper_bound_`) **bit-exact** by raw IEEE
+/// bit pattern (`f64::to_bits`), NOT within a tolerance. This is the correct
+/// comparison for deterministically-computed bin boundaries: any 1-ULP drift is
+/// a real divergence. `+inf` and `NaN` compare by their canonical bit patterns;
+/// a `NaN` bin sentinel matches another `NaN` only if the bits are identical
+/// (both sides emit the same `f64::NAN` / C++ `NaN`).
+pub fn compare_exact_f64_bits(rust: &[f64], cpp: &[f64]) -> Result<(), Mismatch> {
+    if rust.len() != cpp.len() {
+        return Err(Mismatch::LengthMismatch {
+            rust_len: rust.len(),
+            cpp_len: cpp.len(),
+        });
+    }
+    for (index, (&r, &c)) in rust.iter().zip(cpp.iter()).enumerate() {
+        if r.to_bits() != c.to_bits() {
+            return Err(Mismatch::ExactMismatch {
+                index,
+                rust: format!("{r} (bits=0x{:016X})", r.to_bits()),
+                cpp: format!("{c} (bits=0x{:016X})", c.to_bits()),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Compares two byte slices (e.g. `DenseBin`/`SparseBin` storage layout) for
+/// exact equality, returning the first divergence (or a length mismatch). Used
+/// by later storage-layout goldens.
+pub fn compare_exact_bytes(rust: &[u8], cpp: &[u8]) -> Result<(), Mismatch> {
+    if rust.len() != cpp.len() {
+        return Err(Mismatch::LengthMismatch {
+            rust_len: rust.len(),
+            cpp_len: cpp.len(),
+        });
+    }
+    for (index, (&r, &c)) in rust.iter().zip(cpp.iter()).enumerate() {
+        if r != c {
+            return Err(Mismatch::ExactMismatch {
+                index,
+                rust: format!("0x{r:02X}"),
+                cpp: format!("0x{c:02X}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+
+    #[test]
+    fn exact_u32_matches_and_reports_divergence() {
+        assert!(compare_exact_u32(&[0, 1, 2], &[0, 1, 2]).is_ok());
+        let err = compare_exact_u32(&[0, 9, 2], &[0, 1, 2]).unwrap_err();
+        match err {
+            Mismatch::ExactMismatch { index, .. } => assert_eq!(index, 1),
+            other => panic!("expected ExactMismatch, got {other:?}"),
+        }
+        assert!(matches!(
+            compare_exact_u32(&[0, 1], &[0, 1, 2]),
+            Err(Mismatch::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_f64_bits_distinguishes_one_ulp() {
+        let a = 1.0_f64;
+        let b = a.next_up(); // 1 ULP above
+        assert!(compare_exact_f64_bits(&[a], &[a]).is_ok());
+        let err = compare_exact_f64_bits(&[a], &[b]).unwrap_err();
+        assert!(matches!(err, Mismatch::ExactMismatch { index: 0, .. }));
+        // +inf compares equal by bits.
+        assert!(compare_exact_f64_bits(&[f64::INFINITY], &[f64::INFINITY]).is_ok());
+    }
+
+    #[test]
+    fn exact_bytes_matches_and_reports_divergence() {
+        assert!(compare_exact_bytes(&[0xAB, 0xCD], &[0xAB, 0xCD]).is_ok());
+        let err = compare_exact_bytes(&[0xAB, 0x00], &[0xAB, 0xCD]).unwrap_err();
+        assert!(matches!(err, Mismatch::ExactMismatch { index: 1, .. }));
+    }
 }

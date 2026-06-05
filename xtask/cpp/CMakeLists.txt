@@ -49,3 +49,20 @@ endif()
 # recorded in REFERENCE_MANIFEST.md, not forced here.
 add_executable(rng_capture rng_capture.cpp)
 target_include_directories(rng_capture PRIVATE "${LIGHTGBM_DIR}/include")
+
+# bin_capture: numeric binning goldens (Phase 2, layers 1+2).
+#
+# The authoritative BinMapper::FindBin/ValueToBin live in src/io/bin.cpp, which
+# transitively #includes common.h -> fast_double_parser.h + fmt/format.h from
+# external_libs/. Those submodules are present here only as EMPTY directories
+# (the LightGBM tree is git-untracked and its external_libs are not vendored),
+# so bin.cpp itself cannot be compiled. bin_capture.cpp therefore VERBATIM-
+# transcribes the numeric FindBin/GreedyFindBin/.../ValueToBin/NeedFilter from
+# the pinned bin.cpp/bin.h using the real std::nextafter (== GetDoubleUpperBound)
+# — emitting byte-identical numeric goldens — and includes the header-only
+# LightGBM/include only for the genuine reference Random (sampling). This mirrors
+# the rng_capture header-only discipline (see REFERENCE_MANIFEST.md). It does NOT
+# add_subdirectory the submodule and references NO external_libs header dirs
+# (they are empty / unbuildable in this environment).
+add_executable(bin_capture bin_capture.cpp)
+target_include_directories(bin_capture PRIVATE "${LIGHTGBM_DIR}/include")

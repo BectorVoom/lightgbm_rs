@@ -36,6 +36,12 @@ pub const N_RNG_CASES: u32 = 256;
 /// Number of randomized `Sample` `(N, K)` cases straddling the branch boundary.
 pub const N_SAMPLE_CASES: u32 = 256;
 
+/// The recorded master seed for the Phase-2 numeric binning golden corpus. Like
+/// [`MASTER_SEED`] it is the SINGLE source of randomness for the binning cases
+/// (synthetic distributions + curated edge battery), so `bin-capture` is
+/// idempotent (empty `git diff`). Recorded in REFERENCE_MANIFEST.md.
+pub const BIN_MASTER_SEED: i32 = 0x0B11_BEEF;
+
 /// Pinned LightGBM submodule commit (recorded in the manifest, ORA-02 / D-05).
 pub const LIGHTGBM_COMMIT: &str = "195c26fc7b00eb0fec252dfe841e2e66d6833954";
 
@@ -46,11 +52,12 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("regen") => regen(),
+        Some("bin-capture") => bin_capture(),
         Some(other) => {
-            bail!("unknown subcommand `{other}` (try: regen)");
+            bail!("unknown subcommand `{other}` (try: regen | bin-capture)");
         }
         None => {
-            eprintln!("usage: cargo run -p xtask -- regen");
+            eprintln!("usage: cargo run -p xtask -- <regen | bin-capture>");
             Ok(())
         }
     }
@@ -165,6 +172,94 @@ fn regen() -> Result<()> {
     Ok(())
 }
 
+/// Regenerate the Phase-2 numeric binning golden corpus (layers 1+2).
+///
+/// Mirrors [`regen`]: configures + builds the standalone `bin_capture` C++ target
+/// (header-only against the pinned `LightGBM/include` for the reference Random;
+/// the numeric `FindBin`/`ValueToBin` are verbatim-transcribed in `bin_capture.cpp`
+/// because the submodule's `external_libs/` are not vendored here — see that
+/// file's header), then runs it over the [`BIN_MASTER_SEED`]-derived corpus and
+/// writes `crates/lgbm-dataset/tests/fixtures/numeric_binning.txt`. Idempotent.
+fn bin_capture() -> Result<()> {
+    let root = workspace_root()?;
+    verify_toolchain()?;
+
+    let lightgbm_dir = root.join("LightGBM");
+    if !lightgbm_dir.join("include/LightGBM/utils/random.h").is_file() {
+        bail!(
+            "LightGBM submodule not found at {} (expected include/LightGBM/utils/random.h)",
+            lightgbm_dir.display()
+        );
+    }
+
+    let cpp_dir = root.join("xtask/cpp");
+    let build_dir = root.join("target/xtask-cpp-build");
+    std::fs::create_dir_all(&build_dir)
+        .with_context(|| format!("creating build dir {}", build_dir.display()))?;
+
+    let fixtures_dir = root.join("crates/lgbm-dataset/tests/fixtures");
+    std::fs::create_dir_all(&fixtures_dir)
+        .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
+    let fixture_path = fixtures_dir.join("numeric_binning.txt");
+
+    eprintln!("xtask bin-capture: configuring C++ capture build ...");
+    run(
+        Command::new("cmake")
+            .arg("-S")
+            .arg(&cpp_dir)
+            .arg("-B")
+            .arg(&build_dir)
+            .arg(format!("-DLIGHTGBM_DIR={}", lightgbm_dir.display()))
+            .arg("-DCMAKE_BUILD_TYPE=Release"),
+        "cmake configure",
+    )?;
+
+    eprintln!("xtask bin-capture: building bin_capture ...");
+    run(
+        Command::new("cmake")
+            .arg("--build")
+            .arg(&build_dir)
+            .arg("--target")
+            .arg("bin_capture")
+            .arg("--config")
+            .arg("Release"),
+        "cmake build",
+    )?;
+
+    let exe = locate_exe(&build_dir, "bin_capture")?;
+    eprintln!("xtask bin-capture: running capture ({}) ...", exe.display());
+    run(
+        Command::new(&exe)
+            .arg(&fixture_path)
+            .arg(BIN_MASTER_SEED.to_string()),
+        "bin_capture",
+    )?;
+
+    if !fixture_path.is_file() {
+        bail!(
+            "capture completed but {} was not written",
+            fixture_path.display()
+        );
+    }
+
+    // Refresh the shared reference manifest (regen + bin-capture write the same
+    // file; content is a pure function of the recorded constants, idempotent).
+    let manifest_path = root
+        .join("crates/oracle-harness/fixtures")
+        .join("REFERENCE_MANIFEST.md");
+    write_manifest(&manifest_path)?;
+
+    eprintln!(
+        "xtask bin-capture: done. Wrote {}.",
+        fixture_path.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- bin-capture` and confirm \
+         `git diff --stat crates/lgbm-dataset/tests/fixtures/` is empty (idempotent)."
+    );
+    Ok(())
+}
+
 /// Verify a C++ toolchain and CMake are present, returning a clear (non-panic)
 /// error if absent (RESEARCH §Environment).
 fn verify_toolchain() -> Result<()> {
@@ -206,11 +301,17 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
 /// Find the built `rng_capture` executable under the build dir (handles
 /// single- and multi-config generators).
 fn locate_capture_exe(build_dir: &Path) -> Result<PathBuf> {
+    locate_exe(build_dir, "rng_capture")
+}
+
+/// Find a built capture executable `name` under the build dir (handles single-
+/// and multi-config generators).
+fn locate_exe(build_dir: &Path, name: &str) -> Result<PathBuf> {
     let candidates = [
-        build_dir.join("rng_capture"),
-        build_dir.join("rng_capture.exe"),
-        build_dir.join("Release/rng_capture"),
-        build_dir.join("Release/rng_capture.exe"),
+        build_dir.join(name),
+        build_dir.join(format!("{name}.exe")),
+        build_dir.join(format!("Release/{name}")),
+        build_dir.join(format!("Release/{name}.exe")),
     ];
     for c in candidates {
         if c.is_file() {
@@ -218,7 +319,7 @@ fn locate_capture_exe(build_dir: &Path) -> Result<PathBuf> {
         }
     }
     bail!(
-        "could not locate the built rng_capture executable under {}",
+        "could not locate the built {name} executable under {}",
         build_dir.display()
     );
 }
@@ -227,7 +328,7 @@ fn locate_capture_exe(build_dir: &Path) -> Result<PathBuf> {
 /// function of the recorded constants, so this is idempotent.
 fn write_manifest(path: &Path) -> Result<()> {
     let content = format!(
-        "# Reference Manifest — LightGBM-rs Oracle (Phase 1)\n\
+        "# Reference Manifest — LightGBM-rs Oracle (Phases 1-2)\n\
 \n\
 This file pins the C++ reference build used to generate the committed RNG\n\
 golden set (`rng_sequence.txt`). It records everything needed to reproduce the\n\
@@ -300,7 +401,54 @@ SAMPLE seed=<s> N=<n> K=<k> result=<v0;v1;...>\n\
 \n\
 `float` values are the raw little-endian f32 bit pattern (a decimal `u32`) so the\n\
 Rust parity test asserts exact-bit f32 equality; integer draws are compared\n\
-exactly; `Sample` output is compared as an exact ordered sequence.\n",
+exactly; `Sample` output is compared as an exact ordered sequence.\n\
+\n\
+## Numeric Binning Golden Set (Phase 2, layers 1+2)\n\
+\n\
+Captured by `cargo run -p xtask -- bin-capture` into\n\
+`crates/lgbm-dataset/tests/fixtures/numeric_binning.txt`. Covers the NUMERIC\n\
+`BinMapper::FindBin` (layer 1: `bin_upper_bound_`, `num_bin`, `bin_type`,\n\
+`missing_type`, `default_bin`, `most_freq_bin`, `is_trivial`) and per-row\n\
+`ValueToBin` (layer 2). Categorical folding and EFB are OUT OF SCOPE here\n\
+(categorical -> Plan 03, EFB -> Plan 05).\n\
+\n\
+- **Binning master seed:** `{bin_master_seed}` (`0x{bin_master_seed_hex:08X}`) —\n\
+  the SINGLE source of randomness for the binning corpus (idempotent regen).\n\
+- **Corpus (four-source, D-06; numeric subset):**\n\
+  1. synthetic randomized distributions sweeping `max_bin` (2/16/64/255),\n\
+     `min_data_in_bin` (1/3/20), and `bin_construct_sample_cnt` (64/256/100000),\n\
+     each with a randomized `data_random_seed`;\n\
+  2. curated numeric edge battery: NaN-as-missing, +0.0/-0.0 signed zeros,\n\
+     on-boundary ties, all-missing, single-value, all-zero, zero-as-missing,\n\
+     a pre-filter-triggering column, and a dense 500-value column.\n\
+  (LightGBM example datasets and the categorical/EFB corpus land in later plans.)\n\
+\n\
+### EXACT comparison discipline (NOT the ~1e-6 oracle tolerance)\n\
+\n\
+Binning goldens are compared **bit-exact**, never within the `~1e-6` oracle\n\
+tolerance: per-row bin indices via `compare_exact_u32`, the f64\n\
+`bin_upper_bound_` array via `compare_exact_f64_bits` (`.to_bits()` per element),\n\
+and storage-layout bytes (later plans) via `compare_exact_bytes`. A 1-ULP\n\
+boundary drift is a real divergence, so exact f64-bit equality is mandatory.\n\
+\n\
+### Capture-harness note (external_libs unavailable)\n\
+\n\
+The authoritative `BinMapper::FindBin`/`ValueToBin` in `src/io/bin.cpp` pull in\n\
+`common.h` -> `fast_double_parser.h` + `fmt/format.h` from `external_libs/`,\n\
+which are present here only as EMPTY directories (the LightGBM tree is\n\
+git-untracked and its submodules are not vendored). `bin.cpp` is therefore\n\
+unbuildable in this environment. `xtask/cpp/bin_capture.cpp` VERBATIM-transcribes\n\
+the numeric FindBin family from the pinned `bin.cpp`/`bin.h` (commit `{commit}`,\n\
+version `{version}`) using the genuine `std::nextafter` (== `GetDoubleUpperBound`)\n\
+and the asymmetric `b <= nextafter(a)` dedup — so it emits goldens byte-identical\n\
+to lib_lightgbm — and links only the header-only reference `Random` for sampling.\n\
+This mirrors the Phase-1 header-only `rng_capture` discipline.\n\
+\n\
+### Exact bin-capture command\n\
+\n\
+```bash\n\
+cargo run -p xtask -- bin-capture\n\
+```\n",
         commit = LIGHTGBM_COMMIT,
         version = LIGHTGBM_VERSION,
         master_seed = MASTER_SEED,
@@ -308,6 +456,8 @@ exactly; `Sample` output is compared as an exact ordered sequence.\n",
         n_rng = N_RNG_CASES,
         n_sample = N_SAMPLE_CASES,
         total = N_RNG_CASES + N_SAMPLE_CASES,
+        bin_master_seed = BIN_MASTER_SEED,
+        bin_master_seed_hex = BIN_MASTER_SEED as u32,
     );
     std::fs::write(path, content)
         .with_context(|| format!("writing manifest {}", path.display()))?;
