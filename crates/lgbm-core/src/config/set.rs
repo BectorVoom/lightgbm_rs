@@ -44,16 +44,24 @@ impl Config {
 
 /// Free-function form of [`Config::from_params`].
 pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigError> {
-    // --- Stage 1: alias resolution -------------------------------------------
-    // Map every incoming key to its canonical name. Unknown keys pass through
-    // (no error). If two aliases collide onto the same canonical, last-writer
-    // wins here — the C++ KeyAliasTransform emits a warning and keeps one; for
-    // parity of the *resolved value* we keep a single entry per canonical.
-    let mut resolved: HashMap<String, String> = HashMap::with_capacity(params.len());
-    for (key, value) in params {
-        let canonical = resolve_alias(key).to_string();
-        resolved.insert(canonical, value.clone());
-    }
+    // --- Stage 1: alias resolution (deterministic KeyAliasTransform) ---------
+    // Faithful port of C++ `ParameterAlias::KeyAliasTransform` + `SortAlias`
+    // (config.h lines 1220-1261). Precedence is fully deterministic — it must
+    // NOT depend on HashMap iteration order (CR-02):
+    //
+    //   (1) A directly-set CANONICAL key always wins over any alias targeting
+    //       that same canonical (mirrors the SECOND KeyAliasTransform loop,
+    //       which only writes the alias value into params[canonical] when the
+    //       canonical key is ABSENT).
+    //   (2) For alias-vs-alias collisions onto the same canonical (no direct
+    //       canonical present), the winner is the alias whose KEY NAME sorts
+    //       FIRST under `SortAlias` = `(key.len(), key)` (shorter first; on
+    //       equal length, lexicographically smaller).
+    //
+    // We classify each incoming key via `resolve_alias`: `resolve_alias(key) ==
+    // key` means canonical-or-unknown (pass through); otherwise it is an alias
+    // mapping to `canonical = resolve_alias(key)`.
+    let resolved = key_alias_transform(params);
 
     let mut cfg = Config::default();
 
@@ -341,6 +349,70 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
     check_param_conflict(&mut cfg, num_leaves_explicit)?;
 
     Ok(cfg)
+}
+
+/// `Config::SortAlias` (config.h lines 1220-1222): returns `true` when `x`
+/// sorts BEFORE `y` under the tuple `(len, value)` — shorter first, then
+/// lexicographic. The alias whose key name sorts first wins a collision.
+fn sort_alias(x: &str, y: &str) -> bool {
+    x.len() < y.len() || (x.len() == y.len() && x < y)
+}
+
+/// Deterministic port of `ParameterAlias::KeyAliasTransform` (config.h
+/// 1224-1260). Maps every incoming key to its canonical name and resolves
+/// alias collisions WITHOUT relying on HashMap iteration order (CR-02).
+///
+/// - Directly-set canonical keys always win over any alias for that canonical.
+/// - Alias-vs-alias collisions are broken by [`sort_alias`] on the alias KEY
+///   names (the C++ `SortAlias` tie-break).
+/// - Unknown (non-alias, non-canonical) keys pass through unchanged, no error.
+fn key_alias_transform(params: &HashMap<String, String>) -> HashMap<String, String> {
+    // Mirror of the C++ `tmp_map`: canonical -> WINNING ALIAS KEY NAME.
+    // We track the winning alias *key* (not its value) so the SortAlias
+    // comparison is over key names, exactly as in C++.
+    let mut winning_alias: HashMap<&str, &str> = HashMap::new();
+    for key in params.keys() {
+        let canonical = resolve_alias(key);
+        if canonical == key.as_str() {
+            // Canonical or unknown key — not an alias; skip here. Canonicals are
+            // copied through verbatim below; unknowns also pass through.
+            continue;
+        }
+        match winning_alias.get(canonical) {
+            Some(current) => {
+                // Collision: keep whichever alias key sorts FIRST under
+                // SortAlias. If the incoming `key` sorts before `current`, it
+                // becomes the new winner; otherwise the current winner stands.
+                if sort_alias(key.as_str(), current) {
+                    winning_alias.insert(canonical, key.as_str());
+                }
+            }
+            None => {
+                winning_alias.insert(canonical, key.as_str());
+            }
+        }
+    }
+
+    // Build the resolved map. Start by copying every CANONICAL/unknown key
+    // through verbatim (a directly-set canonical must survive and win), then
+    // fold in each winning alias ONLY when its canonical was not directly set.
+    let mut resolved: HashMap<String, String> = HashMap::with_capacity(params.len());
+    for (key, value) in params {
+        if resolve_alias(key) == key.as_str() {
+            resolved.insert(key.clone(), value.clone());
+        }
+    }
+    for (canonical, alias_key) in &winning_alias {
+        // (1) directly-set canonical beats alias: only write when absent.
+        if !resolved.contains_key(*canonical) {
+            let value = params
+                .get(*alias_key)
+                .expect("winning alias key originates from params")
+                .clone();
+            resolved.insert((*canonical).to_string(), value);
+        }
+    }
+    resolved
 }
 
 /// Port of the in-scope subset of `CheckParamConflict` (config.cpp 314-474).
