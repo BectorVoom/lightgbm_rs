@@ -149,7 +149,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on 04-01)*
 
-  - [ ] 04-02-PLAN.md — First vertical slice: construct_histograms whole-kernel op + xtask kernel-capture (header-only C++ transcription) + committed histogram golden + bit-exact cubecl-cpu parity
+  - [x] 04-02-PLAN.md — First vertical slice: construct_histograms whole-kernel op + xtask kernel-capture (header-only C++ transcription) + committed histogram golden + bit-exact cubecl-cpu parity — **DONE: Backend::construct_histograms + CpuBackend wired end-to-end; 18-case D-02a golden (dense+sparse, default-bin, u8/u16/u32, grad/hess spread) replays BIT-EXACT via compare_exact_f64_bits; CMP-01/02/05(hist)/ORA-04(cpu) satisfied; cargo test --workspace green**
 
 **Wave 3** *(blocked on 04-02)*
 

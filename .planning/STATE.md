@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-01-PLAN.md
-last_updated: "2026-06-05T18:40:48.000Z"
-last_activity: 2026-06-05 -- Plan 04-01 executed (compute foundation + D-04a spike PASS)
+stopped_at: Completed 04-02-PLAN.md
+last_updated: "2026-06-06T00:00:00.000Z"
+last_activity: 2026-06-06 -- Plan 04-02 executed (construct_histograms vertical slice, bit-exact cpu parity)
 progress:
   total_phases: 8
   completed_phases: 3
   total_plans: 18
-  completed_plans: 15
-  percent: 42
+  completed_plans: 16
+  percent: 47
 ---
 
 # Project State
@@ -26,11 +26,25 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 04 (compute-backend-cpu-first-integer-histograms-rocm) — EXECUTING
-Plan: 2 of 4 (04-01 complete)
+Plan: 3 of 4 (04-01, 04-02 complete)
 Status: Executing Phase 04
-Last activity: 2026-06-05 -- Plan 04-01 executed (compute foundation + D-04a spike PASS)
+Last activity: 2026-06-06 -- Plan 04-02 executed (construct_histograms vertical slice, bit-exact cpu parity)
 
-Progress: [██████████] Phase 3 complete; Phase 4 plan 1/4 done — D-04a bit-determinism bet SETTLED (cubecl-cpu fold bit-exact), ComputeError + runtime/capability gate + CMP-01 guard in place
+Progress: [██████████] Phase 3 complete; Phase 4 plan 2/4 done — first vertical slice closed: construct_histograms Backend op → cubecl-cpu kernel → committed C++ golden → bit-exact parity (18 D-02a cases)
+
+### Plan 04-02 result
+
+Plan 04-02 delivered the FIRST complete compute-backend vertical slice — a real `construct_histograms` whole-kernel op wired end-to-end and proven bit-exact vs C++:
+
+- **`Backend::construct_histograms` (D-01, CMP-05 histogram layer):** coarse whole-kernel op `(client, binned, ordered_gradients, ordered_hessians, num_bin) -> Result<Vec<f64>, ComputeError>` returning stride-2 `[g,h]` f64 cells; concrete `CpuBackend` binds `ActiveRuntime` and dispatches to the 04-01 bit-exact ordered fold. V5 validation + f64 accumulation retained.
+- **`xtask kernel-capture` + `kernel_capture.cpp` (D-02):** header-only VERBATIM transcription of `ConstructHistogram` (`dense_bin.hpp:130-141` / `sparse_bin.hpp:138-152`) reusing the DenseBin/SparseBin forms; emits an 18-case `histogram.txt` golden (D-02a: dense+sparse, default-bin routing, u8/u16/u32 widths, grad/hess spread). No external_libs, byte-idempotent, `KERNEL_MASTER_SEED=0x4157F00D`.
+- **`kernel_parity.rs` (ORA-04 cpu hard gate):** drives `CpuBackend::construct_histograms` over every golden case and asserts BIT-EXACT f64 cells via the full-path `oracle_harness::comparator::compare_exact_f64_bits`. Green; SKIPs cleanly pre-capture.
+- **CMP-01 intact:** cubecl is an oracle-harness DEV-dep only; the library crate stays cubecl-free (containment guard green).
+- 1 Rule-1 bug fixed in newly-authored capture code (stray `num_rows_init` call), corrected before its task commit. `cargo test --workspace` green. Commits: 504e7ff, 80f8fc9, cf3f380.
+
+Key decision: the golden HIST is the DENSE ordered f64 fold over the round-tripped `Bin::data(idx)` (== what the cubecl-cpu kernel computes). Dense/sparse `ConstructHistogram` are identical for non-zero bins (differ only at bin 0, which sparse never folds), so sparse cases use bins in `[1, num_bin)` — exercising the SparseBin store path while keeping the golden replayable by the dense-fold kernel.
+
+Next: `/gsd-execute-phase 4` plan 04-03 (find_best_split + data_partition kernels + goldens, reusing this kernel-capture/parity machinery).
 
 ### Plan 04-01 result
 

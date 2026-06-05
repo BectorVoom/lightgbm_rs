@@ -92,17 +92,17 @@
 ### Compute Backend (CubeCL)
 
 - [x] **CMP-01**: `lgbm-compute` backend trait isolating all device ops behind one crate (contains CubeCL alpha churn) — *04-01: Backend::Runtime bound to cubecl::Runtime; cpu-default/rocm-opt-in features; CMP-01 containment guard test green (no upper crate names cubecl)*
-- [ ] **CMP-02**: CPU backend (cubecl-cpu) as the deterministic reference execution path — *04-01: deterministic anchor PROVEN (D-04a spike: single-owner ordered f64 fold bit-exact across 25 launches + vs C++-order sequential fold); full reference kernel suite lands 04-02/04-03*
+- [x] **CMP-02**: CPU backend (cubecl-cpu) as the deterministic reference execution path — *04-01: deterministic anchor PROVEN (D-04a spike); 04-02: first reference kernel landed — CpuBackend::construct_histograms bit-exact vs committed C++ golden across 18 D-02a cases. (split/partition kernels extend the same cpu reference path in 04-03)*
 - [ ] **CMP-03**: ROCm/HIP backend (cubecl-hip) selectable via Cargo feature and/or runtime config
 - [x] **CMP-04**: CUDA warp-level operations mapped onto CubeCL's `Plane` API with capability gating and sequential fallback — *04-01: probe_capabilities gates Plane::Ops/f64/f32-atomic; cpu matrix → ReducePath::Sequential (the single-owner fold IS the cpu path); capability test asserts the verified matrix*
-- [ ] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the ~1e-6 (f32) contract
+- [ ] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the ~1e-6 (f32) contract — *04-02: HISTOGRAM layer done — construct_histograms whole-kernel op bit-exact on cubecl-cpu vs C++ golden; best-split + data-partition kernels land 04-03, ROCm parity 04-04*
 
 ### Oracle & Validation
 
 - [x] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤~1e-6 absolute (f32 single-precision)
 - [x] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, default `float` `score_t`/`label_t` width) for valid comparison
 - [x] **ORA-03**: Per-stage parity tests (bin → histogram → per-split-gain → leaf-output → prediction), not just final outputs
-- [ ] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment)
+- [ ] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment) — *04-02: cpu hard gate established for the histogram layer — kernel_parity.rs replays the committed C++ golden bit-exact on cubecl-cpu (the deterministic anchor); ROCm execution + ~1e-6 gate lands 04-04 (CPU and ROCm are separate gates)*
 
 ### APIs
 
@@ -169,11 +169,11 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | PRD-03 | Phase 3 | Complete |
 | PRD-06 | Phase 3 | Complete |
 | CMP-01 | Phase 4 | Complete (04-01) |
-| CMP-02 | Phase 4 | Partial (04-01: anchor proven; suite 04-02/03) |
+| CMP-02 | Phase 4 | Complete (04-01 anchor + 04-02 histogram reference kernel) |
 | CMP-03 | Phase 4 | Pending |
 | CMP-04 | Phase 4 | Complete (04-01) |
-| CMP-05 | Phase 4 | Pending |
-| ORA-04 | Phase 4 | Pending |
+| CMP-05 | Phase 4 | Partial (04-02: histogram layer; split/partition 04-03) |
+| ORA-04 | Phase 4 | Partial (04-02: cpu histogram gate; ROCm 04-04) |
 | TRL-01 | Phase 5 | Pending |
 | TRL-02 | Phase 5 | Pending |
 | TRL-03 | Phase 5 | Pending |
