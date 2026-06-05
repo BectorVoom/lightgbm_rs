@@ -1,0 +1,18 @@
+[package]
+name = "lgbm-treelearner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+# Backend trait + SplitInfo/ComputeError only — the learner takes a `&impl
+# Backend` and never names a compute runtime (CMP-01 containment). The compute
+# crate is the single isolation seam, so this crate has no GPU-runtime dependency.
+lgbm-compute = { path = "../lgbm-compute" }
+lgbm-model = { path = "../lgbm-model" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }
