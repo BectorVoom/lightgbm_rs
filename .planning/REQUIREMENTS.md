@@ -41,8 +41,8 @@
 - [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing
 - [ ] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
 - [x] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction
-- [ ] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
-- [ ] **TRL-09**: `force_row_wise` / `force_col_wise` histogram build strategies, both output-matching
+- [x] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
+- [x] **TRL-09**: `force_row_wise` / `force_col_wise` histogram build strategies, both output-matching
 
 ### Boosting & Sample Strategies
 
@@ -180,8 +180,8 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | TRL-04 | Phase 5 | Complete |
 | TRL-05 | Phase 5 | Complete |
 | TRL-07 | Phase 5 | Complete |
-| TRL-08 | Phase 5 | Pending |
-| TRL-09 | Phase 5 | Pending |
+| TRL-08 | Phase 5 | Complete (05-04) |
+| TRL-09 | Phase 5 | Complete (05-04) |
 | BST-01 | Phase 6 | Pending |
 | BST-02 | Phase 6 | Pending |
 | BST-03 | Phase 6 | Pending |

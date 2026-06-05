@@ -188,7 +188,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on 05-03 — parity additions on the proven spine)*
 
-  - [ ] 05-04-PLAN.md — `force_col_wise`==`force_row_wise`==C++ tree (TRL-09) + per-tree/per-node feature subsampling RNG parity via `ColSampler` (TRL-08) + captured real iter-1 g/h full-tree parity (D-03)
+  - [x] 05-04-PLAN.md — `force_col_wise`==`force_row_wise`==C++ tree (TRL-09, Open Q2 RESOLVED: config-flag no-op over the shared construct_histograms op on the deterministic anchor) + per-tree/per-node feature subsampling RNG parity via `ColSampler` (TRL-08, ResetByTree+GetByNode draw-sequence) + captured real iter-1 g/h full-tree parity (D-03, regression-l2 + binary-logloss). **DONE: col_wise.txt / col_sampler.txt / real_gh.txt goldens + learner_parity_{row_vs_col,col_sampler_rng,real_gh_full_tree} replay bit-exact; 1 Rule-1 fix (tree leaf_count records the ACTUAL data_partition count, update_cnt=true, not the reconstructed SplitInfo count); cargo test --workspace green; byte-idempotent**
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
 
@@ -249,7 +249,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 3/4 | In Progress|  |
+| 5. Tree Learner + Split Finding | 4/4 | Complete    | 2026-06-05 |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

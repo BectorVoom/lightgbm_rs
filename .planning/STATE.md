@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-03-PLAN.md
-last_updated: "2026-06-05T23:06:42.125Z"
+stopped_at: Completed 05-04-PLAN.md
+last_updated: "2026-06-05T23:41:25Z"
 last_activity: 2026-06-05 -- Phase 05 execution started
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 22
-  completed_plans: 21
-  percent: 50
+  completed_plans: 22
+  percent: 52
 ---
 
 # Project State
@@ -26,11 +26,23 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 05 (tree-learner-split-finding) — EXECUTING
-Plan: 4 of 4
-Status: Ready to execute
+Plan: 4 of 4 — COMPLETE (all 4 plans done)
+Status: Phase 05 plans complete; ready for phase review/verification
 Last activity: 2026-06-05 -- Phase 05 execution started
 
-Progress: [██████████] Phase 4 COMPLETE — compute backend closed on BOTH backends within contract: cpu bit-exact (hard gate, 04-01..03: construct_histograms + find_best_split + data_partition + subtract_histograms) AND cubecl-hip on gfx1100 (04-04: f32-accumulate path via capability gate, separate ~1e-6 hip-vs-cpu-anchor parity gate run; one documented f32-vs-f64 accumulation gap ≈ 1 f32 ULP in 04-ROCM-GAPS.md, best-effort D-03a). CPU-only build needs no ROCm toolchain.
+Progress: [██████████] Phase 5 plans 05-01..05-04 COMPLETE — full serial tree-learner parity-validated on the cpu anchor: spine (D-06 per-split / D-07 per-tree), force_col_wise == force_row_wise == C++ (TRL-09), per-tree/per-node feature subsampling RNG via ColSampler (TRL-08), and captured-real iter-1 g/h full-tree parity (D-03, regression-l2 + binary-logloss). All replayed bit-exact from committed goldens that never touch LightGBM/.
+
+### Plan 05-04 result
+
+Plan 05-04 layered the two parity additions + the captured-g/h corpus onto the proven spine:
+
+- **force_col_wise (TRL-09, Open Q2 RESOLVED):** `BuildStrategy::{RowWise,ColWise}` is a config FLAG (a no-op) over the shared `construct_histograms` Backend op on the single-thread deterministic anchor — NOT a distinct compute path (A1 confirmed). `col_wise.txt` carries the identical PTREE as `spine.txt`; `learner_parity_row_vs_col` grows the corpus under BOTH strategies and asserts `to_string()` equality to each other and to C++.
+- **ColSampler RNG parity (TRL-08):** `col_sampler.rs` reproduces the C++ `Random::Sample` draw SEQUENCE (ResetByTree once per tree, GetByNode per node smaller-leaf-then-larger). `col_sampler.txt` (drawn from the genuine reference Random at `feature_fraction=1.0` / `feature_fraction_bynode=0.5`) asserts the exact selected REAL-feature indices per draw via `train_with_col_sampler_trace`.
+- **Captured real iter-1 g/h (D-03):** `real_gh.txt` — regression-l2 (`grad=score-label`, `hess=1`) + binary-logloss (`boost_from_average=false`, `score_t=float`) over fixed real labels; `learner_parity_real_gh_full_tree` proves the learner grows the same tree as C++ under a realistic gradient distribution (D-07).
+- **1 Rule-1 fix:** the tree's `leaf_count`/`internal_count` record the ACTUAL `data_partition` leaf_count (`serial_tree_learner.cpp:788-791`, `update_cnt=true`), not the SplitInfo `round_int(hess·cnt_factor)` reconstructed counts (which disagree by ±1 for fractional hessians) — corrected the spine counts to the faithful actual-partition values. Applied in both Rust `split_inner` and the C++ transcription.
+- `cargo test --workspace` green (8 learner_parity tests + 29 lgbm-treelearner). Byte-idempotent; never git-adds `LightGBM/`. Commits: e8efc90 (Task 1, pre-committed), d06d85b (Task 2).
+
+Next: `/gsd-execute-phase 5` is complete (4/4 plans); proceed to phase 05 review/verification or phase 06 (GBDT).
 
 ### Plan 04-04 result
 
@@ -202,6 +214,9 @@ Recent decisions affecting current work:
 - [Phase 05]: 05-03: smaller/larger child LeafSplits seeded by DataPartition::leaf_count (not SplitInfo left/right_count) so it agrees with find_best_splits' smaller-child selection (Pitfall 3) — fixed swapped child sums
 - [Phase 05]: 05-03: D-07 full-tree parity compares via the SHARED lgbm-model %.17g formatter (golden carries the reference Tree's raw field bits; Rust reconstructs + serializes), not a C++ %g reimplementation
 - [Phase 05]: 05-03: FixHistogram is learner-side on RAW (un-bumped) leaf sums (Pitfall 2, Open Q1); ComputeClient re-exported from lgbm-compute so the learner names the Backend client without a cubecl dep (CMP-01)
+- [Phase 05]: 05-04: Open Q2 RESOLVED — force_col_wise == force_row_wise on the single-thread deterministic anchor; it is a config FLAG (a no-op) over the shared construct_histograms op, NOT a distinct compute path (A1 confirmed). col_wise.txt carries the identical tree as spine.txt; the row==col equality gate fails loudly if a backend ever diverged.
+- [Phase 05]: 05-04: the tree's leaf_count/internal_count record the ACTUAL data_partition leaf_count (serial_tree_learner.cpp:788-791, update_cnt=true), NOT the SplitInfo round_int(hess*cnt_factor) reconstructed counts (which disagree by ±1 for fractional hessians) — Rule-1 fix to the Plan-03 spine, applied in Rust split_inner + the C++ transcription (regenerated spine.txt to the faithful actual-partition counts)
+- [Phase 05]: 05-04: ColSampler RNG parity is the CALL SEQUENCE (ResetByTree once per tree, GetByNode per node smaller-then-larger), not the PRNG; col_sampler.txt asserts the exact selected feature indices per draw. D-03 captured-g/h = regression-l2 (hess=1) + binary-logloss (boost_from_average=false); binary capped at num_leaves=2 to avoid the fractional-hessian degenerate-split corner (regression carries the deeper 3-leaf tree)
 
 ### Pending Todos
 
@@ -225,6 +240,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T23:06:34.297Z
-Stopped at: Completed 05-03-PLAN.md
+Last session: 2026-06-05T23:41:25Z
+Stopped at: Completed 05-04-PLAN.md
 Resume file: None
