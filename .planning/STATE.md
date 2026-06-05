@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-04-PLAN.md
-last_updated: "2026-06-05T07:37:00Z"
-last_activity: 2026-06-05 -- Completed Plan 02-04 (from_mat/from_csr/from_csc ingestion + metadata + example-dataset parity)
+stopped_at: Phase 02 verification gaps_found (CR-01/CR-02)
+last_updated: "2026-06-05T08:30:00Z"
+last_activity: 2026-06-05 -- Phase 02 verified gaps_found (3/5); awaiting gap closure for default-config binning divergence
 progress:
   total_phases: 8
   completed_phases: 1
@@ -25,16 +25,25 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 02 (dataset-binning-determinism-root) — COMPLETE
-Plan: 5 of 5
-Status: Phase 02 complete (all 5 plans)
-Last activity: 2026-06-05 -- Completed Plan 02-05
+Phase: 02 (dataset-binning-determinism-root) — GAPS FOUND (verification 3/5)
+Plan: 5 of 5 plans executed; phase NOT complete (goal not met)
+Status: All 5 plans executed, but phase verification found 2 blocking gaps. Awaiting gap closure.
+Last activity: 2026-06-05 -- Phase 02 verification: gaps_found (CR-01 default-config binning divergence)
 
-Progress: [██████████] 100% (5 of 5 Phase-02 plans complete)
+Progress: [████████░░] 5/5 plans executed — verification gaps_found, phase pending
 
 ### Resume
 
-Phase 02 COMPLETE: the dataset+binning determinism root is fully locked and bit-proven against C++ — numeric/categorical/missing binning (layers 1+2), bin storage layout, metadata, ingestion, and now EFB grouping (layer 3). Next: the predict phase (the first consumer of the immutable bundled `FinishedDataset`).
+Phase 02 plans 02-01..02-05 all executed, BUT phase verification (02-VERIFICATION.md) found 2 blocking gaps that violate the determinism-root goal — DO NOT advance to Phase 3 until closed:
+
+- **GAP-1 (CR-01, blocker):** `ingest.rs::build_mapper` (line ~94) passes raw `cfg.min_data_in_leaf` as `min_split_data` to `find_bin_numeric`, but C++ `DatasetLoader::ConstructFromSampleData` (dataset_loader.cpp:623) passes a SCALED `filter_cnt = (min_data_in_leaf * total_sample_size) / num_dist_data`. With `feature_pre_filter=true` + `min_data_in_leaf=20` (both defaults), the `need_filter`/`is_trivial_` decision diverges from C++ on every default ingest, cascading into bin stores, EFB `used_features`, and all downstream splits. Same flaw at `bin_mapper.rs:635 find_bin_from_column`. Confirmed against C++ source by verifier.
+- **GAP-2 (CR-02, blocker):** the default `feature_pre_filter=true` path is untested on BOTH sides (every ingest test forces `false`; the C++ golden generator uses `pre_filter=false`), so `cargo test --workspace` is green only because all tests avoid the divergent path — a false positive for a determinism-root phase.
+
+Fix: correct the `filter_cnt` derivation (both sites) AND add a default-config ingest parity golden that fails before / passes after. Then re-verify.
+
+Next: `/gsd-plan-phase 02 --gaps` → `/gsd-execute-phase 02 --gaps-only`.
+
+Verified PASS: SC#2 (ingest + immutable store), SC#3 (missing/categorical routing), SC#4 (EFB grouping). FAILED: SC#1 (bit-identical binning on default path), SC#5 (per-stage parity coverage of default path). DAT-01/DAT-07 downgraded to PARTIAL.
 
 - EFB (Plan 02-05): `MultiValBin` dense/sparse storage (+1 push), `efb.rs` (`fast_feature_bundling`/`find_groups`/`get_conflict_count`/`fix_sample_indices` — ALL randomness via `lgbm_core::Random::new(num_data)`, STABLE sorts, element-wise parallel-vector swap), and the `Dataset::construct_bundled` `enable_bundle` dispatch with real<->packed feature maps (`used_feature_map_`/`real_feature_idx_`). EFB layer-3 golden (feature->group membership + per-group `bin_offsets_`/`num_total_bin_`/`group_is_multi_val` + per-row bundled indices) bit-identical to C++ on the D-06 #4 mutually-exclusive sparse corpus + a no-bundle control. EFB capture = HEADER-ONLY verbatim transcription of `dataset.cpp` (external_libs unvendored → both nominal capture paths infeasible; human-approved). bin-capture idempotent.
 

@@ -22,13 +22,13 @@
 
 ### Dataset, Binning & I/O
 
-- [x] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`)
+- [~] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`) — PARTIAL: kernel faithful, but default-config ingest passes raw `min_data_in_leaf` instead of scaled `filter_cnt` (CR-01); pending gap closure
 - [x] **DAT-02**: Binned columnar dataset store (DenseBin + SparseBin) immutable after finish-load
 - [x] **DAT-03**: Missing-value handling (`use_missing`, `zero_as_missing`, `MissingType`) with C++-matching default-direction routing
 - [x] **DAT-04**: Categorical feature encoding (category→bin mapping, low-frequency folding)
 - [x] **DAT-05**: Exclusive Feature Bundling (`enable_bundle`) reproducing C++ feature grouping
 - [x] **DAT-06**: Metadata support (labels, weights, init_score, query/group boundaries)
-- [x] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API
+- [~] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API — PARTIAL: ingest works, but the default-config (`feature_pre_filter=true`) path diverges from C++ (CR-01) and is untested (CR-02); pending gap closure
 - [ ] **DAT-08**: LightGBM model text format read — load a C++-trained model and predict identically
 - [ ] **DAT-09**: LightGBM model text format write — emit the exact text schema (trees, leaf values, bin mappers, feature metadata) including `%.17g` float formatting
 
@@ -154,13 +154,13 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | CFG-03 | Phase 1 | Complete |
 | ORA-01 | Phase 1 | Complete |
 | ORA-02 | Phase 1 | Complete |
-| DAT-01 | Phase 2 | Complete (02-01) |
+| DAT-01 | Phase 2 | Partial (02-01) — CR-01 default-config divergence, gap closure pending |
 | DAT-02 | Phase 2 | Complete (02-02) |
 | DAT-03 | Phase 2 | Complete (02-03) |
 | DAT-04 | Phase 2 | Complete (02-03) |
 | DAT-05 | Phase 2 | Complete (02-05) |
 | DAT-06 | Phase 2 | Complete |
-| DAT-07 | Phase 2 | Complete |
+| DAT-07 | Phase 2 | Partial — CR-01/CR-02 default-config ingest divergence + coverage gap |
 | ORA-03 | Phase 2 | Pending |
 | DAT-08 | Phase 3 | Pending |
 | DAT-09 | Phase 3 | Pending |

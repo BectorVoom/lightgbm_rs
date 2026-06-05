@@ -14,7 +14,7 @@ A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm bac
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [ ] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace
-- [x] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion
+- [ ] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion *(5/5 plans executed; verification gaps_found — default-config binning divergence, see 02-VERIFICATION.md)*
 - [ ] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists)
 - [ ] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity
