@@ -64,7 +64,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Exclusive Feature Bundling (`enable_bundle`) reproduces C++ feature grouping bit-for-bit.
   5. Per-stage parity tests cover the bin granularity (bin boundaries + per-row bin assignment), localizing any divergence to binning before histograms exist.
 
-**Plans**: 5 plans
+**Plans**: 6 plans (incl. 1 gap-closure)
 
 **Wave 1**
 
@@ -85,6 +85,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 5** *(blocked on Wave 4; EFB sequenced last per MEDIUM-risk capture flag, has checkpoint)*
 
   - [x] 02-05-PLAN.md — Exclusive Feature Bundling (MultiValBin + FastFeatureBundling) group/offset golden parity (layer 3)
+
+**Wave 6** *(gap closure — closes SC#1 / DAT-01 + SC#5 / ORA-03 bin stage / DAT-07; default-config scaled filter_cnt divergence, see 02-VERIFICATION.md)*
+
+  - [ ] 02-06-PLAN.md — Gap closure: scaled `filter_cnt = (min_data_in_leaf * total_sample_cnt) / num_rows` in a single source-of-truth helper (CR-01/IN-02) + default feature_pre_filter=true ingest parity golden that fails-before/passes-after (CR-02)
 
 ### Phase 3: Tree Model + Model Text I/O + Predict Parity
 
