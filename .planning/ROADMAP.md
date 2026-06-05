@@ -14,7 +14,7 @@ A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm bac
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [ ] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace
-- [ ] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion *(6/6 plans executed incl. gap-closure 02-06; GAP-1/GAP-2 closed — default-config scaled filter_cnt fixed + covered; ready to re-verify)*
+- [ ] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion *(7/7 plans executed incl. gap-closure 02-06 + 02-07; GAP-1/GAP-2 + CR-01 + WR-01 closed — default ingest unified onto the faithful single C++ Dataset::Construct, trivial features dropped, grouping verified; ready to re-verify)*
 - [ ] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists)
 - [ ] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity
@@ -89,6 +89,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 6** *(gap closure — closes SC#1 / DAT-01 + SC#5 / ORA-03 bin stage / DAT-07; default-config scaled filter_cnt divergence, see 02-VERIFICATION.md)*
 
   - [x] 02-06-PLAN.md — Gap closure: scaled `filter_cnt = (min_data_in_leaf * total_sample_cnt) / num_rows` in a single source-of-truth helper (CR-01/IN-02) + default feature_pre_filter=true ingest parity golden that fails-before/passes-after (CR-02) — DONE; GAP-1/GAP-2 closed, workspace green, capture idempotent
+
+**Wave 7** *(gap closure — closes CR-01 (default-ingest Construct divergence) + WR-01; restores DAT-07 / ORA-03 / DAT-01/02/05 at the determinism root, see 02-06-REVIEW.md / re-verification gaps_found)*
+
+  - [x] 02-07-PLAN.md — Gap closure: default ingest unified onto the faithful single C++ `Dataset::Construct` (`construct_bundled`) — trivial features DROPPED (`used_feature_map_[real]=-1`), EfbSamples built to the exact c_api.cpp:1352-1374 sampled-set convention (no second RNG draw); golden emitter models C++ Construct (trivial dropped, per-non-trivial group/subfeature via in-file FastFeatureBundling, is_sparse=true); parity test asserts trivial-exclusion + per-non-trivial group/subfeature parity + bit-exact stored bins, panics on missing golden (WR-01), HARD fails-before/passes-after — DONE; CR-01 + EFB parity hole + masking + WR-01 closed, workspace green, capture idempotent
 
 ### Phase 3: Tree Model + Model Text I/O + Predict Parity
 
@@ -194,7 +198,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
-| 2. Dataset + Binning | 5/5 | Plans complete | 2026-06-05 |
+| 2. Dataset + Binning | 7/7 | Plans complete (incl. gap-closure 02-06, 02-07) | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |

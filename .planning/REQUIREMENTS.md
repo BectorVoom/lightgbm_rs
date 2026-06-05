@@ -22,13 +22,13 @@
 
 ### Dataset, Binning & I/O
 
-- [x] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`) — SATISFIED (02-06): default-config ingest now feeds the SCALED `filter_cnt` via the single-source-of-truth `scaled_filter_cnt` helper, so `is_trivial_`/num_bin_/per-row bins match C++ on the default config (CR-01 closed); proven by `default_config_ingest_parity.rs` (fails-before/passes-after)
+- [x] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`) — SATISFIED (02-06 + 02-07): default-config ingest feeds the SCALED `filter_cnt` via `scaled_filter_cnt` (02-06) AND now routes through the faithful single C++ `Dataset::Construct` (`construct_bundled`, 02-07) so trivial features are dropped and `is_trivial_`/num_bin_/grouping/per-row bins match C++ on the default config (CR-01 closed at the Construct level); proven by `default_config_ingest_parity.rs` (fails-before/passes-after)
 - [x] **DAT-02**: Binned columnar dataset store (DenseBin + SparseBin) immutable after finish-load
 - [x] **DAT-03**: Missing-value handling (`use_missing`, `zero_as_missing`, `MissingType`) with C++-matching default-direction routing
 - [x] **DAT-04**: Categorical feature encoding (category→bin mapping, low-frequency folding)
 - [x] **DAT-05**: Exclusive Feature Bundling (`enable_bundle`) reproducing C++ feature grouping
 - [x] **DAT-06**: Metadata support (labels, weights, init_score, query/group boundaries)
-- [x] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API — SATISFIED (02-06): the default-config (`feature_pre_filter=true`, sample_cnt<num_rows) path now matches C++ (scaled `filter_cnt`, CR-01 closed) and is covered by `default_config_ingest_parity.rs` (CR-02 closed); CSR/CSC inherit the fix via `finish_from_columns -> build_mapper`
+- [x] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API — SATISFIED (02-06 + 02-07): the default-config (`feature_pre_filter=true`, sample_cnt<num_rows) path matches C++ (scaled `filter_cnt`, 02-06) AND now routes through the faithful single C++ `Dataset::Construct` (`construct_bundled` enable_bundle dispatch, 02-07: trivial features dropped, EFB grouping verified, EfbSamples to the c_api.cpp:1352-1374 convention) — CR-01 closed at the Construct level; covered by `default_config_ingest_parity.rs` (trivial-exclusion + per-non-trivial group/subfeature parity); CSR/CSC inherit via `finish_from_columns`
 - [ ] **DAT-08**: LightGBM model text format read — load a C++-trained model and predict identically
 - [ ] **DAT-09**: LightGBM model text format write — emit the exact text schema (trees, leaf values, bin mappers, feature metadata) including `%.17g` float formatting
 
@@ -154,14 +154,14 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | CFG-03 | Phase 1 | Complete |
 | ORA-01 | Phase 1 | Complete |
 | ORA-02 | Phase 1 | Complete |
-| DAT-01 | Phase 2 | Complete (02-01 kernel + 02-06 scaled filter_cnt; CR-01 closed) |
+| DAT-01 | Phase 2 | Complete (02-01 kernel + 02-06 scaled filter_cnt + 02-07 faithful Construct; CR-01 closed at Construct level) |
 | DAT-02 | Phase 2 | Complete (02-02) |
 | DAT-03 | Phase 2 | Complete (02-03) |
 | DAT-04 | Phase 2 | Complete (02-03) |
 | DAT-05 | Phase 2 | Complete (02-05) |
 | DAT-06 | Phase 2 | Complete |
-| DAT-07 | Phase 2 | Complete (02-04 ingest + 02-06 default-config parity; CR-01/CR-02 closed) |
-| ORA-03 | Phase 2 | Bin stage covered for default config (02-06); remaining stages pending later phases |
+| DAT-07 | Phase 2 | Complete (02-04 ingest + 02-06 default-config parity + 02-07 faithful Construct; CR-01/CR-02 + EFB parity hole closed) |
+| ORA-03 | Phase 2 | Bin stage covered for default config (02-06 + 02-07 Construct/grouping parity); remaining stages pending later phases |
 | DAT-08 | Phase 3 | Pending |
 | DAT-09 | Phase 3 | Pending |
 | PRD-01 | Phase 3 | Pending |
