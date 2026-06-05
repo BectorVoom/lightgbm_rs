@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -174,8 +175,14 @@ struct SparseBin : IBin {
     int i_delta = -1, cur_pos = 0;
     while (true) {
       ++i_delta;
-      cur_pos += deltas_[i_delta];
+      // WR-06: check the bound BEFORE dereferencing deltas_[i_delta]. The old
+      // order read deltas_[i_delta] first and only then tested i_delta >=
+      // num_vals_, so an idx past the last stored row (or a malformed delta
+      // stream) was an out-of-bounds read in this golden-generator — UB that
+      // would silently corrupt the authoritative fixture. Matches the upstream
+      // sparse_bin.hpp discipline (bound-check immediately after ++i_delta).
       if (i_delta >= num_vals_) return 0;
+      cur_pos += deltas_[i_delta];
       if (cur_pos == idx) return static_cast<uint32_t>(vals_[i_delta]);
       if (cur_pos > idx) return 0;
     }
@@ -909,6 +916,16 @@ struct PCaseSpec {
 };
 
 void EmitPCase(std::ofstream& out, const PCaseSpec& cs) {
+  // WR-01: refuse to emit a golden the kernel can never reproduce. The Rust
+  // data_partition_on returns ComputeError::Runtime when threshold >= num_bin
+  // (partition.rs), but this generator routes regardless. Mirror the kernel
+  // contract at capture time so an out-of-contract PCaseSpec fails loudly HERE
+  // rather than as a panic!("data_partition failed") at replay.
+  if (cs.threshold >= cs.num_bin) {
+    std::cerr << "PCASE " << cs.name << ": threshold (" << cs.threshold
+              << ") >= num_bin (" << cs.num_bin << ")\n";
+    std::abort();
+  }
   std::vector<int> route = SplitRoute(cs.bins, cs.min_bin, cs.max_bin, cs.threshold,
                                       cs.most_freq_bin);
   // Stable two-pass gather: left (route 0) then right (route 1), each in order.
