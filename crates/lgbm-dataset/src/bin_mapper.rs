@@ -35,6 +35,8 @@
 //! Per D-03, `find_bin` is a standalone per-column constructor (no shared mutable
 //! accumulator across features) so a later `par_iter` is a one-line swap.
 
+use std::collections::HashMap;
+
 use lgbm_core::random::Random;
 use lgbm_core::types::K_ZERO_THRESHOLD;
 
@@ -119,6 +121,14 @@ pub struct BinMapper {
     pub min_val_: f64,
     /// C++ `double max_val_`.
     pub max_val_: f64,
+    /// C++ `std::vector<int> bin_2_categorical_` — bin index → category value
+    /// (`-1` for the NaN dummy bin 0). Empty for a numeric mapper.
+    pub bin_2_categorical_: Vec<i32>,
+    /// C++ `std::unordered_map<int, unsigned int> categorical_2_bin_` —
+    /// category value → bin index (`-1 -> 0`). Lookups are by key; iteration
+    /// order is irrelevant (fold order is sort-driven), so a plain `HashMap`
+    /// is faithful (RESEARCH State-of-the-Art). Empty for a numeric mapper.
+    pub categorical_2_bin_: HashMap<i32, u32>,
 }
 
 impl BinMapper {
@@ -162,10 +172,20 @@ impl BinMapper {
             }
             l as u32
         } else {
-            // categorical path is wired in a later plan (Plan 03); for a numeric
-            // mapper this branch is unreachable. Mirror C++ negative->0.
+            // Categorical path (bin.h:638-649), transcribed verbatim:
+            //   int_value = (int)value
+            //   if int_value < 0: return 0          // negative -> NaN dummy bin
+            //   categorical_2_bin_.count(int_value) ? at(int_value) : 0
+            // The `value as i32` matches C++ `static_cast<int>(value)` for finite
+            // values (truncation toward zero); NaN was already routed to 0 above.
             let int_value = value as i32;
-            if int_value < 0 { 0 } else { 0 }
+            if int_value < 0 {
+                return 0;
+            }
+            match self.categorical_2_bin_.get(&int_value) {
+                Some(b) => *b,
+                None => 0,
+            }
         }
     }
 
@@ -331,6 +351,8 @@ impl BinMapper {
             most_freq_bin_: 0,
             min_val_,
             max_val_,
+            bin_2_categorical_: Vec::new(),
+            categorical_2_bin_: HashMap::new(),
         };
 
         // trivial / pre-filter checks (bin.cpp:479-505)
@@ -350,6 +372,244 @@ impl BinMapper {
             let max_sparse_rate =
                 cnt_in_bin[most_freq_bin_ as usize] as f64 / total_sample_cnt as f64;
             // kSparseThreshold = 0.7 (bin.h:43)
+            if most_freq_bin_ != default_bin_ && max_sparse_rate < 0.7 {
+                most_freq_bin_ = default_bin_;
+            }
+            sparse_rate_ = cnt_in_bin[most_freq_bin_ as usize] as f64 / total_sample_cnt as f64;
+            mapper.default_bin_ = default_bin_;
+            mapper.most_freq_bin_ = most_freq_bin_;
+        } else {
+            sparse_rate_ = 1.0;
+        }
+        mapper.is_trivial_ = is_trivial_;
+        mapper.sparse_rate_ = sparse_rate_;
+        mapper
+    }
+
+    /// C++ `BinMapper::FindBin` categorical branch (`bin.cpp:311-506`, the
+    /// `bin_type_ == CategoricalBin` arm at 410-476).
+    ///
+    /// Constructs the categorical bin mapper for a single feature column from its
+    /// sampled values (already widened to f64). The shared prefix (NaN-strip,
+    /// `missing_type_` derivation, distinct-value build with the asymmetric
+    /// `CheckDoubleEqualOrdered` dedup) is identical to the numeric branch; the
+    /// divergence is the int conversion + descending-count fold below.
+    ///
+    /// Category→bin folding (bit-exact tie-break logic, distinct from numeric):
+    /// - distinct f64 values are cast to `int` (`value as i32`); negatives are
+    ///   accumulated into `na_cnt` (treated as NaN, C++ `Log::Warning` omitted —
+    ///   no logging contract), and adjacent equal ints are merged;
+    /// - `(counts_int, distinct_values_int)` are stable-sorted by COUNT DESCENDING
+    ///   (C++ `SortForPair(is_reverse=true)`); ties keep input (ascending-value)
+    ///   order;
+    /// - `cut_cnt = RoundInt((total - na) * 0.99f)` with the FLOAT `0.99f` literal
+    ///   and `RoundInt(x) = (int)(x + 0.5f)`;
+    /// - bin 0 is the NaN dummy (`bin_2_categorical_[0] == -1`,
+    ///   `categorical_2_bin_[-1] == 0`); the fold loop assigns bins 1..N while
+    ///   `used_cnt < cut_cnt || num_bin_ < max_bin`, breaking on a rare level
+    ///   (`counts_int[cur] < min_data_in_bin && cur_cat_idx > 1`);
+    /// - `missing_type_ = None` iff every distinct category was consumed AND
+    ///   `na_cnt == 0`, else `NaN`; `cnt_in_bin[0] = total - used_cnt`.
+    ///
+    /// This is the per-feature constructor (D-03): no shared mutable state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_bin_categorical(
+        mut values: Vec<f64>,
+        mut max_bin: i32,
+        min_data_in_bin: i32,
+        min_split_data: i32,
+        pre_filter: bool,
+        use_missing: bool,
+        zero_as_missing: bool,
+        total_sample_cnt: usize,
+    ) -> BinMapper {
+        let num_sample_values_in = values.len() as i32;
+
+        // 1. strip NaNs in place, count non-NaN (bin.cpp:315-321)
+        let mut non_na_cnt: usize = 0;
+        for i in 0..values.len() {
+            if !values[i].is_nan() {
+                values[non_na_cnt] = values[i];
+                non_na_cnt += 1;
+            }
+        }
+
+        // 2. derive missing_type_ (bin.cpp:322-333)
+        let mut na_cnt: i32 = 0;
+        let mut missing_type_ = if !use_missing {
+            MissingType::None
+        } else if zero_as_missing {
+            MissingType::Zero
+        } else if non_na_cnt as i32 == num_sample_values_in {
+            MissingType::None
+        } else {
+            na_cnt = num_sample_values_in - non_na_cnt as i32;
+            MissingType::NaN
+        };
+
+        let num_sample_values = non_na_cnt;
+        values.truncate(num_sample_values);
+
+        let bin_type_ = BinType::Categorical;
+        let zero_cnt: i32 =
+            (total_sample_cnt as i64 - num_sample_values as i64 - na_cnt as i64) as i32;
+
+        // 3. distinct values + counts, with zero pseudo-value insertion
+        //    (bin.cpp:339-375) — IDENTICAL to the numeric branch prefix.
+        let mut distinct_values: Vec<f64> = Vec::new();
+        let mut counts: Vec<i32> = Vec::new();
+
+        values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN after strip"));
+
+        if num_sample_values == 0 || (values[0] > 0.0 && zero_cnt > 0) {
+            distinct_values.push(0.0);
+            counts.push(zero_cnt);
+        }
+        if num_sample_values > 0 {
+            distinct_values.push(values[0]);
+            counts.push(1);
+        }
+        for i in 1..num_sample_values {
+            if !check_double_equal_ordered(values[i - 1], values[i]) {
+                if values[i - 1] < 0.0 && values[i] > 0.0 {
+                    distinct_values.push(0.0);
+                    counts.push(zero_cnt);
+                }
+                distinct_values.push(values[i]);
+                counts.push(1);
+            } else {
+                *distinct_values.last_mut().unwrap() = values[i];
+                *counts.last_mut().unwrap() += 1;
+            }
+        }
+        if num_sample_values > 0 && values[num_sample_values - 1] < 0.0 && zero_cnt > 0 {
+            distinct_values.push(0.0);
+            counts.push(zero_cnt);
+        }
+
+        let min_val_ = *distinct_values.first().unwrap_or(&0.0);
+        let max_val_ = *distinct_values.last().unwrap_or(&0.0);
+
+        // 4. categorical branch (bin.cpp:410-476).
+        // convert to int type first (negatives -> NaN), merge adjacent equal ints.
+        let mut distinct_values_int: Vec<i32> = Vec::new();
+        let mut counts_int: Vec<i32> = Vec::new();
+        for i in 0..distinct_values.len() {
+            let val = distinct_values[i] as i32; // static_cast<int>
+            if val < 0 {
+                na_cnt += counts[i];
+                // C++ logs a warning here; we have no logging contract — omit.
+            } else if distinct_values_int.is_empty() || val != *distinct_values_int.last().unwrap() {
+                distinct_values_int.push(val);
+                counts_int.push(counts[i]);
+            } else {
+                *counts_int.last_mut().unwrap() += counts[i];
+            }
+        }
+
+        let mut num_bin_: i32 = 1;
+        let mut bin_2_categorical_: Vec<i32> = Vec::new();
+        let mut categorical_2_bin_: HashMap<i32, u32> = HashMap::new();
+        let mut cnt_in_bin: Vec<i32> = Vec::new();
+        let mut used_cnt: i32 = 0;
+
+        let rest_cnt: i32 = (total_sample_cnt as i64 - na_cnt as i64) as i32;
+        if rest_cnt > 0 {
+            // C++ emits a sparse-values warning (SPARSE_RATIO) here; no-op for us.
+
+            // sort by counts in descending order, STABLE (SortForPair is_reverse=true).
+            // Mirror SortForPair: build (count, value) pairs, stable_sort by
+            // count DESC, write back. `sort_by` is stable; ties keep input
+            // (ascending-value) order.
+            let mut pairs: Vec<(i32, i32)> = counts_int
+                .iter()
+                .copied()
+                .zip(distinct_values_int.iter().copied())
+                .collect();
+            pairs.sort_by(|a, b| b.0.cmp(&a.0)); // a.first > b.first (descending)
+            for (i, (c, v)) in pairs.iter().enumerate() {
+                counts_int[i] = *c;
+                distinct_values_int[i] = *v;
+            }
+
+            // will ignore the categorical of small counts.
+            // cut_cnt = RoundInt((total_sample_cnt - na_cnt) * 0.99f).
+            // C++ chain: (size_t - int) -> size_t; size_t * float(0.99f) -> the
+            // integer operand converts to FLOAT, the multiply is in f32; then
+            // RoundInt(double x) = (int)(x + 0.5f) (float 0.5 promoted to double).
+            let rest_f32: f32 = rest_cnt as f32;
+            let scaled: f32 = rest_f32 * 0.99_f32;
+            let cut_cnt: i32 = (scaled as f64 + 0.5_f32 as f64) as i32;
+
+            let mut cur_cat_idx: usize = 0;
+            // distinct_cnt counts the NaN dummy bin when na_cnt > 0 (bin.cpp:444-447).
+            let mut distinct_cnt: i32 = distinct_values_int.len() as i32;
+            if na_cnt > 0 {
+                distinct_cnt += 1;
+            }
+            max_bin = max_bin.min(distinct_cnt);
+
+            // Push the dummy bin for NaN (bin.cpp:451-455).
+            bin_2_categorical_.push(-1);
+            categorical_2_bin_.insert(-1, 0);
+            cnt_in_bin.push(0);
+            num_bin_ = 1;
+
+            while cur_cat_idx < distinct_values_int.len()
+                && (used_cnt < cut_cnt || num_bin_ < max_bin)
+            {
+                if counts_int[cur_cat_idx] < min_data_in_bin && cur_cat_idx > 1 {
+                    break;
+                }
+                bin_2_categorical_.push(distinct_values_int[cur_cat_idx]);
+                categorical_2_bin_.insert(distinct_values_int[cur_cat_idx], num_bin_ as u32);
+                used_cnt += counts_int[cur_cat_idx];
+                cnt_in_bin.push(counts_int[cur_cat_idx]);
+                num_bin_ += 1;
+                cur_cat_idx += 1;
+            }
+
+            // Use MissingType::None to represent "this bin contains all categoricals".
+            if cur_cat_idx == distinct_values_int.len() && na_cnt == 0 {
+                missing_type_ = MissingType::None;
+            } else {
+                missing_type_ = MissingType::NaN;
+            }
+            // fix count of NaN bin (bin.cpp:475).
+            cnt_in_bin[0] = (total_sample_cnt as i64 - used_cnt as i64) as i32;
+        }
+
+        // Build the mapper so ValueToBin(0) can be evaluated for default_bin_.
+        let mut mapper = BinMapper {
+            num_bin_,
+            missing_type_,
+            bin_upper_bound_: Vec::new(),
+            is_trivial_: false,
+            sparse_rate_: 0.0,
+            bin_type_,
+            default_bin_: 0,
+            most_freq_bin_: 0,
+            min_val_,
+            max_val_,
+            bin_2_categorical_,
+            categorical_2_bin_,
+        };
+
+        // trivial / pre-filter checks (bin.cpp:479-505).
+        let mut is_trivial_ = num_bin_ <= 1;
+        if !is_trivial_
+            && pre_filter
+            && need_filter(&cnt_in_bin, total_sample_cnt as i32, min_split_data, bin_type_)
+        {
+            is_trivial_ = true;
+        }
+
+        let sparse_rate_;
+        if !is_trivial_ {
+            let default_bin_ = mapper.value_to_bin(0.0);
+            let mut most_freq_bin_ = arg_max(&cnt_in_bin) as u32;
+            let max_sparse_rate =
+                cnt_in_bin[most_freq_bin_ as usize] as f64 / total_sample_cnt as f64;
             if most_freq_bin_ != default_bin_ && max_sparse_rate < 0.7 {
                 most_freq_bin_ = default_bin_;
             }
@@ -758,6 +1018,8 @@ mod tests {
             most_freq_bin_: 0,
             min_val_: 0.0,
             max_val_: 0.0,
+            bin_2_categorical_: Vec::new(),
+            categorical_2_bin_: HashMap::new(),
         }
     }
 
@@ -919,5 +1181,137 @@ mod tests {
             m.is_trivial_,
             "feature with no valid split given min_split_data=50 must be filtered trivial"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Categorical FindBin + categorical ValueToBin (Plan 03)
+    // -----------------------------------------------------------------------
+
+    /// Build a categorical mapper from a column of integer-valued categories.
+    fn cat_mapper(col: Vec<f64>, max_bin: i32, min_data_in_bin: i32) -> BinMapper {
+        let n = col.len();
+        BinMapper::find_bin_categorical(
+            col,
+            max_bin,
+            min_data_in_bin,
+            /*min_split_data=*/ 1,
+            /*pre_filter=*/ false,
+            /*use_missing=*/ true,
+            /*zero_as_missing=*/ false,
+            n,
+        )
+    }
+
+    #[test]
+    fn categorical_descending_count_fold() {
+        // Categories sorted by COUNT DESCENDING map to bins 1..N in that order.
+        // Hand case: value 5 appears x4, value 2 appears x3, value 9 appears x1.
+        // Descending-count order: 5, 2, 9 -> bins 1, 2, 3 (bin 0 is NaN dummy).
+        let mut col = Vec::new();
+        col.extend(std::iter::repeat(5.0).take(4));
+        col.extend(std::iter::repeat(2.0).take(3));
+        col.push(9.0);
+        let m = cat_mapper(col, 256, 1);
+        assert_eq!(m.bin_type_, BinType::Categorical);
+        assert_eq!(m.categorical_2_bin_.get(&5), Some(&1), "highest count -> bin 1");
+        assert_eq!(m.categorical_2_bin_.get(&2), Some(&2), "next count -> bin 2");
+        assert_eq!(m.categorical_2_bin_.get(&9), Some(&3), "lowest count -> bin 3");
+        // bin_2_categorical_ is the inverse, with bin 0 == -1 (NaN dummy).
+        assert_eq!(m.bin_2_categorical_, vec![-1, 5, 2, 9]);
+        // value_to_bin routes via the map.
+        assert_eq!(m.value_to_bin(5.0), 1);
+        assert_eq!(m.value_to_bin(2.0), 2);
+        assert_eq!(m.value_to_bin(9.0), 3);
+    }
+
+    #[test]
+    fn categorical_count_tie_keeps_ascending_value_order() {
+        // SortForPair is STABLE: equal counts keep input (ascending-value) order.
+        // values 3, 1, 2 each appear exactly once -> all tie; the distinct build
+        // produces ascending order 1, 2, 3, which the stable desc-sort preserves.
+        let col = vec![3.0, 1.0, 2.0];
+        let m = cat_mapper(col, 256, 1);
+        assert_eq!(m.bin_2_categorical_, vec![-1, 1, 2, 3], "ties keep ascending value order");
+    }
+
+    #[test]
+    fn categorical_099_cut_uses_f32_literal() {
+        // Long-tail folding stops once used_cnt >= RoundInt((total-na)*0.99f),
+        // unless num_bin < max_bin. With max_bin small enough that the cut binds,
+        // the rarest categories are folded into the implicit remainder (bin 0).
+        // 100 rows: value 1 x99, value 2 x1. cut_cnt = round(100 * 0.99) = 99.
+        // After binning value 1 (used_cnt=99 >= 99) the loop stops (num_bin_=2 ==
+        // max_bin), so value 2 is NOT assigned a bin -> value_to_bin(2)==0.
+        let mut col = Vec::new();
+        col.extend(std::iter::repeat(1.0).take(99));
+        col.push(2.0);
+        let m = cat_mapper(col, /*max_bin=*/ 2, 1);
+        assert_eq!(m.categorical_2_bin_.get(&1), Some(&1));
+        assert_eq!(
+            m.value_to_bin(2.0),
+            0,
+            "category beyond the 0.99 cut folds into the remainder (bin 0)"
+        );
+        // missing_type_ must be NaN because not every category was consumed.
+        assert_eq!(m.missing_type_, MissingType::NaN);
+    }
+
+    #[test]
+    fn categorical_min_data_in_bin_fold_break() {
+        // A rare category (count < min_data_in_bin) with cur_cat_idx > 1 breaks
+        // the loop, collapsing rare levels into the bin-0 remainder.
+        // Counts: 10(x10), 20(x10), 30(x10), 40(x1). min_data_in_bin=5.
+        // Desc-count order: 10,20,30 (each 10) then 40 (1). 40 has count 1 < 5 and
+        // cur_cat_idx==3 > 1 -> break. So 40 is never assigned a bin.
+        let mut col = Vec::new();
+        col.extend(std::iter::repeat(10.0).take(10));
+        col.extend(std::iter::repeat(20.0).take(10));
+        col.extend(std::iter::repeat(30.0).take(10));
+        col.push(40.0);
+        let m = cat_mapper(col, /*max_bin=*/ 256, /*min_data_in_bin=*/ 5);
+        assert!(m.categorical_2_bin_.contains_key(&10));
+        assert!(m.categorical_2_bin_.contains_key(&20));
+        assert!(m.categorical_2_bin_.contains_key(&30));
+        assert_eq!(
+            m.value_to_bin(40.0),
+            0,
+            "rare level (count < min_data_in_bin, idx>1) collapses into bin 0"
+        );
+    }
+
+    #[test]
+    fn categorical_nan_and_negative_and_unknown_route_to_bin_0() {
+        // bin_2_categorical_[0] == -1 (NaN dummy); negative/NaN/unknown -> bin 0.
+        let col = vec![0.0, 1.0, 2.0, 0.0, 1.0];
+        let m = cat_mapper(col, 256, 1);
+        assert_eq!(m.bin_2_categorical_[0], -1, "bin 0 is the NaN dummy");
+        // NaN -> 0 (categorical NaN routing in value_to_bin head).
+        assert_eq!(m.value_to_bin(f64::NAN), 0, "NaN -> categorical bin 0");
+        // negative category -> 0 (int_value < 0 guard).
+        assert_eq!(m.value_to_bin(-1.0), 0, "negative category -> bin 0");
+        // unknown (never-seen) category -> 0.
+        assert_eq!(m.value_to_bin(99.0), 0, "unknown category -> bin 0");
+    }
+
+    #[test]
+    fn categorical_negative_values_fold_into_na() {
+        // Negative distinct values accumulate into na_cnt (treated as NaN) and are
+        // NOT assigned a category bin; missing_type_ becomes NaN.
+        let col = vec![-3.0, -3.0, 1.0, 1.0, 1.0, 2.0, 2.0];
+        let m = cat_mapper(col, 256, 1);
+        assert!(!m.categorical_2_bin_.contains_key(&-3), "negative is not a category");
+        assert_eq!(m.value_to_bin(-3.0), 0);
+        assert_eq!(m.missing_type_, MissingType::NaN, "negatives -> NaN missing");
+        assert_eq!(m.categorical_2_bin_.get(&1), Some(&1));
+        assert_eq!(m.categorical_2_bin_.get(&2), Some(&2));
+    }
+
+    #[test]
+    fn categorical_all_consumed_no_na_is_missing_none() {
+        // When every category is consumed and there are no NaNs/negatives,
+        // missing_type_ == None.
+        let col = vec![0.0, 1.0, 2.0, 3.0, 1.0, 2.0];
+        let m = cat_mapper(col, 256, 1);
+        assert_eq!(m.missing_type_, MissingType::None);
     }
 }

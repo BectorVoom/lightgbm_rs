@@ -294,6 +294,8 @@ mod tests {
             most_freq_bin_: most_freq_bin,
             min_val_: 0.0,
             max_val_: 0.0,
+            bin_2_categorical_: Vec::new(),
+            categorical_2_bin_: std::collections::HashMap::new(),
         }
     }
 
