@@ -9,10 +9,10 @@
 
 ### Foundations & Determinism
 
-- [ ] **FND-01**: Port LightGBM's `Random` PRNG (32-bit LCG, `NextFloat`, `Sample(N,K)`) bit-for-bit, unit-tested against a captured C++ draw sequence
-- [ ] **FND-02**: Establish workspace crate structure (loosely-coupled crates by responsibility) building under edition 2024
-- [ ] **FND-03**: Use `f32` (single-precision) data types end-to-end (gradients, hessians, leaf values, scores) matching C++ defaults, with standard `f32` histogram/score accumulations on CPU and ROCm; outputs match the C++ reference within ~1e-6 (no integer-quantized reduction strategy)
-- [ ] **FND-04**: `thiserror` domain error types at every crate boundary; `anyhow` propagation in application/test layers
+- [x] **FND-01**: Port LightGBM's `Random` PRNG (32-bit LCG, `NextFloat`, `Sample(N,K)`) bit-for-bit, unit-tested against a captured C++ draw sequence
+- [x] **FND-02**: Establish workspace crate structure (loosely-coupled crates by responsibility) building under edition 2024
+- [x] **FND-03**: Use `f32` (single-precision) data types end-to-end (gradients, hessians, leaf values, scores) matching C++ defaults, with standard `f32` histogram/score accumulations on CPU and ROCm; outputs match the C++ reference within ~1e-6 (no integer-quantized reduction strategy)
+- [x] **FND-04**: `thiserror` domain error types at every crate boundary; `anyhow` propagation in application/test layers
 
 ### Configuration
 
@@ -99,8 +99,8 @@
 
 ### Oracle & Validation
 
-- [ ] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤~1e-6 absolute (f32 single-precision)
-- [ ] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, default `float` `score_t`/`label_t` width) for valid comparison
+- [x] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤~1e-6 absolute (f32 single-precision)
+- [x] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, default `float` `score_t`/`label_t` width) for valid comparison
 - [ ] **ORA-03**: Per-stage parity tests (bin → histogram → per-split-gain → leaf-output → prediction), not just final outputs
 - [ ] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment)
 
@@ -145,15 +145,15 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FND-01 | Phase 1 | Pending |
-| FND-02 | Phase 1 | Pending |
-| FND-03 | Phase 1 | Pending |
-| FND-04 | Phase 1 | Pending |
+| FND-01 | Phase 1 | Complete |
+| FND-02 | Phase 1 | Complete |
+| FND-03 | Phase 1 | Complete |
+| FND-04 | Phase 1 | Complete |
 | CFG-01 | Phase 1 | Pending |
 | CFG-02 | Phase 1 | Pending |
 | CFG-03 | Phase 1 | Pending |
-| ORA-01 | Phase 1 | Pending |
-| ORA-02 | Phase 1 | Pending |
+| ORA-01 | Phase 1 | Complete |
+| ORA-02 | Phase 1 | Complete |
 | DAT-01 | Phase 2 | Pending |
 | DAT-02 | Phase 2 | Pending |
 | DAT-03 | Phase 2 | Pending |
@@ -216,6 +216,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | PYB-04 | Phase 8 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 69 total (the prior "58" headline was a stale count; the enumerated REQ-ID list contains 69 distinct IDs)
 - Mapped to phases: 69 ✓
 - Unmapped: 0 ✓
