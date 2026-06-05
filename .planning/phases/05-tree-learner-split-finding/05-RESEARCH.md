@@ -439,21 +439,23 @@ used_feature_indices_ = random_.Sample(valid_feature_indices_.size(), used_cnt_b
 
 **If this table is empty:** it is not — five assumptions need confirmation during planning/discuss.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All three resolved during Phase 5 planning (plans 05-03 / 05-04). Resolutions inlined below.
 
 1. **Where does `FixHistogram` (most-freq-bin reconstruct) belong — learner or Backend?**
    - What we know: C++ runs it in the learner (`Dataset::FixHistogram`) immediately before each per-feature scan, on the raw leaf sums. It is a short, deterministic f64 loop.
    - What's unclear: whether to keep it learner-side (simplest, matches C++ call site) or fold it into a Backend op (keeps all histogram-cell math behind the CubeCL seam).
-   - Recommendation: keep it **learner-side** as a plain f64 function (it operates on the host-side histogram `Vec<f64>` returned by `construct_histograms`); golden it as part of the per-split snapshot. Revisit only if a future ROCm path needs it GPU-resident.
+   - **RESOLVED:** keep it **learner-side** as a plain f64 function on the host-side histogram `Vec<f64>` returned by `construct_histograms`; goldened as part of the per-split snapshot. Implemented in 05-03 Task 1.
 
 2. **Does `force_col_wise` require a distinct compute path (A1)?**
    - What we know: the two strategies differ only in build order; results must be identical on the deterministic anchor.
    - What's unclear: whether the existing Phase-4 `construct_histograms` already covers both, or `force_col_wise` needs a column-major accumulation that produces the same f64 cells.
-   - Recommendation: in Wave 1, capture both goldens and assert tree-equality; if identical at the Backend layer, TRL-09 is satisfied by a config flag with no new kernel. Document the finding.
+   - **RESOLVED:** treated as a config flag over the shared Backend path (05-04 Task 1), with an explicit STOP-and-flag escape (threat T-05-04-02) if the captured `force_col_wise` golden diverges from `force_row_wise` at the `construct_histograms` layer. TRL-09 is satisfied by tree-equality golden, no new kernel expected.
 
 3. **D-03 captured-g/h: which objective/dataset/`boost_from_average`?** (Claude's discretion)
    - What we know: needs realistic iteration-1 g/h from a real C++ objective on a real dataset; the Phase-2/3 example datasets (regression 28-feature, binary 28-feature, 500 rows) are already committed.
-   - Recommendation: use `regression` (l2) iteration-1 (`grad = score - label`, `hess = 1`) with `boost_from_average=false` for the cleanest deterministic g/h, on the committed regression example matrix; add a `binary` (logloss) iteration-1 case for sign/magnitude spread. Avoid NaN-missing features in the chosen columns (ties to A5). Capture via the existing `$LGBM_CAPTURE_PYTHON` pip path or a header-only objective transcription.
+   - **RESOLVED:** `regression` (l2) iteration-1 (`grad = score - label`, `hess = 1`) with `boost_from_average=false` on the committed regression example matrix; plus a `binary` (logloss) iteration-1 case for sign/magnitude spread; NaN-missing columns avoided (ties to A5). Implemented in 05-04 Task 2.
 
 ## Environment Availability
 
