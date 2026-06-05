@@ -2134,9 +2134,11 @@ constexpr int kDefaultIngestMinDataInBin = 3;
 
 // Replicate FeatureGroup::new_single + PushData (feature_group.h:93-111,
 // 253-267) to compute the STORED bin a single-value dense group would hold for
-// `value`. In the non-bundled Dataset::construct path EVERY feature gets such a
-// group (trivial features are NOT skipped), so this is exactly what the Rust
-// FeatureGroup stores per row.
+// `value`. Per C++ Dataset::Construct (dataset.cpp:337-343), a TRIVIAL feature is
+// DROPPED — it gets no FeatureGroup and no store — so this is only ever called
+// for NON-trivial features (the call site gates on !bm.is_trivial_). For a
+// non-trivial single-value group this is exactly what the Rust FeatureGroup
+// stores per row.
 uint32_t StoredBinSingleGroup(const BinMapper& bm, double value) {
   // bin_offsets_[0] for new_single is 1 (num_total_bin_ seeded at 1).
   const uint32_t offset = 1;
@@ -2203,6 +2205,13 @@ void EmitDefaultConfigIngest(std::ofstream& out, int master_seed) {
   }
   out << "\n";
 
+  // 1. Build a BinMapper per feature AND capture its sampled per-row values (the
+  //    same single Random(seed).Sample draw used to bin) so the EFB grouping
+  //    inputs reuse the ingest sampled set — no second RNG draw.
+  std::vector<BinMapper> mappers;
+  mappers.reserve(num_features);
+  std::vector<std::vector<double>> sampled_columns(num_features);
+  std::vector<int> filter_cnts(num_features, 0);
   for (int f = 0; f < num_features; ++f) {
     const std::vector<double>& col = columns[f];
     // Replicate the dense in-memory C-API sample path: Random(seed).Sample over
@@ -2218,33 +2227,118 @@ void EmitDefaultConfigIngest(std::ofstream& out, int master_seed) {
     // then truncate to int). total_sample_size = k, num_dist_data = num_rows.
     const int filter_cnt = static_cast<int>(
         static_cast<double>(kDefaultIngestMinDataInLeaf * k) / num_rows);
+    filter_cnts[f] = filter_cnt;
 
-    BinMapper bm = FindBinNumeric(sampled, kDefaultIngestMaxBin,
-                                  kDefaultIngestMinDataInBin,
-                                  /*min_split_data=*/filter_cnt,
-                                  /*pre_filter=*/true, /*use_missing=*/true,
-                                  /*zero_as_missing=*/false, sampled.size(),
-                                  /*forced=*/{});
+    mappers.push_back(FindBinNumeric(sampled, kDefaultIngestMaxBin,
+                                     kDefaultIngestMinDataInBin,
+                                     /*min_split_data=*/filter_cnt,
+                                     /*pre_filter=*/true, /*use_missing=*/true,
+                                     /*zero_as_missing=*/false, sampled.size(),
+                                     /*forced=*/{}));
+    sampled_columns[f] = std::move(sampled);
+  }
+  const int sample_cnt = static_cast<int>(
+      sampled_columns.empty() ? 0 : sampled_columns[0].size());
 
+  // 2. Compute feature2group_/feature2subfeature_ via the IN-FILE verbatim
+  //    FastFeatureBundling transcription over the !is_trivial_ used-feature set
+  //    (dataset.cpp:337-369), mirroring the single C++ Dataset::Construct. There
+  //    is NO LightGBM::Dataset object here (header-only harness; linking
+  //    lib_lightgbm is forbidden) — the grouping comes from the in-file EFB
+  //    transcription fed the BinMappers above.
+  //
+  //    SAMPLED-SET convention (matches Task 1's ingest EfbSamples, c_api.cpp:
+  //    1352-1374): outer position i = 0..sample_cnt; keep value when
+  //    |v| > kZeroThreshold || isnan(v); pushed index = i (sampled-set POSITION);
+  //    total_sample_cnt = sample_cnt (NOT num_rows). On this dense fixture the
+  //    grouping is convention-independent (single_val_max_conflict_cnt =
+  //    sample_cnt/10000 = 0, every feature dense -> strict one-feature-per-group),
+  //    so this is a robustness/documentation safeguard that also avoids the
+  //    forbidden lib_lightgbm link — NOT a live correctness divergence today.
+  constexpr double kZeroThreshold = 1e-35;
+  std::vector<std::vector<int>> efb_idx(num_features);
+  std::vector<std::vector<double>> efb_val(num_features);
+  std::vector<int> efb_num_per_col(num_features, 0);
+  for (int f = 0; f < num_features; ++f) {
+    const std::vector<double>& sc = sampled_columns[f];
+    for (int i = 0; i < static_cast<int>(sc.size()); ++i) {
+      const double v = sc[i];
+      if (std::fabs(v) > kZeroThreshold || std::isnan(v)) {
+        efb_idx[f].push_back(i);  // sampled-set POSITION, not raw row
+        efb_val[f].push_back(v);
+      }
+    }
+    efb_num_per_col[f] = static_cast<int>(efb_idx[f].size());
+  }
+
+  // used_features = non-trivial features, in order (dataset.cpp:337-343).
+  std::vector<int> used_features;
+  for (int f = 0; f < num_features; ++f) {
+    if (!mappers[f].is_trivial_) used_features.push_back(f);
+  }
+
+  std::vector<int*> idx_ptrs(num_features, nullptr);
+  std::vector<double*> val_ptrs(num_features, nullptr);
+  for (int f = 0; f < num_features; ++f) {
+    idx_ptrs[f] = efb_idx[f].empty() ? nullptr : efb_idx[f].data();
+    val_ptrs[f] = efb_val[f].empty() ? nullptr : efb_val[f].data();
+  }
+
+  std::vector<int8_t> group_is_multi_val(used_features.size(), 0);
+  std::vector<std::vector<int>> features_in_group;
+  if (!used_features.empty()) {
+    // enable_bundle defaults true -> FastFeatureBundling (dataset.cpp:362-369).
+    features_in_group = FastFeatureBundling(
+        mappers, idx_ptrs.data(), val_ptrs.data(), efb_num_per_col.data(),
+        num_features, /*total_sample_cnt=*/sample_cnt, used_features,
+        /*num_data=*/num_rows, /*is_use_gpu=*/false, /*is_sparse=*/false,
+        &group_is_multi_val);
+  }
+
+  // Build feature2group_/feature2subfeature_ over the used-feature grouping
+  // (dataset.cpp:375-411). real feature -> (group, subfeature), -1 if trivial.
+  std::vector<int> rf2group(num_features, -1), rf2sub(num_features, -1);
+  for (int i = 0; i < static_cast<int>(features_in_group.size()); ++i) {
+    const auto& fs = features_in_group[i];
+    for (int j = 0; j < static_cast<int>(fs.size()); ++j) {
+      rf2group[fs[j]] = i;
+      rf2sub[fs[j]] = j;
+    }
+  }
+
+  // 3. Emit. The FEATURE line carries is_trivial for ALL features (so the Rust
+  //    test asserts the flip + the exclusion); a NON-trivial feature additionally
+  //    carries group=/subfeature= and an ASSIGN line; a TRIVIAL feature gets NO
+  //    group/subfeature and NO ASSIGN (it is dropped from the store —
+  //    dataset.cpp:337-343).
+  for (int f = 0; f < num_features; ++f) {
+    const BinMapper& bm = mappers[f];
     out << "FEATURE f=" << f << " num_bin=" << bm.num_bin_
         << " missing_type=" << static_cast<int>(bm.missing_type_)
         << " default_bin=" << bm.default_bin_
         << " most_freq_bin=" << bm.most_freq_bin_
         << " is_trivial=" << (bm.is_trivial_ ? 1 : 0)
-        << " filter_cnt=" << filter_cnt << " upper=";
+        << " filter_cnt=" << filter_cnts[f];
+    if (!bm.is_trivial_) {
+      out << " group=" << rf2group[f] << " subfeature=" << rf2sub[f];
+    }
+    out << " upper=";
     for (size_t i = 0; i < bm.bin_upper_bound_.size(); ++i) {
       if (i) out << ";";
       out << F64Bits(bm.bin_upper_bound_[i]);
     }
     out << "\n";
 
-    // STORED per-row bin (what the dataset's single-value FeatureGroup stores).
-    out << "ASSIGN f=" << f << " ";
-    for (int r = 0; r < num_rows; ++r) {
-      if (r) out << ";";
-      out << StoredBinSingleGroup(bm, col[r]);
+    // STORED per-row bin — ONLY for non-trivial features (trivial -> no store).
+    if (!bm.is_trivial_) {
+      const std::vector<double>& col = columns[f];
+      out << "ASSIGN f=" << f << " ";
+      for (int r = 0; r < num_rows; ++r) {
+        if (r) out << ";";
+        out << StoredBinSingleGroup(bm, col[r]);
+      }
+      out << "\n";
     }
-    out << "\n";
   }
 }
 
