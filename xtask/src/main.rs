@@ -49,6 +49,14 @@ pub const BIN_MASTER_SEED: i32 = 0x0B11_BEEF;
 /// REFERENCE_MANIFEST.md.
 pub const KERNEL_MASTER_SEED: i32 = 0x4157_F00D;
 
+/// The recorded master seed for the Phase-5 serial tree-learner golden corpus
+/// (D-06 per-split / D-07 per-tree). Like the other master seeds it is the SINGLE
+/// source of randomness for the learner cases, so `learner-capture` is
+/// byte-idempotent (empty `git diff`). Recorded in REFERENCE_MANIFEST.md. The
+/// 05-02 scaffold emits a fixed placeholder; Plan 03/04 drive the real corpus off
+/// this seed.
+pub const LEARNER_MASTER_SEED: i32 = 0x1EA6_5EED;
+
 /// Pinned LightGBM submodule commit (recorded in the manifest, ORA-02 / D-05).
 pub const LIGHTGBM_COMMIT: &str = "195c26fc7b00eb0fec252dfe841e2e66d6833954";
 
@@ -76,16 +84,19 @@ fn main() -> Result<()> {
         Some("bin-capture") => bin_capture(),
         Some("model-capture") => model_capture(),
         Some("kernel-capture") => kernel_capture(),
+        Some("learner-capture") => learner_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
-                 (try: regen | bin-capture | model-capture | kernel-capture)"
+                 (try: regen | bin-capture | model-capture | kernel-capture | \
+                 learner-capture)"
             );
         }
         None => {
             eprintln!(
                 "usage: cargo run -p xtask -- \
-                 <regen | bin-capture | model-capture | kernel-capture>"
+                 <regen | bin-capture | model-capture | kernel-capture | \
+                 learner-capture>"
             );
             Ok(())
         }
@@ -449,6 +460,109 @@ fn kernel_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- kernel-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/kernels/` \
+         is empty (byte-idempotent)."
+    );
+    Ok(())
+}
+
+/// Regenerate the Phase-5 serial tree-learner golden corpus (D-06 / D-07).
+///
+/// Mirrors [`kernel_capture`]: configures + builds the standalone `learner_capture`
+/// C++ target (header-only against the pinned `LightGBM/include` for the reference
+/// `Random`; the learner growth loop is verbatim-transcribed in
+/// `learner_capture.cpp` because the submodule's `external_libs/` are not vendored
+/// here — see that file's header), then runs it over the [`LEARNER_MASTER_SEED`]-
+/// derived corpus and writes the goldens under
+/// `crates/oracle-harness/tests/fixtures/learner/`. Byte-idempotent.
+///
+/// Plan 05-02 ships the SCAFFOLD: a single placeholder fixture (`scaffold.txt`)
+/// exercising the PSPLIT (per-split, D-06) + PTREE (per-tree, D-07) record
+/// formats. Plan 03/04 fill the real per-split / per-tree corpus.
+fn learner_capture() -> Result<()> {
+    let root = workspace_root()?;
+    verify_toolchain()?;
+
+    let lightgbm_dir = root.join("LightGBM");
+    if !lightgbm_dir
+        .join("include/LightGBM/utils/random.h")
+        .is_file()
+    {
+        bail!(
+            "LightGBM submodule not found at {} (expected include/LightGBM/utils/random.h)",
+            lightgbm_dir.display()
+        );
+    }
+
+    let cpp_dir = root.join("xtask/cpp");
+    let build_dir = root.join("target/xtask-cpp-build");
+    std::fs::create_dir_all(&build_dir)
+        .with_context(|| format!("creating build dir {}", build_dir.display()))?;
+
+    // Fixtures live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let fixtures_dir = root.join("crates/oracle-harness/tests/fixtures/learner");
+    std::fs::create_dir_all(&fixtures_dir)
+        .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
+    let scaffold_path = fixtures_dir.join("scaffold.txt");
+
+    eprintln!("xtask learner-capture: configuring C++ capture build ...");
+    run(
+        Command::new("cmake")
+            .arg("-S")
+            .arg(&cpp_dir)
+            .arg("-B")
+            .arg(&build_dir)
+            .arg(format!("-DLIGHTGBM_DIR={}", lightgbm_dir.display()))
+            .arg("-DCMAKE_BUILD_TYPE=Release"),
+        "cmake configure",
+    )?;
+
+    eprintln!("xtask learner-capture: building learner_capture ...");
+    run(
+        Command::new("cmake")
+            .arg("--build")
+            .arg(&build_dir)
+            .arg("--target")
+            .arg("learner_capture")
+            .arg("--config")
+            .arg("Release"),
+        "cmake build",
+    )?;
+
+    let exe = locate_exe(&build_dir, "learner_capture")?;
+    eprintln!(
+        "xtask learner-capture: running capture ({}) ...",
+        exe.display()
+    );
+    run(
+        Command::new(&exe)
+            .arg(&scaffold_path)
+            .arg(LEARNER_MASTER_SEED.to_string()),
+        "learner_capture",
+    )?;
+
+    if !scaffold_path.is_file() {
+        bail!(
+            "capture completed but {} was not written",
+            scaffold_path.display()
+        );
+    }
+
+    // Refresh the shared reference manifest (idempotent — pure function of the
+    // recorded constants).
+    let manifest_path = root
+        .join("crates/oracle-harness/fixtures")
+        .join("REFERENCE_MANIFEST.md");
+    write_manifest(&manifest_path)?;
+
+    eprintln!(
+        "xtask learner-capture: done. Wrote {} and refreshed {}.",
+        scaffold_path.display(),
+        manifest_path.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- learner-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/learner/` \
          is empty (byte-idempotent)."
     );
     Ok(())
@@ -944,6 +1058,61 @@ on the cubecl-cpu anchor via `compare_exact_f64_bits` / `compare_exact_u32`.\n\
 \n\
 ```bash\n\
 cargo run -p xtask -- kernel-capture\n\
+```\n\
+\n\
+## Learner Golden Set (Phase 5, D-06 per-split / D-07 per-tree)\n\
+\n\
+Captured by `cargo run -p xtask -- learner-capture` into\n\
+`crates/oracle-harness/tests/fixtures/learner/`. Covers the serial tree-learner\n\
+growth: PER-SPLIT snapshots (D-06 — the full per-bin gain array + winning split,\n\
+so a divergence localizes to the gain scan) and PER-TREE goldens (D-07 — the\n\
+grown tree's `Tree::to_string()` text, compared via the Phase-3 `%.17g` machinery\n\
+as a `String`). `crates/oracle-harness/tests/learner_parity.rs` replays them\n\
+bit-exact on the cubecl-cpu anchor (`compare_exact_f64_bits` per-split) / string\n\
+equality (per-tree).\n\
+\n\
+- **Learner master seed:** `{learner_master_seed}` (`0x{learner_master_seed_hex:08X}`) —\n\
+  the SINGLE source of randomness for the learner corpus (idempotent regen).\n\
+- **Plan 05-02 status: SCAFFOLD.** A single placeholder fixture (`scaffold.txt`)\n\
+  exercises both record formats (one PSPLIT, one PTREE) so the parity harness has\n\
+  a committed target and a failing-until-implemented end-to-end test exists.\n\
+- **Capture-config placeholders (finalized in Plan 03/04):** D-04 row/col\n\
+  dimensions and the D-03 gradient/hessian source are TBD — the spine plan pins\n\
+  synthetic cases to `missing_type == None` to defer the NA_AS_MISSING forward\n\
+  branch (RESEARCH A5).\n\
+\n\
+### Record format (`scaffold.txt`)\n\
+\n\
+```\n\
+LEARNER_MASTER_SEED <seed>\n\
+COUNTS splits=<n> trees=<n>\n\
+PSPLIT split=<i> feature=<f> num_bin=<n> gains=<f64bits;...> winner=<f64bits>\n\
+PTREE name=<id>\n\
+<Tree::to_string() lines...>\n\
+ENDTREE\n\
+```\n\
+\n\
+`gains`/`winner` are raw little-endian f64 bit patterns (decimal `u64`) for\n\
+bit-exact replay; the per-tree block is compared as a `String`.\n\
+\n\
+### Capture-harness note (external_libs unbuildable)\n\
+\n\
+The authoritative `SerialTreeLearner` lives in\n\
+`src/treelearner/serial_tree_learner.cpp`, which (via `<LightGBM/dataset.h>` ->\n\
+`common.h`) transitively #includes `fast_double_parser.h` + `fmt/format.h` from\n\
+`external_libs/` — present here only as EMPTY directories. `learner_capture.cpp`\n\
+therefore VERBATIM-transcribes the learner growth loop (Plan 03/04) from the\n\
+pinned `serial_tree_learner.cpp` (commit `{commit}`, version `{version}`),\n\
+reusing `kernel_capture.cpp`'s already-transcribed gain/split math (D-02a\n\
+cross-check), and includes the header-only `LightGBM/include` only for the genuine\n\
+reference `Random`. Same discipline as `rng_capture`/`bin_capture`/`kernel_capture`:\n\
+no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` time\n\
+(the golden is committed).\n\
+\n\
+### Exact learner-capture command\n\
+\n\
+```bash\n\
+cargo run -p xtask -- learner-capture\n\
 ```\n",
         commit = LIGHTGBM_COMMIT,
         version = LIGHTGBM_VERSION,
@@ -956,6 +1125,8 @@ cargo run -p xtask -- kernel-capture\n\
         bin_master_seed_hex = BIN_MASTER_SEED as u32,
         kernel_master_seed = KERNEL_MASTER_SEED,
         kernel_master_seed_hex = KERNEL_MASTER_SEED as u32,
+        learner_master_seed = LEARNER_MASTER_SEED,
+        learner_master_seed_hex = LEARNER_MASTER_SEED as u32,
         model_train_seed = MODEL_TRAIN_SEED,
         model_train_seed_hex = MODEL_TRAIN_SEED as u32,
         model_lgbm_version = MODEL_LIGHTGBM_VERSION,

@@ -273,3 +273,58 @@ on the cubecl-cpu anchor via `compare_exact_f64_bits` / `compare_exact_u32`.
 ```bash
 cargo run -p xtask -- kernel-capture
 ```
+
+## Learner Golden Set (Phase 5, D-06 per-split / D-07 per-tree)
+
+Captured by `cargo run -p xtask -- learner-capture` into
+`crates/oracle-harness/tests/fixtures/learner/`. Covers the serial tree-learner
+growth: PER-SPLIT snapshots (D-06 — the full per-bin gain array + winning split,
+so a divergence localizes to the gain scan) and PER-TREE goldens (D-07 — the
+grown tree's `Tree::to_string()` text, compared via the Phase-3 `%.17g` machinery
+as a `String`). `crates/oracle-harness/tests/learner_parity.rs` replays them
+bit-exact on the cubecl-cpu anchor (`compare_exact_f64_bits` per-split) / string
+equality (per-tree).
+
+- **Learner master seed:** `514219757` (`0x1EA65EED`) —
+the SINGLE source of randomness for the learner corpus (idempotent regen).
+- **Plan 05-02 status: SCAFFOLD.** A single placeholder fixture (`scaffold.txt`)
+exercises both record formats (one PSPLIT, one PTREE) so the parity harness has
+a committed target and a failing-until-implemented end-to-end test exists.
+- **Capture-config placeholders (finalized in Plan 03/04):** D-04 row/col
+dimensions and the D-03 gradient/hessian source are TBD — the spine plan pins
+synthetic cases to `missing_type == None` to defer the NA_AS_MISSING forward
+branch (RESEARCH A5).
+
+### Record format (`scaffold.txt`)
+
+```
+LEARNER_MASTER_SEED <seed>
+COUNTS splits=<n> trees=<n>
+PSPLIT split=<i> feature=<f> num_bin=<n> gains=<f64bits;...> winner=<f64bits>
+PTREE name=<id>
+<Tree::to_string() lines...>
+ENDTREE
+```
+
+`gains`/`winner` are raw little-endian f64 bit patterns (decimal `u64`) for
+bit-exact replay; the per-tree block is compared as a `String`.
+
+### Capture-harness note (external_libs unbuildable)
+
+The authoritative `SerialTreeLearner` lives in
+`src/treelearner/serial_tree_learner.cpp`, which (via `<LightGBM/dataset.h>` ->
+`common.h`) transitively #includes `fast_double_parser.h` + `fmt/format.h` from
+`external_libs/` — present here only as EMPTY directories. `learner_capture.cpp`
+therefore VERBATIM-transcribes the learner growth loop (Plan 03/04) from the
+pinned `serial_tree_learner.cpp` (commit `195c26fc7b00eb0fec252dfe841e2e66d6833954`, version `4.6.0.99`),
+reusing `kernel_capture.cpp`'s already-transcribed gain/split math (D-02a
+cross-check), and includes the header-only `LightGBM/include` only for the genuine
+reference `Random`. Same discipline as `rng_capture`/`bin_capture`/`kernel_capture`:
+no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` time
+(the golden is committed).
+
+### Exact learner-capture command
+
+```bash
+cargo run -p xtask -- learner-capture
+```

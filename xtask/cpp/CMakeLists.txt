@@ -83,3 +83,21 @@ target_include_directories(bin_capture PRIVATE "${LIGHTGBM_DIR}/include")
 # submodule and references NO external_libs header dirs (empty / unbuildable here).
 add_executable(kernel_capture kernel_capture.cpp)
 target_include_directories(kernel_capture PRIVATE "${LIGHTGBM_DIR}/include")
+
+# learner_capture: serial tree-learner goldens (Phase 5, D-06 per-split / D-07
+# per-tree). SCAFFOLD in Plan 05-02; full transcription in Plan 03/04.
+#
+# The authoritative SerialTreeLearner lives in
+# src/treelearner/serial_tree_learner.cpp, which (via <LightGBM/dataset.h> ->
+# common.h) transitively #includes fast_double_parser.h + fmt/format.h from
+# external_libs/. Those submodules are present here only as EMPTY directories
+# (the LightGBM tree is git-untracked and its external_libs are not vendored), so
+# serial_tree_learner.cpp cannot be compiled and no lib_lightgbm can be built or
+# linked. learner_capture.cpp therefore VERBATIM-transcribes the learner growth
+# loop (Plan 03/04) — reusing kernel_capture's already-transcribed gain/split math
+# — and includes the header-only LightGBM/include only for the genuine reference
+# Random. Same discipline as rng_capture / bin_capture / kernel_capture: no
+# external_libs, no lib_lightgbm link, no C++ toolchain at `cargo test` time (the
+# golden is committed). See REFERENCE_MANIFEST.md.
+add_executable(learner_capture learner_capture.cpp)
+target_include_directories(learner_capture PRIVATE "${LIGHTGBM_DIR}/include")
