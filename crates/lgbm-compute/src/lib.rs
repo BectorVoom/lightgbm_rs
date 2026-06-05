@@ -104,6 +104,50 @@ pub trait Backend {
         sum_hessian: f64,
         num_data: i32,
     ) -> Result<SplitInfo, ComputeError>;
+
+    /// Partition a leaf's rows left/right by a feature threshold, mirroring the
+    /// C++ `DataPartition::Split` stable reorder (`data_partition.hpp:101`, the
+    /// `MissingType::None` numeric routing of `DenseBin::SplitInner`).
+    ///
+    /// Returns `(reordered, split_point)`: a STABLE reordered index array — the
+    /// left rows in their original relative order followed by the right rows in
+    /// their original relative order — and `split_point` = the left-row count
+    /// (left indices occupy `[0, split_point)`, right `[split_point, len)`). The
+    /// Phase-5 learner owns `leaf_begin_`/`leaf_count_` bookkeeping; this op
+    /// returns only the partition.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] if `num_bin == 0` or `threshold >= num_bin`, or
+    /// [`ComputeError::BinIndexOutOfRange`] for any `bins[i] >= num_bin` (V5).
+    #[allow(clippy::too_many_arguments)]
+    fn data_partition(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        bins: &[u32],
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<(Vec<u32>, usize), ComputeError>;
+
+    /// Derive the larger child's histogram via the subtraction trick
+    /// (`parent - child`), the kernel-layer MATH of `FeatureHistogram::Subtract`
+    /// (`feature_histogram.hpp:99`). WHICH child is subtracted (the smaller
+    /// sibling) is Phase-5 orchestration (RESEARCH A3: the subtract OP is
+    /// in-scope at the kernel layer).
+    ///
+    /// `parent` / `child` are the stride-2 `[g0,h0,g1,h1,…]` f64 histograms of
+    /// equal length `2 * num_bin`.
+    ///
+    /// # Errors
+    /// [`ComputeError::LengthMismatch`] if `parent.len() != child.len()` (V5).
+    fn subtract_histograms(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent: &[f64],
+        child: &[f64],
+    ) -> Result<Vec<f64>, ComputeError>;
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -162,5 +206,36 @@ impl Backend for CpuBackend {
             sum_hessian,
             num_data,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn data_partition(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        bins: &[u32],
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<(Vec<u32>, usize), ComputeError> {
+        kernels::partition::data_partition_cpu(
+            client,
+            bins,
+            num_bin,
+            min_bin,
+            max_bin,
+            threshold,
+            most_freq_bin,
+        )
+    }
+
+    fn subtract_histograms(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent: &[f64],
+        child: &[f64],
+    ) -> Result<Vec<f64>, ComputeError> {
+        kernels::subtract::subtract_histograms_cpu(client, parent, child)
     }
 }
