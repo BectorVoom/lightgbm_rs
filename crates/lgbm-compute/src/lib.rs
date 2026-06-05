@@ -21,6 +21,14 @@ pub use gain::{GainConfig, SplitInfo};
 
 use cubecl::prelude::ComputeClient;
 
+/// Re-export of the cubecl [`ComputeClient`](cubecl::prelude::ComputeClient) so
+/// downstream crates (e.g. `lgbm-treelearner`) can name the
+/// `&ComputeClient<B::Runtime>` argument the [`Backend`] ops require WITHOUT
+/// depending on `cubecl` directly — preserving the CMP-01 containment boundary
+/// (the compute crate is the single CubeCL seam; everyone above it sees only
+/// `lgbm_compute::ComputeClient`).
+pub use cubecl::prelude::ComputeClient as ComputeClientReexport;
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
