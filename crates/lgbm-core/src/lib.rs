@@ -4,6 +4,9 @@
 //! domain errors at the crate boundary ([`error`]), and the bit-exact `Random`
 //! LCG ([`random`]). Every later crate depends on this one.
 
+pub mod config;
 pub mod error;
 pub mod random;
 pub mod types;
+
+pub use config::Config;
