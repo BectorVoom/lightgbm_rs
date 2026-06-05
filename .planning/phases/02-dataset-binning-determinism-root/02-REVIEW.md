@@ -2,270 +2,178 @@
 phase: 02-dataset-binning-determinism-root
 reviewed: 2026-06-05T00:00:00Z
 depth: standard
-files_reviewed: 16
+scope: 02-07 gap-closure delta (1854704^..HEAD)
+files_reviewed: 4
 files_reviewed_list:
-  - crates/lgbm-dataset/src/bin_mapper.rs
   - crates/lgbm-dataset/src/dataset.rs
-  - crates/lgbm-dataset/src/efb.rs
-  - crates/lgbm-dataset/src/error.rs
-  - crates/lgbm-dataset/src/feature_group.rs
   - crates/lgbm-dataset/src/ingest.rs
-  - crates/lgbm-dataset/src/lib.rs
-  - crates/lgbm-dataset/src/metadata.rs
-  - crates/lgbm-dataset/src/multi_val_bin.rs
-  - crates/lgbm-dataset/src/bin/mod.rs
-  - crates/lgbm-dataset/src/bin/dense_bin.rs
-  - crates/lgbm-dataset/src/bin/sparse_bin.rs
-  - crates/oracle-harness/src/comparator.rs
+  - crates/lgbm-dataset/tests/default_config_ingest_parity.rs
   - xtask/cpp/bin_capture.cpp
-  - xtask/cpp/CMakeLists.txt
-  - xtask/src/main.rs
 findings:
-  critical: 2
-  warning: 5
-  info: 4
-  total: 11
+  critical: 0
+  warning: 4
+  info: 3
+  total: 7
 status: issues_found
 ---
 
-# Phase 02: Code Review Report
+# Phase 02 (plan 02-07 gap-closure): Code Review Report
 
 **Reviewed:** 2026-06-05
 **Depth:** standard
-**Files Reviewed:** 16
+**Files Reviewed:** 4
 **Status:** issues_found
+
+> Scope note: this report reviews ONLY the 02-07 gap-closure delta
+> (`1854704^..HEAD`) that closes CR-01. The broader phase-02 review (16 files) was
+> recorded in `02-06-REVIEW.md`. This file was overwritten per the workflow `review_path`.
 
 ## Summary
 
-The phase-02 binning layer is a careful, heavily-documented transcription of the
-C++ `src/io/` subsystem, and most of the numeric kernel (`value_to_bin`,
-`greedy_find_bin`, `find_bin_with_zero_as_one_bin`, the dedup `next_up` math, the
-4-bit/sparse storage byte layouts, EFB `find_groups`/`fast_feature_bundling`, the
-multi-val `+1` push convention, and the f32 query-weight arithmetic) was verified
-line-for-line against both the in-tree C++ reference (`LightGBM/src/io/bin.cpp`,
-`feature_group.h`, `sparse_bin.hpp`, `metadata.cpp`) and the transcription
-harness and found faithful.
+Adversarial review of the 02-07 delta closing CR-01 on the dataset-binning determinism root.
+The delta (a) filters trivial features in `Dataset::construct`/`construct_bundled`
+(`used_feature_map_[real] = -1`), (b) routes the ingest tail (`finish_from_columns`) through
+the `enable_bundle` dispatch with an `EfbSamples` built to the sampled-set convention, (c) adds
+the `default_config_ingest_parity` test asserting trivial-exclusion + per-non-trivial
+group/subfeature parity, and (d) extends `bin_capture.cpp` with the default-config emitter.
 
-Two correctness/fidelity defects were found that violate the project's
-non-negotiable parity contract under the **default** configuration:
+I traced the live ingest path end-to-end against the C++ reference transcription and the
+supporting `efb.rs` / `bin_mapper.rs` / `feature_group.rs` code. The core CR-01 fix and the
+parity test are **correct and genuinely discriminating**: the test asserts post-shuffle group
+IDs (`feature_to_group`) against the golden, reads STORED bins (not recomputed), panics on a
+missing golden, and requires both a trivial and a non-trivial feature to be present. The Rust
+live path (`construct_bundled` → `FeatureGroup::new` with `force_dense=true`) and the emitter
+(`FeatureGroupMV` with `CreateDenseBin`) agree, and the EFB sample-set conventions match
+between the two sides bit-for-bit. The test compiles and runs green (verified).
 
-1. **The ingestion pre-filter argument is wrong (CR-01).** `ingest.rs` passes the
-   raw `min_data_in_leaf` as `min_split_data` to `find_bin_numeric`, but the C-API
-   in-memory path it claims to mirror passes the *scaled* `filter_cnt =
-   (min_data_in_leaf * total_sample_size) / num_dist_data`. Because
-   `feature_pre_filter` defaults to `true` and `min_data_in_leaf` defaults to 20,
-   every default-config ingest can mark different features trivial than C++ —
-   a determinism-root divergence.
+No BLOCKER-class divergence was proven on the **live** determinism path. I did find WARNING-class
+issues: a real C++-fidelity divergence in the now-test-only no-bundle `Dataset::construct` path
+(uses `new_single` → `force_dense=false`, contradicting both C++ and this file's own module
+doc); an internal-invariant `expect()` that panics on an EFB-partition bug instead of erroring;
+an unverifiable-fidelity gap for the EfbSamples convention (the fixture is
+convention-independent so cannot detect a convention error); and a structural weakness in how
+the test discovers the trivial feature. Info items cover a misplaced doc comment, a
+bool-vs-true assertion, and a dead-store edge in the test parser.
 
-2. **The reviewed-path tests disable the very feature that hides CR-01 (CR-02).**
-   Every `ingest.rs` test sets `feature_pre_filter = false`, so the corpus never
-   exercises the default pre-filter path; the divergence ships untested.
+## Structural Findings (fallow)
 
-The remaining findings are robustness/maintainability concerns (panics reachable
-on internally-but-not-statically-guaranteed inputs, a documented CSR/CSC
-densification semantics gap, and dead/duplicated code).
+No `<structural_findings>` block was supplied with this review; none to report.
 
-## Critical Issues
-
-### CR-01: Ingestion passes raw `min_data_in_leaf` instead of the scaled `filter_cnt` to `FindBin`
-
-**File:** `crates/lgbm-dataset/src/ingest.rs:90-100` (and `:94`)
-**Issue:** `build_mapper` calls `BinMapper::find_bin_numeric(..., cfg.min_data_in_leaf, ...)`,
-passing `min_data_in_leaf` directly as the `min_split_data` (pre-filter) argument.
-The module doc-comment states this path mirrors the C-API in-memory path
-(`LGBM_DatasetCreateFromMat` → `CreateSampleIndices` → `FindBin`). That path
-routes through `DatasetLoader::ConstructFromSampleData`
-(`LightGBM/src/io/dataset_loader.cpp:623-646`), which computes:
-
-```cpp
-const data_size_t filter_cnt = static_cast<data_size_t>(
-    static_cast<double>(config_.min_data_in_leaf * total_sample_size) / num_dist_data);
-bin_mappers[i]->FindBin(..., config_.min_data_in_bin, filter_cnt, config_.feature_pre_filter, ...);
-```
-
-i.e. C++ passes the **scaled** `filter_cnt`, not raw `min_data_in_leaf`. Since
-`feature_pre_filter` defaults to `true` (`config.h:723`,
-`lgbm-core/src/config/mod.rs:356`) and `min_data_in_leaf` defaults to 20
-(`mod.rs:305`), `need_filter` will receive a different threshold than C++ for
-every feature on the default path, so `is_trivial_` (and therefore which features
-get a bin store, the EFB `used_features` set, and every downstream split) can
-diverge. This breaks the ≤1e-12 parity contract — and it is the binning
-determinism root, so the divergence cascades. The bug is masked today only
-because all tests set `pre_filter = false`.
-
-**Fix:** Compute `filter_cnt` exactly as C++ and pass it. `total_sample_size` is
-the sampled-row count (`total_sample_cnt = k`); `num_dist_data` is the number of
-distinct sampled rows (`std::set` size in `c_api.cpp`'s sampler). Thread both
-through `finish_from_columns`/`build_mapper`:
-
-```rust
-// num_dist_data = number of DISTINCT sampled rows across all columns
-// (matches c_api.cpp CreateSampleIndices dedup); total_sample_size = k.
-let filter_cnt = ((cfg.min_data_in_leaf as i64 * total_sample_size as i64)
-    / num_dist_data as i64) as i32;
-BinMapper::find_bin_numeric(
-    sampled, cfg.max_bin, cfg.min_data_in_bin,
-    filter_cnt,                 // <-- was cfg.min_data_in_leaf
-    cfg.feature_pre_filter, cfg.use_missing, cfg.zero_as_missing,
-    total_sample_cnt, &[],
-);
-```
-
-Verify the precise `total_sample_size` / `num_dist_data` definitions against
-`c_api.cpp` (the in-memory sampler) before locking, since the integer-division
-truncation is itself parity-load-bearing.
-
-### CR-02: Ingestion parity tests never exercise the default `feature_pre_filter=true` path
-
-**File:** `crates/lgbm-dataset/src/ingest.rs:341-349` (`cfg()` helper) and all tests using it
-**Issue:** The shared test `cfg()` sets `c.feature_pre_filter = false`, and every
-`from_mat`/`from_csr`/`from_csc` test reuses it. The default LightGBM behavior is
-`feature_pre_filter = true`. As a result the entire pre-filter → `is_trivial_`
-path (the one that surfaces CR-01) is untested at the ingestion boundary, so a
-determinism-root divergence ships green. For a project whose sole contract is
-bit-faithfulness, the highest-risk default path having zero coverage is itself a
-defect.
-
-**Fix:** Add an ingestion parity case with `feature_pre_filter = true` and
-`min_data_in_leaf` at its default (20), built against a C++ golden captured
-through the same scaled-`filter_cnt` path, asserting identical `is_trivial_` /
-`num_bin_` / per-row `ASSIGN` vectors. This case must fail before CR-01 is fixed
-and pass after.
+## Narrative Findings (AI reviewer)
 
 ## Warnings
 
-### WR-01: `Dataset::construct` accepts an empty mapper set despite the doc claiming it is rejected
+### WR-01: No-bundle `Dataset::construct` diverges from C++ `force_dense=true` (and from its own doc)
 
-**File:** `crates/lgbm-dataset/src/dataset.rs:78-104`
-**Issue:** The doc-comment says construct "Validates `num_data >= 0` **and a
-non-empty mapper set** at the boundary, returning [`DatasetError`] rather than
-panicking (Security V5)." The body only validates `num_data < 0`; an empty
-`bin_mappers` vector is silently accepted (producing a 0-feature dataset). The
-stated invariant is not enforced, so a caller relying on it gets no error.
-**Fix:** Either drop the "non-empty mapper set" claim from the doc, or enforce it:
+**File:** `crates/lgbm-dataset/src/dataset.rs:130` (module doc `:19-21`)
+**Issue:** `Dataset::construct` builds each group via `FeatureGroup::new_single(m, num_data)`,
+which calls `create_bin_data(num_data, false, /*force_dense=*/false, false)`
+(`feature_group.rs:161`). With `force_dense=false`, a single-value feature whose
+`sparse_rate_ >= 0.7` is stored as a **SparseBin**. But C++ `Dataset::Construct` builds **every**
+group — including the `OneFeaturePerGroup` (no-bundle) branch — through the primary
+`FeatureGroup` constructor with `CreateBinData(..., force_dense=true, ...)` (confirmed in
+`02-RESEARCH.md` §8 lines 413-419 and `02-PATTERNS.md:264`), so C++ would store the SAME
+feature as a **DenseBin**. The live `construct_bundled` path correctly uses `FeatureGroup::new`
+(`force_dense=true`, `:230`), so the two construct paths produce different storage backends for a
+sparse single-value feature — a real C++-fidelity divergence affecting which `Bin`
+implementation (and byte-layout golden) backs the feature.
+
+The module doc-comment at `dataset.rs:19-21` explicitly claims `construct` "uses
+`CreateBinData(..., force_dense=true, force_sparse=false)`" — the code contradicts the doc.
+
+Mitigating fact: `Dataset::construct` is now called ONLY from unit tests
+(`dataset.rs:430,438,445,462,541`); production ingest routes through `construct_bundled`. So
+this is not a live determinism BLOCKER today, but it is a public API that silently diverges from
+C++ and will mislead a future non-EFB caller.
+**Fix:** Route `construct` through the same group-build loop as `construct_bundled` (i.e. build
+each group via `FeatureGroup::new(1, false, vec![m], num_data, group_id)` with `force_dense=true`),
+eliminating the second storage path; or, if `new_single`'s sparse-selection is intentional for a
+different (binary-load) constructor, correct the `construct` module doc to stop claiming
+`force_dense=true`.
+
+### WR-02: `.expect()` on EFB partition can panic instead of returning a typed error
+
+**File:** `crates/lgbm-dataset/src/dataset.rs:225` (also `:127-129`)
+**Issue:** `construct_bundled` does
+`mappers_opt[real_fidx as usize].take().expect("each used feature assigned to exactly one group")`.
+If `fast_feature_bundling` ever returns a partition where a feature appears in two groups (or a
+real index out of range), this **panics** rather than returning a `DatasetError`. The module's
+stated discipline (`ingest.rs:15-18`, "VALIDATES all caller input at the boundary FIRST … never
+a panic") is undermined because the panic is reachable through the grouping algorithm rather than
+a checked invariant. The clean-partition property is neither asserted nor validated; a future EFB
+change could turn a grouping bug into a crash on the ingest path.
+**Fix:** Convert to a typed error and/or assert the partition invariant:
 ```rust
-if bin_mappers.is_empty() {
-    return Err(DatasetError::ShapeMismatch {
-        detail: "bin_mappers must be non-empty".into(),
-    });
-}
-```
-Match whichever the C++ reference actually does (C++ allows 0 features in some
-paths — confirm before adding the check, but the doc and code must agree).
-
-### WR-02: `push_value` / `feature_to_group` / `feature_to_subfeature` panic on out-of-range real-feature index
-
-**File:** `crates/lgbm-dataset/src/dataset.rs:219-248` (and `FinishedDataset` 337-361)
-**Issue:** `self.used_feature_map_[real_feature]` indexes with a caller-supplied
-`real_feature: usize` with no bounds check; an out-of-range index panics
-(index-out-of-bounds) rather than being ignored or surfaced. `push_row` validates
-the row *width* but `push_value` is also public and is the documented per-value
-entry. The boundary contract for this crate is "never panic on caller input"
-(error.rs module doc, Security V5). `real_feature_idx()` on `FinishedDataset`
-(`:359-361`) has the same unchecked `self.real_feature_idx_[packed]`.
-**Fix:** Bounds-check and return `DatasetError` (or document these as
-internal-only and make them non-`pub`). At minimum:
-```rust
-pub fn push_value(&mut self, real_feature: usize, row: i32, value: f64) {
-    let Some(&packed) = self.used_feature_map_.get(real_feature) else { return; };
-    ...
-}
+let m = mappers_opt[real_fidx as usize].take().ok_or_else(|| {
+    DatasetError::ShapeMismatch { detail: format!(
+        "EFB produced a non-partition: feature {real_fidx} assigned to multiple groups") }
+})?;
 ```
 
-### WR-03: `MultiValBin::push_one_row` sparse branch can panic / silently misbehave on a non-monotone `idx`
+### WR-03: EfbSamples sampled-set convention is self-consistent but its fidelity to real lib_lightgbm is unverifiable here
 
-**File:** `crates/lgbm-dataset/src/multi_val_bin.rs:181-191`
-**Issue:** The sparse branch writes `self.row_ptr_[(idx + 1) as usize] = values.len()`.
-This assumes rows are pushed in ascending `idx` with no gaps (the per-row count is
-later prefix-summed in `finish_load`). If `idx + 1 > num_data` it panics; if rows
-are pushed out of order or skipped, the CSR `row_ptr_` is silently wrong (a later
-row's `data_` slice will be misattributed) because `data_` is a single appended
-stream while `row_ptr_` is positional. There is no assertion tying the append
-position to `idx`. C++ `MultiValSparseBin::PushOneRow` has the same positional
-assumption but is only ever driven by the ordered `PushDataToMultiValBin` loop;
-the Rust API is `pub` with no such guard.
-**Fix:** Assert the ordering invariant (`debug_assert_eq!` the running append
-offset against the expected position) or document the precondition and keep the
-method crate-private. At minimum bounds-check `idx`.
+**File:** `crates/lgbm-dataset/src/ingest.rs:138-162`; `xtask/cpp/bin_capture.cpp:2258-2301`
+**Issue:** `build_efb_samples` (Rust) and the EFB block of `EmitDefaultConfigIngest` (C++) both
+build `sample_indices`/`num_per_col`/`total_sample_cnt` to the "sampled-set position
+`0..sample_cnt`, non-zero/NaN filter (`|v| > 1e-35 || isnan`), `total_sample_cnt = sample_cnt`"
+convention attributed to `c_api.cpp:1352-1374`. I verified the two SIDES agree bit-for-bit (same
+threshold, same NaN clause, same position semantics, same `total_sample_cnt`). The golden
+therefore proves Rust == emitter, but because `external_libs` is unvendored and `lib_lightgbm`
+cannot be built here (`bin_capture.cpp:10-32`), the golden does NOT independently prove
+emitter == real `lib_lightgbm` C-API. The emitter itself concedes the grouping is
+"convention-independent on this dense fixture" (`single_val_max_conflict_cnt = sample_cnt/10000
+= 0`, every feature dense → strict one-feature-per-group, `:2253-2257`) — so this fixture cannot
+detect a convention error; the test passes regardless of whether the sampled-set convention is
+the truly-correct c_api convention.
+**Fix:** Add (in a later plan) an EFB fixture where the convention is **observable** — sparse
+mutually-exclusive features with `sample_cnt < num_rows` so `single_val_max_conflict_cnt > 0` and
+the index/total convention actually changes grouping. Until then, annotate the test that it gates
+only Rust-vs-emitter agreement, not c_api-convention fidelity.
 
-### WR-04: `arg_max` returns 0 for an empty slice — masks an invalid-state read
+### WR-04: Test "discovers" the trivial feature only via the golden it is validating (weak independent check)
 
-**File:** `crates/lgbm-dataset/src/bin_mapper.rs:666-674`
-**Issue:** `arg_max(&[])` returns `0`, and callers then index `cnt_in_bin[0]`
-(`bin_mapper.rs:373`, `:612`). In the current control flow `arg_max` is only
-reached when `!is_trivial_` (so `num_bin_ > 1` and `cnt_in_bin` is non-empty), so
-it is not currently triggerable — but the function silently returns a valid-looking
-index for an empty input, which would turn a future logic error into a wrong
-result (reading bin 0 of an empty histogram) instead of a panic. C++ `ArgMax`
-returns 0 for empty too, so this is faithful, but the silent-zero is a latent trap.
-**Fix:** Add `debug_assert!(!v.is_empty())` to localize any future misuse without
-changing release behavior.
-
-### WR-05: `next_nonzero` advances `cur_pos` using an out-of-range delta before the bound check (relies on the terminator invariant)
-
-**File:** `crates/lgbm-dataset/src/bin/sparse_bin.rs:96-105`
-**Issue:** `next_nonzero` does `*i_delta += 1; *cur_pos += self.deltas_[*i_delta]`
-*before* checking `*i_delta < self.num_vals_`. This is a verbatim port of C++
-`NextNonzero` and is only safe because `load_from_pair` always pushes a trailing
-`deltas_.push(0)` terminator so `deltas_[num_vals_]` is in range. However, if a
-`SparseBin` is read before `finish_load` (e.g. `data()` called on a freshly
-`new`'d bin, `deltas_` empty), the index `deltas_[0]` panics. `data()` is `pub`
-and has no "finish_load first" guard.
-**Fix:** Guard `data()`/`next_nonzero` against an unloaded (`deltas_.is_empty()`)
-state, or document that read methods require `finish_load` and `debug_assert!` it.
+**File:** `crates/lgbm-dataset/tests/default_config_ingest_parity.rs:290,302-305,322-336`
+**Issue:** `used_count`, the "at least one trivial + one non-trivial" guard, and the per-feature
+branch are all derived from `g.features[*].is_trivial`, read out of the **same golden file** whose
+correctness is under test. The genuine Rust-vs-golden cross-check of `is_trivial`
+(`mapper.is_trivial_ == fg.is_trivial`, `:366-370`) runs ONLY inside the `!fg.is_trivial` branch.
+A feature the golden wrongly marks trivial (with Rust agreeing it is dropped) is never
+re-derived and compared — the test just asserts `feature_to_group(f) == -1` and `continue`s. So an
+emitter mistake that over-marks a feature trivial moves `used_count`, `num_groups`, and the branch
+in lockstep and still passes.
+**Fix:** For EVERY feature (trivial or not), independently rebuild the Rust mapper from the raw
+column + header config and assert `rust_mapper.is_trivial_ == fg.is_trivial` BEFORE branching on
+the golden flag, so the discriminating signal does not depend on the artifact being validated.
 
 ## Info
 
-### IN-01: CSR/CSC ingest densifies by column, diverging from the C++ row-iterator sample/zero accounting
+### IN-01: Misplaced doc comment in dataset.rs tests
 
-**File:** `crates/lgbm-dataset/src/ingest.rs:259-269` (CSR), `:322-332` (CSC)
-**Issue:** Both sparse ingest paths build a fully dense per-column buffer with
-absent entries defaulting to `0.0`, then bin every column as dense. The real
-C-API CSR/CSC path samples non-zero entries and tracks `num_per_col` / zero counts
-differently; densifying to explicit zeros changes `total_sample_cnt`, `zero_cnt`,
-and the sampled set feeding `find_bin`. The code comments label this "Open Q2",
-so it is a known/accepted MVP simplification — flagged for traceability because it
-is a potential parity divergence for sparse inputs once goldens cover them.
-**Fix:** None required for this phase; ensure a sparse-input parity golden is added
-before the sparse path is declared faithful.
+**File:** `crates/lgbm-dataset/src/dataset.rs:474-479`
+**Issue:** The `///` block describing the "compile-fail documentation" / immutability proof is
+attached to `empty_samples(num_cols)`, which is unrelated. It belongs above
+`finished_dataset_has_no_mutating_api` (`:536`) or `finish_load_yields_immutable_read_only_view`
+(`:451`).
+**Fix:** Move the block to the relevant test, or demote it to `//` so it stops misdocumenting
+`empty_samples`.
 
-### IN-02: Dead helper `find_bin_with_zero_as_one_bin` parameter / unused `cur_cnt_inbin` tail
+### IN-02: `assert_eq!(cond, true, ...)` instead of `assert!`
 
-**File:** `crates/lgbm-dataset/src/bin_mapper.rs:727` and `find_bin_from_column` (`:635-662`)
-**Issue:** (a) `greedy_find_bin` has a commented-out `cur_cnt_inbin += counts[...]`
-tail (`:727`) faithfully noting the C++ dead store — fine, but leave a one-line
-note that it is intentionally elided. (b) `BinMapper::find_bin_from_column`
-duplicates `build_mapper` in `ingest.rs` almost exactly (same sample→gather→
-find_bin_numeric), but passes `min_split_data` differently and is not used by the
-ingest path; it is a second, divergent copy of the same logic (and would inherit a
-*different* fix than CR-01). Duplicated determinism-root logic is a maintenance
-hazard.
-**Fix:** Either remove `find_bin_from_column` or have `build_mapper` delegate to it
-(single source of truth), so the CR-01 fix cannot be applied to only one copy.
+**File:** `crates/lgbm-dataset/tests/default_config_ingest_parity.rs:242-248`
+**Issue:** `assert_eq!(g.bin_construct_sample_cnt < g.num_rows, true, ...)` compares a bool to
+`true` (clippy `bool_assert_comparison`); less readable than `assert!`.
+**Fix:** `assert!(g.bin_construct_sample_cnt < g.num_rows, "golden must have sample_cnt ({}) < num_rows ({})", g.bin_construct_sample_cnt, g.num_rows);`
 
-### IN-03: `min_val_`/`max_val_` use `unwrap_or(0.0)` masking the empty-distinct-values case
+### IN-03: ASSIGN parser silently zeroes `stored` when the cell list is absent
 
-**File:** `crates/lgbm-dataset/src/bin_mapper.rs:282-283`, `:490-491`
-**Issue:** `*distinct_values.first().unwrap_or(&0.0)` silently substitutes 0.0 when
-`distinct_values` is empty. C++ reads `distinct_values.front()/back()` directly
-(UB if empty), so in practice `distinct_values` is never empty here (the
-zero-pseudo-value push guarantees ≥1 element when relevant). The `unwrap_or` is
-safer than C++ but hides the assumption; if the invariant ever breaks, the value
-silently becomes 0.0 rather than failing.
-**Fix:** `debug_assert!(!distinct_values.is_empty())` to document/verify the
-invariant.
-
-### IN-04: `comparator.rs` `ValueMismatch` / `abs_diff_within` are unused by the binning goldens
-
-**File:** `crates/oracle-harness/src/comparator.rs:86-112`
-**Issue:** Phase-02 binning goldens are all bit-exact (`compare_exact_*`); the
-`~1e-6` tolerance comparators (`abs_diff_within`, `compare_within`,
-`Mismatch::ValueMismatch`) are not exercised by any phase-02 source path (only by
-their own unit tests). Not a defect — they are forward-looking API for training
-goldens — but worth noting so a future reviewer does not assume the tolerance path
-is in use for binning (using it for binning would be a parity bug).
-**Fix:** None; optionally add `#[allow(dead_code)]`-free justification doc, already
-largely present.
+**File:** `crates/lgbm-dataset/tests/default_config_ingest_parity.rs:178-188`
+**Issue:** When an `ASSIGN` line has no value list, `tokens.last()` is `"f=<i>"`, the
+`starts_with("f=")` guard yields `stored = Vec::new()` while `has_assign` is still `true`. A
+non-trivial feature would then pass the representation gate (`:209-214`) yet later compare an
+empty `stored` against 200 Rust bins, surfacing as an opaque length mismatch rather than a clear
+"ASSIGN had no per-row data" diagnostic. Latent today (the emitter always writes all rows).
+**Fix:** In the `f=`-only branch for a non-trivial feature, panic with an explicit
+"non-trivial ASSIGN line missing per-row data" message instead of storing an empty vector.
 
 ---
 
