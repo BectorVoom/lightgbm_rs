@@ -24,8 +24,8 @@
 
 - [x] **DAT-01**: `BinMapper` continuous→bin mapping (`FindBin`) producing bit-identical bin boundaries vs C++ (`max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`)
 - [x] **DAT-02**: Binned columnar dataset store (DenseBin + SparseBin) immutable after finish-load
-- [ ] **DAT-03**: Missing-value handling (`use_missing`, `zero_as_missing`, `MissingType`) with C++-matching default-direction routing
-- [ ] **DAT-04**: Categorical feature encoding (category→bin mapping, low-frequency folding)
+- [x] **DAT-03**: Missing-value handling (`use_missing`, `zero_as_missing`, `MissingType`) with C++-matching default-direction routing
+- [x] **DAT-04**: Categorical feature encoding (category→bin mapping, low-frequency folding)
 - [ ] **DAT-05**: Exclusive Feature Bundling (`enable_bundle`) reproducing C++ feature grouping
 - [ ] **DAT-06**: Metadata support (labels, weights, init_score, query/group boundaries)
 - [ ] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API
@@ -156,8 +156,8 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | ORA-02 | Phase 1 | Complete |
 | DAT-01 | Phase 2 | Complete (02-01) |
 | DAT-02 | Phase 2 | Complete (02-02) |
-| DAT-03 | Phase 2 | Pending |
-| DAT-04 | Phase 2 | Pending |
+| DAT-03 | Phase 2 | Complete (02-03) |
+| DAT-04 | Phase 2 | Complete (02-03) |
 | DAT-05 | Phase 2 | Pending |
 | DAT-06 | Phase 2 | Pending |
 | DAT-07 | Phase 2 | Pending |

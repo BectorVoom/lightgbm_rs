@@ -76,7 +76,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on Wave 2)*
 
-  - [ ] 02-03-PLAN.md — Categorical folding (category→bin) + missing-value routing golden parity (layers 1+3)
+  - [x] 02-03-PLAN.md — Categorical folding (category→bin) + missing-value routing golden parity (layers 1+3)
 
 **Wave 4** *(blocked on Wave 3)*
 
