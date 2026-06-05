@@ -12,8 +12,12 @@
 
 pub mod bin;
 pub mod bin_mapper;
+pub mod dataset;
 pub mod error;
+pub mod feature_group;
 
 pub use bin::{Bin, BinValue, create_dense_bin, create_sparse_bin};
 pub use bin_mapper::{BinMapper, BinType, MissingType};
+pub use dataset::{Dataset, FinishedDataset};
 pub use error::DatasetError;
+pub use feature_group::FeatureGroup;
