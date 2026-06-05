@@ -496,22 +496,25 @@ Binning algorithm is stable LightGBM core logic; there is no "newer approach" to
 | A4 | Plain `HashMap` iteration order for `categorical_2_bin_` cannot affect any committed output | Stack alternatives, State of the Art | If some downstream consumer iterates the map in order (it should not — lookups are by key), order could leak. LOW risk — verified `ValueToBin` does point lookups only. |
 | A5 | The C-API `from_mat` ingestion path (sample→FindBin→Construct→PushData→FinishLoad) is the correct model for the Rust `from_mat`/`from_csr`/`from_csc`, vs the dataset_loader text path | DAT-07, Architecture | The text-file path adds parsing not in scope; the C-API path is the right in-memory analog. LOW risk — both converge on `Dataset::Construct`. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **EFB golden capture mechanism (layer 3).**
    - What we know: `external_libs` headers are on disk; a `bin.cpp`-only harness can produce layer 1+2 goldens.
    - What's unclear: whether `dataset.cpp` (EFB) compiles in a focused harness or needs a fuller `lib_lightgbm` build (which Phase 1 avoided because external_libs were unvendored — but they ARE present now).
    - Recommendation: Plan a Wave that (a) first delivers BinMapper goldens via a minimal harness, then (b) attempts a focused `dataset.cpp` capture; if it pulls too much of the lib, fall back to driving the full build with `enable_bundle=true` and dumping group/offset layout via the CLI or a tiny linked program. De-risk by sequencing EFB last.
+   - **RESOLVED:** EFB sequenced last (Wave 5) with a blocking `checkpoint:human-verify` task that decides focused-`dataset.cpp`-harness vs CLI-dump fallback at capture time — see `02-05-PLAN.md` Task 3 (checkpoint).
 
 2. **Sample-value gathering for sparse ingest.**
    - What we know: dense gathering is trivial (value at sampled row); the C-API sparse path gathers nonzeros per column.
    - What's unclear: exact handling when a sampled row is zero in a sparse column (counts toward `zero_cnt`, not `sample_values`).
    - Recommendation: Mirror the C-API `LGBM_DatasetCreateFromCSR`/`FromMat` sample-column construction (read `c_api.cpp` `PushDataToBin`/sample gather in the planning read-set); golden-test sparse ingest against dense-equivalent matrices.
+   - **RESOLVED:** Nonzero-aware per-column sample gather with `zero_cnt` accounting is specified in `02-04-PLAN.md` Task 2 (ingestion), golden-tested against dense-equivalent matrices.
 
 3. **`min_split_data`/`feature_pre_filter` (`NeedFilter`) in MVP scope.**
    - What we know: `FindBin` takes `min_split_data` (= `filter_cnt` derived from `min_data_in_leaf`) and `pre_filter`; `NeedFilter` can mark a feature trivial.
    - What's unclear: whether MVP fixtures exercise `feature_pre_filter` (default true) enough to need parity now.
    - Recommendation: Include `NeedFilter` in the transcription (it is small and on the `FindBin` tail path) and include at least one fixture where pre-filtering triggers, so the `is_trivial_` path is golden-covered.
+   - **RESOLVED:** `NeedFilter`/`is_trivial_` transcribed on the `FindBin` tail path with a pre-filter-triggering fixture in `02-01-PLAN.md` Task 2 (numeric BinMapper); `need_filter` listed as a produced artifact.
 
 ## Environment Availability
 
