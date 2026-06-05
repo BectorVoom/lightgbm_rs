@@ -980,6 +980,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         };
         let threshold_real = f.real_threshold(best.threshold);
         let split_gain_field = (best.gain + self.cfg.min_gain_to_split) as f32;
+        // ACTUAL partition counts for the tree's leaf_count/internal_count
+        // (serial_tree_learner.cpp:788-791, `update_cnt=true`): after the
+        // data-partition routes the rows, the SplitInfo's reconstructed
+        // `left_count`/`right_count` (from `round_int(hess·cnt_factor)`) are
+        // OVERWRITTEN with `data_partition_->leaf_count(...)`. For fractional
+        // hessians the two can disagree by ±1; the faithful tree records the real
+        // partition counts (Pitfall 3). The seeded leaf-split sums + outputs come
+        // from the SplitInfo (left_sum_hessian etc.) and are NOT overwritten.
+        let actual_left_count = data_partition.leaf_count(new_left);
+        let actual_right_count = data_partition.leaf_count(new_right);
         tree.split(
             best_leaf,
             feat_idx, // inner feature index (== real on the single-group spine)
@@ -988,8 +998,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             threshold_real,
             best.left_output,
             best.right_output,
-            best.left_count,
-            best.right_count,
+            actual_left_count,
+            actual_right_count,
             best.left_sum_hessian,
             best.right_sum_hessian,
             split_gain_field,

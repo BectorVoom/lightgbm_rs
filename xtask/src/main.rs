@@ -505,6 +505,11 @@ fn learner_capture() -> Result<()> {
         .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
     // Plan 05-03 emits the real per-split (D-06) + per-tree (D-07) spine golden.
     let spine_path = fixtures_dir.join("spine.txt");
+    // Plan 05-04 additions: force_col_wise (TRL-09), ColSampler RNG parity
+    // (TRL-08), and the captured real iteration-1 g/h corpus (D-03).
+    let col_wise_path = fixtures_dir.join("col_wise.txt");
+    let col_sampler_path = fixtures_dir.join("col_sampler.txt");
+    let real_gh_path = fixtures_dir.join("real_gh.txt");
 
     eprintln!("xtask learner-capture: configuring C++ capture build ...");
     run(
@@ -538,15 +543,17 @@ fn learner_capture() -> Result<()> {
     run(
         Command::new(&exe)
             .arg(&spine_path)
+            .arg(&col_wise_path)
+            .arg(&col_sampler_path)
+            .arg(&real_gh_path)
             .arg(LEARNER_MASTER_SEED.to_string()),
         "learner_capture",
     )?;
 
-    if !spine_path.is_file() {
-        bail!(
-            "capture completed but {} was not written",
-            spine_path.display()
-        );
+    for p in [&spine_path, &col_wise_path, &col_sampler_path, &real_gh_path] {
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
     }
 
     // Refresh the shared reference manifest (idempotent — pure function of the
@@ -557,8 +564,11 @@ fn learner_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask learner-capture: done. Wrote {} and refreshed {}.",
+        "xtask learner-capture: done. Wrote {}, {}, {}, {} and refreshed {}.",
         spine_path.display(),
+        col_wise_path.display(),
+        col_sampler_path.display(),
+        real_gh_path.display(),
         manifest_path.display()
     );
     eprintln!(
@@ -1084,6 +1094,47 @@ equality (per-tree).\n\
   as raw bits, D-07). `learner_parity.rs` replays per-split bit-exact, full-tree\n\
   via the shared `%.17g` formatter, the subtraction trick, missing/zero routing,\n\
   and the D-02a kernel-vs-learner cross-check.\n\
+- **Plan 05-04 status: parity ADDITIONS (`col_wise.txt`, `col_sampler.txt`,\n\
+  `real_gh.txt`).** Three goldens layered on the proven spine:\n\
+  - **`col_wise.txt` (TRL-09).** The SAME spine corpus grown under `force_col_wise`.\n\
+    The transcription is strategy-agnostic (row- vs column-major histogram build\n\
+    differ ONLY in accumulation ORDER, not result — Pitfall 5), so on the\n\
+    single-thread cubecl-cpu anchor the grown tree is bit-identical to `spine.txt`.\n\
+    `learner_parity_row_vs_col` grows the corpus under BOTH `BuildStrategy::RowWise`\n\
+    and `ColWise` and asserts `row_tree.to_string() == col_tree.to_string() ==`\n\
+    this golden (String equality). **Open Q2 RESOLVED: `force_col_wise` is a config\n\
+    FLAG (a no-op) over the shared `construct_histograms` Backend op on the\n\
+    deterministic anchor — NOT a distinct compute path** (A1 confirmed; a divergence\n\
+    would fail the row==col gate loudly rather than ship a divergent tree).\n\
+  - **`col_sampler.txt` (TRL-08).** A `feature_fraction=1.0` /\n\
+    `feature_fraction_bynode=0.5` config over a 4-feature corpus, drawing the\n\
+    GENUINE header-only reference `Random::Sample` (`col_sampler.hpp` transcription).\n\
+    Emits `CS_BYTREE` (the per-tree `ResetByTree` selection) + `CS_NODE` lines (each\n\
+    per-node `GetByNode` selection, in DRAW ORDER: root first, then smaller-leaf\n\
+    then larger-leaf per split). The Rust `ColSampler` reproduces the EXACT selected\n\
+    REAL-feature indices via `train_with_col_sampler_trace`; a wrong draw sequence\n\
+    fails the parity gate (threat T-05-04-01) rather than silently selecting\n\
+    different features. The growth is col-sampler-GATED so the draw count/order\n\
+    matches the Rust learner's trace exactly.\n\
+  - **`real_gh.txt` (D-03).** Captured iteration-1 g/h from two REAL objectives\n\
+    (regression-l2 `grad=score-label`, `hess=1`; binary-logloss\n\
+    `response=-label*sigmoid/(1+exp(label*sigmoid*score))`), `boost_from_average=\n\
+    false` (score=0), `score_t=float`, over fixed real labels (a realistic gradient\n\
+    distribution). Each `GH_CORPUS` block emits the captured g/h (raw f32 bits) +\n\
+    the per-feature bin layout (`GH_FEATURE`) + the grown reference tree (PSPLIT +\n\
+    PTREE). `learner_parity_real_gh_full_tree` grows from the captured g/h and\n\
+    asserts the full tree `to_string()` is byte-identical to the C++ reference\n\
+    (D-07 under a realistic distribution, `missing_type=None` — A5). Regression\n\
+    grows a clean 3-leaf tree; binary (fractional 0.25 hessians) a clean 2-leaf\n\
+    tree — `num_leaves` per corpus chosen so every split's ACTUAL children are\n\
+    non-degenerate.\n\
+- **Faithfulness fix (this plan):** the tree's `leaf_count`/`internal_count` record\n\
+  the ACTUAL `data_partition_->leaf_count(...)` after the row partition\n\
+  (`serial_tree_learner.cpp:788-791`, `update_cnt=true`), NOT the SplitInfo\n\
+  `round_int(hess*cnt_factor)` reconstructed counts (which can disagree by +/-1 for\n\
+  fractional hessians). This corrected the spine's `spine.txt` leaf counts to the\n\
+  faithful actual-partition values (summing to num_data) and is applied in both the\n\
+  Rust `split_inner` and the C++ transcription.\n\
 \n\
 ### Record format (`spine.txt`)\n\
 \n\

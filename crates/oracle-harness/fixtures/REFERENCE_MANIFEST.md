@@ -297,6 +297,47 @@ every split decision, D-06) + 1 PTREE record (the grown 4-leaf tree's field set
 as raw bits, D-07). `learner_parity.rs` replays per-split bit-exact, full-tree
 via the shared `%.17g` formatter, the subtraction trick, missing/zero routing,
 and the D-02a kernel-vs-learner cross-check.
+- **Plan 05-04 status: parity ADDITIONS (`col_wise.txt`, `col_sampler.txt`,
+`real_gh.txt`).** Three goldens layered on the proven spine:
+- **`col_wise.txt` (TRL-09).** The SAME spine corpus grown under `force_col_wise`.
+The transcription is strategy-agnostic (row- vs column-major histogram build
+differ ONLY in accumulation ORDER, not result — Pitfall 5), so on the
+single-thread cubecl-cpu anchor the grown tree is bit-identical to `spine.txt`.
+`learner_parity_row_vs_col` grows the corpus under BOTH `BuildStrategy::RowWise`
+and `ColWise` and asserts `row_tree.to_string() == col_tree.to_string() ==`
+this golden (String equality). **Open Q2 RESOLVED: `force_col_wise` is a config
+FLAG (a no-op) over the shared `construct_histograms` Backend op on the
+deterministic anchor — NOT a distinct compute path** (A1 confirmed; a divergence
+would fail the row==col gate loudly rather than ship a divergent tree).
+- **`col_sampler.txt` (TRL-08).** A `feature_fraction=1.0` /
+`feature_fraction_bynode=0.5` config over a 4-feature corpus, drawing the
+GENUINE header-only reference `Random::Sample` (`col_sampler.hpp` transcription).
+Emits `CS_BYTREE` (the per-tree `ResetByTree` selection) + `CS_NODE` lines (each
+per-node `GetByNode` selection, in DRAW ORDER: root first, then smaller-leaf
+then larger-leaf per split). The Rust `ColSampler` reproduces the EXACT selected
+REAL-feature indices via `train_with_col_sampler_trace`; a wrong draw sequence
+fails the parity gate (threat T-05-04-01) rather than silently selecting
+different features. The growth is col-sampler-GATED so the draw count/order
+matches the Rust learner's trace exactly.
+- **`real_gh.txt` (D-03).** Captured iteration-1 g/h from two REAL objectives
+(regression-l2 `grad=score-label`, `hess=1`; binary-logloss
+`response=-label*sigmoid/(1+exp(label*sigmoid*score))`), `boost_from_average=
+false` (score=0), `score_t=float`, over fixed real labels (a realistic gradient
+distribution). Each `GH_CORPUS` block emits the captured g/h (raw f32 bits) +
+the per-feature bin layout (`GH_FEATURE`) + the grown reference tree (PSPLIT +
+PTREE). `learner_parity_real_gh_full_tree` grows from the captured g/h and
+asserts the full tree `to_string()` is byte-identical to the C++ reference
+(D-07 under a realistic distribution, `missing_type=None` — A5). Regression
+grows a clean 3-leaf tree; binary (fractional 0.25 hessians) a clean 2-leaf
+tree — `num_leaves` per corpus chosen so every split's ACTUAL children are
+non-degenerate.
+- **Faithfulness fix (this plan):** the tree's `leaf_count`/`internal_count` record
+the ACTUAL `data_partition_->leaf_count(...)` after the row partition
+(`serial_tree_learner.cpp:788-791`, `update_cnt=true`), NOT the SplitInfo
+`round_int(hess*cnt_factor)` reconstructed counts (which can disagree by +/-1 for
+fractional hessians). This corrected the spine's `spine.txt` leaf counts to the
+faithful actual-partition values (summing to num_data) and is applied in both the
+Rust `split_inner` and the C++ transcription.
 
 ### Record format (`spine.txt`)
 

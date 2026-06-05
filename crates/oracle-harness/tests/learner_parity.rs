@@ -25,7 +25,7 @@ use lgbm_compute::gain::GainConfig;
 use lgbm_compute::{runtime::cpu_client, Backend, CpuBackend};
 use lgbm_dataset::bin_mapper::MissingType;
 use lgbm_model::Tree;
-use lgbm_treelearner::learner::{FeatureColumn, SerialTreeLearner};
+use lgbm_treelearner::learner::{BuildStrategy, FeatureColumn, SerialTreeLearner};
 use oracle_harness::comparator::compare_exact_f64_bits;
 
 /// The committed learner golden directory — TRACKED under the oracle-harness
@@ -476,5 +476,395 @@ fn learner_parity_transcription_crosscheck() {
             .unwrap_or_else(|m| panic!("D-02a REVERSE drift at PSPLIT[{i}]: {m:?}"));
         compare_exact_f64_bits(&rr.2, &gr.fwd)
             .unwrap_or_else(|m| panic!("D-02a FORWARD drift at PSPLIT[{i}]: {m:?}"));
+    }
+}
+
+// ===========================================================================
+// Plan 05-04: force_col_wise (TRL-09), ColSampler RNG parity (TRL-08), and the
+// captured real iteration-1 g/h corpus (D-03). All three replay committed
+// goldens; each SKIPs gracefully when its fixture is absent.
+// ===========================================================================
+
+fn col_wise_fixture() -> PathBuf {
+    learner_dir().join("col_wise.txt")
+}
+fn col_sampler_fixture() -> PathBuf {
+    learner_dir().join("col_sampler.txt")
+}
+fn real_gh_fixture() -> PathBuf {
+    learner_dir().join("real_gh.txt")
+}
+
+/// TRL-09: force_row_wise and force_col_wise grow BIT-IDENTICAL trees to each
+/// other AND to the committed C++ `col_wise.txt` golden (String equality via the
+/// shared `%.17g` formatter — Pitfall 5). The two strategies differ only in
+/// histogram-build ORDER, not result, so on the single-thread anchor they are
+/// observationally identical (A1 / Open Q2 — empirically confirmed here).
+#[test]
+fn learner_parity_row_vs_col() {
+    let Ok(text) = std::fs::read_to_string(col_wise_fixture()) else {
+        eprintln!(
+            "learner_parity: SKIP — col_wise.txt not found. Run \
+             `cargo run -p xtask -- learner-capture` and commit the golden set."
+        );
+        return;
+    };
+    let (_splits, golden_tree) = parse(&text);
+
+    let backend = CpuBackend;
+    let client = cpu_client();
+
+    // Grow the SAME spine corpus under force_row_wise.
+    let (features_r, g, h, cfg, num_leaves, max_depth) = corpus();
+    let mut row_learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+        .with_features(features_r)
+        .with_strategy(BuildStrategy::RowWise);
+    let row_tree = row_learner.train(&g, &h, true).expect("row train ok");
+
+    // Grow it under force_col_wise.
+    let (features_c, g2, h2, cfg2, nl2, md2) = corpus();
+    let mut col_learner = SerialTreeLearner::new(&backend, &client, cfg2, nl2, md2)
+        .with_features(features_c)
+        .with_strategy(BuildStrategy::ColWise);
+    let col_tree = col_learner.train(&g2, &h2, true).expect("col train ok");
+
+    let row_s = row_tree.to_string();
+    let col_s = col_tree.to_string();
+    assert_eq!(
+        row_s, col_s,
+        "TRL-09: force_row_wise tree != force_col_wise tree (must be bit-identical)"
+    );
+    let want = golden_tree.to_tree().to_string();
+    assert_eq!(
+        col_s, want,
+        "TRL-09: force_col_wise tree != C++ col_wise.txt golden"
+    );
+}
+
+/// One `CS_NODE` / `CS_BYTREE` selection: the ascending selected REAL feature
+/// indices.
+fn parse_semi_i32(s: &str) -> Vec<i32> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(';').map(|t| t.parse::<i32>().expect("i32")).collect()
+}
+
+/// The parsed `col_sampler.txt` golden: the per-tree ResetByTree selection +
+/// every per-node GetByNode selection in DRAW ORDER.
+struct ColSamplerGolden {
+    feature_fraction: f64,
+    feature_fraction_bynode: f64,
+    seed: i32,
+    bytree: Vec<i32>,
+    bynode: Vec<Vec<i32>>,
+}
+
+fn parse_col_sampler(text: &str) -> ColSamplerGolden {
+    let mut g = ColSamplerGolden {
+        feature_fraction: 1.0,
+        feature_fraction_bynode: 1.0,
+        seed: 0,
+        bytree: Vec::new(),
+        bynode: Vec::new(),
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let t: Vec<&str> = line.split_whitespace().collect();
+        match t[0] {
+            "CS_CONFIG" => {
+                g.feature_fraction = field(&t, "feature_fraction_bits")
+                    .map(|v| f64::from_bits(v.parse::<u64>().expect("ff bits")))
+                    .unwrap_or(1.0);
+                g.feature_fraction_bynode = field(&t, "feature_fraction_bynode_bits")
+                    .map(|v| f64::from_bits(v.parse::<u64>().expect("ffn bits")))
+                    .unwrap_or(1.0);
+                g.seed = field(&t, "seed").and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "CS_BYTREE" => {
+                g.bytree = if t.len() > 1 { parse_semi_i32(t[1]) } else { Vec::new() };
+            }
+            "CS_NODE" => {
+                // CS_NODE order=<i> <semi-list> ; the list is the LAST token (or empty).
+                let list = t.last().filter(|s| !s.starts_with("order=")).copied().unwrap_or("");
+                g.bynode.push(parse_semi_i32(list));
+            }
+            _ => {}
+        }
+    }
+    g
+}
+
+/// The 4-feature col-sampler corpus — MUST mirror
+/// `xtask/cpp/learner_capture.cpp::BuildColSamplerCorpus` EXACTLY.
+fn col_sampler_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
+    let grad = vec![
+        -8.0f32, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+    ];
+    let hess = vec![1.0f32; 16];
+
+    let make = |bins: Vec<u32>, num_bin: u32, real: i32| -> FeatureColumn {
+        let upper: Vec<f64> = (0..num_bin).map(|b| b as f64 + 0.5).collect();
+        FeatureColumn {
+            bins,
+            num_bin,
+            offset: 0,
+            min_bin: 0,
+            max_bin: num_bin - 1,
+            default_bin: num_bin,
+            most_freq_bin: 0,
+            missing_type: MissingType::None,
+            bin_upper_bound: upper,
+            real_feature_index: real,
+        }
+    };
+    let f0 = make(vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3], 4, 0);
+    let f1 = make(vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1], 2, 1);
+    let f2 = make(vec![0, 1, 0, 1, 1, 2, 1, 2, 2, 1, 2, 1, 3, 2, 3, 2], 4, 2);
+    let f3 = make(vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2], 3, 3);
+
+    let cfg = GainConfig {
+        min_data_in_leaf: 1,
+        min_sum_hessian_in_leaf: 0.0,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+    };
+    (vec![f0, f1, f2, f3], grad, hess, cfg, 4, -1)
+}
+
+/// TRL-08: per-tree / per-node feature subsampling selects the SAME features as
+/// C++ via `Random::Sample` CALL-SEQUENCE parity. The Rust `ColSampler` draw
+/// sequence (ResetByTree once, GetByNode per node smaller-then-larger) must match
+/// the committed `col_sampler.txt` selected-index golden exactly (T-05-04-01).
+#[test]
+fn learner_parity_col_sampler_rng() {
+    let Ok(text) = std::fs::read_to_string(col_sampler_fixture()) else {
+        eprintln!(
+            "learner_parity: SKIP — col_sampler.txt not found. Run \
+             `cargo run -p xtask -- learner-capture` and commit the golden set."
+        );
+        return;
+    };
+    let golden = parse_col_sampler(&text);
+
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, num_leaves, max_depth) = col_sampler_corpus();
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+        .with_features(features)
+        .with_feature_fraction(
+            golden.feature_fraction,
+            golden.feature_fraction_bynode,
+            golden.seed,
+        );
+    let (_tree, _snaps, trace) = learner
+        .train_with_col_sampler_trace(&g, &h, true)
+        .expect("col-sampler train ok");
+
+    // Per-tree ResetByTree selection (ascending REAL feature indices).
+    assert_eq!(
+        trace.bytree_selected, golden.bytree,
+        "TRL-08: ResetByTree per-tree selection != golden CS_BYTREE"
+    );
+    // Per-node GetByNode selections in DRAW ORDER.
+    assert_eq!(
+        trace.bynode_selected.len(),
+        golden.bynode.len(),
+        "TRL-08: GetByNode draw COUNT mismatch: rust {} vs golden {}",
+        trace.bynode_selected.len(),
+        golden.bynode.len()
+    );
+    for (i, (rust_sel, gold_sel)) in trace.bynode_selected.iter().zip(golden.bynode.iter()).enumerate()
+    {
+        assert_eq!(
+            rust_sel, gold_sel,
+            "TRL-08: GetByNode[{i}] selected features != golden (draw-sequence parity)"
+        );
+    }
+}
+
+/// One parsed `real_gh.txt` corpus block: the captured g/h, the per-feature bin
+/// layout, and the reconstructed reference tree.
+struct GhCorpus {
+    name: String,
+    num_leaves: i32,
+    grad: Vec<f32>,
+    hess: Vec<f32>,
+    features: Vec<FeatureColumn>,
+    tree: TreeGolden,
+}
+
+fn parse_u32_semi(s: &str) -> Vec<u32> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(';').map(|t| t.parse::<u32>().expect("u32")).collect()
+}
+fn parse_f64_bits_semi(s: &str) -> Vec<f64> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(';')
+        .map(|t| f64::from_bits(t.parse::<u64>().expect("f64 bits")))
+        .collect()
+}
+
+/// Parse the `real_gh.txt` golden into its per-objective corpus blocks. Each block
+/// is GH_CORPUS / GH_GRAD / GH_HESS / GH_FEATURE* followed by a spine-style
+/// COUNTS / PSPLIT* / PTREE...ENDTREE reference tree.
+fn parse_real_gh(text: &str) -> Vec<GhCorpus> {
+    let mut out: Vec<GhCorpus> = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t[0] != "GH_CORPUS" {
+            continue;
+        }
+        let name = field(&t, "name").unwrap_or("").to_string();
+        let num_leaves: i32 = field(&t, "num_leaves").and_then(|v| v.parse().ok()).unwrap_or(3);
+        let mut grad = Vec::new();
+        let mut hess = Vec::new();
+        let mut features: Vec<FeatureColumn> = Vec::new();
+        let mut tree = TreeGolden::default();
+        // Consume the block until ENDTREE.
+        for body in lines.by_ref() {
+            let bt = body.trim();
+            if bt.is_empty() || bt.starts_with('#') {
+                continue;
+            }
+            let bt_tokens: Vec<&str> = bt.split_whitespace().collect();
+            match bt_tokens[0] {
+                "GH_GRAD" => grad = parse_f32_bits_ws(&bt[bt.find(' ').map_or(0, |p| p + 1)..]),
+                "GH_HESS" => hess = parse_f32_bits_ws(&bt[bt.find(' ').map_or(0, |p| p + 1)..]),
+                "GH_FEATURE" => {
+                    let real: i32 =
+                        field(&bt_tokens, "real").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let num_bin: u32 =
+                        field(&bt_tokens, "num_bin").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let most_freq_bin: u32 =
+                        field(&bt_tokens, "most_freq_bin").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let default_bin: u32 =
+                        field(&bt_tokens, "default_bin").and_then(|v| v.parse().ok()).unwrap_or(num_bin);
+                    let min_bin: u32 =
+                        field(&bt_tokens, "min_bin").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let max_bin: u32 = field(&bt_tokens, "max_bin")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(num_bin.saturating_sub(1));
+                    let bins = parse_u32_semi(field(&bt_tokens, "bins").unwrap_or(""));
+                    let upper = parse_f64_bits_semi(field(&bt_tokens, "upper").unwrap_or(""));
+                    features.push(FeatureColumn {
+                        bins,
+                        num_bin,
+                        offset: if most_freq_bin == 0 { 0 } else { 1 },
+                        min_bin,
+                        max_bin,
+                        default_bin,
+                        most_freq_bin,
+                        missing_type: MissingType::None,
+                        bin_upper_bound: upper,
+                        real_feature_index: real,
+                    });
+                }
+                "PTREE" => {
+                    tree.name = field(&bt_tokens, "name").unwrap_or("").to_string();
+                    tree.num_leaves =
+                        field(&bt_tokens, "num_leaves").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    for inner in lines.by_ref() {
+                        let it = inner.trim();
+                        if it == "ENDTREE" {
+                            break;
+                        }
+                        let (tag, rest) = it.split_once(' ').unwrap_or((it, ""));
+                        match tag {
+                            "PT_SPLIT_FEATURE" => tree.split_feature = parse_i32_ws(rest),
+                            "PT_THRESHOLD_BITS" => tree.threshold = parse_f64_bits_ws(rest),
+                            "PT_DECISION_TYPE" => tree.decision_type = parse_i8_ws(rest),
+                            "PT_SPLIT_GAIN_BITS" => tree.split_gain = parse_f32_bits_ws(rest),
+                            "PT_LEFT_CHILD" => tree.left_child = parse_i32_ws(rest),
+                            "PT_RIGHT_CHILD" => tree.right_child = parse_i32_ws(rest),
+                            "PT_LEAF_VALUE_BITS" => tree.leaf_value = parse_f64_bits_ws(rest),
+                            "PT_LEAF_WEIGHT_BITS" => tree.leaf_weight = parse_f64_bits_ws(rest),
+                            "PT_LEAF_COUNT" => tree.leaf_count = parse_i32_ws(rest),
+                            "PT_INTERNAL_VALUE_BITS" => tree.internal_value = parse_f64_bits_ws(rest),
+                            "PT_INTERNAL_COUNT" => tree.internal_count = parse_i32_ws(rest),
+                            _ => {}
+                        }
+                    }
+                    break; // end of this corpus block
+                }
+                _ => {}
+            }
+        }
+        out.push(GhCorpus {
+            name,
+            num_leaves,
+            grad,
+            hess,
+            features,
+            tree,
+        });
+    }
+    out
+}
+
+/// D-03 + D-07: the learner grows the SAME tree as C++ on captured REAL
+/// iteration-1 g/h (regression-l2 + binary-logloss, realistic distribution). Each
+/// corpus block's grown tree `to_string()` must be byte-identical to the C++
+/// reference tree (the shared `%.17g` formatter is the arbiter).
+#[test]
+fn learner_parity_real_gh_full_tree() {
+    let Ok(text) = std::fs::read_to_string(real_gh_fixture()) else {
+        eprintln!(
+            "learner_parity: SKIP — real_gh.txt not found. Run \
+             `cargo run -p xtask -- learner-capture` and commit the golden set."
+        );
+        return;
+    };
+    let corpora = parse_real_gh(&text);
+    assert!(
+        !corpora.is_empty(),
+        "real_gh.txt must carry at least one GH_CORPUS block"
+    );
+
+    let backend = CpuBackend;
+    let client = cpu_client();
+    // min_data_in_leaf=3 mirrors BuildRealGhCorpus — keeps every split's actual
+    // children non-degenerate so the faithful actual-partition leaf counts never
+    // collapse a child to 0 rows.
+    let cfg = GainConfig {
+        min_data_in_leaf: 3,
+        min_sum_hessian_in_leaf: 0.0,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+    };
+
+    for gh in &corpora {
+        // num_leaves comes from the golden (regression=3 / binary=2) — each chosen
+        // to keep every split's actual children non-degenerate.
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, gh.num_leaves, -1)
+            .with_features(gh.features.clone());
+        let tree = learner
+            .train(&gh.grad, &gh.hess, true)
+            .unwrap_or_else(|e| panic!("real_gh {} train failed: {e:?}", gh.name));
+        let want = gh.tree.to_tree().to_string();
+        let got = tree.to_string();
+        assert_eq!(
+            got, want,
+            "D-03/D-07 real_gh {} full-tree mismatch (grown != C++ reference)",
+            gh.name
+        );
     }
 }

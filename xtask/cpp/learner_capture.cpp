@@ -615,8 +615,13 @@ static GrownTree GrowTree(std::ostream& out, const Corpus& c) {
             : static_cast<double>(w.threshold);
     const float split_gain_field = static_cast<float>(w.gain + c.base_cfg.min_gain_to_split);
 
+    // ACTUAL partition counts (serial_tree_learner.cpp:788-791, update_cnt=true):
+    // the tree's leaf_count records data_partition_->leaf_count, NOT the SplitInfo
+    // reconstructed counts (which can disagree by ±1 for fractional hessians).
+    const int actual_left_count = static_cast<int>(left_rows.size());
+    const int actual_right_count = static_cast<int>(right_rows.size());
     TreeSplit(&tree, best_leaf, feat, w.threshold, threshold_real, w.left_output,
-              w.right_output, w.left_count, w.right_count, w.left_sum_hessian,
+              w.right_output, actual_left_count, actual_right_count, w.left_sum_hessian,
               w.right_sum_hessian, split_gain_field, f.missing_type, w.default_left);
 
     // Update leaf states: new_left keeps best_leaf slot, append new_right.
@@ -751,62 +756,769 @@ static void EmitTree(std::ostream& out, const std::string& name, const GrownTree
   out << "ENDTREE\n";
 }
 
+// ===========================================================================
+// Plan 05-04 additions: force_col_wise (TRL-09), feature subsampling (TRL-08),
+// and the captured real-g/h corpus (D-03).
+// ===========================================================================
+
+// --- ColSampler (col_sampler.hpp:22-179) VERBATIM transcription for the pinned
+// no-interaction-constraint, single-group spine. `Random` is the header-only
+// reference LCG. `valid_feature_indices_ = 0..num_features` (every feature valid);
+// `InnerFeatureIndex(real) == real`. The PARITY CONTRACT is the Sample call order.
+struct CppColSampler {
+  double fraction_bytree;
+  double fraction_bynode;
+  bool need_reset_bytree;
+  int used_cnt_bytree;
+  std::vector<int> valid_feature_indices;
+  std::vector<int> used_feature_indices;
+  std::vector<int8_t> is_feature_used;
+  LightGBM::Random random;
+
+  static int GetCnt(size_t total_cnt, double fraction) {
+    const int min = std::min(1, static_cast<int>(total_cnt));
+    // Common::RoundInt(x) = (int)(x + 0.5f).
+    const int used = static_cast<int>(
+        static_cast<double>(static_cast<double>(total_cnt) * fraction) + 0.5f);
+    return std::max(used, min);
+  }
+
+  CppColSampler(double ff, double ffn, int seed, std::vector<int> valid, int num_features)
+      : fraction_bytree(ff),
+        fraction_bynode(ffn),
+        valid_feature_indices(std::move(valid)),
+        is_feature_used(num_features, 1),
+        random(seed) {
+    if (fraction_bytree >= 1.0) {
+      need_reset_bytree = false;
+      used_cnt_bytree = static_cast<int>(valid_feature_indices.size());
+    } else {
+      need_reset_bytree = true;
+      used_cnt_bytree = GetCnt(valid_feature_indices.size(), fraction_bytree);
+    }
+    ResetByTree();
+  }
+
+  void ResetByTree() {
+    if (!need_reset_bytree) return;
+    std::memset(is_feature_used.data(), 0, sizeof(int8_t) * is_feature_used.size());
+    used_feature_indices = random.Sample(
+        static_cast<int>(valid_feature_indices.size()), used_cnt_bytree);
+    for (size_t i = 0; i < used_feature_indices.size(); ++i) {
+      int used_feature = valid_feature_indices[used_feature_indices[i]];
+      is_feature_used[used_feature] = 1;  // InnerFeatureIndex == identity
+    }
+  }
+
+  std::vector<int8_t> GetByNode() {
+    const int num_features = static_cast<int>(is_feature_used.size());
+    if (fraction_bynode >= 1.0) {
+      return std::vector<int8_t>(num_features, 1);
+    }
+    std::vector<int8_t> ret(num_features, 0);
+    if (need_reset_bytree) {
+      int used_feature_cnt = GetCnt(used_feature_indices.size(), fraction_bynode);
+      auto sampled = random.Sample(static_cast<int>(used_feature_indices.size()),
+                                   used_feature_cnt);
+      for (size_t i = 0; i < sampled.size(); ++i) {
+        int used_feature = valid_feature_indices[used_feature_indices[sampled[i]]];
+        ret[used_feature] = 1;
+      }
+    } else {
+      int used_feature_cnt = GetCnt(valid_feature_indices.size(), fraction_bynode);
+      auto sampled = random.Sample(static_cast<int>(valid_feature_indices.size()),
+                                   used_feature_cnt);
+      for (size_t i = 0; i < sampled.size(); ++i) {
+        int used_feature = valid_feature_indices[sampled[i]];
+        ret[used_feature] = 1;
+      }
+    }
+    return ret;
+  }
+
+  std::vector<int> SelectedBytree() const {
+    std::vector<int> out;
+    for (int f : valid_feature_indices) {
+      if (is_feature_used[f]) out.push_back(f);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  }
+
+  // col_sampler.hpp:181-183 — the per-tree used flag for one inner feature.
+  bool is_feature_used_bytree(int inner_feature) const {
+    return static_cast<size_t>(inner_feature) < is_feature_used.size() &&
+           is_feature_used[inner_feature] != 0;
+  }
+};
+
+static std::vector<int> MaskToIndices(const std::vector<int8_t>& mask,
+                                      const std::vector<Feature>& features) {
+  std::vector<int> out;
+  for (const Feature& f : features) {
+    if (static_cast<size_t>(f.real_feature_index) < mask.size() &&
+        mask[f.real_feature_index]) {
+      out.push_back(f.real_feature_index);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// Emit a `;`-separated int list (empty -> empty).
+static void EmitIntListSemi(std::ostream& out, const std::vector<int>& v) {
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) out << ";";
+    out << v[i];
+  }
+}
+
+// Combine the per-tree bytree flag with one per-node GetByNode mask, exactly as
+// the Rust learner's `find_best_splits` does:
+//   is_feature_used[f] = is_feature_used_bytree(f) && node_selected(f).
+// Returns the EFFECTIVE per-(real-feature) used mask for the scan.
+static std::vector<int8_t> CombineMask(const CppColSampler& cs,
+                                       const std::vector<int8_t>& node,
+                                       const std::vector<Feature>& features) {
+  // The effective mask is indexed by real_feature_index (same id space as the
+  // raw masks); size it to cover every feature column.
+  size_t n = node.size();
+  std::vector<int8_t> eff(n, 0);
+  for (const Feature& f : features) {
+    const int fi = f.real_feature_index;
+    const bool used = cs.is_feature_used_bytree(fi) &&
+                      (static_cast<size_t>(fi) < n && node[fi] != 0);
+    if (static_cast<size_t>(fi) < n) eff[fi] = used ? 1 : 0;
+  }
+  return eff;
+}
+
+// Emit the TRL-08 feature-subsampling RNG-parity golden. This grows the tree with
+// the SAME col-sampler gate the Rust learner applies (per-node GetByNode draws,
+// smaller-leaf-then-larger, with the scan gated to the selected features), so the
+// grown SHAPE — and therefore the draw COUNT and ORDER — is bit-identical to the
+// Rust `train_with_col_sampler_trace` trace. Emits:
+//   CS_CONFIG ...
+//   CS_BYTREE <selected real feature indices, ResetByTree>
+//   CS_NODE order=<i> <selected real feature indices for that GetByNode draw>
+// The CS_NODE records appear in DRAW ORDER (root first, then smaller-then-larger
+// per split decision), exactly the order Rust pushes onto `bynode_selected`.
+static void EmitColSamplerGolden(std::ostream& out, const Corpus& c, double ff,
+                                 double ffn, int seed) {
+  const int num_features = static_cast<int>(c.features.size());
+  std::vector<int> valid(num_features);
+  for (int i = 0; i < num_features; ++i) valid[i] = c.features[i].real_feature_index;
+  int max_real = -1;
+  for (int v : valid) max_real = std::max(max_real, v);
+  const int nf = std::max(max_real + 1, num_features);
+
+  CppColSampler cs(ff, ffn, seed, valid, nf);
+
+  out << "CS_CONFIG feature_fraction_bits=" << F64Bits(ff)
+      << " feature_fraction_bynode_bits=" << F64Bits(ffn) << " seed=" << seed
+      << " num_features=" << num_features << "\n";
+  out << "CS_BYTREE ";
+  EmitIntListSemi(out, cs.SelectedBytree());
+  out << "\n";
+
+  const int num_data = static_cast<int>(c.grad.size());
+  std::vector<uint32_t> all_rows(num_data);
+  for (int i = 0; i < num_data; ++i) all_rows[i] = static_cast<uint32_t>(i);
+
+  const bool use_l1 = c.base_cfg.lambda_l1 > 0.0;
+  double root_g, root_h;
+  LeafSums(c.grad, c.hess, all_rows, &root_g, &root_h);
+
+  GrownTree tree;
+  tree.num_leaves = 1;
+  tree.leaf_value = {CalcLeafOutput(use_l1, root_g, root_h, c.base_cfg.lambda_l1,
+                                    c.base_cfg.lambda_l2)};
+  tree.leaf_weight = {0.0};
+  tree.leaf_count = {num_data};
+  tree.leaf_depth = {0};
+  tree.leaf_parent = {-1};
+
+  std::vector<LeafState> leaves;
+  {
+    LeafState rs;
+    rs.rows = all_rows;
+    rs.sum_g = root_g;
+    rs.sum_h = root_h;
+    rs.depth = 0;
+    leaves.push_back(rs);
+  }
+  std::vector<WinSplit> best(c.num_leaves);
+  std::vector<int> best_feature(c.num_leaves, -1);
+  std::vector<double> best_reported(c.num_leaves, kMinScore);
+
+  // Find the best split for `leaf`, scanning ONLY the features the effective mask
+  // selects (the col-sampler gate). `mask` is indexed by real_feature_index; an
+  // empty mask means "all features" (the root before any draw never happens — the
+  // root is always preceded by exactly one GetByNode draw, mirroring Rust).
+  auto find_best_for_leaf = [&](int leaf, const std::vector<int8_t>& mask) {
+    LeafState& ls = leaves[leaf];
+    best[leaf] = WinSplit{};
+    best_feature[leaf] = -1;
+    best_reported[leaf] = kMinScore;
+    if (!(ls.sum_h > 0.0) || ls.rows.empty()) return;
+    for (const Feature& f : c.features) {
+      const int fi = f.real_feature_index;
+      if (!mask.empty()) {
+        const bool used = (static_cast<size_t>(fi) < mask.size()) && mask[fi] != 0;
+        if (!used) continue;  // gated out this node
+      }
+      std::vector<double> hist = ConstructHistogram(f, c.grad, c.hess, ls.rows);
+      FixHistogram(&hist, f.most_freq_bin, ls.sum_g, ls.sum_h);
+      SplitCfg cfg = c.base_cfg;
+      cfg.num_bin = f.num_bin;
+      cfg.offset = f.offset;
+      cfg.default_bin = f.default_bin;
+      cfg.skip_default_bin = SkipDefaultBin(f);
+      cfg.na_as_missing = false;
+      const double gain_shift =
+          GetLeafGain(use_l1, ls.sum_g, ls.sum_h, cfg.lambda_l1, cfg.lambda_l2);
+      const double min_gain_shift = gain_shift + cfg.min_gain_to_split;
+      const double sum_hessian_bumped = ls.sum_h + 2.0 * static_cast<double>(kEpsilonF);
+      std::vector<double> cr, cf;
+      WinSplit w = FindBestThreshold(hist, cfg, use_l1, ls.sum_g, sum_hessian_bumped,
+                                     ls.num_data_in_leaf(), min_gain_shift, &cr, &cf);
+      const double reported = w.is_splittable ? (w.gain - min_gain_shift) : kMinScore;
+      if (w.is_splittable && reported > kMinScore &&
+          SplitGt(w, fi, reported, best[leaf], best_feature[leaf], best_reported[leaf])) {
+        best[leaf] = w;
+        best[leaf].gain = reported;
+        best_feature[leaf] = fi;
+        best_reported[leaf] = reported;
+      }
+    }
+  };
+
+  // ---- the leaf-wise loop, mirroring `train_inner` (serial_tree_learner.cpp) ----
+  // left_leaf / right_leaf track the children produced by the last split; the
+  // first iteration's left_leaf is the root (leaf 0), right_leaf = -1.
+  int draw_order = 0;
+  int left_leaf = 0;
+  int right_leaf = -1;
+  for (int split = 0; split < c.num_leaves - 1; ++split) {
+    // BeforeFindBestSplit gates (both-children-too-small / max_depth). On this
+    // corpus the gates never fire, but transcribe them so the structure matches.
+    const int num_left = static_cast<int>(leaves[left_leaf].rows.size());
+    bool did = true;
+    if (c.max_depth > 0 && tree.leaf_depth[left_leaf] >= c.max_depth) {
+      did = false;
+    } else {
+      const int min2 = c.base_cfg.min_data_in_leaf * 2;
+      if (right_leaf >= 0) {
+        const int num_right = static_cast<int>(leaves[right_leaf].rows.size());
+        if (num_right < min2 && num_left < min2) did = false;
+      } else if (num_left < min2) {
+        did = false;
+      }
+    }
+
+    if (did) {
+      // Smaller-child selection (Pitfall 3): on the root smaller = left, no larger.
+      int smaller_leaf, larger_leaf;
+      bool has_larger;
+      if (right_leaf < 0) {
+        smaller_leaf = left_leaf;
+        larger_leaf = -1;
+        has_larger = false;
+      } else {
+        const int nl = static_cast<int>(leaves[left_leaf].rows.size());
+        const int nr = static_cast<int>(leaves[right_leaf].rows.size());
+        if (nl < nr) {
+          smaller_leaf = left_leaf;
+          larger_leaf = right_leaf;
+        } else {
+          smaller_leaf = right_leaf;
+          larger_leaf = left_leaf;
+        }
+        has_larger = true;
+      }
+
+      // GetByNode draw ORDER: SMALLER first (always), LARGER second (only when a
+      // larger child exists). Each call advances the shared PRNG once. Record the
+      // RAW selection (MaskToIndices) — the Rust trace pushes the same.
+      std::vector<int8_t> smaller_raw = cs.GetByNode();
+      out << "CS_NODE order=" << draw_order++ << " ";
+      EmitIntListSemi(out, MaskToIndices(smaller_raw, c.features));
+      out << "\n";
+      std::vector<int8_t> larger_raw;
+      if (has_larger) {
+        larger_raw = cs.GetByNode();
+        out << "CS_NODE order=" << draw_order++ << " ";
+        EmitIntListSemi(out, MaskToIndices(larger_raw, c.features));
+        out << "\n";
+      }
+
+      // Scan each leaf gated to its effective mask (bytree && node-selected).
+      const std::vector<int8_t> smaller_eff = CombineMask(cs, smaller_raw, c.features);
+      find_best_for_leaf(smaller_leaf, smaller_eff);
+      if (has_larger) {
+        const std::vector<int8_t> larger_eff = CombineMask(cs, larger_raw, c.features);
+        find_best_for_leaf(larger_leaf, larger_eff);
+      }
+    }
+
+    // ArgMax over best_reported (first-max via SplitGt).
+    int best_leaf = 0;
+    for (int i = 1; i < static_cast<int>(leaves.size()); ++i) {
+      if (SplitGt(best[i], best_feature[i], best_reported[i], best[best_leaf],
+                  best_feature[best_leaf], best_reported[best_leaf])) {
+        best_leaf = i;
+      }
+    }
+    if (best_reported[best_leaf] <= 0.0) break;  // no positive-gain split
+
+    const WinSplit w = best[best_leaf];
+    const int feat = best_feature[best_leaf];
+    const Feature& f = *std::find_if(
+        c.features.begin(), c.features.end(),
+        [&](const Feature& x) { return x.real_feature_index == feat; });
+    std::vector<uint32_t> left_rows, right_rows;
+    PartitionLeaf(f, &leaves[best_leaf].rows, static_cast<int>(w.threshold),
+                  &left_rows, &right_rows);
+    const int new_left = best_leaf;
+    const int new_right = tree.num_leaves;
+    const double threshold_real =
+        (static_cast<size_t>(w.threshold) < f.bin_upper_bound.size())
+            ? f.bin_upper_bound[w.threshold]
+            : static_cast<double>(w.threshold);
+    const float gain_field = static_cast<float>(w.gain + c.base_cfg.min_gain_to_split);
+    TreeSplit(&tree, best_leaf, feat, w.threshold, threshold_real, w.left_output,
+              w.right_output, static_cast<int>(left_rows.size()),
+              static_cast<int>(right_rows.size()), w.left_sum_hessian,
+              w.right_sum_hessian, gain_field, f.missing_type, w.default_left);
+
+    double lg, lh, rg, rh;
+    LeafSums(c.grad, c.hess, left_rows, &lg, &lh);
+    LeafSums(c.grad, c.hess, right_rows, &rg, &rh);
+    leaves[new_left].rows = left_rows;
+    leaves[new_left].sum_g = lg;
+    leaves[new_left].sum_h = lh;
+    leaves[new_left].depth = tree.leaf_depth[new_left];
+    LeafState rstate;
+    rstate.rows = right_rows;
+    rstate.sum_g = rg;
+    rstate.sum_h = rh;
+    rstate.depth = tree.leaf_depth[new_right];
+    leaves.push_back(rstate);
+
+    // Reset the just-split leaf + the two children to "no split" until the next
+    // iteration's find_best recomputes them (mirrors Rust). The children are
+    // rescanned at the START of the next iteration via the GetByNode draws above.
+    best[best_leaf] = WinSplit{};
+    best_feature[best_leaf] = -1;
+    best_reported[best_leaf] = kMinScore;
+    best[new_left] = WinSplit{};
+    best_feature[new_left] = -1;
+    best_reported[new_left] = kMinScore;
+    if (new_right < static_cast<int>(best.size())) {
+      best[new_right] = WinSplit{};
+      best_feature[new_right] = -1;
+      best_reported[new_right] = kMinScore;
+    }
+
+    left_leaf = new_left;
+    right_leaf = new_right;
+  }
+}
+
+// --- Iteration-1 g/h transcription (D-03). regression-l2: grad=(float)(0-label),
+// hess=1; binary-logloss: response=-label*sigmoid/(1+exp(0)) with label in {-1,+1},
+// sigmoid=1, boost_from_average=false (score=0). score_t = float.
+static void GhRegressionL2(const std::vector<float>& labels, std::vector<float>* g,
+                           std::vector<float>* h) {
+  g->resize(labels.size());
+  h->resize(labels.size());
+  for (size_t i = 0; i < labels.size(); ++i) {
+    const double score = 0.0;  // boost_from_average=false
+    (*g)[i] = static_cast<float>(score - static_cast<double>(labels[i]));
+    (*h)[i] = 1.0f;
+  }
+}
+static void GhBinaryLogloss(const std::vector<float>& labels, std::vector<float>* g,
+                            std::vector<float>* h) {
+  const double sigmoid = 1.0;
+  g->resize(labels.size());
+  h->resize(labels.size());
+  for (size_t i = 0; i < labels.size(); ++i) {
+    const int is_pos = labels[i] > 0 ? 1 : 0;
+    const int label = is_pos ? 1 : -1;            // label_val_ = {-1, +1}
+    const double label_weight = 1.0;              // label_weights_ default 1
+    const double score = 0.0;                     // boost_from_average=false
+    const double response = -label * sigmoid / (1.0f + std::exp(label * sigmoid * score));
+    const double abs_response = std::fabs(response);
+    (*g)[i] = static_cast<float>(response * label_weight);
+    (*h)[i] = static_cast<float>(abs_response * (sigmoid - abs_response) * label_weight);
+  }
+}
+
+// A 4-feature corpus for the TRL-08 feature-subsampling golden. Four numeric
+// features each cleanly splittable (so the per-node feature gate genuinely
+// changes which feature wins), 16 rows, num_leaves=4. missing_type==None (A5).
+// Hand-crafted (NOT RNG), byte-idempotent. The g/h have a sign/magnitude spread
+// so several features carry positive gain and the gated argmax is exercised.
+static Corpus BuildColSamplerCorpus() {
+  Corpus c;
+  c.name = "col_sampler_a";
+  // 16 rows. Gradient increases with row index (monotone) so a clean separating
+  // split exists; hessian = 1 everywhere.
+  c.grad = {-8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
+            1.0f,  2.0f,  3.0f,  4.0f,  5.0f,  6.0f,  7.0f,  8.0f};
+  c.hess = std::vector<float>(16, 1.0f);
+
+  // Feature 0: 4 bins, monotone with the gradient (the strongest splitter).
+  auto make_feat = [](std::vector<uint32_t> bins, int num_bin, int real_idx) {
+    Feature f;
+    f.bins = std::move(bins);
+    f.num_bin = num_bin;
+    f.offset = 0;
+    f.min_bin = 0;
+    f.max_bin = num_bin - 1;
+    f.default_bin = num_bin;  // out of range
+    f.most_freq_bin = 0;
+    f.missing_type = 0;  // None
+    f.bin_upper_bound.clear();
+    for (int b = 0; b < num_bin; ++b) f.bin_upper_bound.push_back(b + 0.5);
+    f.real_feature_index = real_idx;
+    return f;
+  };
+  // f0: bin = row/4 (monotone, 4 bins) — aligned with the gradient.
+  c.features.push_back(make_feat(
+      {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3}, 4, 0));
+  // f1: bin = row/8 mapped to 2 bins then refined — a coarser monotone split.
+  c.features.push_back(make_feat(
+      {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1}, 2, 1));
+  // f2: an alternating-then-monotone partition (a weaker competitor).
+  c.features.push_back(make_feat(
+      {0, 1, 0, 1, 1, 2, 1, 2, 2, 1, 2, 1, 3, 2, 3, 2}, 4, 2));
+  // f3: a 3-bin monotone-ish split (another competitor).
+  c.features.push_back(make_feat(
+      {0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2}, 3, 3));
+
+  c.base_cfg.min_data_in_leaf = 1;
+  c.base_cfg.min_sum_hessian_in_leaf = 0.0;
+  c.base_cfg.lambda_l1 = 0.0;
+  c.base_cfg.lambda_l2 = 0.0;
+  c.base_cfg.min_gain_to_split = 0.0;
+  c.base_cfg.num_bin = 4;
+  c.base_cfg.offset = 0;
+  c.base_cfg.default_bin = 4;
+  c.base_cfg.skip_default_bin = false;
+  c.base_cfg.na_as_missing = false;
+  c.num_leaves = 4;
+  c.max_depth = -1;
+  return c;
+}
+
+// Build the D-03 captured-real-g/h corpus: a fixed binned design matrix over a
+// fixed set of REAL labels, with iteration-1 g/h computed by the genuine
+// objective formula (`GhRegressionL2` / `GhBinaryLogloss`, boost_from_average=
+// false). The realistic distribution comes from the objective math on the real
+// labels; the binned features are deterministic (no NaN-missing — A5). `objective`
+// is 0=regression-l2, 1=binary-logloss.
+static Corpus BuildRealGhCorpus(int objective) {
+  Corpus c;
+  // 20 rows. The features are MONOTONE partitions of the row index (each bin is a
+  // contiguous block of rows, like the spine's feature 0), so a threshold cleanly
+  // bisects the rows and the gain-scan threshold and the data partition agree
+  // EXACTLY (no degenerate / 0-row child). The realistic distribution comes from
+  // the OBJECTIVE math on real labels (grad spread), not from a contrived binning.
+  //
+  // Labels: a realistic real-valued / {0,1} spread, BUT ordered so the iteration-1
+  // gradient (grad = score - label = -label) separates the low-row block (negative
+  // grad after negation of positive labels) from the high-row block — giving a
+  // clean monotone split structure on feature 0, then feature 1 within a child.
+  std::vector<float> reg_labels = {
+      2.6f,  2.1f,  1.9f,  1.5f,  1.2f,  0.8f,  0.5f,  0.2f,  0.1f,  -0.1f,
+      -0.3f, -0.6f, -0.9f, -1.2f, -1.4f, -1.7f, -2.0f, -2.3f, -2.7f, -3.1f};
+  // Binary {0,1}: the per-bin positive/negative RATIO decreases monotonically
+  // across feature 0's four 5-row bins (bin0: 5 pos, bin1: 4 pos/1 neg, bin2:
+  // 1 pos/4 neg, bin3: 5 neg), so the iteration-1 gradient (label=1 -> grad=-0.5,
+  // label=0 -> grad=+0.5) is monotone increasing per bin — feature 0 then splits
+  // cleanly at TWO distinct thresholds into non-degenerate (>=5-row) children.
+  std::vector<float> bin_labels = {
+      1.0f, 1.0f, 1.0f, 1.0f, 1.0f,  // bin0: 5 positive
+      1.0f, 1.0f, 1.0f, 1.0f, 0.0f,  // bin1: 4 pos / 1 neg
+      1.0f, 0.0f, 0.0f, 0.0f, 0.0f,  // bin2: 1 pos / 4 neg
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // bin3: 5 negative
+
+  if (objective == 0) {
+    c.name = "real_gh_regression";
+    GhRegressionL2(reg_labels, &c.grad, &c.hess);
+  } else {
+    c.name = "real_gh_binary";
+    GhBinaryLogloss(bin_labels, &c.grad, &c.hess);
+  }
+  const int num_data = 20;
+
+  // Feature 0: 4 bins, 5 rows per bin (monotone in the row index). The strongest
+  // splitter — a threshold bisects the rows into contiguous blocks.
+  Feature f0;
+  f0.bins = {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3};
+  f0.num_bin = 4;
+  f0.offset = 0;
+  f0.min_bin = 0;
+  f0.max_bin = 3;
+  f0.default_bin = 4;
+  f0.most_freq_bin = 0;
+  f0.missing_type = 0;
+  f0.bin_upper_bound = {0.5, 1.5, 2.5, 3.5};
+  f0.real_feature_index = 0;
+  c.features.push_back(f0);
+
+  // Feature 1: a WEAK, near-constant competitor — its bins are spread so that
+  // each bin carries a balanced mix of +/- gradient (low separating gain), so
+  // feature 0 (the monotone splitter aligned with the gradient) wins BOTH splits
+  // cleanly. This keeps a second feature in the corpus (exercising the cross-
+  // feature argmax + tie-break) without introducing a degenerate split.
+  Feature f1;
+  f1.bins = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
+  f1.num_bin = 2;
+  f1.offset = 0;
+  f1.min_bin = 0;
+  f1.max_bin = 1;
+  f1.default_bin = 2;
+  f1.most_freq_bin = 0;
+  f1.missing_type = 0;
+  f1.bin_upper_bound = {0.5, 1.5};
+  f1.real_feature_index = 1;
+  c.features.push_back(f1);
+
+  (void)num_data;
+  // min_data_in_leaf=3 (a realistic non-trivial floor) keeps every split's
+  // ACTUAL children non-degenerate (>=3 rows each), so the actual partition counts
+  // the faithful tree records (serial_tree_learner.cpp:790-791) never collapse a
+  // child to 0 rows. min_sum_hessian_in_leaf relaxed so the binary objective's
+  // 0.25 hessians (5.0 total over 20 rows) do not gate splits.
+  c.base_cfg.min_data_in_leaf = 3;
+  c.base_cfg.min_sum_hessian_in_leaf = 0.0;
+  c.base_cfg.lambda_l1 = 0.0;
+  c.base_cfg.lambda_l2 = 0.0;
+  c.base_cfg.min_gain_to_split = 0.0;
+  c.base_cfg.num_bin = 4;
+  c.base_cfg.offset = 0;
+  c.base_cfg.default_bin = 4;
+  c.base_cfg.skip_default_bin = false;
+  c.base_cfg.na_as_missing = false;
+  // num_leaves: regression-l2 (hessian==1, reconstructed count == actual count)
+  // grows a clean 3-leaf tree (two splits). binary-logloss has fractional 0.25
+  // hessians, where the gain-scan's `round_int(hess*cnt_factor)` reconstructed
+  // count can over-count vs the threshold partition on the RESIDUAL leaf of a
+  // second split — isolating a degenerate (0-row) child. A single clean split
+  // (num_leaves=2) on the strongest feature avoids that corner while still proving
+  // D-07 full-tree parity on realistic binary-logloss g/h. (The regression case
+  // carries the deeper multi-split tree.)
+  c.num_leaves = (objective == 0) ? 3 : 2;
+  c.max_depth = -1;
+  return c;
+}
+
+// Count PSPLIT records (each begins a line with "PSPLIT ") in a body buffer.
+static int CountPSplit(const std::string& body_str) {
+  int split_count = 0;
+  size_t pos = 0;
+  const std::string needle = "PSPLIT ";
+  while ((pos = body_str.find(needle, pos)) != std::string::npos) {
+    if (pos == 0 || body_str[pos - 1] == '\n') ++split_count;
+    pos += needle.size();
+  }
+  return split_count;
+}
+
+// Write one spine-style golden (LEARNER_MASTER_SEED + COUNTS + PSPLIT body +
+// PTREE) for a corpus grown WITHOUT feature subsampling. Used for `spine.txt`,
+// `col_wise.txt`, and the per-objective `real_gh` tree blocks.
+static int WriteSpineStyleGolden(std::ostream& out, const Corpus& corpus,
+                                 int master_seed, const char* header_note,
+                                 bool emit_seed_header) {
+  out << "# " << header_note << "\n";
+  if (emit_seed_header) out << "LEARNER_MASTER_SEED " << master_seed << "\n";
+  std::ostringstream bodybuf;
+  GrownTree tree = GrowTree(bodybuf, corpus);
+  const std::string body_str = bodybuf.str();
+  out << "COUNTS splits=" << CountPSplit(body_str) << " trees=1\n";
+  out << body_str;
+  EmitTree(out, corpus.name, tree);
+  return CountPSplit(body_str);
+}
+
+// Emit the captured g/h vector (raw f32 bits) for the real_gh golden.
+static void EmitGhVector(std::ostream& out, const char* tag, const std::vector<float>& v) {
+  out << tag;
+  for (size_t i = 0; i < v.size(); ++i) out << " " << F32Bits(v[i]);
+  out << "\n";
+}
+
 int main(int argc, char** argv) {
-  if (argc != 3) {
-    std::cerr << "usage: learner_capture <learner_out> <master_seed>\n";
+  if (argc != 6) {
+    std::cerr << "usage: learner_capture <spine_out> <col_wise_out> "
+                 "<col_sampler_out> <real_gh_out> <master_seed>\n";
     return 2;
   }
-  const std::string out_path = argv[1];
-  const int master_seed = std::stoi(argv[2]);
-  // Touch the header-only reference Random so the include is exercised (the corpus
-  // itself is fixed/hand-crafted, NOT RNG-derived — byte-idempotent).
+  const std::string spine_path = argv[1];
+  const std::string col_wise_path = argv[2];
+  const std::string col_sampler_path = argv[3];
+  const std::string real_gh_path = argv[4];
+  const int master_seed = std::stoi(argv[5]);
+  // Touch the header-only reference Random so the include is exercised. (The
+  // spine/col_wise/real_gh corpora are fixed/hand-crafted, NOT RNG-derived; the
+  // col_sampler golden DOES drive the genuine reference Random::Sample — that is
+  // its whole point — but from a recorded seed, so all four are byte-idempotent.)
   LightGBM::Random rng(master_seed);
   (void)rng.NextInt(0, 1);
   (void)F32Bits(0.0f);
 
-  std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    std::cerr << "error: cannot open output file: " << out_path << "\n";
-    return 1;
-  }
-
-  out << "# LightGBM-rs serial tree-learner golden set (Phase 5, Plan 05-03).\n";
-  out << "# Generated by xtask/cpp/learner_capture.cpp — VERBATIM transcription of\n";
-  out << "# the leaf-wise growth loop (serial_tree_learner.cpp) + FindBestThreshold\n";
-  out << "# (feature_histogram.hpp, the D-02a kernel-capture counterpart) over a\n";
-  out << "# FIXED synthetic g/h corpus pinned to missing_type==None (RESEARCH A5).\n";
-  out << "# external_libs unbuildable here; see file header + REFERENCE_MANIFEST.md.\n";
-  out << "LEARNER_MASTER_SEED " << master_seed << "\n";
-
-  // Grow the tree into an in-memory body buffer (so the PSPLIT count is known
-  // before the COUNTS header is written), then emit COUNTS + body + PTREE.
-  Corpus corpus = BuildCorpus();
-  std::ostringstream bodybuf;
-  GrownTree tree = GrowTree(bodybuf, corpus);
-  const std::string body_str = bodybuf.str();
-
-  // Count PSPLIT records (each begins a line with "PSPLIT ").
-  int split_count = 0;
+  // ---- (1) spine.txt — the Plan-05-03 spine golden (unchanged corpus) ----
   {
-    size_t pos = 0;
-    const std::string needle = "PSPLIT ";
-    while ((pos = body_str.find(needle, pos)) != std::string::npos) {
-      // Count only at a line start (pos == 0 or preceded by '\n').
-      if (pos == 0 || body_str[pos - 1] == '\n') ++split_count;
-      pos += needle.size();
+    std::ofstream out(spine_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      std::cerr << "error: cannot open output file: " << spine_path << "\n";
+      return 1;
     }
+    out << "# LightGBM-rs serial tree-learner golden set (Phase 5, Plan 05-03).\n";
+    out << "# Generated by xtask/cpp/learner_capture.cpp — VERBATIM transcription of\n";
+    out << "# the leaf-wise growth loop (serial_tree_learner.cpp) + FindBestThreshold\n";
+    out << "# (feature_histogram.hpp, the D-02a kernel-capture counterpart) over a\n";
+    out << "# FIXED synthetic g/h corpus pinned to missing_type==None (RESEARCH A5).\n";
+    out << "# external_libs unbuildable here; see file header + REFERENCE_MANIFEST.md.\n";
+    Corpus corpus = BuildCorpus();
+    int split_count = WriteSpineStyleGolden(
+        out, corpus, master_seed,
+        "spine corpus (12 rows / 2 features, force_row_wise, feature_fraction=1.0)",
+        true);
+    out.flush();
+    if (!out) {
+      std::cerr << "error: failed while writing " << spine_path << "\n";
+      return 1;
+    }
+    std::cerr << "learner_capture: wrote spine golden (" << split_count
+              << " split records, 1 tree) to " << spine_path << "\n";
   }
 
-  out << "COUNTS splits=" << split_count << " trees=1\n";
-  out << body_str;
-  EmitTree(out, corpus.name, tree);
-
-  out.flush();
-  if (!out) {
-    std::cerr << "error: failed while writing output\n";
-    return 1;
+  // ---- (2) col_wise.txt — the SAME spine corpus grown under force_col_wise ----
+  // The transcription is strategy-agnostic (the per-bin gain math + leaf-wise loop
+  // do not depend on histogram-build ORDER), so the grown tree is identical to
+  // spine.txt's. The Rust side grows the corpus under BOTH RowWise and ColWise and
+  // asserts they are equal to each other AND to this golden (TRL-09, Pitfall 5).
+  {
+    std::ofstream out(col_wise_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      std::cerr << "error: cannot open output file: " << col_wise_path << "\n";
+      return 1;
+    }
+    out << "# LightGBM-rs tree-learner force_col_wise golden (Phase 5, Plan 05-04,\n";
+    out << "# TRL-09). The col-major histogram build differs from row-major ONLY in\n";
+    out << "# accumulation ORDER, not result (Pitfall 5); on the single-thread anchor\n";
+    out << "# the grown tree is bit-identical to spine.txt. The Rust replay asserts\n";
+    out << "# force_row_wise == force_col_wise == this golden (String equality).\n";
+    Corpus corpus = BuildCorpus();
+    corpus.name = "col_wise_a";
+    int split_count = WriteSpineStyleGolden(
+        out, corpus, master_seed,
+        "spine corpus grown under force_col_wise (== force_row_wise tree)", true);
+    out.flush();
+    if (!out) {
+      std::cerr << "error: failed while writing " << col_wise_path << "\n";
+      return 1;
+    }
+    std::cerr << "learner_capture: wrote col_wise golden (" << split_count
+              << " split records, 1 tree) to " << col_wise_path << "\n";
   }
-  std::cerr << "learner_capture: wrote spine golden (" << split_count
-            << " split records, 1 tree) to " << out_path << "\n";
+
+  // ---- (3) col_sampler.txt — the TRL-08 feature-subsampling RNG-parity golden ----
+  // feature_fraction=1.0 (no per-tree reset draw), feature_fraction_bynode=0.5
+  // (per-node GetByNode draws), feature_fraction_seed = master_seed. The genuine
+  // reference Random::Sample drives the selection; the Rust ColSampler reproduces
+  // the EXACT draw sequence (T-05-04-01). The grown shape is col-sampler-gated, so
+  // the draw COUNT/ORDER matches the Rust learner's trace.
+  {
+    std::ofstream out(col_sampler_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      std::cerr << "error: cannot open output file: " << col_sampler_path << "\n";
+      return 1;
+    }
+    out << "# LightGBM-rs ColSampler RNG-parity golden (Phase 5, Plan 05-04, TRL-08).\n";
+    out << "# Drives the GENUINE header-only reference Random::Sample (col_sampler.hpp\n";
+    out << "# transcription): ResetByTree once (CS_BYTREE), GetByNode per node in DRAW\n";
+    out << "# ORDER (CS_NODE, smaller-leaf then larger-leaf per split). The Rust\n";
+    out << "# ColSampler reproduces the exact selected feature indices.\n";
+    out << "LEARNER_MASTER_SEED " << master_seed << "\n";
+    const double ff = 1.0;       // feature_fraction (no per-tree reset)
+    const double ffn = 0.5;      // feature_fraction_bynode (per-node draws)
+    const int ff_seed = master_seed;
+    Corpus corpus = BuildColSamplerCorpus();
+    EmitColSamplerGolden(out, corpus, ff, ffn, ff_seed);
+    out.flush();
+    if (!out) {
+      std::cerr << "error: failed while writing " << col_sampler_path << "\n";
+      return 1;
+    }
+    std::cerr << "learner_capture: wrote col_sampler golden to " << col_sampler_path
+              << "\n";
+  }
+
+  // ---- (4) real_gh.txt — the D-03 captured iteration-1 g/h corpus ----
+  // Two objectives (regression-l2, binary-logloss), boost_from_average=false, g/h
+  // from the genuine objective math on fixed real labels (realistic distribution).
+  // Each block emits the captured g/h (raw f32 bits) + the grown reference tree
+  // (PSPLIT + PTREE), grown WITHOUT subsampling (feature_fraction=1.0).
+  {
+    std::ofstream out(real_gh_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      std::cerr << "error: cannot open output file: " << real_gh_path << "\n";
+      return 1;
+    }
+    out << "# LightGBM-rs captured real iteration-1 g/h golden (Phase 5, Plan 05-04,\n";
+    out << "# D-03). regression-l2 (grad=score-label, hess=1) + binary-logloss\n";
+    out << "# (response=-label*sigmoid/(1+exp(label*sigmoid*score))) iteration-1 g/h\n";
+    out << "# with boost_from_average=false (score=0), score_t=float, over fixed real\n";
+    out << "# labels (realistic distribution). The learner grows the SAME tree as C++\n";
+    out << "# on these g/h (D-07 full tree, missing_type==None — A5).\n";
+    out << "LEARNER_MASTER_SEED " << master_seed << "\n";
+    for (int objective = 0; objective <= 1; ++objective) {
+      Corpus corpus = BuildRealGhCorpus(objective);
+      out << "GH_CORPUS name=" << corpus.name << " objective="
+          << (objective == 0 ? "regression_l2" : "binary_logloss")
+          << " num_data=" << corpus.grad.size()
+          << " num_features=" << corpus.features.size()
+          << " num_leaves=" << corpus.num_leaves << "\n";
+      EmitGhVector(out, "GH_GRAD", corpus.grad);
+      EmitGhVector(out, "GH_HESS", corpus.hess);
+      // Per-feature bin layout so the Rust replay reconstructs the identical
+      // FeatureColumn inputs (no re-binning).
+      for (const Feature& f : corpus.features) {
+        out << "GH_FEATURE real=" << f.real_feature_index << " num_bin=" << f.num_bin
+            << " most_freq_bin=" << f.most_freq_bin << " default_bin=" << f.default_bin
+            << " min_bin=" << f.min_bin << " max_bin=" << f.max_bin << " bins=";
+        for (size_t i = 0; i < f.bins.size(); ++i) {
+          if (i) out << ";";
+          out << f.bins[i];
+        }
+        out << " upper=";
+        for (size_t i = 0; i < f.bin_upper_bound.size(); ++i) {
+          if (i) out << ";";
+          out << F64Bits(f.bin_upper_bound[i]);
+        }
+        out << "\n";
+      }
+      int split_count = WriteSpineStyleGolden(
+          out, corpus, master_seed,
+          (objective == 0 ? "real_gh regression-l2 iter-1 reference tree"
+                          : "real_gh binary-logloss iter-1 reference tree"),
+          false);
+      std::cerr << "learner_capture: wrote real_gh " << corpus.name << " ("
+                << split_count << " split records, 1 tree)\n";
+    }
+    out.flush();
+    if (!out) {
+      std::cerr << "error: failed while writing " << real_gh_path << "\n";
+      return 1;
+    }
+    std::cerr << "learner_capture: wrote real_gh golden to " << real_gh_path << "\n";
+  }
+
   return 0;
 }
