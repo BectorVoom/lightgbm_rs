@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-03-PLAN.md
-last_updated: "2026-06-05T06:58:28Z"
-last_activity: 2026-06-05 -- Completed Plan 02-03 (categorical folding + missing-value routing golden parity)
+stopped_at: Completed 02-04-PLAN.md
+last_updated: "2026-06-05T07:37:00Z"
+last_activity: 2026-06-05 -- Completed Plan 02-04 (from_mat/from_csr/from_csc ingestion + metadata + example-dataset parity)
 progress:
   total_phases: 8
   completed_phases: 1
   total_plans: 8
-  completed_plans: 6
-  percent: 38
+  completed_plans: 7
+  percent: 44
 ---
 
 # Project State
@@ -26,15 +26,17 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 02 (dataset-binning-determinism-root) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Executing Phase 02
-Last activity: 2026-06-05 -- Completed Plan 02-03
+Last activity: 2026-06-05 -- Completed Plan 02-04
 
-Progress: [██████░░░░] 60% (3 of 5 Phase-02 plans complete)
+Progress: [████████░░] 80% (4 of 5 Phase-02 plans complete)
 
 ### Resume
 
-Phase 02 Plan 03 complete: categorical folding + missing-value routing are locked and bit-proven. Next: Plan 02-04 (ingestion `from_mat`/`from_csr`/`from_csc` + metadata).
+Phase 02 Plan 04 complete: the internal ingestion API (`from_mat`/`from_csr`/`from_csc`) + `Metadata` are locked and bit-proven end-to-end. Next: Plan 02-05 (EFB grouping + MultiValBin).
+
+- Ingestion (Plan 02-04): `from_mat`/`from_csr`/`from_csc` (validated entry points, Security V5 — typed `DatasetError` never a panic) wire sample → `find_bin` → `Dataset::construct` → `push` → `finish_load`; sampling routes through the Phase-1 RNG (`create_sample_indices`), f32→f64 widening at one `widen()` site. Dense vs CSR vs CSC bin bit-identically (incl. a zero-heavy column). `Metadata` (f32 label/weights/query_weights, f64 init_score, i32 query_boundaries) + `finish_load` query-weight derivation (f32 `CalculateQueryWeights`) round-trips bit-exact. End-to-end parity: regression + binary_classification example datasets (28 features each, 500 rows) bin bit-identical to C++ for every feature (layers 1+2). Example fixtures COPIED into committed `tests/fixtures/examples/`.
 
 - `lgbm-dataset` crate exists with `BinMapper` (numeric `find_bin`/`value_to_bin`, bit-exact f64 boundary kernel), `BinType`/`MissingType`, and `DatasetError`.
 - Categorical (Plan 02-03): `find_bin_categorical` (descending-count fold via stable `SortForPair`, f32 0.99 cut, `min_data_in_bin` fold-break, NaN dummy bin 0) + `categorical_2_bin_`/`bin_2_categorical_` + categorical `value_to_bin`; completed `MissingType` routing (None/Zero/NaN, signed zeros, all-missing) — 6-case categorical (layers 1+3 + per-row) + 8-case missing (layer 1 + per-row) golden replay, bit-identical, idempotent.
@@ -56,13 +58,14 @@ Phase 02 Plan 03 complete: categorical folding + missing-value routing are locke
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-oracle-contract-foundations | 3/3 | ~2 sessions | ~1 session |
-| 02-dataset-binning-determinism-root | 3/5 | ~30 min | ~10 min |
+| 02-dataset-binning-determinism-root | 4/5 | ~65 min | ~16 min |
 
 **Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 **Plan 01-03:** 2 TDD tasks, 3 files modified, 7 new tests (49 → 56); deterministic alias resolution + empty==absent reads; `cargo test --workspace` green.
 **Plan 02-01:** 4 tasks (~12 min), 14 files (9 created + 5 modified), numeric BinMapper kernel + bin-capture harness + 45-case golden replay (layers 1+2 bit-exact); `cargo test --workspace` green.
 **Plan 02-02:** 3 tasks (~9 min), 11 files (7 created + 4 modified), bin-storage layer (Bin trait + DenseBin/4-bit + SparseBin + FeatureGroup offsets + Dataset finish_load type-state immutability) + 6-case storage golden replay (byte-exact); 25 new lib tests (10→35); `cargo test --workspace` green; bin-capture idempotent.
 **Plan 02-03:** 2 tasks (~9 min), 9 files (4 created + 5 modified), categorical `find_bin_categorical` (stable descending-count fold + f32 0.99 cut + fold-break + NaN dummy bin) + categorical `value_to_bin` + completed MissingType routing; 6-case categorical (layers 1+3 + per-row) + 8-case missing (layer 1 + per-row) golden replay (bit-exact); 7 new inline + 2 integration tests (35→42 lib); `cargo test --workspace` green; bin-capture idempotent.
+**Plan 02-04:** 3 tasks (~35 min), 12 files (9 created + 3 modified), `Metadata` (f32 query-weight derivation) + `from_mat`/`from_csr`/`from_csc` ingestion (validated entries, single widen site, Phase-1-RNG sampling); dense/CSR/CSC bit-identical (zero-heavy column) + metadata golden + end-to-end example-dataset parity (regression + binary, 28 features each, layers 1+2 bit-exact); 14 new inline + 3 integration test files (42→56 lib); `cargo test --workspace` green; bin-capture idempotent.
 
 **Recent Trend:**
 
@@ -89,6 +92,7 @@ Recent decisions affecting current work:
 - [Phase 2 exec, 2026-06-05]: **Dataset immutability = type-state, not a runtime flag** — `Dataset::finish_load(self)` consumes the mutable loading state and returns `FinishedDataset` (no `push_*`/`finish_load` method), so a post-finish mutation is a COMPILE error — strictly stronger than C++ `is_finish_load_` while observably identical.
 - [Phase 2 exec, 2026-06-05]: **Categorical folding + missing routing locked (DAT-03, DAT-04)** — `find_bin_categorical` transcribes the descending-count fold via the STABLE `slice::sort_by` (mirrors `SortForPair(is_reverse=true)`; equal-count ties keep ascending-value order), the f32 `0.99` cut (`RoundInt((rest as f32 * 0.99f) ...)` — NOT `0.99_f64`, which would shift the cut), the `min_data_in_bin && cur_cat_idx>1` fold-break, and the NaN dummy bin 0; `categorical_2_bin_` is a by-key `HashMap` (fold order is sort-driven). Missing routing (None/Zero/NaN, signed +0/-0 identical, all-missing single bin) proven bit-identical to C++ across a 6-case categorical (layers 1+3 + per-row) + 8-case missing (layer 1 + per-row) golden battery.
 - [Phase 2 exec, 2026-06-05]: **`autobins = false` on lgbm-dataset** — the locked module path `src/bin/{mod,dense_bin,sparse_bin}.rs` collides with Cargo's binary-target convention (Cargo tried to compile the storage module files as `main`-bearing binaries). Disabling binary auto-discovery preserves the path; the crate ships no binaries.
+- [Phase 2 exec, 2026-06-05]: **Ingestion API locked (D-05, DAT-06/07)** — `from_mat`/`from_csr`/`from_csc` are single validated public entries (validate ALL caller input first → typed `DatasetError`, never panic; Security V5 / T-02-10..13) wiring sample→`find_bin`→`construct`→`push`→`finish_load`. f32→f64 widening at ONE `widen()` site; sparse gather is dense-by-column (absent==0.0, Open Q2). Dense/CSR/CSC of the same matrix bin bit-identically (tolerance-free internal invariant). `Metadata` query weights computed in f32 (`CalculateQueryWeights` verbatim). End-to-end real example-dataset (regression + binary) binning bit-identical to C++ for all 28 features × both datasets (layers 1+2). Example fixtures COPIED into the committed dir, never the untracked LightGBM/ tree.
 
 ### Pending Todos
 
@@ -112,6 +116,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T06:58:28Z
-Stopped at: Completed 02-03-PLAN.md
+Last session: 2026-06-05T07:37:00Z
+Stopped at: Completed 02-04-PLAN.md
 Resume file: None

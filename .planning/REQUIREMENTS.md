@@ -27,8 +27,8 @@
 - [x] **DAT-03**: Missing-value handling (`use_missing`, `zero_as_missing`, `MissingType`) with C++-matching default-direction routing
 - [x] **DAT-04**: Categorical feature encoding (category→bin mapping, low-frequency folding)
 - [ ] **DAT-05**: Exclusive Feature Bundling (`enable_bundle`) reproducing C++ feature grouping
-- [ ] **DAT-06**: Metadata support (labels, weights, init_score, query/group boundaries)
-- [ ] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API
+- [x] **DAT-06**: Metadata support (labels, weights, init_score, query/group boundaries)
+- [x] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API
 - [ ] **DAT-08**: LightGBM model text format read — load a C++-trained model and predict identically
 - [ ] **DAT-09**: LightGBM model text format write — emit the exact text schema (trees, leaf values, bin mappers, feature metadata) including `%.17g` float formatting
 
@@ -159,8 +159,8 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | DAT-03 | Phase 2 | Complete (02-03) |
 | DAT-04 | Phase 2 | Complete (02-03) |
 | DAT-05 | Phase 2 | Pending |
-| DAT-06 | Phase 2 | Pending |
-| DAT-07 | Phase 2 | Pending |
+| DAT-06 | Phase 2 | Complete |
+| DAT-07 | Phase 2 | Complete |
 | ORA-03 | Phase 2 | Pending |
 | DAT-08 | Phase 3 | Pending |
 | DAT-09 | Phase 3 | Pending |

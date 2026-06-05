@@ -80,7 +80,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 4** *(blocked on Wave 3)*
 
-  - [ ] 02-04-PLAN.md — Metadata + from_mat/from_csr/from_csc ingestion + dense/CSR/CSC equivalence + example-dataset parity
+  - [x] 02-04-PLAN.md — Metadata + from_mat/from_csr/from_csc ingestion + dense/CSR/CSC equivalence + example-dataset parity
 
 **Wave 5** *(blocked on Wave 4; EFB sequenced last per MEDIUM-risk capture flag, has checkpoint)*
 
