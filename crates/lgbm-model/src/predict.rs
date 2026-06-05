@@ -29,6 +29,7 @@
 
 use crate::ensemble::GbdtModel;
 use crate::error::ModelError;
+use crate::objective::ObjectiveKind;
 
 /// Width of the materialized raw row buffer = `max_feature_idx + 1`.
 #[inline]
@@ -228,6 +229,392 @@ pub fn predict_raw_csc(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Transformed prediction (PRD-02) + leaf-index prediction (PRD-03).
+//
+// These reuse the SAME raw dense-row materialization as the raw driver above:
+// each public entry materializes the row buffer (mat: per-row slice; csr: per-row
+// scatter; csc: full dense scatter), then either
+//   - applies `GbdtModel::predict_raw` (full range) + ObjectiveKind::convert
+//     (transformed, `gbdt_prediction.cpp:55` Predict), or
+//   - walks `trees[i*ntpi+k].get_leaf(row)` into the per-(iter×class) stride
+//     (leaf, `gbdt_prediction.cpp:79-86` PredictLeafIndex + Pitfall 8 layout).
+// ---------------------------------------------------------------------------
+
+/// Resolve + validate the model's objective once per transformed-predict call.
+/// The transformed output width must match `num_tree_per_iteration` (the raw
+/// per-class width) — a mismatch is a malformed model.
+fn resolve_objective(model: &GbdtModel) -> Result<ObjectiveKind, ModelError> {
+    let line = model
+        .objective_string
+        .as_deref()
+        .ok_or_else(|| ModelError::MalformedModel {
+            detail: "model has no objective= line; cannot apply ConvertOutput".to_string(),
+        })?;
+    let kind = ObjectiveKind::parse(line)?;
+    let ntpi = model.num_tree_per_iteration.max(0) as usize;
+    if kind.num_output() != ntpi {
+        return Err(ModelError::MalformedModel {
+            detail: format!(
+                "objective output width {} != num_tree_per_iteration {ntpi}",
+                kind.num_output()
+            ),
+        });
+    }
+    Ok(kind)
+}
+
+/// Apply the transformed pipeline to one materialized row: raw per-class scores
+/// (f64) → `ObjectiveKind::convert` → push f32 outputs.
+#[inline]
+fn predict_row_transformed(
+    model: &GbdtModel,
+    kind: &ObjectiveKind,
+    row: &[f64],
+    raw_buf: &mut Vec<f64>,
+    conv_buf: &mut [f64],
+    out: &mut Vec<f32>,
+) {
+    raw_buf.clear();
+    raw_buf.extend(model.predict_raw(row, 0, -1));
+    kind.convert(raw_buf, conv_buf);
+    for &v in conv_buf.iter() {
+        out.push(v as f32);
+    }
+}
+
+/// Walk one materialized row's leaf ids into the per-(iter×class) stride
+/// (`gbdt_prediction.cpp:79-86`, Pitfall 8): output length
+/// `num_tree_per_iteration * num_iteration_for_pred`, ordered
+/// `[iter0_class0, iter0_class1, ..., iter1_class0, ...]`. Leaf ids are
+/// non-negative (`!node`), emitted as `u32`.
+#[inline]
+fn predict_row_leaf(model: &GbdtModel, row: &[f64], out: &mut Vec<u32>) {
+    let ntpi = model.num_tree_per_iteration.max(0) as usize;
+    let num_iter = model.num_iteration().max(0) as usize;
+    for i in 0..num_iter {
+        for k in 0..ntpi {
+            let idx = i * ntpi + k;
+            let leaf = model.trees[idx].predict_leaf_index(row);
+            out.push(leaf as u32);
+        }
+    }
+}
+
+/// Transformed dense prediction (PRD-02). Output is row-major
+/// `[row0_out0, .., row0_out{m-1}, row1_out0, ..]` where `m =
+/// num_tree_per_iteration` (1 for regression/binary, `num_class` for multiclass).
+pub fn predict_mat(
+    model: &GbdtModel,
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<f32>, ModelError> {
+    validate_dense_shape(model, data, num_rows, num_cols)?;
+    let kind = resolve_objective(model)?;
+
+    let width = row_width(model);
+    let m = kind.num_output();
+    let ncols = num_cols as usize;
+    let mut out = Vec::with_capacity(num_rows as usize * m);
+    let mut row = vec![0.0f64; width];
+    let mut raw_buf: Vec<f64> = Vec::with_capacity(m);
+    let mut conv_buf = vec![0.0f64; m];
+    for r in 0..num_rows as usize {
+        let base = r * ncols;
+        for (c, slot) in row.iter_mut().enumerate() {
+            *slot = data[base + c] as f64;
+        }
+        predict_row_transformed(model, &kind, &row, &mut raw_buf, &mut conv_buf, &mut out);
+    }
+    Ok(out)
+}
+
+/// Transformed CSR prediction (PRD-02).
+pub fn predict_csr(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<f32>, ModelError> {
+    validate_csr_shape(model, indptr, indices, values, num_rows, num_cols)?;
+    let kind = resolve_objective(model)?;
+
+    let width = row_width(model);
+    let m = kind.num_output();
+    let mut out = Vec::with_capacity(num_rows as usize * m);
+    let mut row = vec![0.0f64; width];
+    let mut raw_buf: Vec<f64> = Vec::with_capacity(m);
+    let mut conv_buf = vec![0.0f64; m];
+    for r in 0..num_rows as usize {
+        for slot in row.iter_mut() {
+            *slot = 0.0;
+        }
+        scatter_csr_row(indptr, indices, values, r, num_cols, width, &mut row)?;
+        predict_row_transformed(model, &kind, &row, &mut raw_buf, &mut conv_buf, &mut out);
+    }
+    Ok(out)
+}
+
+/// Transformed CSC prediction (PRD-02).
+pub fn predict_csc(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<f32>, ModelError> {
+    validate_csc_shape(model, indptr, indices, values, num_rows, num_cols)?;
+    let kind = resolve_objective(model)?;
+
+    let width = row_width(model);
+    let nrows = num_rows as usize;
+    let m = kind.num_output();
+    let dense = scatter_csc_dense(indptr, indices, values, num_rows, num_cols, width)?;
+
+    let mut out = Vec::with_capacity(nrows * m);
+    let mut raw_buf: Vec<f64> = Vec::with_capacity(m);
+    let mut conv_buf = vec![0.0f64; m];
+    for r in 0..nrows {
+        let row = &dense[r * width..(r + 1) * width];
+        predict_row_transformed(model, &kind, row, &mut raw_buf, &mut conv_buf, &mut out);
+    }
+    Ok(out)
+}
+
+/// Leaf-index dense prediction (PRD-03). Output is row-major; each row contributes
+/// `num_tree_per_iteration * num_iteration` `u32` leaf ids in the per-(iter×class)
+/// layout (Pitfall 8).
+pub fn predict_leaf_index_mat(
+    model: &GbdtModel,
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<u32>, ModelError> {
+    validate_dense_shape(model, data, num_rows, num_cols)?;
+    let width = row_width(model);
+    let per_row = leaf_width(model);
+    let ncols = num_cols as usize;
+    let mut out = Vec::with_capacity(num_rows as usize * per_row);
+    let mut row = vec![0.0f64; width];
+    for r in 0..num_rows as usize {
+        let base = r * ncols;
+        for (c, slot) in row.iter_mut().enumerate() {
+            *slot = data[base + c] as f64;
+        }
+        predict_row_leaf(model, &row, &mut out);
+    }
+    Ok(out)
+}
+
+/// Leaf-index CSR prediction (PRD-03).
+pub fn predict_leaf_index_csr(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<u32>, ModelError> {
+    validate_csr_shape(model, indptr, indices, values, num_rows, num_cols)?;
+    let width = row_width(model);
+    let per_row = leaf_width(model);
+    let mut out = Vec::with_capacity(num_rows as usize * per_row);
+    let mut row = vec![0.0f64; width];
+    for r in 0..num_rows as usize {
+        for slot in row.iter_mut() {
+            *slot = 0.0;
+        }
+        scatter_csr_row(indptr, indices, values, r, num_cols, width, &mut row)?;
+        predict_row_leaf(model, &row, &mut out);
+    }
+    Ok(out)
+}
+
+/// Leaf-index CSC prediction (PRD-03).
+pub fn predict_leaf_index_csc(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<u32>, ModelError> {
+    validate_csc_shape(model, indptr, indices, values, num_rows, num_cols)?;
+    let width = row_width(model);
+    let nrows = num_rows as usize;
+    let per_row = leaf_width(model);
+    let dense = scatter_csc_dense(indptr, indices, values, num_rows, num_cols, width)?;
+    let mut out = Vec::with_capacity(nrows * per_row);
+    for r in 0..nrows {
+        let row = &dense[r * width..(r + 1) * width];
+        predict_row_leaf(model, row, &mut out);
+    }
+    Ok(out)
+}
+
+/// Per-row leaf-index output width = `num_tree_per_iteration * num_iteration`
+/// (`NumPredictOneRow` for leaf, `gbdt.h:281-291`).
+#[inline]
+fn leaf_width(model: &GbdtModel) -> usize {
+    let ntpi = model.num_tree_per_iteration.max(0) as usize;
+    let num_iter = model.num_iteration().max(0) as usize;
+    ntpi * num_iter
+}
+
+// --- shared shape validators + materializers (extracted so raw/transformed/leaf
+//     entry points apply the SAME boundary checks) ---
+
+fn validate_dense_shape(
+    model: &GbdtModel,
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<(), ModelError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    let expected = (num_rows as i64) * (num_cols as i64);
+    if data.len() as i64 != expected {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!(
+                "data.len()={} must equal num_rows*num_cols={expected}",
+                data.len()
+            ),
+        });
+    }
+    check_cols(model, num_cols)
+}
+
+fn validate_csr_shape(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<(), ModelError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    if indices.len() != values.len() {
+        return Err(ModelError::MalformedModel {
+            detail: format!(
+                "indices.len()={} must equal values.len()={}",
+                indices.len(),
+                values.len()
+            ),
+        });
+    }
+    if indptr.len() != num_rows as usize + 1 {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!(
+                "csr indptr.len()={} must equal num_rows+1={}",
+                indptr.len(),
+                num_rows as usize + 1
+            ),
+        });
+    }
+    check_cols(model, num_cols)
+}
+
+fn validate_csc_shape(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<(), ModelError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    if indices.len() != values.len() {
+        return Err(ModelError::MalformedModel {
+            detail: format!(
+                "indices.len()={} must equal values.len()={}",
+                indices.len(),
+                values.len()
+            ),
+        });
+    }
+    if indptr.len() != num_cols as usize + 1 {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!(
+                "csc indptr.len()={} must equal num_cols+1={}",
+                indptr.len(),
+                num_cols as usize + 1
+            ),
+        });
+    }
+    check_cols(model, num_cols)
+}
+
+/// Scatter CSR row `r`'s `(col, value)` pairs into the (pre-zeroed) `row` buffer.
+fn scatter_csr_row(
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    r: usize,
+    num_cols: i32,
+    width: usize,
+    row: &mut [f64],
+) -> Result<(), ModelError> {
+    let start = validate_indptr_pair(indptr, r, values.len())?;
+    let end = indptr[r + 1] as usize;
+    for k in start..end {
+        let col = indices[k];
+        if col < 0 || col >= num_cols {
+            return Err(ModelError::ShapeMismatch {
+                detail: format!("csr column index {col} out of range [0, {num_cols})"),
+            });
+        }
+        let c = col as usize;
+        if c < width {
+            row[c] = values[k] as f64;
+        }
+    }
+    Ok(())
+}
+
+/// Materialize the full dense `f64` matrix (`num_rows * width`) from CSC input.
+fn scatter_csc_dense(
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    width: usize,
+) -> Result<Vec<f64>, ModelError> {
+    let nrows = num_rows as usize;
+    let mut dense = vec![0.0f64; nrows * width];
+    for c in 0..num_cols as usize {
+        let start = validate_indptr_pair(indptr, c, values.len())?;
+        let end = indptr[c + 1] as usize;
+        for k in start..end {
+            let row = indices[k];
+            if row < 0 || row >= num_rows {
+                return Err(ModelError::ShapeMismatch {
+                    detail: format!("csc row index {row} out of range [0, {num_rows})"),
+                });
+            }
+            if c < width {
+                dense[row as usize * width + c] = values[k] as f64;
+            }
+        }
+    }
+    Ok(dense)
+}
+
 /// Validate `indptr[i] <= indptr[i+1]`, both in `[0, nnz]`, returning `indptr[i]`
 /// as a `usize`. Rejects negative / decreasing / out-of-range pointers.
 fn validate_indptr_pair(indptr: &[i64], i: usize, nnz: usize) -> Result<usize, ModelError> {
@@ -336,6 +723,105 @@ mod tests {
         let m = model();
         let data = vec![1.0f32, 0.0, 0.0]; // not 2*2
         let err = predict_raw_mat(&m, &data, 2, 2).unwrap_err();
+        assert!(matches!(err, ModelError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn transformed_regression_is_identity_of_raw() {
+        let m = model(); // objective=regression -> identity
+        let data = vec![1.0f32, 0.0, 0.0, 1.0];
+        let raw = predict_raw_mat(&m, &data, 2, 2).unwrap();
+        let tf = predict_mat(&m, &data, 2, 2).unwrap();
+        assert_eq!(raw, tf, "regression transform must be identity");
+    }
+
+    /// A multiclass model: num_tree_per_iteration=2, one iteration. Tree for
+    /// class 0 outputs raw 0.0/feature-routed; class 1 outputs the other.
+    fn multiclass_model() -> GbdtModel {
+        // iter0 class0: stump on feature 0 (->1.0 or 2.0)
+        // iter0 class1: stump on feature 1 (->0.1 or 0.2)
+        GbdtModel {
+            trees: vec![stump(1.0, 2.0, 0, 0.5), stump(0.1, 0.2, 1, 0.5)],
+            num_class: 2,
+            num_tree_per_iteration: 2,
+            label_index: 0,
+            max_feature_idx: 1,
+            average_output: false,
+            objective_string: Some("multiclass num_class:2".to_string()),
+            feature_names: "Column_0 Column_1".to_string(),
+            feature_infos: "[0:1] [0:1]".to_string(),
+            monotone_constraints: None,
+            trailer: None,
+        }
+    }
+
+    #[test]
+    fn transformed_multiclass_softmax_sums_to_one() {
+        let m = multiclass_model();
+        let data = vec![1.0f32, 0.0]; // 1 row: f0=1.0->class0=2.0, f1=0.0->class1=0.1
+        let tf = predict_mat(&m, &data, 1, 2).unwrap();
+        assert_eq!(tf.len(), 2);
+        let sum = tf[0] + tf[1];
+        assert!((sum - 1.0).abs() < 1e-6, "softmax row sums to 1, got {sum}");
+        // class0 raw (2.0) > class1 raw (0.1) -> class0 prob larger.
+        assert!(tf[0] > tf[1]);
+    }
+
+    #[test]
+    fn leaf_index_regression_layout() {
+        let m = model(); // 2 trees, ntpi=1, 2 iterations.
+        let data = vec![1.0f32, 0.0]; // 1 row
+        let leaf = predict_leaf_index_mat(&m, &data, 1, 2).unwrap();
+        // per_row = ntpi(1) * num_iter(2) = 2.
+        assert_eq!(leaf.len(), 2);
+        // tree0 stump feat0: 1.0>0.5 -> leaf 1. tree1 stump feat1: 0.0<=0.5 -> leaf 0.
+        assert_eq!(leaf, vec![1, 0]);
+    }
+
+    #[test]
+    fn leaf_index_multiclass_per_iter_class_stride() {
+        let m = multiclass_model(); // ntpi=2, 1 iteration.
+        let data = vec![1.0f32, 1.0]; // 1 row: f0=1.0->leaf1, f1=1.0->leaf1
+        let leaf = predict_leaf_index_mat(&m, &data, 1, 2).unwrap();
+        // layout [iter0_class0, iter0_class1].
+        assert_eq!(leaf, vec![1, 1]);
+    }
+
+    #[test]
+    fn transformed_leaf_csr_csc_match_dense() {
+        let m = multiclass_model();
+        let data = vec![1.0f32, 0.0];
+        let dense_tf = predict_mat(&m, &data, 1, 2).unwrap();
+        let dense_leaf = predict_leaf_index_mat(&m, &data, 1, 2).unwrap();
+
+        let (ip, ix, v) = (vec![0i64, 1], vec![0i32], vec![1.0f32]); // only f0=1.0
+        let csr_tf = predict_csr(&m, &ip, &ix, &v, 1, 2).unwrap();
+        let csr_leaf = predict_leaf_index_csr(&m, &ip, &ix, &v, 1, 2).unwrap();
+        assert_eq!(dense_tf, csr_tf);
+        assert_eq!(dense_leaf, csr_leaf);
+
+        // CSC: col0 has row0=1.0; col1 empty.
+        let (cip, cix, cv) = (vec![0i64, 1, 1], vec![0i32], vec![1.0f32]);
+        let csc_tf = predict_csc(&m, &cip, &cix, &cv, 1, 2).unwrap();
+        let csc_leaf = predict_leaf_index_csc(&m, &cip, &cix, &cv, 1, 2).unwrap();
+        assert_eq!(dense_tf, csc_tf);
+        assert_eq!(dense_leaf, csc_leaf);
+    }
+
+    #[test]
+    fn transformed_out_of_scope_objective_is_err() {
+        let mut m = model();
+        m.objective_string = Some("lambdarank".to_string());
+        let data = vec![1.0f32, 0.0];
+        let err = predict_mat(&m, &data, 1, 2).unwrap_err();
+        assert!(matches!(err, ModelError::MalformedModel { .. }));
+    }
+
+    #[test]
+    fn transformed_too_few_cols_is_shape_mismatch() {
+        let m = model();
+        let data = vec![1.0f32];
+        let err = predict_mat(&m, &data, 1, 1).unwrap_err();
         assert!(matches!(err, ModelError::ShapeMismatch { .. }));
     }
 }

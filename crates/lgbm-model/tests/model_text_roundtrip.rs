@@ -45,3 +45,20 @@ fn round_trip_corpus(corpus: &str) {
 fn regression_model_text_round_trips_byte_exact() {
     round_trip_corpus("regression");
 }
+
+#[test]
+fn binary_model_text_round_trips_byte_exact() {
+    round_trip_corpus("binary");
+}
+
+#[test]
+fn multiclass_model_text_round_trips_byte_exact() {
+    round_trip_corpus("multiclass");
+}
+
+/// The categorical fixture exercises the `cat_boundaries`/`cat_threshold`
+/// `Tree::ToString` lines (DAT-09 for `num_cat>0`).
+#[test]
+fn categorical_model_text_round_trips_byte_exact() {
+    round_trip_corpus("categorical");
+}
