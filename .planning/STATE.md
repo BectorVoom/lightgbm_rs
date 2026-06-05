@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 3 context gathered
-last_updated: "2026-06-05T11:28:14.006Z"
-last_activity: 2026-06-05 -- Phase 03 execution started
+stopped_at: Completed 03-04-PLAN.md (Phase 3 plans complete)
+last_updated: "2026-06-05T12:00:00.000Z"
+last_activity: 2026-06-05 -- Phase 03 plan 04 executed (sub-range predict parity, PRD-06)
 progress:
   total_phases: 8
   completed_phases: 2
   total_plans: 14
-  completed_plans: 13
+  completed_plans: 14
   percent: 25
 ---
 
@@ -25,14 +25,28 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 03 (tree-model-model-text-i-o-predict-parity) — EXECUTING
-Plan: 4 of 4
-Status: Ready to execute
-Last activity: 2026-06-05 -- Phase 03 execution started
+Phase: 03 (tree-model-model-text-i-o-predict-parity) — ALL PLANS COMPLETE
+Plan: 4 of 4 (executed)
+Status: Phase 3 plans complete — ready for /gsd-verify-phase 03
+Last activity: 2026-06-05 -- Phase 03 plan 04 executed (sub-range predict parity, PRD-06)
 
-Progress: [██████████] 7/7 plans executed — CR-01 blocker + WR-01 closed; re-verify next
+Progress: [██████████] 4/4 Phase-3 plans executed — full D-06 layered battery (layers 1-5) green
 
 ### Resume
+
+Plan 03-04 closed PRD-06 (sub-range prediction) and completed the Phase-3 prediction surface:
+
+- **PRD-06 CLOSED:** `init_predict` (C++ `gbdt.h:426-435`) is parity-asserted with the full `<behavior>` clamp/slice battery — `-1==all` (and `0==all`), bounded count, non-zero start, over-range/extreme clamp to empty slice (T-03-12: `i32::MAX`/`i32::MIN`/negative never panic or index OOB), and slice accumulation proven to sum ONLY the selected iterations (differs from full range). Added `predict_raw_{mat,csr,csc}_range` threading `start_iteration`/`num_iteration` through the batch driver; the full-range `predict_raw_{mat,csr,csc}` now delegate with `(0,-1)` so 03-02/03-03 callers stay green.
+- **D-06 layer 5 GREEN:** `predict_subrange.rs` replays the committed `subrange.txt` golden's four slices `(0,10)`/`(0,5)`/`(5,-1)`/`(1,1)` (covering `-1==all`, bounded count, non-zero start) via `compare_within(ORACLE_TOL)` over all 7000 rows — DENSE form (slice math orthogonal to input form; CSR/CSC raw covered in 03-02).
+- **Capture untouched** — the 03-01 subrange golden already recorded the needed pairs; byte-idempotency preserved (no fixture re-emission).
+
+`cargo test --workspace` fully green (0 failed); full Phase-3 layered parity battery (layers 1-5) passes. Commits: bb29ec5 (Task 1), 642f5a5 (Task 2).
+
+Next: `/gsd-verify-phase 03` — expect PRD-01/02/03/06 + DAT-08/DAT-09 to verify PASS.
+
+---
+
+#### Prior phase-2 resume (retained for context)
 
 Plan 02-07 closed the CR-01 blocker (default-ingest Construct divergence) + its masking + WR-01:
 
