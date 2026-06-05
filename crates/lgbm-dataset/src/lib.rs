@@ -13,6 +13,7 @@
 pub mod bin;
 pub mod bin_mapper;
 pub mod dataset;
+pub mod efb;
 pub mod error;
 pub mod feature_group;
 pub mod ingest;
@@ -22,6 +23,7 @@ pub mod multi_val_bin;
 pub use bin::{Bin, BinValue, create_dense_bin, create_sparse_bin};
 pub use bin_mapper::{BinMapper, BinType, MissingType};
 pub use dataset::{Dataset, FinishedDataset};
+pub use efb::{fast_feature_bundling, one_feature_per_group};
 pub use error::DatasetError;
 pub use feature_group::FeatureGroup;
 pub use ingest::{from_csc, from_csr, from_mat};
