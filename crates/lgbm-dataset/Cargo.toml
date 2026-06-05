@@ -10,3 +10,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+oracle-harness = { path = "../oracle-harness" }
