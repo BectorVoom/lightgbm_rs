@@ -179,11 +179,24 @@ pub fn find_best_split_kernel(
         // (the gate ORDER and the exact arithmetic are still 1:1 with C++).
         for k in 0..count {
             let t = t_start - k;
+            // C++ REVERSE loop bound is `t >= t_end` with `t_end = 1 - offset`
+            // (:860,863). The `0..count` counter form drops that lower bound, so
+            // for `offset >= 2` (out of the C++ `offset ∈ {0,1}` contract) `t`
+            // would go negative and `(t as usize)` would wrap to a huge index —
+            // an OOB read (WR-02). Restore the bound: `in_range` reproduces the
+            // C++ loop condition, and we clamp the read index to a valid cell so
+            // a negative `t` reads bin 0 inertly (it is forced inactive anyway,
+            // so it never contributes). For the valid `offset ∈ {0,1}` cases `t`
+            // never drops below `t_end ∈ {0,1}`, so this is a strict no-op there.
+            let in_range = t >= (1 - offset);
             // skip default bin (:864-868) — a `continue`, does NOT stop the scan.
             let skip = skip_def && (t + offset) == default_bin;
-            // Accumulate only when not skipped and not already stopped.
-            let active = !skip && !done;
-            let bi = (t as usize) * 2; // GET_GRAD index = t<<1
+            // Accumulate only when in range, not skipped and not already stopped.
+            let active = in_range && !skip && !done;
+            // Branchless clamp (cubecl-cpu mis-lowers nested-`if`): a negative `t`
+            // reads bin 0; it is inactive so it never contributes to any sum.
+            let t_safe = select(t < 0, 0i32, t);
+            let bi = (t_safe as usize) * 2; // GET_GRAD index = t<<1
             let g = hist[bi];
             let h = hist[bi + 1];
             sum_right_gradient += select(active, g, 0.0);
@@ -377,9 +390,16 @@ pub fn find_best_split_kernel_f32(
 
         for k in 0..count {
             let t = t_start - k;
+            // Restore the C++ `t >= t_end` (t_end = 1 - offset) lower bound that
+            // the `0..count` counter form drops, and clamp the read index so a
+            // negative `t` (offset >= 2, out of the C++ offset∈{0,1} contract)
+            // cannot wrap `(t as usize)` into an OOB read (WR-02). No-op for the
+            // valid offset∈{0,1} cases.
+            let in_range = t >= (1 - offset);
             let skip = skip_def && (t + offset) == default_bin;
-            let active = !skip && !done;
-            let bi = (t as usize) * 2;
+            let active = in_range && !skip && !done;
+            let t_safe = select(t < 0, 0i32, t);
+            let bi = (t_safe as usize) * 2;
             let g = hist[bi];
             let h = hist[bi + 1];
             sum_right_gradient += select(active, g, 0.0);
@@ -598,8 +618,11 @@ pub fn find_best_split_cpu(
 
     // SAFETY: `h_hist` was allocated for exactly `hist.len() == 2*num_bin`
     // elements and `h_out` for `out_len` cells; both outlive the launch. The
-    // kernel only reads `hist[(t<<1)+1]` for `t` in `[0, num_bin)` (offset
-    // arithmetic keeps `t+offset` in range; `t<<1+1 <= 2*num_bin-1`), staying
+    // REVERSE scan iterates a forward counter but restores the C++ `t >= 1-offset`
+    // bound (`in_range`) and clamps the read index to bin 0 for any negative `t`
+    // (`t_safe = select(t<0,0,t)`), so even an out-of-contract `offset >= 2`
+    // cannot wrap `(t as usize)` into an OOB read (WR-02). The FORWARD scan starts
+    // at `t = 0`. Thus every `hist[(t<<1)+1]` index stays in `[0, 2*num_bin)`,
     // within the allocation. All cubecl unsafe is confined here (CMP-01).
     unsafe {
         find_best_split_kernel::launch(
