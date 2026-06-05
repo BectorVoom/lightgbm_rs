@@ -2096,6 +2096,158 @@ std::vector<EfbCaseSpec> BuildEfbCorpus(int master_seed) {
   return cases;
 }
 
+// ===========================================================================
+// Default-config in-memory ingest golden (GAP-1/GAP-2 closure, SC#1/SC#5).
+//
+// This emitter exercises the DEFAULT scaled-filter_cnt path that every prior
+// ingest golden avoided (they all forced pre_filter=false). With
+// feature_pre_filter=true (default) and bin_construct_sample_cnt < num_rows
+// (sampling active), C++ DatasetLoader::ConstructFromSampleData
+// (dataset_loader.cpp:623-624) passes a SCALED pre-filter threshold
+//   filter_cnt = static_cast<data_size_t>(
+//       static_cast<double>(min_data_in_leaf * total_sample_size) / num_dist_data)
+// to FindBin, NOT the raw min_data_in_leaf. For the dense in-memory path
+// (c_api.cpp:1360-1374) total_sample_size = sample_cnt (k) and
+// num_dist_data = total_nrow.
+//
+// Dimensions are chosen so the divergence is genuinely TRIGGERED:
+//   num_rows = 200, sample_cnt = 50, min_data_in_leaf = 20
+//   -> filter_cnt = (20 * 50) / 200 = 5 (integer truncation) != 20.
+// At least one engineered feature has a best split whose minority side count
+// lands in [5, 20): it PASSES need_filter at filter_cnt=5 (non-trivial) but
+// FAILS at the raw threshold 20 (trivial), so is_trivial_ flips.
+//
+// The golden carries the RAW matrix (single source of truth for the data) so
+// the Rust test reads byte-identical f64 cells and feeds them to from_mat —
+// it never regenerates the Random-derived matrix. The ASSIGN line carries the
+// STORED per-row bin (the value the dataset's FeatureGroup actually stores via
+// the new_single + PushData path), so a flip in is_trivial_ shows up as a
+// per-row store divergence too.
+// ===========================================================================
+
+constexpr int kDefaultIngestNumRows = 200;
+constexpr int kDefaultIngestNumFeatures = 4;
+constexpr int kDefaultIngestSampleCnt = 50;
+constexpr int kDefaultIngestMinDataInLeaf = 20;
+constexpr int kDefaultIngestMaxBin = 255;
+constexpr int kDefaultIngestMinDataInBin = 3;
+
+// Replicate FeatureGroup::new_single + PushData (feature_group.h:93-111,
+// 253-267) to compute the STORED bin a single-value dense group would hold for
+// `value`. In the non-bundled Dataset::construct path EVERY feature gets such a
+// group (trivial features are NOT skipped), so this is exactly what the Rust
+// FeatureGroup stores per row.
+uint32_t StoredBinSingleGroup(const BinMapper& bm, double value) {
+  // bin_offsets_[0] for new_single is 1 (num_total_bin_ seeded at 1).
+  const uint32_t offset = 1;
+  uint32_t bin = bm.ValueToBin(value);
+  if (bin == bm.most_freq_bin_) {
+    return 0;  // most-freq is skipped -> cell stays the default 0.
+  }
+  if (bm.most_freq_bin_ == 0) {
+    bin -= 1;
+  }
+  bin += offset;
+  return bin;
+}
+
+void EmitDefaultConfigIngest(std::ofstream& out, int master_seed) {
+  const int num_rows = kDefaultIngestNumRows;
+  const int num_features = kDefaultIngestNumFeatures;
+  const int seed = master_seed + 4242;  // dedicated, stable seed for this golden
+
+  // Build the synthetic matrix deterministically via the header-only Random
+  // (no wall-clock entropy). columns[f][row].
+  //
+  // CRITICAL: the Rust ingest entry `from_mat` takes `&[f32]` and widens f32 ->
+  // f64 at a single site. To stay byte-identical we generate every cell as an
+  // f32-REPRESENTABLE value (cast through float, then store as double), so the
+  // f64 binning arithmetic operates on exactly the same bits on both sides.
+  std::vector<std::vector<double>> columns(num_features,
+                                           std::vector<double>(num_rows, 0.0));
+  // A single Random instance drives all feature value generation so the matrix
+  // is a pure function of `seed`.
+  LightGBM::Random gen(seed);
+  for (int r = 0; r < num_rows; ++r) {
+    // f0: continuous spread over [0, 100) -> non-trivial regardless of threshold.
+    columns[0][r] = static_cast<double>(static_cast<float>(gen.NextInt(0, 1000)) / 10.0f);
+    // f1: ENGINEERED flip feature. ~75% of rows take the common value 1.0, the
+    // rest take a distinct high value 9.0. The best split separates the two
+    // clusters; the minority cluster's sampled count lands in [5, 20) (here 10
+    // of 50), so the feature is non-trivial at filter_cnt=5 (10 >= 5 on both
+    // sides) but trivial at the raw threshold 20 (10 < 20). This is the flip.
+    columns[1][r] = static_cast<double>((gen.NextInt(0, 100) < 25) ? 9.0f : 1.0f);
+    // f2: near-constant (all 5.0 but a 2-row tail) -> trivial both ways.
+    columns[2][r] = static_cast<double>((r < 2) ? 7.0f : 5.0f);
+    // f3: balanced two-cluster (~50/50) -> non-trivial both ways.
+    columns[3][r] = static_cast<double>((gen.NextInt(0, 100) < 50) ? 2.0f : 8.0f);
+  }
+
+  // DATASET header so the Rust test configures an IDENTICAL Config.
+  out << "DATASET num_rows=" << num_rows << " num_features=" << num_features
+      << " max_bin=" << kDefaultIngestMaxBin
+      << " min_data_in_bin=" << kDefaultIngestMinDataInBin
+      << " min_data_in_leaf=" << kDefaultIngestMinDataInLeaf
+      << " bin_construct_sample_cnt=" << kDefaultIngestSampleCnt
+      << " seed=" << seed << "\n";
+
+  // RAW matrix (single source of truth). Row-major, f64 raw bits, ';'-joined.
+  out << "MATRIX rows=" << num_rows << " cols=" << num_features << " ";
+  bool first_cell = true;
+  for (int r = 0; r < num_rows; ++r) {
+    for (int f = 0; f < num_features; ++f) {
+      if (!first_cell) out << ";";
+      first_cell = false;
+      out << F64Bits(columns[f][r]);
+    }
+  }
+  out << "\n";
+
+  for (int f = 0; f < num_features; ++f) {
+    const std::vector<double>& col = columns[f];
+    // Replicate the dense in-memory C-API sample path: Random(seed).Sample over
+    // ALL rows then gather. total_sample_size = k (the sampled count).
+    LightGBM::Random rand(seed);
+    std::vector<int> idx = rand.Sample(num_rows, kDefaultIngestSampleCnt);
+    std::vector<double> sampled;
+    sampled.reserve(idx.size());
+    for (int i : idx) sampled.push_back(col[i]);
+    const int k = static_cast<int>(sampled.size());
+
+    // SCALED filter_cnt exactly as dataset_loader.cpp:623-624 (divide in double
+    // then truncate to int). total_sample_size = k, num_dist_data = num_rows.
+    const int filter_cnt = static_cast<int>(
+        static_cast<double>(kDefaultIngestMinDataInLeaf * k) / num_rows);
+
+    BinMapper bm = FindBinNumeric(sampled, kDefaultIngestMaxBin,
+                                  kDefaultIngestMinDataInBin,
+                                  /*min_split_data=*/filter_cnt,
+                                  /*pre_filter=*/true, /*use_missing=*/true,
+                                  /*zero_as_missing=*/false, sampled.size(),
+                                  /*forced=*/{});
+
+    out << "FEATURE f=" << f << " num_bin=" << bm.num_bin_
+        << " missing_type=" << static_cast<int>(bm.missing_type_)
+        << " default_bin=" << bm.default_bin_
+        << " most_freq_bin=" << bm.most_freq_bin_
+        << " is_trivial=" << (bm.is_trivial_ ? 1 : 0)
+        << " filter_cnt=" << filter_cnt << " upper=";
+    for (size_t i = 0; i < bm.bin_upper_bound_.size(); ++i) {
+      if (i) out << ";";
+      out << F64Bits(bm.bin_upper_bound_[i]);
+    }
+    out << "\n";
+
+    // STORED per-row bin (what the dataset's single-value FeatureGroup stores).
+    out << "ASSIGN f=" << f << " ";
+    for (int r = 0; r < num_rows; ++r) {
+      if (r) out << ";";
+      out << StoredBinSingleGroup(bm, col[r]);
+    }
+    out << "\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2105,11 +2257,14 @@ int main(int argc, char** argv) {
   //   <numeric_out> <master_seed> <storage_out> <categorical_out> <missing_out>
   //   ... <missing_out> <metadata_out>
   //   ... <metadata_out> <efb_out>
-  //   ... <efb_out> <example_out> <example_in1> [<example_in2> ...]
-  if (argc != 3 && argc != 4 && argc != 6 && argc != 7 && argc != 8 && argc < 10) {
+  //   ... <efb_out> <default_config_out>
+  //   ... <default_config_out> <example_out> <example_in1> [<example_in2> ...]
+  if (argc != 3 && argc != 4 && argc != 6 && argc != 7 && argc != 8 && argc != 9 &&
+      argc < 11) {
     std::cerr << "usage: bin_capture <numeric_out> <master_seed> "
                  "[<storage_out> [<categorical_out> <missing_out> "
-                 "[<metadata_out> [<efb_out> [<example_out> <example_in>...]]]]]\n";
+                 "[<metadata_out> [<efb_out> [<default_config_out> "
+                 "[<example_out> <example_in>...]]]]]]\n";
     return 2;
   }
   const std::string out_path = argv[1];
@@ -2255,9 +2410,32 @@ int main(int argc, char** argv) {
     std::cerr << "bin_capture: wrote " << fcorpus.size() << " EFB cases to " << efb_path << "\n";
   }
 
-  if (argc >= 10) {
-    // example datasets: argv[8] = output golden, argv[9..] = copied input paths.
-    const std::string example_out = argv[8];
+  if (argc >= 9) {
+    // default-config in-memory ingest golden (GAP-1/GAP-2): argv[8] = output
+    // golden. FIXED positional slot, BEFORE the variadic example tail.
+    const std::string default_cfg_out = argv[8];
+    std::ofstream dout(default_cfg_out, std::ios::binary | std::ios::trunc);
+    if (!dout) {
+      std::cerr << "error: cannot open default-config output file: " << default_cfg_out << "\n";
+      return 1;
+    }
+    dout << "# LightGBM-rs default-config in-memory ingest golden (GAP-1/GAP-2, SC#1/SC#5)\n";
+    dout << "# Scaled-filter_cnt ConstructFromSampleData path (feature_pre_filter=true,\n";
+    dout << "# bin_construct_sample_cnt < num_rows). filter_cnt = (min_data_in_leaf *\n";
+    dout << "# sample_cnt) / num_rows (dataset_loader.cpp:623-624). Carries the raw matrix.\n";
+    dout << "MASTER_SEED " << master_seed << "\n";
+    EmitDefaultConfigIngest(dout, master_seed);
+    dout.flush();
+    if (!dout) {
+      std::cerr << "error: failed while writing default-config output\n";
+      return 1;
+    }
+    std::cerr << "bin_capture: wrote default-config ingest golden to " << default_cfg_out << "\n";
+  }
+
+  if (argc >= 11) {
+    // example datasets: argv[9] = output golden, argv[10..] = copied input paths.
+    const std::string example_out = argv[9];
     std::ofstream eout(example_out, std::ios::binary | std::ios::trunc);
     if (!eout) {
       std::cerr << "error: cannot open example output file: " << example_out << "\n";
@@ -2267,7 +2445,7 @@ int main(int argc, char** argv) {
     eout << "# End-to-end FindBin+ValueToBin over copied LightGBM example datasets\n";
     eout << "# (read from the COMMITTED fixtures dir, never the untracked LightGBM/ tree).\n";
     eout << "MASTER_SEED " << master_seed << "\n";
-    const int kFirstExampleArgv = 9;  // argv slot of the first example input
+    const int kFirstExampleArgv = 10;  // argv slot of the first example input
     const int num_examples = argc - kFirstExampleArgv;
     eout << "COUNTS datasets=" << num_examples << "\n";
     int written = 0;
@@ -2278,9 +2456,10 @@ int main(int argc, char** argv) {
       const size_t slash = name.find_last_of('/');
       if (slash != std::string::npos) name = name.substr(slash + 1);
       // derive a per-dataset seed from the master seed + a STABLE positional base
-      // (8 + index): the EFB arg slot inserted at argv[7] shifted example argv from
-      // 8 to 9, so we anchor the seed to the original base (8) to keep the example
-      // goldens unchanged by this plan.
+      // (8 + index). The default-config arg was inserted at argv[8] and the
+      // example block shifted from argv[8] to argv[9] (kFirstExampleArgv 9->10);
+      // anchoring the seed to the original base (8) keeps the example goldens
+      // byte-unchanged by this plan.
       const int seed = master_seed + 8 + (a - kFirstExampleArgv);
       EmitExampleDataset(eout, name, in_path, seed);
       written++;

@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 // ---------------------------------------------------------------------------
 // Recorded randomized-capture parameters (D-14). These are the SINGLE source of
@@ -92,7 +92,10 @@ fn regen() -> Result<()> {
     verify_toolchain()?;
 
     let lightgbm_dir = root.join("LightGBM");
-    if !lightgbm_dir.join("include/LightGBM/utils/random.h").is_file() {
+    if !lightgbm_dir
+        .join("include/LightGBM/utils/random.h")
+        .is_file()
+    {
         bail!(
             "LightGBM submodule not found at {} (expected include/LightGBM/utils/random.h)",
             lightgbm_dir.display()
@@ -185,7 +188,10 @@ fn bin_capture() -> Result<()> {
     verify_toolchain()?;
 
     let lightgbm_dir = root.join("LightGBM");
-    if !lightgbm_dir.join("include/LightGBM/utils/random.h").is_file() {
+    if !lightgbm_dir
+        .join("include/LightGBM/utils/random.h")
+        .is_file()
+    {
         bail!(
             "LightGBM submodule not found at {} (expected include/LightGBM/utils/random.h)",
             lightgbm_dir.display()
@@ -206,6 +212,7 @@ fn bin_capture() -> Result<()> {
     let missing_fixture_path = fixtures_dir.join("missing_edge_cases.txt");
     let metadata_fixture_path = fixtures_dir.join("metadata.txt");
     let efb_fixture_path = fixtures_dir.join("efb_grouping.txt");
+    let default_cfg_fixture_path = fixtures_dir.join("default_config_ingest.txt");
     let example_fixture_path = fixtures_dir.join("example_dataset_binning.txt");
     // The COPIED example datasets live under the committed fixtures dir (never the
     // untracked LightGBM/ tree); the C++ harness reads these exact paths.
@@ -260,6 +267,10 @@ fn bin_capture() -> Result<()> {
         .arg(&missing_fixture_path)
         .arg(&metadata_fixture_path)
         .arg(&efb_fixture_path)
+        // FIXED positional slot (argv[8]), BEFORE the variadic example tail so the
+        // example inputs stay strictly last and the new golden is never consumed
+        // as an example input.
+        .arg(&default_cfg_fixture_path)
         .arg(&example_fixture_path);
     for ex in &example_inputs {
         cmd.arg(ex);
@@ -273,6 +284,7 @@ fn bin_capture() -> Result<()> {
         &missing_fixture_path,
         &metadata_fixture_path,
         &efb_fixture_path,
+        &default_cfg_fixture_path,
         &example_fixture_path,
     ] {
         if !p.is_file() {
@@ -288,13 +300,14 @@ fn bin_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask bin-capture: done. Wrote {}, {}, {}, {}, {}, {}, and {}.",
+        "xtask bin-capture: done. Wrote {}, {}, {}, {}, {}, {}, {}, and {}.",
         fixture_path.display(),
         storage_fixture_path.display(),
         categorical_fixture_path.display(),
         missing_fixture_path.display(),
         metadata_fixture_path.display(),
         efb_fixture_path.display(),
+        default_cfg_fixture_path.display(),
         example_fixture_path.display()
     );
     eprintln!(
