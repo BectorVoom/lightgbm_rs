@@ -21,5 +21,7 @@
 
 pub mod error;
 pub mod format;
+pub mod tree;
 
 pub use error::ModelError;
+pub use tree::Tree;
