@@ -66,3 +66,20 @@ target_include_directories(rng_capture PRIVATE "${LIGHTGBM_DIR}/include")
 # (they are empty / unbuildable in this environment).
 add_executable(bin_capture bin_capture.cpp)
 target_include_directories(bin_capture PRIVATE "${LIGHTGBM_DIR}/include")
+
+# kernel_capture: compute-kernel histogram goldens (Phase 4, D-02 / D-02a).
+#
+# The authoritative ConstructHistogram lives in src/io/dense_bin.hpp /
+# sparse_bin.hpp, which (via <LightGBM/bin.h> -> common.h) transitively #include
+# fast_double_parser.h + fmt/format.h from external_libs/. Those submodules are
+# present here only as EMPTY directories (the LightGBM tree is git-untracked and
+# its external_libs are not vendored), so neither header can be compiled. So
+# kernel_capture.cpp VERBATIM-transcribes the ConstructHistogram accumulation
+# bodies from the pinned dense_bin.hpp:130-141 / sparse_bin.hpp:138-152 (f32 read
+# / hist_t=double accumulate) — emitting byte-identical histogram goldens — and
+# includes the header-only LightGBM/include only for the genuine reference Random
+# (synthetic inputs). This mirrors the rng_capture / bin_capture header-only
+# discipline (see REFERENCE_MANIFEST.md). It does NOT add_subdirectory the
+# submodule and references NO external_libs header dirs (empty / unbuildable here).
+add_executable(kernel_capture kernel_capture.cpp)
+target_include_directories(kernel_capture PRIVATE "${LIGHTGBM_DIR}/include")

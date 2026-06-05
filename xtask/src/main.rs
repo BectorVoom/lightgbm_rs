@@ -42,6 +42,13 @@ pub const N_SAMPLE_CASES: u32 = 256;
 /// idempotent (empty `git diff`). Recorded in REFERENCE_MANIFEST.md.
 pub const BIN_MASTER_SEED: i32 = 0x0B11_BEEF;
 
+/// The recorded master seed for the Phase-4 compute-kernel histogram golden
+/// corpus (D-02a). Like the other master seeds it is the SINGLE source of
+/// randomness for the synthetic histogram cases (bin layouts, grad/hess spread),
+/// so `kernel-capture` is byte-idempotent (empty `git diff`). Recorded in
+/// REFERENCE_MANIFEST.md.
+pub const KERNEL_MASTER_SEED: i32 = 0x4157_F00D;
+
 /// Pinned LightGBM submodule commit (recorded in the manifest, ORA-02 / D-05).
 pub const LIGHTGBM_COMMIT: &str = "195c26fc7b00eb0fec252dfe841e2e66d6833954";
 
@@ -68,11 +75,18 @@ fn main() -> Result<()> {
         Some("regen") => regen(),
         Some("bin-capture") => bin_capture(),
         Some("model-capture") => model_capture(),
+        Some("kernel-capture") => kernel_capture(),
         Some(other) => {
-            bail!("unknown subcommand `{other}` (try: regen | bin-capture | model-capture)");
+            bail!(
+                "unknown subcommand `{other}` \
+                 (try: regen | bin-capture | model-capture | kernel-capture)"
+            );
         }
         None => {
-            eprintln!("usage: cargo run -p xtask -- <regen | bin-capture | model-capture>");
+            eprintln!(
+                "usage: cargo run -p xtask -- \
+                 <regen | bin-capture | model-capture | kernel-capture>"
+            );
             Ok(())
         }
     }
@@ -328,6 +342,105 @@ fn bin_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- bin-capture` and confirm \
          `git diff --stat crates/lgbm-dataset/tests/fixtures/` is empty (idempotent)."
+    );
+    Ok(())
+}
+
+/// Regenerate the Phase-4 compute-kernel histogram golden corpus (D-02 / D-02a).
+///
+/// Mirrors [`bin_capture`]: configures + builds the standalone `kernel_capture`
+/// C++ target (header-only against the pinned `LightGBM/include` for the
+/// reference `Random`; the `ConstructHistogram` accumulation bodies are
+/// verbatim-transcribed in `kernel_capture.cpp` because the submodule's
+/// `external_libs/` are not vendored here — see that file's header), then runs
+/// it over the [`KERNEL_MASTER_SEED`]-derived synthetic corpus and writes
+/// `crates/oracle-harness/tests/fixtures/kernels/histogram.txt`. Byte-idempotent.
+fn kernel_capture() -> Result<()> {
+    let root = workspace_root()?;
+    verify_toolchain()?;
+
+    let lightgbm_dir = root.join("LightGBM");
+    if !lightgbm_dir
+        .join("include/LightGBM/utils/random.h")
+        .is_file()
+    {
+        bail!(
+            "LightGBM submodule not found at {} (expected include/LightGBM/utils/random.h)",
+            lightgbm_dir.display()
+        );
+    }
+
+    let cpp_dir = root.join("xtask/cpp");
+    let build_dir = root.join("target/xtask-cpp-build");
+    std::fs::create_dir_all(&build_dir)
+        .with_context(|| format!("creating build dir {}", build_dir.display()))?;
+
+    // Fixtures live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let fixtures_dir = root.join("crates/oracle-harness/tests/fixtures/kernels");
+    std::fs::create_dir_all(&fixtures_dir)
+        .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
+    let fixture_path = fixtures_dir.join("histogram.txt");
+
+    eprintln!("xtask kernel-capture: configuring C++ capture build ...");
+    run(
+        Command::new("cmake")
+            .arg("-S")
+            .arg(&cpp_dir)
+            .arg("-B")
+            .arg(&build_dir)
+            .arg(format!("-DLIGHTGBM_DIR={}", lightgbm_dir.display()))
+            .arg("-DCMAKE_BUILD_TYPE=Release"),
+        "cmake configure",
+    )?;
+
+    eprintln!("xtask kernel-capture: building kernel_capture ...");
+    run(
+        Command::new("cmake")
+            .arg("--build")
+            .arg(&build_dir)
+            .arg("--target")
+            .arg("kernel_capture")
+            .arg("--config")
+            .arg("Release"),
+        "cmake build",
+    )?;
+
+    let exe = locate_exe(&build_dir, "kernel_capture")?;
+    eprintln!(
+        "xtask kernel-capture: running capture ({}) ...",
+        exe.display()
+    );
+    run(
+        Command::new(&exe)
+            .arg(&fixture_path)
+            .arg(KERNEL_MASTER_SEED.to_string()),
+        "kernel_capture",
+    )?;
+
+    if !fixture_path.is_file() {
+        bail!(
+            "capture completed but {} was not written",
+            fixture_path.display()
+        );
+    }
+
+    // Refresh the shared reference manifest (idempotent — pure function of the
+    // recorded constants).
+    let manifest_path = root
+        .join("crates/oracle-harness/fixtures")
+        .join("REFERENCE_MANIFEST.md");
+    write_manifest(&manifest_path)?;
+
+    eprintln!(
+        "xtask kernel-capture: done. Wrote {} and refreshed {}.",
+        fixture_path.display(),
+        manifest_path.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- kernel-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/kernels/histogram.txt` \
+         is empty (byte-idempotent)."
     );
     Ok(())
 }
@@ -759,6 +872,47 @@ Manual-Only Verifications). The capture interpreter is resolved from\n\
 \n\
 ```bash\n\
 LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- model-capture\n\
+```\n\
+\n\
+## Kernel Golden Set (Phase 4, D-02 / D-02a)\n\
+\n\
+Captured by `cargo run -p xtask -- kernel-capture` into\n\
+`crates/oracle-harness/tests/fixtures/kernels/histogram.txt`. Covers the D-01\n\
+whole-kernel `construct_histograms` op: the stride-2 `[g0,h0,g1,h1,...]` f64\n\
+histogram (`hist_t = double`) accumulated from f32 (`score_t = float`) ordered\n\
+gradients/hessians over a feature column's per-row bin indices\n\
+(`ti = bin << 1`). The cubecl-cpu kernel reproduces this BIT-EXACT (the D-04\n\
+deterministic anchor); `crates/oracle-harness/tests/kernel_parity.rs` replays it\n\
+via `compare_exact_f64_bits`.\n\
+\n\
+- **Kernel master seed:** `{kernel_master_seed}` (`0x{kernel_master_seed_hex:08X}`) —\n\
+  the SINGLE source of randomness for the histogram corpus (idempotent regen).\n\
+- **D-02a path coverage:** dense + sparse bin layouts; the most-frequent /\n\
+  default-bin (lowest-bin) routing; multiple bin-store bit widths\n\
+  (`DenseBin<u8,4bit>` / `u8` / `u16` / `u32` and the matching `SparseBin`\n\
+  widths, selected by `num_bin` per `Bin::CreateDenseBin`/`CreateSparseBin`); an\n\
+  all-rows-on-one-bin pileup; an empty-sparse-stream (all-bin-0) round-trip; and\n\
+  a grad/hess sign+magnitude spread (~1e-3 .. ~1e3, mixed signs) that stresses\n\
+  the non-associative f64 reduction order.\n\
+\n\
+### Capture-harness note (external_libs unbuildable)\n\
+\n\
+The authoritative `ConstructHistogram` lives in `src/io/dense_bin.hpp` /\n\
+`sparse_bin.hpp`, which (via `<LightGBM/bin.h>` -> `common.h`) transitively pull\n\
+in `fast_double_parser.h` + `fmt/format.h` from `external_libs/` — present here\n\
+only as EMPTY directories. `xtask/cpp/kernel_capture.cpp` therefore VERBATIM-\n\
+transcribes the `ConstructHistogram` accumulation bodies from the pinned\n\
+`dense_bin.hpp:130-141` / `sparse_bin.hpp:138-152` (commit `{commit}`, version\n\
+`{version}`), reusing the `DenseBin`/`SparseBin` bin-storage forms, and emits\n\
+goldens byte-identical to lib_lightgbm. Synthetic inputs use the genuine\n\
+header-only `LightGBM::Random`. Same discipline as `rng_capture`/`bin_capture`:\n\
+no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` time\n\
+(the golden is committed).\n\
+\n\
+### Exact kernel-capture command\n\
+\n\
+```bash\n\
+cargo run -p xtask -- kernel-capture\n\
 ```\n",
         commit = LIGHTGBM_COMMIT,
         version = LIGHTGBM_VERSION,
@@ -769,6 +923,8 @@ LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- model-capture
         total = N_RNG_CASES + N_SAMPLE_CASES,
         bin_master_seed = BIN_MASTER_SEED,
         bin_master_seed_hex = BIN_MASTER_SEED as u32,
+        kernel_master_seed = KERNEL_MASTER_SEED,
+        kernel_master_seed_hex = KERNEL_MASTER_SEED as u32,
         model_train_seed = MODEL_TRAIN_SEED,
         model_train_seed_hex = MODEL_TRAIN_SEED as u32,
         model_lgbm_version = MODEL_LIGHTGBM_VERSION,

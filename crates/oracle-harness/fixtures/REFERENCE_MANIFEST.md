@@ -210,3 +210,44 @@ Manual-Only Verifications). The capture interpreter is resolved from
 ```bash
 LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- model-capture
 ```
+
+## Kernel Golden Set (Phase 4, D-02 / D-02a)
+
+Captured by `cargo run -p xtask -- kernel-capture` into
+`crates/oracle-harness/tests/fixtures/kernels/histogram.txt`. Covers the D-01
+whole-kernel `construct_histograms` op: the stride-2 `[g0,h0,g1,h1,...]` f64
+histogram (`hist_t = double`) accumulated from f32 (`score_t = float`) ordered
+gradients/hessians over a feature column's per-row bin indices
+(`ti = bin << 1`). The cubecl-cpu kernel reproduces this BIT-EXACT (the D-04
+deterministic anchor); `crates/oracle-harness/tests/kernel_parity.rs` replays it
+via `compare_exact_f64_bits`.
+
+- **Kernel master seed:** `1096282125` (`0x4157F00D`) —
+the SINGLE source of randomness for the histogram corpus (idempotent regen).
+- **D-02a path coverage:** dense + sparse bin layouts; the most-frequent /
+default-bin (lowest-bin) routing; multiple bin-store bit widths
+(`DenseBin<u8,4bit>` / `u8` / `u16` / `u32` and the matching `SparseBin`
+widths, selected by `num_bin` per `Bin::CreateDenseBin`/`CreateSparseBin`); an
+all-rows-on-one-bin pileup; an empty-sparse-stream (all-bin-0) round-trip; and
+a grad/hess sign+magnitude spread (~1e-3 .. ~1e3, mixed signs) that stresses
+the non-associative f64 reduction order.
+
+### Capture-harness note (external_libs unbuildable)
+
+The authoritative `ConstructHistogram` lives in `src/io/dense_bin.hpp` /
+`sparse_bin.hpp`, which (via `<LightGBM/bin.h>` -> `common.h`) transitively pull
+in `fast_double_parser.h` + `fmt/format.h` from `external_libs/` — present here
+only as EMPTY directories. `xtask/cpp/kernel_capture.cpp` therefore VERBATIM-
+transcribes the `ConstructHistogram` accumulation bodies from the pinned
+`dense_bin.hpp:130-141` / `sparse_bin.hpp:138-152` (commit `195c26fc7b00eb0fec252dfe841e2e66d6833954`, version
+`4.6.0.99`), reusing the `DenseBin`/`SparseBin` bin-storage forms, and emits
+goldens byte-identical to lib_lightgbm. Synthetic inputs use the genuine
+header-only `LightGBM::Random`. Same discipline as `rng_capture`/`bin_capture`:
+no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` time
+(the golden is committed).
+
+### Exact kernel-capture command
+
+```bash
+cargo run -p xtask -- kernel-capture
+```
