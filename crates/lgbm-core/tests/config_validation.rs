@@ -118,6 +118,72 @@ fn bool_coercion_matches_cpp() {
 }
 
 // ---------------------------------------------------------------------------
+// CR-01: empty-string value == ABSENT (no-op), matching C++ Get* helpers which
+// guard on `params.count(name) > 0 && !params.at(name).empty()` (config.h
+// 1165-1218). Applies to the `seed` lookup and the six enum reads (task,
+// boosting, data_sample_strategy, objective, device_type, tree_learner).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_seed_is_noop() {
+    let def = Config::default();
+    let c = Config::from_params(&params(&[("seed", "")])).unwrap();
+    // seed keeps its default; the six derived sub-seeds keep theirs (the
+    // derivation block is skipped because seed is treated as absent).
+    assert_eq!(c.seed, def.seed, "empty seed must keep default seed");
+    assert_eq!(c.data_random_seed, def.data_random_seed);
+    assert_eq!(c.bagging_seed, def.bagging_seed);
+    assert_eq!(c.drop_seed, def.drop_seed);
+    assert_eq!(c.feature_fraction_seed, def.feature_fraction_seed);
+    assert_eq!(c.objective_seed, def.objective_seed);
+    assert_eq!(c.extra_seed, def.extra_seed);
+}
+
+#[test]
+fn empty_enum_values_are_noop() {
+    let def = Config::default();
+
+    let c = Config::from_params(&params(&[("task", "")])).unwrap();
+    assert_eq!(c.task, def.task, "empty task must keep default");
+
+    let c = Config::from_params(&params(&[("boosting", "")])).unwrap();
+    assert_eq!(c.boosting, def.boosting, "empty boosting must keep default");
+
+    let c = Config::from_params(&params(&[("data_sample_strategy", "")])).unwrap();
+    assert_eq!(
+        c.data_sample_strategy, def.data_sample_strategy,
+        "empty data_sample_strategy must keep default"
+    );
+
+    let c = Config::from_params(&params(&[("objective", "")])).unwrap();
+    assert_eq!(c.objective, def.objective, "empty objective must keep default");
+
+    let c = Config::from_params(&params(&[("device_type", "")])).unwrap();
+    assert_eq!(c.device_type, def.device_type, "empty device_type must keep default");
+
+    let c = Config::from_params(&params(&[("tree_learner", "")])).unwrap();
+    assert_eq!(c.tree_learner, def.tree_learner, "empty tree_learner must keep default");
+}
+
+#[test]
+fn non_empty_invalid_enum_still_errors() {
+    // Control: present() filters ONLY the empty string, not all validation. A
+    // non-empty invalid value must still return the typed UnknownValue error.
+    assert!(matches!(
+        Config::from_params(&params(&[("objective", "nonsense")])),
+        Err(ConfigError::UnknownValue { .. })
+    ));
+    assert!(matches!(
+        Config::from_params(&params(&[("boosting", "nonsense")])),
+        Err(ConfigError::UnknownValue { .. })
+    ));
+    assert!(matches!(
+        Config::from_params(&params(&[("device_type", "nonsense")])),
+        Err(ConfigError::UnknownValue { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // CheckParamConflict mutations.
 // ---------------------------------------------------------------------------
 
