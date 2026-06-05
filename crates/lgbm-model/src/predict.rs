@@ -52,21 +52,47 @@ fn check_cols(model: &GbdtModel, num_cols: i32) -> Result<(), ModelError> {
 }
 
 /// Run the resolved sub-range raw predict over one materialized row, appending
-/// the `num_tree_per_iteration` f32 outputs to `out`.
+/// the `num_tree_per_iteration` f32 outputs to `out`. `start_iteration` /
+/// `num_iteration` are threaded straight into `GbdtModel::predict_raw`, which
+/// clamps them via `init_predict` (`gbdt.h:426-435`) — `0`/`-1` = full range,
+/// `num_iteration == -1` (== all from start), extreme values never panic.
 #[inline]
-fn predict_row(model: &GbdtModel, row: &[f64], out: &mut Vec<f32>) {
-    let scores = model.predict_raw(row, 0, -1);
+fn predict_row(
+    model: &GbdtModel,
+    row: &[f64],
+    start_iteration: i32,
+    num_iteration: i32,
+    out: &mut Vec<f32>,
+) {
+    let scores = model.predict_raw(row, start_iteration, num_iteration);
     for s in scores {
         out.push(s as f32);
     }
 }
 
-/// Dense raw-score prediction. `data` is row-major `num_rows * num_cols` `f32`.
+/// Dense raw-score prediction over the full ensemble (`start_iteration=0`,
+/// `num_iteration=-1`). Thin wrapper over [`predict_raw_mat_range`].
 pub fn predict_raw_mat(
     model: &GbdtModel,
     data: &[f32],
     num_rows: i32,
     num_cols: i32,
+) -> Result<Vec<f32>, ModelError> {
+    predict_raw_mat_range(model, data, num_rows, num_cols, 0, -1)
+}
+
+/// Dense raw-score prediction over the sub-range `(start_iteration,
+/// num_iteration)` (PRD-06). `data` is row-major `num_rows * num_cols` `f32`.
+/// `num_iteration == -1` (or `<= 0`) means "all iterations from `start_iteration`";
+/// `start_iteration` is clamped into `[0, num_iteration()]` — extreme values
+/// produce an empty slice (zero scores), never a panic or OOB (T-03-12).
+pub fn predict_raw_mat_range(
+    model: &GbdtModel,
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    start_iteration: i32,
+    num_iteration: i32,
 ) -> Result<Vec<f32>, ModelError> {
     if num_rows < 0 || num_cols < 0 {
         return Err(ModelError::ShapeMismatch {
@@ -96,13 +122,13 @@ pub fn predict_raw_mat(
         for (c, slot) in row.iter_mut().enumerate() {
             *slot = data[base + c] as f64;
         }
-        predict_row(model, &row, &mut out);
+        predict_row(model, &row, start_iteration, num_iteration, &mut out);
     }
     Ok(out)
 }
 
-/// CSR raw-score prediction. `indptr` has `num_rows + 1` entries; row `r`'s
-/// `(col, value)` pairs are `indices[indptr[r]..indptr[r+1]]` / `values[...]`.
+/// CSR raw-score prediction over the full ensemble. Thin wrapper over
+/// [`predict_raw_csr_range`].
 pub fn predict_raw_csr(
     model: &GbdtModel,
     indptr: &[i64],
@@ -110,6 +136,22 @@ pub fn predict_raw_csr(
     values: &[f32],
     num_rows: i32,
     num_cols: i32,
+) -> Result<Vec<f32>, ModelError> {
+    predict_raw_csr_range(model, indptr, indices, values, num_rows, num_cols, 0, -1)
+}
+
+/// CSR raw-score prediction over the sub-range `(start_iteration, num_iteration)`
+/// (PRD-06). `indptr` has `num_rows + 1` entries; row `r`'s `(col, value)` pairs
+/// are `indices[indptr[r]..indptr[r+1]]` / `values[...]`.
+pub fn predict_raw_csr_range(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    start_iteration: i32,
+    num_iteration: i32,
 ) -> Result<Vec<f32>, ModelError> {
     if num_rows < 0 || num_cols < 0 {
         return Err(ModelError::ShapeMismatch {
@@ -158,13 +200,13 @@ pub fn predict_raw_csr(
                 row[c] = values[k] as f64;
             }
         }
-        predict_row(model, &row, &mut out);
+        predict_row(model, &row, start_iteration, num_iteration, &mut out);
     }
     Ok(out)
 }
 
-/// CSC raw-score prediction. `indptr` has `num_cols + 1` entries; column `c`'s
-/// `(row, value)` pairs are `indices[indptr[c]..indptr[c+1]]` / `values[...]`.
+/// CSC raw-score prediction over the full ensemble. Thin wrapper over
+/// [`predict_raw_csc_range`].
 pub fn predict_raw_csc(
     model: &GbdtModel,
     indptr: &[i64],
@@ -172,6 +214,22 @@ pub fn predict_raw_csc(
     values: &[f32],
     num_rows: i32,
     num_cols: i32,
+) -> Result<Vec<f32>, ModelError> {
+    predict_raw_csc_range(model, indptr, indices, values, num_rows, num_cols, 0, -1)
+}
+
+/// CSC raw-score prediction over the sub-range `(start_iteration, num_iteration)`
+/// (PRD-06). `indptr` has `num_cols + 1` entries; column `c`'s `(row, value)`
+/// pairs are `indices[indptr[c]..indptr[c+1]]` / `values[...]`.
+pub fn predict_raw_csc_range(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    start_iteration: i32,
+    num_iteration: i32,
 ) -> Result<Vec<f32>, ModelError> {
     if num_rows < 0 || num_cols < 0 {
         return Err(ModelError::ShapeMismatch {
@@ -224,7 +282,7 @@ pub fn predict_raw_csc(
     let mut out = Vec::with_capacity(nrows * ntpi);
     for r in 0..nrows {
         let row = &dense[r * width..(r + 1) * width];
-        predict_row(model, row, &mut out);
+        predict_row(model, row, start_iteration, num_iteration, &mut out);
     }
     Ok(out)
 }

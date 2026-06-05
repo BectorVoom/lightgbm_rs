@@ -180,6 +180,75 @@ mod tests {
         assert_eq!(m.init_predict(0, 1), (0, 1));
     }
 
+    /// A 5-iteration single-class model (`total = 5`) for the full `<behavior>`
+    /// `init_predict` clamp/slice battery (Task 1 Tests 1-4).
+    fn five_iter_regression() -> GbdtModel {
+        GbdtModel {
+            trees: vec![
+                stump(0.0, 1.0, 0, 0.5),
+                stump(0.0, 2.0, 0, 0.5),
+                stump(0.0, 4.0, 0, 0.5),
+                stump(0.0, 8.0, 0, 0.5),
+                stump(0.0, 16.0, 0, 0.5),
+            ],
+            num_class: 1,
+            num_tree_per_iteration: 1,
+            label_index: 0,
+            max_feature_idx: 1,
+            average_output: false,
+            objective_string: Some("regression".to_string()),
+            feature_names: "Column_0 Column_1".to_string(),
+            feature_infos: "[0:1] [0:1]".to_string(),
+            monotone_constraints: None,
+            trailer: None,
+        }
+    }
+
+    /// Task 1 Test 1 (`-1 == all`): `init_predict(0, -1)` -> `(0, total)`.
+    #[test]
+    fn init_predict_minus_one_is_all() {
+        let m = five_iter_regression();
+        let total = m.num_iteration(); // 5
+        assert_eq!(m.init_predict(0, -1), (0, total));
+        // `0` is also treated as "all remaining" per the C++ `num_iteration > 0` test.
+        assert_eq!(m.init_predict(0, 0), (0, total));
+    }
+
+    /// Task 1 Test 2 (bounded count): `init_predict(0, 3)` -> `(0, min(3, total))`.
+    #[test]
+    fn init_predict_bounded_count() {
+        let m = five_iter_regression();
+        assert_eq!(m.init_predict(0, 3), (0, 3));
+        // A count larger than total is capped to total.
+        assert_eq!(m.init_predict(0, 99), (0, 5));
+    }
+
+    /// Task 1 Test 3 (non-zero start): `init_predict(2, -1)` -> `(2, total-2)`;
+    /// `init_predict(2, 3)` -> `(2, min(3, total-2))`.
+    #[test]
+    fn init_predict_non_zero_start() {
+        let m = five_iter_regression(); // total = 5
+        assert_eq!(m.init_predict(2, -1), (2, 3));
+        assert_eq!(m.init_predict(2, 3), (2, 3)); // min(3, 5-2) = 3
+        assert_eq!(m.init_predict(2, 99), (2, 3)); // min(99, 3) = 3
+        assert_eq!(m.init_predict(4, 99), (4, 1)); // min(99, 1) = 1
+    }
+
+    /// Task 1 Test 4 (clamp): `init_predict(total+5, -1)` -> `(total, 0)` (start
+    /// clamped to total; empty slice; never indexes OOB, never panics — T-03-12).
+    #[test]
+    fn init_predict_over_range_clamps_to_empty() {
+        let m = five_iter_regression(); // total = 5
+        assert_eq!(m.init_predict(10, -1), (5, 0));
+        assert_eq!(m.init_predict(5, 3), (5, 0));
+        // Extreme / negative values clamp, never panic.
+        assert_eq!(m.init_predict(i32::MAX, -1), (5, 0));
+        assert_eq!(m.init_predict(-7, -1), (0, 5)); // negative start -> 0
+        assert_eq!(m.init_predict(i32::MIN, i32::MIN), (0, 5));
+        // Predict over the empty slice yields the zero accumulator (no panic).
+        assert_eq!(m.predict_raw(&[1.0, 0.0], 10, -1), vec![0.0]);
+    }
+
     #[test]
     fn predict_raw_accumulates_f64() {
         let m = two_tree_regression();
@@ -190,6 +259,31 @@ mod tests {
         // sub-range: only tree 0.
         let out1 = m.predict_raw(&[1.0, 0.0], 0, 1);
         assert!((out1[0] - 2.0).abs() < 1e-12);
+    }
+
+    /// Task 1 Test 5 (slice accumulation): `predict_raw(row, 1, 2)` accumulates
+    /// ONLY `trees[i*ntpi+k]` for `i in 1..3` — assert it equals the manual sum of
+    /// exactly those trees, and differs from the full-range result.
+    #[test]
+    fn predict_raw_slice_accumulates_only_selected_iterations() {
+        let m = five_iter_regression();
+        // All leaves route feature-0=1.0 (>0.5) to leaf1 = {1,2,4,8,16}.
+        let row = [1.0f64, 0.0];
+        let ntpi = m.num_tree_per_iteration as usize;
+
+        // Sub-range (start=1, num=2) -> iterations 1 and 2 only: 2.0 + 4.0 = 6.0.
+        let sub = m.predict_raw(&row, 1, 2);
+        // Manual sum of exactly trees[1*ntpi+0] and trees[2*ntpi+0].
+        let manual: f64 = (1..3)
+            .map(|i| m.trees[i * ntpi].predict(&row))
+            .sum();
+        assert!((sub[0] - manual).abs() < 1e-12);
+        assert!((sub[0] - 6.0).abs() < 1e-12);
+
+        // Full range = 1+2+4+8+16 = 31, which must differ from the slice.
+        let full = m.predict_raw(&row, 0, -1);
+        assert!((full[0] - 31.0).abs() < 1e-12);
+        assert!((full[0] - sub[0]).abs() > 1e-9, "slice must differ from full range");
     }
 
     #[test]
