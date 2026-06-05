@@ -12,10 +12,12 @@
 //! point of the seam, and the `cmp01_containment` guard test enforces it.
 
 pub mod error;
+pub mod gain;
 pub mod kernels;
 pub mod runtime;
 
 pub use error::ComputeError;
+pub use gain::{GainConfig, SplitInfo};
 
 use cubecl::prelude::ComputeClient;
 
@@ -63,6 +65,45 @@ pub trait Backend {
         ordered_hessians: &[f32],
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError>;
+
+    /// Find the best split threshold for a feature column (D-01 whole-kernel op,
+    /// gain math in-kernel per D-01a), faithful to
+    /// `feature_histogram.hpp:165-1057` (the default CPU template
+    /// `<USE_RAND=false, USE_MC=false, USE_MAX_OUTPUT=false,
+    /// USE_SMOOTHING=false>`; `USE_L1` keyed on `cfg.lambda_l1 > 0`).
+    ///
+    /// Inputs:
+    /// - `hist` — the stride-2 `[g0,h0,g1,h1,…]` f64 histogram from
+    ///   [`construct_histograms`](Backend::construct_histograms), length
+    ///   `2 * num_bin`.
+    /// - `cfg` — the [`GainConfig`] (the seven gain-relevant `Config` fields).
+    /// - `num_bin` — the feature's bin count.
+    /// - `offset` / `default_bin` / `most_freq_bin` — the Phase-2
+    ///   `FeatureGroup`/`Bin` bin-layout descriptors driving the
+    ///   `SKIP_DEFAULT_BIN` continue and the threshold offset arithmetic.
+    /// - `sum_gradient` / `sum_hessian` / `num_data` — the leaf totals.
+    ///
+    /// Returns a [`SplitInfo`]; `gain == f64::NEG_INFINITY` (C++ `kMinScore`)
+    /// signals "no valid split found".
+    ///
+    /// # Errors
+    /// [`ComputeError::LengthMismatch`] if `hist.len() != 2 * num_bin`, or
+    /// [`ComputeError::Runtime`] for `num_bin == 0`, non-positive `sum_hessian`,
+    /// or unsupported non-default gain params (V5, T-04-01).
+    #[allow(clippy::too_many_arguments)]
+    fn find_best_split(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        hist: &[f64],
+        cfg: &GainConfig,
+        num_bin: u32,
+        offset: i32,
+        default_bin: u32,
+        most_freq_bin: u32,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<SplitInfo, ComputeError>;
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -92,6 +133,34 @@ impl Backend for CpuBackend {
             ordered_gradients,
             ordered_hessians,
             num_bin,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_best_split(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        hist: &[f64],
+        cfg: &GainConfig,
+        num_bin: u32,
+        offset: i32,
+        default_bin: u32,
+        most_freq_bin: u32,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<SplitInfo, ComputeError> {
+        kernels::split::find_best_split_cpu(
+            client,
+            hist,
+            cfg,
+            num_bin,
+            offset,
+            default_bin,
+            most_freq_bin,
+            sum_gradient,
+            sum_hessian,
+            num_data,
         )
     }
 }
