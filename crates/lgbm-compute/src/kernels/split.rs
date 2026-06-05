@@ -803,12 +803,36 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
     Ok(f32::from_bytes(&bytes).to_vec())
 }
 
-/// Whether the scan must skip the default bin. C++ instantiates
-/// `SKIP_DEFAULT_BIN` true when `meta_->offset` (i.e. the lowest stored bin is
-/// the most-frequent bin) implies a default bin that must not be scanned. The
-/// reference threshold-fun dispatch keys SKIP_DEFAULT_BIN on whether the
-/// histogram includes the default bin; here we conservatively skip whenever a
-/// valid in-range `default_bin` is present, mirroring the common dispatch.
+/// Whether the scan must skip the default bin (the `SKIP_DEFAULT_BIN` template
+/// bool of `FindBestThresholdSequentially`).
+///
+/// AUTHORITATIVE C++ PREDICATE (WR-04): `FuncForNumricalL3`
+/// (feature_histogram.hpp:396-429) sets `SKIP_DEFAULT_BIN == true` for the
+/// numeric (non-quantized) path **iff**
+///
+/// ```text
+/// meta_->num_bin > 2 && meta_->missing_type == MissingType::Zero
+/// ```
+///
+/// (When `missing_type == NaN` with `num_bin > 2` it instead sets
+/// `NA_AS_MISSING == true, SKIP_DEFAULT_BIN == false`; when
+/// `missing_type == None` both are false.) The flag is therefore a function of
+/// `missing_type`, NOT of `default_bin` vs `num_bin`.
+///
+/// PHASE-4 HEURISTIC + PRECONDITION: this layer does not yet carry
+/// `missing_type` into the kernel surface, so it approximates the predicate as
+/// `default_bin < num_bin`. This is only sound under the Phase-4 precondition
+/// that captured cases set `default_bin < num_bin` **iff** the C++ predicate
+/// above holds — which the committed golden corpus satisfies (verified by the
+/// bit-exact parity gate, including `default_bin_skip`). It is NOT a faithful
+/// transcription of the C++ dispatch.
+///
+/// FOLLOW-UP (Phase-5, recorded in 04-REVIEW-FIX.md): thread the authoritative
+/// `skip_default_bin` (derived from `missing_type` + `num_bin > 2`) from the
+/// caller through `find_best_split_cpu` / `Backend::find_best_split` instead of
+/// re-deriving it here, and add a golden where `default_bin < num_bin` but
+/// `skip_default_bin == false` to exercise the divergence. Not done in Phase-4
+/// because it changes the public trait signature and the current parity is green.
 fn cfg_skip_default_bin(default_bin: u32, num_bin: u32) -> bool {
     default_bin < num_bin
 }
