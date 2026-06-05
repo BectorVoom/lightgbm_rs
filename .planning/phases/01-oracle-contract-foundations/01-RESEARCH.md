@@ -440,22 +440,25 @@ The six pitfalls above are the parity-critical ones. The meta-pitfall: **every n
 | A5 | thiserror/anyhow/cubecl exact patch versions (2.0.18 / 1.0.102 / 0.10.0) are current | Standard Stack | Low — verified via cargo search this session; pin in Cargo.lock |
 | A6 | xtask-as-member-crate is the chosen regen pattern | Architecture | Low — Claude's discretion (D); bin target in harness crate is equivalent |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Exact "in-scope" parameter count (~110 vs 131 auto-extracted)**
    - What we know: `config_auto.cpp` auto-extracts 131 params via `GetMembersFromString`; alias_table maps many more aliases.
    - What's unclear: which exact params are "in-scope single-machine" — distributed (`num_machines`, `local_listen_port`, `time_out`), GPU (`num_gpu`, `gpu_*`), linear-tree, and quantized-grad params are out of v1 scope.
    - Recommendation: Planner enumerates the in-scope set from REQUIREMENTS v1 scope; the drift-checker test (D-11) asserts coverage and will flag any miss. Port the full alias table verbatim (cheap) but only validate/expose in-scope params.
+   - **RESOLVED:** Plan 01-02 Task 1 makes the in-scope split explicit in `crates/lgbm-core/src/config/scope.rs::IN_SCOPE_PARAMS` (131 auto-extracted minus distributed/gpu/linear-tree/quantized-grad), guarded by the `config_drift` test (D-11).
 
 2. **Fixture file format**
-   - What we know: must hold the 100k RNG draw sequence + per-stage intermediates + config goldens; Claude's discretion.
+   - What we know: must hold the RNG draw sequence + per-stage intermediates + config goldens; Claude's discretion.
    - What's unclear: text vs binary vs serde.
    - Recommendation: line-delimited text (diff-friendly, no extra deps) for the RNG sequence; keep config goldens as a simple key=value or JSON-ish text. Avoid serde unless a strong need emerges.
+   - **RESOLVED:** Plan 01-01 Task 3 adopts line-delimited text fixtures (`rng_sequence.txt`), no serde — diff-friendly and dependency-free.
 
 3. **C++ harness linkage mechanics**
    - What we know: D-07 wants a small C++ program linking `lib_lightgbm` including `Random`/`BinMapper` headers; CLI for end-to-end.
    - What's unclear: build it inside the LightGBM CMake tree (add an executable target) vs a standalone CMakeLists linking the built lib.
    - Recommendation: standalone tiny CMake target linking the built `lib_lightgbm` + including `LightGBM/include` — keeps the read-only submodule untouched. Planner to confirm.
+   - **RESOLVED:** Plan 01-01 Task 3 uses a standalone `xtask/cpp/CMakeLists.txt` target linking the built `lib_lightgbm` and including `LightGBM/include` — the read-only submodule tree is never modified.
 
 ## Environment Availability
 
