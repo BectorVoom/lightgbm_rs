@@ -1,14 +1,18 @@
 # Standalone CMake target for the dev-only RNG capture harness.
 #
 # This file does NOT live inside, and never modifies, the read-only LightGBM
-# submodule tree (D-07 recommendation). It builds the pinned `lib_lightgbm`
-# from the in-repo submodule and links a tiny `rng_capture` executable that
-# includes `LightGBM/include` and exercises the reference `Random` LCG.
+# submodule tree (D-07 recommendation). It compiles a tiny `rng_capture`
+# executable that includes `LightGBM/include` and exercises the reference
+# `Random` LCG.
 #
-# `LightGBM::Random` is header-only, so the capture program compiles purely
-# against the headers; we still build and link `_lightgbm` to (a) prove the
-# pinned commit builds with the recorded deterministic flags and (b) keep the
-# manifest's "links lib_lightgbm" contract (ORA-02 / D-05).
+# `LightGBM::Random` (include/LightGBM/utils/random.h) is a self-contained,
+# header-only class depending only on the C++ standard library, so the capture
+# program compiles directly against the pinned header — NO lib_lightgbm build or
+# link is required. (Deviation from the original plan, which assumed linking
+# lib_lightgbm: the in-repo submodule's `external_libs/` are not checked out
+# here, so a full lib build is unavailable; and since the RNG draws come entirely
+# from the header source, a header-only capture is numerically identical and
+# remains faithful to the exact pinned reference. See REFERENCE_MANIFEST.md.)
 #
 # Invoked by `cargo run -p xtask -- regen`; not part of `cargo build`.
 
@@ -36,22 +40,12 @@ if(NOT EXISTS "${LIGHTGBM_DIR}/include/LightGBM/utils/random.h")
     "(expected include/LightGBM/utils/random.h). Pass -DLIGHTGBM_DIR=<path>.")
 endif()
 
-# Build lib_lightgbm from the pinned submodule with deterministic-friendly flags.
-# We force the CPU-only, single-precision (default float) configuration recorded
-# in REFERENCE_MANIFEST.md: no GPU/CUDA/MPI, no SWIG, no CLI, no C++ tests.
-set(USE_GPU OFF CACHE BOOL "" FORCE)
-set(USE_CUDA OFF CACHE BOOL "" FORCE)
-set(USE_MPI OFF CACHE BOOL "" FORCE)
-set(USE_SWIG OFF CACHE BOOL "" FORCE)
-set(BUILD_CLI OFF CACHE BOOL "" FORCE)
-set(BUILD_CPP_TEST OFF CACHE BOOL "" FORCE)
-set(BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
-set(INSTALL_HEADERS OFF CACHE BOOL "" FORCE)
-# NOTE: do NOT define SCORE_T_USE_DOUBLE / LABEL_T_USE_DOUBLE — keep the f32
-# default width (D-01).
-
-add_subdirectory("${LIGHTGBM_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lightgbm_build")
-
+# The reference `Random` is header-only (see header comment above), so we compile
+# `rng_capture` directly against the pinned `LightGBM/include` headers with the
+# default f32 width — `SCORE_T_USE_DOUBLE` / `LABEL_T_USE_DOUBLE` are NOT defined
+# (D-01). No `add_subdirectory(LIGHTGBM_DIR)` / lib link: the RNG draws depend
+# only on the header source, and the submodule's external_libs are not vendored
+# here. The deterministic CPU-only build flags for future (training) goldens are
+# recorded in REFERENCE_MANIFEST.md, not forced here.
 add_executable(rng_capture rng_capture.cpp)
 target_include_directories(rng_capture PRIVATE "${LIGHTGBM_DIR}/include")
-target_link_libraries(rng_capture PRIVATE _lightgbm)

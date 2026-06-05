@@ -103,7 +103,9 @@ fn regen() -> Result<()> {
     let fixture_path = fixtures_dir.join("rng_sequence.txt");
     let manifest_path = fixtures_dir.join("REFERENCE_MANIFEST.md");
 
-    // 1. Configure the standalone capture build (builds lib_lightgbm too).
+    // 1. Configure the standalone, header-only capture build (compiles
+    //    rng_capture directly against the pinned LightGBM headers; the
+    //    header-only `Random` needs no lib_lightgbm build/link).
     eprintln!("xtask regen: configuring C++ capture build ...");
     run(
         Command::new("cmake")
@@ -247,11 +249,14 @@ does (D-06).\n\
 - default `float` width — `SCORE_T_USE_DOUBLE` / `LABEL_T_USE_DOUBLE` NOT defined (D-01)\n\
 - CPU-only build: `USE_GPU=OFF USE_CUDA=OFF USE_MPI=OFF USE_SWIG=OFF BUILD_CLI=OFF`\n\
 \n\
-> The RNG (`LightGBM::Random`) is a header-only LCG, so its draws do not depend\n\
-> on the threading/row-wise flags above; those flags are recorded because the\n\
-> same pinned, deterministic build is the reference for all later (training)\n\
-> goldens, and the manifest is the single source of truth for the reference\n\
-> build configuration.\n\
+> The RNG (`LightGBM::Random`) is a self-contained, header-only LCG, so its draws\n\
+> do not depend on the threading/row-wise/build flags above. The RNG golden is\n\
+> therefore captured by compiling `rng_capture` DIRECTLY against the pinned\n\
+> `include/LightGBM/utils/random.h` (default f32 width) — no `lib_lightgbm` build\n\
+> or link (the in-repo submodule's `external_libs/` are not vendored). The\n\
+> deterministic CPU-only flags above are recorded because the same pinned\n\
+> reference build is the source of truth for all later (training) goldens; this\n\
+> manifest is the single source of truth for that reference configuration.\n\
 \n\
 ## Exact Regeneration Command\n\
 \n\
