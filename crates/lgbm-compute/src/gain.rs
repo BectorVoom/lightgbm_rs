@@ -138,9 +138,14 @@ pub fn calculate_splitted_leaf_output(
 /// f32 mirror of [`threshold_l1`] (the no-f64 hip path).
 #[cube]
 pub fn threshold_l1_f32(s: f32, l1: f32) -> f32 {
-    let reg_s = f32::max(0.0, f32::abs(s) - l1);
-    let pos = select(s > 0.0, 1.0, 0.0);
-    let neg = select(s < 0.0, 1.0, 0.0);
+    // WR-05: pin EVERY literal to f32 so cubecl `#[cube]` literal inference
+    // cannot resolve a bare `1.0`/`0.0` to f64 (which `select`'s value type does
+    // not pin from `s`) and silently widen / mix precision on the hip path. The
+    // f32 path exists precisely to avoid f64 on gfx1100; an inferred f64 here
+    // would defeat that.
+    let reg_s = f32::max(0.0f32, f32::abs(s) - l1);
+    let pos = select(s > 0.0f32, 1.0f32, 0.0f32);
+    let neg = select(s < 0.0f32, 1.0f32, 0.0f32);
     (pos - neg) * reg_s
 }
 
