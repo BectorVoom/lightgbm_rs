@@ -1,9 +1,9 @@
 # Requirements: LightGBM-rs
 
 **Defined:** 2026-06-05
-**Core Value:** For identical inputs and config, reproduce C++ LightGBM outputs to within 1e-12 absolute difference on every backend (CPU and ROCm).
+**Core Value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using `f32` (single-precision) data types end-to-end to match the C++ reference defaults (`score_t`/`label_t` = `float`).
 
-> **Scope:** v1 = full single-machine parity with C++ LightGBM (GBDT/DART/RF/GOSS, all objectives + metrics, categorical, monotone, SHAP), exposed via a Rust-native API and Python bindings, on a switchable CubeCL CPU/ROCm backend. The 1e-12 oracle is a hard merge gate on every backend. Distributed training, C ABI, CLI, and raw CUDA/OpenCL are out of scope.
+> **Scope:** v1 = full single-machine parity with C++ LightGBM (GBDT/DART/RF/GOSS, all objectives + metrics, categorical, monotone, SHAP), exposed via a Rust-native API and Python bindings, on a switchable CubeCL CPU/ROCm backend. The ~1e-6 (f32) oracle is a hard merge gate on every backend. Distributed training, C ABI, CLI, and raw CUDA/OpenCL are out of scope.
 
 ## v1 Requirements
 
@@ -11,7 +11,7 @@
 
 - [ ] **FND-01**: Port LightGBM's `Random` PRNG (32-bit LCG, `NextFloat`, `Sample(N,K)`) bit-for-bit, unit-tested against a captured C++ draw sequence
 - [ ] **FND-02**: Establish workspace crate structure (loosely-coupled crates by responsibility) building under edition 2024
-- [ ] **FND-03**: Define deterministic reduction strategy (integer-quantized histograms / ordered f64 accumulation) so structural results are bit-identical across CPU and ROCm
+- [ ] **FND-03**: Use `f32` (single-precision) data types end-to-end (gradients, hessians, leaf values, scores) matching C++ defaults, with standard `f32` histogram/score accumulations on CPU and ROCm; outputs match the C++ reference within ~1e-6 (no integer-quantized reduction strategy)
 - [ ] **FND-04**: `thiserror` domain error types at every crate boundary; `anyhow` propagation in application/test layers
 
 ### Configuration
@@ -58,7 +58,7 @@
 
 - [ ] **OBJ-01**: Core objectives — `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`
 - [ ] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
-- [ ] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — exact to 1e-12
+- [ ] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`
 - [ ] **OBJ-05**: Cross-entropy objectives — `cross_entropy`, `cross_entropy_lambda`
 - [ ] **OBJ-06**: Ranking objectives — `lambdarank`, `rank_xendcg` (query boundaries, DCGCalculator, `objective_seed`)
@@ -95,12 +95,12 @@
 - [ ] **CMP-02**: CPU backend (cubecl-cpu) as the deterministic reference execution path
 - [ ] **CMP-03**: ROCm/HIP backend (cubecl-hip) selectable via Cargo feature and/or runtime config
 - [ ] **CMP-04**: CUDA warp-level operations mapped onto CubeCL's `Plane` API with capability gating and sequential fallback
-- [ ] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the 1e-12 contract
+- [ ] **CMP-05**: GPU-resident histogram construction, best-split finding, and data partition kernels meeting the ~1e-6 (f32) contract
 
 ### Oracle & Validation
 
-- [ ] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤1e-12 absolute
-- [ ] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, `score_t` width) for valid comparison
+- [ ] **ORA-01**: Oracle harness comparing Rust vs C++ LightGBM outputs at ≤~1e-6 absolute (f32 single-precision)
+- [ ] **ORA-02**: Pinned C++ reference build/config manifest (threads, deterministic settings, default `float` `score_t`/`label_t` width) for valid comparison
 - [ ] **ORA-03**: Per-stage parity tests (bin → histogram → per-split-gain → leaf-output → prediction), not just final outputs
 - [ ] **ORA-04**: Oracle suite executes and passes on the ROCm backend (mandated test environment)
 
@@ -225,4 +225,4 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 
 ---
 *Requirements defined: 2026-06-05*
-*Last updated: 2026-06-05 after roadmap creation (traceability populated)*
+*Last updated: 2026-06-05 — numerical contract revised to f32 / ~1e-6 (Phase 1 discuss)*

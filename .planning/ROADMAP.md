@@ -2,7 +2,7 @@
 
 ## Overview
 
-A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm backend, built bottom-up along a dependency-forced spine so numerical fidelity is provable at every layer. The journey starts by pinning the oracle contract and the bit-exact foundations (RNG, deterministic-reduction strategy, config) that everything downstream is validated against, then locks the binning determinism root, then proves prediction parity against a C++-trained model *before* training exists. It next builds the integer-histogram compute backend (the determinism linchpin and CubeCL-churn containment boundary), the histogram tree learner (the keystone FP-parity subsystem), and finally the GBDT loop with core objectives/metrics — the first moment a full train→predict run hits 1e-12. The remaining boosting variants, objectives, metrics, constraints, and SHAP are thin additions on the proven spine, and Python bindings land last as a translation layer over a validated Rust facade. Each phase is a vertical, oracle-validated slice: working numerical parity widens outward from binning → prediction → training rather than being deferred to the end.
+A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm backend, built bottom-up along a dependency-forced spine so numerical fidelity is provable at every layer. Data types are `f32` (single-precision) end-to-end to match the C++ reference defaults, and the oracle tolerance is ~1e-6 absolute. The journey starts by pinning the oracle contract and the foundations (bit-exact RNG, f32 numerical strategy, config) that everything downstream is validated against, then locks the binning determinism root, then proves prediction parity against a C++-trained model *before* training exists. It next builds the f32 compute backend (the CubeCL-churn containment boundary), the histogram tree learner (the keystone FP-parity subsystem), and finally the GBDT loop with core objectives/metrics — the first moment a full train→predict run hits ~1e-6 (f32) parity. The remaining boosting variants, objectives, metrics, constraints, and SHAP are thin additions on the proven spine, and Python bindings land last as a translation layer over a validated Rust facade. Each phase is a vertical, oracle-validated slice: working numerical parity widens outward from binning → prediction → training rather than being deferred to the end.
 
 ## Phases
 
@@ -12,28 +12,28 @@ A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm bac
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Oracle Contract + Foundations** - Tiered oracle, pinned C++ reference, bit-exact RNG, config, deterministic-reduction strategy, workspace
+- [ ] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace
 - [ ] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion
 - [ ] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists)
-- [ ] **Phase 4: Compute Backend (CPU-first integer histograms → ROCm)** - Backend trait, integer histogram/split/score kernels, CPU then ROCm, both at 1e-12
+- [ ] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity
-- [ ] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end 1e-12 train→predict with bagging, early stopping, Rust-native API
+- [ ] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API
 - [ ] **Phase 7: Parity-Completing Variants** - GOSS/DART/RF, categorical/EFB splits, remaining objectives/metrics, ranking, SHAP, monotone, refit, importance
 - [ ] **Phase 8: Python Bindings** - PyO3 + numpy bindings mirroring the official `lightgbm` Booster/Dataset/sklearn API
 
 ## Phase Details
 
 ### Phase 1: Oracle Contract + Foundations
-**Goal**: A falsifiable, tiered oracle contract and the bit-exact foundations (RNG, reduction strategy, config, workspace, pinned reference) that every later phase is validated against.
+**Goal**: A falsifiable, f32 single-precision oracle contract (~1e-6 absolute) and the foundations (bit-exact RNG, f32 numerical strategy, config, workspace, pinned reference) that every later phase is validated against.
 **Mode:** mvp
 **Depends on**: Nothing (first phase)
 **Requirements**: FND-01, FND-02, FND-03, FND-04, CFG-01, CFG-02, CFG-03, ORA-01, ORA-02
 **Success Criteria** (what must be TRUE):
-  1. The oracle harness compares Rust output against a pinned, deterministic C++ LightGBM 4.6 reference (`deterministic=true`, `force_row_wise=true`, `num_threads=1`, fixed seed, known `score_t` width) and the reference build/config manifest is checked in and regenerates goldens idempotently.
+  1. The oracle harness compares Rust output against a pinned, deterministic C++ LightGBM 4.6 reference (`deterministic=true`, `force_row_wise=true`, `num_threads=1`, fixed seed, default `float` `score_t`/`label_t` width) at ~1e-6 absolute tolerance, and the reference build/config manifest is checked in and regenerates goldens idempotently.
   2. A user can run the ported `Random` LCG and reproduce a captured 100k-draw C++ sequence (`RandInt16`/`RandInt32`/`NextFloat`/`NextInt`/`Sample(N,K)` across the branch boundary) bit-for-bit, with `u32` wraparound and `f32` `NextFloat`.
   3. The Cargo workspace (loosely-coupled crates by responsibility) builds under edition 2024 with `Cargo.lock` and `rust-toolchain.toml` committed; `thiserror` domain errors exist at crate boundaries and `anyhow` propagates at app/test layers.
   4. A config struct accepts the ~110 in-scope hyperparameters, resolves aliases (`num_iteration`/`n_estimators`/`num_boost_round`, etc.) via a data table matching `config_auto.cpp`, and rejects invalid combos with typed `Result` errors mirroring C++ `Config::Set` CHECK constraints.
-  5. The deterministic-reduction strategy (integer-quantized histograms / ordered f64 accumulation) is documented as a tiered-oracle Key Decision in PROJECT.md so no later phase targets an unfalsifiable invariant.
+  5. The f32 single-precision data-type contract and ~1e-6 oracle tolerance (standard f32 histogram/score accumulations, no integer-quantized reduction strategy) is documented as a Key Decision in PROJECT.md so no later phase targets an unfalsifiable invariant.
 **Plans**: TBD
 
 ### Phase 2: Dataset + Binning (determinism root)
@@ -55,7 +55,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Depends on**: Phase 2
 **Requirements**: DAT-08, DAT-09, PRD-01, PRD-02, PRD-03, PRD-06
 **Success Criteria** (what must be TRUE):
-  1. A user can load a C++-trained LightGBM `.txt` model and produce raw-score predictions within 1e-12 of the C++ reference on the deterministic CPU path.
+  1. A user can load a C++-trained LightGBM `.txt` model and produce raw-score predictions within ~1e-6 (f32) of the C++ reference on the deterministic CPU path.
   2. Transformed predictions (`ConvertOutput` sigmoid/softmax) and leaf-index predictions (`pred_leaf`) match the C++ reference.
   3. The Rust writer emits the exact LightGBM text schema (tree structure, leaf values, bin mappers, feature metadata) including `%.17g` float formatting, and a load→predict→write→reload round-trip is byte-stable.
   4. Sub-range prediction (`start_iteration` / `num_iteration`) returns the C++-matching slice of the ensemble.
@@ -63,14 +63,14 @@ Decimal phases appear between their surrounding integers in numeric order.
 **UI hint**: no
 
 ### Phase 4: Compute Backend (CPU-first integer histograms → ROCm)
-**Goal**: An isolated `lgbm-compute` backend whose integer-histogram, split-scan, and score-update kernels produce bit-identical results on CPU and ROCm by construction — the determinism linchpin and the CubeCL-churn containment boundary.
+**Goal**: An isolated `lgbm-compute` backend whose f32 histogram, split-scan, and score-update kernels produce results matching CPU and ROCm within ~1e-6 — the CubeCL-churn containment boundary.
 **Mode:** mvp
 **Depends on**: Phase 2
 **Requirements**: CMP-01, CMP-02, CMP-03, CMP-04, CMP-05, ORA-04
 **Success Criteria** (what must be TRUE):
   1. All CubeCL usage lives behind one `lgbm-compute` `Backend` trait; no crate above it names a CubeCL runtime, and a CPU-only build needs no ROCm toolchain.
-  2. Integer-quantized histogram construction, best-split-finding, and data-partition kernels run on the cubecl-cpu reference path and produce bit-identical results to a sequential f64/integer CPU reference.
-  3. The same kernels run on the cubecl-hip (ROCm) backend, selectable by Cargo feature and/or runtime config, and produce results bit-identical to the CPU backend (integer accumulation → order-independent).
+  2. Standard f32 histogram construction, best-split-finding, and data-partition kernels run on the cubecl-cpu reference path and produce results matching a sequential f32 CPU reference within ~1e-6.
+  3. The same kernels run on the cubecl-hip (ROCm) backend, selectable by Cargo feature and/or runtime config, and produce results matching the CPU backend within ~1e-6 (f32).
   4. CUDA warp-level reductions are expressed via CubeCL's `Plane` API with startup capability-gating (`Plane::Ops`, f64, atomics) and a deterministic sequential fallback when a capability is absent.
   5. The oracle suite executes and passes on the ROCm backend for the histogram/split/partition kernels (mandated test environment), with CPU-runtime and ROCm treated as separate gates.
 **Plans**: TBD
@@ -82,21 +82,21 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Requirements**: TRL-01, TRL-02, TRL-03, TRL-04, TRL-05, TRL-07, TRL-08, TRL-09
 **Success Criteria** (what must be TRUE):
   1. Given fixed gradients/hessians, the learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`) selects the same split feature, split bin/threshold, and missing-direction as C++ for every split, validated against per-split candidate-gain snapshots (not just the winner).
-  2. The histogram-subtraction trick reproduces the C++ smaller-child selection and derived-child histogram (integer-exact), and the default-bin-skip scan considers the same candidate-threshold set.
+  2. The histogram-subtraction trick reproduces the C++ smaller-child selection and derived-child histogram (matching the C++ f32 path within ~1e-6), and the default-bin-skip scan considers the same candidate-threshold set.
   3. Leaf-wise (best-first) growth respects `num_leaves`/`max_depth`, and the split-gain formula matches C++ (`kEpsilon` positions, `lambda_l1`/`lambda_l2`/`min_gain_to_split`/`min_sum_hessian_in_leaf`/`min_data_in_leaf`/`max_delta_step`/`path_smooth`).
   4. Numerical threshold splits route missing/zero exactly as C++; data partition (row→leaf) feeds the subtraction trick correctly.
   5. Per-tree/per-node feature subsampling (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`) selects the same features via RNG parity, and both `force_row_wise`/`force_col_wise` strategies produce matching trees.
 **Plans**: TBD
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
-**Goal**: The first end-to-end 1e-12 train→predict run — the simplest boosting variant proves the full spine before any variant is added.
+**Goal**: The first end-to-end ~1e-6 (f32) train→predict run — the simplest boosting variant proves the full spine before any variant is added.
 **Mode:** mvp
 **Depends on**: Phase 5
 **Requirements**: BST-01, BST-02, BST-03, BST-07, OBJ-01, OBJ-02, OBJ-03, MET-01, MET-02, API-01
 **Success Criteria** (what must be TRUE):
-  1. A user can call the Rust-native API (`Dataset`, `Booster`, `train`, `predict`) to train a GBDT model and predict, with outputs within 1e-12 of the C++ reference (Tier B CPU) and a same-tree structural match on every backend (Tier A).
+  1. A user can call the Rust-native API (`Dataset`, `Booster`, `train`, `predict`) to train a GBDT model and predict, with outputs within ~1e-6 (f32) of the C++ reference and a same-tree structural match on every backend.
   2. The GBDT loop (`TrainOneIter`, `UpdateScore`, per-class trees, shrinkage, `boost_from_average`) and score updater accumulate with deterministic reduction ordering.
-  3. Core objectives (`regression`, `regression_l1`, `binary`, `multiclass`, `multiclassova`, `custom`) compute grad/hess, `ConvertOutput`, `BoostFromScore`, and `reg_sqrt` exact to 1e-12 (with the CPU-vs-GPU objective-residency decision from Phase 1 honored).
+  3. Core objectives (`regression`, `regression_l1`, `binary`, `multiclass`, `multiclassova`, `custom`) compute grad/hess, `ConvertOutput`, `BoostFromScore`, and `reg_sqrt` to within ~1e-6 (f32) of the reference.
   4. Core metrics (`l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`) plus multi-metric infrastructure (`metric_freq`, training-metric eval) match the reference, and early stopping (`early_stopping_round`, `first_metric_only`, `early_stopping_min_delta`) fires identically.
   5. Bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) selects the same rows via RNG-matching sequence and call order.
 **Plans**: TBD

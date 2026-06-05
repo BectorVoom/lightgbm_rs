@@ -6,7 +6,7 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 
 ## Core Value
 
-For identical inputs and configuration, the Rust implementation must reproduce the C++ LightGBM's outputs to within an absolute difference of **1e-12 on every backend (CPU and ROCm)**. Numerical fidelity is the non-negotiable contract; everything else serves it.
+For identical inputs and configuration, the Rust implementation must reproduce the C++ LightGBM's outputs to within an absolute difference of **~1e-6 on every backend (CPU and ROCm)**, using `f32` (single-precision) data types end-to-end to match the C++ reference defaults (`score_t`/`label_t` = `float`). Numerical fidelity at single precision is the non-negotiable contract; everything else serves it.
 
 ## Requirements
 
@@ -22,20 +22,20 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 
 - [ ] Cargo workspace split into loosely-coupled crates (core data, boosting, tree-learner, objectives/metrics, compute backend, Python bindings)
 - [ ] Dataset + binned columnar store (BinMapper, FeatureGroup, MultiValBin) matching C++ binning bit-for-bit
-- [ ] GBDT training loop (gradient boosting) with 1e-12 oracle parity
+- [ ] GBDT training loop (gradient boosting) with ~1e-6 (f32) oracle parity
 - [ ] DART, Random Forest, and GOSS boosting/sample strategies
 - [ ] Histogram-based serial tree learner with split-gain scan, data partition, leaf splits
 - [ ] Full objective-function set (regression, binary, multiclass, ranking, etc.)
 - [ ] Full metric set (l1/l2/rmse, auc, ndcg, logloss, etc.)
 - [ ] Monotone constraints and categorical-feature support
-- [ ] Model train/predict producing outputs within 1e-12 of C++ reference
+- [ ] Model train/predict producing outputs within ~1e-6 (f32) of C++ reference
 - [ ] LightGBM model text format read/write compatibility (load a C++-trained model, predict identically)
 - [ ] CubeCL compute backend with switchable CPU ↔ ROCm (feature flag and/or runtime selection)
 - [ ] CUDA warp-level operations mapped onto CubeCL's `Plane` API
-- [ ] Bit-deterministic reductions (ordered / f64-accumulated histogram + score updates) so ROCm also meets 1e-12
+- [ ] Standard `f32` histogram + score-update accumulations on CPU and ROCm (no integer-quantized reduction strategy)
 - [ ] Rust-native train/predict/Dataset/Booster API
 - [ ] Python bindings mirroring the official `lightgbm` Python interface
-- [ ] Oracle test harness comparing Rust vs C++ LightGBM outputs at 1e-12, executed on ROCm
+- [ ] Oracle test harness comparing Rust vs C++ LightGBM outputs at ~1e-6 (f32), executed on ROCm
 - [ ] `thiserror` domain error types at crate boundaries; `anyhow` in application/test layers
 
 ### Out of Scope
@@ -54,13 +54,13 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 - **Reference codebase mapped:** `.planning/codebase/` documents the Microsoft C++ LightGBM core (ARCHITECTURE, STRUCTURE, STACK, CONVENTIONS, CONCERNS, INTEGRATIONS, TESTING). GPU-relevant subsystems are flagged there. The C++ tree is read-only reference, not a build target.
 - **Current Rust crate:** greenfield — `src/main.rs` is hello-world, `Cargo.toml` declares only `cubecl = "0.10.0"`, edition 2024.
 - **Key C++ subsystems to port:** `boosting/` (GBDT/DART/RF/GOSS), `treelearner/` (histograms, split finding, gradient discretizer), `io/` (Dataset, Bin, FeatureGroup, Metadata), `objective/`, `metric/`, model text serialization.
-- **Numerical fidelity is the hardest part:** floating-point reductions are non-associative, so hitting 1e-12 on ROCm vs a C++ CPU reference requires deliberate determinism in binning and reduction ordering — not an afterthought.
+- **Numerical fidelity is the hardest part:** even at `f32` / ~1e-6, floating-point reductions are non-associative, so matching the C++ reference on ROCm vs a C++ CPU reference still requires care in binning and accumulation — not an afterthought. The target is single-precision parity, matching the C++ `float` defaults rather than a double-precision 1e-12 bound.
 
 ## Constraints
 
 - **Tech stack**: Pure Rust, Cargo workspace, `cubecl` for compute — no raw CUDA/OpenCL. Use latest available crate versions.
 - **Compatibility**: 100% behavioral compatibility with C++ LightGBM for in-scope APIs, configs, and internal specifications (binning, split logic, model format).
-- **Numerical**: Absolute output difference ≤ 1e-12 vs C++ reference on **both** CPU and ROCm backends.
+- **Numerical**: `f32` (single-precision) data types end-to-end, matching C++ `score_t`/`label_t` = `float` defaults; absolute output difference ≤ ~1e-6 vs C++ reference on **both** CPU and ROCm backends.
 - **Hardware**: Tests validated on a **local ROCm GPU**; CubeCL `Plane` API used for warp-level ops.
 - **Backends**: CPU and ROCm must be switchable (Cargo features and/or runtime configuration).
 - **Error handling**: `thiserror` for structured domain errors at library boundaries; `anyhow` for ergonomic propagation in app/high-level layers.
@@ -71,8 +71,8 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | v1 = full single-machine parity (no distributed) | Cover all boosting types/objectives/metrics while deferring the large distributed surface | — Pending |
-| Strict 1e-12 oracle on **every** backend incl. ROCm | Numerical fidelity is the product's core value; no backend gets a relaxed tolerance | — Pending |
-| Bit-deterministic reductions to meet GPU tolerance | FP non-associativity otherwise breaks 1e-12 on ROCm; needs ordered/f64 accumulation by design | — Pending |
+| `f32` single-precision end-to-end + ~1e-6 oracle on **every** backend incl. ROCm | Matches the C++ reference defaults (`score_t`/`label_t` = `float`); 1e-12 is unachievable/meaningless against an f32 reference, and f32 is the most faithful baseline | — Decided 2026-06-05 (Phase 1 discuss) |
+| Standard `f32` accumulations (drop integer-quantized histograms) | At f32 / ~1e-6 the integer-quantization complexity buys nothing; standard f32 reductions keep the CubeCL CPU/ROCm path simple | — Decided 2026-06-05 (Phase 1 discuss) |
 | Rust-native API + Python bindings (no C ABI / CLI in v1) | Covers v1 consumers without the C-ABI/CLI surface | — Pending |
 | CubeCL `Plane` API for CUDA warp operations | Project mandate; portable across CPU/ROCm without raw CUDA | — Pending |
 | Cargo workspace with crate-per-responsibility | Maintainability, loose coupling, clear separation of concerns | — Pending |
@@ -96,4 +96,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-05 after initialization*
+*Last updated: 2026-06-05 — revised numerical contract to f32 / ~1e-6 (Phase 1 discuss)*
