@@ -141,17 +141,88 @@ Deferred — parallel code paths or convenience features not on the v1 parity sp
 
 ## Traceability
 
-Populated during roadmap creation (each requirement maps to exactly one phase).
+Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| _(filled by roadmapper)_ | — | Pending |
+| FND-01 | Phase 1 | Pending |
+| FND-02 | Phase 1 | Pending |
+| FND-03 | Phase 1 | Pending |
+| FND-04 | Phase 1 | Pending |
+| CFG-01 | Phase 1 | Pending |
+| CFG-02 | Phase 1 | Pending |
+| CFG-03 | Phase 1 | Pending |
+| ORA-01 | Phase 1 | Pending |
+| ORA-02 | Phase 1 | Pending |
+| DAT-01 | Phase 2 | Pending |
+| DAT-02 | Phase 2 | Pending |
+| DAT-03 | Phase 2 | Pending |
+| DAT-04 | Phase 2 | Pending |
+| DAT-05 | Phase 2 | Pending |
+| DAT-06 | Phase 2 | Pending |
+| DAT-07 | Phase 2 | Pending |
+| ORA-03 | Phase 2 | Pending |
+| DAT-08 | Phase 3 | Pending |
+| DAT-09 | Phase 3 | Pending |
+| PRD-01 | Phase 3 | Pending |
+| PRD-02 | Phase 3 | Pending |
+| PRD-03 | Phase 3 | Pending |
+| PRD-06 | Phase 3 | Pending |
+| CMP-01 | Phase 4 | Pending |
+| CMP-02 | Phase 4 | Pending |
+| CMP-03 | Phase 4 | Pending |
+| CMP-04 | Phase 4 | Pending |
+| CMP-05 | Phase 4 | Pending |
+| ORA-04 | Phase 4 | Pending |
+| TRL-01 | Phase 5 | Pending |
+| TRL-02 | Phase 5 | Pending |
+| TRL-03 | Phase 5 | Pending |
+| TRL-04 | Phase 5 | Pending |
+| TRL-05 | Phase 5 | Pending |
+| TRL-07 | Phase 5 | Pending |
+| TRL-08 | Phase 5 | Pending |
+| TRL-09 | Phase 5 | Pending |
+| BST-01 | Phase 6 | Pending |
+| BST-02 | Phase 6 | Pending |
+| BST-03 | Phase 6 | Pending |
+| BST-07 | Phase 6 | Pending |
+| OBJ-01 | Phase 6 | Pending |
+| OBJ-02 | Phase 6 | Pending |
+| OBJ-03 | Phase 6 | Pending |
+| MET-01 | Phase 6 | Pending |
+| MET-02 | Phase 6 | Pending |
+| API-01 | Phase 6 | Pending |
+| BST-04 | Phase 7 | Pending |
+| BST-05 | Phase 7 | Pending |
+| BST-06 | Phase 7 | Pending |
+| TRL-06 | Phase 7 | Pending |
+| OBJ-04 | Phase 7 | Pending |
+| OBJ-05 | Phase 7 | Pending |
+| OBJ-06 | Phase 7 | Pending |
+| MET-03 | Phase 7 | Pending |
+| MET-04 | Phase 7 | Pending |
+| PRD-04 | Phase 7 | Pending |
+| PRD-05 | Phase 7 | Pending |
+| ADV-01 | Phase 7 | Pending |
+| ADV-02 | Phase 7 | Pending |
+| ADV-03 | Phase 7 | Pending |
+| ADV-04 | Phase 7 | Pending |
+| ADV-05 | Phase 7 | Pending |
+| ADV-06 | Phase 7 | Pending |
+| ADV-07 | Phase 7 | Pending |
+| PYB-01 | Phase 8 | Pending |
+| PYB-02 | Phase 8 | Pending |
+| PYB-03 | Phase 8 | Pending |
+| PYB-04 | Phase 8 | Pending |
 
 **Coverage:**
-- v1 requirements: 58 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 58 ⚠️
+- v1 requirements: 69 total (the prior "58" headline was a stale count; the enumerated REQ-ID list contains 69 distinct IDs)
+- Mapped to phases: 69 ✓
+- Unmapped: 0 ✓
+- v2 (not mapped): QNT-01, LIN-01, ING-01, ING-02, ING-03
+
+**Per-phase counts:** P1=9, P2=8, P3=6, P4=6, P5=8, P6=10, P7=18, P8=4 (= 69).
 
 ---
 *Requirements defined: 2026-06-05*
-*Last updated: 2026-06-05 after initial definition*
+*Last updated: 2026-06-05 after roadmap creation (traceability populated)*
