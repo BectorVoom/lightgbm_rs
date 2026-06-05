@@ -1,0 +1,11 @@
+[package]
+name = "oracle-harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+lgbm-core = { path = "../lgbm-core" }

@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned stable channel supporting edition 2024 (verified in RESEARCH: 1.95.0).
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
