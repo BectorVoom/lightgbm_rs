@@ -184,7 +184,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on 05-01 + 05-02 — the keystone spine)*
 
-  - [ ] 05-03-PLAN.md — Faithful tree-learner spine (`force_row_wise`, `feature_fraction=1.0`, numeric, `missing_type=None`): leaf-wise loop + subtraction trick + FixHistogram + HistogramPool (D-05 full mirror) + DataPartition + LeafSplits; per-split (full per-bin gain arrays, D-06) + full-tree (`%.17g`, D-07) parity + D-02a two-transcription cross-check (TRL-01,02,03,04,05,07)
+  - [x] 05-03-PLAN.md — Faithful tree-learner spine (`force_row_wise`, `feature_fraction=1.0`, numeric, `missing_type=None`): leaf-wise loop + subtraction trick + FixHistogram + HistogramPool (D-05 full mirror) + DataPartition + LeafSplits; per-split (full per-bin gain arrays, D-06) + full-tree (`%.17g`, D-07) parity + D-02a two-transcription cross-check (TRL-01,02,03,04,05,07)
 
 **Wave 3** *(blocked on 05-03 — parity additions on the proven spine)*
 
@@ -249,7 +249,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 2/4 | In Progress|  |
+| 5. Tree Learner + Split Finding | 3/4 | In Progress|  |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

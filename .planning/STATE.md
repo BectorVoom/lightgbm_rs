@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-02-PLAN.md
-last_updated: "2026-06-05T22:37:42.912Z"
+stopped_at: Completed 05-03-PLAN.md
+last_updated: "2026-06-05T23:06:42.125Z"
 last_activity: 2026-06-05 -- Phase 05 execution started
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 22
-  completed_plans: 20
+  completed_plans: 21
   percent: 50
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 05 (tree-learner-split-finding) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-06-05 -- Phase 05 execution started
 
@@ -163,6 +163,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 04 P01 | ~8 min | 3 tasks | 10 files |
 | Phase 05 P01 | 7min | 2 tasks | 5 files |
 | Phase 05 P02 | 8min | 3 tasks | 17 files |
+| Phase 05 P03 | 25min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -198,6 +199,9 @@ Recent decisions affecting current work:
 - [Phase ?]: Tree::split stores learner-computed leaf outputs (does not compute gain); owns only the C++ parallel-array rewiring + decision_type bit-packing
 - [Phase ?]: Tree growth-time arrays (leaf_depth/leaf_parent/split_feature_inner/threshold_in_bin) are NOT serialized; a loaded tree carries parser-default values, so the serialized form remains the identity contract
 - [Phase ?]: lgbm-treelearner re-exports the single canonical lgbm_compute::gain::SplitInfo and adds only the split_gt operator> tie-break; no duplicate struct, no compute-runtime dependency (CMP-01)
+- [Phase 05]: 05-03: smaller/larger child LeafSplits seeded by DataPartition::leaf_count (not SplitInfo left/right_count) so it agrees with find_best_splits' smaller-child selection (Pitfall 3) — fixed swapped child sums
+- [Phase 05]: 05-03: D-07 full-tree parity compares via the SHARED lgbm-model %.17g formatter (golden carries the reference Tree's raw field bits; Rust reconstructs + serializes), not a C++ %g reimplementation
+- [Phase 05]: 05-03: FixHistogram is learner-side on RAW (un-bumped) leaf sums (Pitfall 2, Open Q1); ComputeClient re-exported from lgbm-compute so the learner names the Backend client without a cubecl dep (CMP-01)
 
 ### Pending Todos
 
@@ -221,6 +225,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T22:37:29.363Z
-Stopped at: Completed 05-02-PLAN.md
+Last session: 2026-06-05T23:06:34.297Z
+Stopped at: Completed 05-03-PLAN.md
 Resume file: None

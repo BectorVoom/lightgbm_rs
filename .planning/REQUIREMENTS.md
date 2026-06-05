@@ -35,12 +35,12 @@
 ### Tree Learner
 
 - [x] **TRL-01**: Histogram-based serial tree learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`)
-- [ ] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against
-- [ ] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
+- [x] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against
+- [x] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
 - [x] **TRL-04**: Split-gain scan with exact gain formula and tie-breaking (`lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`)
 - [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing
 - [ ] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
-- [ ] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction
+- [x] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction
 - [ ] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
 - [ ] **TRL-09**: `force_row_wise` / `force_col_wise` histogram build strategies, both output-matching
 
@@ -175,11 +175,11 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | CMP-05 | Phase 4 | Complete (04-02/03 cpu bit-exact + 04-04 hip f32 within ~1e-6; gap in 04-ROCM-GAPS.md, D-03a) |
 | ORA-04 | Phase 4 | Complete (04-02/03 cpu hard gate + 04-04 separate ~1e-6 hip gate run on gfx1100; D-03a) |
 | TRL-01 | Phase 5 | Complete |
-| TRL-02 | Phase 5 | Pending |
-| TRL-03 | Phase 5 | Pending |
+| TRL-02 | Phase 5 | Complete |
+| TRL-03 | Phase 5 | Complete |
 | TRL-04 | Phase 5 | Complete |
 | TRL-05 | Phase 5 | Complete |
-| TRL-07 | Phase 5 | Pending |
+| TRL-07 | Phase 5 | Complete |
 | TRL-08 | Phase 5 | Pending |
 | TRL-09 | Phase 5 | Pending |
 | BST-01 | Phase 6 | Pending |
