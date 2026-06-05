@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: "Plan 01-02 complete (config slice: flat Config + verbatim alias table + from_params pipeline + D-14 randomized validation + drift-checker); phase 01 plans complete"
-last_updated: "2026-06-05T00:00:00.000Z"
-last_activity: "2026-06-05 -- Plan 01-02 complete: config slice landed; lgbm-core 14 unit + 26 integration green, oracle-harness config_drift 3/3, cargo test --workspace green"
+status: completed
+stopped_at: Phase 1 context gathered (numerical contract revised to f32 / ~1e-6)
+last_updated: "2026-06-05T04:48:50.559Z"
+last_activity: 2026-06-05 -- Plan 01-02 completed and committed
 progress:
   total_phases: 8
   completed_phases: 0
