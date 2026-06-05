@@ -423,22 +423,25 @@ fn plane_reduce_kernel<F: Float>(out: &mut Tensor<F>) {
 | A4 | The Phase-2 `Bin` trait exposes enough (per-row `data(idx)`, `num_data`) to drive a histogram kernel without re-binning | Don't Hand-Roll | LOW — verified `Bin::data(idx)->u32` exists; iterator-based access (`GetIterator`) may be needed for sparse, mirroring C++. |
 | A5 | "f32 end-to-end" tolerates f64 histogram cells on cpu (matching C++ `hist_t=double`) | Pitfall 3 | LOW — directly verified in C++ source; this is faithful-mirror, not a deviation. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Does the cubecl-cpu MLIR backend preserve fp operation order within a single unit's loop?**
    - What we know: each unit runs on its own thread; a single-owner loop has no cross-thread reduction.
    - What's unclear: whether MLIR/LLVM applies fast-math reassociation that would reorder the f64 fold (LightGBM compiles WITHOUT fast-math for the deterministic path).
    - Recommendation: The Wave-0 spike (Pitfall 1) settles this empirically. If MLIR reassociates, investigate a `CUBECL_*` flag or accept ~1e-6 anchor (D-04a).
+   - **RESOLVED:** Settled empirically by the Wave-0 cubecl-cpu bit-determinism spike (`determinism_spike`), planned FIRST in Wave 1 of 04-01 with the D-04a fallback (accept ~1e-6 anchor) if MLIR reassociates.
 
 2. **HIP path: accumulate in f32 (no f64) — does warp-reduction order stay within ~1e-6?**
    - What we know: gfx1100 is wave32; f32 atomic-add is available; `plane_sum` is available.
    - What's unclear: whether a `plane_sum`-based histogram or an atomic-based one stays within 1e-6 of the f64 cpu anchor across the D-02a stress inputs.
    - Recommendation: Bring up HIP, run the oracle, document any gap (D-03a). Prefer the same single-owner ordered fold on HIP first (simplest parity), optimize to Plane later.
+   - **RESOLVED:** 04-04 brings up HIP, runs the separate ~1e-6 hip-vs-cpu-anchor gate, and records any residual gap in 04-ROCM-GAPS.md per D-03a (no silent pass); the single-owner ordered fold is used on HIP first.
 
 3. **Scope of `data_partition` output:** indices array (C++ `indices_` reordered, `leaf_begin_`/`leaf_count_`) vs a left/right boolean mask?
    - What we know: C++ `DataPartition::Split` reorders an indices array in place and tracks `leaf_begin_`/`leaf_count_` (`data_partition.hpp:101`); `Dataset::Split` decides per-row left/right.
    - What's unclear: the exact backend op signature (Claude's discretion per CONTEXT.md).
    - Recommendation: Mirror the C++ row→{left,right} partition with stable order; let Phase 5 own the `leaf_begin_`/`leaf_count_` bookkeeping.
+   - **RESOLVED:** 04-03 fixes `Backend::data_partition` to return a stable reordered index array + a `split_point` (left-row count), mirroring `DataPartition::Split`; Phase 5 owns `leaf_begin_`/`leaf_count_`.
 
 ## Environment Availability
 

@@ -2,8 +2,8 @@
 phase: 4
 slug: compute-backend-cpu-first-integer-histograms-rocm
 status: draft
-nyquist_compliant: false
-wave_0_complete: false
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-06-05
 ---
 

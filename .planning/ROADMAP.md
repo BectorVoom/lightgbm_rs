@@ -129,7 +129,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 ### Phase 4: Compute Backend (CPU-first integer histograms → ROCm)
 
-**Goal**: An isolated `lgbm-compute` backend whose f32 histogram, split-scan, and score-update kernels produce results matching CPU and ROCm within ~1e-6 — the CubeCL-churn containment boundary.
+**Goal**: An isolated `lgbm-compute` backend whose f32 histogram, split-scan, and data-partition kernels produce results matching CPU and ROCm within ~1e-6 — the CubeCL-churn containment boundary.
 **Mode:** mvp
 **Depends on**: Phase 2
 **Requirements**: CMP-01, CMP-02, CMP-03, CMP-04, CMP-05, ORA-04
