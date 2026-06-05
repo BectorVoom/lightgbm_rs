@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 3 context gathered
-last_updated: "2026-06-05T11:19:33.097Z"
+last_updated: "2026-06-05T11:28:14.006Z"
 last_activity: 2026-06-05 -- Phase 03 execution started
 progress:
   total_phases: 8
   completed_phases: 2
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
   percent: 25
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 03 (tree-model-model-text-i-o-predict-parity) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-06-05 -- Phase 03 execution started
 
@@ -92,6 +92,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 *Updated after each plan completion*
 | Phase 03 P01 | ~20 min | 4 tasks | 29 files |
 | Phase 03 P02 | ~7 min | 3 tasks | 8 files |
+| Phase 03 P03 | ~12 min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -120,6 +121,7 @@ Recent decisions affecting current work:
 - [Phase ?]: feature_importances recomputed via split-count on write
 - [Phase 03]: parameters tail (incl pandas_categorical) preserved verbatim on round-trip
 - [Phase 03]: Tree parser stricter than C++: validates array lengths + node indices before indexing
+- [Phase ?]: 03-03: ConvertOutput parsed from objective= line (not Config); non-core objectives -> ModelError; softmax max-subtraction; leaf per-(iter x class) stride
 
 ### Pending Todos
 
@@ -143,6 +145,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T11:19:23.959Z
+Last session: 2026-06-05T11:27:57.128Z
 Stopped at: Phase 3 context gathered
 Resume file: .planning/phases/03-tree-model-model-text-i-o-predict-parity/03-CONTEXT.md

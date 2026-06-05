@@ -73,8 +73,8 @@
 ### Prediction
 
 - [x] **PRD-01**: Raw score prediction (sum of tree outputs)
-- [ ] **PRD-02**: Transformed prediction (`ConvertOutput` sigmoid/softmax)
-- [ ] **PRD-03**: Leaf index prediction (`pred_leaf`)
+- [x] **PRD-02**: Transformed prediction (`ConvertOutput` sigmoid/softmax)
+- [x] **PRD-03**: Leaf index prediction (`pred_leaf`)
 - [ ] **PRD-04**: Feature contributions / TreeSHAP (`predict_contrib`) over full tree node/cover structure
 - [ ] **PRD-05**: Prediction early stopping (`pred_early_stop`, `_freq`, `_margin`)
 - [ ] **PRD-06**: Sub-range prediction (`start_iteration` / `num_iteration`)
@@ -165,8 +165,8 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | DAT-08 | Phase 3 | Complete |
 | DAT-09 | Phase 3 | Complete |
 | PRD-01 | Phase 3 | Complete |
-| PRD-02 | Phase 3 | Pending |
-| PRD-03 | Phase 3 | Pending |
+| PRD-02 | Phase 3 | Complete |
+| PRD-03 | Phase 3 | Complete |
 | PRD-06 | Phase 3 | Pending |
 | CMP-01 | Phase 4 | Pending |
 | CMP-02 | Phase 4 | Pending |

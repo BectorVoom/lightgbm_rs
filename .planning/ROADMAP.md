@@ -119,7 +119,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on Wave 2)*
 
-  - [ ] 03-03-PLAN.md — Transform + leaf-index slice: core ConvertOutput (sigmoid/softmax/ova/identity) + multiclass per-class stride + pred_leaf + categorical-split parity (PRD-02/PRD-03)
+  - [x] 03-03-PLAN.md — Transform + leaf-index slice: core ConvertOutput (sigmoid/softmax/ova/identity) + multiclass per-class stride + pred_leaf + categorical-split parity (PRD-02/PRD-03)
 
 **Wave 4** *(blocked on Wave 3)*
 
@@ -216,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 |-------|----------------|--------|-----------|
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
-| 3. Tree Model + Model Text I/O + Predict Parity | 2/4 | In Progress|  |
+| 3. Tree Model + Model Text I/O + Predict Parity | 3/4 | In Progress|  |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
