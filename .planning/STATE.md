@@ -2,8 +2,8 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Phase 3 context gathered
+status: phase_complete
+stopped_at: Phase 3 verified PASSED (4/4 success criteria, 6/6 requirement IDs)
 last_updated: "2026-06-05T11:44:58.328Z"
 last_activity: 2026-06-05
 progress:
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 03 — tree-model-model-text-i-o-predict-parity
+**Current focus:** Phase 4 — Compute Backend (CPU-first integer histograms → ROCm)
 
 ## Current Position
 
 Phase: 4
 Plan: Not started
-Status: Phase 3 plans complete — ready for /gsd-verify-phase 03
+Status: Phase 3 COMPLETE & VERIFIED (PASSED) — ready to plan Phase 4
 Last activity: 2026-06-05
 
-Progress: [██████████] 4/4 Phase-3 plans executed — full D-06 layered battery (layers 1-5) green
+Progress: [██████████] Phase 3 complete — 4/4 plans executed & verified; PRD-01/02/03/06 + DAT-08/DAT-09 all PASS
 
 ### Resume
 
@@ -42,7 +42,9 @@ Plan 03-04 closed PRD-06 (sub-range prediction) and completed the Phase-3 predic
 
 `cargo test --workspace` fully green (0 failed); full Phase-3 layered parity battery (layers 1-5) passes. Commits: bb29ec5 (Task 1), 642f5a5 (Task 2).
 
-Next: `/gsd-verify-phase 03` — expect PRD-01/02/03/06 + DAT-08/DAT-09 to verify PASS.
+Phase 3 verification PASSED (03-VERIFICATION.md): all 4 success criteria + 6 requirement IDs satisfied; negative-control confirmed parity assertions are load-bearing. Code review (03-REVIEW.md) raised 3 Critical divergences from C++ source that are out-of-corpus latent (CR-01 feature-importance `split_gain>0` guard, CR-02 leaf-index sub-range, CR-03 RF `average_output` apply) — none affect a Phase-3 criterion; recorded as Phase 7 / RF (BST-06) follow-ups.
+
+Next: `/gsd-plan-phase 4` — Compute Backend (CPU-first integer histograms → ROCm).
 
 ---
 
