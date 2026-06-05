@@ -286,28 +286,36 @@ bit-exact on the cubecl-cpu anchor (`compare_exact_f64_bits` per-split) / string
 equality (per-tree).
 
 - **Learner master seed:** `514219757` (`0x1EA65EED`) —
-the SINGLE source of randomness for the learner corpus (idempotent regen).
-- **Plan 05-02 status: SCAFFOLD.** A single placeholder fixture (`scaffold.txt`)
-exercises both record formats (one PSPLIT, one PTREE) so the parity harness has
-a committed target and a failing-until-implemented end-to-end test exists.
-- **Capture-config placeholders (finalized in Plan 03/04):** D-04 row/col
-dimensions and the D-03 gradient/hessian source are TBD — the spine plan pins
-synthetic cases to `missing_type == None` to defer the NA_AS_MISSING forward
-branch (RESEARCH A5).
+recorded for format continuity; the Plan-05-03 corpus is hand-crafted (fixed
+synthetic g/h), NOT RNG-derived, so the capture is byte-idempotent regardless.
+- **Plan 05-03 status: REAL SPINE GOLDEN (`spine.txt`).** The full verbatim
+leaf-wise-loop transcription grows a tree over a FIXED 12-row / 2-feature
+synthetic g/h corpus (`force_row_wise`, `feature_fraction=1.0`,
+`missing_type=None` per RESEARCH A5 — NA_AS_MISSING deferred). It emits 10
+PSPLIT records (per-bin REVERSE+FORWARD gain arrays per candidate feature at
+every split decision, D-06) + 1 PTREE record (the grown 4-leaf tree's field set
+as raw bits, D-07). `learner_parity.rs` replays per-split bit-exact, full-tree
+via the shared `%.17g` formatter, the subtraction trick, missing/zero routing,
+and the D-02a kernel-vs-learner cross-check.
 
-### Record format (`scaffold.txt`)
+### Record format (`spine.txt`)
 
 ```
 LEARNER_MASTER_SEED <seed>
 COUNTS splits=<n> trees=<n>
-PSPLIT split=<i> feature=<f> num_bin=<n> gains=<f64bits;...> winner=<f64bits>
-PTREE name=<id>
-<Tree::to_string() lines...>
+PSPLIT split=<i> leaf=<l> feature=<f> num_bin=<n> rev=<f64bits;...> fwd=<f64bits;...> winner=<f64bits>
+PTREE name=<id> num_leaves=<n>
+PT_SPLIT_FEATURE <i...>  PT_THRESHOLD_BITS <u64...>  PT_DECISION_TYPE <i...>
+PT_SPLIT_GAIN_BITS <u32...>  PT_LEFT_CHILD <i...>  PT_RIGHT_CHILD <i...>
+PT_LEAF_VALUE_BITS <u64...>  PT_LEAF_WEIGHT_BITS <u64...>  PT_LEAF_COUNT <i...>
+PT_INTERNAL_VALUE_BITS <u64...>  PT_INTERNAL_COUNT <i...>
 ENDTREE
 ```
 
-`gains`/`winner` are raw little-endian f64 bit patterns (decimal `u64`) for
-bit-exact replay; the per-tree block is compared as a `String`.
+`rev`/`fwd`/`winner` + the PT_*_BITS lines are raw little-endian f64/f32 bit
+patterns (decimal `u64`/`u32`) for bit-exact replay; the Rust side reconstructs
+the reference `Tree` from the PT_* fields and serializes it via the shared
+`lgbm-model` `%.17g` formatter for the D-07 String compare.
 
 ### Capture-harness note (external_libs unbuildable)
 
@@ -315,7 +323,7 @@ The authoritative `SerialTreeLearner` lives in
 `src/treelearner/serial_tree_learner.cpp`, which (via `<LightGBM/dataset.h>` ->
 `common.h`) transitively #includes `fast_double_parser.h` + `fmt/format.h` from
 `external_libs/` — present here only as EMPTY directories. `learner_capture.cpp`
-therefore VERBATIM-transcribes the learner growth loop (Plan 03/04) from the
+therefore VERBATIM-transcribes the learner growth loop (Plan 05-03) from the
 pinned `serial_tree_learner.cpp` (commit `195c26fc7b00eb0fec252dfe841e2e66d6833954`, version `4.6.0.99`),
 reusing `kernel_capture.cpp`'s already-transcribed gain/split math (D-02a
 cross-check), and includes the header-only `LightGBM/include` only for the genuine

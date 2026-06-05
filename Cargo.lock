@@ -2183,6 +2183,8 @@ dependencies = [
  "lgbm-compute",
  "lgbm-core",
  "lgbm-dataset",
+ "lgbm-model",
+ "lgbm-treelearner",
 ]
 
 [[package]]

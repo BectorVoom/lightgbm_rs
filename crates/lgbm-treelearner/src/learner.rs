@@ -821,11 +821,17 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         );
 
         // Seed the two child LeafSplits for the next iteration (smaller/larger by
-        // left_count < right_count, :851). The ordered fold over each child's rows
-        // (now grouped by data_partition.split) is the deterministic seed.
+        // row count, :851). Use the ACTUAL data-partition row counts (not
+        // best.left_count/right_count) so this selection is bit-consistent with the
+        // smaller-child selection in `find_best_splits` (which reads
+        // `DataPartition::leaf_count`) — the two MUST agree (Pitfall 3). The ordered
+        // fold over each child's rows (now grouped by data_partition.split) is the
+        // deterministic seed.
         let left_rows: Vec<u32> = data_partition.indices_in_leaf(new_left).to_vec();
         let right_rows: Vec<u32> = data_partition.indices_in_leaf(new_right).to_vec();
-        if best.left_count < best.right_count {
+        let count_left = data_partition.leaf_count(new_left);
+        let count_right = data_partition.leaf_count(new_right);
+        if count_left < count_right {
             // smaller = left
             smaller_leaf_splits.init(gradients, hessians, &left_rows, &self.cfg);
             larger_leaf_splits.init(gradients, hessians, &right_rows, &self.cfg);

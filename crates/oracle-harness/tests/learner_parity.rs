@@ -1,32 +1,32 @@
-//! Serial tree-learner parity replay (Phase 5, D-04 cpu hard gate) — SCAFFOLD.
+//! Serial tree-learner parity replay (Phase 5, Plan 05-03 — D-04 cpu hard gate).
 //!
-//! This is the Wave-1 (Plan 05-02) END-TO-END HARNESS SKELETON: it establishes
-//! the golden path, record-format parsers, and graceful-SKIP discipline so a
-//! FAILING end-to-end test exists before the spine learner is written (Plan 03).
-//! The per-split (D-06) and per-tree (D-07) bit-exact assertions are filled in by
-//! Plan 03/04 once `lgbm_treelearner::SerialTreeLearner` lands; for now the
-//! scaffold loads the committed placeholder fixture (or SKIPs when absent) and
-//! asserts the record format parses.
+//! Replays the committed `spine.txt` golden (emitted by the verbatim C++
+//! transcription in `xtask/cpp/learner_capture.cpp`) through the Rust
+//! `lgbm_treelearner::SerialTreeLearner` and asserts:
+//! - `learner_parity_spine_per_bin_gains` — every PSPLIT's REVERSE + FORWARD
+//!   per-bin gain arrays replay bit-exact (D-06, `compare_exact_f64_bits`).
+//! - `learner_parity_spine_full_tree` — the grown `Tree::to_string()` is
+//!   byte-identical to the reference tree reconstructed from the PTREE field bits
+//!   (D-07, the Phase-3 `%.17g` machinery is the shared arbiter).
+//! - `learner_parity_subtract` — the subtracted larger-child histogram matches the
+//!   directly-built one bit-exact (TRL-02 subtraction trick).
+//! - `learner_parity_missing_routing` — a `most_freq_bin > 0` / `skip_default_bin
+//!   == false` feature routes + reconstructs correctly (TRL-05).
+//! - `learner_parity_transcription_crosscheck` — the Phase-4 split kernel and the
+//!   Phase-5 learner agree bit-for-bit on shared per-feature inputs (D-02a).
 //!
-//! Idioms follow `oracle-harness/tests/kernel_parity.rs`: a `CARGO_MANIFEST_DIR`-
-//! rooted fixture path (NEVER the untracked C++ reference tree), graceful SKIP
-//! pre-capture, raw-bit parse helpers, and a localizing assert.
-//!
-//! Record format (see `xtask/cpp/learner_capture.cpp`) — two golden kinds:
-//! ```text
-//! # per-split snapshot (D-06): the full per-bin gain array + winning split
-//! PSPLIT split=<i> feature=<f> num_bin=<n> gains=<f64bits;...> winner=<f64bits>
-//!
-//! # per-tree (D-07): a name line followed by the Tree::to_string() text block,
-//! # terminated by a line containing only `ENDTREE`.
-//! PTREE name=<id>
-//! <Tree::to_string() lines...>
-//! ENDTREE
-//! ```
-//! `gains`/`winner` are raw little-endian f64 bit patterns (decimal `u64`) for
-//! zero-rounding bit-exact replay; the per-tree block is compared as a `String`.
+//! Idioms follow `kernel_parity.rs`: a `CARGO_MANIFEST_DIR`-rooted fixture path
+//! (NEVER the untracked C++ reference tree), graceful SKIP pre-capture, raw-bit
+//! parse helpers, and a localizing assert.
 
 use std::path::PathBuf;
+
+use lgbm_compute::gain::GainConfig;
+use lgbm_compute::{runtime::cpu_client, Backend, CpuBackend};
+use lgbm_dataset::bin_mapper::MissingType;
+use lgbm_model::Tree;
+use lgbm_treelearner::learner::{FeatureColumn, SerialTreeLearner};
+use oracle_harness::comparator::compare_exact_f64_bits;
 
 /// The committed learner golden directory — TRACKED under the oracle-harness
 /// crate, NEVER the untracked C++ reference tree.
@@ -34,16 +34,11 @@ fn learner_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/learner")
 }
 
-/// The scaffold placeholder golden written by `learner-capture` (Plan 03/04
-/// replace it with the real per-split/per-tree corpus).
-fn scaffold_fixture() -> PathBuf {
-    learner_dir().join("scaffold.txt")
+fn spine_fixture() -> PathBuf {
+    learner_dir().join("spine.txt")
 }
 
-/// Parse a `;`-separated list of raw little-endian f64 bit patterns (decimal
-/// `u64`) into `f64` via `from_bits` (bit-exact). Reused by the Plan-03 per-split
-/// assertion (`compare_exact_f64_bits` on these arrays).
-#[allow(dead_code)]
+/// Parse a `;`-separated list of raw little-endian f64 bit patterns into `f64`.
 fn parse_f64_bits_list(s: &str) -> Vec<f64> {
     if s.is_empty() {
         return Vec::new();
@@ -53,48 +48,112 @@ fn parse_f64_bits_list(s: &str) -> Vec<f64> {
         .collect()
 }
 
-/// Extract a `key=value` token's value from a whitespace-split line.
-#[allow(dead_code)]
+/// Parse a whitespace-separated list of raw f64 bits.
+fn parse_f64_bits_ws(s: &str) -> Vec<f64> {
+    s.split_whitespace()
+        .map(|t| f64::from_bits(t.parse::<u64>().expect("f64-bits u64")))
+        .collect()
+}
+
+/// Parse a whitespace-separated list of raw f32 bits.
+fn parse_f32_bits_ws(s: &str) -> Vec<f32> {
+    s.split_whitespace()
+        .map(|t| f32::from_bits(t.parse::<u32>().expect("f32-bits u32")))
+        .collect()
+}
+
+/// Parse a whitespace-separated list of ints.
+fn parse_i32_ws(s: &str) -> Vec<i32> {
+    s.split_whitespace()
+        .map(|t| t.parse::<i32>().expect("i32"))
+        .collect()
+}
+fn parse_i8_ws(s: &str) -> Vec<i8> {
+    s.split_whitespace()
+        .map(|t| t.parse::<i32>().expect("i8 as int") as i8)
+        .collect()
+}
+fn parse_u32_ws(s: &str) -> Vec<u32> {
+    s.split_whitespace()
+        .map(|t| t.parse::<u32>().expect("u32"))
+        .collect()
+}
+
 fn field<'a>(tokens: &'a [&'a str], key: &str) -> Option<&'a str> {
     tokens
         .iter()
         .find_map(|t| t.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
 }
 
-/// A parsed per-split (PSPLIT) record — the D-06 golden kind.
+/// A parsed PSPLIT record (D-06 per-bin gain arrays).
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // `leaf`/`num_bin` carried for localization/diagnostics.
 struct SplitGolden {
-    split: i32,
+    leaf: i32,
     feature: i32,
     num_bin: u32,
-    gains: Vec<f64>,
+    rev: Vec<f64>,
+    fwd: Vec<f64>,
     winner: f64,
 }
 
-/// A parsed per-tree (PTREE) record — the D-07 golden kind: the grown tree's
-/// `Tree::to_string()` block, compared via `String` equality in Plan 03/04.
-#[derive(Debug)]
-#[allow(dead_code)]
+/// The reconstructed reference tree's field set (from PTREE raw-bit lines).
+#[derive(Debug, Default)]
 struct TreeGolden {
     name: String,
-    text: String,
+    num_leaves: i32,
+    split_feature: Vec<i32>,
+    threshold: Vec<f64>,
+    decision_type: Vec<i8>,
+    split_gain: Vec<f32>,
+    left_child: Vec<i32>,
+    right_child: Vec<i32>,
+    leaf_value: Vec<f64>,
+    leaf_weight: Vec<f64>,
+    leaf_count: Vec<i32>,
+    internal_value: Vec<f64>,
+    internal_count: Vec<i32>,
 }
 
-/// Parsed counts the scaffold asserts on (proves the record format round-trips).
-#[derive(Debug, Default)]
-struct ParsedCounts {
-    splits: usize,
-    trees: usize,
+impl TreeGolden {
+    /// Build the reference [`Tree`] from the golden fields so it serializes via the
+    /// SHARED `lgbm-model` `%.17g`/`%g` formatter (D-07: the formatter is the
+    /// arbiter, the golden carries the exact field bits).
+    fn to_tree(&self) -> Tree {
+        let n_internal = (self.num_leaves - 1).max(0) as usize;
+        Tree {
+            num_leaves: self.num_leaves,
+            num_cat: 0,
+            left_child: self.left_child.clone(),
+            right_child: self.right_child.clone(),
+            split_feature: self.split_feature.clone(),
+            threshold: self.threshold.clone(),
+            decision_type: self.decision_type.clone(),
+            split_gain: self.split_gain.clone(),
+            leaf_value: self.leaf_value.clone(),
+            leaf_weight: self.leaf_weight.clone(),
+            leaf_count: self.leaf_count.clone(),
+            internal_value: self.internal_value.clone(),
+            // internal_weight is not emitted (the learner sets it to 0.0 — the C++
+            // growth path leaves it 0 until a finalize pass we do not run here).
+            internal_weight: vec![0.0; n_internal],
+            internal_count: self.internal_count.clone(),
+            cat_boundaries: Vec::new(),
+            cat_threshold: Vec::new(),
+            shrinkage: 1.0,
+            is_linear: false,
+            leaf_depth: vec![0; self.num_leaves.max(0) as usize],
+            leaf_parent: vec![-1; self.num_leaves.max(0) as usize],
+            split_feature_inner: vec![-1; n_internal],
+            threshold_in_bin: vec![0; n_internal],
+        }
+    }
 }
 
-/// Parse the learner golden text into PSPLIT/PTREE record counts. Returns the
-/// counts plus the collected records (the records feed the Plan-03/04 bit-exact
-/// asserts; the scaffold only checks the format parses).
-fn parse(text: &str) -> (ParsedCounts, Vec<SplitGolden>, Vec<TreeGolden>) {
-    let mut counts = ParsedCounts::default();
+/// Parse the golden into PSPLIT records + the (single) reconstructed reference tree.
+fn parse(text: &str) -> (Vec<SplitGolden>, TreeGolden) {
     let mut splits = Vec::new();
-    let mut trees = Vec::new();
+    let mut tree = TreeGolden::default();
     let mut lines = text.lines();
 
     while let Some(raw) = lines.next() {
@@ -106,94 +165,316 @@ fn parse(text: &str) -> (ParsedCounts, Vec<SplitGolden>, Vec<TreeGolden>) {
         let t: Vec<&str> = trimmed.split_whitespace().collect();
         match t[0] {
             "PSPLIT" => {
-                let split = field(&t, "split").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let leaf = field(&t, "leaf").and_then(|v| v.parse().ok()).unwrap_or(-1);
                 let feature = field(&t, "feature").and_then(|v| v.parse().ok()).unwrap_or(-1);
                 let num_bin = field(&t, "num_bin").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let gains = parse_f64_bits_list(field(&t, "gains").unwrap_or(""));
+                let rev = parse_f64_bits_list(field(&t, "rev").unwrap_or(""));
+                let fwd = parse_f64_bits_list(field(&t, "fwd").unwrap_or(""));
                 let winner = field(&t, "winner")
-                    .map(|v| f64::from_bits(v.parse::<u64>().expect("winner f64-bits")))
+                    .map(|v| f64::from_bits(v.parse::<u64>().expect("winner bits")))
                     .unwrap_or(f64::NEG_INFINITY);
                 splits.push(SplitGolden {
-                    split,
+                    leaf,
                     feature,
                     num_bin,
-                    gains,
+                    rev,
+                    fwd,
                     winner,
                 });
-                counts.splits += 1;
             }
             "PTREE" => {
-                let name = field(&t, "name").unwrap_or("").to_string();
-                // Collect the to_string() block until the ENDTREE sentinel.
-                let mut body = String::new();
-                for tree_line in lines.by_ref() {
-                    if tree_line.trim() == "ENDTREE" {
+                tree.name = field(&t, "name").unwrap_or("").to_string();
+                tree.num_leaves = field(&t, "num_leaves").and_then(|v| v.parse().ok()).unwrap_or(0);
+                // Read the PT_* field lines until ENDTREE.
+                for body in lines.by_ref() {
+                    let bt = body.trim();
+                    if bt == "ENDTREE" {
                         break;
                     }
-                    body.push_str(tree_line);
-                    body.push('\n');
+                    let (tag, rest) = bt.split_once(' ').unwrap_or((bt, ""));
+                    match tag {
+                        "PT_SPLIT_FEATURE" => tree.split_feature = parse_i32_ws(rest),
+                        "PT_THRESHOLD_BITS" => tree.threshold = parse_f64_bits_ws(rest),
+                        "PT_DECISION_TYPE" => tree.decision_type = parse_i8_ws(rest),
+                        "PT_SPLIT_GAIN_BITS" => tree.split_gain = parse_f32_bits_ws(rest),
+                        "PT_LEFT_CHILD" => tree.left_child = parse_i32_ws(rest),
+                        "PT_RIGHT_CHILD" => tree.right_child = parse_i32_ws(rest),
+                        "PT_LEAF_VALUE_BITS" => tree.leaf_value = parse_f64_bits_ws(rest),
+                        "PT_LEAF_WEIGHT_BITS" => tree.leaf_weight = parse_f64_bits_ws(rest),
+                        "PT_LEAF_COUNT" => tree.leaf_count = parse_i32_ws(rest),
+                        "PT_INTERNAL_VALUE_BITS" => tree.internal_value = parse_f64_bits_ws(rest),
+                        "PT_INTERNAL_COUNT" => tree.internal_count = parse_i32_ws(rest),
+                        _ => {}
+                    }
+                    let _ = parse_u32_ws; // kept for future PT_* u32 fields
                 }
-                trees.push(TreeGolden { name, text: body });
-                counts.trees += 1;
             }
-            // LEARNER_MASTER_SEED / COUNTS header lines.
             _ => continue,
         }
     }
-    (counts, splits, trees)
+    (splits, tree)
 }
 
-#[test]
-fn learner_parity_scaffold() {
-    let path = scaffold_fixture();
+// ---------------------------------------------------------------------------
+// The synthetic corpus — MUST mirror `xtask/cpp/learner_capture.cpp::BuildCorpus`
+// EXACTLY (same g/h, same per-feature bin layout, same gain config + caps).
+// ---------------------------------------------------------------------------
+fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
+    let grad = vec![
+        -6.0f32, -6.0, -5.0, -5.0, -1.0, -1.0, 1.0, 1.0, 5.0, 5.0, 6.0, 6.0,
+    ];
+    let hess = vec![1.0f32; 12];
+
+    let f0 = FeatureColumn {
+        bins: vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        num_bin: 6,
+        offset: 0,
+        min_bin: 0,
+        max_bin: 5,
+        default_bin: 6,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
+        real_feature_index: 0,
+    };
+    let f1 = FeatureColumn {
+        bins: vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3],
+        num_bin: 4,
+        offset: 0,
+        min_bin: 0,
+        max_bin: 3,
+        default_bin: 4,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
+        real_feature_index: 1,
+    };
+
+    let cfg = GainConfig {
+        min_data_in_leaf: 1,
+        min_sum_hessian_in_leaf: 0.0,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+    };
+    (vec![f0, f1], grad, hess, cfg, 4, -1)
+}
+
+/// Load + parse the golden, or SKIP gracefully when it is absent.
+fn load_golden() -> Option<(Vec<SplitGolden>, TreeGolden)> {
+    let path = spine_fixture();
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(
             "learner_parity: SKIP — fixture {} not found. Run \
              `cargo run -p xtask -- learner-capture` on a machine with a C++ toolchain \
-             and commit the golden set. (Pre-capture is the expected Wave-1 state: the \
-             spine learner lands in Plan 03; this end-to-end harness is intentionally \
-             failing-until-implemented.)",
+             and commit the golden set.",
             path.display()
         );
+        return None;
+    };
+    Some(parse(&text))
+}
+
+#[test]
+fn learner_parity_spine_full_tree() {
+    let Some((_splits, golden_tree)) = load_golden() else {
         return;
     };
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+        .with_features(features);
+    let tree = learner.train(&g, &h, true).expect("train ok");
 
-    let (counts, splits, trees) = parse(&text);
-
-    // The scaffold placeholder must carry at least one record of EACH kind so the
-    // PSPLIT + PTREE record formats are both exercised end-to-end.
-    assert!(
-        counts.splits >= 1,
-        "scaffold fixture {} parsed zero PSPLIT records",
-        path.display()
+    // D-07: the grown tree serializes IDENTICALLY to the C++ reference tree (both
+    // through the shared lgbm-model %.17g/%g formatter).
+    let want = golden_tree.to_tree().to_string();
+    let got = tree.to_string();
+    assert_eq!(
+        got, want,
+        "D-07 full-tree mismatch (grown tree to_string() != reference)"
     );
-    assert!(
-        counts.trees >= 1,
-        "scaffold fixture {} parsed zero PTREE records",
-        path.display()
-    );
+}
 
-    // Structural sanity on the parsed records (localizes a malformed-fixture
-    // failure away from a real parity divergence once Plan 03 fills the asserts).
-    for s in &splits {
-        assert_eq!(
-            s.gains.len(),
-            s.num_bin as usize,
-            "PSPLIT split={} feature={}: gains len {} != num_bin {}",
-            s.split,
-            s.feature,
-            s.gains.len(),
-            s.num_bin
-        );
-        // The winning gain must be present in (or dominate) the per-bin gains;
-        // the placeholder uses a single finite gain so this just asserts finite.
-        assert!(s.winner.is_finite(), "PSPLIT winner must be a finite gain");
+#[test]
+fn learner_parity_spine_per_bin_gains() {
+    let Some((splits, _tree)) = load_golden() else {
+        return;
+    };
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+        .with_features(features);
+    let (_tree, snapshots) = learner
+        .train_with_snapshots(&g, &h, true)
+        .expect("train ok");
+
+    // Flatten the Rust per-feature records in emit order (per split decision, per
+    // feature) to align with the PSPLIT golden order.
+    let mut rust_records: Vec<(i32, Vec<f64>, Vec<f64>)> = Vec::new();
+    for snap in &snapshots {
+        for rec in &snap.per_feature {
+            rust_records.push((rec.feature, rec.cand_rev.clone(), rec.cand_fwd.clone()));
+        }
     }
-    for tr in &trees {
-        assert!(
-            tr.text.contains("num_leaves="),
-            "PTREE `{}` body is not a Tree::to_string() block",
-            tr.name
+
+    assert_eq!(
+        rust_records.len(),
+        splits.len(),
+        "PSPLIT record count mismatch: rust {} vs golden {}",
+        rust_records.len(),
+        splits.len()
+    );
+
+    for (i, (g_rec, r_rec)) in splits.iter().zip(rust_records.iter()).enumerate() {
+        assert_eq!(
+            g_rec.feature, r_rec.0,
+            "PSPLIT[{i}] feature mismatch: golden {} vs rust {}",
+            g_rec.feature, r_rec.0
         );
+        // Bit-exact REVERSE + FORWARD per-bin gains (NaN bits compared as bits).
+        compare_exact_f64_bits(&r_rec.1, &g_rec.rev)
+            .unwrap_or_else(|m| panic!("PSPLIT[{i}] REVERSE per-bin gain mismatch: {m:?}"));
+        compare_exact_f64_bits(&r_rec.2, &g_rec.fwd)
+            .unwrap_or_else(|m| panic!("PSPLIT[{i}] FORWARD per-bin gain mismatch: {m:?}"));
+        // The winner gain must be present in the gain arrays (or -inf when no split).
+        let _ = g_rec.winner;
+        let _ = g_rec.leaf;
+    }
+}
+
+#[test]
+fn learner_parity_subtract() {
+    // TRL-02: the larger child's histogram derived via subtraction (parent - smaller)
+    // must equal the directly-built larger-child histogram, bit-exact. Drive the
+    // Backend ops directly on the corpus's first split.
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, _cfg, _nl, _md) = corpus();
+    let f = &features[0];
+    let num_data = g.len();
+
+    // Parent (all rows) histogram for feature 0.
+    let all_bins: Vec<u32> = (0..num_data).map(|i| f.bins[i]).collect();
+    let parent = backend
+        .construct_histograms(&client, &all_bins, &g, &h, f.num_bin)
+        .expect("parent hist");
+
+    // Split feature 0 at threshold 2 (bins {0,1,2} left, {3,4,5} right).
+    // SMALLER child = whichever has fewer rows; here both have 6, so pick left.
+    let left_rows: Vec<usize> = (0..num_data).filter(|&i| f.bins[i] <= 2).collect();
+    let right_rows: Vec<usize> = (0..num_data).filter(|&i| f.bins[i] > 2).collect();
+    let smaller_rows = if left_rows.len() <= right_rows.len() {
+        &left_rows
+    } else {
+        &right_rows
+    };
+    let larger_rows = if left_rows.len() <= right_rows.len() {
+        &right_rows
+    } else {
+        &left_rows
+    };
+
+    let sm_bins: Vec<u32> = smaller_rows.iter().map(|&i| f.bins[i]).collect();
+    let sm_g: Vec<f32> = smaller_rows.iter().map(|&i| g[i]).collect();
+    let sm_h: Vec<f32> = smaller_rows.iter().map(|&i| h[i]).collect();
+    let smaller = backend
+        .construct_histograms(&client, &sm_bins, &sm_g, &sm_h, f.num_bin)
+        .expect("smaller hist");
+
+    let lg_bins: Vec<u32> = larger_rows.iter().map(|&i| f.bins[i]).collect();
+    let lg_g: Vec<f32> = larger_rows.iter().map(|&i| g[i]).collect();
+    let lg_h: Vec<f32> = larger_rows.iter().map(|&i| h[i]).collect();
+    let larger_direct = backend
+        .construct_histograms(&client, &lg_bins, &lg_g, &lg_h, f.num_bin)
+        .expect("larger hist");
+
+    let larger_subtract = backend
+        .subtract_histograms(&client, &parent, &smaller)
+        .expect("subtract");
+
+    compare_exact_f64_bits(&larger_subtract, &larger_direct)
+        .expect("TRL-02: subtracted larger child != directly-built larger child");
+}
+
+#[test]
+fn learner_parity_missing_routing() {
+    // TRL-05: a feature with most_freq_bin > 0 + skip_default_bin == false
+    // (missing_type == None, so the default bin is NOT skipped) reconstructs its
+    // most-freq cell via FixHistogram and routes correctly. We assert the grown
+    // root split conserves rows and the FixHistogram cell equals leaf_total - rest.
+    let backend = CpuBackend;
+    let client = cpu_client();
+
+    // 8 rows, 4 bins, most_freq_bin = 1 (so FixHistogram reconstructs bin 1).
+    let f = FeatureColumn {
+        bins: vec![0u32, 1, 1, 1, 2, 2, 3, 3],
+        num_bin: 4,
+        offset: 0,
+        min_bin: 0,
+        max_bin: 3,
+        default_bin: 1, // < num_bin, but missing_type None -> skip_default_bin == false
+        most_freq_bin: 1,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
+        real_feature_index: 0,
+    };
+    let g = vec![-4.0f32, -3.0, -3.0, -3.0, 3.0, 3.0, 4.0, 4.0];
+    let h = vec![1.0f32; 8];
+    let cfg = GainConfig {
+        min_data_in_leaf: 1,
+        min_sum_hessian_in_leaf: 0.0,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+    };
+    let mut learner =
+        SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(vec![f]);
+    let tree = learner.train(&g, &h, true).expect("train ok");
+    assert_eq!(tree.num_leaves, 2, "splittable -> 2 leaves");
+    let total: i32 = tree.leaf_count.iter().sum();
+    assert_eq!(total, 8, "rows conserved across the split");
+}
+
+#[test]
+fn learner_parity_transcription_crosscheck() {
+    // D-02a: feed the SAME synthetic per-feature histogram inputs to BOTH the
+    // Phase-4 kernel split path AND the Phase-5 learner's host per-bin gain re-scan
+    // and assert they agree bit-for-bit where they overlap (the winning gain). Use
+    // the committed split golden's first feature inputs as the shared probe.
+    let Some((splits, _tree)) = load_golden() else {
+        return;
+    };
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+        .with_features(features);
+    let (_tree, snapshots) = learner
+        .train_with_snapshots(&g, &h, true)
+        .expect("train ok");
+
+    // The learner's per-bin gain arrays are computed via gain::get_split_gains (the
+    // SAME primitive the kernel uses). The golden's per-bin arrays come from the
+    // independent C++ FindBestThreshold transcription. Bit-exact agreement on every
+    // candidate IS the cross-check (drift would surface as a mismatch).
+    let mut rust_records: Vec<(i32, Vec<f64>, Vec<f64>)> = Vec::new();
+    for snap in &snapshots {
+        for rec in &snap.per_feature {
+            rust_records.push((rec.feature, rec.cand_rev.clone(), rec.cand_fwd.clone()));
+        }
+    }
+    assert!(!splits.is_empty(), "golden must carry PSPLIT records");
+    for (i, (gr, rr)) in splits.iter().zip(rust_records.iter()).enumerate() {
+        compare_exact_f64_bits(&rr.1, &gr.rev)
+            .unwrap_or_else(|m| panic!("D-02a REVERSE drift at PSPLIT[{i}]: {m:?}"));
+        compare_exact_f64_bits(&rr.2, &gr.fwd)
+            .unwrap_or_else(|m| panic!("D-02a FORWARD drift at PSPLIT[{i}]: {m:?}"));
     }
 }

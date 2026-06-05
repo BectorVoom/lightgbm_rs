@@ -52,9 +52,9 @@ pub const KERNEL_MASTER_SEED: i32 = 0x4157_F00D;
 /// The recorded master seed for the Phase-5 serial tree-learner golden corpus
 /// (D-06 per-split / D-07 per-tree). Like the other master seeds it is the SINGLE
 /// source of randomness for the learner cases, so `learner-capture` is
-/// byte-idempotent (empty `git diff`). Recorded in REFERENCE_MANIFEST.md. The
-/// 05-02 scaffold emits a fixed placeholder; Plan 03/04 drive the real corpus off
-/// this seed.
+/// byte-idempotent (empty `git diff`). Recorded in REFERENCE_MANIFEST.md. Plan
+/// 05-03 emits the real `spine.txt` from the fixed (hand-crafted, NOT
+/// RNG-derived) synthetic corpus; the seed is recorded for format continuity.
 pub const LEARNER_MASTER_SEED: i32 = 0x1EA6_5EED;
 
 /// Pinned LightGBM submodule commit (recorded in the manifest, ORA-02 / D-05).
@@ -475,9 +475,9 @@ fn kernel_capture() -> Result<()> {
 /// derived corpus and writes the goldens under
 /// `crates/oracle-harness/tests/fixtures/learner/`. Byte-idempotent.
 ///
-/// Plan 05-02 ships the SCAFFOLD: a single placeholder fixture (`scaffold.txt`)
-/// exercising the PSPLIT (per-split, D-06) + PTREE (per-tree, D-07) record
-/// formats. Plan 03/04 fill the real per-split / per-tree corpus.
+/// Plan 05-03 emits the real `spine.txt`: the full verbatim leaf-wise-loop
+/// transcription over a fixed synthetic g/h corpus, carrying per-split (D-06)
+/// per-bin gain arrays + the per-tree (D-07) grown-tree field set.
 fn learner_capture() -> Result<()> {
     let root = workspace_root()?;
     verify_toolchain()?;
@@ -503,7 +503,8 @@ fn learner_capture() -> Result<()> {
     let fixtures_dir = root.join("crates/oracle-harness/tests/fixtures/learner");
     std::fs::create_dir_all(&fixtures_dir)
         .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
-    let scaffold_path = fixtures_dir.join("scaffold.txt");
+    // Plan 05-03 emits the real per-split (D-06) + per-tree (D-07) spine golden.
+    let spine_path = fixtures_dir.join("spine.txt");
 
     eprintln!("xtask learner-capture: configuring C++ capture build ...");
     run(
@@ -536,15 +537,15 @@ fn learner_capture() -> Result<()> {
     );
     run(
         Command::new(&exe)
-            .arg(&scaffold_path)
+            .arg(&spine_path)
             .arg(LEARNER_MASTER_SEED.to_string()),
         "learner_capture",
     )?;
 
-    if !scaffold_path.is_file() {
+    if !spine_path.is_file() {
         bail!(
             "capture completed but {} was not written",
-            scaffold_path.display()
+            spine_path.display()
         );
     }
 
@@ -557,7 +558,7 @@ fn learner_capture() -> Result<()> {
 
     eprintln!(
         "xtask learner-capture: done. Wrote {} and refreshed {}.",
-        scaffold_path.display(),
+        spine_path.display(),
         manifest_path.display()
     );
     eprintln!(
@@ -1072,28 +1073,36 @@ bit-exact on the cubecl-cpu anchor (`compare_exact_f64_bits` per-split) / string
 equality (per-tree).\n\
 \n\
 - **Learner master seed:** `{learner_master_seed}` (`0x{learner_master_seed_hex:08X}`) —\n\
-  the SINGLE source of randomness for the learner corpus (idempotent regen).\n\
-- **Plan 05-02 status: SCAFFOLD.** A single placeholder fixture (`scaffold.txt`)\n\
-  exercises both record formats (one PSPLIT, one PTREE) so the parity harness has\n\
-  a committed target and a failing-until-implemented end-to-end test exists.\n\
-- **Capture-config placeholders (finalized in Plan 03/04):** D-04 row/col\n\
-  dimensions and the D-03 gradient/hessian source are TBD — the spine plan pins\n\
-  synthetic cases to `missing_type == None` to defer the NA_AS_MISSING forward\n\
-  branch (RESEARCH A5).\n\
+  recorded for format continuity; the Plan-05-03 corpus is hand-crafted (fixed\n\
+  synthetic g/h), NOT RNG-derived, so the capture is byte-idempotent regardless.\n\
+- **Plan 05-03 status: REAL SPINE GOLDEN (`spine.txt`).** The full verbatim\n\
+  leaf-wise-loop transcription grows a tree over a FIXED 12-row / 2-feature\n\
+  synthetic g/h corpus (`force_row_wise`, `feature_fraction=1.0`,\n\
+  `missing_type=None` per RESEARCH A5 — NA_AS_MISSING deferred). It emits 10\n\
+  PSPLIT records (per-bin REVERSE+FORWARD gain arrays per candidate feature at\n\
+  every split decision, D-06) + 1 PTREE record (the grown 4-leaf tree's field set\n\
+  as raw bits, D-07). `learner_parity.rs` replays per-split bit-exact, full-tree\n\
+  via the shared `%.17g` formatter, the subtraction trick, missing/zero routing,\n\
+  and the D-02a kernel-vs-learner cross-check.\n\
 \n\
-### Record format (`scaffold.txt`)\n\
+### Record format (`spine.txt`)\n\
 \n\
 ```\n\
 LEARNER_MASTER_SEED <seed>\n\
 COUNTS splits=<n> trees=<n>\n\
-PSPLIT split=<i> feature=<f> num_bin=<n> gains=<f64bits;...> winner=<f64bits>\n\
-PTREE name=<id>\n\
-<Tree::to_string() lines...>\n\
+PSPLIT split=<i> leaf=<l> feature=<f> num_bin=<n> rev=<f64bits;...> fwd=<f64bits;...> winner=<f64bits>\n\
+PTREE name=<id> num_leaves=<n>\n\
+PT_SPLIT_FEATURE <i...>  PT_THRESHOLD_BITS <u64...>  PT_DECISION_TYPE <i...>\n\
+PT_SPLIT_GAIN_BITS <u32...>  PT_LEFT_CHILD <i...>  PT_RIGHT_CHILD <i...>\n\
+PT_LEAF_VALUE_BITS <u64...>  PT_LEAF_WEIGHT_BITS <u64...>  PT_LEAF_COUNT <i...>\n\
+PT_INTERNAL_VALUE_BITS <u64...>  PT_INTERNAL_COUNT <i...>\n\
 ENDTREE\n\
 ```\n\
 \n\
-`gains`/`winner` are raw little-endian f64 bit patterns (decimal `u64`) for\n\
-bit-exact replay; the per-tree block is compared as a `String`.\n\
+`rev`/`fwd`/`winner` + the PT_*_BITS lines are raw little-endian f64/f32 bit\n\
+patterns (decimal `u64`/`u32`) for bit-exact replay; the Rust side reconstructs\n\
+the reference `Tree` from the PT_* fields and serializes it via the shared\n\
+`lgbm-model` `%.17g` formatter for the D-07 String compare.\n\
 \n\
 ### Capture-harness note (external_libs unbuildable)\n\
 \n\
@@ -1101,7 +1110,7 @@ The authoritative `SerialTreeLearner` lives in\n\
 `src/treelearner/serial_tree_learner.cpp`, which (via `<LightGBM/dataset.h>` ->\n\
 `common.h`) transitively #includes `fast_double_parser.h` + `fmt/format.h` from\n\
 `external_libs/` — present here only as EMPTY directories. `learner_capture.cpp`\n\
-therefore VERBATIM-transcribes the learner growth loop (Plan 03/04) from the\n\
+therefore VERBATIM-transcribes the learner growth loop (Plan 05-03) from the\n\
 pinned `serial_tree_learner.cpp` (commit `{commit}`, version `{version}`),\n\
 reusing `kernel_capture.cpp`'s already-transcribed gain/split math (D-02a\n\
 cross-check), and includes the header-only `LightGBM/include` only for the genuine\n\

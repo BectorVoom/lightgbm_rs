@@ -23,3 +23,8 @@ lgbm-core = { path = "../lgbm-core" }
 # for `cargo test` of this crate, never by downstream consumers of the harness.
 lgbm-compute = { path = "../lgbm-compute" }
 lgbm-dataset = { path = "../lgbm-dataset" }
+# Test-only: the learner-parity replay drives the spine learner + reconstructs the
+# reference Tree from the committed golden's raw-bit fields, comparing via the
+# shared lgbm-model %.17g formatter (D-07).
+lgbm-model = { path = "../lgbm-model" }
+lgbm-treelearner = { path = "../lgbm-treelearner" }
