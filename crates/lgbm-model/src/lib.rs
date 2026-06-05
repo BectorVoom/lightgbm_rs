@@ -23,9 +23,11 @@ pub mod ensemble;
 pub mod error;
 pub mod format;
 pub mod model_text;
+pub mod objective;
 pub mod predict;
 pub mod tree;
 
 pub use ensemble::GbdtModel;
 pub use error::ModelError;
+pub use objective::ObjectiveKind;
 pub use tree::Tree;
