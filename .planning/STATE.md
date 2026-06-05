@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 04-04-PLAN.md
-last_updated: "2026-06-05T19:55:00.000Z"
-last_activity: 2026-06-05 -- Plan 04-04 executed (ROCm/HIP bring-up on gfx1100 + separate ~1e-6 hip parity gate; D-03a gap ledger)
+status: completed
+stopped_at: Phase 04 complete — verified (5/5 SC, 6/6 req IDs); ready for Phase 05
+last_updated: "2026-06-05T20:09:20.634Z"
+last_activity: 2026-06-05
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 18
-  completed_plans: 17
-  percent: 56
+  completed_plans: 18
+  percent: 50
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 04 — compute-backend-cpu-first-integer-histograms-rocm
+**Current focus:** Phase 05 — Tree Learner + Split Finding (Phase 04 compute backend complete)
 
 ## Current Position
 
-Phase: 04 (compute-backend-cpu-first-integer-histograms-rocm) — COMPLETE
-Plan: 4 of 4 (04-01, 04-02, 04-03, 04-04 complete)
+Phase: 5
+Plan: Not started
 Status: Phase 04 complete — ready for Phase 05 (tree learner)
-Last activity: 2026-06-05 -- Plan 04-04 executed (ROCm/HIP bring-up on gfx1100 + separate ~1e-6 hip parity gate; D-03a gap ledger)
+Last activity: 2026-06-05
 
 Progress: [██████████] Phase 4 COMPLETE — compute backend closed on BOTH backends within contract: cpu bit-exact (hard gate, 04-01..03: construct_histograms + find_best_split + data_partition + subtract_histograms) AND cubecl-hip on gfx1100 (04-04: f32-accumulate path via capability gate, separate ~1e-6 hip-vs-cpu-anchor parity gate run; one documented f32-vs-f64 accumulation gap ≈ 1 f32 ULP in 04-ROCM-GAPS.md, best-effort D-03a). CPU-only build needs no ROCm toolchain.
 
@@ -127,7 +127,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 
 **Velocity:**
 
-- Total plans completed: 12 (tracked)
+- Total plans completed: 16 (tracked)
 - Average duration: ~3 min
 - Total execution time: <1 hour
 
@@ -139,6 +139,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | 02-dataset-binning-determinism-root | 5/5 | ~65 min + continuation | ~16 min |
 | 02 | 7 | - | - |
 | 03 | 4 | - | - |
+| 04 | 4 | - | - |
 
 **Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 **Plan 01-03:** 2 TDD tasks, 3 files modified, 7 new tests (49 → 56); deterministic alias resolution + empty==absent reads; `cargo test --workspace` green.
