@@ -14,7 +14,7 @@ A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm bac
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [ ] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace
-- [ ] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion
+- [x] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion
 - [ ] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists)
 - [ ] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity
@@ -84,7 +84,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 5** *(blocked on Wave 4; EFB sequenced last per MEDIUM-risk capture flag, has checkpoint)*
 
-  - [ ] 02-05-PLAN.md — Exclusive Feature Bundling (MultiValBin + FastFeatureBundling) group/offset golden parity (layer 3)
+  - [x] 02-05-PLAN.md — Exclusive Feature Bundling (MultiValBin + FastFeatureBundling) group/offset golden parity (layer 3)
 
 ### Phase 3: Tree Model + Model Text I/O + Predict Parity
 
@@ -190,7 +190,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
-| 2. Dataset + Binning | 2/5 | In progress | - |
+| 2. Dataset + Binning | 5/5 | Plans complete | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
