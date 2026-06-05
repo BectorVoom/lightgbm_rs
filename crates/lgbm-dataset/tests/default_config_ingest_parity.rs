@@ -85,14 +85,26 @@ fn parse_u32_list(s: &str) -> Vec<u32> {
 }
 
 /// One feature's golden: layer-1 metadata + the STORED per-row bins.
+///
+/// Representation contract (agreed with the bin_capture.cpp emitter, Task 2):
+/// a TRIVIAL feature (`is_trivial=1`) carries NO `group=`/`subfeature=` fields
+/// and NO `ASSIGN` line (it is dropped from the store, dataset.cpp:337-343); a
+/// NON-trivial feature carries `group=`/`subfeature=` AND exactly one `ASSIGN`.
 struct FeatureGolden {
     num_bin: i32,
     default_bin: u32,
     most_freq_bin: u32,
     is_trivial: bool,
     upper: Vec<f64>,
-    /// STORED per-row bins (what the FeatureGroup holds), NOT recomputed.
+    /// C++-Construct group id (`feature2group_`); `None` for a trivial feature.
+    group: Option<i32>,
+    /// C++-Construct sub-feature index (`feature2subfeature_`); `None` if trivial.
+    subfeature: Option<i32>,
+    /// STORED per-row bins (what the FeatureGroup holds), NOT recomputed. Empty
+    /// for a trivial feature (no ASSIGN line).
     stored: Vec<u32>,
+    /// Whether an ASSIGN line was seen for this feature (representation check).
+    has_assign: bool,
 }
 
 struct Golden {
@@ -146,13 +158,21 @@ fn parse_golden(text: &str) -> Golden {
                 if let Some(fg) = pending.take() {
                     features.push(fg);
                 }
+                let is_trivial = parse_i32(&tokens, "is_trivial") != 0;
+                // group=/subfeature= present iff non-trivial (Task 2 contract).
+                let group = field(&tokens, "group").map(|s| s.parse::<i32>().expect("group i32"));
+                let subfeature = field(&tokens, "subfeature")
+                    .map(|s| s.parse::<i32>().expect("subfeature i32"));
                 pending = Some(FeatureGolden {
                     num_bin: parse_i32(&tokens, "num_bin"),
                     default_bin: parse_i32(&tokens, "default_bin") as u32,
                     most_freq_bin: parse_i32(&tokens, "most_freq_bin") as u32,
-                    is_trivial: parse_i32(&tokens, "is_trivial") != 0,
+                    is_trivial,
                     upper: parse_f64_bits_list(field(&tokens, "upper").unwrap_or("")),
+                    group,
+                    subfeature,
                     stored: Vec::new(),
+                    has_assign: false,
                 });
             }
             "ASSIGN" => {
@@ -162,13 +182,37 @@ fn parse_golden(text: &str) -> Golden {
                 } else {
                     parse_u32_list(list)
                 };
-                pending.as_mut().expect("FEATURE before ASSIGN").stored = stored;
+                let fg = pending.as_mut().expect("FEATURE before ASSIGN");
+                fg.stored = stored;
+                fg.has_assign = true;
             }
             other => panic!("unexpected record `{other}`"),
         }
     }
     if let Some(fg) = pending.take() {
         features.push(fg);
+    }
+
+    // Representation-agreement check (hard parse-time panic, NOT a skip): a
+    // trivial feature MUST have no group/subfeature and no ASSIGN; a non-trivial
+    // feature MUST have group=/subfeature= AND exactly one ASSIGN. A mismatch
+    // means the emitter (Task 2) and the test disagree — that is a hard error.
+    for (f, fg) in features.iter().enumerate() {
+        if fg.is_trivial {
+            assert!(
+                fg.group.is_none() && fg.subfeature.is_none() && !fg.has_assign,
+                "feature {f}: trivial feature must carry NO group/subfeature and NO ASSIGN \
+                 (group={:?} subfeature={:?} has_assign={})",
+                fg.group, fg.subfeature, fg.has_assign
+            );
+        } else {
+            assert!(
+                fg.group.is_some() && fg.subfeature.is_some() && fg.has_assign,
+                "feature {f}: non-trivial feature must carry group=/subfeature= AND one ASSIGN \
+                 (group={:?} subfeature={:?} has_assign={})",
+                fg.group, fg.subfeature, fg.has_assign
+            );
+        }
     }
 
     Golden {
@@ -187,15 +231,11 @@ fn parse_golden(text: &str) -> Golden {
 #[test]
 fn default_config_ingest_matches_cpp() {
     let gpath = golden_path();
-    let Ok(text) = std::fs::read_to_string(&gpath) else {
-        eprintln!(
-            "default_config_ingest_parity: SKIP — golden {} not found. Run \
-             `cargo run -p xtask -- bin-capture` on a machine with a C++ toolchain \
-             and commit the golden.",
-            gpath.display()
-        );
-        return;
-    };
+    // WR-01: the golden is COMMITTED, so a missing/unreadable file is a HARD
+    // failure (panic), never a silent SKIP. A silent skip would let the parity
+    // gate vanish without anyone noticing on a determinism-root phase.
+    let text = std::fs::read_to_string(&gpath)
+        .unwrap_or_else(|e| panic!("committed golden {} unreadable: {e}", gpath.display()));
 
     let g = parse_golden(&text);
     assert!(g.num_rows > 0 && g.num_features > 0, "empty golden");
@@ -242,7 +282,20 @@ fn default_config_ingest_matches_cpp() {
     let (ds, _md) = lgbm_dataset::from_mat(&flat, g.num_rows, g.num_features, &cfg, md)
         .expect("from_mat on default config");
     assert_eq!(ds.num_data(), g.num_rows);
-    assert_eq!(ds.num_features(), g.num_features);
+    // CR-01: trivial features are DROPPED, so ds.num_features() is the count of
+    // NON-trivial (used) golden features, NOT the total column count. Whenever a
+    // feature is trivial this is strictly less than g.num_features — exactly the
+    // C++ Construct behaviour (used_features only). An unfixed construct that kept
+    // every feature would give ds.num_features() == g.num_features and FAIL here.
+    let used_count = g.features.iter().filter(|f| !f.is_trivial).count() as i32;
+    assert_eq!(
+        ds.num_features(),
+        used_count,
+        "ds.num_features {} != non-trivial golden feature count {} \
+         (CR-01: trivial features must be dropped)",
+        ds.num_features(),
+        used_count
+    );
 
     // At least one feature MUST be trivial in the golden (the engineered flip
     // feature) — otherwise the test would not discriminate the bug.
@@ -251,22 +304,72 @@ fn default_config_ingest_matches_cpp() {
         "golden must contain BOTH a trivial and a non-trivial feature to exercise the flip"
     );
 
+    // Whole-grouping cross-check: the dataset's group count equals the number of
+    // distinct golden group ids (one feature per group on this dense fixture).
+    let distinct_groups: std::collections::BTreeSet<i32> =
+        g.features.iter().filter_map(|f| f.group).collect();
+    assert_eq!(
+        ds.num_groups() as usize,
+        distinct_groups.len(),
+        "num_groups {} != distinct golden group ids {}",
+        ds.num_groups(),
+        distinct_groups.len()
+    );
+
     for f in 0..g.num_features as usize {
         let fg = &g.features[f];
-        // One-feature-per-group default: feature f lives at group f, sub-feature 0.
-        let group = ds.feature_group(f);
-        let mapper = group.bin_mapper(0);
 
-        // PRIMARY discriminating assertion: is_trivial_ must match C++.
+        if fg.is_trivial {
+            // TRIVIAL feature: DROPPED on the default ingest path. It is excluded
+            // from used_feature_map_ (used_feature_map_[f] = -1), so it has no
+            // group and no stored bins. This is the PRIMARY CR-01 assertion: an
+            // unfixed construct that stored the trivial feature would give
+            // feature_to_group(f) != -1 and FAIL here.
+            assert_eq!(
+                ds.feature_to_group(f),
+                -1,
+                "feature {f}: trivial feature must be EXCLUDED \
+                 (feature_to_group == -1), got {} (CR-01: trivial feature wrongly stored)",
+                ds.feature_to_group(f)
+            );
+            // Do NOT call ds.feature_group(f) for a trivial feature — it has none.
+            continue;
+        }
+
+        // NON-trivial feature: assert the GROUPING matches the C++-Construct
+        // golden FIRST (closes the EFB parity hole — an incorrectly-built
+        // EfbSamples that re-groups features FAILS here, not silently).
+        let want_group = fg.group.expect("non-trivial golden has group");
+        let want_sub = fg.subfeature.expect("non-trivial golden has subfeature");
+        assert_eq!(
+            ds.feature_to_group(f),
+            want_group,
+            "feature {f}: feature_to_group {} != C++-Construct golden group {} \
+             (EFB grouping divergence)",
+            ds.feature_to_group(f),
+            want_group
+        );
+        assert_eq!(
+            ds.feature_to_subfeature(f),
+            want_sub,
+            "feature {f}: feature_to_subfeature {} != C++-Construct golden subfeature {}",
+            ds.feature_to_subfeature(f),
+            want_sub
+        );
+
+        // Locate the group/sub via the verified maps and read the mapper.
+        let group = ds.feature_group(ds.feature_to_group(f) as usize);
+        let sub = ds.feature_to_subfeature(f) as usize;
+        let mapper = group.bin_mapper(sub);
+
+        // is_trivial_ must be false here (matches golden).
         assert_eq!(
             mapper.is_trivial_, fg.is_trivial,
             "feature {f}: is_trivial_ {} != golden {} (scaled-filter_cnt divergence)",
             mapper.is_trivial_, fg.is_trivial
         );
 
-        // num_bin_ and the bin_upper_bound_ (f64-bit exact). num_bin_ does NOT
-        // change on a trivial feature, so this passes regardless of the flip —
-        // it guards the kernel, not the flip.
+        // num_bin_ + bin_upper_bound_ (f64-bit exact), default_bin_, most_freq_bin_.
         assert_eq!(
             mapper.num_bin_, fg.num_bin,
             "feature {f}: num_bin_ {} != golden {}",
@@ -274,26 +377,19 @@ fn default_config_ingest_matches_cpp() {
         );
         compare_exact_f64_bits(&mapper.bin_upper_bound_, &fg.upper)
             .unwrap_or_else(|m| panic!("feature {f}: bin_upper_bound_ mismatch: {m:?}"));
-
-        // default_bin_ / most_freq_bin_ are only populated on the non-trivial
-        // branch (a trivial feature leaves them at 0). Assert them where the
-        // feature is non-trivial.
-        if !fg.is_trivial {
-            assert_eq!(
-                mapper.default_bin_, fg.default_bin,
-                "feature {f}: default_bin_ {} != golden {}",
-                mapper.default_bin_, fg.default_bin
-            );
-            assert_eq!(
-                mapper.most_freq_bin_, fg.most_freq_bin,
-                "feature {f}: most_freq_bin_ {} != golden {}",
-                mapper.most_freq_bin_, fg.most_freq_bin
-            );
-        }
+        assert_eq!(
+            mapper.default_bin_, fg.default_bin,
+            "feature {f}: default_bin_ {} != golden {}",
+            mapper.default_bin_, fg.default_bin
+        );
+        assert_eq!(
+            mapper.most_freq_bin_, fg.most_freq_bin,
+            "feature {f}: most_freq_bin_ {} != golden {}",
+            mapper.most_freq_bin_, fg.most_freq_bin
+        );
 
         // STORED per-row bins read out of the FeatureGroup store (NOT recomputed
-        // via value_to_bin). A flip in is_trivial_ -> most_freq_bin_ shift -> the
-        // stored bins diverge too, so this independently catches the bug.
+        // via value_to_bin) — bit-exact against the C++-Construct golden ASSIGN.
         let store = group
             .bin_data()
             .unwrap_or_else(|| panic!("feature {f}: no single-value bin store"));

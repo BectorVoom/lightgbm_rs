@@ -2288,10 +2288,15 @@ void EmitDefaultConfigIngest(std::ofstream& out, int master_seed) {
   std::vector<std::vector<int>> features_in_group;
   if (!used_features.empty()) {
     // enable_bundle defaults true -> FastFeatureBundling (dataset.cpp:362-369).
+    // is_sparse = io_config.is_enable_sparse, whose config.h DEFAULT is TRUE
+    // (dataset.cpp:352). The default ingest Config has is_enable_sparse=true, so
+    // we MUST pass true here to trigger the same dense/sparse second-pass split
+    // in FindGroups that the Rust construct_bundled default path runs — passing
+    // false would diverge the grouping/shuffle order from the ingest path.
     features_in_group = FastFeatureBundling(
         mappers, idx_ptrs.data(), val_ptrs.data(), efb_num_per_col.data(),
         num_features, /*total_sample_cnt=*/sample_cnt, used_features,
-        /*num_data=*/num_rows, /*is_use_gpu=*/false, /*is_sparse=*/false,
+        /*num_data=*/num_rows, /*is_use_gpu=*/false, /*is_sparse=*/true,
         &group_is_multi_val);
   }
 
