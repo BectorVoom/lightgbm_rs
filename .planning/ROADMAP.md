@@ -153,7 +153,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on 04-02)*
 
-  - [ ] 04-03-PLAN.md — find_best_split (gain math inside kernel, verbatim) + data_partition + subtract_histograms (A3 in-scope) + split/partition/subtract goldens + bit-exact cpu parity
+  - [x] 04-03-PLAN.md — find_best_split (gain math inside kernel, verbatim) + data_partition + subtract_histograms (A3 in-scope) + split/partition/subtract goldens + bit-exact cpu parity — **DONE: Backend::find_best_split (D-01a, both REVERSE t-1+offset and FORWARD t+offset branches, exact kEpsilon/2*kEpsilon + gate order) + data_partition (stable reordered index array + split_point) + subtract_histograms wired end-to-end; split.txt (per-candidate gains + winner, reverse/forward/default-bin-skip/L1/no-split) / partition.txt / subtract.txt replay BIT-EXACT; full CMP-05 kernel set closed on cpu (CMP-04/05, ORA-04 cpu); 1 Rule-1 L1-gain codegen bug fixed; cargo test --workspace green**
 
 **Wave 4** *(blocked on 04-03; has ROCm GPU checkpoint)*
 

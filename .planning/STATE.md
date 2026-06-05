@@ -26,11 +26,24 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 04 (compute-backend-cpu-first-integer-histograms-rocm) — EXECUTING
-Plan: 3 of 4 (04-01, 04-02 complete)
+Plan: 4 of 4 (04-01, 04-02, 04-03 complete)
 Status: Executing Phase 04
-Last activity: 2026-06-06 -- Plan 04-02 executed (construct_histograms vertical slice, bit-exact cpu parity)
+Last activity: 2026-06-06 -- Plan 04-03 executed (find_best_split + data_partition + subtract_histograms kernels, bit-exact cpu parity; L1 gain codegen bug fixed)
 
-Progress: [██████████] Phase 3 complete; Phase 4 plan 2/4 done — first vertical slice closed: construct_histograms Backend op → cubecl-cpu kernel → committed C++ golden → bit-exact parity (18 D-02a cases)
+Progress: [██████████] Phase 3 complete; Phase 4 plan 3/4 done — full CMP-05 Backend op set closed on cpu: construct_histograms + find_best_split (in-kernel gain math, D-01a) + data_partition + subtract_histograms, each bit-exact vs committed C++ goldens (ORA-04 cpu hard gate). Only 04-04 (ROCm) remains.
+
+### Plan 04-03 result
+
+Plan 04-03 closed the full compute-backend kernel suite on the cpu anchor and resolved RESEARCH open question A3:
+
+- **`Backend::find_best_split` (D-01a — gain math IN-kernel):** `gain.rs` holds `ThresholdL1`/`get_leaf_gain`/`get_split_gains`/`calculate_splitted_leaf_output` as `#[cube]` fns (verbatim `feature_histogram.hpp:711-845`) + `GainConfig` + `SplitInfo`; `kernels/split.rs` transcribes `FindBestThresholdSequentially` (`:830-1057`) for BOTH the REVERSE (`t-1+offset`, `sum_right_hessian=kEpsilon` seed) and FORWARD (`t+offset`, `sum_left_hessian=kEpsilon` seed) branches, with the `2*kEpsilon` entry bump, SKIP_DEFAULT_BIN continue, exact gate order, and kEpsilon subtracted back at finalize.
+- **`Backend::data_partition`** (stable SplitInner `MissingType::None` routing → reordered index array + split_point; Phase-5 owns leaf_begin_/leaf_count_) **and `Backend::subtract_histograms`** (FeatureHistogram::Subtract math, A3 resolved in-scope at the kernel layer).
+- **Layered goldens + parity (ORA-04 cpu):** `kernel_capture.cpp` extended → `split.txt` (per-candidate gains REVERSE+FORWARD + winner; reverse/forward/default-bin-skip/L1/no-split), `partition.txt`, `subtract.txt`; `kernel_parity.rs` replays all three bit-exact (split per-candidate gains via `get_split_gains` + winner via the kernel; partition via `compare_exact_u32`; subtract via `compare_exact_f64_bits`). Byte-idempotent.
+- 1 Rule-1 bug fixed: `gain.rs::threshold_l1`'s `if/else` sign form mis-lowered to a constant on cubecl-cpu, ZEROING every L1 gain (kernel returned no-split for any `lambda_l1>0`); fixed with branchless `select`, proven by the L1 split parity case. `cargo test --workspace` green. Commits: ff24113, d5061b9, 7f8a5fc.
+
+Key decision: complex sequential cube kernels on cubecl-cpu (0.10.0) require LITERAL-initialized loop-carried mutables (never from a scalar kernel arg) + branchless `select` for all conditional in-loop stores — the C++ gate ORDER and arithmetic are preserved 1:1, only the control-flow ENCODING changes. The gain sentinel is the literal `0.0` (valid gains are strictly positive; "no split" is signaled by `is_splittable==0`).
+
+Next: `/gsd-execute-phase 4` plan 04-04 (ROCm Backend impl + ~1e-6 parity variant against the same four committed goldens).
 
 ### Plan 04-02 result
 
