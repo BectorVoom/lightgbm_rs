@@ -59,10 +59,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1446,6 +1448,106 @@ std::vector<MetaCaseSpec> BuildMetaCorpus(int master_seed) {
   return cases;
 }
 
+// ===========================================================================
+// Example-dataset parity (DAT-07): load a copied LightGBM example dataset (TSV,
+// column 0 = label, columns 1.. = numeric features), bin each feature with the
+// pinned deterministic config, and dump layer 1 (bin_upper_bound_ + internals
+// per feature) + layer 2 (per-row ValueToBin per feature). End-to-end proof on
+// real data. The harness reads the COPIED fixture path passed on argv — NEVER
+// the untracked LightGBM/ tree.
+// ===========================================================================
+
+// Fixed config for example binning (matches the C-API defaults used in the Rust
+// ingest test): max_bin=255, min_data_in_bin=3, min_data_in_leaf=20,
+// no pre-filter, use_missing, sample all rows.
+constexpr int kExampleMaxBin = 255;
+constexpr int kExampleMinDataInBin = 3;
+constexpr int kExampleMinDataInLeaf = 20;
+// Cap rows for a manageable golden; the Rust test ingests the SAME prefix.
+constexpr int kExampleMaxRows = 500;
+
+// Parse a whitespace/tab-delimited numeric matrix (column 0 = label, dropped).
+// Returns features as a column-major vector<vector<double>> plus num_rows.
+struct ExampleData {
+  int num_rows = 0;
+  int num_features = 0;
+  std::vector<std::vector<double>> columns;  // columns[f][row]
+};
+
+ExampleData LoadExample(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) {
+    std::cerr << "error: cannot open example dataset: " << path << "\n";
+    std::exit(1);
+  }
+  ExampleData data;
+  std::string line;
+  while (static_cast<int>(data.num_rows) < kExampleMaxRows && std::getline(in, line)) {
+    if (line.empty()) continue;
+    std::istringstream ss(line);
+    std::vector<double> row_vals;
+    double v;
+    while (ss >> v) row_vals.push_back(v);
+    if (row_vals.empty()) continue;
+    // column 0 is the label -> features are row_vals[1..].
+    const int nfeat = static_cast<int>(row_vals.size()) - 1;
+    if (data.num_features == 0) {
+      data.num_features = nfeat;
+      data.columns.resize(nfeat);
+    }
+    for (int f = 0; f < nfeat; ++f) {
+      data.columns[f].push_back(row_vals[f + 1]);
+    }
+    data.num_rows++;
+  }
+  return data;
+}
+
+void EmitExampleDataset(std::ofstream& out, const std::string& name, const std::string& path,
+                        int data_random_seed) {
+  ExampleData data = LoadExample(path);
+
+  out << "DATASET name=" << name << " num_rows=" << data.num_rows
+      << " num_features=" << data.num_features << " max_bin=" << kExampleMaxBin
+      << " min_data_in_bin=" << kExampleMinDataInBin << " seed=" << data_random_seed << "\n";
+
+  for (int f = 0; f < data.num_features; ++f) {
+    const std::vector<double>& col = data.columns[f];
+    // sample all rows (sample_cnt > num_rows -> k = num_rows), matching the Rust
+    // ingest path with bin_construct_sample_cnt = 100000.
+    const int total_nrow = static_cast<int>(col.size());
+    const int sample_cnt = 100000;
+    const int k = total_nrow < sample_cnt ? total_nrow : sample_cnt;
+    LightGBM::Random rand(data_random_seed);
+    std::vector<int> idx = rand.Sample(total_nrow, k);
+    std::vector<double> sampled;
+    sampled.reserve(idx.size());
+    for (int i : idx) sampled.push_back(col[i]);
+
+    BinMapper bm = FindBinNumeric(sampled, kExampleMaxBin, kExampleMinDataInBin,
+                                  kExampleMinDataInLeaf, /*pre_filter=*/false,
+                                  /*use_missing=*/true, /*zero_as_missing=*/false,
+                                  sampled.size(), /*forced=*/{});
+
+    out << "FEATURE f=" << f << " num_bin=" << bm.num_bin_
+        << " missing_type=" << static_cast<int>(bm.missing_type_)
+        << " default_bin=" << bm.default_bin_ << " most_freq_bin=" << bm.most_freq_bin_
+        << " is_trivial=" << (bm.is_trivial_ ? 1 : 0) << " upper=";
+    for (size_t i = 0; i < bm.bin_upper_bound_.size(); ++i) {
+      if (i) out << ";";
+      out << F64Bits(bm.bin_upper_bound_[i]);
+    }
+    out << "\n";
+
+    out << "ASSIGN f=" << f << " ";
+    for (int r = 0; r < total_nrow; ++r) {
+      if (r) out << ";";
+      out << bm.ValueToBin(col[r]);
+    }
+    out << "\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1577,6 +1679,40 @@ int main(int argc, char** argv) {
     }
     std::cerr << "bin_capture: wrote " << mcorpus.size() << " metadata cases to " << meta_path
               << "\n";
+  }
+
+  if (argc >= 9) {
+    // example datasets: argv[7] = output golden, argv[8..] = copied input paths.
+    const std::string example_out = argv[7];
+    std::ofstream eout(example_out, std::ios::binary | std::ios::trunc);
+    if (!eout) {
+      std::cerr << "error: cannot open example output file: " << example_out << "\n";
+      return 1;
+    }
+    eout << "# LightGBM-rs example-dataset binning golden set (DAT-07, layers 1+2)\n";
+    eout << "# End-to-end FindBin+ValueToBin over copied LightGBM example datasets\n";
+    eout << "# (read from the COMMITTED fixtures dir, never the untracked LightGBM/ tree).\n";
+    eout << "MASTER_SEED " << master_seed << "\n";
+    const int num_examples = argc - 8;
+    eout << "COUNTS datasets=" << num_examples << "\n";
+    int written = 0;
+    for (int a = 8; a < argc; ++a) {
+      const std::string in_path = argv[a];
+      // dataset name = the file stem (after the last '/').
+      std::string name = in_path;
+      const size_t slash = name.find_last_of('/');
+      if (slash != std::string::npos) name = name.substr(slash + 1);
+      // derive a per-dataset seed from the master seed + index (deterministic).
+      const int seed = master_seed + a;
+      EmitExampleDataset(eout, name, in_path, seed);
+      written++;
+    }
+    eout.flush();
+    if (!eout) {
+      std::cerr << "error: failed while writing example output\n";
+      return 1;
+    }
+    std::cerr << "bin_capture: wrote " << written << " example datasets to " << example_out << "\n";
   }
   return 0;
 }

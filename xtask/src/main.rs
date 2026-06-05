@@ -205,6 +205,13 @@ fn bin_capture() -> Result<()> {
     let categorical_fixture_path = fixtures_dir.join("categorical_folding.txt");
     let missing_fixture_path = fixtures_dir.join("missing_edge_cases.txt");
     let metadata_fixture_path = fixtures_dir.join("metadata.txt");
+    let example_fixture_path = fixtures_dir.join("example_dataset_binning.txt");
+    // The COPIED example datasets live under the committed fixtures dir (never the
+    // untracked LightGBM/ tree); the C++ harness reads these exact paths.
+    let example_inputs = [
+        fixtures_dir.join("examples/regression.train"),
+        fixtures_dir.join("examples/binary.train"),
+    ];
 
     eprintln!("xtask bin-capture: configuring C++ capture build ...");
     run(
@@ -232,16 +239,30 @@ fn bin_capture() -> Result<()> {
 
     let exe = locate_exe(&build_dir, "bin_capture")?;
     eprintln!("xtask bin-capture: running capture ({}) ...", exe.display());
-    run(
-        Command::new(&exe)
-            .arg(&fixture_path)
-            .arg(BIN_MASTER_SEED.to_string())
-            .arg(&storage_fixture_path)
-            .arg(&categorical_fixture_path)
-            .arg(&missing_fixture_path)
-            .arg(&metadata_fixture_path),
-        "bin_capture",
-    )?;
+    // Verify the copied example fixtures exist before capture (they are committed,
+    // never read from the untracked LightGBM/ tree).
+    for ex in &example_inputs {
+        if !ex.is_file() {
+            bail!(
+                "example fixture {} not found — copy it from LightGBM/examples/ into the \
+                 committed fixtures dir first",
+                ex.display()
+            );
+        }
+    }
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg(&fixture_path)
+        .arg(BIN_MASTER_SEED.to_string())
+        .arg(&storage_fixture_path)
+        .arg(&categorical_fixture_path)
+        .arg(&missing_fixture_path)
+        .arg(&metadata_fixture_path)
+        .arg(&example_fixture_path);
+    for ex in &example_inputs {
+        cmd.arg(ex);
+    }
+    run(&mut cmd, "bin_capture")?;
 
     for p in [
         &fixture_path,
@@ -249,6 +270,7 @@ fn bin_capture() -> Result<()> {
         &categorical_fixture_path,
         &missing_fixture_path,
         &metadata_fixture_path,
+        &example_fixture_path,
     ] {
         if !p.is_file() {
             bail!("capture completed but {} was not written", p.display());
@@ -263,12 +285,13 @@ fn bin_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask bin-capture: done. Wrote {}, {}, {}, {}, and {}.",
+        "xtask bin-capture: done. Wrote {}, {}, {}, {}, {}, and {}.",
         fixture_path.display(),
         storage_fixture_path.display(),
         categorical_fixture_path.display(),
         missing_fixture_path.display(),
-        metadata_fixture_path.display()
+        metadata_fixture_path.display(),
+        example_fixture_path.display()
     );
     eprintln!(
         "Re-run `cargo run -p xtask -- bin-capture` and confirm \
