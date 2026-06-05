@@ -64,7 +64,27 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Exclusive Feature Bundling (`enable_bundle`) reproduces C++ feature grouping bit-for-bit.
   5. Per-stage parity tests cover the bin granularity (bin boundaries + per-row bin assignment), localizing any divergence to binning before histograms exist.
 
-**Plans**: TBD
+**Plans**: 5 plans
+
+**Wave 1**
+
+  - [ ] 02-01-PLAN.md — Crate scaffold + golden-capture harness + numeric BinMapper (FindBin/ValueToBin) golden layers 1+2
+
+**Wave 2** *(blocked on Wave 1)*
+
+  - [ ] 02-02-PLAN.md — Bin trait + DenseBin (incl. 4-bit) + SparseBin + FeatureGroup offsets/PushData + Dataset finish_load immutability
+
+**Wave 3** *(blocked on Wave 2)*
+
+  - [ ] 02-03-PLAN.md — Categorical folding (category→bin) + missing-value routing golden parity (layers 1+3)
+
+**Wave 4** *(blocked on Wave 3)*
+
+  - [ ] 02-04-PLAN.md — Metadata + from_mat/from_csr/from_csc ingestion + dense/CSR/CSC equivalence + example-dataset parity
+
+**Wave 5** *(blocked on Wave 4; EFB sequenced last per MEDIUM-risk capture flag, has checkpoint)*
+
+  - [ ] 02-05-PLAN.md — Exclusive Feature Bundling (MultiValBin + FastFeatureBundling) group/offset golden parity (layer 3)
 
 ### Phase 3: Tree Model + Model Text I/O + Predict Parity
 
@@ -170,7 +190,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
-| 2. Dataset + Binning | 0/TBD | Not started | - |
+| 2. Dataset + Binning | 0/5 | Plans complete | - |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
