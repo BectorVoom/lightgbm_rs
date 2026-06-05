@@ -107,7 +107,23 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. The Rust writer emits the exact LightGBM text schema (tree structure, leaf values, bin mappers, feature metadata) including `%.17g` float formatting, and a load→predict→write→reload round-trip is byte-stable.
   4. Sub-range prediction (`start_iteration` / `num_iteration`) returns the C++-matching slice of the ensemble.
 
-**Plans**: TBD
+**Plans**: 4 plans
+
+**Wave 1** *(enabling slice — crate + %.17g formatter + golden-capture pipeline)*
+
+  - [ ] 03-01-PLAN.md — lgbm-model crate skeleton + ModelError + `%.17g`/`{:g}` formatter (the DAT-09 linchpin, built FIRST) + `xtask model-capture` committed golden corpus (capture-path decision gate)
+
+**Wave 2** *(blocked on Wave 1)*
+
+  - [ ] 03-02-PLAN.md — Regression slice: load→raw-predict (dense/CSR/CSC, f64 accumulate)→write byte-exact→reload (DAT-08/DAT-09/PRD-01) — faithful array Tree + GbdtModel + model_text envelope + predict driver
+
+**Wave 3** *(blocked on Wave 2)*
+
+  - [ ] 03-03-PLAN.md — Transform + leaf-index slice: core ConvertOutput (sigmoid/softmax/ova/identity) + multiclass per-class stride + pred_leaf + categorical-split parity (PRD-02/PRD-03)
+
+**Wave 4** *(blocked on Wave 3)*
+
+  - [ ] 03-04-PLAN.md — Sub-range slice: InitPredict `start_iteration`/`num_iteration` (`-1==all`) parity (PRD-06) — full D-06 layered battery (1-5) green
 **UI hint**: no
 
 ### Phase 4: Compute Backend (CPU-first integer histograms → ROCm)
@@ -199,7 +215,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 |-------|----------------|--------|-----------|
 | 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
-| 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
+| 3. Tree Model + Model Text I/O + Predict Parity | 0/4 | Plans complete | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
 | 5. Tree Learner + Split Finding | 0/TBD | Not started | - |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
