@@ -1,6 +1,11 @@
 ---
-gsd_state_version: '1.0'
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
 status: planning
+stopped_at: Phase 1 context gathered (numerical contract revised to f32 / ~1e-6)
+last_updated: "2026-06-05T02:37:56.008Z"
+last_activity: 2026-06-05 — Roadmap created (8 phases, dependency-forced parity spine)
 progress:
   total_phases: 8
   completed_phases: 0
@@ -15,7 +20,7 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-06-05)
 
-**Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within 1e-12 absolute difference on every backend (CPU and ROCm).
+**Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
 **Current focus:** Phase 1 — Oracle Contract + Foundations
 
 ## Current Position
@@ -30,6 +35,7 @@ Progress: [░░░░░░░░░░] 0%
 ## Performance Metrics
 
 **Velocity:**
+
 - Total plans completed: 0
 - Average duration: -
 - Total execution time: 0 hours
@@ -41,6 +47,7 @@ Progress: [░░░░░░░░░░] 0%
 | - | - | - | - |
 
 **Recent Trend:**
+
 - Last 5 plans: -
 - Trend: -
 
@@ -53,9 +60,9 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- [Roadmap]: Build order is dependency-forced — each layer must be bit-exact before anything above it can be validated (binning → predict → compute → learner → GBDT → variants → Python).
-- [Roadmap]: 1e-12 oracle is a per-phase success criterion on every backend; integer-quantized histograms make CPU/ROCm structural results bit-identical by construction.
-- [Phase 1 pending]: The tiered-oracle contract (Tier A bit-exact structural on all backends / Tier B 1e-12 CPU / Tier C documented relaxed + same-tree check on ROCm) must be signed into PROJECT.md before any kernel work — currently PROJECT.md states strict 1e-12 everywhere.
+- [Roadmap]: Build order is dependency-forced — each layer must match the reference before anything above it can be validated (binning → predict → compute → learner → GBDT → variants → Python).
+- [Phase 1 discuss, 2026-06-05]: Numerical contract revised to **f32 (single-precision) end-to-end, ~1e-6 absolute oracle tolerance** on every backend — matching the C++ reference defaults (`score_t`/`label_t` = `float`). Supersedes the prior strict-1e-12 / tiered-oracle direction.
+- [Phase 1 discuss, 2026-06-05]: **Standard f32 histogram/score accumulations** on CPU and ROCm — the integer-quantized histogram strategy is dropped (buys nothing at f32 / ~1e-6).
 
 ### Pending Todos
 
@@ -63,9 +70,9 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 4]: CubeCL is alpha (v0.10.0) — pin exactly, isolate behind lgbm-compute; ROCm f64/atomic capability gaps and CPU-runtime-vs-HIP divergence need empirical validation on the local ROCm GPU (research flag: HIGH).
-- [Phase 6]: f64 transcendental (exp/log/pow/sigmoid) parity CPU↔ROCm is unproven; fallback is CPU-resident objective grad/hess pushing only discretized integers to the GPU.
-- [Cross-cutting]: PROJECT.md's "strict 1e-12 on ROCm" vs research's tiered-oracle recommendation is an open contract tension to resolve in Phase 1.
+- [Phase 4]: CubeCL is alpha (v0.10.0) — pin exactly, isolate behind lgbm-compute; ROCm capability gaps and CPU-runtime-vs-HIP divergence need empirical validation on the local ROCm GPU (research flag: HIGH). Now evaluated against the ~1e-6 (f32) tolerance rather than bit-exactness.
+- [Phase 6]: f32 transcendental (exp/log/pow/sigmoid) parity CPU↔ROCm is unproven at ~1e-6 — needs empirical validation; if a gap appears, fallback is CPU-resident objective grad/hess.
+- [Cross-cutting]: RESOLVED (2026-06-05) — the strict-1e-12-vs-tiered tension is closed by adopting the f32 / ~1e-6 contract; project docs (PROJECT/REQUIREMENTS/ROADMAP) updated to match.
 
 ## Deferred Items
 
@@ -79,6 +86,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05
-Stopped at: ROADMAP.md and STATE.md written; REQUIREMENTS.md traceability updated.
-Resume file: None
+Last session: 2026-06-05T02:37:56.004Z
+Stopped at: Phase 1 context gathered (numerical contract revised to f32 / ~1e-6)
+Resume file: .planning/phases/01-oracle-contract-foundations/01-CONTEXT.md
