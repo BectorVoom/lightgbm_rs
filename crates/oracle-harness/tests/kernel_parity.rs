@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use lgbm_compute::gain::{get_split_gains, GainConfig};
+use lgbm_compute::gain::{get_leaf_gain, get_split_gains, GainConfig};
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::{Backend, CpuBackend};
 // The exact comparators are NOT re-exported from the crate root (lib.rs re-exports
@@ -495,14 +495,14 @@ fn lgbm_compute_k_epsilon() -> f64 {
 
 /// `GetLeafGain<USE_L1,false,false>` host mirror (feature_histogram.hpp:799-815)
 /// — the closed form used for the `gain_shift` whole-leaf gain in
-/// `BeforeNumerical`. Bit-identical to `lgbm_compute::gain::get_leaf_gain`.
+/// `BeforeNumerical`. Delegates to the production `#[cube]` primitive
+/// `lgbm_compute::gain::get_leaf_gain` (called as a plain host fn) so there is a
+/// SINGLE source of truth for the L1 `Sign(s) = (s>0)-(s<0)` semantics. Rust's
+/// `f64::signum` must NOT be used here: it returns `+1.0` at `0.0` and `-1.0` at
+/// `-0.0`, never `0.0`, diverging from C++ `Common::Sign` for any zero-gradient
+/// L1 case (CR-01/CR-02).
 fn leaf_gain(use_l1: bool, g: f64, h: f64, l1: f64, l2: f64) -> f64 {
-    if use_l1 {
-        let s = g.signum() * (g.abs() - l1).max(0.0);
-        (s * s) / (h + l2)
-    } else {
-        (g * g) / (h + l2)
-    }
+    get_leaf_gain(use_l1, g, h, l1, l2)
 }
 
 #[test]
@@ -752,6 +752,7 @@ fn kernel_parity_subtract_bit_exact_on_cpu() {
 #[cfg(feature = "rocm")]
 mod hip {
     use super::*;
+    use lgbm_compute::gain::get_leaf_gain_f32;
     use lgbm_compute::kernels::histogram::construct_histograms_f32_on;
     use lgbm_compute::kernels::partition::data_partition_on;
     use lgbm_compute::kernels::split::find_best_split_raw_f32_on;
@@ -1013,14 +1014,13 @@ mod hip {
         }
     }
 
-    /// f32 `GetLeafGain` host mirror for the hip net-gain finalization.
+    /// f32 `GetLeafGain` host mirror for the hip net-gain finalization. Delegates
+    /// to the production `#[cube]` primitive `get_leaf_gain_f32` (single source of
+    /// truth for the L1 `Sign(s) = (s>0)-(s<0)` semantics). `f32::signum` must NOT
+    /// be used: it never returns `0.0` at `0.0`/`-0.0`, diverging from C++
+    /// `Common::Sign` for zero-gradient L1 cases (CR-01/CR-02).
     fn leaf_gain_f32(use_l1: bool, g: f32, h: f32, l1: f32, l2: f32) -> f32 {
-        if use_l1 {
-            let s = g.signum() * (g.abs() - l1).max(0.0);
-            (s * s) / (h + l2)
-        } else {
-            (g * g) / (h + l2)
-        }
+        get_leaf_gain_f32(use_l1, g, h, l1, l2)
     }
 
     #[test]
