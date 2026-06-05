@@ -36,7 +36,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A user can run the ported `Random` LCG and reproduce a captured 100k-draw C++ sequence (`RandInt16`/`RandInt32`/`NextFloat`/`NextInt`/`Sample(N,K)` across the branch boundary) bit-for-bit, with `u32` wraparound and `f32` `NextFloat`.
   3. The Cargo workspace (loosely-coupled crates by responsibility) builds under edition 2024 with `Cargo.lock` and `rust-toolchain.toml` committed; `thiserror` domain errors exist at crate boundaries and `anyhow` propagates at app/test layers.
   4. A config struct accepts the ~110 in-scope hyperparameters, resolves aliases (`num_iteration`/`n_estimators`/`num_boost_round`, etc.) via a data table matching `config_auto.cpp`, and rejects invalid combos with typed `Result` errors mirroring C++ `Config::Set` CHECK constraints.
-  5. The f32 single-precision data-type contract and ~1e-6 oracle tolerance (standard f32 histogram/score accumulations, no integer-quantized reduction strategy) is documented as a Key Decision in PROJECT.md so no later phase targets an unfalsifiable invariant.**Plans**: 2 plans
+  5. The f32 single-precision data-type contract and ~1e-6 oracle tolerance (standard f32 histogram/score accumulations, no integer-quantized reduction strategy) is documented as a Key Decision in PROJECT.md so no later phase targets an unfalsifiable invariant.**Plans**: 3 plans (incl. 1 gap-closure)
 
 **Wave 1**
 
@@ -45,6 +45,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 2** *(blocked on Wave 1 completion)*
 
   - [x] 01-02-PLAN.md — Hand-ported flat Config: struct/defaults + verbatim alias table + seed derivation + typed CHECK validation + drift-checker
+
+**Wave 3** *(gap closure — blocked on Wave 2; closes SC#4 / CFG-02 + CFG-03)*
+
+  - [ ] 01-03-PLAN.md — Gap closure: deterministic SortAlias alias-collision resolution (CR-02) + present()-routed seed/enum empty-is-absent (CR-01), each with regression tests
 
 ### Phase 2: Dataset + Binning (determinism root)
 
