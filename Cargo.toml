@@ -4,6 +4,7 @@ members = [
     "crates/lgbm-core",
     "crates/lgbm-compute",
     "crates/lgbm-dataset",
+    "crates/lgbm-model",
     "crates/oracle-harness",
     "xtask",
 ]
