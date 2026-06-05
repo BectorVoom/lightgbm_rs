@@ -246,6 +246,28 @@ header-only `LightGBM::Random`. Same discipline as `rng_capture`/`bin_capture`:
 no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` time
 (the golden is committed).
 
+### 04-03 split / partition / subtract goldens
+
+`kernel-capture` also emits three more goldens under the same kernels dir
+(`split.txt`, `partition.txt`, `subtract.txt`), each a VERBATIM transcription of
+the pinned reference (commit `195c26fc7b00eb0fec252dfe841e2e66d6833954`, version `4.6.0.99`):
+
+- **`split.txt`** — `FindBestThresholdSequentially` + the gain math
+(`feature_histogram.hpp:711-1057`, default CPU template). Each case emits the
+PER-CANDIDATE gains (REVERSE + FORWARD, NaN where a candidate is gated) AND the
+winning `SplitInfo`, so a divergence localizes to the gain scan, not just the
+winner. Covers a REVERSE-branch winner (`default_left=1`, threshold `t-1+offset`),
+a FORWARD-branch winner (`t+offset`), a default-bin-skip case, an L1-regularized
+case, and a no-admissible-split case.
+- **`partition.txt`** — `DataPartition::Split` row routing via `SplitInner`
+(`dense_bin.hpp:314-394`, `MissingType::None`) + the stable two-pass gather;
+emits the reordered index array + `split_point`.
+- **`subtract.txt`** — `FeatureHistogram::Subtract` (`feature_histogram.hpp:99-145`,
+default `USE_DIST_GRAD=false`): `derived[i] = parent[i] - child[i]`.
+
+`crates/oracle-harness/tests/kernel_parity.rs` replays all four layers BIT-EXACT
+on the cubecl-cpu anchor via `compare_exact_f64_bits` / `compare_exact_u32`.
+
 ### Exact kernel-capture command
 
 ```bash

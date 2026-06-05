@@ -381,6 +381,10 @@ fn kernel_capture() -> Result<()> {
     std::fs::create_dir_all(&fixtures_dir)
         .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
     let fixture_path = fixtures_dir.join("histogram.txt");
+    // 04-03 additional goldens (split / partition / subtract).
+    let split_path = fixtures_dir.join("split.txt");
+    let partition_path = fixtures_dir.join("partition.txt");
+    let subtract_path = fixtures_dir.join("subtract.txt");
 
     eprintln!("xtask kernel-capture: configuring C++ capture build ...");
     run(
@@ -414,15 +418,17 @@ fn kernel_capture() -> Result<()> {
     run(
         Command::new(&exe)
             .arg(&fixture_path)
-            .arg(KERNEL_MASTER_SEED.to_string()),
+            .arg(KERNEL_MASTER_SEED.to_string())
+            .arg(&split_path)
+            .arg(&partition_path)
+            .arg(&subtract_path),
         "kernel_capture",
     )?;
 
-    if !fixture_path.is_file() {
-        bail!(
-            "capture completed but {} was not written",
-            fixture_path.display()
-        );
+    for p in [&fixture_path, &split_path, &partition_path, &subtract_path] {
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
     }
 
     // Refresh the shared reference manifest (idempotent — pure function of the
@@ -433,13 +439,16 @@ fn kernel_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask kernel-capture: done. Wrote {} and refreshed {}.",
+        "xtask kernel-capture: done. Wrote {}, {}, {}, {} and refreshed {}.",
         fixture_path.display(),
+        split_path.display(),
+        partition_path.display(),
+        subtract_path.display(),
         manifest_path.display()
     );
     eprintln!(
         "Re-run `cargo run -p xtask -- kernel-capture` and confirm \
-         `git diff --stat crates/oracle-harness/tests/fixtures/kernels/histogram.txt` \
+         `git diff --stat crates/oracle-harness/tests/fixtures/kernels/` \
          is empty (byte-idempotent)."
     );
     Ok(())
@@ -908,6 +917,28 @@ goldens byte-identical to lib_lightgbm. Synthetic inputs use the genuine\n\
 header-only `LightGBM::Random`. Same discipline as `rng_capture`/`bin_capture`:\n\
 no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` time\n\
 (the golden is committed).\n\
+\n\
+### 04-03 split / partition / subtract goldens\n\
+\n\
+`kernel-capture` also emits three more goldens under the same kernels dir\n\
+(`split.txt`, `partition.txt`, `subtract.txt`), each a VERBATIM transcription of\n\
+the pinned reference (commit `{commit}`, version `{version}`):\n\
+\n\
+- **`split.txt`** — `FindBestThresholdSequentially` + the gain math\n\
+  (`feature_histogram.hpp:711-1057`, default CPU template). Each case emits the\n\
+  PER-CANDIDATE gains (REVERSE + FORWARD, NaN where a candidate is gated) AND the\n\
+  winning `SplitInfo`, so a divergence localizes to the gain scan, not just the\n\
+  winner. Covers a REVERSE-branch winner (`default_left=1`, threshold `t-1+offset`),\n\
+  a FORWARD-branch winner (`t+offset`), a default-bin-skip case, an L1-regularized\n\
+  case, and a no-admissible-split case.\n\
+- **`partition.txt`** — `DataPartition::Split` row routing via `SplitInner`\n\
+  (`dense_bin.hpp:314-394`, `MissingType::None`) + the stable two-pass gather;\n\
+  emits the reordered index array + `split_point`.\n\
+- **`subtract.txt`** — `FeatureHistogram::Subtract` (`feature_histogram.hpp:99-145`,\n\
+  default `USE_DIST_GRAD=false`): `derived[i] = parent[i] - child[i]`.\n\
+\n\
+`crates/oracle-harness/tests/kernel_parity.rs` replays all four layers BIT-EXACT\n\
+on the cubecl-cpu anchor via `compare_exact_f64_bits` / `compare_exact_u32`.\n\
 \n\
 ### Exact kernel-capture command\n\
 \n\

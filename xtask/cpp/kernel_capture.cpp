@@ -56,10 +56,12 @@
 #include <LightGBM/utils/random.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -254,6 +256,236 @@ uint32_t F32Bits(float f) {
   uint32_t b;
   std::memcpy(&b, &f, sizeof(b));
   return b;
+}
+
+// ===========================================================================
+// 04-03: GAIN MATH + SCAN + PARTITION + SUBTRACT transcription.
+//
+// VERBATIM transcription of the default-CPU-path gain math + best-threshold scan
+// from `LightGBM/src/treelearner/feature_histogram.hpp:711-1057` (commit
+// 195c26fc, VERSION 4.6.0.99), the partition routing from
+// `dense_bin.hpp:314-394` (`SplitInner`, MissingType::None), and the subtraction
+// math from `feature_histogram.hpp:99-145` (default USE_DIST_GRAD=false path).
+// These depend ONLY on the f64 histogram cells / bin indices and the scalar
+// config — none of fast_double_parser / fmt — so they compile standalone here,
+// exactly as the histogram transcription above (external_libs unvendored).
+//
+// kEpsilon = 1e-15f (meta.h:54); kMinScore = -inf (meta.h:50). RoundInt(x) =
+// (int)(x + 0.5f) (common.h:904). Sign(x) = (x>0)-(x<0) (common.h:872). The
+// `2*kEpsilon` entry bump (feature_histogram.hpp:172), the REVERSE
+// `sum_right_hessian = kEpsilon` seed (:856), and the FORWARD `sum_left_hessian =
+// kEpsilon` seed (:939) are reproduced verbatim, as are the gate ORDER and the
+// `t-1+offset` (REVERSE) vs `t+offset` (FORWARD) threshold recording.
+// ===========================================================================
+static const float kEpsilonF = 1e-15f;       // meta.h: const score_t kEpsilon = 1e-15f;
+static const double kMinScore = -std::numeric_limits<double>::infinity();
+
+static int CppSign(double x) { return (x > 0.0) - (x < 0.0); }
+static int CppRoundInt(double x) { return static_cast<int>(x + 0.5f); }
+
+static double ThresholdL1(double s, double l1) {
+  const double reg_s = std::max(0.0, std::fabs(s) - l1);
+  return CppSign(s) * reg_s;
+}
+// GetLeafGain<USE_L1,false,false> (feature_histogram.hpp:799-815 fast path).
+static double GetLeafGain(bool use_l1, double g, double h, double l1, double l2) {
+  if (use_l1) {
+    const double sg = ThresholdL1(g, l1);
+    return (sg * sg) / (h + l2);
+  }
+  return (g * g) / (h + l2);
+}
+// GetSplitGains<false,USE_L1,false,false> (:757-797, !USE_MC branch).
+static double GetSplitGains(bool use_l1, double lg, double lh, double rg, double rh,
+                            double l1, double l2) {
+  return GetLeafGain(use_l1, lg, lh, l1, l2) + GetLeafGain(use_l1, rg, rh, l1, l2);
+}
+// CalculateSplittedLeafOutput<USE_L1,false,false> (:716-738 path).
+static double CalcLeafOutput(bool use_l1, double g, double h, double l1, double l2) {
+  if (use_l1) return -ThresholdL1(g, l1) / (h + l2);
+  return -g / (h + l2);
+}
+
+// The split config (the seven GainConfig fields + the bin-layout descriptors).
+struct SplitCfg {
+  int min_data_in_leaf;
+  double min_sum_hessian_in_leaf;
+  double lambda_l1;
+  double lambda_l2;
+  double min_gain_to_split;
+  int num_bin;
+  int offset;
+  int default_bin;
+  bool skip_default_bin;
+};
+
+// The decoded winner (mirrors the Rust SplitInfo).
+struct WinSplit {
+  bool is_splittable = false;
+  uint32_t threshold = 0;
+  double gain = kMinScore;       // RAW best_gain (before -min_gain_shift)
+  int left_count = 0;
+  int right_count = 0;
+  double left_sum_gradient = 0.0;
+  double left_sum_hessian = 0.0; // reported (kEpsilon already subtracted)
+  double right_sum_gradient = 0.0;
+  double right_sum_hessian = 0.0;
+  double left_output = 0.0;
+  double right_output = 0.0;
+  bool default_left = true;
+};
+
+// VERBATIM FindBestThresholdSequentially (feature_histogram.hpp:830-1057) for
+// <USE_RAND=false,USE_MC=false,USE_L1=?,USE_MAX_OUTPUT=false,USE_SMOOTHING=false,
+//  NA_AS_MISSING=false>. Records PER-CANDIDATE gains (a gain value when a bin is
+// a considered candidate, NaN when it is gated out / skipped) for BOTH branches
+// so the golden localizes a divergence to the scan, not just the winner.
+//
+// `sum_hessian` here is ALREADY bumped by 2*kEpsilon (the FindBestThreshold entry
+// at :172); `min_gain_shift = GetLeafGain(un-bumped totals) + min_gain_to_split`.
+static WinSplit FindBestThreshold(const std::vector<double>& hist, const SplitCfg& cfg,
+                                  bool use_l1, double sum_gradient,
+                                  double sum_hessian_bumped, int num_data,
+                                  double min_gain_shift,
+                                  std::vector<double>* cand_rev,
+                                  std::vector<double>* cand_fwd) {
+  const double l1 = cfg.lambda_l1, l2 = cfg.lambda_l2;
+  const int offset = cfg.offset;
+  const double cnt_factor = static_cast<double>(num_data) / sum_hessian_bumped;
+  const double qnan = std::numeric_limits<double>::quiet_NaN();
+
+  double best_sum_left_gradient = 0.0, best_sum_left_hessian = 0.0;
+  double best_gain = kMinScore;
+  int best_left_count = 0;
+  uint32_t best_threshold = static_cast<uint32_t>(cfg.num_bin);
+  bool is_splittable = false;
+  bool best_default_left = true;
+
+  auto GET_GRAD = [&](int t) { return hist[(static_cast<size_t>(t) << 1)]; };
+  auto GET_HESS = [&](int t) { return hist[(static_cast<size_t>(t) << 1) + 1]; };
+
+  // ---- REVERSE (:854-936): t high -> low, record t-1+offset ----
+  cand_rev->clear();
+  {
+    double sum_right_gradient = 0.0;
+    double sum_right_hessian = kEpsilonF;  // :856
+    int right_count = 0;
+    int t = cfg.num_bin - 1 - offset;      // NA_AS_MISSING=0
+    const int t_end = 1 - offset;
+    for (; t >= t_end; --t) {
+      if (cfg.skip_default_bin && (t + offset) == cfg.default_bin) {
+        cand_rev->push_back(qnan);
+        continue;
+      }
+      sum_right_gradient += GET_GRAD(t);
+      sum_right_hessian += GET_HESS(t);
+      right_count += CppRoundInt(GET_HESS(t) * cnt_factor);
+      if (right_count < cfg.min_data_in_leaf ||
+          sum_right_hessian < cfg.min_sum_hessian_in_leaf) {
+        cand_rev->push_back(qnan);
+        continue;
+      }
+      int left_count = num_data - right_count;
+      if (left_count < cfg.min_data_in_leaf) { cand_rev->push_back(qnan); break; }
+      double sum_left_hessian = sum_hessian_bumped - sum_right_hessian;
+      if (sum_left_hessian < cfg.min_sum_hessian_in_leaf) { cand_rev->push_back(qnan); break; }
+      double sum_left_gradient = sum_gradient - sum_right_gradient;
+      double current_gain = GetSplitGains(use_l1, sum_left_gradient, sum_left_hessian,
+                                          sum_right_gradient, sum_right_hessian, l1, l2);
+      if (current_gain <= min_gain_shift) { cand_rev->push_back(qnan); continue; }
+      cand_rev->push_back(current_gain);
+      is_splittable = true;
+      if (current_gain > best_gain) {
+        best_left_count = left_count;
+        best_sum_left_gradient = sum_left_gradient;
+        best_sum_left_hessian = sum_left_hessian;
+        best_threshold = static_cast<uint32_t>(t - 1 + offset);  // :933
+        best_gain = current_gain;
+        best_default_left = true;  // REVERSE
+      }
+    }
+  }
+
+  // ---- FORWARD (:937-1029): t low -> high, record t+offset ----
+  cand_fwd->clear();
+  {
+    double sum_left_gradient = 0.0;
+    double sum_left_hessian = kEpsilonF;  // :939
+    int left_count = 0;
+    int t = 0;
+    const int t_end = cfg.num_bin - 2 - offset;
+    for (; t <= t_end; ++t) {
+      if (cfg.skip_default_bin && (t + offset) == cfg.default_bin) {
+        cand_fwd->push_back(qnan);
+        continue;
+      }
+      // t >= 0 always (NA_AS_MISSING=0).
+      sum_left_gradient += GET_GRAD(t);
+      sum_left_hessian += GET_HESS(t);
+      left_count += CppRoundInt(GET_HESS(t) * cnt_factor);
+      if (left_count < cfg.min_data_in_leaf ||
+          sum_left_hessian < cfg.min_sum_hessian_in_leaf) {
+        cand_fwd->push_back(qnan);
+        continue;
+      }
+      int right_count = num_data - left_count;
+      if (right_count < cfg.min_data_in_leaf) { cand_fwd->push_back(qnan); break; }
+      double sum_right_hessian = sum_hessian_bumped - sum_left_hessian;
+      if (sum_right_hessian < cfg.min_sum_hessian_in_leaf) { cand_fwd->push_back(qnan); break; }
+      double sum_right_gradient = sum_gradient - sum_left_gradient;
+      double current_gain = GetSplitGains(use_l1, sum_left_gradient, sum_left_hessian,
+                                          sum_right_gradient, sum_right_hessian, l1, l2);
+      if (current_gain <= min_gain_shift) { cand_fwd->push_back(qnan); continue; }
+      cand_fwd->push_back(current_gain);
+      is_splittable = true;
+      if (current_gain > best_gain) {
+        best_left_count = left_count;
+        best_sum_left_gradient = sum_left_gradient;
+        best_sum_left_hessian = sum_left_hessian;
+        best_threshold = static_cast<uint32_t>(t + offset);  // :1025
+        best_gain = current_gain;
+        best_default_left = false;  // FORWARD
+      }
+    }
+  }
+
+  // ---- finalization (:1031-1056) ----
+  WinSplit w;
+  if (is_splittable && best_gain > kMinScore) {  // output->gain starts at kMinScore
+    w.is_splittable = true;
+    w.threshold = best_threshold;
+    w.left_output = CalcLeafOutput(use_l1, best_sum_left_gradient, best_sum_left_hessian, l1, l2);
+    w.left_count = best_left_count;
+    w.left_sum_gradient = best_sum_left_gradient;
+    w.left_sum_hessian = best_sum_left_hessian - kEpsilonF;  // :1042
+    double rsg = sum_gradient - best_sum_left_gradient;
+    double rsh = sum_hessian_bumped - best_sum_left_hessian;
+    w.right_output = CalcLeafOutput(use_l1, rsg, rsh, l1, l2);
+    w.right_count = num_data - best_left_count;
+    w.right_sum_gradient = rsg;
+    w.right_sum_hessian = rsh - kEpsilonF;  // :1053
+    w.gain = best_gain;  // RAW; the Rust host applies -min_gain_shift (penalty=1)
+    w.default_left = best_default_left;
+  }
+  return w;
+}
+
+// VERBATIM SplitInner routing (dense_bin.hpp:314-394, MissingType::None path:
+// MISS_IS_ZERO=false, MISS_IS_NA=false, MFB_IS_ZERO=false, MFB_IS_NA=false,
+// USE_MIN_BIN=true). Emits the per-row route (0=lte/left, 1=gt/right).
+static std::vector<int> SplitRoute(const std::vector<uint32_t>& bins, int min_bin,
+                                   int max_bin, int threshold, int most_freq_bin) {
+  int th = threshold + min_bin;
+  if (most_freq_bin == 0) --th;
+  const bool default_to_right = !(most_freq_bin <= threshold);
+  std::vector<int> route(bins.size(), 0);
+  for (size_t i = 0; i < bins.size(); ++i) {
+    const int bin = static_cast<int>(bins[i]);
+    const bool is_default = (bin < min_bin || bin > max_bin);
+    const bool gt = bin > th;
+    route[i] = (is_default ? default_to_right : gt) ? 1 : 0;
+  }
+  return route;
 }
 
 // A deterministic case generator reusing the reference Random LCG so the corpus
@@ -492,14 +724,325 @@ std::vector<HCaseSpec> BuildHistCorpus(int master_seed) {
   return cases;
 }
 
+// ===========================================================================
+// 04-03 SPLIT golden. Each case fixes a histogram + GainConfig + offset/default
+// + leaf totals (sum_gradient/sum_hessian/num_data) and emits per-candidate
+// gains (REVERSE + FORWARD) AND the winning SplitInfo, so a failure localizes to
+// the gain scan, not just the winner. The corpus covers BOTH a reverse-winner
+// (default_left=1, threshold t-1+offset) and a forward-winner case, plus a
+// default-bin-skip case (D-02a routing) and a no-admissible-split case.
+// ===========================================================================
+struct SCaseSpec {
+  std::string name;
+  SplitCfg cfg;
+  std::vector<double> hist;  // 2*num_bin f64 cells
+  double sum_gradient;       // leaf totals (UN-bumped sum_hessian)
+  double sum_hessian;
+  int num_data;
+  std::string note;
+};
+
+void EmitSCase(std::ofstream& out, const SCaseSpec& cs) {
+  const bool use_l1 = cs.cfg.lambda_l1 > 0.0;
+  // BeforeNumerical (feature_histogram.hpp:198-207): gain_shift over UN-bumped
+  // totals; min_gain_shift = gain_shift + min_gain_to_split.
+  const double gain_shift =
+      GetLeafGain(use_l1, cs.sum_gradient, cs.sum_hessian, cs.cfg.lambda_l1, cs.cfg.lambda_l2);
+  const double min_gain_shift = gain_shift + cs.cfg.min_gain_to_split;
+  // FindBestThreshold entry bump (:172): sum_hessian + 2*kEpsilon.
+  const double sum_hessian_bumped = cs.sum_hessian + 2.0 * static_cast<double>(kEpsilonF);
+
+  std::vector<double> cand_rev, cand_fwd;
+  WinSplit w = FindBestThreshold(cs.hist, cs.cfg, use_l1, cs.sum_gradient,
+                                 sum_hessian_bumped, cs.num_data, min_gain_shift,
+                                 &cand_rev, &cand_fwd);
+
+  out << "SCASE name=" << cs.name << " num_bin=" << cs.cfg.num_bin
+      << " offset=" << cs.cfg.offset << " default_bin=" << cs.cfg.default_bin
+      << " skip_default_bin=" << (cs.cfg.skip_default_bin ? 1 : 0)
+      << " use_l1=" << (use_l1 ? 1 : 0)
+      << " min_data_in_leaf=" << cs.cfg.min_data_in_leaf
+      << " min_sum_hessian_in_leaf=" << F64Bits(cs.cfg.min_sum_hessian_in_leaf)
+      << " lambda_l1=" << F64Bits(cs.cfg.lambda_l1)
+      << " lambda_l2=" << F64Bits(cs.cfg.lambda_l2)
+      << " min_gain_to_split=" << F64Bits(cs.cfg.min_gain_to_split)
+      << " sum_gradient=" << F64Bits(cs.sum_gradient)
+      << " sum_hessian=" << F64Bits(cs.sum_hessian) << " num_data=" << cs.num_data
+      << " note=" << cs.note << "\n";
+
+  out << "SHIST ";
+  for (size_t i = 0; i < cs.hist.size(); ++i) {
+    if (i) out << ";";
+    out << F64Bits(cs.hist[i]);
+  }
+  out << "\n";
+
+  out << "SCAND_REV ";
+  for (size_t i = 0; i < cand_rev.size(); ++i) {
+    if (i) out << ";";
+    out << F64Bits(cand_rev[i]);
+  }
+  out << "\n";
+  out << "SCAND_FWD ";
+  for (size_t i = 0; i < cand_fwd.size(); ++i) {
+    if (i) out << ";";
+    out << F64Bits(cand_fwd[i]);
+  }
+  out << "\n";
+
+  // The Rust host reports gain = (raw_gain - min_gain_shift)*penalty (penalty=1);
+  // we emit BOTH min_gain_shift and the raw gain so the parity can reconstruct.
+  const double reported_gain =
+      w.is_splittable ? (w.gain - min_gain_shift) : kMinScore;
+  out << "SWIN is_splittable=" << (w.is_splittable ? 1 : 0)
+      << " threshold=" << w.threshold
+      << " gain=" << F64Bits(reported_gain)
+      << " min_gain_shift=" << F64Bits(min_gain_shift)
+      << " left_count=" << w.left_count << " right_count=" << w.right_count
+      << " left_sum_gradient=" << F64Bits(w.left_sum_gradient)
+      << " left_sum_hessian=" << F64Bits(w.left_sum_hessian)
+      << " right_sum_gradient=" << F64Bits(w.right_sum_gradient)
+      << " right_sum_hessian=" << F64Bits(w.right_sum_hessian)
+      << " left_output=" << F64Bits(w.left_output)
+      << " right_output=" << F64Bits(w.right_output)
+      << " default_left=" << (w.default_left ? 1 : 0) << "\n";
+}
+
+std::vector<SCaseSpec> BuildSplitCorpus() {
+  std::vector<SCaseSpec> cases;
+  auto cfg = [](int nb, int mdl, double msh, double l1, double l2, double mgts,
+                int off, int defb, bool skip) {
+    SplitCfg c;
+    c.num_bin = nb; c.min_data_in_leaf = mdl; c.min_sum_hessian_in_leaf = msh;
+    c.lambda_l1 = l1; c.lambda_l2 = l2; c.min_gain_to_split = mgts;
+    c.offset = off; c.default_bin = defb; c.skip_default_bin = skip;
+    return c;
+  };
+
+  // (a) FORWARD-winner: low bins clearly negative grad, high bins positive grad.
+  //     With offset=0 and default_bin out of range (no skip), the forward branch
+  //     (left grows from bin 0) finds the best split first → default_left=0,
+  //     threshold = t+offset.
+  {
+    SCaseSpec s;
+    s.name = "forward_winner";
+    s.cfg = cfg(4, 1, 0.0, 0.0, 0.0, 0.0, 0, 4, false);
+    s.hist = {-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0};
+    s.sum_gradient = -10.0 - 8.0 + 9.0 + 8.0;
+    s.sum_hessian = 20.0;
+    s.num_data = 20;
+    s.note = "low-neg-high-pos-forward-wins";
+    cases.push_back(s);
+  }
+  // (b) REVERSE-winner: construct so the BEST gain is first attained by the
+  //     reverse scan at a threshold recorded as t-1+offset (default_left=1). A
+  //     symmetric-but-tie-broken layout: the reverse scan reaches the max gain at
+  //     an earlier (higher-t) point. Use a layout whose unique best split is the
+  //     boundary the reverse branch records first.
+  {
+    SCaseSpec s;
+    s.name = "reverse_winner";
+    s.cfg = cfg(4, 1, 0.0, 0.0, 0.0, 0.0, 0, 4, false);
+    // Three low bins with mild gradient, one high bin with large positive grad,
+    // so the best split isolates the top bin: reverse scan (right side growing
+    // from the top) records it as t-1+offset before forward reaches it.
+    s.hist = {1.0, 5.0, 1.0, 5.0, 1.0, 5.0, 30.0, 5.0};
+    s.sum_gradient = 1.0 + 1.0 + 1.0 + 30.0;
+    s.sum_hessian = 20.0;
+    s.num_data = 20;
+    s.note = "top-bin-isolated-reverse-records-first";
+    cases.push_back(s);
+  }
+  // (c) default-bin skip (D-02a): offset=1, default_bin=1 skipped during the scan.
+  {
+    SCaseSpec s;
+    s.name = "default_bin_skip";
+    s.cfg = cfg(5, 1, 0.0, 0.0, 0.0, 0.0, 1, 1, true);
+    s.hist = {0.0, 0.0, -6.0, 4.0, -5.0, 4.0, 7.0, 4.0, 8.0, 4.0};
+    s.sum_gradient = -6.0 - 5.0 + 7.0 + 8.0;
+    s.sum_hessian = 16.0;
+    s.num_data = 16;
+    s.note = "offset1-defbin1-skipped";
+    cases.push_back(s);
+  }
+  // (d) L1 regularization path (use_l1=true) so the L1 gain branch is exercised.
+  {
+    SCaseSpec s;
+    s.name = "l1_forward";
+    s.cfg = cfg(4, 1, 0.0, 0.5, 0.1, 0.0, 0, 4, false);
+    s.hist = {-12.0, 6.0, -7.0, 6.0, 6.0, 6.0, 11.0, 6.0};
+    s.sum_gradient = -12.0 - 7.0 + 6.0 + 11.0;
+    s.sum_hessian = 24.0;
+    s.num_data = 24;
+    s.note = "l1-l2-regularized";
+    cases.push_back(s);
+  }
+  // (e) no admissible split (min_data_in_leaf impossible) → is_splittable=0.
+  {
+    SCaseSpec s;
+    s.name = "no_split";
+    s.cfg = cfg(4, 1000000, 0.0, 0.0, 0.0, 0.0, 0, 4, false);
+    s.hist = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    s.sum_gradient = 4.0;
+    s.sum_hessian = 4.0;
+    s.num_data = 8;
+    s.note = "gates-reject-all";
+    cases.push_back(s);
+  }
+  return cases;
+}
+
+// ===========================================================================
+// 04-03 PARTITION golden. Each case fixes a binned column + min/max/threshold/
+// most_freq_bin and emits the stable reordered index array + split_point (the
+// SAME shape Backend::data_partition returns).
+// ===========================================================================
+struct PCaseSpec {
+  std::string name;
+  std::vector<uint32_t> bins;
+  int num_bin;
+  int min_bin;
+  int max_bin;
+  int threshold;
+  int most_freq_bin;
+  std::string note;
+};
+
+void EmitPCase(std::ofstream& out, const PCaseSpec& cs) {
+  std::vector<int> route = SplitRoute(cs.bins, cs.min_bin, cs.max_bin, cs.threshold,
+                                      cs.most_freq_bin);
+  // Stable two-pass gather: left (route 0) then right (route 1), each in order.
+  std::vector<uint32_t> reordered;
+  reordered.reserve(cs.bins.size());
+  for (size_t i = 0; i < route.size(); ++i)
+    if (route[i] == 0) reordered.push_back(static_cast<uint32_t>(i));
+  const int split_point = static_cast<int>(reordered.size());
+  for (size_t i = 0; i < route.size(); ++i)
+    if (route[i] != 0) reordered.push_back(static_cast<uint32_t>(i));
+
+  out << "PCASE name=" << cs.name << " num_bin=" << cs.num_bin
+      << " min_bin=" << cs.min_bin << " max_bin=" << cs.max_bin
+      << " threshold=" << cs.threshold << " most_freq_bin=" << cs.most_freq_bin
+      << " note=" << cs.note << "\n";
+  out << "PBINS ";
+  for (size_t i = 0; i < cs.bins.size(); ++i) {
+    if (i) out << ";";
+    out << cs.bins[i];
+  }
+  out << "\n";
+  out << "PORDER ";
+  for (size_t i = 0; i < reordered.size(); ++i) {
+    if (i) out << ";";
+    out << reordered[i];
+  }
+  out << "\n";
+  out << "PSPLIT " << split_point << "\n";
+}
+
+std::vector<PCaseSpec> BuildPartitionCorpus(int master_seed) {
+  std::vector<PCaseSpec> cases;
+  CaseGen gen(master_seed ^ 0x5151);
+  // (a) basic in-range threshold split.
+  {
+    PCaseSpec p;
+    p.name = "basic"; p.bins = {1, 5, 3, 7, 0, 4, 2, 6};
+    p.num_bin = 8; p.min_bin = 0; p.max_bin = 7; p.threshold = 3; p.most_freq_bin = 8;
+    p.note = "in-range-thr3"; cases.push_back(p);
+  }
+  // (b) default routing: most_freq_bin <= threshold so out-of-range go left.
+  {
+    PCaseSpec p;
+    p.name = "default_left"; p.bins = {0, 2, 9, 1, 5, 9, 3};
+    p.num_bin = 10; p.min_bin = 1; p.max_bin = 6; p.threshold = 4; p.most_freq_bin = 2;
+    p.note = "oor-go-left"; cases.push_back(p);
+  }
+  // (c) default routing right: most_freq_bin > threshold so out-of-range go right.
+  {
+    PCaseSpec p;
+    p.name = "default_right"; p.bins = {0, 2, 9, 1, 5, 9, 3};
+    p.num_bin = 10; p.min_bin = 1; p.max_bin = 6; p.threshold = 2; p.most_freq_bin = 7;
+    p.note = "oor-go-right"; cases.push_back(p);
+  }
+  // (d) randomized larger case (stability stress).
+  {
+    PCaseSpec p;
+    p.name = "random"; p.num_bin = 16; p.min_bin = 0; p.max_bin = 15;
+    p.threshold = 7; p.most_freq_bin = 16;
+    const int n = 40;
+    p.bins.resize(n);
+    for (int i = 0; i < n; ++i) p.bins[i] = static_cast<uint32_t>(gen.NextInt(0, 16));
+    p.note = "random-40-rows"; cases.push_back(p);
+  }
+  return cases;
+}
+
+// ===========================================================================
+// 04-03 SUBTRACT golden. parent - child over 2*num_bin f64 cells.
+// ===========================================================================
+struct SubCaseSpec {
+  std::string name;
+  std::vector<double> parent;
+  std::vector<double> child;
+  std::string note;
+};
+
+void EmitSubCase(std::ofstream& out, const SubCaseSpec& cs) {
+  // FeatureHistogram::Subtract default path: derived[i] = parent[i] - child[i].
+  std::vector<double> derived(cs.parent.size());
+  for (size_t i = 0; i < cs.parent.size(); ++i) derived[i] = cs.parent[i] - cs.child[i];
+
+  out << "SUBCASE name=" << cs.name << " len=" << cs.parent.size()
+      << " note=" << cs.note << "\n";
+  auto emit = [&](const char* tag, const std::vector<double>& v) {
+    out << tag << " ";
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (i) out << ";";
+      out << F64Bits(v[i]);
+    }
+    out << "\n";
+  };
+  emit("SUBPARENT", cs.parent);
+  emit("SUBCHILD", cs.child);
+  emit("SUBDERIVED", derived);
+}
+
+std::vector<SubCaseSpec> BuildSubtractCorpus(int master_seed) {
+  std::vector<SubCaseSpec> cases;
+  CaseGen gen(master_seed ^ 0x2626);
+  // (a) simple.
+  {
+    SubCaseSpec s;
+    s.name = "simple"; s.parent = {10.0, 5.0, 8.0, 4.0}; s.child = {3.0, 2.0, 1.0, 1.0};
+    s.note = "4-bin"; cases.push_back(s);
+  }
+  // (b) spread (mixed signs / magnitudes) over a larger histogram.
+  {
+    SubCaseSpec s;
+    s.name = "spread"; const int nb = 12;
+    s.parent.resize(2 * nb); s.child.resize(2 * nb);
+    for (int i = 0; i < 2 * nb; ++i) {
+      const double mag = (i % 4 == 0) ? 1e3 : (i % 4 == 1) ? 1e-3 : (i % 4 == 2) ? 7.5 : 0.125;
+      const double sign = (gen.NextInt(0, 2) == 0) ? 1.0 : -1.0;
+      s.parent[i] = sign * mag * (1.0 + gen.NextFloat());
+      s.child[i] = sign * mag * 0.25 * (1.0 + gen.NextFloat());
+    }
+    s.note = "spread-12-bin"; cases.push_back(s);
+  }
+  return cases;
+}
+
 int main(int argc, char** argv) {
-  // argv: <hist_out> <master_seed>
-  if (argc != 3) {
-    std::cerr << "usage: kernel_capture <hist_out> <master_seed>\n";
+  // argv: <hist_out> <master_seed> <split_out> <partition_out> <subtract_out>
+  if (argc != 6) {
+    std::cerr << "usage: kernel_capture <hist_out> <master_seed> "
+                 "<split_out> <partition_out> <subtract_out>\n";
     return 2;
   }
   const std::string out_path = argv[1];
   const int master_seed = std::stoi(argv[2]);
+  const std::string split_path = argv[3];
+  const std::string partition_path = argv[4];
+  const std::string subtract_path = argv[5];
 
   std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
@@ -527,5 +1070,62 @@ int main(int argc, char** argv) {
   }
   std::cerr << "kernel_capture: wrote " << corpus.size() << " histogram cases to "
             << out_path << "\n";
+
+  // ---- SPLIT golden ----
+  std::ofstream sout(split_path, std::ios::binary | std::ios::trunc);
+  if (!sout) {
+    std::cerr << "error: cannot open output file: " << split_path << "\n";
+    return 1;
+  }
+  std::vector<SCaseSpec> scorpus = BuildSplitCorpus();
+  sout << "# LightGBM-rs find_best_split golden (Phase 4 04-03). VERBATIM\n";
+  sout << "# FindBestThresholdSequentially + gain math from feature_histogram.hpp\n";
+  sout << "# 711-1057 (commit 195c26fc). Per-candidate gains (REVERSE + FORWARD,\n";
+  sout << "# NaN when gated) + the winning SplitInfo; covers reverse-winner,\n";
+  sout << "# forward-winner, default-bin skip, L1, and no-split cases.\n";
+  sout << "KERNEL_MASTER_SEED " << master_seed << "\n";
+  sout << "COUNTS split=" << scorpus.size() << "\n";
+  for (const auto& cs : scorpus) EmitSCase(sout, cs);
+  sout.flush();
+  if (!sout) { std::cerr << "error: failed writing split golden\n"; return 1; }
+  std::cerr << "kernel_capture: wrote " << scorpus.size() << " split cases to "
+            << split_path << "\n";
+
+  // ---- PARTITION golden ----
+  std::ofstream pout(partition_path, std::ios::binary | std::ios::trunc);
+  if (!pout) {
+    std::cerr << "error: cannot open output file: " << partition_path << "\n";
+    return 1;
+  }
+  std::vector<PCaseSpec> pcorpus = BuildPartitionCorpus(master_seed);
+  pout << "# LightGBM-rs data_partition golden (Phase 4 04-03). VERBATIM SplitInner\n";
+  pout << "# routing (dense_bin.hpp:314-394, MissingType::None) + stable two-pass\n";
+  pout << "# gather. Emits the reordered index array + split_point.\n";
+  pout << "KERNEL_MASTER_SEED " << master_seed << "\n";
+  pout << "COUNTS partition=" << pcorpus.size() << "\n";
+  for (const auto& cs : pcorpus) EmitPCase(pout, cs);
+  pout.flush();
+  if (!pout) { std::cerr << "error: failed writing partition golden\n"; return 1; }
+  std::cerr << "kernel_capture: wrote " << pcorpus.size() << " partition cases to "
+            << partition_path << "\n";
+
+  // ---- SUBTRACT golden ----
+  std::ofstream subout(subtract_path, std::ios::binary | std::ios::trunc);
+  if (!subout) {
+    std::cerr << "error: cannot open output file: " << subtract_path << "\n";
+    return 1;
+  }
+  std::vector<SubCaseSpec> subcorpus = BuildSubtractCorpus(master_seed);
+  subout << "# LightGBM-rs subtract_histograms golden (Phase 4 04-03). VERBATIM\n";
+  subout << "# FeatureHistogram::Subtract (feature_histogram.hpp:99-145, default\n";
+  subout << "# USE_DIST_GRAD=false): derived[i] = parent[i] - child[i].\n";
+  subout << "KERNEL_MASTER_SEED " << master_seed << "\n";
+  subout << "COUNTS subtract=" << subcorpus.size() << "\n";
+  for (const auto& cs : subcorpus) EmitSubCase(subout, cs);
+  subout.flush();
+  if (!subout) { std::cerr << "error: failed writing subtract golden\n"; return 1; }
+  std::cerr << "kernel_capture: wrote " << subcorpus.size() << " subtract cases to "
+            << subtract_path << "\n";
+
   return 0;
 }

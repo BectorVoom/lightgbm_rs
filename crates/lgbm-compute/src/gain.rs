@@ -45,9 +45,11 @@ use cubecl::prelude::*;
 #[cube]
 pub fn threshold_l1(s: f64, l1: f64) -> f64 {
     let reg_s = f64::max(0.0, f64::abs(s) - l1);
-    // Sign(s) = (s > 0) - (s < 0), as f64.
-    let pos = if s > 0.0 { 1.0 } else { 0.0 };
-    let neg = if s < 0.0 { 1.0 } else { 0.0 };
+    // Sign(s) = (s > 0) - (s < 0), as f64. Expressed with branchless `select`
+    // because the `if cond { 1.0 } else { 0.0 }` form mis-lowers to a constant on
+    // cubecl-cpu (0.10.0) — it returned 0 for s<0, zeroing every L1 gain.
+    let pos = select(s > 0.0, 1.0, 0.0);
+    let neg = select(s < 0.0, 1.0, 0.0);
     (pos - neg) * reg_s
 }
 
