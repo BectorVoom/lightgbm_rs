@@ -17,18 +17,81 @@ pub mod runtime;
 
 pub use error::ComputeError;
 
+use cubecl::prelude::ComputeClient;
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
-/// kernels are dispatched to. Kernel methods (`construct_histograms`,
-/// `find_best_split`, `data_partition`, `subtract_histograms`) are finalized in
-/// 04-02/04-03; this plan establishes the foundation (error type, runtime
-/// selection, capability gate, and the minimal histogram kernel proving the
-/// D-04a bit-determinism bet).
+/// kernels are dispatched to. The coarse whole-kernel ops (D-01) live on this
+/// trait: [`construct_histograms`](Backend::construct_histograms) is finalized
+/// in 04-02 (this plan); `find_best_split` / `data_partition` follow in 04-03.
 ///
 /// This trait is the ONLY place where CubeCL runtime types should appear; that
 /// is the whole point of the seam.
 pub trait Backend {
     /// The concrete CubeCL runtime this backend dispatches kernels to.
     type Runtime: cubecl::Runtime;
+
+    /// Construct a single feature column's gradient/hessian histogram (D-01
+    /// whole-kernel op, faithful to `dense_bin.hpp:99-141`).
+    ///
+    /// Inputs (sourced from the Phase-2 binned store — do NOT re-bin):
+    /// - `client`  — the compute client for [`Self::Runtime`].
+    /// - `binned`  — the per-row bin indices for this feature column, i.e. the
+    ///   `u32`-widened `Bin::data(idx)` for `idx in 0..num_data()`.
+    /// - `ordered_gradients` / `ordered_hessians` — the `f32`
+    ///   (`score_t = float`) gradient/hessian slice, one per row, in the SAME
+    ///   row order as `binned`.
+    /// - `num_bin` — the feature's bin count; the output has `2 * num_bin` cells.
+    ///
+    /// Output: the stride-2 interleaved `[g0,h0,g1,h1,…]` histogram of length
+    /// `2 * num_bin`, indexed `ti = bin << 1` (`out[ti] += grad`,
+    /// `out[ti + 1] += hess`). Gradients/hessians are read as `f32` but
+    /// accumulated into `f64` cells (`hist_t = double`, RESEARCH Pitfall 3) on
+    /// the single-owner ordered fold proven bit-exact in 04-01.
+    ///
+    /// # Errors
+    /// Returns [`ComputeError::LengthMismatch`] if `ordered_gradients`/
+    /// `ordered_hessians`/`binned` lengths differ, or
+    /// [`ComputeError::BinIndexOutOfRange`] if any `binned[i] >= num_bin` (V5
+    /// boundary validation, threat T-04-01) — never a panic / UB.
+    fn construct_histograms(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        binned: &[u32],
+        ordered_gradients: &[f32],
+        ordered_hessians: &[f32],
+        num_bin: u32,
+    ) -> Result<Vec<f64>, ComputeError>;
+}
+
+/// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
+///
+/// Binds [`runtime::ActiveRuntime`] (cubecl-cpu under the default `cpu` feature)
+/// and dispatches [`construct_histograms`](Backend::construct_histograms) to the
+/// single-owner ordered f64 fold in [`kernels::histogram`].
+#[cfg(feature = "cpu")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuBackend;
+
+#[cfg(feature = "cpu")]
+impl Backend for CpuBackend {
+    type Runtime = runtime::ActiveRuntime;
+
+    fn construct_histograms(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        binned: &[u32],
+        ordered_gradients: &[f32],
+        ordered_hessians: &[f32],
+        num_bin: u32,
+    ) -> Result<Vec<f64>, ComputeError> {
+        kernels::histogram::construct_histograms_cpu(
+            client,
+            binned,
+            ordered_gradients,
+            ordered_hessians,
+            num_bin,
+        )
+    }
 }
