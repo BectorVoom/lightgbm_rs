@@ -44,7 +44,10 @@ pub struct FeatureGroup {
     num_feature_: i32,
     /// C++ `bool is_multi_val_`.
     is_multi_val_: bool,
-    /// C++ `bool is_dense_multi_val_`.
+    /// C++ `bool is_dense_multi_val_`. Set during offset packing; consumed by the
+    /// EFB multi-val store layout in Plan 05 (kept now to mirror C++ state and
+    /// keep the offset-packing branch faithful).
+    #[allow(dead_code)]
     is_dense_multi_val_: bool,
     /// C++ `bool is_sparse_`.
     is_sparse_: bool,

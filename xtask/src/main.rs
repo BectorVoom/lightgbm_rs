@@ -201,6 +201,7 @@ fn bin_capture() -> Result<()> {
     std::fs::create_dir_all(&fixtures_dir)
         .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
     let fixture_path = fixtures_dir.join("numeric_binning.txt");
+    let storage_fixture_path = fixtures_dir.join("bin_storage_layout.txt");
 
     eprintln!("xtask bin-capture: configuring C++ capture build ...");
     run(
@@ -231,7 +232,8 @@ fn bin_capture() -> Result<()> {
     run(
         Command::new(&exe)
             .arg(&fixture_path)
-            .arg(BIN_MASTER_SEED.to_string()),
+            .arg(BIN_MASTER_SEED.to_string())
+            .arg(&storage_fixture_path),
         "bin_capture",
     )?;
 
@@ -239,6 +241,12 @@ fn bin_capture() -> Result<()> {
         bail!(
             "capture completed but {} was not written",
             fixture_path.display()
+        );
+    }
+    if !storage_fixture_path.is_file() {
+        bail!(
+            "capture completed but {} was not written",
+            storage_fixture_path.display()
         );
     }
 
@@ -250,8 +258,9 @@ fn bin_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask bin-capture: done. Wrote {}.",
-        fixture_path.display()
+        "xtask bin-capture: done. Wrote {} and {}.",
+        fixture_path.display(),
+        storage_fixture_path.display()
     );
     eprintln!(
         "Re-run `cargo run -p xtask -- bin-capture` and confirm \
