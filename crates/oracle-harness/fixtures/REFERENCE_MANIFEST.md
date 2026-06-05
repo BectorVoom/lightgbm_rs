@@ -114,6 +114,45 @@ and the asymmetric `b <= nextafter(a)` dedup — so it emits goldens byte-identi
 to lib_lightgbm — and links only the header-only reference `Random` for sampling.
 This mirrors the Phase-1 header-only `rng_capture` discipline.
 
+## EFB Grouping Golden Set (Phase 2, layer 3, DAT-05)
+
+Captured by `cargo run -p xtask -- bin-capture` into
+`crates/lgbm-dataset/tests/fixtures/efb_grouping.txt`. Covers Exclusive Feature
+Bundling (layer 3): feature->group membership (`feature2group_` /
+`feature2subfeature_`), per-group `bin_offsets_` + `num_total_bin_` + the
+`group_is_multi_val` flag, and the per-row bundled bin index per single-value
+group. Corpus = D-06 number 4: two mutually-exclusive sparse feature sets (which EFB
+bundles into one group each) plus a control where no features are mutually
+exclusive (one single-feature group per feature — proves the `enable_bundle`
+dispatch boundary).
+
+### Capture-harness resolution: VERBATIM TRANSCRIPTION (external_libs unvendored)
+
+The plan flagged a MEDIUM-risk feasibility choice between (a) a focused harness
+compiling `src/io/dataset.cpp` directly, and (b) a full-CLI `enable_bundle=true`
+dump. **Both nominal options are provably infeasible in this environment:**
+
+- **(a) focused `dataset.cpp` build — INFEASIBLE.** `dataset.cpp` transitively
+includes `common.h` -> `fast_double_parser.h` + `fmt/format.h` from
+`external_libs/`, which are present here only as EMPTY directories (the
+LightGBM tree is git-untracked and its submodules are unvendored). The build
+fails with `fast_double_parser.h: No such file or directory`.
+- **(b) full-CLI dump — INFEASIBLE.** Building `lib_lightgbm` / the `lightgbm`
+CLI requires the same unvendored `external_libs` (`fast_double_parser`, `fmt`,
+`eigen`, `compute`), so the CLI cannot be built either.
+
+**Resolution (human-approved):** EFB is captured by a HEADER-ONLY VERBATIM
+TRANSCRIPTION of the EFB pipeline (`GetConflictCount`/`FindGroups`/
+`FastFeatureBundling`/`FixSampleIndices` + the bundled `FeatureGroup` /
+`bin_offsets_` / `num_total_bin_` group layout) from the pinned `dataset.cpp`
+(commit `195c26fc7b00eb0fec252dfe841e2e66d6833954`, version `4.6.0.99`) and `feature_group.h`, compiled against
+only `-I LightGBM/include` plus the header-only `LightGBM::Random` (sampling +
+group shuffle). This is the SAME discipline plans 02-01..02-04 used for every
+prior golden layer (numeric / storage / categorical / missing / metadata): no
+`external_libs`, no `lib_lightgbm` link, output byte-identical to what
+lib_lightgbm would emit because the transcribed code is the authoritative
+reference source.
+
 ### Exact bin-capture command
 
 ```bash

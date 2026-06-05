@@ -205,6 +205,7 @@ fn bin_capture() -> Result<()> {
     let categorical_fixture_path = fixtures_dir.join("categorical_folding.txt");
     let missing_fixture_path = fixtures_dir.join("missing_edge_cases.txt");
     let metadata_fixture_path = fixtures_dir.join("metadata.txt");
+    let efb_fixture_path = fixtures_dir.join("efb_grouping.txt");
     let example_fixture_path = fixtures_dir.join("example_dataset_binning.txt");
     // The COPIED example datasets live under the committed fixtures dir (never the
     // untracked LightGBM/ tree); the C++ harness reads these exact paths.
@@ -258,6 +259,7 @@ fn bin_capture() -> Result<()> {
         .arg(&categorical_fixture_path)
         .arg(&missing_fixture_path)
         .arg(&metadata_fixture_path)
+        .arg(&efb_fixture_path)
         .arg(&example_fixture_path);
     for ex in &example_inputs {
         cmd.arg(ex);
@@ -270,6 +272,7 @@ fn bin_capture() -> Result<()> {
         &categorical_fixture_path,
         &missing_fixture_path,
         &metadata_fixture_path,
+        &efb_fixture_path,
         &example_fixture_path,
     ] {
         if !p.is_file() {
@@ -285,12 +288,13 @@ fn bin_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask bin-capture: done. Wrote {}, {}, {}, {}, {}, and {}.",
+        "xtask bin-capture: done. Wrote {}, {}, {}, {}, {}, {}, and {}.",
         fixture_path.display(),
         storage_fixture_path.display(),
         categorical_fixture_path.display(),
         missing_fixture_path.display(),
         metadata_fixture_path.display(),
+        efb_fixture_path.display(),
         example_fixture_path.display()
     );
     eprintln!(
@@ -483,6 +487,45 @@ version `{version}`) using the genuine `std::nextafter` (== `GetDoubleUpperBound
 and the asymmetric `b <= nextafter(a)` dedup — so it emits goldens byte-identical\n\
 to lib_lightgbm — and links only the header-only reference `Random` for sampling.\n\
 This mirrors the Phase-1 header-only `rng_capture` discipline.\n\
+\n\
+## EFB Grouping Golden Set (Phase 2, layer 3, DAT-05)\n\
+\n\
+Captured by `cargo run -p xtask -- bin-capture` into\n\
+`crates/lgbm-dataset/tests/fixtures/efb_grouping.txt`. Covers Exclusive Feature\n\
+Bundling (layer 3): feature->group membership (`feature2group_` /\n\
+`feature2subfeature_`), per-group `bin_offsets_` + `num_total_bin_` + the\n\
+`group_is_multi_val` flag, and the per-row bundled bin index per single-value\n\
+group. Corpus = D-06 number 4: two mutually-exclusive sparse feature sets (which EFB\n\
+bundles into one group each) plus a control where no features are mutually\n\
+exclusive (one single-feature group per feature — proves the `enable_bundle`\n\
+dispatch boundary).\n\
+\n\
+### Capture-harness resolution: VERBATIM TRANSCRIPTION (external_libs unvendored)\n\
+\n\
+The plan flagged a MEDIUM-risk feasibility choice between (a) a focused harness\n\
+compiling `src/io/dataset.cpp` directly, and (b) a full-CLI `enable_bundle=true`\n\
+dump. **Both nominal options are provably infeasible in this environment:**\n\
+\n\
+- **(a) focused `dataset.cpp` build — INFEASIBLE.** `dataset.cpp` transitively\n\
+  includes `common.h` -> `fast_double_parser.h` + `fmt/format.h` from\n\
+  `external_libs/`, which are present here only as EMPTY directories (the\n\
+  LightGBM tree is git-untracked and its submodules are unvendored). The build\n\
+  fails with `fast_double_parser.h: No such file or directory`.\n\
+- **(b) full-CLI dump — INFEASIBLE.** Building `lib_lightgbm` / the `lightgbm`\n\
+  CLI requires the same unvendored `external_libs` (`fast_double_parser`, `fmt`,\n\
+  `eigen`, `compute`), so the CLI cannot be built either.\n\
+\n\
+**Resolution (human-approved):** EFB is captured by a HEADER-ONLY VERBATIM\n\
+TRANSCRIPTION of the EFB pipeline (`GetConflictCount`/`FindGroups`/\n\
+`FastFeatureBundling`/`FixSampleIndices` + the bundled `FeatureGroup` /\n\
+`bin_offsets_` / `num_total_bin_` group layout) from the pinned `dataset.cpp`\n\
+(commit `{commit}`, version `{version}`) and `feature_group.h`, compiled against\n\
+only `-I LightGBM/include` plus the header-only `LightGBM::Random` (sampling +\n\
+group shuffle). This is the SAME discipline plans 02-01..02-04 used for every\n\
+prior golden layer (numeric / storage / categorical / missing / metadata): no\n\
+`external_libs`, no `lib_lightgbm` link, output byte-identical to what\n\
+lib_lightgbm would emit because the transcribed code is the authoritative\n\
+reference source.\n\
 \n\
 ### Exact bin-capture command\n\
 \n\
