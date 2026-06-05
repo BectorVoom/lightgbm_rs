@@ -48,7 +48,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(gap closure — blocked on Wave 2; closes SC#4 / CFG-02 + CFG-03)*
 
-  - [ ] 01-03-PLAN.md — Gap closure: deterministic SortAlias alias-collision resolution (CR-02) + present()-routed seed/enum empty-is-absent (CR-01), each with regression tests
+  - [x] 01-03-PLAN.md — Gap closure: deterministic SortAlias alias-collision resolution (CR-02) + present()-routed seed/enum empty-is-absent (CR-01), each with regression tests
 
 ### Phase 2: Dataset + Binning (determinism root)
 
@@ -169,7 +169,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Oracle Contract + Foundations | 2/2 | Plans complete | 2026-06-05 |
+| 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
 | 2. Dataset + Binning | 0/TBD | Not started | - |
 | 3. Tree Model + Model Text I/O + Predict Parity | 0/TBD | Not started | - |
 | 4. Compute Backend (CPU-first → ROCm) | 0/TBD | Not started | - |
