@@ -71,27 +71,65 @@ pub struct EfbSamples {
 
 impl Dataset {
     /// C++ `Dataset::Construct` (`dataset.cpp:325-441`), one-feature-per-group
-    /// default. Builds a `FeatureGroup` per `BinMapper` (single-value groups).
+    /// (no-bundle) variant — mirrors the single C++ `Dataset::Construct` with the
+    /// `enable_bundle` branch NOT taken (`OneFeaturePerGroup(used_features)` at
+    /// dataset.cpp:350, no `FastFeatureBundling`).
     ///
-    /// Validates `num_data >= 0` and a non-empty mapper set at the boundary,
-    /// returning [`DatasetError`] rather than panicking (Security V5).
+    /// CRITICAL (CR-01 fix): like C++ Construct, this FILTERS TRIVIAL FEATURES
+    /// (`used_features = !is_trivial_` only, dataset.cpp:337-343) BEFORE grouping.
+    /// A trivial feature is DROPPED — it gets NO `FeatureGroup`, no bin offset, no
+    /// stored bins, and `used_feature_map_[real] = -1` (dataset.cpp:376, 396). So
+    /// `num_features_` / `feature2group_` / `feature2subfeature_` are built over
+    /// the USED features only, exactly as C++ does, and a trivial feature shifts
+    /// none of those. Without this filter, a trivial feature would wrongly get its
+    /// own group and stored bins, diverging from C++ at the determinism root.
+    ///
+    /// Validates `num_data >= 0` at the boundary, returning [`DatasetError`]
+    /// rather than panicking (Security V5).
     pub fn construct(bin_mappers: Vec<BinMapper>, num_data: i32) -> Result<Self, DatasetError> {
         if num_data < 0 {
             return Err(DatasetError::ShapeMismatch {
                 detail: format!("num_data must be >= 0, got {num_data}"),
             });
         }
-        let num_features_ = bin_mappers.len() as i32;
-        let mut feature_groups_ = Vec::with_capacity(bin_mappers.len());
-        for m in bin_mappers {
+        let num_total_features = bin_mappers.len() as i32;
+
+        // used_features = non-trivial features, in order (dataset.cpp:337-343).
+        let used_features: Vec<i32> = (0..num_total_features)
+            .filter(|&i| !bin_mappers[i as usize].is_trivial_)
+            .collect();
+        // No-bundle dispatch: OneFeaturePerGroup over the USED features only.
+        let features_in_group = crate::efb::one_feature_per_group(&used_features);
+
+        // Build FeatureGroups + the feature->group/subfeature maps over USED
+        // features only (dataset.cpp:371-411). Move mappers out of the Vec by
+        // index so each used feature lands in exactly one group.
+        let mut mappers_opt: Vec<Option<BinMapper>> =
+            bin_mappers.into_iter().map(Some).collect();
+        let num_features_ = used_features.len() as i32;
+        let mut feature2group_ = vec![-1i32; num_features_ as usize];
+        let mut feature2subfeature_ = vec![-1i32; num_features_ as usize];
+        let mut real_feature_idx_ = vec![-1i32; num_features_ as usize];
+        // real feature index -> packed index (C++ used_feature_map_), -1 if trivial.
+        let mut used_feature_map_ = vec![-1i32; num_total_features as usize];
+
+        let mut feature_groups_ = Vec::with_capacity(features_in_group.len());
+        let mut cur_fidx = 0i32;
+        for (i, cur_features) in features_in_group.iter().enumerate() {
+            for (j, &real_fidx) in cur_features.iter().enumerate() {
+                real_feature_idx_[cur_fidx as usize] = real_fidx;
+                used_feature_map_[real_fidx as usize] = cur_fidx;
+                feature2group_[cur_fidx as usize] = i as i32;
+                feature2subfeature_[cur_fidx as usize] = j as i32;
+                cur_fidx += 1;
+            }
+            // One feature per group -> a single-value FeatureGroup.
+            let m = mappers_opt[cur_features[0] as usize]
+                .take()
+                .expect("each used feature assigned to exactly one group");
             feature_groups_.push(FeatureGroup::new_single(m, num_data));
         }
-        // One-feature-per-group: feature f lives at group f, sub-feature 0.
-        let feature2group_ = (0..num_features_).collect();
-        let feature2subfeature_ = vec![0; num_features_ as usize];
-        // packed index == real index (identity) in the no-bundle default.
-        let real_feature_idx_ = (0..num_features_).collect();
-        let used_feature_map_ = (0..num_features_).collect();
+
         Ok(Dataset {
             num_data_: num_data,
             num_features_,

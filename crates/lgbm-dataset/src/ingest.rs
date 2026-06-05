@@ -32,10 +32,11 @@
 //! `bin_mapper`).
 
 use lgbm_core::config::Config;
+use lgbm_core::types::K_ZERO_THRESHOLD;
 
 pub use crate::bin_mapper::{create_sample_indices, sample_count};
 use crate::bin_mapper::{scaled_filter_cnt, BinMapper};
-use crate::dataset::FinishedDataset;
+use crate::dataset::{EfbSamples, FinishedDataset};
 use crate::error::DatasetError;
 use crate::metadata::Metadata;
 
@@ -72,13 +73,20 @@ fn validate_binning_config(cfg: &Config) -> Result<(), DatasetError> {
     Ok(())
 }
 
-/// Build the numeric `BinMapper` for one column from its full per-row values.
+/// Build the numeric `BinMapper` for one column from its full per-row values,
+/// returning BOTH the mapper AND the sampled per-row values (in sampled-set
+/// order) that share the same `create_sample_indices` draw.
 ///
 /// Mirrors the C-API path: sample row indices via the Phase-1 RNG, gather the
 /// sampled rows' values, then `find_bin_numeric` with `total_sample_cnt = k`.
 /// `column` is already f64-widened. This is the per-feature constructor (D-03):
 /// no shared mutable state, so a later `par_iter` over columns is a one-line swap.
-fn build_mapper(column: &[f64], cfg: &Config) -> BinMapper {
+///
+/// The returned `sampled` Vec is reused to build the `EfbSamples` the Construct
+/// dispatch consumes — the SAME single `create_sample_indices` draw used to bin,
+/// so NO second RNG draw is introduced (the seed is `cfg.data_random_seed` and
+/// the per-column sample positions `0..k` are identical across columns).
+fn build_mapper(column: &[f64], cfg: &Config) -> (BinMapper, Vec<f64>) {
     let total_nrow = column.len() as i32;
     let indices = create_sample_indices(
         total_nrow,
@@ -93,8 +101,8 @@ fn build_mapper(column: &[f64], cfg: &Config) -> BinMapper {
     // total_sample_cnt = k (the sampled count) and num_rows = total_nrow, matching
     // the dense c_api convention (CSR/CSC use the identical convention).
     let filter_cnt = scaled_filter_cnt(cfg.min_data_in_leaf, total_sample_cnt as i32, total_nrow);
-    BinMapper::find_bin_numeric(
-        sampled,
+    let mapper = BinMapper::find_bin_numeric(
+        sampled.clone(),
         cfg.max_bin,
         cfg.min_data_in_bin,
         filter_cnt,
@@ -103,23 +111,92 @@ fn build_mapper(column: &[f64], cfg: &Config) -> BinMapper {
         cfg.zero_as_missing,
         total_sample_cnt,
         &[],
-    )
+    );
+    (mapper, sampled)
+}
+
+/// Build the per-column [`EfbSamples`] the `enable_bundle` Construct dispatch
+/// consumes, to the EXACT C++ `c_api.cpp:1352-1374` SAMPLED-SET convention:
+///
+/// - the outer index `i` runs `0..sample_cnt` — the position WITHIN the sampled
+///   set, NOT the raw row index (`c_api.cpp:1352`, `sample_idx[k].emplace_back(i)`);
+/// - per column `k`, a sampled value `v` is kept ONLY when
+///   `v.abs() > kZeroThreshold || v.is_nan()` (`c_api.cpp:1361`);
+/// - `total_sample_cnt` = the SAMPLED-SET size `sample_cnt`
+///   (`= sampled_columns[*].len()`), NOT `num_rows` (`c_api.cpp:1372` `sample_cnt`
+///   arg, distinct from the `total_nrow` arg that only drives `num_rows`);
+/// - `num_per_col[k]` = `sample_values[k].len()` (the kept non-zero/NaN count).
+///
+/// This is DELIBERATELY NOT the `efb_grouping.rs` full-row convention
+/// (total_sample_cnt = num_rows, raw row indices): on the ingest path the sample
+/// is `bin_construct_sample_cnt` rows, so the sampled-set positions `0..sample_cnt`
+/// are the correct indices.
+///
+/// `sampled_columns[k]` is the sampled per-row values for column `k`, in
+/// sampled-set order, as returned by [`build_mapper`] — i.e. all columns share
+/// the same single `create_sample_indices` draw (no second RNG draw).
+fn build_efb_samples(sampled_columns: &[Vec<f64>], num_cols: i32) -> EfbSamples {
+    // sample_cnt is the SAMPLED-SET size, identical across columns (one draw).
+    let sample_cnt = sampled_columns.first().map(|c| c.len()).unwrap_or(0) as i32;
+    let mut sample_indices: Vec<Vec<i32>> = vec![Vec::new(); num_cols as usize];
+    let mut sample_values: Vec<Vec<f64>> = vec![Vec::new(); num_cols as usize];
+    let mut num_per_col: Vec<i32> = vec![0; num_cols as usize];
+    for k in 0..num_cols as usize {
+        let col = &sampled_columns[k];
+        for (i, &v) in col.iter().enumerate() {
+            // c_api.cpp:1361 non-zero/NaN filter; `i` is the sampled-set POSITION.
+            if v.abs() > K_ZERO_THRESHOLD || v.is_nan() {
+                sample_values[k].push(v);
+                sample_indices[k].push(i as i32);
+            }
+        }
+        num_per_col[k] = sample_values[k].len() as i32;
+    }
+    EfbSamples {
+        sample_indices,
+        sample_values,
+        num_per_col,
+        num_sample_col: num_cols,
+        total_sample_cnt: sample_cnt,
+    }
 }
 
 /// Run the shared tail of every ingestion path: build one mapper per column,
-/// `Dataset::construct`, push every row, attach the validated metadata, and
-/// `finish_load` (the immutability boundary).
+/// dispatch through the single C++ `Dataset::Construct` (the `enable_bundle`
+/// branch, [`Dataset::construct_bundled`]), push every row, attach the validated
+/// metadata, and `finish_load` (the immutability boundary).
 ///
 /// `columns[c]` is the full f64-widened per-row column for feature `c`; every
 /// column has the same length `num_rows`.
+///
+/// CRITICAL (CR-01 fix): this routes through `construct_bundled` — the faithful
+/// port of the SINGLE C++ `Dataset::Construct` (dataset.cpp:325-441) — instead of
+/// the prior store-everything non-bundled path. With the default
+/// `cfg.enable_bundle = true` it filters trivial features (used_features =
+/// `!is_trivial_`, dataset.cpp:337-343) AND runs `FastFeatureBundling`
+/// (dataset.cpp:362-369); with `enable_bundle = false` it falls back to
+/// `one_feature_per_group(used_features)` — STILL trivial-filtered. The
+/// `EfbSamples` it consumes is built to the exact c_api.cpp:1352-1374 sampled-set
+/// convention (see [`build_efb_samples`]).
 fn finish_from_columns(
     columns: &[Vec<f64>],
     num_rows: i32,
     cfg: &Config,
     mut metadata: Metadata,
 ) -> Result<(FinishedDataset, Metadata), DatasetError> {
-    let mappers: Vec<BinMapper> = columns.iter().map(|col| build_mapper(col, cfg)).collect();
-    let mut ds = crate::dataset::Dataset::construct(mappers, num_rows)?;
+    let num_cols = columns.len() as i32;
+    // One pass: build each mapper AND capture its sampled per-row values (the
+    // SAME create_sample_indices draw — no second RNG draw).
+    let mut mappers: Vec<BinMapper> = Vec::with_capacity(columns.len());
+    let mut sampled_columns: Vec<Vec<f64>> = Vec::with_capacity(columns.len());
+    for col in columns {
+        let (mapper, sampled) = build_mapper(col, cfg);
+        mappers.push(mapper);
+        sampled_columns.push(sampled);
+    }
+    // EfbSamples built to the c_api.cpp:1352-1374 sampled-set convention.
+    let samples = build_efb_samples(&sampled_columns, num_cols);
+    let mut ds = crate::dataset::Dataset::construct_bundled(mappers, num_rows, cfg, &samples)?;
     for row in 0..num_rows {
         for (feature, col) in columns.iter().enumerate() {
             ds.push_value(feature, row, col[row as usize]);
