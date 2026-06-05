@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
+status: executing
 stopped_at: Phase 3 context gathered
-last_updated: "2026-06-05T10:47:43.719Z"
-last_activity: 2026-06-05 -- Phase 03 planning complete
+last_updated: "2026-06-05T11:06:33.591Z"
+last_activity: 2026-06-05 -- Phase 03 execution started
 progress:
   total_phases: 8
   completed_phases: 2
-  total_plans: 10
-  completed_plans: 10
+  total_plans: 14
+  completed_plans: 11
   percent: 25
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 02 — dataset-binning-determinism-root
+**Current focus:** Phase 03 — tree-model-model-text-i-o-predict-parity
 
 ## Current Position
 
-Phase: 3
-Plan: Not started
-Status: All 7 plans executed; CR-01 (default-ingest Construct divergence) + WR-01 (silent-skip) closed. Phase ready for re-verification.
-Last activity: 2026-06-05 -- Phase 03 planning complete
+Phase: 03 (tree-model-model-text-i-o-predict-parity) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-06-05 -- Phase 03 execution started
 
 Progress: [██████████] 7/7 plans executed — CR-01 blocker + WR-01 closed; re-verify next
 
@@ -90,6 +90,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 - Trend: -
 
 *Updated after each plan completion*
+| Phase 03 P01 | ~20 min | 4 tasks | 29 files |
 
 ## Accumulated Context
 
@@ -113,6 +114,8 @@ Recent decisions affecting current work:
 - [Phase 2 exec, 2026-06-05]: **Scaled pre-filter threshold locked (GAP-1/GAP-2, SC#1/SC#5)** — the default in-memory ingest path now feeds the SCALED `filter_cnt = (min_data_in_leaf * total_sample_cnt) / num_rows` (i64 integer truncation, exact analog of `dataset_loader.cpp:623-624`) to `find_bin_numeric`, computed once in `bin_mapper.rs::scaled_filter_cnt` and called from BOTH `ingest.rs::build_mapper` and `bin_mapper.rs::find_bin_from_column` (no divergent raw-forwarding copy). `from_csr`/`from_csc` inherit via `finish_from_columns -> build_mapper` (CSR/CSC use the identical dense convention `total_sample_size=sample_cnt`, `num_dist_data=total_nrow`, confirmed in c_api.cpp). `num_rows==0` returns raw `min_data_in_leaf` as a Rust-only, parity-unobservable empty-matrix guard (no C++ analog — C++ never reaches FindBin with zero rows). Proven by a default-config (feature_pre_filter=true, sample_cnt=50<num_rows=200, min_data_in_leaf=20 -> filter_cnt=5) ingest parity golden that FAILS before and PASSES after, asserting `is_trivial_` + STORED per-row bins (read from `feature_group().bin_data()`, NOT recomputed). Golden cells are f32-representable (from_mat takes &[f32]) so the f32->f64 widen does not drift boundaries.
 - [Phase 2 exec, 2026-06-05]: **Default ingest unified onto the faithful single C++ Dataset::Construct (CR-01, SC#2, DAT-01/02/05/07, ORA-03)** — `from_mat`/`from_csr`/`from_csc` -> `finish_from_columns` now dispatch on `cfg.enable_bundle` through `Dataset::construct_bundled` (the faithful port of the single C++ `Dataset::Construct`, dataset.cpp:325-441) instead of the prior store-everything non-bundled construct. Trivial features (`is_trivial_`) are DROPPED (`used_feature_map_[real] = -1`, no FeatureGroup, no stored bins), so `num_features_`/`feature2group_`/`feature2subfeature_`/`num_total_bin_` are bit-identical to C++ whenever any feature is trivial. The `EfbSamples` it consumes is built to the EXACT c_api.cpp:1352-1374 SAMPLED-SET convention (sample-set-relative positions `0..sample_cnt`, `|v|>kZeroThreshold||isnan(v)` filter, `total_sample_cnt = sample_cnt` NOT num_rows) — DELIBERATELY NOT the efb_grouping.rs full-row convention — reusing the SAME single `create_sample_indices` draw (NO second RNG draw). The non-bundled `construct` was ALSO fixed to filter trivial features so it is never a future divergence trap. The golden emitter must pass `is_sparse=true` (config.h default `is_enable_sparse=true`, dataset.cpp:352) so its FastFeatureBundling grouping/shuffle matches the ingest path. Parity test asserts trivial-exclusion + per-non-trivial `feature_to_group`/`feature_to_subfeature` vs the C++-Construct golden (closing the EFB parity hole), bit-exact stored bins, panics on a missing golden (WR-01), HARD fails-before/passes-after.
 - [Phase 2 exec, 2026-06-05]: **Ingestion API locked (D-05, DAT-06/07)** — `from_mat`/`from_csr`/`from_csc` are single validated public entries (validate ALL caller input first → typed `DatasetError`, never panic; Security V5 / T-02-10..13) wiring sample→`find_bin`→`construct`→`push`→`finish_load`. f32→f64 widening at ONE `widen()` site; sparse gather is dense-by-column (absent==0.0, Open Q2). Dense/CSR/CSC of the same matrix bin bit-identically (tolerance-free internal invariant). `Metadata` query weights computed in f32 (`CalculateQueryWeights` verbatim). End-to-end real example-dataset (regression + binary) binning bit-identical to C++ for all 28 features × both datasets (layers 1+2). Example fixtures COPIED into the committed dir, never the untracked LightGBM/ tree.
+- [Phase 3 exec, 2026-06-05]: **Golden-capture path B (pip lightgbm 4.6.0 train + dump) selected + human-approved (Task 3 checkpoint)** — only feasible source of a trained `version=v4` `.txt` here (no Rust trainer yet; C++ trainer unbuildable with empty `external_libs`). The prebuilt wheel's `save_model()` is the authoritative `%.17g` v4 format. `xtask model-capture` shells out to `xtask/py/model_capture.py` (via `$LGBM_CAPTURE_PYTHON`), trains 5 corpora (regression/binary/multiclass(3)/categorical/subrange) on the reused Phase-2 example matrices with `deterministic=true force_row_wise=true num_threads=1 seed=MODEL_TRAIN_SEED` + no subsampling, dumps each `model.txt` + raw/transformed/leaf/subrange goldens + `format_golden.txt`. Byte-idempotent; pip is a CAPTURE-time tool only (fixtures committed, `cargo test` needs nothing). REFERENCE_MANIFEST.md "Model / Predict Golden Set" section pins the version + train params.
+- [Phase 3 exec, 2026-06-05]: **%g formatter locked (DAT-09 linchpin, lgbm-model)** — `format::format_g17` (`%.17g`) / `format_g6` (`{:g}`) source correctly-rounded significant digits from Rust `format!("{:.*e}", precision-1, x)`, then apply the C/printf `%g` fixed-vs-scientific rule (sci iff decimal exp `< -4` or `>= precision`) + trailing-zero strip + C-locale exponent (lowercase `e`, explicit sign, min 2 digits) — NOT `ryu`/`to_string()`/`{:.17e}`. Proven bit-for-bit vs C printf `%g` on a 10-case battery (`0.1 -> 0.10000000000000001`, `5e-324`, `1e±300`, signed zero, exactly-17-digit case) + bit-exact round-trip (`f64::from_str(format_g17(x)) == x`); committed `format_golden.txt` (authoritative `fmt`) is the arbiter (`golden_matches_formatter`). Used for `threshold`/`leaf_value`/`leaf_weight` (g17) and `split_gain`/`internal_value`/`internal_weight`/`shrinkage` (g6).
 
 ### Pending Todos
 
@@ -136,6 +139,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T09:45:47.018Z
+Last session: 2026-06-05T11:06:17.782Z
 Stopped at: Phase 3 context gathered
 Resume file: .planning/phases/03-tree-model-model-text-i-o-predict-parity/03-CONTEXT.md

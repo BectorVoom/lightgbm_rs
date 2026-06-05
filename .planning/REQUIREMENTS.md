@@ -29,8 +29,8 @@
 - [x] **DAT-05**: Exclusive Feature Bundling (`enable_bundle`) reproducing C++ feature grouping
 - [x] **DAT-06**: Metadata support (labels, weights, init_score, query/group boundaries)
 - [x] **DAT-07**: In-memory matrix ingestion (dense + CSR/CSC sparse) via the Rust API — SATISFIED (02-06 + 02-07): the default-config (`feature_pre_filter=true`, sample_cnt<num_rows) path matches C++ (scaled `filter_cnt`, 02-06) AND now routes through the faithful single C++ `Dataset::Construct` (`construct_bundled` enable_bundle dispatch, 02-07: trivial features dropped, EFB grouping verified, EfbSamples to the c_api.cpp:1352-1374 convention) — CR-01 closed at the Construct level; covered by `default_config_ingest_parity.rs` (trivial-exclusion + per-non-trivial group/subfeature parity); CSR/CSC inherit via `finish_from_columns`
-- [ ] **DAT-08**: LightGBM model text format read — load a C++-trained model and predict identically
-- [ ] **DAT-09**: LightGBM model text format write — emit the exact text schema (trees, leaf values, bin mappers, feature metadata) including `%.17g` float formatting
+- [x] **DAT-08**: LightGBM model text format read — load a C++-trained model and predict identically
+- [x] **DAT-09**: LightGBM model text format write — emit the exact text schema (trees, leaf values, bin mappers, feature metadata) including `%.17g` float formatting
 
 ### Tree Learner
 
@@ -162,8 +162,8 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | DAT-06 | Phase 2 | Complete |
 | DAT-07 | Phase 2 | Complete (02-04 ingest + 02-06 default-config parity + 02-07 faithful Construct; CR-01/CR-02 + EFB parity hole closed) |
 | ORA-03 | Phase 2 | Bin stage covered for default config (02-06 + 02-07 Construct/grouping parity); remaining stages pending later phases |
-| DAT-08 | Phase 3 | Pending |
-| DAT-09 | Phase 3 | Pending |
+| DAT-08 | Phase 3 | Complete |
+| DAT-09 | Phase 3 | Complete |
 | PRD-01 | Phase 3 | Pending |
 | PRD-02 | Phase 3 | Pending |
 | PRD-03 | Phase 3 | Pending |
