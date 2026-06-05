@@ -9,3 +9,9 @@ anyhow.workspace = true
 
 [dev-dependencies]
 lgbm-core = { path = "../lgbm-core" }
+# Test-only: the kernel-parity replay drives the cubecl-cpu backend against the
+# committed histogram golden. The LIBRARY crate (`[dependencies]`) stays
+# cubecl-free so the CMP-01 containment guard holds — cubecl is pulled in only
+# for `cargo test` of this crate, never by downstream consumers of the harness.
+lgbm-compute = { path = "../lgbm-compute" }
+lgbm-dataset = { path = "../lgbm-dataset" }
