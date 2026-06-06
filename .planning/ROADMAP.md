@@ -13,7 +13,7 @@ A pure-Rust, parity-faithful port of Microsoft LightGBM on a CubeCL CPU/ROCm bac
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace
+- [x] **Phase 1: Oracle Contract + Foundations** - f32 ~1e-6 oracle, pinned C++ reference, bit-exact RNG, config, f32 numerical strategy, workspace *(3/3 plans; UAT 10/10 passed + security 9/9 threats resolved (0 open), retroactively verified 2026-06-06)* (completed 2026-06-05)
 - [x] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion *(7/7 plans executed incl. gap-closure 02-06 + 02-07; GAP-1/GAP-2 + CR-01 + WR-01 closed — default ingest unified onto the faithful single C++ Dataset::Construct, trivial features dropped, grouping verified; ready to re-verify)* (completed 2026-06-05)
 - [x] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists) (completed 2026-06-05)
 - [x] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
@@ -289,7 +289,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Oracle Contract + Foundations | 3/3 | Plans complete | 2026-06-05 |
+| 1. Oracle Contract + Foundations | 3/3 | Complete    | 2026-06-05 |
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
