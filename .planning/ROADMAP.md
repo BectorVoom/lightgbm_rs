@@ -175,7 +175,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Numerical threshold splits route missing/zero exactly as C++; data partition (row→leaf) feeds the subtraction trick correctly.
   5. Per-tree/per-node feature subsampling (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`) selects the same features via RNG parity, and both `force_row_wise`/`force_col_wise` strategies produce matching trees.
 
-**Plans**: 4 plans
+**Plans**: 7 plans (4 original + 3 gap-closure)
 
 **Wave 1** *(spine prerequisites — parallel; no shared files)*
 
@@ -189,6 +189,18 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 3** *(blocked on 05-03 — parity additions on the proven spine)*
 
   - [x] 05-04-PLAN.md — `force_col_wise`==`force_row_wise`==C++ tree (TRL-09, Open Q2 RESOLVED: config-flag no-op over the shared construct_histograms op on the deterministic anchor) + per-tree/per-node feature subsampling RNG parity via `ColSampler` (TRL-08, ResetByTree+GetByNode draw-sequence) + captured real iter-1 g/h full-tree parity (D-03, regression-l2 + binary-logloss). **DONE: col_wise.txt / col_sampler.txt / real_gh.txt goldens + learner_parity_{row_vs_col,col_sampler_rng,real_gh_full_tree} replay bit-exact; 1 Rule-1 fix (tree leaf_count records the ACTUAL data_partition count, update_cnt=true, not the reconstructed SplitInfo count); cargo test --workspace green; byte-idempotent**
+
+**Wave 4** *(GAP CLOSURE — blocked on 05-01..04; from 05-VERIFICATION.md gaps_found)*
+
+  - [ ] 05-05-PLAN.md — CR-01 fix (D-09): single shared `offset_for_most_freq_bin` helper unifying the three contradictory offset rules + adopt the real-LightGBM `offset==1`/compacted-histogram convention so stored threshold / partition `--th` / predict routing agree + oracle-independent `get_leaf`-tally==`leaf_count` self-consistency assertion (TRL-05, TRL-07, TRL-01)
+
+**Wave 5** *(GAP CLOSURE — blocked on 05-05)*
+
+  - [ ] 05-06-PLAN.md — CR-02 fix (D-08): real `lib_lightgbm` 4.6 oracle — `learner-oracle-capture` xtask + python dumper trains the spine + a new `most_freq_bin>0` corpus deterministically (`deterministic=true force_row_wise=true num_threads=1` fixed seed) on the pip wheel's real binary, commits `spine_real.txt`/`mfb_pos_real.txt`, and validates the Rust learner bit-exact incl. the previously-uncovered offset==1 path (TRL-09, TRL-05, TRL-01) [human-gated capture]
+
+**Wave 6** *(GAP CLOSURE — blocked on 05-05 + 05-06)*
+
+  - [ ] 05-07-PLAN.md — WR-01/WR-02 fix (D-05): wire the dead subtraction-trick + HistogramPool into the live `find_best_splits` growth path (larger child derived by `parent − smaller`, pool slots read/reused) and re-validate bit-exact against the real lib_lightgbm goldens (TRL-01, TRL-02, TRL-05)
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
 
