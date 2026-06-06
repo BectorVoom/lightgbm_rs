@@ -34,13 +34,13 @@
 
 ### Tree Learner
 
-- [ ] **TRL-01**: Histogram-based serial tree learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`) — _reopened: gaps_found (subtraction orchestration dead, WR-02); closing in 05-05/05-07_
+- [x] **TRL-01**: Histogram-based serial tree learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`) — _reopened: gaps_found (subtraction orchestration dead, WR-02); closing in 05-05/05-07_
 - [ ] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against — _reopened: gaps_found (dead in growth path, WR-01/02); closing in 05-07_
 - [x] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
 - [x] **TRL-04**: Split-gain scan with exact gain formula and tie-breaking (`lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`)
-- [ ] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing — _reopened: gaps_found BLOCKED (CR-01 partition/threshold off-by-one; CR-02 offset==1 uncovered); closing in 05-05/05-06_
+- [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing — _reopened: gaps_found BLOCKED (CR-01 partition/threshold off-by-one; CR-02 offset==1 uncovered); closing in 05-05/05-06_
 - [ ] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
-- [ ] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction — _reopened: gaps_found BLOCKED (CR-01 partition does not route as the serialized tree predicts); closing in 05-05_
+- [x] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction — _reopened: gaps_found BLOCKED (CR-01 partition does not route as the serialized tree predicts); closing in 05-05_
 - [x] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
 - [x] **TRL-09**: `force_row_wise` / `force_col_wise` histogram build strategies, both output-matching
 

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 05-04-PLAN.md
-last_updated: "2026-06-06T01:27:48.762Z"
-last_activity: 2026-06-05 -- Phase 05 execution started
+status: executing
+stopped_at: Completed 05-05-PLAN.md
+last_updated: "2026-06-06T02:49:55.877Z"
+last_activity: 2026-06-06 -- Phase 05 plan 05-05 (CR-01 closure) complete
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 22
-  completed_plans: 22
-  percent: 52
+  total_plans: 25
+  completed_plans: 23
+  percent: 50
 ---
 
 # Project State
@@ -26,11 +26,24 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 05 (tree-learner-split-finding) — EXECUTING
-Plan: 4 of 4 — COMPLETE (all 4 plans done)
-Status: Phase 05 plans complete; ready for phase review/verification
-Last activity: 2026-06-05 -- Phase 05 execution started
+Plan: 6 of 7 (05-05 gap-closure COMPLETE; next 05-06)
+Status: Ready to execute 05-06
+Last activity: 2026-06-06 -- Phase 05 plan 05-05 (CR-01 closure) complete
 
-Progress: [██████████] Phase 5 plans 05-01..05-04 COMPLETE — full serial tree-learner parity-validated on the cpu anchor: spine (D-06 per-split / D-07 per-tree), force_col_wise == force_row_wise == C++ (TRL-09), per-tree/per-node feature subsampling RNG via ColSampler (TRL-08), and captured-real iter-1 g/h full-tree parity (D-03, regression-l2 + binary-logloss). All replayed bit-exact from committed goldens that never touch LightGBM/.
+Progress: [█████████░] Phase 5 plans 05-01..05-05 COMPLETE — 05-05 closed CR-01 (BLOCKER) per D-09: a SINGLE offset_for_most_freq_bin helper (most_freq_bin==0 -> offset 1) + compacted offset==1 histogram + the single-feature-group min_bin (min_bin+offset, mirroring DenseBin::Split(max_bin,...)'s hard-coded min_bin=1) make the stored threshold / partition --th / predict fval<=threshold all agree. An oracle-INDEPENDENT learner_parity_routing_self_consistency (get_leaf tally == data_partition leaf_count) reproduces+passes the [4,8] vs [6,6] divergence. The pre-D-09 self-transcription full-tree/per-bin goldens (CR-02) are superseded by 05-06's real lib_lightgbm oracle; row==col equality stays live. kernel_parity 4/4 bit-exact; cargo test --workspace green.
+
+### Plan 05-05 result (gap closure — CR-01 BLOCKER)
+
+Plan 05-05 closed CR-01 by adopting the real-LightGBM offset==1 + compacted convention end-to-end (D-09, supersedes D-01):
+
+- **One offset rule (Task 1):** `lgbm_treelearner::offset_for_most_freq_bin(most_freq_bin) -> i32` (1 if 0, else 0) is THE authoritative source; every corpus/feature offset (spine f0/f1, col_sampler `make`, missing_routing, real_gh parser) routes through it. The three contradictory inlined rules are deleted (grep gate: 0 inlined offset literals).
+- **Compacted offset==1 histogram (Task 2):** `compact_histogram` shifts the stride-2 histogram into the C++ `data_` compacted layout (cell c = real bin c+offset, bin-0 dropped, tail zeroed to 2*num_bin) before find_best_split + the host per-bin re-scan (feature_histogram.hpp:619/943/950). No-op for offset==0; kernel_parity 4/4 stays bit-exact.
+- **CR-01 root cause = single-feature-group min_bin (Rule-1 fix, surfaced by Task 3):** compaction alone did NOT fix the partition. C++ `FeatureGroup::Split(num_feature_==1)` dispatches to `DenseBin::Split(max_bin,...)` which HARD-CODES `min_bin=1` (dense_bin.hpp:423-433). Passing `partition_min_bin = f.min_bin + f.offset` collapses the verbatim `--th` to `th=threshold` for mfb==0, so partition `bin>threshold -> right` == predict `bin<=threshold -> left`. Raw `min_bin=0` left `th=threshold-1` (the [4,8] partition vs [6,6] predict off-by-one).
+- **Oracle-INDEPENDENT CR-01 gate (Task 3):** `learner_parity_routing_self_consistency` routes every training row through the grown tree's `get_leaf`, tallies per leaf, asserts == `tree.leaf_count` (stored data_partition count) EXACTLY for spine/col_wise/col_sampler/real_gh. FAILED pre-fix (tally [6,2,0,4] vs stored [4,2,0,6]); PASSES after.
+- **Stale-golden supersession (Rule-3):** the pre-D-09 `learner_capture.cpp` full-tree/per-bin goldens share the buggy convention (CR-02), so `spine_full_tree`/`spine_per_bin_gains`/`transcription_crosscheck`/`real_gh_full_tree` + the golden half of `row_vs_col` skip with a 05-06 re-point note; `row==col` equality (TRL-09, convention-independent) + the routing test stay live. Golden parsers kept (#[allow(dead_code)]) for 05-06 reuse.
+- `cargo test --workspace` green (9 learner_parity + 32 lgbm-treelearner lib); kernel_parity 4/4 bit-exact. Never git-adds `LightGBM/`. Commits: bc3dd95 (Task 1), 2e996e0 (Task 2), ee0255f (Task 3).
+
+Next: `/gsd-execute-phase 5` plan 05-06 — replace the self-transcription learner oracle with a REAL lib_lightgbm 4.6 binary oracle (spine_real.txt / mfb_pos_real.txt), re-point the now-skipped full-tree/per-bin tests, and give the offset==1 path its first real bit-exact coverage (CR-02).
 
 ### Plan 05-04 result
 
@@ -176,6 +189,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 05 P01 | 7min | 2 tasks | 5 files |
 | Phase 05 P02 | 8min | 3 tasks | 17 files |
 | Phase 05 P03 | 25min | 3 tasks | 14 files |
+| Phase 05 P05 | 13min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -217,6 +231,9 @@ Recent decisions affecting current work:
 - [Phase 05]: 05-04: Open Q2 RESOLVED — force_col_wise == force_row_wise on the single-thread deterministic anchor; it is a config FLAG (a no-op) over the shared construct_histograms op, NOT a distinct compute path (A1 confirmed). col_wise.txt carries the identical tree as spine.txt; the row==col equality gate fails loudly if a backend ever diverged.
 - [Phase 05]: 05-04: the tree's leaf_count/internal_count record the ACTUAL data_partition leaf_count (serial_tree_learner.cpp:788-791, update_cnt=true), NOT the SplitInfo round_int(hess*cnt_factor) reconstructed counts (which disagree by ±1 for fractional hessians) — Rule-1 fix to the Plan-03 spine, applied in Rust split_inner + the C++ transcription (regenerated spine.txt to the faithful actual-partition counts)
 - [Phase 05]: 05-04: ColSampler RNG parity is the CALL SEQUENCE (ResetByTree once per tree, GetByNode per node smaller-then-larger), not the PRNG; col_sampler.txt asserts the exact selected feature indices per draw. D-03 captured-g/h = regression-l2 (hess=1) + binary-logloss (boost_from_average=false); binary capped at num_leaves=2 to avoid the fractional-hessian degenerate-split corner (regression carries the deeper 3-leaf tree)
+- [Phase ?]: [Phase 05]: 05-05: D-09 adopted end-to-end — offset_for_most_freq_bin (most_freq_bin==0 -> offset 1) is the SINGLE offset rule; offset==1 uses a COMPACTED histogram (compact_histogram: cell c = real bin c+offset). Supersedes D-01.
+- [Phase ?]: [Phase 05]: 05-05: CR-01 root cause = single-feature-group min_bin — C++ FeatureGroup::Split(num_feature_==1) dispatches to DenseBin::Split(max_bin,...) hard-coding min_bin=1; passing min_bin+offset collapses the verbatim --th to th=threshold so partition (bin>th right) == predict (bin<=threshold left). Raw min_bin=0 gave the [4,8] vs [6,6] off-by-one. Closed by the oracle-INDEPENDENT routing test (get_leaf tally == data_partition leaf_count).
+- [Phase ?]: [Phase 05]: 05-05: the pre-D-09 learner_capture.cpp full-tree/per-bin goldens (spine/col_wise/real_gh) share the buggy convention (CR-02) so their assertions are SUPERSEDED by 05-06's real lib_lightgbm oracle; row==col equality + routing self-consistency stay live.
 
 ### Pending Todos
 
@@ -240,6 +257,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-05T23:41:25Z
+Last session: 2026-06-06T02:49:25.485Z
 Stopped at: Completed 05-04-PLAN.md
 Resume file: None

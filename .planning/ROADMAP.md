@@ -192,7 +192,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 4** *(GAP CLOSURE — blocked on 05-01..04; from 05-VERIFICATION.md gaps_found)*
 
-  - [ ] 05-05-PLAN.md — CR-01 fix (D-09): single shared `offset_for_most_freq_bin` helper unifying the three contradictory offset rules + adopt the real-LightGBM `offset==1`/compacted-histogram convention so stored threshold / partition `--th` / predict routing agree + oracle-independent `get_leaf`-tally==`leaf_count` self-consistency assertion (TRL-05, TRL-07, TRL-01)
+  - [x] 05-05-PLAN.md — CR-01 fix (D-09): single shared `offset_for_most_freq_bin` helper unifying the three contradictory offset rules + adopt the real-LightGBM `offset==1`/compacted-histogram convention so stored threshold / partition `--th` / predict routing agree + oracle-independent `get_leaf`-tally==`leaf_count` self-consistency assertion (TRL-05, TRL-07, TRL-01)
 
 **Wave 5** *(GAP CLOSURE — blocked on 05-05)*
 
@@ -261,7 +261,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 4/4 | Complete    | 2026-06-05 |
+| 5. Tree Learner + Split Finding | 5/7 | In Progress|  |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |
