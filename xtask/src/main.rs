@@ -77,6 +77,20 @@ pub const MODEL_TRAIN_SEED: i32 = 0x7FFF_FFFF;
 /// manifest; `model-capture` asserts the installed version matches.
 pub const MODEL_LIGHTGBM_VERSION: &str = "4.6.0";
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-5 learner
+/// oracle (plan 05-06, decision D-08). Reuses the SAME prebuilt-wheel binary as
+/// [`MODEL_LIGHTGBM_VERSION`] (the real `lib_lightgbm` 4.6 whose `save_model()`
+/// is authoritative); `learner-oracle-capture` asserts the installed version
+/// matches before training so a wrong version can never silently emit a
+/// divergent reference tree (threat T-05-06-03).
+pub const LEARNER_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-5 REAL learner oracle (plan 05-06,
+/// D-08). Combined with `deterministic=true force_row_wise=true num_threads=1`
+/// (and no subsampling), it makes the real-binary reference trees byte-idempotent
+/// (empty `git diff` on a re-capture). Recorded in REFERENCE_MANIFEST.md.
+pub const LEARNER_ORACLE_SEED: i32 = 0x05D6_0A6E;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -85,18 +99,19 @@ fn main() -> Result<()> {
         Some("model-capture") => model_capture(),
         Some("kernel-capture") => kernel_capture(),
         Some("learner-capture") => learner_capture(),
+        Some("learner-oracle-capture") => learner_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
-                 learner-capture)"
+                 learner-capture | learner-oracle-capture)"
             );
         }
         None => {
             eprintln!(
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
-                 learner-capture>"
+                 learner-capture | learner-oracle-capture>"
             );
             Ok(())
         }
@@ -696,6 +711,111 @@ fn model_capture() -> Result<()> {
     Ok(())
 }
 
+/// Capture the Phase-5 REAL `lib_lightgbm` 4.6 learner oracle (plan 05-06, D-08).
+///
+/// CR-02 closure: the committed `spine.txt` / `real_gh.txt` learner goldens are
+/// emitted by `xtask/cpp/learner_capture.cpp`, a hand transcription that SHARES
+/// the Rust port's offset/`--th`/compaction conventions — so it validated the
+/// port against itself and could not falsify a shared-convention error. Per user
+/// decision D-08 this subcommand replaces that self-oracle with a REAL
+/// `lib_lightgbm` 4.6 oracle: the pip wheel ships a prebuilt `lib_lightgbm` (with
+/// `fmt` baked in) whose `save_model()` IS authoritative — exactly the Phase-3
+/// `model-capture` mechanism (human-approved). Building `lib_lightgbm` from source
+/// is INFEASIBLE here (the submodule's `external_libs` are empty), so the pip
+/// wheel is the real binary.
+///
+/// It trains TWO corpora on the real binary with `deterministic=true
+/// force_row_wise=true num_threads=1 seed=LEARNER_ORACLE_SEED bagging_fraction=1.0
+/// feature_fraction=1.0` — a SPINE corpus (`most_freq_bin==0`, offset==1 path) and
+/// a `most_freq_bin > 0` corpus (offset==0 path) — dumps the real model text, and
+/// writes `spine_real.txt` / `mfb_pos_real.txt` under
+/// `crates/oracle-harness/tests/fixtures/learner/`. The python script forces
+/// IDENTITY binning (bin index == raw value) and ASSERTS the realized per-feature
+/// bin count + `most_freq_bin` match the harness corpus layout, aborting on any
+/// mismatch (so a golden can only be trained on the exact bin layout the Rust
+/// learner consumes). The pip `lightgbm` is a CAPTURE-time tool only — never a
+/// crate dependency and never read at `cargo test` time (the goldens are
+/// committed). NEVER `git add` the `LightGBM/` tree.
+fn learner_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/learner_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Fixtures live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let fixtures_dir = root.join("crates/oracle-harness/tests/fixtures/learner");
+    std::fs::create_dir_all(&fixtures_dir)
+        .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
+    let spine_real = fixtures_dir.join("spine_real.txt");
+    let mfb_pos_real = fixtures_dir.join("mfb_pos_real.txt");
+
+    // Verify the interpreter has the recorded lightgbm version before training so a
+    // wrong version can never silently emit a divergent reference tree (T-05-06-03).
+    eprintln!(
+        "xtask learner-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        LEARNER_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = LEARNER_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python (e.g. a venv) with \
+         `pip install lightgbm==4.6.0`. `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask learner-oracle-capture: training the spine + mfb>0 corpora on real \
+         lib_lightgbm and dumping goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&spine_real)
+            .arg(&mfb_pos_real)
+            .arg(LEARNER_ORACLE_SEED.to_string())
+            .arg(LEARNER_ORACLE_LIGHTGBM_VERSION),
+        "learner_oracle_capture.py",
+    )?;
+
+    for p in [&spine_real, &mfb_pos_real] {
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    // Refresh the shared reference manifest (idempotent — pure function of the
+    // recorded constants).
+    let manifest_path = root
+        .join("crates/oracle-harness/fixtures")
+        .join("REFERENCE_MANIFEST.md");
+    write_manifest(&manifest_path)?;
+
+    eprintln!(
+        "xtask learner-oracle-capture: done. Wrote {}, {} and refreshed {}.",
+        spine_real.display(),
+        mfb_pos_real.display(),
+        manifest_path.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- learner-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/learner/` \
+         is empty (byte-idempotent real-binary dump)."
+    );
+    Ok(())
+}
+
 /// Resolve a python interpreter that can run the capture (lightgbm importable).
 ///
 /// Order: `$LGBM_CAPTURE_PYTHON`, then a few common venv locations, then
@@ -1173,6 +1293,47 @@ no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` tim
 \n\
 ```bash\n\
 cargo run -p xtask -- learner-capture\n\
+```\n\
+\n\
+## REAL Learner Oracle Set (Phase 5, plan 05-06 / D-08 — CR-02 closure)\n\
+\n\
+Captured by `cargo run -p xtask -- learner-oracle-capture` into\n\
+`crates/oracle-harness/tests/fixtures/learner/{{spine_real.txt,mfb_pos_real.txt}}`.\n\
+These REPLACE the pre-D-09 self-transcription learner goldens (`spine.txt` /\n\
+`real_gh.txt`, which shared the port's offset/`--th` conventions and so validated\n\
+the port against ITSELF — CR-02) with model text dumped from the REAL prebuilt\n\
+`lib_lightgbm` `{model_lgbm_version}` (the pip wheel's `save_model()`, exactly the\n\
+Phase-3 `model-capture` mechanism — human-approved). Building `lib_lightgbm` from\n\
+source is INFEASIBLE here (the in-repo submodule's `external_libs` are empty), so\n\
+the pip wheel is the authoritative real binary.\n\
+\n\
+- **`spine_real.txt`** — a `most_freq_bin==0` corpus (offset==1 scan+partition\n\
+  path) trained on the real binary.\n\
+- **`mfb_pos_real.txt`** — a `most_freq_bin > 0` corpus (offset==0 path); the\n\
+  FIRST bit-exact real-binary anchor for the offset==1-vs-offset==0 convention\n\
+  fixed in plan 05-05.\n\
+\n\
+- **Training tool (capture-time only):** pip `lightgbm` `{model_lgbm_version}` —\n\
+  NOT a crate dependency and NEVER read at `cargo test` time (the goldens are\n\
+  committed). The version is asserted before training (threat T-05-06-03).\n\
+- **Oracle seed:** `{learner_oracle_seed}` (`0x{learner_oracle_seed_hex:08X}`).\n\
+- **Deterministic train params:** `deterministic=true force_row_wise=true\n\
+  num_threads=1 bagging_fraction=1.0 feature_fraction=1.0` + identity binning\n\
+  (`max_bin >= K`, `min_data_in_bin=1`, `bin_construct_sample_cnt >= n_rows`,\n\
+  `feature_pre_filter=false`, `min_data_in_leaf=1`), so `binned_value == raw_value`\n\
+  and the dump is byte-idempotent.\n\
+- **Binning-pinning (MANDATORY):** the python dumper forces identity binning\n\
+  (distinct consecutive integers `0..K-1` as raw values) and ASSERTS the realized\n\
+  per-feature bin count + `most_freq_bin` match the harness corpus layout\n\
+  (`most_freq_bin > 0` for the mfb>0 corpus), ABORTING the capture on any\n\
+  mismatch — so a golden can only ever be trained on the exact bin layout the\n\
+  Rust learner consumes (a binning mismatch can never masquerade as a learner\n\
+  divergence).\n\
+\n\
+### Exact learner-oracle-capture command\n\
+\n\
+```bash\n\
+LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- learner-oracle-capture\n\
 ```\n",
         commit = LIGHTGBM_COMMIT,
         version = LIGHTGBM_VERSION,
@@ -1190,6 +1351,8 @@ cargo run -p xtask -- learner-capture\n\
         model_train_seed = MODEL_TRAIN_SEED,
         model_train_seed_hex = MODEL_TRAIN_SEED as u32,
         model_lgbm_version = MODEL_LIGHTGBM_VERSION,
+        learner_oracle_seed = LEARNER_ORACLE_SEED,
+        learner_oracle_seed_hex = LEARNER_ORACLE_SEED as u32,
     );
     std::fs::write(path, content)
         .with_context(|| format!("writing manifest {}", path.display()))?;
