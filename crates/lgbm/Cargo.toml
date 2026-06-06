@@ -12,4 +12,10 @@ lgbm-treelearner = { path = "../lgbm-treelearner" }
 lgbm-objective = { path = "../lgbm-objective" }
 lgbm-metric = { path = "../lgbm-metric" }
 lgbm-boosting = { path = "../lgbm-boosting" }
+# Backend + GainConfig + CpuBackend to drive the learner from the facade train()
+# (the trait/types + the CPU anchor only — the facade names no cubecl runtime).
+lgbm-compute = { path = "../lgbm-compute" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

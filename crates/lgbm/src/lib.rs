@@ -11,6 +11,15 @@
 //! Mirrors the `lgbm-model/src/lib.rs` facade shape: lean `pub use` re-exports of
 //! the stable types from each crate.
 
+pub mod booster;
+pub mod builder;
+pub mod error;
+
+// --- public training API (Phase 6, 06-02 spine) ---
+pub use booster::{train, Booster, DenseCorpus};
+pub use builder::TrainingBuilder;
+pub use error::LgbmError;
+
 // --- core config (the single source of truth, D-02) ---
 pub use lgbm_core::Config;
 

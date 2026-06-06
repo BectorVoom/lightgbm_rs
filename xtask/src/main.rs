@@ -91,6 +91,18 @@ pub const LEARNER_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// (empty `git diff` on a re-capture). Recorded in REFERENCE_MANIFEST.md.
 pub const LEARNER_ORACLE_SEED: i32 = 0x05D6_0A6E;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-6 GBDT-spine
+/// oracle (plan 06-02). Reuses the SAME prebuilt-wheel binary as
+/// [`MODEL_LIGHTGBM_VERSION`]; `boosting-oracle-capture` asserts the installed
+/// version matches before training (threat T-06-02-SC).
+pub const BOOSTING_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-6 REAL GBDT-spine oracle (plan 06-02).
+/// Combined with `deterministic=true force_row_wise=true num_threads=1` (no
+/// subsampling), it makes the spine goldens byte-idempotent (empty `git diff` on
+/// a re-capture). Recorded in REFERENCE_MANIFEST.md.
+pub const BOOSTING_ORACLE_SEED: i32 = 0x6005_7000;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -828,11 +840,77 @@ fn learner_oracle_capture() -> Result<()> {
 /// this prints a not-yet-implemented notice and exits 0 so the subcommand is
 /// wired and discoverable.
 fn boosting_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/boosting_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Goldens live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/boosting");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    // Version-assert the wheel before training so a wrong version can never
+    // silently emit divergent spine goldens (threat T-06-02-SC).
     eprintln!(
-        "xtask boosting-oracle-capture: not yet implemented — wave 2+ (06-02..06-05). \
-         The real capture will emit the L1-L5 boosting goldens under \
-         crates/oracle-harness/tests/fixtures/boosting/ from a version-asserted \
-         lightgbm==4.6.0 wheel (modeled on learner-oracle-capture)."
+        "xtask boosting-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        BOOSTING_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = BOOSTING_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask boosting-oracle-capture: training the regression spine on real \
+         lib_lightgbm and dumping L1/L2/L3/L5 goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(BOOSTING_ORACLE_SEED.to_string())
+            .arg(BOOSTING_ORACLE_LIGHTGBM_VERSION),
+        "boosting_oracle_capture.py",
+    )?;
+
+    for name in [
+        "regression_gh_iter1.txt",
+        "regression_gh_iterN.txt",
+        "regression_scores.txt",
+        "regression_metrics.txt",
+        "regression_spine_model.txt",
+        "regression_spine_pred.txt",
+    ] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask boosting-oracle-capture: done. Wrote spine goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- boosting-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/boosting/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())
 }

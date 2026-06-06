@@ -8,20 +8,44 @@
 
 ## Boosting / Objective / Metric Golden Set (Phase 6, D-10..D-13 / L1–L5)
 
-**Status (Wave 0, 06-01):** SCAFFOLD only. The `boosting_parity.rs` tests are
-`#[ignore]`d with an explicit `MISSING — implemented in wave N` reason until the
-GBDT spine loop lands. Goldens below are added as each wave commits them.
+**Status (Wave 2, 06-02):** SPINE goldens CAPTURED + replaying. The L1
+(`gradients`), L2 (`score_accumulation`), L5 (`spine_end_to_end`) layers are LIVE
+(`boosting_parity.rs` un-`#[ignore]`d, passing); L3 (`early_stopping`), L4
+(`bagging_rng`), and `custom_objective` stay `#[ignore]`d until their waves
+(06-03/06-05). The committed spine cell (bagging-off / early-stopping-off /
+boost-from-average-on, regression L2) is the allowed D-07 collapse.
 
-**Capture command (stubbed in 06-01):**
+**Committed spine goldens (06-02), trained on real `lightgbm==4.6.0` with seed
+`BOOSTING_ORACLE_SEED = 0x60057000`, `deterministic=true force_row_wise=true
+num_threads=1`, identity binning, 10 iters, num_leaves=4, lr=0.1, bfa=true:**
+
+| File | Layer | Encoding |
+|------|-------|----------|
+| `regression_spine_model.txt` | L5 model text | `save_model()` `%.17g` |
+| `regression_spine_pred.txt`  | L5 predict() | f64 bits |
+| `regression_scores.txt`      | L2 per-iter raw score | f64 bits, one line per k |
+| `regression_gh_iter1.txt`    | L1 iter-1 g/h | f32 bits (GRAD/HESS) |
+| `regression_gh_iterN.txt`    | L1 iter-5 g/h | f32 bits (GRAD/HESS) |
+| `regression_metrics.txt`     | L3 per-round l2/rmse | f64 bits |
+
+**L2 PRECISION CONTRACT (RESOLVED — Open-Q2/A4):** the per-iter score L2 golden is
+**BIT-EXACT** (`compare_exact_f64_bits`), not ~1e-6. The Rust internal `score_`
+after k iters equals `predict(raw_score=True, num_iteration=k)` bit-for-bit on this
+cell (verified by `lgbm::booster::predict_raw_equals_internal_score_open_q2` AND
+`boosting_parity::score_accumulation`). All ~40 downstream cells (06-05) inherit
+this bit-exact L2 contract; 06-05 reads it here rather than re-deciding it.
+
+**Capture command:**
 
 ```bash
 LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- boosting-oracle-capture
 ```
 
-The real capture (wave 2+) trains a real-binary `lightgbm==4.6.0` (version
-asserted before training), writes goldens under the TRACKED
-`crates/oracle-harness/tests/fixtures/boosting/`, and is byte-idempotent. It
-NEVER `git add`s the untracked `LightGBM/` tree.
+The capture trains a real-binary `lightgbm==4.6.0` (version asserted before
+training), writes goldens under the TRACKED
+`crates/oracle-harness/tests/fixtures/boosting/`, and is byte-idempotent (verified
+empty `git diff` across two runs). It NEVER `git add`s the untracked `LightGBM/`
+tree.
 
 ### Validation layers (RESEARCH §Validation Architecture)
 
