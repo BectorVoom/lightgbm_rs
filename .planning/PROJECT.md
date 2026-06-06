@@ -6,7 +6,7 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 
 ## Core Value
 
-For identical inputs and configuration, the Rust implementation must reproduce the C++ LightGBM's outputs to within an absolute difference of **~1e-6 on every backend (CPU and ROCm)**, using `f32` (single-precision) data types end-to-end to match the C++ reference defaults (`score_t`/`label_t` = `float`). Numerical fidelity at single precision is the non-negotiable contract; everything else serves it.
+For identical inputs and configuration, the Rust implementation must reproduce the C++ LightGBM's outputs to within an absolute difference of **~1e-6 on every backend (CPU and ROCm)**, using `f32` (single-precision) data types end-to-end to match the C++ reference defaults (`score_t`/`label_t` = `float`). The CPU path — the `cubecl-cpu` f64-fold deterministic anchor — is the hard merge gate and, where the algorithm permits, achieves **bit-exact** parity with the C++ reference (e.g. binning, and the serial tree learner is bit-exact vs real `lib_lightgbm` 4.6 on both committed corpora); the ROCm path (`cubecl-hip`, f32) is held to ~1e-6 against that anchor, with residual f32-vs-f64 accumulation gaps documented per phase. Numerical fidelity at single precision is the non-negotiable contract; everything else serves it.
 
 ## Requirements
 

@@ -6,13 +6,13 @@
 
 A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as a Cargo workspace and using the `cubecl` crate for compute and GPU acceleration. It targets ML practitioners and LightGBM users who want a memory-safe Rust implementation that runs on both CPU and AMD ROCm GPUs while remaining numerically faithful to the original. The Microsoft C++ implementation under `LightGBM/` is the read-only reference being ported; the deliverable is the Rust crate(s).
 
-**Core Value:** For identical inputs and configuration, the Rust implementation must reproduce the C++ LightGBM's outputs to within an absolute difference of **1e-12 on every backend (CPU and ROCm)**. Numerical fidelity is the non-negotiable contract; everything else serves it.
+**Core Value:** For identical inputs and configuration, the Rust implementation must reproduce the C++ LightGBM's outputs to within an absolute difference of **~1e-6 on every backend (CPU and ROCm)**, using `f32` (single-precision) data types end-to-end to match the C++ reference defaults (`score_t`/`label_t` = `float`). The CPU path — the `cubecl-cpu` f64-fold deterministic anchor — is the hard merge gate and, where the algorithm permits, achieves **bit-exact** parity with the C++ reference (e.g. binning, and the serial tree learner is bit-exact vs real `lib_lightgbm` 4.6 on both committed corpora); the ROCm path (`cubecl-hip`, f32) is held to ~1e-6 against that anchor, with residual f32-vs-f64 accumulation gaps documented per phase. Numerical fidelity at single precision is the non-negotiable contract; everything else serves it. _(Revised from an earlier 1e-12 framing — Decided 2026-06-05, Phase 1 discuss: 1e-12 is unachievable/meaningless against an f32 reference. See PROJECT.md Key Decisions.)_
 
 ### Constraints
 
 - **Tech stack**: Pure Rust, Cargo workspace, `cubecl` for compute — no raw CUDA/OpenCL. Use latest available crate versions.
 - **Compatibility**: 100% behavioral compatibility with C++ LightGBM for in-scope APIs, configs, and internal specifications (binning, split logic, model format).
-- **Numerical**: Absolute output difference ≤ 1e-12 vs C++ reference on **both** CPU and ROCm backends.
+- **Numerical**: `f32` (single-precision) data types end-to-end, matching the C++ `score_t`/`label_t` = `float` defaults; absolute output difference ≤ ~1e-6 vs C++ reference on **both** CPU and ROCm backends. The `cubecl-cpu` f64-fold path is the deterministic reference anchor and hard merge gate — bit-exact to C++ where the algorithm permits (e.g. the serial tree learner is bit-exact vs real `lib_lightgbm` 4.6 on both committed corpora); `cubecl-hip` (f32) is a separate ~1e-6 best-effort gate (residual f32-vs-f64 accumulation gaps documented per phase, e.g. `04-ROCM-GAPS.md`).
 - **Hardware**: Tests validated on a **local ROCm GPU**; CubeCL `Plane` API used for warp-level ops.
 - **Backends**: CPU and ROCm must be switchable (Cargo features and/or runtime configuration).
 - **Error handling**: `thiserror` for structured domain errors at library boundaries; `anyhow` for ergonomic propagation in app/high-level layers.
