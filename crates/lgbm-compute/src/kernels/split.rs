@@ -545,6 +545,7 @@ pub fn find_best_split_cpu(
     _most_freq_bin: u32,
     skip_default_bin: bool,
     na_as_missing: bool,
+    run_forward: bool,
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
@@ -623,7 +624,20 @@ pub fn find_best_split_cpu(
     //   FORWARD: t = 0 .. num_bin-2-offset          ->  count = num_bin-1-offset
     let num_bin_i = num_bin as i32;
     let rev_count = (num_bin_i - 1).max(0);
-    let fwd_count = (num_bin_i - 1 - offset).max(0);
+    // FORWARD branch dispatch (feature_histogram.hpp:420-429): LightGBM runs the
+    // FORWARD scan ONLY for `num_bin > 2 && missing_type != None` (Zero or NaN);
+    // for `missing_type == None` (and num_bin <= 2) it dispatches the REVERSE
+    // branch ONLY, so `FindBestThreshold:170`'s pre-set `default_left = true`
+    // survives (decision_type == 2). The caller passes `run_forward` as a verbatim
+    // transcription of that truth table; when it is false we drive `fwd_count = 0`
+    // so the FORWARD loop iterates zero times and `best_default_left` keeps its
+    // REVERSE/initial 1.0 — exactly mirroring C++ never invoking the FORWARD
+    // FindBestThresholdSequentially for this missing_type.
+    let fwd_count = if run_forward {
+        (num_bin_i - 1 - offset).max(0)
+    } else {
+        0
+    };
 
     let out_len = 12usize;
     let h_hist = client.create_from_slice(f64::as_bytes(hist));
@@ -729,6 +743,7 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
     default_bin: u32,
     skip_default_bin: bool,
     na_as_missing: bool,
+    run_forward: bool,
     sum_gradient: f32,
     sum_hessian: f32,
     num_data: i32,
@@ -788,7 +803,15 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
 
     let num_bin_i = num_bin as i32;
     let rev_count = (num_bin_i - 1).max(0);
-    let fwd_count = (num_bin_i - 1 - offset).max(0);
+    // FORWARD branch dispatch (feature_histogram.hpp:420-429) — see the f64
+    // `find_best_split_cpu` for the full transcription. `run_forward` is the
+    // verbatim `num_bin > 2 && missing_type == Zero` truth value; when false we
+    // drive `fwd_count = 0` so only the REVERSE branch contributes.
+    let fwd_count = if run_forward {
+        (num_bin_i - 1 - offset).max(0)
+    } else {
+        0
+    };
 
     let out_len = 12usize;
     let h_hist = client.create_from_slice(f32::as_bytes(hist));
@@ -885,6 +908,7 @@ mod tests {
             0,
             false, // skip_default_bin
             false, // na_as_missing
+            true,  // run_forward (exercise both scan branches in the smoke launch)
             sum_gradient,
             sum_hessian,
             num_data,
@@ -912,7 +936,7 @@ mod tests {
             path_smooth: 0.0,
         };
         let si = find_best_split_cpu(
-            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, 4.0, 4.0, 8,
+            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, 4.0, 4.0, 8,
         )
         .expect("call ok");
         assert_eq!(si.gain, f64::NEG_INFINITY, "no split -> kMinScore");
@@ -941,6 +965,7 @@ mod tests {
             0,
             false,
             false,
+            true,
             1.0,
             1.0,
             4,
@@ -977,6 +1002,7 @@ mod tests {
             0,
             false, // skip_default_bin
             true,  // na_as_missing -> deferred typed error
+            false, // run_forward (unreached: na_as_missing errors first)
             -1.0,
             20.0,
             20,

@@ -96,7 +96,17 @@ pub trait Backend {
     ///   `na_as_missing == (num_bin > 2 && missing_type == NaN)`, both false for
     ///   `missing_type == None`). These REPLACE the Phase-4
     ///   `cfg_skip_default_bin(default_bin, num_bin)` heuristic (RESEARCH
-    ///   Pitfall 1). `na_as_missing == true` is currently a typed
+    ///   Pitfall 1).
+    /// - `run_forward` — the AUTHORITATIVE C++ FORWARD-branch dispatch flag
+    ///   (`feature_histogram.hpp:420-429`): the FORWARD scan runs ONLY when
+    ///   `num_bin > 2 && missing_type == Zero` (the sole dispatch invoking both the
+    ///   REVERSE and FORWARD `FindBestThresholdSequentially`). For
+    ///   `missing_type == None` (and `num_bin <= 2`) only the REVERSE branch runs,
+    ///   so `FindBestThreshold`'s pre-set `default_left = true` survives and
+    ///   `decision_type == 2`. Equal to `skip_default_bin` here (the deferred NaN
+    ///   case is a typed error), but threaded explicitly as a verbatim transcription
+    ///   of the C++ dispatch truth table, NOT a bin-layout heuristic.
+    ///   `na_as_missing == true` is currently a typed
     ///   [`ComputeError::Runtime`] (the NA_AS_MISSING forward branch is deferred,
     ///   RESEARCH A5 — never a silent wrong answer).
     /// - `sum_gradient` / `sum_hessian` / `num_data` — the leaf totals.
@@ -121,6 +131,7 @@ pub trait Backend {
         most_freq_bin: u32,
         skip_default_bin: bool,
         na_as_missing: bool,
+        run_forward: bool,
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
@@ -213,6 +224,7 @@ impl Backend for CpuBackend {
         most_freq_bin: u32,
         skip_default_bin: bool,
         na_as_missing: bool,
+        run_forward: bool,
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
@@ -227,6 +239,7 @@ impl Backend for CpuBackend {
             most_freq_bin,
             skip_default_bin,
             na_as_missing,
+            run_forward,
             sum_gradient,
             sum_hessian,
             num_data,

@@ -585,6 +585,14 @@ fn kernel_parity_split_bit_exact_on_cpu() {
                 0,
                 c.skip_default_bin,
                 c.na_as_missing,
+                // run_forward=true: the split.txt golden captures the RAW kernel
+                // running BOTH the REVERSE and FORWARD `FindBestThresholdSequentially`
+                // (the `skip_default_bin_false` case is a deliberate FORWARD-winner
+                // /default_left=0 divergence). This is the kernel-level golden, NOT
+                // the learner's per-missing_type `find_best_threshold_fun_` dispatch
+                // (feature_histogram.hpp:420-429), so we replay both branches to
+                // match the captured winner bit-exact.
+                true,
                 c.sum_gradient,
                 c.sum_hessian,
                 c.num_data,
@@ -966,6 +974,10 @@ mod hip {
                 c.default_bin as u32,
                 c.skip_default_bin,
                 c.na_as_missing,
+                // run_forward=true: replay BOTH branches to match the split.txt
+                // golden's captured winner (kernel-level golden, not the learner's
+                // per-missing_type dispatch). Matches the cpu anchor below.
+                true,
                 c.sum_gradient as f32,
                 c.sum_hessian as f32,
                 c.num_data,
@@ -987,6 +999,7 @@ mod hip {
                     0,
                     c.skip_default_bin,
                     c.na_as_missing,
+                    true, // run_forward: both-branch golden replay (see hip raw above)
                     c.sum_gradient,
                     c.sum_hessian,
                     c.num_data,

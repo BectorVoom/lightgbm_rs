@@ -132,6 +132,18 @@ impl FeatureColumn {
         self.num_bin > 2 && self.missing_type == MissingType::NaN
     }
 
+    /// The authoritative C++ FORWARD-branch dispatch flag
+    /// (`feature_histogram.hpp:420-429`). LightGBM dispatches BOTH the REVERSE and
+    /// FORWARD `FindBestThresholdSequentially` ONLY for
+    /// `num_bin > 2 && missing_type == Zero`; for `missing_type == None` (and
+    /// `num_bin <= 2`) it runs the REVERSE branch ONLY, so `FindBestThreshold:170`'s
+    /// pre-set `default_left = true` survives → `decision_type == 2`. This is a
+    /// verbatim transcription of that truth table (it equals `skip_default_bin()`
+    /// here; the deferred NaN case is a typed error before this is reached).
+    fn run_forward(&self) -> bool {
+        self.num_bin > 2 && self.missing_type == MissingType::Zero
+    }
+
     /// The real-value threshold a split at `threshold_bin` records on the tree
     /// (`bin_upper_bound_[threshold_bin]`). Falls back to the bin index as f64 if
     /// the upper-bound table is short (spine cases always supply it).
@@ -610,16 +622,23 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             (None, None)
         };
 
-        // The smaller leaf's seeded sums vs the larger leaf's (the LeafSplits
-        // identities track which physical leaf each holds; on the root the smaller
-        // is the only leaf).
+        // The smaller leaf's seeded sums vs the larger leaf's. `split_inner` seeds
+        // `smaller_leaf_splits` with the SMALLER-by-partition-count child and
+        // `larger_leaf_splits` with the larger (tie ⇒ right is "smaller"), using the
+        // SAME `data_partition.leaf_count` comparison that picks `smaller_leaf` /
+        // `larger_leaf` above. Therefore `smaller_leaf_splits` ALWAYS holds
+        // `smaller_leaf`'s sums and `larger_leaf_splits` holds `larger_leaf`'s — the
+        // mapping is a DIRECT pass-through, mirroring C++ `smaller_leaf_splits_` /
+        // `larger_leaf_splits_` carrying their own `leaf_index_`
+        // (serial_tree_learner.cpp:851). The previous `smaller_leaf == left_leaf`
+        // branch SWAPPED the slots whenever the smaller child was the right leaf
+        // (incl. the equal-count tie), feeding `smaller_leaf` the larger sibling's
+        // sums (CR-03 root cause: leaf 1 got leaf 0's −24 sum → wrong child splits /
+        // `leaf_value` like −17.99).
         let (smaller_splits, larger_splits) = if right_leaf < 0 {
             (smaller_leaf_splits, smaller_leaf_splits)
-        } else if smaller_leaf == left_leaf {
-            (smaller_leaf_splits, larger_leaf_splits)
         } else {
-            // smaller is the RIGHT leaf, larger is the LEFT.
-            (larger_leaf_splits, smaller_leaf_splits)
+            (smaller_leaf_splits, larger_leaf_splits)
         };
 
         let smaller_records = self.find_best_split_for_leaf(
@@ -741,7 +760,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 &ord_h,
                 f.num_bin,
             )?;
-            let _ = subtract_from; // subtraction agreement asserted in parity test
+            let _ = subtract_from; // subtraction-trick wiring is 05-07 scope
 
             // FixHistogram on the RAW leaf sums (Pitfall 2 — BEFORE the scan).
             // For most_freq_bin == 0 (offset == 1) this is a no-op
@@ -759,9 +778,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // buffer whose tail cells are unread). For offset == 0 this is a no-op.
             compact_histogram(&mut hist, f.offset);
 
-            // Authoritative dispatch flags (Pitfall 1).
+            // Authoritative dispatch flags (Pitfall 1). `run_forward` transcribes
+            // the C++ per-missing_type branch dispatch (feature_histogram.hpp:
+            // 420-429): the FORWARD scan runs ONLY for `num_bin>2 &&
+            // missing_type==Zero`; for `missing_type==None` (both spine and mfb>0
+            // corpora) only REVERSE runs, so `default_left` stays true
+            // (decision_type==2) and the REVERSE-only winner is selected.
             let skip_default_bin = f.skip_default_bin();
             let na_as_missing = f.na_as_missing();
+            let run_forward = f.run_forward();
 
             let split = self.backend.find_best_split(
                 self.client,
@@ -773,6 +798,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 f.most_freq_bin,
                 skip_default_bin,
                 na_as_missing,
+                run_forward,
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
@@ -1038,13 +1064,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             best.default_left,
         );
 
-        // Seed the two child LeafSplits for the next iteration (smaller/larger by
-        // row count, :851). Use the ACTUAL data-partition row counts (not
-        // best.left_count/right_count) so this selection is bit-consistent with the
-        // smaller-child selection in `find_best_splits` (which reads
-        // `DataPartition::leaf_count`) — the two MUST agree (Pitfall 3). The ordered
-        // fold over each child's rows (now grouped by data_partition.split) is the
-        // deterministic seed.
+        // Seed the two child LeafSplits for the next iteration
+        // (serial_tree_learner.cpp:850-870). The child leaf-split sums are the
+        // deterministic ordered f64 re-fold over each child's data-partition rows;
+        // the smaller/larger selection uses the ACTUAL data-partition counts (the
+        // `update_cnt=true` overwrite, :790-791), bit-consistent with the
+        // smaller-child selection in `find_best_splits`.
         let left_rows: Vec<u32> = data_partition.indices_in_leaf(new_left).to_vec();
         let right_rows: Vec<u32> = data_partition.indices_in_leaf(new_right).to_vec();
         let count_left = data_partition.leaf_count(new_left);

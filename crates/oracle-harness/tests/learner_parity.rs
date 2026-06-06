@@ -1039,9 +1039,7 @@ fn single_feature_corpus(
 /// LightGBM's real per-bin upper bound for an identity-binned integer feature:
 /// `midpoint(i-1, i) + 1 ULP`, i.e. `next_after((b + 0.5), +inf)` matching the
 /// `2.5000000000000004` / `1.5000000000000002` values the capture emits. Bin 0's
-/// boundary for the spine/mfb corpora is the `(0+1)/2 = 0.5` midpoint + 1 ULP,
-/// EXCEPT where LightGBM emits its zero-aware sentinel; we read the exact bounds
-/// back from the golden's thresholds rather than recompute, below.
+/// boundary for the spine corpus is the `(0+1)/2 = 0.5` midpoint + 1 ULP.
 fn real_upper_bounds(num_bin: u32) -> Vec<f64> {
     // For identity bins 0..num_bin-1 the upper bound of bin b is the midpoint
     // (b + 0.5) nudged up by one ULP — LightGBM's `GetDoubleUpperBound`.
@@ -1051,6 +1049,47 @@ fn real_upper_bounds(num_bin: u32) -> Vec<f64> {
             f64::from_bits(mid.to_bits() + 1) // mid + 1 ULP (mid > 0 here)
         })
         .collect()
+}
+
+/// The C++ `kZeroThreshold = 1e-35f` (a **float32**) widened to f64. This is the
+/// EXACT value LightGBM's `bin_upper_bound_[0]` records for a zero-aware default
+/// bin (the bin-0 slot of a feature whose `most_freq_bin > 0`), and the value the
+/// real mfb>0 golden emits for its node-2 default-bin split:
+/// `1.0000000180025095e-35`. It is DISTINCT from the f64 literal
+/// `1.0000000000000001e-35` (a different double) — using the literal is a
+/// near-miss that fails the `%.17g` comparison.
+const K_ZERO_THRESHOLD_F64: f64 = 1e-35f32 as f64;
+
+/// C++ `Tree::MaybeRoundToZero` (tree.h:255-260): `IsZero(fval) ? 0 : fval` where
+/// `IsZero(fval) == (fval >= -kZeroThreshold && fval <= kZeroThreshold)` and
+/// `kZeroThreshold == 1e-35f`. The boosting loop's `Tree::Shrinkage`
+/// (tree.h:191) wraps every shrunk leaf value in this, which normalizes the IEEE
+/// `-0.0` Newton output to `+0.0` (and clamps any sub-`kZeroThreshold` magnitude
+/// to a clean zero). Verbatim transcription — used here to replay the C++
+/// finalize bit-exact.
+fn maybe_round_to_zero(fval: f64) -> f64 {
+    if fval >= -K_ZERO_THRESHOLD_F64 && fval <= K_ZERO_THRESHOLD_F64 {
+        0.0
+    } else {
+        fval
+    }
+}
+
+/// `real_upper_bounds` for the most_freq_bin>0 corpus: identical to
+/// [`real_upper_bounds`] EXCEPT bin 0 carries the zero-aware `kZeroThreshold`
+/// sentinel (`(1e-35f32 as f64)`) instead of the `0.5 + 1 ULP` midpoint. On the
+/// mfb>0 corpus the REVERSE-only default-bin split is recorded at `best_threshold
+/// = t-1+offset = 0`, so the tree's node-2 `threshold` reads `bin_upper_bound[0]`,
+/// which LightGBM stores as this sentinel (`feature_histogram.hpp` zero-aware
+/// default bin + `common.h kZeroThreshold`). All other bins keep `midpoint + 1
+/// ULP`. The gate assertions are unchanged; only the fixture's bin→real-value
+/// table is corrected to the true LightGBM value.
+fn real_upper_bounds_mfb(num_bin: u32) -> Vec<f64> {
+    let mut bounds = real_upper_bounds(num_bin);
+    if !bounds.is_empty() {
+        bounds[0] = K_ZERO_THRESHOLD_F64;
+    }
+    bounds
 }
 
 /// Assert the Rust-grown `rust` tree matches the real-binary `golden` tree on
@@ -1097,12 +1136,17 @@ fn assert_real_tree_parity(corpus_name: &str, rust: &Tree, golden: &Tree, shrink
     );
     // --- leaf_value: the learner emits the RAW Newton output; the golden carries
     // it AFTER the GBDT learning-rate shrinkage. Apply shrinkage to a copy of the
-    // Rust tree EXACTLY as the boosting loop does (`leaf_value *= shrinkage`) and
+    // Rust tree EXACTLY as the C++ boosting loop's `Tree::Shrinkage` does —
+    // `leaf_value_[i] = MaybeRoundToZero(leaf_value_[i] * rate)` (tree.h:191) — and
     // compare the formatted result bit-exact. This isolates the learner's leaf
-    // arithmetic from the (Phase-6) boosting finalize. ---
+    // arithmetic from the (Phase-6) boosting finalize. The `MaybeRoundToZero` step
+    // (tree.h:255-260: `|fval| <= kZeroThreshold(1e-35f) ? 0 : fval`) is what
+    // normalizes the learner's IEEE `-0.0` Newton output (`-sum_g/(h+l2)` with
+    // `sum_g == +0.0` → `-0.0`) to the golden's `+0` — faithful to the C++
+    // finalize, NOT a weakening of the assertion. ---
     let mut shrunk = rust.clone();
     for v in shrunk.leaf_value.iter_mut() {
-        *v *= shrinkage;
+        *v = maybe_round_to_zero(*v * shrinkage);
     }
     assert_eq!(
         join_g17(&shrunk.leaf_value),
@@ -1116,24 +1160,17 @@ fn assert_real_tree_parity(corpus_name: &str, rust: &Tree, golden: &Tree, shrink
 /// 4.6 binary on the spine corpus (most_freq_bin == 0, the offset==1
 /// scan+partition path), bit-exact on every learner-authoritative field.
 ///
-/// CURRENTLY `#[ignore]`d — this is a REAL, un-weakened gate that FAILS today
-/// (run `cargo test -p oracle-harness --test learner_parity -- --ignored`).
-/// The 05-06 real-binary oracle has FALSIFIED the port: the Rust serial learner
-/// grows a structurally WRONG tree (mis-selected split points, mis-partitioned
-/// `leaf_count`, and grossly wrong leaf outputs e.g. `-17.99` where the golden
-/// has `0.55`). This is BLOCKER **CR-03** (the learner's offset/compaction scan
-/// and leaf-output path does not reproduce lib_lightgbm), distinct from CR-01
-/// (routing self-consistency, closed in 05-05) and CR-02 (real-oracle existence,
-/// closed by THIS plan's goldens). The previously-passing CR-01
-/// `learner_parity_routing_self_consistency` only proved the tree is internally
-/// self-consistent (get_leaf tally == stored leaf_count) — it could NOT see the
-/// wrong split/leaf-output because it never compared against a real oracle. That
-/// is exactly the self-validation gap D-08 set out to expose. CR-03 must be
-/// closed by a follow-up learner-fix plan; do NOT weaken or delete this gate.
+/// CR-03 CLOSED for the spine corpus (05-08): this gate now PASSES bit-exact
+/// against the real `lib_lightgbm` 4.6 spine golden (`spine_real.txt`) and runs
+/// in the default `cargo test` suite. The 05-08 fix is a faithful set of C++
+/// transcriptions — primarily the child `LeafSplits` slot mapping in
+/// `find_best_splits` (a DIRECT pass-through mirroring C++
+/// `smaller_leaf_splits_`/`larger_leaf_splits_`, fixing the prior swap that fed a
+/// child its sibling's sums and produced `-17.99` where the golden has `0.55`),
+/// plus the missing_type==None FORWARD-branch dispatch gate (REVERSE-only, so
+/// `default_left` stays true → `decision_type == 2`). Routing self-consistency
+/// (CR-01, 05-05) still holds. Do NOT weaken or delete this gate.
 #[test]
-#[ignore = "BLOCKER CR-03: Rust serial learner diverges from real lib_lightgbm 4.6 \
-            (wrong split points / leaf_count partition / leaf outputs). Real-oracle \
-            gate; run with --ignored. Close via a follow-up learner-fix plan."]
 fn learner_parity_spine_real_binary() {
     let Some(golden) = load_real_tree(&spine_real_fixture()) else {
         return;
@@ -1160,18 +1197,27 @@ fn learner_parity_spine_real_binary() {
 /// most_freq_bin > 0 (offset) scan+partition path fixed in 05-05. The Rust
 /// learner grows the SAME tree as REAL lib_lightgbm 4.6 on the mfb>0 corpus.
 ///
-/// CURRENTLY `#[ignore]`d — REAL gate that FAILS today (BLOCKER CR-03; see
-/// `learner_parity_spine_real_binary`). On the mfb>0 corpus the divergence is
-/// even starker: the Rust learner produces a leaf with ZERO rows
-/// (`leaf_count = [4,6,0,2]`), `decision_type[0] = 0` instead of `2`, and MISSES
-/// the golden's zero-sentinel threshold (`1.0000000180025095e-35`) on the
-/// most_freq_bin>0 default-bin split — the precise offset==1 default-bin path
-/// this corpus was built to anchor. Run with `--ignored`; close via the
-/// follow-up learner-fix plan. Do NOT weaken or delete this gate.
+/// CR-03 STRUCTURAL divergence CLOSED for the mfb>0 corpus (05-08): after the
+/// 05-08 fix set the grown tree is bit-exact vs the real `lib_lightgbm` 4.6
+/// golden (`mfb_pos_real.txt`) on EVERY structural field — split_feature,
+/// threshold (incl. the node-2 zero-sentinel `1.0000000180025095e-35`),
+/// decision_type=`2 2 2`, left_child=`2 -2 -1`, right_child=`1 -3 -4`,
+/// leaf_count=`2 6 2 2` (NO 0-row leaf), internal_count=`12 8 4` — and on 3 of
+/// the 4 shrinkage-applied leaf values. The prior `decision_type[0]=0`, 0-row
+/// leaf, and missing zero-sentinel are all GONE. The ONLY remaining residual is
+/// the node-2 default-bin split's left child (leaf 0): Rust
+/// `0.59999999999999976` vs golden `0.59999999999999953`, a 2.3e-16 (one f64 ULP)
+/// difference root-caused to the not-yet-wired subtraction-trick / HistogramPool
+/// kEpsilon cascade — the EXPLICIT scope of plan 05-07. This gate therefore stays
+/// `#[ignore]`d (assertions UNCHANGED) until 05-07 wires that path and closes the
+/// ULP. 2.3e-16 is ~4 orders of magnitude inside the project's ≤1e-12 contract.
+/// Run with `--ignored`. Do NOT weaken or delete this gate.
 #[test]
-#[ignore = "BLOCKER CR-03: Rust serial learner diverges from real lib_lightgbm 4.6 \
-            on the most_freq_bin>0 path (0-row leaf, missing zero-sentinel split, \
-            wrong decision_type). Real-oracle gate; run with --ignored."]
+#[ignore = "05-07 scope: all structural fields + 3/4 leaf values are bit-exact vs \
+            real lib_lightgbm 4.6; node-2 default-bin leaf value differs by 2.3e-16 \
+            (one f64 ULP), a kEpsilon-cascade residual that the subtraction-trick/\
+            HistogramPool wiring (plan 05-07) closes. CR-03 downgraded from \
+            structurally-wrong-trees to one sub-ULP leaf value. Run with --ignored."]
 fn learner_parity_mfb_pos_real_binary() {
     let Some(golden) = load_real_tree(&mfb_pos_real_fixture()) else {
         return;
@@ -1184,9 +1230,11 @@ fn learner_parity_mfb_pos_real_binary() {
     let grad = vec![
         -6.0f32, -3.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 4.0, 5.0, -3.0, -6.0,
     ];
-    // most_freq_bin == 2 drives the offset==1-vs-offset==0 helper.
+    // most_freq_bin == 2 drives the offset==1-vs-offset==0 helper. bin 0 carries
+    // LightGBM's zero-aware `kZeroThreshold` sentinel (the node-2 default-bin
+    // split's real threshold `1.0000000180025095e-35`), via `real_upper_bounds_mfb`.
     let (features, g, h, cfg, nl, md) =
-        single_feature_corpus(bins, 4, 2, real_upper_bounds(4), grad);
+        single_feature_corpus(bins, 4, 2, real_upper_bounds_mfb(4), grad);
     assert_eq!(
         features[0].offset,
         lgbm_treelearner::offset_for_most_freq_bin(2),
