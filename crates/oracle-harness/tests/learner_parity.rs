@@ -1260,17 +1260,23 @@ fn learner_parity_growth_path_subtract() {
 /// leaf, and missing zero-sentinel are all GONE. The ONLY remaining residual is
 /// the node-2 default-bin split's left child (leaf 0): Rust
 /// `0.59999999999999976` vs golden `0.59999999999999953`, a 2.3e-16 (one f64 ULP)
-/// difference root-caused to the not-yet-wired subtraction-trick / HistogramPool
-/// kEpsilon cascade — the EXPLICIT scope of plan 05-07. This gate therefore stays
-/// `#[ignore]`d (assertions UNCHANGED) until 05-07 wires that path and closes the
-/// ULP. 2.3e-16 is ~4 orders of magnitude inside the project's ≤1e-12 contract.
+/// difference. 05-07 PROVED this is NOT a subtraction-trick effect — leaf 0 is
+/// node-2's DIRECTLY-BUILT smaller child, so the subtraction trick (`larger =
+/// parent − smaller`) never touches it. The residual is a 2-ULP f64
+/// accumulation-order subtlety in the FixHistogram-active DIRECT histogram build
+/// (construct / FixHistogram / output fold), deferred to plan 05-09
+/// (FixHistogram fold-order parity). This gate therefore stays `#[ignore]`d
+/// (assertions UNCHANGED) until 05-09 aligns that fold order and closes the ULP.
+/// 2.3e-16 is ~4 orders of magnitude inside the project's ≤1e-12 contract.
 /// Run with `--ignored`. Do NOT weaken or delete this gate.
 #[test]
-#[ignore = "05-07 scope: all structural fields + 3/4 leaf values are bit-exact vs \
-            real lib_lightgbm 4.6; node-2 default-bin leaf value differs by 2.3e-16 \
-            (one f64 ULP), a kEpsilon-cascade residual that the subtraction-trick/\
-            HistogramPool wiring (plan 05-07) closes. CR-03 downgraded from \
-            structurally-wrong-trees to one sub-ULP leaf value. Run with --ignored."]
+#[ignore = "05-09 scope: every structural field + 3/4 leaf values are bit-exact vs \
+            real lib_lightgbm 4.6; node-2 leaf-0 value differs by 2.3e-16 (one f64 \
+            ULP). 05-07 proved this is NOT a subtraction-trick effect (leaf 0 is the \
+            directly-built smaller child) but a 2-ULP f64 accumulation-order subtlety \
+            in the FixHistogram-active direct histogram build. Deferred to 05-09 \
+            (FixHistogram fold-order parity). ~4 orders inside the <=1e-12 contract. \
+            Run with --ignored."]
 fn learner_parity_mfb_pos_real_binary() {
     let Some(golden) = load_real_tree(&mfb_pos_real_fixture()) else {
         return;
