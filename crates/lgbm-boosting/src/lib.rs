@@ -21,5 +21,9 @@
 //! (bagging/early-stopping).
 
 pub mod error;
+pub mod gbdt;
+pub mod score_updater;
 
 pub use error::BoostingError;
+pub use gbdt::{Gbdt, IterSnapshot};
+pub use score_updater::ScoreUpdater;

@@ -281,8 +281,30 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>), TreeLearnerError> {
-        let (tree, snaps, _trace) = self.train_inner(gradients, hessians, is_first_tree)?;
+        let (tree, snaps, _trace, _part) = self.train_inner(gradients, hessians, is_first_tree)?;
         Ok((tree, snaps))
+    }
+
+    /// Like [`train`](Self::train) but ALSO returns the final [`DataPartition`]
+    /// the tree was grown over (the row→leaf mapping after the last split).
+    ///
+    /// The GBDT loop (06-02) needs this for the bit-exact training-path score
+    /// scatter [`add_prediction_to_score`](Self::add_prediction_to_score): the
+    /// C++ `data_partition_` is a learner member, but this port builds the
+    /// partition locally inside `train_inner` and does not retain it on `self`, so
+    /// the boosting caller takes ownership of it here and passes it back to the
+    /// scatter. The returned partition's per-leaf row sets are exactly the C++
+    /// `data_partition_->indices/leaf_begin/leaf_count` used by
+    /// `AddPredictionToScore`.
+    pub fn train_returning_partition(
+        &mut self,
+        gradients: &[f32],
+        hessians: &[f32],
+        is_first_tree: bool,
+    ) -> Result<(Tree, DataPartition), TreeLearnerError> {
+        let (tree, _snaps, _trace, part) =
+            self.train_inner(gradients, hessians, is_first_tree)?;
+        Ok((tree, part))
     }
 
     /// Like [`train_with_snapshots`](Self::train_with_snapshots) but also returns
@@ -297,7 +319,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace), TreeLearnerError> {
-        self.train_inner(gradients, hessians, is_first_tree)
+        let (tree, snaps, trace, _part) =
+            self.train_inner(gradients, hessians, is_first_tree)?;
+        Ok((tree, snaps, trace))
     }
 
     /// The shared growth driver behind [`train`](Self::train),
@@ -309,7 +333,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         gradients: &[f32],
         hessians: &[f32],
         _is_first_tree: bool,
-    ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace), TreeLearnerError> {
+    ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace, DataPartition), TreeLearnerError> {
         let num_data = gradients.len() as i32;
         let features = self.features.clone();
 
@@ -507,7 +531,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             right_leaf = new_right;
         }
 
-        Ok((tree, snapshots, trace))
+        Ok((tree, snapshots, trace, data_partition))
     }
 
     /// `BeforeFindBestSplit` gates (`serial_tree_learner.cpp:343-378`): apply the

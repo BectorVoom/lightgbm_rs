@@ -9,13 +9,18 @@ lgbm-core = { path = "../lgbm-core" }
 lgbm-dataset = { path = "../lgbm-dataset" }
 lgbm-model = { path = "../lgbm-model" }
 # The boosting loop drives the Phase-5 SerialTreeLearner via its existing public
-# API — it never names a compute runtime. CMP-01 containment: like
-# `lgbm-treelearner`, this crate has NO GPU-compute-runtime dependency and does
-# not depend on `lgbm-compute`; the compute seam stays isolated below the learner.
-# (Mirror of the comment block in `crates/lgbm-treelearner/Cargo.toml`.)
+# API. CMP-01 containment: this crate names NO GPU compute runtime — the compute
+# seam stays isolated below the learner.
 lgbm-treelearner = { path = "../lgbm-treelearner" }
 lgbm-objective = { path = "../lgbm-objective" }
 lgbm-metric = { path = "../lgbm-metric" }
+# Backend TRAIT BOUND only: the learner's score-scatter
+# `SerialTreeLearner<'_, B: Backend>::add_prediction_to_score` appears in the
+# `ScoreUpdater` signature, so we must name `lgbm_compute::Backend`. This is the
+# trait/type only — exactly the `lgbm-treelearner` discipline (which also depends
+# on `lgbm-compute` for the trait while naming no GPU compute runtime). CMP-01 is
+# the no-runtime gate, which still holds.
+lgbm-compute = { path = "../lgbm-compute" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
