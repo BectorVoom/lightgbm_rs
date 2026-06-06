@@ -590,22 +590,25 @@ buf[left..cnt].reverse();   // one-buffer reverse of the OOB tail
 | A5 | `GbdtModel` is the model container name in `lgbm-model` (CONTEXT says `GbdtModel`; could be a different ident) | Standard Stack | Cosmetic; planner confirms the actual type name when wiring. |
 | A6 | The Rust `Tree` already has `shrinkage`/`add_bias` (CONTEXT P5 mentions MaybeRoundToZero/Shrinkage finalize) | Wave 0 | If absent, add them (small); if present, reuse. Audit in Wave 0. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Where should `ConvertOutput` canonically live?**
+1. **Where should `ConvertOutput` canonically live?** _(RESOLVED: 06-02 Task 3)_
    - What we know: `lgbm-model::ObjectiveKind::convert_output` exists (predict side, P3); metrics + objectives both need it.
    - What's unclear: whether to move it to `lgbm-objective` (canonical objective owner) and have `lgbm-model` depend on it, or keep it in `lgbm-model` and have `lgbm-objective`/`lgbm-metric` depend on `lgbm-model`.
    - Recommendation: Keep predict-side in `lgbm-model` to avoid churning Phase-3 callers; `lgbm-metric` depends on `lgbm-model` for `ConvertOutput`. `lgbm-objective` owns the TRAINING side (`GetGradients`/`BoostFromScore`) and may re-export or duplicate the small transform. Claude's discretion (CONTEXT) — bounded by not breaking P3 tests.
+   - RESOLVED: 06-02 Task 3 — `ConvertOutput` stays in `lgbm-model`; the builder/Booster predict path and `lgbm-metric` call `ObjectiveKind::convert_output`; resolution recorded in the 06-02 SUMMARY.
 
-2. **D-11 capture route fidelity (see A4).**
+2. **D-11 capture route fidelity (see A4).** _(RESOLVED: 06-02 Task 3)_
    - What we know: Python `predict(raw_score=True)` gives cumulative raw margin.
    - What's unclear: whether it equals the internal training `score_` (f64) bit-for-bit, or only within ULPs (different accumulation order).
    - Recommendation: On the spine cell, assert `predict(raw_score, k)` against the Rust internal `score_` after k iters; if bit-exact, use it for all cells; if only ~1e-6, treat L2 as a ~1e-6 (not bit-exact) layer and lean on L5 (model text, bit-exact) as the hard gate. Resolve in the spine wave before scaling to 40 cells.
+   - RESOLVED: 06-02 Task 3 — the per-iter score L2 precision contract (bit-exact vs ~1e-6, with rationale) is decided on the spine cell and RECORDED in the 06-02 SUMMARY before the ~40-cell matrix is captured in 06-05; all ~40 downstream cells inherit that resolution.
 
-3. **regression_l1 `PercentileFun` exact algorithm.**
+3. **regression_l1 `PercentileFun` exact algorithm.** _(RESOLVED: 06-03 Task 1)_
    - What we know: it's a sort+index median (alpha=0.5), used in both `BoostFromScore` and `RenewTreeOutput`.
    - What's unclear: the exact index/interpolation convention in `common.h` (not yet read line-by-line this session).
    - Recommendation: Read `common.h` `PercentileFun`/`WeightedPercentileFun` macros verbatim before implementing the l1 cells; capture a per-leaf renew golden. Highest new-numerical-code risk.
+   - RESOLVED: 06-03 Task 1 — `PercentileFun`/`WeightedPercentileFun` ported verbatim from `common.h` into `lgbm-objective/src/percentile.rs`, validated on the regression_l1 `BoostFromScore` (median) + per-leaf renew goldens.
 
 ## Sources
 
