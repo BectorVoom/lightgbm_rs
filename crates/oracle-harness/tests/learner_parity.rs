@@ -1193,6 +1193,59 @@ fn learner_parity_spine_real_binary() {
     assert_real_tree_parity("spine_real", &tree, &golden, 0.1);
 }
 
+/// TRL-02 (plan 05-07): the subtraction trick + HistogramPool are wired into the
+/// ACTUAL `find_best_splits` growth path — NOT just exercised in isolation
+/// (`learner_parity_subtract`). This drives the spine corpus through the LIVE
+/// learner with the growth-path subtraction AUDIT enabled, and asserts that for
+/// EVERY `use_subtract` larger child grown (right_leaf >= 0), the histogram the
+/// wired `subtract_histograms(parent, smaller)` produced equals an independent
+/// DIRECT build of that same leaf's rows, cell-for-cell (bit-exact f64). It then
+/// asserts the grown tree STILL matches the real `lib_lightgbm` 4.6 spine golden
+/// bit-exact — i.e. wiring the trick did not change the output, only the
+/// derivation path (T-05-07-01: a silent tree change would fail loudly). The
+/// spine corpus has `most_freq_bin == 0` (FixHistogram is a no-op), so the
+/// derived-vs-direct equivalence is exact for f64 integer hessians.
+#[test]
+fn learner_parity_growth_path_subtract() {
+    let backend = CpuBackend;
+    let client = cpu_client();
+    // SAME single feature + g/h as `learner_parity_spine_real_binary`.
+    let bins = vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+    let grad = vec![
+        -6.0f32, -6.0, -5.0, -5.0, -1.0, -1.0, 1.0, 1.0, 5.0, 5.0, 6.0, 6.0,
+    ];
+    let (features, g, h, cfg, nl, md) =
+        single_feature_corpus(bins, 6, 0, real_upper_bounds(6), grad);
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, nl, md)
+        .with_features(features.clone())
+        .with_subtract_audit();
+    let tree = learner.train(&g, &h, true).expect("growth-path subtract train ok");
+
+    // The audit recorded one (derived, direct) pair per use_subtract larger child.
+    let audit = learner.take_subtract_audit();
+    assert!(
+        !audit.is_empty(),
+        "TRL-02: the subtraction trick must FIRE in the live growth path (a non-root \
+         split with right_leaf >= 0 derives the larger child by subtraction); the \
+         audit is empty, so the trick is not wired"
+    );
+    for (i, (derived, direct)) in audit.iter().enumerate() {
+        compare_exact_f64_bits(derived, direct).unwrap_or_else(|e| {
+            panic!(
+                "TRL-02: growth-path subtracted larger child #{i} \
+                 (parent - smaller) != direct build of the same leaf's rows: {e}"
+            )
+        });
+    }
+
+    // And the wired path still grows the SAME tree as the real lib_lightgbm 4.6
+    // spine golden (wiring changed only the derivation, not the output).
+    if let Some(golden) = load_real_tree(&spine_real_fixture()) {
+        assert_routing_self_consistent("growth_path_subtract", &features, &tree, g.len());
+        assert_real_tree_parity("growth_path_subtract", &tree, &golden, 0.1);
+    }
+}
+
 /// CR-02 closure + the FIRST bit-exact real-binary coverage of the
 /// most_freq_bin > 0 (offset) scan+partition path fixed in 05-05. The Rust
 /// learner grows the SAME tree as REAL lib_lightgbm 4.6 on the mfb>0 corpus.

@@ -42,7 +42,7 @@ use lgbm_model::Tree;
 use crate::col_sampler::ColSampler;
 use crate::data_partition::DataPartition;
 use crate::error::TreeLearnerError;
-use crate::histogram_pool::HistogramPool;
+use crate::HistogramPool;
 use crate::leaf_splits::LeafSplits;
 use crate::split_info::{split_gt, SplitInfo};
 
@@ -173,6 +173,14 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// (`feature_fraction == feature_fraction_bynode == 1.0`, no subsampling, the
     /// `ColSampler` is never built so the Plan-03 behavior is bit-identical).
     col_sampling: Option<(f64, f64, i32)>,
+    /// TEST-ONLY audit hook (T-05-07-01). When `Some`, every `use_subtract` larger
+    /// child in the live growth path records `(derived, direct)`: the histogram the
+    /// wired `subtract_histograms(parent, smaller)` produced vs an independent
+    /// direct build of the same leaf's rows. A parity test drains this to assert the
+    /// subtracted larger child equals the direct build cell-for-cell (TRL-02), in
+    /// the ACTUAL growth path (not just in isolation). `None` in production (no-op,
+    /// zero overhead beyond the `Option` check).
+    subtract_audit: Option<std::cell::RefCell<Vec<(Vec<f64>, Vec<f64>)>>>,
 }
 
 /// The per-split snapshot the spine emits for the D-06 golden: for each candidate
@@ -239,6 +247,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             features: Vec::new(),
             strategy: BuildStrategy::RowWise,
             col_sampling: None,
+            subtract_audit: None,
         }
     }
 
@@ -384,14 +393,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
 
         let mut data_partition = DataPartition::new(num_data, self.num_leaves);
-        // The spine processes one feature column at a time, so each pool slot holds
-        // the widest single-feature histogram (2 * max num_bin).
-        let max_hist_len = features
-            .iter()
-            .map(|f| 2 * f.num_bin as usize)
-            .max()
-            .unwrap_or(0);
-        let mut pool = HistogramPool::new(self.num_leaves, max_hist_len);
+        // The pool slot holds EVERY feature's compacted histogram CONCATENATED
+        // (mirroring C++ `histogram_array_[feature_index]`, a contiguous per-leaf
+        // buffer). `slot_off[fpos]` is feature `fpos`'s start cell in the slot; the
+        // total slot length is `Σ 2*num_bin`. The whole concatenated buffer is the
+        // subtraction-trick unit: `larger = parent − smaller` is a single
+        // element-wise subtract over it (each feature's compacted region subtracts
+        // independently; the zeroed compaction tails subtract to zero — D-05/A3).
+        let (slot_off, slot_len) = feature_slot_layout(&features);
+        let mut pool = HistogramPool::new(self.num_leaves, slot_len);
         pool.reset_map();
 
         // Root leaf sums via the ordered f64 fold over ALL rows.
@@ -451,6 +461,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     hessians,
                     &data_partition,
                     &mut pool,
+                    &slot_off,
                     &smaller_leaf_splits,
                     &larger_leaf_splits,
                     left_leaf,
@@ -558,7 +569,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         gradients: &[f32],
         hessians: &[f32],
         data_partition: &DataPartition,
-        _pool: &mut HistogramPool,
+        pool: &mut HistogramPool,
+        slot_off: &[usize],
         smaller_leaf_splits: &LeafSplits,
         larger_leaf_splits: &LeafSplits,
         left_leaf: i32,
@@ -568,19 +580,55 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         col_sampler: Option<&mut ColSampler>,
         trace: &mut ColSamplerTrace,
     ) -> Result<SplitSnapshot, TreeLearnerError> {
-        // Determine which leaf is the SMALLER child (built directly) vs the LARGER
-        // (derived by subtraction). On the root, smaller = left, no subtraction.
-        let (smaller_leaf, larger_leaf, use_subtract) = if right_leaf < 0 {
-            (left_leaf, -1, false)
+        // ---- HistogramPool slot dance (serial_tree_learner.cpp:364-378) ----
+        // Decide smaller/larger by the ACTUAL data-partition row counts, and assign
+        // pool slots EXACTLY as C++ `BeforeFindBestSplit` does:
+        //   - root (right_leaf < 0): Get(left) → smaller slot; no larger; no parent.
+        //   - num_left < num_right (smaller == left): the PARENT histogram lives in
+        //     `left_leaf`'s slot (a cache HIT → retain as `parent`); Move(left→right)
+        //     hands that buffer to the LARGER child (right), then Get(left) gives the
+        //     SMALLER child (left) a fresh slot.
+        //   - else (smaller == right): retain `left_leaf`'s slot as the LARGER child's
+        //     (parent), and Get(right) gives the SMALLER child a fresh slot.
+        // `use_subtract` is true iff a parent histogram was retained (cache hit) —
+        // i.e. the larger child can be derived by `parent − smaller` instead of a
+        // second direct build. On the root the parent slot is empty so use_subtract
+        // is false and the single leaf is built directly.
+        let (smaller_leaf, larger_leaf) = if right_leaf < 0 {
+            (left_leaf, -1)
         } else {
             let num_left = data_partition.leaf_count(left_leaf);
             let num_right = data_partition.leaf_count(right_leaf);
             if num_left < num_right {
-                (left_leaf, right_leaf, true) // smaller = left
+                (left_leaf, right_leaf) // smaller = left
             } else {
-                (right_leaf, left_leaf, true) // smaller = right
+                (right_leaf, left_leaf) // smaller = right
             }
         };
+
+        // Run the C++ pool Get/Move sequence and learn which slots back the smaller
+        // child, the larger child, and (when a hit) the retained parent histogram.
+        let (smaller_slot, larger_slot, parent_slot) = if right_leaf < 0 {
+            // Only the root leaf.
+            let (s, _existed) = pool.get(left_leaf);
+            (s, None, None)
+        } else if smaller_leaf == left_leaf {
+            // smaller == left: parent lives in left's slot.
+            let (parent, existed) = pool.get(left_leaf);
+            let parent_opt = existed.then_some(parent);
+            pool.move_(left_leaf, right_leaf); // hand parent's buffer to the larger child
+            let (s, _e) = pool.get(left_leaf); // fresh slot for the smaller child
+            (s, Some(parent), parent_opt)
+        } else {
+            // smaller == right: parent stays in left's slot (the larger child).
+            let (parent, existed) = pool.get(left_leaf);
+            let parent_opt = existed.then_some(parent);
+            let (s, _e) = pool.get(right_leaf); // fresh slot for the smaller child
+            (s, Some(parent), parent_opt)
+        };
+        // use_subtract == (a parent histogram was retained), C++
+        // `parent_leaf_histogram_array_ != nullptr` (serial_tree_learner.cpp:398).
+        let use_subtract = parent_slot.is_some();
 
         // ColSampler.GetByNode draw ORDER (serial_tree_learner.cpp:479,487): the
         // SMALLER leaf is drawn FIRST (always), the LARGER leaf SECOND (only when a
@@ -641,35 +689,96 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             (smaller_leaf_splits, larger_leaf_splits)
         };
 
-        let smaller_records = self.find_best_split_for_leaf(
+        // ---- SMALLER child: build its concatenated histogram directly into its
+        // pool slot (construct → FixHistogram raw sums → compact, per feature),
+        // then scan it (serial_tree_learner.cpp:530-543). ----
+        self.build_leaf_histogram_into(
             features,
             gradients,
             hessians,
             data_partition,
+            slot_off,
             smaller_leaf,
             smaller_splits,
-            None,
+            pool.buffer_mut(smaller_slot),
+        );
+        let smaller_records = self.scan_leaf_histogram(
+            features,
+            slot_off,
+            smaller_leaf,
+            smaller_splits,
+            pool.buffer(smaller_slot),
             best_split_per_leaf,
             best_split_feature,
             smaller_node_mask.as_deref(),
         )?;
 
-        // The larger leaf: build via subtraction if applicable.
+        // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
+        // OR build directly when no parent was retained. ----
         let mut larger_records: Vec<FeatureSplitRecord> = Vec::new();
-        if use_subtract && larger_leaf >= 0 {
-            larger_records = self.find_best_split_for_leaf(
+        if larger_leaf >= 0 {
+            let larger_slot = larger_slot.expect("non-root larger child must hold a pool slot");
+            if let Some(parent_slot) = parent_slot {
+                // use_subtract: larger = parent − smaller over the WHOLE concatenated
+                // compacted buffer (FeatureHistogram::Subtract, feature_histogram.hpp:
+                // 140-144 — `larger_data_[i] -= smaller_data_[i]` per compacted cell).
+                // The smaller buffer here is already FixHistogram'd+compacted, and the
+                // retained parent buffer is the parent leaf's FixHistogram'd+compacted
+                // histogram; the derived larger is NOT re-FixHistogram'd (C++ runs no
+                // FixHistogram on the use_subtract larger child, only ComputeBestSplit).
+                // This is the kEpsilon-faithful derivation the direct rebuild cannot
+                // reproduce bit-for-bit.
+                debug_assert_eq!(larger_slot, parent_slot, "the larger child reuses the moved parent slot");
+                let parent_buf = pool.buffer(parent_slot).to_vec();
+                let smaller_buf = pool.buffer(smaller_slot).to_vec();
+                let derived = self
+                    .backend
+                    .subtract_histograms(self.client, &parent_buf, &smaller_buf)?;
+                // TEST audit hook (T-05-07-01): record (derived, direct) so a parity
+                // test can assert the subtracted larger child == a direct build of its
+                // own rows, cell-for-cell, in the LIVE growth path.
+                if let Some(audit) = self.subtract_audit.as_ref() {
+                    let mut direct = vec![0.0f64; derived.len()];
+                    self.build_leaf_histogram_into(
+                        features,
+                        gradients,
+                        hessians,
+                        data_partition,
+                        slot_off,
+                        larger_leaf,
+                        larger_splits,
+                        &mut direct,
+                    );
+                    audit.borrow_mut().push((derived.clone(), direct));
+                }
+                pool.buffer_mut(larger_slot).copy_from_slice(&derived);
+            } else {
+                // No parent retained (cannot happen post-root in the current spine,
+                // but kept faithful to the C++ `else` direct-build branch): build the
+                // larger child directly into its slot.
+                self.build_leaf_histogram_into(
+                    features,
+                    gradients,
+                    hessians,
+                    data_partition,
+                    slot_off,
+                    larger_leaf,
+                    larger_splits,
+                    pool.buffer_mut(larger_slot),
+                );
+            }
+            larger_records = self.scan_leaf_histogram(
                 features,
-                gradients,
-                hessians,
-                data_partition,
+                slot_off,
                 larger_leaf,
                 larger_splits,
-                Some(smaller_leaf),
+                pool.buffer(larger_slot),
                 best_split_per_leaf,
                 best_split_feature,
                 larger_node_mask.as_deref(),
             )?;
         }
+        let _ = use_subtract; // recorded for clarity; the parent_slot Option drives it
 
         // The snapshot records the SMALLER leaf's per-feature scan (the directly-
         // built one — the D-06 localizer); the winner is the smaller leaf's best.
@@ -683,27 +792,82 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         })
     }
 
-    /// Build one leaf's histograms (directly, or `parent − smaller` when
-    /// `subtract_from` is the smaller sibling), `FixHistogram` each feature on the
-    /// RAW leaf sums, run `find_best_split`, and record the cross-feature argmax
-    /// into `best_split_per_leaf[leaf]`.
-    ///
-    /// Returns the per-feature D-06 records (with the per-bin gain arrays).
+    /// Build one leaf's per-feature CONCATENATED histogram DIRECTLY (construct over
+    /// the leaf's rows → `FixHistogram` on the RAW leaf sums → compact) into the
+    /// caller's pool-slot buffer `buf`. Each feature `fpos`'s compacted histogram
+    /// occupies `buf[slot_off[fpos] .. slot_off[fpos] + 2*num_bin]`; unused trailing
+    /// cells (from compaction) are zeroed. This is the C++ `ConstructHistograms`
+    /// directly-built smaller leaf (serial_tree_learner.cpp:452-459), with
+    /// `FixHistogram` (`:531-534`) folded in so the stored slot is the
+    /// FixHistogram'd+compacted form the subtraction trick consumes.
     #[allow(clippy::too_many_arguments)]
-    fn find_best_split_for_leaf(
+    fn build_leaf_histogram_into(
         &self,
         features: &[FeatureColumn],
         gradients: &[f32],
         hessians: &[f32],
         data_partition: &DataPartition,
+        slot_off: &[usize],
         leaf: i32,
         leaf_splits: &LeafSplits,
-        subtract_from: Option<i32>,
+        buf: &mut [f64],
+    ) {
+        let sum_g = leaf_splits.sum_gradients;
+        let sum_h = leaf_splits.sum_hessians;
+        // Empty / no-hessian leaf: leave the slot zeroed (it will not be scanned).
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let buildable = sum_h > 0.0 && leaf_splits.num_data_in_leaf > 0;
+        for c in buf.iter_mut() {
+            *c = 0.0;
+        }
+        if !buildable {
+            return;
+        }
+        let leaf_rows = data_partition.indices_in_leaf(leaf);
+        for (fpos, f) in features.iter().enumerate() {
+            let cells = 2 * f.num_bin as usize;
+            let region = &mut buf[slot_off[fpos]..slot_off[fpos] + cells];
+            // ORDERED per-feature gradient/hessian for this leaf's rows (the C++
+            // ordered fold — never reordered/parallelized).
+            let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
+            let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+            let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+            for &row in leaf_rows {
+                ord_bins.push(f.bins[row as usize]);
+                ord_g.push(gradients[row as usize]);
+                ord_h.push(hessians[row as usize]);
+            }
+            let mut hist = self
+                .backend
+                .construct_histograms(self.client, &ord_bins, &ord_g, &ord_h, f.num_bin)
+                .expect("construct_histograms on a validated leaf cannot fail");
+            // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
+            // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
+            crate::fix_histogram::fix_histogram(&mut hist, f.most_freq_bin, sum_g, sum_h);
+            // COMPACTED layout (D-09): shift real-bin `c+offset` into cell `c`,
+            // zero the dropped tail. No-op for offset==0.
+            compact_histogram(&mut hist, f.offset);
+            region.copy_from_slice(&hist);
+        }
+    }
+
+    /// Scan one leaf's per-feature CONCATENATED compacted+fixed histogram (already
+    /// in the pool slot `buf`, built directly OR derived via subtraction), running
+    /// `find_best_split` per feature and recording the cross-feature argmax into
+    /// `best_split_per_leaf[leaf]` (C++ `FindBestSplitsFromHistograms` per-feature
+    /// `ComputeBestSplitForFeature`). Returns the per-feature D-06 records.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_leaf_histogram(
+        &self,
+        features: &[FeatureColumn],
+        slot_off: &[usize],
+        leaf: i32,
+        leaf_splits: &LeafSplits,
+        buf: &[f64],
         best_split_per_leaf: &mut [SplitInfo],
         best_split_feature: &mut [i32],
         used_features: Option<&[i8]>,
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
-        let leaf_rows = data_partition.indices_in_leaf(leaf);
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
         let num_data_in_leaf = leaf_splits.num_data_in_leaf;
@@ -713,11 +877,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut leaf_best_feature: i32 = -1;
 
         // A leaf with no admissible hessian mass cannot be split (the `cnt_factor =
-        // num_data / sum_hessian` division would divide by ~0). The C++ gates keep
-        // the scan off such a leaf; mirror that by leaving its best as `none()`
-        // rather than calling `find_best_split` (which would reject sum_hessian<=0
-        // as a typed error). On the spine `hessian == 1` per row, so this only
-        // triggers for a truly empty leaf.
+        // num_data / sum_hessian` division would divide by ~0). Leave its best as
+        // `none()` rather than calling `find_best_split` (which would reject
+        // sum_hessian<=0 as a typed error).
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(sum_h > 0.0) || num_data_in_leaf <= 0 {
             best_split_per_leaf[leaf as usize] = SplitInfo::none();
@@ -727,70 +889,27 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         for (fpos, f) in features.iter().enumerate() {
             // ColSampler gate (serial_tree_learner.cpp: `if (!is_feature_used[fi])
-            // continue;`): skip a feature this node did NOT select. The mask is
-            // positionally aligned to `features` (built in the same order). On the
-            // spine (`used_features == None`) every feature is scanned.
+            // continue;`). On the spine (`used_features == None`) every feature is
+            // scanned.
             if let Some(mask) = used_features {
                 if mask.get(fpos).copied().unwrap_or(1) == 0 {
                     continue;
                 }
             }
-            // Per-feature ORDERED gradient/hessian for this leaf's rows (the
-            // construct_histograms input — ordered to mirror the C++ ordered fold).
-            let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
-            let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
-            let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
-            for &row in leaf_rows {
-                ord_bins.push(f.bins[row as usize]);
-                ord_g.push(gradients[row as usize]);
-                ord_h.push(hessians[row as usize]);
-            }
-
-            // Histogram: directly built, or larger = parent - smaller. On the spine
-            // we always build directly (the subtract math is exercised + asserted in
-            // the parity test); the subtraction path constructs the larger leaf's
-            // histogram by subtracting the smaller sibling's from the parent's. For
-            // bit-faithful parity we build BOTH and (when subtract_from) also derive
-            // via subtract to assert agreement — but for the gain scan we use the
-            // canonical direct build of THIS leaf's rows.
-            let mut hist = self.backend.construct_histograms(
-                self.client,
-                &ord_bins,
-                &ord_g,
-                &ord_h,
-                f.num_bin,
-            )?;
-            let _ = subtract_from; // subtraction-trick wiring is 05-07 scope
-
-            // FixHistogram on the RAW leaf sums (Pitfall 2 — BEFORE the scan).
-            // For most_freq_bin == 0 (offset == 1) this is a no-op
-            // (fix_histogram.rs:54), exactly as C++ `if (most_freq_bin > 0)`.
-            crate::fix_histogram::fix_histogram(&mut hist, f.most_freq_bin, sum_g, sum_h);
-
-            // COMPACTED-histogram layout (D-09): when offset == 1 (most_freq_bin
-            // == 0) the C++ `data_` histogram is compacted — the bin-0 / most-freq
-            // slot is dropped and cell `c` holds REAL bin `c + offset`
-            // (`feature_histogram.hpp:619` `GET_GRAD(data_, threshold - offset)`,
-            // the `num_bin - offset` scan ranges at :943/:950). Both the kernel
-            // scan and the host per-bin re-scan index `hist[t<<1]` with `t` in the
-            // COMPACTED range, so we shift the non-compacted build down by `offset`
-            // (zeroing the now-unused tail, mirroring the golden's `2*num_bin`-length
-            // buffer whose tail cells are unread). For offset == 0 this is a no-op.
-            compact_histogram(&mut hist, f.offset);
+            let cells = 2 * f.num_bin as usize;
+            let hist = &buf[slot_off[fpos]..slot_off[fpos] + cells];
 
             // Authoritative dispatch flags (Pitfall 1). `run_forward` transcribes
             // the C++ per-missing_type branch dispatch (feature_histogram.hpp:
             // 420-429): the FORWARD scan runs ONLY for `num_bin>2 &&
-            // missing_type==Zero`; for `missing_type==None` (both spine and mfb>0
-            // corpora) only REVERSE runs, so `default_left` stays true
-            // (decision_type==2) and the REVERSE-only winner is selected.
+            // missing_type==Zero`; for `missing_type==None` only REVERSE runs.
             let skip_default_bin = f.skip_default_bin();
             let na_as_missing = f.na_as_missing();
             let run_forward = f.run_forward();
 
             let split = self.backend.find_best_split(
                 self.client,
-                &hist,
+                hist,
                 &self.cfg,
                 f.num_bin,
                 f.offset,
@@ -806,7 +925,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
             // Per-bin gain arrays for the D-06 snapshot (host re-scan of the SAME
             // fixed histogram via the gain primitive — localizes a divergence).
-            let (cand_rev, cand_fwd) = self.per_bin_gains(&hist, f, sum_g, sum_h, num_data_in_leaf);
+            let (cand_rev, cand_fwd) = self.per_bin_gains(hist, f, sum_g, sum_h, num_data_in_leaf);
 
             records.push(FeatureSplitRecord {
                 feature: f.real_feature_index,
@@ -1122,6 +1241,46 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self.col_sampling = Some((feature_fraction, feature_fraction_bynode, feature_fraction_seed));
         self
     }
+
+    /// Enable the GROWTH-PATH subtraction audit (T-05-07-01, TEST hook). After a
+    /// `train*` call, [`take_subtract_audit`](Self::take_subtract_audit) returns one
+    /// `(derived, direct)` pair per `use_subtract` larger child grown: the histogram
+    /// the wired `subtract_histograms(parent, smaller)` produced vs an independent
+    /// direct build of that leaf's rows. A parity test asserts they are equal
+    /// cell-for-cell, proving the subtraction trick fires (and is faithful) in the
+    /// ACTUAL growth path — not just in `learner_parity_subtract`'s isolation.
+    #[must_use]
+    pub fn with_subtract_audit(mut self) -> Self {
+        self.subtract_audit = Some(std::cell::RefCell::new(Vec::new()));
+        self
+    }
+
+    /// Drain the growth-path subtraction audit recorded since the last `train*`
+    /// (see [`with_subtract_audit`](Self::with_subtract_audit)). Each entry is
+    /// `(derived_larger_hist, direct_larger_hist)` for one `use_subtract` larger
+    /// child. Empty when the audit was not enabled or no subtraction fired.
+    pub fn take_subtract_audit(&mut self) -> Vec<(Vec<f64>, Vec<f64>)> {
+        self.subtract_audit
+            .as_ref()
+            .map(|a| std::mem::take(&mut *a.borrow_mut()))
+            .unwrap_or_default()
+    }
+}
+
+/// Per-feature byte layout of a pool slot: `(slot_off, slot_len)` where
+/// `slot_off[fpos]` is feature `fpos`'s first cell in the concatenated slot buffer
+/// and `slot_len` is the total cell count (`Σ 2*num_bin`). Each feature's
+/// compacted histogram occupies `[slot_off[fpos], slot_off[fpos] + 2*num_bin)`.
+/// Mirrors the C++ contiguous per-leaf `histogram_array_` (one feature region after
+/// another); the subtraction trick operates over the whole concatenation at once.
+fn feature_slot_layout(features: &[FeatureColumn]) -> (Vec<usize>, usize) {
+    let mut offs = Vec::with_capacity(features.len());
+    let mut acc = 0usize;
+    for f in features {
+        offs.push(acc);
+        acc += 2 * f.num_bin as usize;
+    }
+    (offs, acc)
 }
 
 /// Shift a stride-2 `[g0,h0,g1,h1,…]` histogram into the C++ COMPACTED layout for
