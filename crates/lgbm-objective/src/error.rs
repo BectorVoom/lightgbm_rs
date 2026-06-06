@@ -44,6 +44,18 @@ pub enum ObjectiveError {
         /// The exclusive upper bound (number of classes).
         num_class: i32,
     },
+
+    /// The requested objective name is not supported in the current scope.
+    ///
+    /// Mirrors the C++ `ObjectiveFunction::CreateObjectiveFunction` `Log::Fatal`
+    /// "Unknown objective type" site — surfaced as a typed error rather than an
+    /// abort. 06-02 supports only the regression L2/sqrt family; later waves add
+    /// the remaining core objectives.
+    #[error("unsupported objective: `{name}`")]
+    Unsupported {
+        /// The unrecognized / out-of-scope objective name.
+        name: String,
+    },
 }
 
 #[cfg(test)]

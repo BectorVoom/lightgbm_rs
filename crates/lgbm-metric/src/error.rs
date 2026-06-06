@@ -30,6 +30,17 @@ pub enum MetricError {
         /// The actual length supplied.
         actual: usize,
     },
+
+    /// The requested metric name is not supported in the current scope.
+    ///
+    /// Mirrors the C++ `Metric::CreateMetric` "Unknown metric type" `Log::Fatal`
+    /// site — surfaced as a typed error. 06-02 supports `l2`/`rmse`/`l1`; binary /
+    /// multiclass / AUC metrics land in 06-04+.
+    #[error("unsupported metric: `{name}`")]
+    Unsupported {
+        /// The unrecognized / out-of-scope metric name.
+        name: String,
+    },
 }
 
 #[cfg(test)]

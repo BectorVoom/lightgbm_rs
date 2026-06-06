@@ -19,5 +19,7 @@
 //! binary_logloss/binary_error/AUC/multi_logloss) land in 06-04+.
 
 pub mod error;
+pub mod regression;
 
 pub use error::MetricError;
+pub use regression::Metric;

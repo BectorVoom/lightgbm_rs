@@ -20,5 +20,12 @@
 //! 06-02 (L2 spine) and 06-03+ (regression_l1 / binary / multiclass / custom).
 
 pub mod error;
+pub mod regression;
 
 pub use error::ObjectiveError;
+pub use regression::Objective;
+
+// Re-export the predict-side transform so downstream callers (metric / boosting /
+// facade) have a single objective import surface. The canonical owner remains
+// `lgbm-model` (Open-Q1); this is a re-export, NOT a re-port.
+pub use lgbm_model::ObjectiveKind;
