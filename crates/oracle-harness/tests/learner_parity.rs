@@ -1306,3 +1306,118 @@ fn learner_parity_mfb_pos_real_binary() {
     assert_real_tree_parity("mfb_pos_real", &tree, &golden, 0.1);
 }
 
+/// TASK-1 SCRATCH INSTRUMENTATION (05-09) — localize the single 2-ULP origin in
+/// the FixHistogram-active DIRECT histogram build that produces node-2 leaf-0's
+/// `best_sum_left_hessian = 2.000000000000001` (Rust) vs the golden-decoded
+/// `2.0000000000000013`. This test does NOT change behavior; it reproduces the
+/// node-2 (default-bin split) leaf chain step-by-step at full f64 precision and
+/// compares each step to the C++-order fold. REMOVED in Task 2.
+///
+/// Node-2 of the mfb>0 tree contains the 4 root-left rows (bins {0,1}, the root
+/// split at threshold 1.5 sends bins ≤ 1 left): rows {0,1,10,11} with
+/// bins {0,1,1,0} and grad {-6,-3,-3,-6}, hess all 1.0. most_freq_bin == 2,
+/// num_bin == 4, offset == 0. The split that produces leaf-0 (bin 0 left) is the
+/// REVERSE-scan candidate at t == 1 (threshold = t-1+offset = 0 — the zero
+/// sentinel). `best_sum_left_hessian = sum_hessian_bumped − sum_right_hessian`.
+#[test]
+#[ignore = "05-09 Task-1 scratch instrumentation: prints the f64 fold trace to \
+            localize the node-2 leaf-0 2-ULP origin. Removed in Task 2."]
+fn scratch_05_09_localize_mfb_node2_leaf0() {
+    let backend = CpuBackend;
+    let client = cpu_client();
+
+    // Node-2's rows (root-left, bins ≤ 1): bins {0,1,1,0}, grad {-6,-3,-3,-6}.
+    // Ordered exactly as the data_partition would hand them to the direct build
+    // (ascending original row index 0,1,10,11).
+    let node2_bins: Vec<u32> = vec![0, 1, 1, 0];
+    let node2_grad: Vec<f32> = vec![-6.0, -3.0, -3.0, -6.0];
+    let node2_hess: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+    let num_bin: u32 = 4;
+    let most_freq_bin: u32 = 2;
+
+    // Raw leaf totals fed to FixHistogram (Pitfall 2: un-bumped).
+    let sum_g_raw: f64 = node2_grad.iter().map(|&x| f64::from(x)).sum();
+    let sum_h_raw: f64 = node2_hess.iter().map(|&x| f64::from(x)).sum();
+
+    // (a) raw per-bin cells out of construct_histograms (BEFORE FixHistogram).
+    let mut hist = backend
+        .construct_histograms(&client, &node2_bins, &node2_grad, &node2_hess, num_bin)
+        .expect("construct ok");
+    eprintln!("=== 05-09 Task-1 node-2 leaf-0 localization ===");
+    eprintln!("sum_g_raw={sum_g_raw:.17e} bits={:#018x}", sum_g_raw.to_bits());
+    eprintln!("sum_h_raw={sum_h_raw:.17e} bits={:#018x}", sum_h_raw.to_bits());
+    for b in 0..num_bin as usize {
+        eprintln!(
+            "(a) construct bin{b}: g={:.17e} (bits {:#018x})  h={:.17e} (bits {:#018x})",
+            hist[b * 2],
+            hist[b * 2].to_bits(),
+            hist[b * 2 + 1],
+            hist[b * 2 + 1].to_bits()
+        );
+    }
+
+    // (b) most_freq_bin cell AFTER fix_histogram (Rust order).
+    lgbm_treelearner::fix_histogram(&mut hist, most_freq_bin, sum_g_raw, sum_h_raw);
+    let mfb = most_freq_bin as usize;
+    eprintln!(
+        "(b) fix_histogram mfb(bin{mfb}) RUST: g={:.17e} (bits {:#018x})  h={:.17e} (bits {:#018x})",
+        hist[mfb * 2],
+        hist[mfb * 2].to_bits(),
+        hist[mfb * 2 + 1],
+        hist[mfb * 2 + 1].to_bits()
+    );
+
+    // C++-order FixHistogram fold (dataset.cpp:1488-1506) recomputed by hand for
+    // the hessian: seed = sum_h_raw, then subtract bins 0,1,3 ascending.
+    {
+        let raw0_h = 1.0f64 + 1.0; // bin0 = rows 0,11
+        let raw1_h = 1.0f64 + 1.0; // bin1 = rows 1,10
+        let raw3_h = 0.0f64; // bin3 empty
+        let mut h_cpp = sum_h_raw;
+        for &(_, cell) in [(0usize, raw0_h), (1, raw1_h), (3, raw3_h)].iter() {
+            h_cpp -= cell;
+        }
+        eprintln!(
+            "(b') fix_histogram mfb hess C++-order = {:.17e} (bits {:#018x})",
+            h_cpp,
+            h_cpp.to_bits()
+        );
+    }
+
+    // (c) REVERSE-scan sum_right_hessian running total + best_sum_left_hessian.
+    let eps = f64::from(lgbm_core::types::K_EPSILON);
+    let sum_h_bumped = sum_h_raw + 2.0 * eps;
+    eprintln!(
+        "sum_h_bumped={:.17e} (bits {:#018x})",
+        sum_h_bumped,
+        sum_h_bumped.to_bits()
+    );
+    let get_hess = |t: i32| hist[((t as usize) << 1) + 1];
+    let offset = 0i32;
+    let t_start = num_bin as i32 - 1 - offset; // 3
+    let t_end = 1 - offset; // 1
+    let mut sum_right_hessian = eps;
+    let mut t = t_start;
+    while t >= t_end {
+        let h = get_hess(t);
+        sum_right_hessian += h;
+        let sum_left_hessian = sum_h_bumped - sum_right_hessian;
+        eprintln!(
+            "(c) t={t}: +h={h:.17e} -> sum_right_h={:.17e} (bits {:#018x})  sum_left_h={:.17e} (bits {:#018x})",
+            sum_right_hessian,
+            sum_right_hessian.to_bits(),
+            sum_left_hessian,
+            sum_left_hessian.to_bits()
+        );
+        t -= 1;
+    }
+    // The winning leaf-0 split is at t==1 (threshold 0). best_sum_left_hessian is
+    // the sum_left_hessian at that iteration.
+    let golden_target = 2.0000000000000013f64;
+    eprintln!(
+        "GOLDEN-DECODED best_sum_left_hessian = {:.17e} (bits {:#018x})",
+        golden_target,
+        golden_target.to_bits()
+    );
+}
+
