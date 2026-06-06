@@ -28,3 +28,11 @@ lgbm-dataset = { path = "../lgbm-dataset" }
 # shared lgbm-model %.17g formatter (D-07).
 lgbm-model = { path = "../lgbm-model" }
 lgbm-treelearner = { path = "../lgbm-treelearner" }
+# Test-only: the boosting-parity replay (Phase 6) drives the GBDT spine + the
+# objective/metric layers against the committed boosting goldens. Pulled in only
+# under `[dev-dependencies]` so the LIBRARY crate stays free of any GPU compute
+# runtime (CMP-01) — same isolation idiom as the cubecl/treelearner dev-deps.
+lgbm-objective = { path = "../lgbm-objective" }
+lgbm-metric = { path = "../lgbm-metric" }
+lgbm-boosting = { path = "../lgbm-boosting" }
+lgbm = { path = "../lgbm" }

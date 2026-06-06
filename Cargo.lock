@@ -2230,10 +2230,14 @@ name = "oracle-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lgbm",
+ "lgbm-boosting",
  "lgbm-compute",
  "lgbm-core",
  "lgbm-dataset",
+ "lgbm-metric",
  "lgbm-model",
+ "lgbm-objective",
  "lgbm-treelearner",
 ]
 

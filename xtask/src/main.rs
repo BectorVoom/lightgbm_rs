@@ -100,18 +100,19 @@ fn main() -> Result<()> {
         Some("kernel-capture") => kernel_capture(),
         Some("learner-capture") => learner_capture(),
         Some("learner-oracle-capture") => learner_oracle_capture(),
+        Some("boosting-oracle-capture") => boosting_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
-                 learner-capture | learner-oracle-capture)"
+                 learner-capture | learner-oracle-capture | boosting-oracle-capture)"
             );
         }
         None => {
             eprintln!(
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
-                 learner-capture | learner-oracle-capture>"
+                 learner-capture | learner-oracle-capture | boosting-oracle-capture>"
             );
             Ok(())
         }
@@ -812,6 +813,26 @@ fn learner_oracle_capture() -> Result<()> {
         "Re-run `cargo run -p xtask -- learner-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/learner/` \
          is empty (byte-idempotent real-binary dump)."
+    );
+    Ok(())
+}
+
+/// `boosting-oracle-capture` — Phase-6 GBDT-spine / objective / metric golden
+/// capture (STUB).
+///
+/// Wave-0 (06-01) stub: the real body — a real-binary `lightgbm==4.6.0` capture
+/// emitting the L1–L5 boosting goldens under
+/// `crates/oracle-harness/tests/fixtures/boosting/` (version-asserted, idempotent,
+/// NEVER `git add LightGBM/`) — fills in across 06-02..06-05, modeled on
+/// [`learner_oracle_capture`] + `xtask/py/learner_oracle_capture.py`. Until then
+/// this prints a not-yet-implemented notice and exits 0 so the subcommand is
+/// wired and discoverable.
+fn boosting_oracle_capture() -> Result<()> {
+    eprintln!(
+        "xtask boosting-oracle-capture: not yet implemented — wave 2+ (06-02..06-05). \
+         The real capture will emit the L1-L5 boosting goldens under \
+         crates/oracle-harness/tests/fixtures/boosting/ from a version-asserted \
+         lightgbm==4.6.0 wheel (modeled on learner-oracle-capture)."
     );
     Ok(())
 }
