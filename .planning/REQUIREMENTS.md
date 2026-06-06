@@ -34,13 +34,13 @@
 
 ### Tree Learner
 
-- [x] **TRL-01**: Histogram-based serial tree learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`) — _reopened: gaps_found (subtraction orchestration dead, WR-02); closing in 05-05/05-07_
+- [x] **TRL-01**: Histogram-based serial tree learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`) — _CR-03 CLOSED (05-08): bit-exact vs real lib_lightgbm 4.6 spine golden; subtraction-trick wiring remains 05-07 (WR-02)_
 - [ ] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against — _reopened: gaps_found (dead in growth path, WR-01/02); closing in 05-07_
 - [x] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
 - [x] **TRL-04**: Split-gain scan with exact gain formula and tie-breaking (`lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`)
-- [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing — _reopened: gaps_found BLOCKED (CR-01 partition/threshold off-by-one; CR-02 offset==1 uncovered); closing in 05-05/05-06_
+- [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing — _CR-03 CLOSED (05-08): spine bit-exact + mfb>0 zero-sentinel default-bin split bit-exact (threshold 1.0000000180025095e-35, decision_type=2) vs real lib_lightgbm 4.6_
 - [ ] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
-- [x] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction — _reopened: gaps_found BLOCKED (CR-01 partition does not route as the serialized tree predicts); closing in 05-05_
+- [x] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction — _CR-03 CLOSED (05-08): leaf_count/topology bit-exact vs real lib_lightgbm 4.6 (spine + mfb>0, no 0-row leaf); routing self-consistency (CR-01) holds_
 - [x] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
 - [x] **TRL-09**: `force_row_wise` / `force_col_wise` histogram build strategies, both output-matching
 
@@ -174,12 +174,12 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | CMP-04 | Phase 4 | Complete (04-01 gate + 04-04 exercised on real hip matrix) |
 | CMP-05 | Phase 4 | Complete (04-02/03 cpu bit-exact + 04-04 hip f32 within ~1e-6; gap in 04-ROCM-GAPS.md, D-03a) |
 | ORA-04 | Phase 4 | Complete (04-02/03 cpu hard gate + 04-04 separate ~1e-6 hip gate run on gfx1100; D-03a) |
-| TRL-01 | Phase 5 | In Progress (gap closure 05-05/05-07; WR-02) |
+| TRL-01 | Phase 5 | CR-03 closed (05-08, bit-exact vs real binary); subtraction-trick wiring → 05-07 (WR-02) |
 | TRL-02 | Phase 5 | In Progress (gap closure 05-07; WR-01/02) |
 | TRL-03 | Phase 5 | Complete |
 | TRL-04 | Phase 5 | Complete |
-| TRL-05 | Phase 5 | In Progress (gap closure 05-05/05-06; CR-01/CR-02) |
-| TRL-07 | Phase 5 | In Progress (gap closure 05-05; CR-01) |
+| TRL-05 | Phase 5 | Complete (05-08, CR-03 closed — spine + mfb>0 zero-sentinel bit-exact vs real binary) |
+| TRL-07 | Phase 5 | Complete (05-08, CR-03 closed — leaf_count/topology bit-exact, no 0-row leaf) |
 | TRL-08 | Phase 5 | Complete (05-04) |
 | TRL-09 | Phase 5 | Complete (05-04) |
 | BST-01 | Phase 6 | Pending |

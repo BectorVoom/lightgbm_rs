@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Planned 05-08 (CR-03 learner-fix) + re-sequenced 05-07 to wave 8; ready to execute wave 7"
-last_updated: "2026-06-06T00:00:00.000Z"
-last_activity: 2026-06-06 -- Phase 05: planned 05-08 (CR-03 fix, 0 blockers); 05-07 re-sequenced behind it
+stopped_at: "Completed 05-08-PLAN.md (CR-03 CLOSED: spine bit-exact; mfb>0 structural bit-exact, leaf-0 ULP deferred to 05-07)"
+last_updated: "2026-06-06T11:19:55.000Z"
+last_activity: 2026-06-06 -- Phase 05 wave 7: 05-08 CR-03 learner-fix COMPLETE; mfb>0 leaf-0 2.3e-16 ULP deferred to 05-07
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 25
-  completed_plans: 24
-  percent: 52
+  completed_plans: 25
+  percent: 55
 ---
 
 # Project State
@@ -25,12 +25,25 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 05 (tree-learner-split-finding) — EXECUTING (CR-03 fix planned)
-Plan: 6 of 8 closed (05-06 COMPLETE — real oracle, port FALSIFIED); 05-08 (CR-03 fix) PLANNED, wave 7; 05-07 re-sequenced to wave 8
-Status: Ready to execute wave 7 (05-08 CR-03 learner-fix), then wave 8 (05-07 subtraction-trick wiring)
-Last activity: 2026-06-06 -- planned 05-08 (CR-03 fix, plan-checker 0 blockers); 05-07 → wave 8
+Phase: 05 (tree-learner-split-finding) — EXECUTING (CR-03 CLOSED via 05-08)
+Plan: 7 of 8 closed (05-08 CR-03 learner-fix COMPLETE, wave 7); 05-07 (subtraction-trick wiring) is wave 8, now UNBLOCKED
+Status: Wave 7 complete; ready to execute wave 8 (05-07 subtraction-trick/HistogramPool wiring — also closes the mfb>0 leaf-0 ULP)
+Last activity: 2026-06-06 -- 05-08 closed CR-03: spine bit-exact, mfb>0 structural bit-exact; leaf-0 2.3e-16 ULP deferred to 05-07
 
-Progress: [█████████░] Phase 5 plans 05-01..05-06 COMPLETE — but 05-06's REAL lib_lightgbm 4.6 oracle FALSIFIED the port → BLOCKER CR-03. The Rust serial learner grows structurally wrong trees vs the real binary (wrong split points / mis-partitioned leaf_count / leaf outputs like -17.99 vs 0.55; on the most_freq_bin>0 corpus: a 0-row leaf [4,6,0,2], decision_type[0]=0≠2, and a missed zero-sentinel threshold 1.0000000180025095e-35 on the offset==1 default-bin split). CR-02 (real-oracle existence) is CLOSED; the two real-binary gates (learner_parity_{spine,mfb_pos}_real_binary) are committed #[ignore]d as live, un-weakened records. TRL-09/TRL-05/TRL-01 are NOT satisfied — deferred to CR-03 closure. 05-07 (wire subtraction-trick+pool) is BLOCKED because its "re-validate bit-exact against the real goldens" gate cannot pass until the learner matches the real oracle.
+Progress: [██████████] Phase 5 plans 05-01..05-06 + 05-08 COMPLETE — BLOCKER CR-03 CLOSED by 05-08. The Rust serial learner now grows trees BIT-EXACT to the real lib_lightgbm 4.6 spine golden (spine_real.txt) and STRUCTURALLY bit-exact to the mfb>0 golden (mfb_pos_real.txt) on every field (split_feature, threshold incl. the zero sentinel 1.0000000180025095e-35, decision_type=2 2 2, child topology, leaf_count with no 0-row leaf, internal_count) + 3/4 leaf values. The fix set (commit c564036): Fix B (PRIMARY) child LeafSplits direct pass-through (was swapping smaller/larger slots, feeding a child its sibling's sums → -17.99 vs 0.55); Fix A missing_type==None FORWARD-dispatch gate (decision_type 0→2); Fix C MaybeRoundToZero signed-zero normalize; Fix D bin-0 kZeroThreshold mapping. spine_real gate un-#[ignore]d + passing in the default suite; mfb_pos gate stays #[ignore]d (assertions UNCHANGED) with a narrowed reason — the ONLY residual is the node-2 default-bin leaf-0 value (Rust 0.59999999999999976 vs golden 0.59999999999999953, Δ 2.3e-16 = one f64 ULP), a kEpsilon cascade DEFERRED to 05-07's not-yet-wired subtraction-trick/HistogramPool (~4 orders of magnitude inside the ≤1e-12 contract; NO assertion weakened). Routing self-consistency (CR-01) still holds; kernel_parity stays 4/4. TRL-05/TRL-07/TRL-01/TRL-09 satisfied bit-exact on the spine vs the real binary. 05-07 (wave 8) is now UNBLOCKED — its subtraction-trick wiring also closes the mfb>0 leaf-0 ULP and un-#[ignore]s learner_parity_mfb_pos_real_binary.
+
+### Plan 05-08 result (CR-03 learner-fix — CR-03 CLOSED)
+
+Plan 05-08 closed BLOCKER CR-03 (the 05-06 real-oracle falsification). The Rust SerialTreeLearner now reproduces the real lib_lightgbm 4.6 goldens bit-exact on the spine and structurally bit-exact on mfb>0:
+
+- **PRIMARY root cause (Fix B) — child LeafSplits slot mapping:** `find_best_splits` mapped smaller/larger LeafSplits by `smaller_leaf == left_leaf`, SWAPPING the slots whenever the smaller child was the right leaf (incl. the equal-count tie) and feeding a child its sibling's sums (leaf 1 got leaf 0's −24 → spine leaf_value −17.99, wrong child splits/topology). Fixed to a DIRECT pass-through (smaller_leaf_splits always holds smaller_leaf), mirroring C++ smaller_leaf_splits_/larger_leaf_splits_ (serial_tree_learner.cpp:851). This makes the spine fully bit-exact. Task-1 had hypothesized the FORWARD gate as the single root cause; the slot swap was the dominant defect.
+- **Fix A — FORWARD-branch dispatch gate:** `run_forward` threaded learner.rs → Backend::find_best_split → find_best_split_cpu; FORWARD runs only for num_bin>2 && missing_type==Zero (feature_histogram.hpp:420-429). Fixes mfb decision_type[0] 0→2.
+- **Fix C — MaybeRoundToZero signed-zero normalize** in the shrinkage finalize (tree.h:191,255-260): −0.0 → +0. Fixes mfb leaf 1 −0 → 0.
+- **Fix D — bin-0 kZeroThreshold mapping:** real_upper_bounds_mfb maps bin 0 → (1e-35f32 as f64) == 1.0000000180025095e-35 (NOT the f64 literal). Fixes the mfb node-2 zero-sentinel threshold.
+- **Gates:** spine_real un-#[ignore]d and PASSES in the default `cargo test --workspace`; mfb_pos stays #[ignore]d with a NARROWED, honest reason (residual sub-ULP leaf-0 value → 05-07), assertions UNTOUCHED (T-05-08-02 upheld).
+- `cargo test --workspace` GREEN (learner_parity 10 passed / 1 ignored; kernel_parity 4/4). Routing self-consistency (CR-01) holds. `LightGBM/` never git-added. Commits: 061d791 (Task 1 localization), e582cf2 (Task-2 findings), c564036 (Task 2 fix + Task 3 gate adjustment).
+
+Next: `/gsd-execute-phase 5 --wave 8` runs 05-07 (wire subtraction-trick + HistogramPool into the live growth path) — which ALSO closes the mfb>0 leaf-0 2.3e-16 ULP and un-#[ignore]s learner_parity_mfb_pos_real_binary.
 
 ### Plan 05-06 result (gap closure — CR-02 closed; BLOCKER CR-03 raised)
 
@@ -201,6 +214,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 05 P02 | 8min | 3 tasks | 17 files |
 | Phase 05 P03 | 25min | 3 tasks | 14 files |
 | Phase 05 P05 | 13min | 3 tasks | 3 files |
+| Phase 05 P08 | closeout | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -245,6 +259,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 05]: 05-05: D-09 adopted end-to-end — offset_for_most_freq_bin (most_freq_bin==0 -> offset 1) is the SINGLE offset rule; offset==1 uses a COMPACTED histogram (compact_histogram: cell c = real bin c+offset). Supersedes D-01.
 - [Phase ?]: [Phase 05]: 05-05: CR-01 root cause = single-feature-group min_bin — C++ FeatureGroup::Split(num_feature_==1) dispatches to DenseBin::Split(max_bin,...) hard-coding min_bin=1; passing min_bin+offset collapses the verbatim --th to th=threshold so partition (bin>th right) == predict (bin<=threshold left). Raw min_bin=0 gave the [4,8] vs [6,6] off-by-one. Closed by the oracle-INDEPENDENT routing test (get_leaf tally == data_partition leaf_count).
 - [Phase ?]: [Phase 05]: 05-05: the pre-D-09 learner_capture.cpp full-tree/per-bin goldens (spine/col_wise/real_gh) share the buggy convention (CR-02) so their assertions are SUPERSEDED by 05-06's real lib_lightgbm oracle; row==col equality + routing self-consistency stay live.
+- [Phase 05]: 05-08: CR-03 CLOSED — the Rust learner is bit-exact to the real lib_lightgbm 4.6 spine golden and structurally bit-exact to the mfb>0 golden. PRIMARY root cause was the child LeafSplits slot mapping (Fix B: a DIRECT pass-through mirroring C++ smaller_leaf_splits_/larger_leaf_splits_, NOT keyed off smaller==left — the prior swap fed a child its sibling's sums, −17.99 vs 0.55), not the FORWARD-dispatch gate (Fix A, which only fixed decision_type). Plus Fix C (MaybeRoundToZero −0.0→+0 in the shrinkage finalize) and Fix D (bin-0 → float32 kZeroThreshold 1.0000000180025095e-35).
+- [Phase 05]: 05-08: the mfb>0 node-2 leaf-0 residual (Rust 0.59999999999999976 vs golden 0.59999999999999953, Δ 2.3e-16 = one f64 ULP) is DEFERRED to 05-07 (user decision). It is a kEpsilon cascade from the not-yet-wired subtraction-trick/HistogramPool (05-07's explicit scope), ~4 orders of magnitude inside the ≤1e-12 contract. The mfb_pos gate stays #[ignore]d with a narrowed honest reason; NO assertion weakened, tolerance-wrapped, or deleted.
 
 ### Pending Todos
 
@@ -268,6 +284,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-06T02:49:25.485Z
-Stopped at: Completed 05-04-PLAN.md
+Last session: 2026-06-06T11:19:55.000Z
+Stopped at: Completed 05-08-PLAN.md (CR-03 CLOSED; mfb>0 leaf-0 ULP deferred to 05-07)
 Resume file: None
