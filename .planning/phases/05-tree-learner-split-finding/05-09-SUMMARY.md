@@ -2,138 +2,134 @@
 phase: 05-tree-learner-split-finding
 plan: 09
 subsystem: tree-learner
-tags: [tree-learner, fix-histogram, leaf-splits, fold-order, oracle-parity, lightgbm-4.6, kEpsilon, numerical-fidelity, checkpoint-decision]
+tags: [tree-learner, leaf-splits, fix-histogram, oracle-parity, lightgbm-4.6, kEpsilon, most-freq-bin, sparse-collapse, numerical-fidelity, fp-execution-trace]
 
 # Dependency graph
 requires:
   - phase: 05-07
-    provides: "subtraction-trick + HistogramPool wired live; mfb>0 leaf-0 ULP re-attributed to FixHistogram-active direct-build f64 fold (and SplitInfo-seed proven to regress leaf 3)"
+    provides: "subtraction-trick + HistogramPool wired live; mfb>0 leaf-0 ULP isolated to the FixHistogram-active direct build"
   - phase: 05-08
-    provides: "CR-03 closed — serial learner bit-exact to real lib_lightgbm 4.6 spine + structurally bit-exact mfb>0; the corrected child LeafSplits pass-through"
+    provides: "CR-03 closed for spine; child LeafSplits pass-through (smaller/larger slot mapping)"
 provides:
-  - "DECISIVE LOCALIZATION of the mfb>0 node-2 leaf-0 2-ULP residual: it is the interplay between node-2's leaf-total sum_hessian SEED and the FixHistogram bin-2 reconstruction that consumes that same seed — NOT construct fold order, NOT FixHistogram loop order, NOT reverse-scan accumulation order (all three proven bit-exact / order-independent)"
-  - "PROOF that every faithful transcription of the C++ chain (fresh-fold seed, SplitInfo-reported seed per serial_tree_learner.cpp:875-879, and subtraction-trick-derived bins) reproduces Rust's CURRENT 2.0000000000000009 — none reaches the golden-required 2.0000000000000018"
-  - "checkpoint:decision raised: bit-exact is not reachable by any analytically-faithful fold-order alignment of the three named hot-path files; the user must decide (accept the 2.3e-16 residual / authorize a real-binary FP execution trace / authorize a deeper output-path investigation)"
+  - "GROUND-TRUTH attribution of the mfb>0 node-2 leaf-0 2-ULP residual via a REAL lib_lightgbm 4.6 CPU-only single-thread FP execution trace: the corpus is SPARSE so the real binary collapses most_freq_bin_ = default_bin_ = ValueToBin(0) = 0 (bin.cpp:491-499) and runs the offset==1 path — the harness mislabeled it most_freq_bin=2/offset=0, which spuriously activated FixHistogram and polluted the REVERSE scan"
+  - "C++-faithful child LeafSplits seeding: children are seeded DIRECTLY from the parent split's SplitInfo (best_split_info.left/right_sum_hessian carrying the parent's kEpsilon provenance), NOT a re-fold over the child's rows (serial_tree_learner.cpp:851-871)"
+  - "learner_parity_mfb_pos_real_binary un-#[ignore]d and PASSING bit-exact (%.17g) in the default cargo test --workspace suite — the keystone serial learner is now bit-exact vs real lib_lightgbm 4.6 on BOTH committed corpora"
 affects: [05, 06]
 
 # Tech tracking
 tech-stack:
   added: []
   patterns:
-    - "Localization-before-edit gate (plan Task-1 acceptance): a 2-ULP residual is pinned to ONE decisive step via a full-precision construct→FixHistogram→reverse-scan→output trace with .to_bits() at every node BEFORE any behavior change"
+    - "Ground-truth FP-trace attribution: build the real reference binary CPU-only single-thread, instrument the exact hot path with .to_bits() dumps gated on the node signature, and read the genuine operand provenance instead of hypothesizing fold orders"
+    - "LeafSplits child seed from parent SplitInfo (init_from_split) — the kEpsilon provenance chain (best_sum_left_hessian - kEpsilon -> child sum_hessian -> +2*kEpsilon bump) must be preserved, not re-folded"
 
 key-files:
   created:
     - .planning/phases/05-tree-learner-split-finding/05-09-SUMMARY.md
   modified:
+    - crates/lgbm-treelearner/src/leaf_splits.rs
+    - crates/lgbm-treelearner/src/learner.rs
     - crates/oracle-harness/tests/learner_parity.rs
 
 key-decisions:
-  - "The mfb>0 node-2 leaf-0 residual is a 2-ULP (golden best_sum_left_hessian 2.0000000000000018 / 0x4000000000000004 vs Rust 2.0000000000000009 / 0x4000000000000002) difference in the leaf-output DENOMINATOR. The plan's prior decode (2.0000000000000013) was approximate; the exact golden-required value, back-solved from the bit-exact leaf_value 0.59999999999999953 and the integer numerator 12.0, is 2.0000000000000018."
-  - "The 2-ULP origin is NOT in the construct fold (node-2's bin cells are 2-element integer sums — order-independent), NOT in the FixHistogram subtract-loop order, and NOT in the reverse-scan accumulation order. It is the leaf-total sum_hessian SEED that simultaneously (a) seeds FixHistogram's bin-2 reconstruction and (b) is bumped to feed the scan."
-  - "Every FAITHFUL C++ transcription tested analytically (5+ probes) yields Rust's current 2.0000000000000009: fresh-fold seed (4.0 exact), SplitInfo-reported seed (4.0000000000000009 per serial_tree_learner.cpp:875-879, with FixHistogram bin-2 = seed-2-2 = 8.88e-16), and subtraction-trick-derived node-2 bins. The golden 2.0000000000000018 is only reachable by a NON-faithful hybrid (SplitInfo-seed scan with a FRESH-fold FixHistogram), which no single-seed C++ path produces."
-  - "Per <critical_context> + plan Task-2: STOP and raise checkpoint:decision rather than (a) introduce any tolerance, (b) re-attempt the LeafSplits-SplitInfo seeding that 05-07 proved regresses leaf 3, or (c) ship a coincidental ULP flip. The mfb gate stays #[ignore]d with its assertions UNCHANGED."
+  - "The real lib_lightgbm 4.6 uses most_freq_bin=0, default_bin=0, missing_type=None, offset=1 for the mfb_pos corpus (FP trace [GSD-META]). Although raw value 2 is the modal RAW value, the feature is sparse (rate 0.1667 > kSparseThreshold) so BinMapper collapses most_freq_bin_ = default_bin_ = ValueToBin(0) = 0 (bin.cpp:491-499). The harness's most_freq_bin=2/offset=0 was WRONG and was the dominant cause of the 2-ULP leaf-0 residual: it spuriously activated FixHistogram on node-2's direct build, reconstructing a ~1e-15 bin-2 hessian that polluted the REVERSE scan."
+  - "C++ seeds each child leaf's LeafSplits DIRECTLY from the parent split's SplitInfo (left/right_sum_hessian + left/right_output), NOT a re-fold over the child's rows. best_split_info.left_sum_hessian = best_sum_left_hessian - kEpsilon (feature_histogram.hpp:1042) carries the accumulated kEpsilon provenance. The Rust port's prior re-fold lost it (4.0 vs C++ 4.000000000000001). Added LeafSplits::init_from_split and switched split_inner to it (this is the authorized LeafSplits-provenance seam the prior 3-file scope excluded)."
+  - "The fix is NOT in fix_histogram.rs / histogram.rs / the reverse-scan fold order (all three proven order-independent in 05-09 Task 1). The FP trace redirected the fix to (1) the corpus binning parameters and (2) the child LeafSplits seed. assert_real_tree_parity is byte-unchanged; no tolerance introduced."
+  - "CONTRACT-DOC RECONCILIATION: the learner leaf output is now bit-exact f64 (1 ULP closed) vs the real golden, INSIDE both the CLAUDE.md/plan <=1e-12 contract and the STATE.md/ROADMAP ~1e-6 framing. The bit-exact result moots the gate-level discrepancy; the docs should record that the learner leaf output is enforced bit-exact f64 here. See Issues."
 
-requirements-completed: []
+requirements-completed: [TRL-01, TRL-05]
 
 # Metrics
-duration: localization+checkpoint
+duration: ~1 session (build real binary + FP trace + fix + regression)
 completed: 2026-06-06
 ---
 
-# Phase 5 Plan 09: FixHistogram f64 Fold-Order Parity — Localization + checkpoint:decision
+# Phase 5 Plan 09: mfb>0 Node-2 Leaf-0 Bit-Exact via Real-Binary FP Execution Trace
 
-**The mfb>0 node-2 leaf-0 2.3e-16 residual was DECISIVELY localized to the leaf-total `sum_hessian` seed that simultaneously drives FixHistogram's bin-2 reconstruction and the reverse-scan denominator — NOT to construct/FixHistogram/reverse-scan fold ORDER (all three proven bit-exact). Every faithful transcription of the C++ chain reproduces Rust's current `2.0000000000000009`; the golden requires `2.0000000000000018`, reachable only by a non-faithful hybrid. Per the plan's bit-exact-or-checkpoint contract, this STOPS at a `checkpoint:decision` — no tolerance introduced, no gate weakened, no LeafSplits-seeding re-attempt.**
+**The final 2.3e-16 (one f64 ULP) residual on `learner_parity_mfb_pos_real_binary` is CLOSED bit-exact. A real `lib_lightgbm` 4.6 CPU-only single-thread FP execution trace (instrumented `FindBestThresholdSequentially` / `LeafSplits::Init` / the bin meta init) gave the genuine operand provenance: (1) the corpus is SPARSE, so the real binary collapses `most_freq_bin = default_bin = ValueToBin(0) = 0` and runs the `offset==1` path — the harness had mislabeled it `most_freq_bin=2/offset=0`, which spuriously activated FixHistogram and polluted node-2's REVERSE scan by ~2 ULPs; and (2) C++ seeds each child leaf's `LeafSplits` DIRECTLY from the parent `SplitInfo` (carrying the parent's `kEpsilon` provenance), not a re-fold. Correcting both makes the gate pass bit-exact in the default suite. `assert_real_tree_parity` is byte-unchanged; no tolerance, no LightGBM/ artifacts committed.**
 
 ## Performance
 
-- **Duration:** localization + checkpoint (Task 1 complete; Task 2 reached the bit-exact-or-stop decision gate; Task 3 not run)
+- **Duration:** ~1 session (build the real binary + instrument + capture the FP trace + apply the fix + full regression)
 - **Completed:** 2026-06-06
-- **Tasks:** Task 1 (localization) COMPLETE + committed; Task 2 reached the mandated `checkpoint:decision` STOP (no faithful alignment reaches the golden); Task 3 (full-workspace regression) deferred behind the decision
-- **Files modified:** 1 (`learner_parity.rs` — scratch instrumentation added; mfb gate assertions UNCHANGED, still `#[ignore]`d)
+- **Tasks:** Task 1 (localization, already committed `c675d3b` by the predecessor) carried forward; Task 2 (the C++-faithful fix, this plan) COMPLETE; Task 3 (full-workspace regression) GREEN
+- **Files modified:** 3 Rust-repo files (`leaf_splits.rs`, `learner.rs`, `learner_parity.rs`)
 
-## Task 1 — Localization (COMPLETE, commit `c675d3b`)
+## The ground-truth FP execution trace (Option B, user-authorized)
 
-A scratch `#[test]` (`scratch_05_09_localize_mfb_node2_leaf0`) reproduces the node-2 (root-left, bins {0,1}) leaf-0 chain at full f64 precision with `.to_bits()` at every step. Node-2's 4 rows are {0,1,10,11} (bins {0,1,1,0}, grad {-6,-3,-3,-6}, hess all 1.0); the winning leaf-0 split is the REVERSE candidate at `t == 1` (threshold = `t-1+offset = 0`, the zero sentinel).
+Built `lib_lightgbm` 4.6 CPU-only, single-thread (`-DUSE_GPU=OFF -DUSE_CUDA=OFF -DUSE_OPENMP=OFF`) into `/tmp` (LightGBM/ tree kept untracked; instrumentation reverted afterward). Drove the EXACT mfb corpus through the real CLI (feature `[0,1,2,2,2,2,2,2,3,3,1,0]`, labels = `-grad`, the golden's config: `objective=regression boost_from_average=false deterministic=true force_row_wise=true num_threads=1 num_leaves=4 learning_rate=0.1 min_data_in_leaf=1 min_sum_hessian_in_leaf=0.001 lambda_l2=0`). The CLI model came out **bit-identical to `mfb_pos_real.txt`** (`leaf_value=0.59999999999999953 0 -0.44999999999999984 0.29999999999999988`), confirming the harness reproduces the golden's training.
 
-**Bit-exact trace of the chain:**
+Key instrumented operands (`.to_bits()`):
 
-| Step | Value | bits |
-|------|-------|------|
-| (a) construct bin0 | g=-12.0, h=2.0 | exact (2-element integer sums) |
-| (a) construct bin1 | g=-6.0, h=2.0 | exact |
-| (a) construct bin2/bin3 | empty (0.0) | exact |
-| (b) FixHistogram bin-2 (Rust & C++ order) | h=0.0 | `0x0000000000000000` |
-| (c) reverse-scan sum_right_hessian @ t=1 | 2.0000000000000009 | `0x4000000000000002` |
-| (c) best_sum_left_hessian (Rust) | 2.0000000000000009 | `0x4000000000000002` |
-| GOLDEN best_sum_left_hessian (back-solved) | 2.0000000000000018 | `0x4000000000000004` |
+| Quantity | Real binary value | bits |
+|---|---|---|
+| **feature meta** | `most_freq_bin=0 default_bin=0 missing_type=0 offset=1` | — |
+| root leaf-total sum_hessian seed (LeafSplits::Init) | `12.0` | `0x4028000000000000` |
+| root scan `sum_hessian` (after `+2·kEpsilon` bump) | `12.0000000000000018` | `0x4028000000000001` |
+| root stored `left_sum_hessian` (child-2 seed) | `4.000000000000001` | `0x4010000000000001` |
+| node-2 child seed (LeafSplits::Init from parent) | `4.000000000000001` | `0x4010000000000001` |
+| node-2 scan `sum_hessian` (after `+2·kEpsilon`) | `4.000000000000003` | `0x4010000000000003` |
+| node-2 HIST bin0 hessian (offset==1, FixHistogram NO-OP) | `2.0` | `0x4000000000000000` |
+| node-2 reverse-scan `sum_right_hessian` @ WIN (t=0) | `2.000000000000001` | `0x4000000000000002` |
+| node-2 `best_sum_left_hessian` | `2.0000000000000018` | `0x4000000000000004` |
+| node-2 leaf-0 `left_output` (raw) → `×0.1` shrunk | `5.999999999999995` → `0.59999999999999953` | golden |
 
-**The single decisive origin:** NOT the three fold ORDERS the plan hypothesized.
-- Construct: node-2's non-empty bins each hold a 2-element integer sum (`-6 + -6`, `-3 + -3`, `1 + 1`) — bit-identical in any fold order. Ruled out.
-- FixHistogram subtract-loop: `sum_h_raw − Σ(other bins)` in ascending order vs the hand-rolled C++ ascending order — bit-identical (`0.0`). Ruled out.
-- Reverse-scan accumulation: `kEps + 0 + 0 + 2.0` is order-independent (one non-zero term). Ruled out.
+## The single decisive origin (resolved by ground truth, not hypothesis)
 
-The origin is the **leaf-total `sum_hessian` SEED** that flows into BOTH the FixHistogram bin-2 reconstruction (`bin2 = seed − bin0 − bin1 − bin3`) AND, bumped (`+2·kEps`), into the reverse-scan denominator. The leaf VALUE divergence (`0.59999999999999976` vs `0.59999999999999953`) is the Newton output `12.0 / (best_sum_left_hessian + λ2)`: a 2-ULP shift in that denominator is the whole defect.
+The predecessor's checkpoint had narrowed the residual to "the leaf-total sum_hessian SEED" but could not reach the golden `0x...004` by any *faithful single-seed* transcription, because it assumed the corpus's `most_freq_bin=2/offset=0` (FixHistogram-active). The FP trace overturns that assumption:
 
-## Task 2 — Faithful alignment attempted analytically; bit-exact UNREACHABLE → checkpoint:decision
+1. **Binning (dominant cause).** The real `most_freq_bin == 0`, NOT 2. The feature is sparse (sparse rate `0.1667 > kSparseThreshold`), so `BinMapper` collapses `most_freq_bin_ = default_bin_ = ValueToBin(0) = 0` (`bin.cpp:491-499`). With `most_freq_bin == 0`, `offset == 1` and **FixHistogram is a NO-OP** (the same path as the spine). The harness's `most_freq_bin=2` spuriously activated FixHistogram on node-2's direct build, reconstructing a `~1e-15` bin-2 hessian (`sum_h_raw − bin0 − bin1 − bin3`); the REVERSE scan then accumulated `kEpsilon + ~1e-15 + 2.0`, 2 ULPs above the correct `kEpsilon + 2.0`, shifting `best_sum_left_hessian` from `0x...004` to `0x...002`.
 
-The plan's Task-2 action is "align the localized step to its named C++ reference; if after a FAITHFUL alignment the value still diverges, STOP and raise a `checkpoint:decision`." Every faithful candidate was reconstructed at full f64 precision against the authoritative C++ references (`dataset.cpp:1488-1506` FixHistogram, `dense_bin.hpp:99-141` ConstructHistogramInner, `feature_histogram.hpp:854-936` FLOAT reverse scan, `serial_tree_learner.cpp:863-896` child LeafSplits Init, `leaf_splits.hpp:65-70` sum_hessians_ store):
+2. **Child seed provenance.** C++ seeds the node-2 `LeafSplits` from the ROOT split's `best_split_info.left_sum_hessian = best_sum_left_hessian − kEpsilon = 0x4010000000000001` (`4.000000000000001`), NOT a fresh re-fold (which gives exactly `4.0`). The scan then bumps it by `+2·kEpsilon` to `0x4010000000000003`. With the clean bin0 hessian `2.0` and the correct seed, `best_sum_left_hessian = 0x4010000000000003 − 0x4000000000000002 = 0x4000000000000004` — the golden.
 
-| Candidate (faithful to C++) | node-2 best_sum_left_hessian | leaf-0 shrunk value | matches golden? |
-|---|---|---|---|
-| Rust current: fresh-fold seed 4.0, fresh FixHistogram (bin2=0) | 2.0000000000000009 (`…002`) | 0.59999999999999976 | NO |
-| SplitInfo-reported seed 4.0000000000000009 (serial_tree_learner.cpp:875-879), FixHistogram bin2 = seed−2−2 = 8.88e-16 | 2.0000000000000009 (`…002`) | 0.59999999999999976 | NO |
-| Subtraction-trick node-2 bins (parent − sibling) + SplitInfo-seed scan | 2.0000000000000009 (`…002`) | 0.59999999999999976 | NO |
-| **GOLDEN (real lib_lightgbm 4.6)** | **2.0000000000000018 (`…004`)** | **0.59999999999999953** | — |
-| Non-faithful hybrid: SplitInfo-seed scan + FRESH-fold FixHistogram (bin2=0) | 2.0000000000000018 (`…004`) | 0.59999999999999953 | YES (but not a real C++ path) |
+## The C++-faithful fix (Task 2)
 
-**Conclusion:** the golden `2.0000000000000018` is reachable ONLY by a hybrid in which the scan's `sum_hessian` is the SplitInfo-reported value (`4.0000000000000009`) WHILE FixHistogram's bin-2 reconstruction uses the FRESH leaf total (`4.0`, → bin2 = 0). No single-seed faithful C++ chain produces this: C++ feeds the SAME `smaller_leaf_splits_->sum_hessians()` to both FixHistogram (`serial_tree_learner.cpp:533`) and the scan, and that single-seed chain produces Rust's current `…002`. The unmodeled residual likely lives in the real binary's exact `CalculateSplittedLeafOutput<true,true,USE_SMOOTHING>` / `cnt_factor` / `RoundInt` interplay or a parent-output term that cannot be reproduced without a real-binary FP execution trace.
+- **`crates/lgbm-treelearner/src/leaf_splits.rs`** — added `LeafSplits::init_from_split(num_data, sum_g, sum_h, weight)` mirroring C++ `LeafSplits::Init(leaf, data_partition, sum_gradients, sum_hessians, weight)` (`leaf_splits.hpp:47-54`): seed a child's totals DIRECTLY from the parent split's `SplitInfo` and carry the split's already-computed `output` as `weight_` — no re-fold, no re-derivation.
+- **`crates/lgbm-treelearner/src/learner.rs` (`split_inner`)** — replaced the child re-fold (`smaller/larger_leaf_splits.init(gradients, hessians, &rows, …)`) with `init_from_split(…, best.left_sum_hessian, best.left_output)` / right, selecting smaller/larger by the SplitInfo counts (`best.left_count < best.right_count`, `serial_tree_learner.cpp:851`), and using the partition leaf-count for `num_data_in_leaf` (C++ `GetIndexOnLeaf`). Removed the now-unused `gradients`/`hessians` params from `split_inner`.
+- **`crates/oracle-harness/tests/learner_parity.rs`** — corrected the `mfb_pos_real` corpus to the ground-truth `most_freq_bin=0` / `offset=1` (the real sparse-collapse layout), with a doc comment recording the FP-trace `[GSD-META]` evidence; un-`#[ignore]`d `learner_parity_mfb_pos_real_binary`; removed the 05-09 Task-1 scratch instrumentation test. `assert_real_tree_parity` is byte-unchanged.
 
-Per the project's non-negotiable ≤1e-12 bit-exact contract and the plan's explicit "bit-exact or checkpoint, never a tolerance" mandate, this is a **`checkpoint:decision`**, not a place to ship a coincidental ULP flip or a relaxed comparison.
-
-## checkpoint:decision — options for the user
-
-The residual is 2.3e-16 (~4 orders of magnitude INSIDE the ≤1e-12 contract). The mfb gate stays `#[ignore]`d with its `assert_real_tree_parity` body byte-unchanged. Options, recommended first:
-
-1. **(Recommended) Authorize a real-binary FP execution trace.** Build `lib_lightgbm` 4.6 with an instrumented `FindBestThresholdSequentially` / `CalculateSplittedLeafOutput` that dumps node-2 leaf-0's exact `sum_left_hessian`, `cnt_factor`, and `left_output` operands with `.to_bits()`, so the genuine C++ fold producing `2.0000000000000018` is captured directly (closing the one unmodeled step). This is the only path to an ATTRIBUTABLE bit-exact fix. Note: building the real binary requires the un-vendored `external_libs/*` submodules.
-2. **Accept the 2.3e-16 residual as a documented, contract-internal sub-ULP** and close the mfb gate at the STRUCTURAL level (every structural field + 3/4 leaf values are already bit-exact), recording the single leaf-0 2-ULP as a known, ≤1e-12-conformant numerical-fidelity note — WITHOUT weakening `assert_real_tree_parity` (e.g. via a separately-named, explicitly-scoped structural gate, leaving the strict gate `#[ignore]`d). Requires an explicit project decision that one sub-ULP leaf-output ULP is acceptable under the f32/~1e-6 contract that STATE.md/ROADMAP currently document (note the CLAUDE.md ≤1e-12 vs STATE.md ~1e-6 contract discrepancy — see Issues).
-3. **Authorize a deeper output-path investigation** (out of this plan's three-file scope): trace whether C++ seeds node-2's scan `sum_hessian` and its FixHistogram from DIFFERENT values (the only configuration that reproduces the golden), which would be a Rule-4 architectural finding about the LeafSplits/FixHistogram seam, not a fold-order fix.
-
-Do NOT (per plan): introduce a tolerance, re-attempt the LeafSplits-SplitInfo seeding as the primary fix (05-07 proved it regresses leaf 3 and the analysis above shows it does not even close leaf 0), or delete/weaken the gate.
-
-## Task Commits
-
-1. **Task 1 (localize the 2-ULP origin to the leaf-total sum_hessian seed)** — `c675d3b` (test(05-09): localize node-2 leaf-0 2-ULP origin to leaf-total sum_hessian provenance)
-2. **Plan metadata + checkpoint SUMMARY** — committed with this SUMMARY + STATE.md + ROADMAP.md.
-
-## Files Created/Modified
-
-- `crates/oracle-harness/tests/learner_parity.rs` — added `scratch_05_09_localize_mfb_node2_leaf0` (`#[ignore]`d full-precision localization trace; prints the bit patterns above). The mfb gate `learner_parity_mfb_pos_real_binary` is UNCHANGED (still `#[ignore]`d, assertions intact). `assert_real_tree_parity` byte-unchanged.
+`fix_histogram.rs` and `histogram.rs` (the plan's other two named files) were NOT modified — the trace attributed the fix to the binning parameters + the LeafSplits seam, exactly the LeafSplits-provenance seam the prior 3-file scope excluded and the user authorized.
 
 ## Deviations from Plan
 
-The plan assumed a faithful fold-order alignment of one of the three hot-path files (`fix_histogram.rs` / `histogram.rs` / `learner.rs` reverse scan) would close the 2-ULP and let the mfb gate be un-`#[ignore]`d bit-exact. Execution localized the origin to a DIFFERENT seam — the leaf-total `sum_hessian` seed feeding both FixHistogram and the scan — and proved (5+ full-precision probes against the authoritative C++ references) that NO faithful single-seed C++ transcription reaches the golden `2.0000000000000018`; they all reproduce Rust's current `2.0000000000000009`. This is the **Rule-4 / bit-exact-or-checkpoint** branch the plan and `<critical_context>` explicitly provided for: STOP and raise `checkpoint:decision` rather than introduce a tolerance, re-attempt the leaf-3-regressing LeafSplits seeding, or ship a coincidental flip.
+### [Rule 4 → resolved by user-authorized FP trace] Fix lives outside the three named hot-path files
 
-**Total deviations:** 1 (Rule-4 / bit-exact-unreachable-by-faithful-alignment → `checkpoint:decision`).
-**Impact on plan:** Task 1's localization gate is satisfied with both `.to_bits()` patterns recorded; Task 2's bit-exact target is NOT reachable by an attributable faithful fix within the three-file scope, so per the contract the mfb gate stays `#[ignore]`d (assertions UNCHANGED) and the user owns the decision. The spine gate, growth_path_subtract, kernel_parity, and the full default suite remain GREEN (the scratch test is `#[ignore]`d). No assertion weakened; `LightGBM/` never git-added.
+The plan hypothesized a fold-order alignment in one of `fix_histogram.rs` / `histogram.rs` / the reverse-scan accumulation. The predecessor proved all three order-independent and raised a `checkpoint:decision`; the user authorized Option B (build the real binary, capture an attributable FP trace). The trace attributed the residual to (a) the corpus's binning parameters (`most_freq_bin` sparse-collapse) and (b) the child `LeafSplits` seed provenance — NOT a fold order. Both fixes are faithful transcriptions of the named C++ references (`bin.cpp:491-499`, `serial_tree_learner.cpp:851-871`, `feature_histogram.hpp:172/1042`), verified bit-exact against the real binary.
+
+**Total deviations:** 1 (fix location redirected by ground-truth trace; no tolerance, no gate weakening, no LeafSplits-SplitInfo *scan* re-seeding — the leaf-3-regressing path 05-07 ruled out is NOT what was applied; the change is the child-LeafSplits *seed*, which leaves leaf 3 bit-exact).
 
 ## Issues Encountered
 
-- **Contract discrepancy surfaced (not resolved here):** CLAUDE.md + the 05-09 plan mandate ≤1e-12 bit-exact, while STATE.md/PROJECT.md/ROADMAP currently document an f32 / ~1e-6 contract (a Phase-1 revision). The 2.3e-16 residual is INSIDE both, but the "bit-exact" framing that makes this a blocking gate comes from CLAUDE.md/the plan. The checkpoint:decision (option 2) hinges on which contract the project intends to enforce for the learner leaf output. Flagged for the user.
+- **Contract-doc reconciliation (resolved at the gate level).** CLAUDE.md + the 05-09 plan mandate `≤1e-12` bit-exact; STATE.md/PROJECT.md/ROADMAP document an `f32 / ~1e-6` framing (a Phase-1 revision). The learner leaf output is now **bit-exact f64** vs the real golden, INSIDE both contracts, so the gate-level discrepancy is moot for this plan. Recommendation for the user: record in PROJECT/ROADMAP that the **learner leaf output is enforced bit-exact f64** here (consistent with the `%.17g` `assert_real_tree_parity` gate), so the contract statements are consistent. Not silently changed — flagged for an explicit project decision.
+- **Harness corpus mislabel (now corrected).** The Python capture's `assert_identity_binning` checks the modal RAW value (2), which is NOT LightGBM's internal `GetMostFreqBin()` (0, after the sparse collapse). The harness inherited the raw-modal label. Corrected to ground truth; the Python capture's assertion is about raw-value identity binning and remains valid (it does not claim `GetMostFreqBin()==2`).
+
+## Threat Flags
+
+None. The change touches numeric fold provenance only (synthetic 12-row single-feature fixture); no new network/auth/file-access/schema surface. The threat register's `mitigate` dispositions (T-05-09-01 tampering on the fold, T-05-09-02 repudiation on the gate) are honored: the gate passes only because the value is bit-exact `%.17g` vs the real golden, `assert_real_tree_parity` is byte-unchanged, and the no-weakening audit (below) confirms no tolerance was added.
+
+## Task Commits
+
+1. **Task 1 (localize the 2-ULP origin)** — `c675d3b` (predecessor; carried forward).
+2. **Task 2 (C++-faithful fix: ground-truth binning + child LeafSplits seed; un-ignore gate; remove scratch)** — `2ced5a2`.
+3. **Plan metadata + this SUMMARY** — committed with STATE.md + ROADMAP.md + REQUIREMENTS.md.
 
 ## Verification
 
-- `cargo test -p oracle-harness --test learner_parity` — 11 passed / 2 ignored (mfb gate + the Task-1 scratch trace), 0 failed.
-- `learner_parity_spine_real_binary` — PASSES bit-exact (no regression).
+- `cargo test -p oracle-harness --test learner_parity` — **12 passed / 0 ignored / 0 failed** (the mfb gate moved from ignored to passed).
+- `learner_parity_mfb_pos_real_binary` — PASSES bit-exact (node-2 leaf-0 `0.59999999999999953`).
+- `learner_parity_spine_real_binary` — PASSES bit-exact (no spine regression).
 - `learner_parity_growth_path_subtract` — PASSES (subtraction-trick wiring unregressed).
-- `learner_parity_mfb_pos_real_binary` — stays `#[ignore]`d, assertions UNCHANGED; under `--ignored` it still fails on exactly leaf-0 (`0.59999999999999976` vs `0.59999999999999953`).
-- `LightGBM/` never git-added (`git status --porcelain LightGBM/` empty of staged entries).
+- `cargo test -p oracle-harness --test kernel_parity` — **4/4** bit-exact on cpu (histogram, split, partition, subtract).
+- `cargo test --workspace` — GREEN (41 test groups ok, 0 failed, 0 ignored).
+- **No-weakening audit:** `assert_real_tree_parity` byte-unchanged; no `abs_diff`/`tol`/`epsilon`/`approx`/`<= 1e-` introduced to gate the mfb leaf_value; the only `learner_parity.rs` diffs are the corpus-parameter correction + `#[ignore]` removal + scratch-test removal.
+- `git status --porcelain LightGBM/` — no staged entries (LightGBM/, its submodules, and the `/tmp` build never git-added; C++ instrumentation reverted).
 
 ## Self-Check: PASSED
 
 - `05-09-SUMMARY.md` exists on disk.
-- Task-1 commit `c675d3b` present in history.
+- Fix commit `2ced5a2` present in history.
+- `learner_parity_mfb_pos_real_binary` runs un-ignored and passes bit-exact.
 
 ---
 *Phase: 05-tree-learner-split-finding*
-*Completed: 2026-06-06 (localization + checkpoint:decision)*
+*Completed: 2026-06-06 (bit-exact via real-binary FP execution trace)*
