@@ -121,6 +121,34 @@ impl LeafSplits {
         );
     }
 
+    /// `LeafSplits::Init(leaf, data_partition, sum_gradients, sum_hessians,
+    /// weight)` (`leaf_splits.hpp:47-54`): seed a CHILD leaf's totals DIRECTLY from
+    /// the parent split's `SplitInfo` (`serial_tree_learner.cpp:851-871`), carrying
+    /// the EXACT `sum_gradients`/`sum_hessians` the split produced AND the split's
+    /// already-computed leaf `output` as `weight_` — NOT a re-fold over the child's
+    /// rows and NOT a re-derivation of the output.
+    ///
+    /// This is load-bearing for bit-exactness: the C++ child seed is
+    /// `best_split_info.{left,right}_sum_hessian` (= `best_sum_left_hessian -
+    /// kEpsilon`, `feature_histogram.hpp:1042`), which carries the accumulated
+    /// `kEpsilon` provenance from the parent's REVERSE scan. A fresh re-fold of the
+    /// child's rows loses that provenance (e.g. yields exactly `4.0` where C++ has
+    /// `4.000000000000001`), shifting the grandchild leaf-output denominator by 2
+    /// ULPs (the 05-09 mfb>0 node-2 leaf-0 residual). Verified against a real
+    /// `lib_lightgbm` 4.6 FP execution trace.
+    pub fn init_from_split(
+        &mut self,
+        num_data_in_leaf: i32,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        weight: f64,
+    ) {
+        self.num_data_in_leaf = num_data_in_leaf;
+        self.sum_gradients = sum_gradient;
+        self.sum_hessians = sum_hessian;
+        self.weight = weight;
+    }
+
     /// C++ `LeafSplits::weight()` — the leaf output used as `parent_output`.
     pub fn weight(&self) -> f64 {
         self.weight

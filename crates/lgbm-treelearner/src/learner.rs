@@ -487,8 +487,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 &mut tree,
                 &mut data_partition,
                 &features,
-                gradients,
-                hessians,
                 best_leaf,
                 feat_idx,
                 &best,
@@ -1099,8 +1097,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         tree: &mut Tree,
         data_partition: &mut DataPartition,
         features: &[FeatureColumn],
-        gradients: &[f32],
-        hessians: &[f32],
         best_leaf: i32,
         feat_idx: i32,
         best: &SplitInfo,
@@ -1184,23 +1180,61 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         );
 
         // Seed the two child LeafSplits for the next iteration
-        // (serial_tree_learner.cpp:850-870). The child leaf-split sums are the
-        // deterministic ordered f64 re-fold over each child's data-partition rows;
-        // the smaller/larger selection uses the ACTUAL data-partition counts (the
-        // `update_cnt=true` overwrite, :790-791), bit-consistent with the
-        // smaller-child selection in `find_best_splits`.
-        let left_rows: Vec<u32> = data_partition.indices_in_leaf(new_left).to_vec();
-        let right_rows: Vec<u32> = data_partition.indices_in_leaf(new_right).to_vec();
-        let count_left = data_partition.leaf_count(new_left);
-        let count_right = data_partition.leaf_count(new_right);
-        if count_left < count_right {
+        // (serial_tree_learner.cpp:851-871). C++ seeds each child DIRECTLY from the
+        // parent's `best_split_info` — `Init(leaf, dp, best_split_info.left_sum_
+        // gradient, best_split_info.left_sum_hessian, best_split_info.left_output)`
+        // — NOT a re-fold over the child's rows. This is load-bearing for
+        // bit-exactness: `best_split_info.left_sum_hessian` is `best_sum_left_
+        // hessian - kEpsilon` (feature_histogram.hpp:1042), carrying the accumulated
+        // `kEpsilon` provenance from the parent's REVERSE scan. The prior re-fold
+        // produced a fresh `sum_hessian` (e.g. exactly `4.0` for the mfb>0 node-2)
+        // that lost that provenance and shifted the grandchild leaf-output
+        // denominator by 2 ULPs (the 05-09 mfb>0 node-2 leaf-0 residual). The seed
+        // provenance was confirmed against a real `lib_lightgbm` 4.6 FP execution
+        // trace: node-2's scan `sum_hessian` is the parent stored
+        // `left_sum_hessian` (`0x4010000000000001` = `4.000000000000001`), bumped by
+        // `+2·kEpsilon` in `FindBestThreshold` (feature_histogram.hpp:172), yielding
+        // `best_sum_left_hessian = 0x4000000000000004` and the golden leaf value.
+        //
+        // The smaller/larger selection uses the SplitInfo counts
+        // (`best_split_info.left_count < best_split_info.right_count`,
+        // serial_tree_learner.cpp:851), NOT the partition counts.
+        //
+        // `num_data_in_leaf` is the PARTITION leaf-count (C++ `LeafSplits::Init`
+        // sets `num_data_in_leaf_` via `GetIndexOnLeaf` — the routed row count,
+        // possibly ±1 from the SplitInfo `left_count`/`right_count` for fractional
+        // hessians, Pitfall 3); only the `sum_gradients`/`sum_hessians`/`weight`
+        // come from the SplitInfo.
+        let part_left = data_partition.leaf_count(new_left);
+        let part_right = data_partition.leaf_count(new_right);
+        if best.left_count < best.right_count {
             // smaller = left
-            smaller_leaf_splits.init(gradients, hessians, &left_rows, &self.cfg);
-            larger_leaf_splits.init(gradients, hessians, &right_rows, &self.cfg);
+            smaller_leaf_splits.init_from_split(
+                part_left,
+                best.left_sum_gradient,
+                best.left_sum_hessian,
+                best.left_output,
+            );
+            larger_leaf_splits.init_from_split(
+                part_right,
+                best.right_sum_gradient,
+                best.right_sum_hessian,
+                best.right_output,
+            );
         } else {
             // smaller = right
-            smaller_leaf_splits.init(gradients, hessians, &right_rows, &self.cfg);
-            larger_leaf_splits.init(gradients, hessians, &left_rows, &self.cfg);
+            smaller_leaf_splits.init_from_split(
+                part_right,
+                best.right_sum_gradient,
+                best.right_sum_hessian,
+                best.right_output,
+            );
+            larger_leaf_splits.init_from_split(
+                part_left,
+                best.left_sum_gradient,
+                best.left_sum_hessian,
+                best.left_output,
+            );
         }
 
         Ok((new_left, new_right))

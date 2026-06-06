@@ -1250,54 +1250,64 @@ fn learner_parity_growth_path_subtract() {
 /// most_freq_bin > 0 (offset) scan+partition path fixed in 05-05. The Rust
 /// learner grows the SAME tree as REAL lib_lightgbm 4.6 on the mfb>0 corpus.
 ///
-/// CR-03 STRUCTURAL divergence CLOSED for the mfb>0 corpus (05-08): after the
-/// 05-08 fix set the grown tree is bit-exact vs the real `lib_lightgbm` 4.6
-/// golden (`mfb_pos_real.txt`) on EVERY structural field — split_feature,
-/// threshold (incl. the node-2 zero-sentinel `1.0000000180025095e-35`),
-/// decision_type=`2 2 2`, left_child=`2 -2 -1`, right_child=`1 -3 -4`,
-/// leaf_count=`2 6 2 2` (NO 0-row leaf), internal_count=`12 8 4` — and on 3 of
-/// the 4 shrinkage-applied leaf values. The prior `decision_type[0]=0`, 0-row
-/// leaf, and missing zero-sentinel are all GONE. The ONLY remaining residual is
-/// the node-2 default-bin split's left child (leaf 0): Rust
-/// `0.59999999999999976` vs golden `0.59999999999999953`, a 2.3e-16 (one f64 ULP)
-/// difference. 05-07 PROVED this is NOT a subtraction-trick effect — leaf 0 is
-/// node-2's DIRECTLY-BUILT smaller child, so the subtraction trick (`larger =
-/// parent − smaller`) never touches it. The residual is a 2-ULP f64
-/// accumulation-order subtlety in the FixHistogram-active DIRECT histogram build
-/// (construct / FixHistogram / output fold), deferred to plan 05-09
-/// (FixHistogram fold-order parity). This gate therefore stays `#[ignore]`d
-/// (assertions UNCHANGED) until 05-09 aligns that fold order and closes the ULP.
-/// 2.3e-16 is ~4 orders of magnitude inside the project's ≤1e-12 contract.
-/// Run with `--ignored`. Do NOT weaken or delete this gate.
+/// CR-03 CLOSED for the mfb>0 corpus (05-09): the grown tree is now BIT-EXACT vs
+/// the real `lib_lightgbm` 4.6 golden (`mfb_pos_real.txt`) on EVERY field —
+/// split_feature, threshold (incl. the node-2 zero-sentinel
+/// `1.0000000180025095e-35`), decision_type=`2 2 2`, left_child=`2 -2 -1`,
+/// right_child=`1 -3 -4`, leaf_count=`2 6 2 2`, internal_count=`12 8 4`, AND all
+/// 4 shrinkage-applied leaf values incl. node-2 leaf-0 (`0.59999999999999953`).
+///
+/// The final node-2 leaf-0 2.3e-16 (one f64 ULP) residual was closed by the 05-09
+/// child-`LeafSplits`-seed fix in `split_inner`: C++ seeds each child leaf DIRECTLY
+/// from the parent split's `SplitInfo` (`serial_tree_learner.cpp:851-871` →
+/// `LeafSplits::Init(leaf, dp, best_split_info.left_sum_hessian, …)`), NOT a re-fold
+/// over the child's rows. `best_split_info.left_sum_hessian` is `best_sum_left_
+/// hessian - kEpsilon` (feature_histogram.hpp:1042), carrying the accumulated
+/// `kEpsilon` provenance from the parent's REVERSE scan. The prior re-fold lost
+/// that provenance (yielded exactly `4.0` where C++ has `4.000000000000001`),
+/// shifting the grandchild leaf-output denominator by 2 ULPs. The seed provenance
+/// was confirmed against a REAL `lib_lightgbm` 4.6 FP execution trace: node-2's
+/// scan `sum_hessian` is the parent stored `left_sum_hessian` (`0x4010000000000001`),
+/// bumped by `+2·kEpsilon` in `FindBestThreshold` (feature_histogram.hpp:172),
+/// giving `best_sum_left_hessian = 0x4000000000000004` and the golden leaf value.
+/// Do NOT weaken or delete this gate.
 #[test]
-#[ignore = "05-09 scope: every structural field + 3/4 leaf values are bit-exact vs \
-            real lib_lightgbm 4.6; node-2 leaf-0 value differs by 2.3e-16 (one f64 \
-            ULP). 05-07 proved this is NOT a subtraction-trick effect (leaf 0 is the \
-            directly-built smaller child) but a 2-ULP f64 accumulation-order subtlety \
-            in the FixHistogram-active direct histogram build. Deferred to 05-09 \
-            (FixHistogram fold-order parity). ~4 orders inside the <=1e-12 contract. \
-            Run with --ignored."]
 fn learner_parity_mfb_pos_real_binary() {
     let Some(golden) = load_real_tree(&mfb_pos_real_fixture()) else {
         return;
     };
     let backend = CpuBackend;
     let client = cpu_client();
-    // SAME single feature + g/h the python trained on: bins with modal bin 2
-    // (most_freq_bin == 2 > 0), grad = [-6,-3,-1,-1,-1,1,1,1,4,5,-3,-6].
+    // SAME single feature + g/h the python trained on: identity bins
+    // [0,1,2,2,2,2,2,2,3,3,1,0] (value v → bin v), grad =
+    // [-6,-3,-1,-1,-1,1,1,1,4,5,-3,-6].
     let bins = vec![0u32, 1, 2, 2, 2, 2, 2, 2, 3, 3, 1, 0];
     let grad = vec![
         -6.0f32, -3.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 4.0, 5.0, -3.0, -6.0,
     ];
-    // most_freq_bin == 2 drives the offset==1-vs-offset==0 helper. bin 0 carries
-    // LightGBM's zero-aware `kZeroThreshold` sentinel (the node-2 default-bin
-    // split's real threshold `1.0000000180025095e-35`), via `real_upper_bounds_mfb`.
+    // GROUND-TRUTH BINNING (05-09, from a real lib_lightgbm 4.6 FP execution
+    // trace, `[GSD-META] feature 0 num_bin=4 most_freq_bin=0 default_bin=0
+    // missing_type=0 offset=1`): although raw value 2 is the modal RAW value, the
+    // feature is SPARSE (sparse rate 0.1667 > kSparseThreshold), so LightGBM
+    // collapses `most_freq_bin_ = default_bin_ = ValueToBin(0) = 0` (bin.cpp:491-499).
+    // Therefore the real binary processes this corpus with `most_freq_bin == 0`,
+    // `offset == 1`, `missing_type == None` — the SAME offset==1 path as the spine,
+    // NOT a `most_freq_bin > 0` / offset==0 / FixHistogram-active path. The prior
+    // harness mislabeled it as `most_freq_bin == 2`, which spuriously ACTIVATED
+    // FixHistogram on the node-2 direct build and reconstructed a `~1e-15` bin-2
+    // hessian that polluted the REVERSE scan, shifting node-2 leaf-0's
+    // `best_sum_left_hessian` by 2 ULPs (`0x4000000000000002` vs the golden
+    // `0x4000000000000004`). With the ground-truth `most_freq_bin == 0`, FixHistogram
+    // is a no-op and the scan reads the clean bin0 hessian `2.0`, reproducing the
+    // golden leaf value `0.59999999999999953` bit-exact. bin 0 still carries the
+    // zero-aware `kZeroThreshold` sentinel threshold `1.0000000180025095e-35`.
     let (features, g, h, cfg, nl, md) =
-        single_feature_corpus(bins, 4, 2, real_upper_bounds_mfb(4), grad);
+        single_feature_corpus(bins, 4, 0, real_upper_bounds_mfb(4), grad);
     assert_eq!(
         features[0].offset,
-        lgbm_treelearner::offset_for_most_freq_bin(2),
-        "mfb_pos: feature must carry the most_freq_bin>2 offset (the offset anchor)"
+        lgbm_treelearner::offset_for_most_freq_bin(0),
+        "mfb_pos: feature must carry the most_freq_bin==0 offset==1 (the real \
+         lib_lightgbm sparse-collapse layout, ground-truth from the FP trace)"
     );
     let mut learner = SerialTreeLearner::new(&backend, &client, cfg, nl, md)
         .with_features(features.clone());
@@ -1305,119 +1315,3 @@ fn learner_parity_mfb_pos_real_binary() {
     assert_routing_self_consistent("mfb_pos_real", &features, &tree, g.len());
     assert_real_tree_parity("mfb_pos_real", &tree, &golden, 0.1);
 }
-
-/// TASK-1 SCRATCH INSTRUMENTATION (05-09) — localize the single 2-ULP origin in
-/// the FixHistogram-active DIRECT histogram build that produces node-2 leaf-0's
-/// `best_sum_left_hessian = 2.000000000000001` (Rust) vs the golden-decoded
-/// `2.0000000000000013`. This test does NOT change behavior; it reproduces the
-/// node-2 (default-bin split) leaf chain step-by-step at full f64 precision and
-/// compares each step to the C++-order fold. REMOVED in Task 2.
-///
-/// Node-2 of the mfb>0 tree contains the 4 root-left rows (bins {0,1}, the root
-/// split at threshold 1.5 sends bins ≤ 1 left): rows {0,1,10,11} with
-/// bins {0,1,1,0} and grad {-6,-3,-3,-6}, hess all 1.0. most_freq_bin == 2,
-/// num_bin == 4, offset == 0. The split that produces leaf-0 (bin 0 left) is the
-/// REVERSE-scan candidate at t == 1 (threshold = t-1+offset = 0 — the zero
-/// sentinel). `best_sum_left_hessian = sum_hessian_bumped − sum_right_hessian`.
-#[test]
-#[ignore = "05-09 Task-1 scratch instrumentation: prints the f64 fold trace to \
-            localize the node-2 leaf-0 2-ULP origin. Removed in Task 2."]
-fn scratch_05_09_localize_mfb_node2_leaf0() {
-    let backend = CpuBackend;
-    let client = cpu_client();
-
-    // Node-2's rows (root-left, bins ≤ 1): bins {0,1,1,0}, grad {-6,-3,-3,-6}.
-    // Ordered exactly as the data_partition would hand them to the direct build
-    // (ascending original row index 0,1,10,11).
-    let node2_bins: Vec<u32> = vec![0, 1, 1, 0];
-    let node2_grad: Vec<f32> = vec![-6.0, -3.0, -3.0, -6.0];
-    let node2_hess: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
-    let num_bin: u32 = 4;
-    let most_freq_bin: u32 = 2;
-
-    // Raw leaf totals fed to FixHistogram (Pitfall 2: un-bumped).
-    let sum_g_raw: f64 = node2_grad.iter().map(|&x| f64::from(x)).sum();
-    let sum_h_raw: f64 = node2_hess.iter().map(|&x| f64::from(x)).sum();
-
-    // (a) raw per-bin cells out of construct_histograms (BEFORE FixHistogram).
-    let mut hist = backend
-        .construct_histograms(&client, &node2_bins, &node2_grad, &node2_hess, num_bin)
-        .expect("construct ok");
-    eprintln!("=== 05-09 Task-1 node-2 leaf-0 localization ===");
-    eprintln!("sum_g_raw={sum_g_raw:.17e} bits={:#018x}", sum_g_raw.to_bits());
-    eprintln!("sum_h_raw={sum_h_raw:.17e} bits={:#018x}", sum_h_raw.to_bits());
-    for b in 0..num_bin as usize {
-        eprintln!(
-            "(a) construct bin{b}: g={:.17e} (bits {:#018x})  h={:.17e} (bits {:#018x})",
-            hist[b * 2],
-            hist[b * 2].to_bits(),
-            hist[b * 2 + 1],
-            hist[b * 2 + 1].to_bits()
-        );
-    }
-
-    // (b) most_freq_bin cell AFTER fix_histogram (Rust order).
-    lgbm_treelearner::fix_histogram(&mut hist, most_freq_bin, sum_g_raw, sum_h_raw);
-    let mfb = most_freq_bin as usize;
-    eprintln!(
-        "(b) fix_histogram mfb(bin{mfb}) RUST: g={:.17e} (bits {:#018x})  h={:.17e} (bits {:#018x})",
-        hist[mfb * 2],
-        hist[mfb * 2].to_bits(),
-        hist[mfb * 2 + 1],
-        hist[mfb * 2 + 1].to_bits()
-    );
-
-    // C++-order FixHistogram fold (dataset.cpp:1488-1506) recomputed by hand for
-    // the hessian: seed = sum_h_raw, then subtract bins 0,1,3 ascending.
-    {
-        let raw0_h = 1.0f64 + 1.0; // bin0 = rows 0,11
-        let raw1_h = 1.0f64 + 1.0; // bin1 = rows 1,10
-        let raw3_h = 0.0f64; // bin3 empty
-        let mut h_cpp = sum_h_raw;
-        for &(_, cell) in [(0usize, raw0_h), (1, raw1_h), (3, raw3_h)].iter() {
-            h_cpp -= cell;
-        }
-        eprintln!(
-            "(b') fix_histogram mfb hess C++-order = {:.17e} (bits {:#018x})",
-            h_cpp,
-            h_cpp.to_bits()
-        );
-    }
-
-    // (c) REVERSE-scan sum_right_hessian running total + best_sum_left_hessian.
-    let eps = f64::from(lgbm_core::types::K_EPSILON);
-    let sum_h_bumped = sum_h_raw + 2.0 * eps;
-    eprintln!(
-        "sum_h_bumped={:.17e} (bits {:#018x})",
-        sum_h_bumped,
-        sum_h_bumped.to_bits()
-    );
-    let get_hess = |t: i32| hist[((t as usize) << 1) + 1];
-    let offset = 0i32;
-    let t_start = num_bin as i32 - 1 - offset; // 3
-    let t_end = 1 - offset; // 1
-    let mut sum_right_hessian = eps;
-    let mut t = t_start;
-    while t >= t_end {
-        let h = get_hess(t);
-        sum_right_hessian += h;
-        let sum_left_hessian = sum_h_bumped - sum_right_hessian;
-        eprintln!(
-            "(c) t={t}: +h={h:.17e} -> sum_right_h={:.17e} (bits {:#018x})  sum_left_h={:.17e} (bits {:#018x})",
-            sum_right_hessian,
-            sum_right_hessian.to_bits(),
-            sum_left_hessian,
-            sum_left_hessian.to_bits()
-        );
-        t -= 1;
-    }
-    // The winning leaf-0 split is at t==1 (threshold 0). best_sum_left_hessian is
-    // the sum_left_hessian at that iteration.
-    let golden_target = 2.0000000000000013f64;
-    eprintln!(
-        "GOLDEN-DECODED best_sum_left_hessian = {:.17e} (bits {:#018x})",
-        golden_target,
-        golden_target.to_bits()
-    );
-}
-
