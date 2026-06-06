@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Dataset + Binning (determinism root)** - Bit-identical BinMapper, columnar bin store, missing/categorical encoding, EFB, metadata, ingestion *(7/7 plans executed incl. gap-closure 02-06 + 02-07; GAP-1/GAP-2 + CR-01 + WR-01 closed — default ingest unified onto the faithful single C++ Dataset::Construct, trivial features dropped, grouping verified; ready to re-verify)* (completed 2026-06-05)
 - [x] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists) (completed 2026-06-05)
 - [x] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
-- [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity
+- [ ] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity *(8 plans bit-exact; 05-09 reached a checkpoint:decision — mfb>0 leaf-0 2-ULP not reachable by any faithful fold-order fix; user decision open)*
 - [ ] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API
 - [ ] **Phase 7: Parity-Completing Variants** - GOSS/DART/RF, categorical/EFB splits, remaining objectives/metrics, ranking, SHAP, monotone, refit, importance
 - [ ] **Phase 8: Python Bindings** - PyO3 + numpy bindings mirroring the official `lightgbm` Booster/Dataset/sklearn API
@@ -211,7 +211,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 9** *(GAP CLOSURE — follow-up: FixHistogram f64 fold-order parity; NEEDS PLANNING — no PLAN.md yet)*
 
-  - [ ] 05-09-PLAN.md — **NEEDS PLANNING (run `/gsd-plan-phase 5`).** Close the mfb>0 node-2 leaf-0 2.3e-16 ULP (one f64 ULP) by aligning the Rust FixHistogram-active DIRECT-build f64 accumulation/fold order with C++ `ConstructHistograms`/`FixHistogram` (the residual lives in the direct histogram build — leaf 0 is node-2's directly-built smaller child, NOT touched by the subtraction trick, per 05-07's disproof of the 05-08 attribution). Target the construct/FixHistogram FOLD ORDER, NOT LeafSplits seeding (the SplitInfo-sum seeding trial did not change leaf 0 and regressed leaf 3). Then un-`#[ignore]` `learner_parity_mfb_pos_real_binary` and assert bit-exact (TRL-01, TRL-05). No assertion may be weakened.
+  - [~] 05-09-PLAN.md — **CHECKPOINT:DECISION OPEN (commit `c675d3b` + SUMMARY).** Task-1 DECISIVELY LOCALIZED the mfb>0 node-2 leaf-0 2-ULP to the leaf-total `sum_hessian` SEED (which drives both FixHistogram's bin-2 reconstruction and the bumped reverse-scan denominator) — the construct fold, FixHistogram subtract-loop, and reverse-scan accumulation ORDERS are all proven bit-exact/order-independent, so the plan's fold-order hypothesis is ruled out. Task-2 attempted every faithful C++ transcription (fresh-fold seed, SplitInfo-reported seed per serial_tree_learner.cpp:875-879, subtraction-trick-derived bins): ALL reproduce Rust's current `best_sum_left_hessian = 2.0000000000000009`; the golden requires `2.0000000000000018` (back-solved from the bit-exact leaf_value `0.59999999999999953` / numerator 12.0), reachable only by a non-faithful hybrid. Per the bit-exact-or-checkpoint contract, raised a **checkpoint:decision** (NO tolerance, NO gate weakened, mfb gate stays `#[ignore]`d). User options: (1) [recommended] real-binary FP execution trace of CalculateSplittedLeafOutput operands; (2) accept the 2.3e-16 sub-ULP residual without weakening the gate; (3) Rule-4 LeafSplits/FixHistogram-seam investigation. Do NOT re-attempt LeafSplits seeding (regresses leaf 3; does not close leaf 0). See 05-09-SUMMARY.md.
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
 
@@ -272,7 +272,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 7/8 | In Progress (05-09 needs planning) |  |
+| 5. Tree Learner + Split Finding | 8/9 | Checkpoint (05-09 decision open) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |
