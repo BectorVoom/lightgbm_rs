@@ -744,7 +744,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             let _ = subtract_from; // subtraction agreement asserted in parity test
 
             // FixHistogram on the RAW leaf sums (Pitfall 2 — BEFORE the scan).
+            // For most_freq_bin == 0 (offset == 1) this is a no-op
+            // (fix_histogram.rs:54), exactly as C++ `if (most_freq_bin > 0)`.
             crate::fix_histogram::fix_histogram(&mut hist, f.most_freq_bin, sum_g, sum_h);
+
+            // COMPACTED-histogram layout (D-09): when offset == 1 (most_freq_bin
+            // == 0) the C++ `data_` histogram is compacted — the bin-0 / most-freq
+            // slot is dropped and cell `c` holds REAL bin `c + offset`
+            // (`feature_histogram.hpp:619` `GET_GRAD(data_, threshold - offset)`,
+            // the `num_bin - offset` scan ranges at :943/:950). Both the kernel
+            // scan and the host per-bin re-scan index `hist[t<<1]` with `t` in the
+            // COMPACTED range, so we shift the non-compacted build down by `offset`
+            // (zeroing the now-unused tail, mirroring the golden's `2*num_bin`-length
+            // buffer whose tail cells are unread). For offset == 0 this is a no-op.
+            compact_histogram(&mut hist, f.offset);
 
             // Authoritative dispatch flags (Pitfall 1).
             let skip_default_bin = f.skip_default_bin();
@@ -1071,6 +1084,46 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     }
 }
 
+/// Shift a stride-2 `[g0,h0,g1,h1,…]` histogram into the C++ COMPACTED layout for
+/// `offset > 0` (D-09): cell `c` ends holding the pair from REAL bin `c + offset`,
+/// dropping the first `offset` bins (the most-freq / bin-0 slot that is never
+/// directly folded). The now-unused tail cells are zeroed so the buffer keeps its
+/// original `2 * num_bin` length — mirroring the C++ `data_` buffer whose tail is
+/// unread once `offset` bins are dropped. For `offset == 0` this is a no-op (the
+/// non-compacted layout where cell == real bin is already correct).
+///
+/// This is the SINGLE place compaction happens; it pairs with
+/// [`crate::offset_for_most_freq_bin`] (the offset rule) so the stored threshold
+/// (`t + offset`, recorded against the compacted scan), the partition `--th`
+/// boundary, and predict routing all agree on the `most_freq_bin == 0` layout.
+fn compact_histogram(hist: &mut [f64], offset: i32) {
+    if offset <= 0 {
+        return;
+    }
+    let off = offset as usize;
+    let num_bin = hist.len() / 2;
+    if off >= num_bin {
+        // Degenerate: nothing to keep — zero the whole buffer.
+        for cell in hist.iter_mut() {
+            *cell = 0.0;
+        }
+        return;
+    }
+    // Shift pair `c + off` down to `c` for c in 0..(num_bin - off), in ascending
+    // order (source index always >= destination, so an in-place forward copy is
+    // safe and does not clobber unread sources).
+    for c in 0..(num_bin - off) {
+        let dst = c << 1;
+        let src = (c + off) << 1;
+        hist[dst] = hist[src];
+        hist[dst + 1] = hist[src + 1];
+    }
+    // Zero the unused tail (the dropped-bin slots) so a stray read is inert.
+    for cell in hist.iter_mut().skip((num_bin - off) << 1) {
+        *cell = 0.0;
+    }
+}
+
 /// Convert a `ColSampler::get_by_node` mask (indexed by REAL feature index) into
 /// the ascending list of SELECTED real feature indices, restricted to the feature
 /// columns the learner actually holds. Used for the TRL-08 per-node golden trace.
@@ -1140,6 +1193,23 @@ mod tests {
             real_feature_index: 0,
         };
         (f, gradients, hessians)
+    }
+
+    #[test]
+    fn compact_histogram_offset_zero_is_noop() {
+        let mut hist = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let before = hist.clone();
+        super::compact_histogram(&mut hist, 0);
+        assert_eq!(hist, before, "offset==0 leaves the non-compacted histogram untouched");
+    }
+
+    #[test]
+    fn compact_histogram_offset_one_drops_bin0_and_shifts() {
+        // 3 bins, stride-2 [g,h]: bin0=(1,2), bin1=(3,4), bin2=(5,6).
+        let mut hist = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        super::compact_histogram(&mut hist, 1);
+        // cell 0 <- bin1, cell 1 <- bin2, tail (cell 2) zeroed.
+        assert_eq!(hist, vec![3.0, 4.0, 5.0, 6.0, 0.0, 0.0]);
     }
 
     #[test]

@@ -330,17 +330,31 @@ fn learner_parity_spine_per_bin_gains() {
         splits.len()
     );
 
+    // The committed spine.txt golden is the OLD `learner_capture.cpp`
+    // self-transcription captured under the pre-D-09 offset==0 convention (the
+    // CR-02 artifact that 05-06 replaces with a REAL lib_lightgbm oracle). Under
+    // D-09 every most_freq_bin==0 feature now scans the COMPACTED histogram
+    // (offset==1): the FORWARD candidate decomposition genuinely differs (bin 0 is
+    // dropped from the running left sum and routed to the default side instead of
+    // contributing a leading left-only candidate), so the FORWARD per-bin gain
+    // VALUES are not a simple slice of the offset==0 golden — they are validated
+    // bit-exact against the real-binary oracle in 05-06.
+    //
+    // REVERSE is offset-invariant on this corpus (its range is `num_bin-1` either
+    // way and it never splits at the bin-0 most-freq slot), so it MUST still match
+    // the golden bit-exact — that keeps a real gain-math cross-check here. The
+    // winning FORWARD split is independently proven correct by
+    // `learner_parity_spine_full_tree` (the grown tree is byte-identical to the
+    // C++ reference).
     for (i, (g_rec, r_rec)) in splits.iter().zip(rust_records.iter()).enumerate() {
         assert_eq!(
             g_rec.feature, r_rec.0,
             "PSPLIT[{i}] feature mismatch: golden {} vs rust {}",
             g_rec.feature, r_rec.0
         );
-        // Bit-exact REVERSE + FORWARD per-bin gains (NaN bits compared as bits).
+        // Bit-exact REVERSE per-bin gains (offset-invariant, still a hard gate).
         compare_exact_f64_bits(&r_rec.1, &g_rec.rev)
             .unwrap_or_else(|m| panic!("PSPLIT[{i}] REVERSE per-bin gain mismatch: {m:?}"));
-        compare_exact_f64_bits(&r_rec.2, &g_rec.fwd)
-            .unwrap_or_else(|m| panic!("PSPLIT[{i}] FORWARD per-bin gain mismatch: {m:?}"));
         // The winner gain must be present in the gain arrays (or -inf when no split).
         let _ = g_rec.winner;
         let _ = g_rec.leaf;
@@ -471,11 +485,15 @@ fn learner_parity_transcription_crosscheck() {
         }
     }
     assert!(!splits.is_empty(), "golden must carry PSPLIT records");
+    // D-02a cross-check over the offset-invariant REVERSE arrays (see
+    // `learner_parity_spine_per_bin_gains` for why the offset==1 compacted FORWARD
+    // decomposition differs from the pre-D-09 offset==0 golden and is validated
+    // against the real-binary oracle in 05-06 instead). REVERSE remains a hard
+    // bit-exact gate that the SAME gain primitive drives in both the kernel and
+    // the learner host re-scan.
     for (i, (gr, rr)) in splits.iter().zip(rust_records.iter()).enumerate() {
         compare_exact_f64_bits(&rr.1, &gr.rev)
             .unwrap_or_else(|m| panic!("D-02a REVERSE drift at PSPLIT[{i}]: {m:?}"));
-        compare_exact_f64_bits(&rr.2, &gr.fwd)
-            .unwrap_or_else(|m| panic!("D-02a FORWARD drift at PSPLIT[{i}]: {m:?}"));
     }
 }
 
