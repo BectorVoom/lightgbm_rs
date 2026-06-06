@@ -175,7 +175,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Numerical threshold splits route missing/zero exactly as C++; data partition (row→leaf) feeds the subtraction trick correctly.
   5. Per-tree/per-node feature subsampling (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`) selects the same features via RNG parity, and both `force_row_wise`/`force_col_wise` strategies produce matching trees.
 
-**Plans**: 7 plans (4 original + 3 gap-closure)
+**Plans**: 8 plans (4 original + 4 gap-closure; 05-09 needs planning)
 
 **Wave 1** *(spine prerequisites — parallel; no shared files)*
 
@@ -206,7 +206,12 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 8** *(GAP CLOSURE — BLOCKED on CR-03 closure: re-validates against the real goldens, only satisfiable after 05-08)*
 
-  - [ ] 05-07-PLAN.md — WR-01/WR-02 fix (D-05): wire the dead subtraction-trick + HistogramPool into the live `find_best_splits` growth path (larger child derived by `parent − smaller`, pool slots read/reused) and re-validate bit-exact against the real lib_lightgbm goldens (TRL-01, TRL-02, TRL-05) — **re-sequenced to wave 8, `depends_on` adds 05-08; its "still matches the real goldens" gate becomes satisfiable once CR-03 is closed**
+  - [x] 05-07-PLAN.md — WR-01/WR-02 fix (D-05): wire the dead subtraction-trick + HistogramPool into the live `find_best_splits` growth path (larger child derived by `parent − smaller`, pool slots read/reused) and re-validate bit-exact against the real lib_lightgbm goldens (TRL-01, TRL-02, TRL-05) — **re-sequenced to wave 8, `depends_on` adds 05-08; its "still matches the real goldens" gate becomes satisfiable once CR-03 is closed**
+    - **✓ OUTCOME: WR-01/WR-02 CLOSED (commit 037e011).** The subtraction trick (`larger = parent − smaller` via `Backend::subtract_histograms`) + HistogramPool slot reuse are wired into the LIVE `find_best_splits` growth path (mirroring C++ serial_tree_learner.cpp:364-378); the dead `let _ = subtract_from;` discard + orphaned `_pool` are gone; `learner_parity_growth_path_subtract` proves derived-larger-child == direct build cell-for-cell AND the spine stays bit-exact. `cargo test --workspace` GREEN (learner_parity 11 passed / 1 ignored; kernel_parity 4/4); routing self-consistency holds. The mfb>0 node-2 leaf-0 2.3e-16 ULP did NOT close — its 05-08 subtraction-trick attribution is **DISPROVEN** (leaf 0 is the directly-built smaller child, untouched by subtraction); RE-ATTRIBUTED to a 2-ULP f64 accumulation-order subtlety in the FixHistogram-active DIRECT histogram build and **deferred to new plan 05-09**. The mfb gate stays `#[ignore]`d with a corrected honest reason (commit fbd4f1d); NO assertion weakened (~4 orders inside ≤1e-12). **TRL-01/TRL-02/TRL-05 satisfied for the wired path.** See 05-07-SUMMARY.md.
+
+**Wave 9** *(GAP CLOSURE — follow-up: FixHistogram f64 fold-order parity; NEEDS PLANNING — no PLAN.md yet)*
+
+  - [ ] 05-09-PLAN.md — **NEEDS PLANNING (run `/gsd-plan-phase 5`).** Close the mfb>0 node-2 leaf-0 2.3e-16 ULP (one f64 ULP) by aligning the Rust FixHistogram-active DIRECT-build f64 accumulation/fold order with C++ `ConstructHistograms`/`FixHistogram` (the residual lives in the direct histogram build — leaf 0 is node-2's directly-built smaller child, NOT touched by the subtraction trick, per 05-07's disproof of the 05-08 attribution). Target the construct/FixHistogram FOLD ORDER, NOT LeafSplits seeding (the SplitInfo-sum seeding trial did not change leaf 0 and regressed leaf 3). Then un-`#[ignore]` `learner_parity_mfb_pos_real_binary` and assert bit-exact (TRL-01, TRL-05). No assertion may be weakened.
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
 
@@ -267,7 +272,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 6/7 | In Progress|  |
+| 5. Tree Learner + Split Finding | 7/8 | In Progress (05-09 needs planning) |  |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

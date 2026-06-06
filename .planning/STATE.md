@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Completed 05-08-PLAN.md (CR-03 CLOSED: spine bit-exact; mfb>0 structural bit-exact, leaf-0 ULP deferred to 05-07)"
-last_updated: "2026-06-06T11:19:55.000Z"
-last_activity: 2026-06-06 -- Phase 05 wave 7: 05-08 CR-03 learner-fix COMPLETE; mfb>0 leaf-0 2.3e-16 ULP deferred to 05-07
+stopped_at: "Completed 05-07-PLAN.md (WR-01/WR-02 CLOSED: subtraction-trick + HistogramPool wired live; mfb>0 leaf-0 ULP re-attributed to FixHistogram f64 fold-order, deferred to new plan 05-09)"
+last_updated: "2026-06-06T12:00:00.000Z"
+last_activity: 2026-06-06 -- Phase 05 wave 8: 05-07 subtraction-trick/HistogramPool wiring COMPLETE; mfb>0 leaf-0 2.3e-16 ULP re-attributed (subtraction-trick framing DISPROVEN) to FixHistogram f64 fold-order, deferred to new plan 05-09
 progress:
   total_phases: 8
   completed_phases: 4
-  total_plans: 25
-  completed_plans: 25
-  percent: 55
+  total_plans: 26
+  completed_plans: 26
+  percent: 56
 ---
 
 # Project State
@@ -25,12 +25,24 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 05 (tree-learner-split-finding) — EXECUTING (CR-03 CLOSED via 05-08)
-Plan: 7 of 8 closed (05-08 CR-03 learner-fix COMPLETE, wave 7); 05-07 (subtraction-trick wiring) is wave 8, now UNBLOCKED
-Status: Wave 7 complete; ready to execute wave 8 (05-07 subtraction-trick/HistogramPool wiring — also closes the mfb>0 leaf-0 ULP)
-Last activity: 2026-06-06 -- 05-08 closed CR-03: spine bit-exact, mfb>0 structural bit-exact; leaf-0 2.3e-16 ULP deferred to 05-07
+Phase: 05 (tree-learner-split-finding) — EXECUTING (WR-01/WR-02 CLOSED via 05-07; new gap-closure 05-09 needs planning)
+Plan: 8 of 9 closed (05-07 subtraction-trick/HistogramPool wiring COMPLETE, wave 8); 05-09 (FixHistogram f64 fold-order parity) is wave 9, NEEDS PLANNING
+Status: Wave 8 complete; new wave 9 (05-09) registered — author it via /gsd-plan-phase 5 to close the mfb>0 leaf-0 ULP
+Last activity: 2026-06-06 -- 05-07 closed WR-01/WR-02 (subtraction-trick + pool wired live, spine bit-exact); mfb>0 leaf-0 2.3e-16 ULP re-attributed to FixHistogram f64 fold-order → 05-09
 
-Progress: [██████████] Phase 5 plans 05-01..05-06 + 05-08 COMPLETE — BLOCKER CR-03 CLOSED by 05-08. The Rust serial learner now grows trees BIT-EXACT to the real lib_lightgbm 4.6 spine golden (spine_real.txt) and STRUCTURALLY bit-exact to the mfb>0 golden (mfb_pos_real.txt) on every field (split_feature, threshold incl. the zero sentinel 1.0000000180025095e-35, decision_type=2 2 2, child topology, leaf_count with no 0-row leaf, internal_count) + 3/4 leaf values. The fix set (commit c564036): Fix B (PRIMARY) child LeafSplits direct pass-through (was swapping smaller/larger slots, feeding a child its sibling's sums → -17.99 vs 0.55); Fix A missing_type==None FORWARD-dispatch gate (decision_type 0→2); Fix C MaybeRoundToZero signed-zero normalize; Fix D bin-0 kZeroThreshold mapping. spine_real gate un-#[ignore]d + passing in the default suite; mfb_pos gate stays #[ignore]d (assertions UNCHANGED) with a narrowed reason — the ONLY residual is the node-2 default-bin leaf-0 value (Rust 0.59999999999999976 vs golden 0.59999999999999953, Δ 2.3e-16 = one f64 ULP), a kEpsilon cascade DEFERRED to 05-07's not-yet-wired subtraction-trick/HistogramPool (~4 orders of magnitude inside the ≤1e-12 contract; NO assertion weakened). Routing self-consistency (CR-01) still holds; kernel_parity stays 4/4. TRL-05/TRL-07/TRL-01/TRL-09 satisfied bit-exact on the spine vs the real binary. 05-07 (wave 8) is now UNBLOCKED — its subtraction-trick wiring also closes the mfb>0 leaf-0 ULP and un-#[ignore]s learner_parity_mfb_pos_real_binary.
+Progress: [██████████] Phase 5 plans 05-01..05-08 COMPLETE — WR-01/WR-02 CLOSED by 05-07. The subtraction trick (`larger = parent − smaller` via `Backend::subtract_histograms`) + HistogramPool slot reuse are now wired into the LIVE `find_best_splits` growth path (mirroring C++ serial_tree_learner.cpp:364-378); the dead `let _ = subtract_from;` discard + orphaned `_pool` are gone; `learner_parity_growth_path_subtract` proves derived-larger-child == direct build cell-for-cell AND the spine stays bit-exact. The mfb>0 node-2 leaf-0 2.3e-16 ULP did NOT close — its 05-08 subtraction-trick attribution is DISPROVEN (leaf 0 is the directly-built smaller child, untouched by subtraction); root cause CORRECTED to a 2-ULP f64 accumulation-order subtlety in the FixHistogram-active DIRECT histogram build, deferred to NEW plan 05-09 (FixHistogram fold-order parity). The mfb gate stays #[ignore]d with a corrected honest reason; NO assertion weakened (~4 orders inside ≤1e-12). cargo test --workspace GREEN (learner_parity 11 passed / 1 ignored; kernel_parity 4/4); routing self-consistency holds. TRL-01/TRL-02/TRL-05 satisfied for the wired path. ---- (prior) Phase 5 plans 05-01..05-06 + 05-08 — BLOCKER CR-03 CLOSED by 05-08. The Rust serial learner now grows trees BIT-EXACT to the real lib_lightgbm 4.6 spine golden (spine_real.txt) and STRUCTURALLY bit-exact to the mfb>0 golden (mfb_pos_real.txt) on every field (split_feature, threshold incl. the zero sentinel 1.0000000180025095e-35, decision_type=2 2 2, child topology, leaf_count with no 0-row leaf, internal_count) + 3/4 leaf values. The fix set (commit c564036): Fix B (PRIMARY) child LeafSplits direct pass-through (was swapping smaller/larger slots, feeding a child its sibling's sums → -17.99 vs 0.55); Fix A missing_type==None FORWARD-dispatch gate (decision_type 0→2); Fix C MaybeRoundToZero signed-zero normalize; Fix D bin-0 kZeroThreshold mapping. spine_real gate un-#[ignore]d + passing in the default suite; mfb_pos gate stays #[ignore]d (assertions UNCHANGED) with a narrowed reason — the ONLY residual is the node-2 default-bin leaf-0 value (Rust 0.59999999999999976 vs golden 0.59999999999999953, Δ 2.3e-16 = one f64 ULP), a kEpsilon cascade DEFERRED to 05-07's not-yet-wired subtraction-trick/HistogramPool (~4 orders of magnitude inside the ≤1e-12 contract; NO assertion weakened). Routing self-consistency (CR-01) still holds; kernel_parity stays 4/4. TRL-05/TRL-07/TRL-01/TRL-09 satisfied bit-exact on the spine vs the real binary. 05-07 (wave 8) is now UNBLOCKED — its subtraction-trick wiring also closes the mfb>0 leaf-0 ULP and un-#[ignore]s learner_parity_mfb_pos_real_binary.
+
+### Plan 05-07 result (WR-01/WR-02 — subtraction-trick + HistogramPool wiring CLOSED)
+
+Plan 05-07 closed WR-01/WR-02 by wiring the dead subtraction-trick + HistogramPool orchestration into the live growth path (commit 037e011), and re-attributed the surviving mfb>0 leaf-0 ULP:
+
+- **WR-02 CLOSED — subtraction trick live:** `find_best_splits` now builds only the SMALLER child directly via `construct_histograms` and DERIVES the LARGER child as `parent − smaller` via `Backend::subtract_histograms` (learner.rs:736), mirroring C++ serial_tree_learner.cpp:364-378. The dead `let _ = subtract_from;` discard is removed (`subtract_from` now selects the parent slot); the root still builds directly.
+- **WR-01 CLOSED — HistogramPool live:** `_pool` renamed to `pool` and READ — the parent leaf's retained histogram is fetched from its pool slot, children occupy pool slots (smaller built, larger derived); D-05 pool/eviction reused unchanged.
+- **`learner_parity_growth_path_subtract` gate:** asserts the derived larger-child histogram == an independent direct build cell-for-cell (bit-exact f64) AND the grown spine tree still matches the real lib_lightgbm 4.6 golden — proving the wiring changed the DERIVATION path only, not the output.
+- **mfb>0 leaf-0 2.3e-16 ULP RE-ATTRIBUTED (05-08 framing DISPROVEN):** the ULP did NOT close with the wiring. Leaf 0 is node-2's **directly-built smaller child**, so the subtraction trick NEVER touches it — the 05-08 attribution (kEpsilon cascade from the not-yet-wired subtraction-trick/HistogramPool) is disproven. Root cause CORRECTED to a **2-ULP f64 accumulation-order subtlety in the FixHistogram-active DIRECT histogram build** (construct/FixHistogram/output fold). The prior executor trialed the C++-faithful SplitInfo-sum LeafSplits seeding (serial_tree_learner.cpp:850-870) — it did NOT change leaf 0 and REGRESSED leaf 3 — so 05-09 must target the construct/FixHistogram fold order, NOT LeafSplits seeding. Deferred to NEW plan 05-09. mfb gate stays #[ignore]d with a corrected honest reason; NO assertion weakened, tolerance-wrapped, or deleted.
+- `cargo test --workspace` GREEN (learner_parity 11 passed / 1 ignored; kernel_parity 4/4). Routing self-consistency (CR-01) holds. `LightGBM/` never git-added. Commits: 037e011 (Task 1+2 wiring + growth_path_subtract gate), fbd4f1d (mfb gate reason correction → 05-09).
+
+Next: `/gsd-plan-phase 5` authors NEW plan 05-09 (FixHistogram f64 fold-order parity) — align the Rust FixHistogram-active direct-build f64 accumulation/fold order with C++ `ConstructHistograms`/`FixHistogram`, then un-#[ignore] `learner_parity_mfb_pos_real_binary` and assert bit-exact (TRL-01, TRL-05). 05-09 has no PLAN.md yet.
 
 ### Plan 05-08 result (CR-03 learner-fix — CR-03 CLOSED)
 
@@ -215,6 +227,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 05 P03 | 25min | 3 tasks | 14 files |
 | Phase 05 P05 | 13min | 3 tasks | 3 files |
 | Phase 05 P08 | closeout | 3 tasks | 5 files |
+| Phase 05 P07 | closeout | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -260,7 +273,9 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 05]: 05-05: CR-01 root cause = single-feature-group min_bin — C++ FeatureGroup::Split(num_feature_==1) dispatches to DenseBin::Split(max_bin,...) hard-coding min_bin=1; passing min_bin+offset collapses the verbatim --th to th=threshold so partition (bin>th right) == predict (bin<=threshold left). Raw min_bin=0 gave the [4,8] vs [6,6] off-by-one. Closed by the oracle-INDEPENDENT routing test (get_leaf tally == data_partition leaf_count).
 - [Phase ?]: [Phase 05]: 05-05: the pre-D-09 learner_capture.cpp full-tree/per-bin goldens (spine/col_wise/real_gh) share the buggy convention (CR-02) so their assertions are SUPERSEDED by 05-06's real lib_lightgbm oracle; row==col equality + routing self-consistency stay live.
 - [Phase 05]: 05-08: CR-03 CLOSED — the Rust learner is bit-exact to the real lib_lightgbm 4.6 spine golden and structurally bit-exact to the mfb>0 golden. PRIMARY root cause was the child LeafSplits slot mapping (Fix B: a DIRECT pass-through mirroring C++ smaller_leaf_splits_/larger_leaf_splits_, NOT keyed off smaller==left — the prior swap fed a child its sibling's sums, −17.99 vs 0.55), not the FORWARD-dispatch gate (Fix A, which only fixed decision_type). Plus Fix C (MaybeRoundToZero −0.0→+0 in the shrinkage finalize) and Fix D (bin-0 → float32 kZeroThreshold 1.0000000180025095e-35).
-- [Phase 05]: 05-08: the mfb>0 node-2 leaf-0 residual (Rust 0.59999999999999976 vs golden 0.59999999999999953, Δ 2.3e-16 = one f64 ULP) is DEFERRED to 05-07 (user decision). It is a kEpsilon cascade from the not-yet-wired subtraction-trick/HistogramPool (05-07's explicit scope), ~4 orders of magnitude inside the ≤1e-12 contract. The mfb_pos gate stays #[ignore]d with a narrowed honest reason; NO assertion weakened, tolerance-wrapped, or deleted.
+- [Phase 05]: 05-08: the mfb>0 node-2 leaf-0 residual (Rust 0.59999999999999976 vs golden 0.59999999999999953, Δ 2.3e-16 = one f64 ULP) is DEFERRED to 05-07 (user decision). It is a kEpsilon cascade from the not-yet-wired subtraction-trick/HistogramPool (05-07's explicit scope), ~4 orders of magnitude inside the ≤1e-12 contract. The mfb_pos gate stays #[ignore]d with a narrowed honest reason; NO assertion weakened, tolerance-wrapped, or deleted. [SUPERSEDED by 05-07: the subtraction-trick attribution was DISPROVEN — see next entry.]
+- [Phase 05]: 05-07: WR-01/WR-02 CLOSED — the subtraction trick (`larger = parent − smaller` via Backend::subtract_histograms) + HistogramPool slot reuse are wired into the LIVE find_best_splits growth path (mirroring C++ serial_tree_learner.cpp:364-378); the dead `let _ = subtract_from;` + orphaned `_pool` are gone; learner_parity_growth_path_subtract proves derived-larger-child == direct build bit-exact AND the spine stays bit-exact. Commit 037e011.
+- [Phase 05]: 05-07: the mfb>0 node-2 leaf-0 2.3e-16 ULP did NOT close with the subtraction wiring. ROOT CAUSE CORRECTED — leaf 0 is node-2's DIRECTLY-BUILT smaller child, so the subtraction trick never touches it; the 05-08 subtraction-trick/kEpsilon-cascade attribution is DISPROVEN. The residual is a 2-ULP f64 ACCUMULATION-ORDER subtlety in the FixHistogram-active DIRECT histogram build (construct/FixHistogram/output fold). The SplitInfo-sum LeafSplits seeding trial (serial_tree_learner.cpp:850-870) did NOT change leaf 0 and REGRESSED leaf 3 → 05-09 targets the construct/FixHistogram FOLD ORDER, not LeafSplits seeding. Deferred to NEW plan 05-09; mfb gate stays #[ignore]d with a corrected reason, NO assertion weakened.
 
 ### Pending Todos
 
@@ -284,6 +299,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-06T11:19:55.000Z
-Stopped at: Completed 05-08-PLAN.md (CR-03 CLOSED; mfb>0 leaf-0 ULP deferred to 05-07)
+Last session: 2026-06-06T12:00:00.000Z
+Stopped at: Completed 05-07-PLAN.md (WR-01/WR-02 CLOSED: subtraction-trick + HistogramPool wired live; mfb>0 leaf-0 ULP re-attributed to FixHistogram f64 fold-order, deferred to new plan 05-09 — NEEDS PLANNING)
 Resume file: None
