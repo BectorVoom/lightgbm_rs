@@ -235,7 +235,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 2** *(blocked on 06-01 — the minimal end-to-end spine, D-14/D-15)*
 
-  - [ ] 06-02-PLAN.md — regression(L2) + l2/rmse + GBDT loop + f64 ScoreUpdater + boost_from_average + builder→Config/Booster/train/predict; spine L1–L5 real-binary goldens; resolve Open-Q1/Q2
+  - [x] 06-02-PLAN.md — regression(L2) + l2/rmse + GBDT loop + f64 ScoreUpdater + boost_from_average + builder→Config/Booster/train/predict; spine L1–L5 real-binary goldens; resolve Open-Q1/Q2
 
 **Wave 3** *(blocked on 06-02 — objective/metric breadth, D-17 step 1)*
 
@@ -293,6 +293,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
-| 6. GBDT Spine + Core Objectives/Metrics | 1/5 | In Progress|  |
+| 6. GBDT Spine + Core Objectives/Metrics | 2/5 | In Progress|  |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

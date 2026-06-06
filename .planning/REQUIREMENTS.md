@@ -56,7 +56,7 @@
 
 ### Objective Functions
 
-- [ ] **OBJ-01**: Core objectives — `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`
+- [x] **OBJ-01**: Core objectives — `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`
 - [ ] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
 - [x] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`
@@ -65,7 +65,7 @@
 
 ### Metrics
 
-- [ ] **MET-01**: Core metrics — `l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`
+- [x] **MET-01**: Core metrics — `l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`
 - [ ] **MET-02**: Metric infrastructure — multi-metric lists, `metric_freq`, `is_provide_training_metric`, training-metric eval
 - [ ] **MET-03**: Extended regression/xentropy metrics — `quantile`, `huber`, `fair`, `poisson`, `mape`, `gamma`, `gamma_deviance`, `tweedie`, `multi_error`, `cross_entropy`, `cross_entropy_lambda`, `kullback_leibler`, `average_precision`, `auc_mu`
 - [ ] **MET-04**: Ranking metrics — `ndcg`, `map` (DCGCalculator static tables, `eval_at`/`ndcg_eval_at`, per-query)
@@ -106,7 +106,7 @@
 
 ### APIs
 
-- [ ] **API-01**: Rust-native API — `Dataset`, `Booster`, `train`, `predict` mirroring LightGBM semantics
+- [x] **API-01**: Rust-native API — `Dataset`, `Booster`, `train`, `predict` mirroring LightGBM semantics
 - [ ] **PYB-01**: Python bindings (PyO3 + maturin) mirroring the official `lightgbm` `Booster`/`Dataset` API
 - [ ] **PYB-02**: NumPy interop (rust-numpy) for dense/sparse input and array outputs
 - [ ] **PYB-03**: Python sklearn-style wrapper API (`LGBMClassifier`/`LGBMRegressor`/`LGBMRanker`) parity
@@ -186,12 +186,12 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | BST-02 | Phase 6 | Complete |
 | BST-03 | Phase 6 | Pending |
 | BST-07 | Phase 6 | Pending |
-| OBJ-01 | Phase 6 | Pending |
+| OBJ-01 | Phase 6 | Complete |
 | OBJ-02 | Phase 6 | Pending |
 | OBJ-03 | Phase 6 | Complete |
-| MET-01 | Phase 6 | Pending |
+| MET-01 | Phase 6 | Complete |
 | MET-02 | Phase 6 | Pending |
-| API-01 | Phase 6 | Pending |
+| API-01 | Phase 6 | Complete |
 | BST-04 | Phase 7 | Pending |
 | BST-05 | Phase 7 | Pending |
 | BST-06 | Phase 7 | Pending |

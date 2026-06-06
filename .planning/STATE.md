@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 6 context gathered
-last_updated: "2026-06-06T23:35:04.947Z"
+last_updated: "2026-06-06T23:59:13.196Z"
 last_activity: 2026-06-06 -- Phase 06 execution started
 progress:
   total_phases: 8
   completed_phases: 5
   total_plans: 32
-  completed_plans: 28
+  completed_plans: 29
   percent: 63
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 06 (gbdt-spine-core-objectives-metrics) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-06-06 -- Phase 06 execution started
 
@@ -230,6 +230,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 05 P07 | closeout | 2 tasks | 3 files |
 | Phase 5 P9 | checkpoint | 1 tasks | 2 files |
 | Phase 06 P01 | 6min | 3 tasks | 19 files |
+| Phase 06 P02 | 40min | 3 tasks | 26 files |
 
 ## Accumulated Context
 
@@ -280,6 +281,8 @@ Recent decisions affecting current work:
 - [Phase 05]: 05-07: the mfb>0 node-2 leaf-0 2.3e-16 ULP did NOT close with the subtraction wiring. ROOT CAUSE CORRECTED — leaf 0 is node-2's DIRECTLY-BUILT smaller child, so the subtraction trick never touches it; the 05-08 subtraction-trick/kEpsilon-cascade attribution is DISPROVEN. The residual is a 2-ULP f64 ACCUMULATION-ORDER subtlety in the FixHistogram-active DIRECT histogram build (construct/FixHistogram/output fold). The SplitInfo-sum LeafSplits seeding trial (serial_tree_learner.cpp:850-870) did NOT change leaf 0 and REGRESSED leaf 3 → 05-09 targets the construct/FixHistogram FOLD ORDER, not LeafSplits seeding. Deferred to NEW plan 05-09; mfb gate stays #[ignore]d with a corrected reason, NO assertion weakened.
 - [Phase ?]: Phase 6 Wave-0: four engine crates (objective/metric/boosting/lgbm) scaffolded with thiserror boundaries; lgbm-boosting names no GPU compute runtime (CMP-01).
 - [Phase ?]: renew_tree_output seam uses Option<closure> not an objective trait (lgbm-treelearner stays free of lgbm-objective); add_prediction_to_score takes &DataPartition explicitly.
+- [Phase ?]: 06-02: L2 score golden is BIT-EXACT (predict(raw,k)==internal score_); phase-wide L2 contract recorded for 06-05
+- [Phase ?]: 06-02: ConvertOutput stays in lgbm-model (Open-Q1); lgbm-objective owns training side only, re-exports it
 
 ### Pending Todos
 
@@ -306,6 +309,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-06T23:34:59.920Z
+Last session: 2026-06-06T23:58:45.875Z
 Stopped at: Phase 6 context gathered
 Resume file: .planning/phases/06-gbdt-spine-core-objectives-metrics/06-CONTEXT.md
