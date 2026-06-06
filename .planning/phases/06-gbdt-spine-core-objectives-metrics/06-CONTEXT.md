@@ -11,7 +11,7 @@ Phase 6 delivers the **first end-to-end ~1e-6 (f32) train→predict run** — th
 In scope (BST-01, BST-02, BST-03, BST-07, OBJ-01, OBJ-02, OBJ-03, MET-01, MET-02, API-01):
 - **BST-01** — GBDT training loop: `TrainOneIter`, `UpdateScore`, per-class trees, shrinkage (`learning_rate`), `boost_from_average`.
 - **BST-02** — score updater accumulation with deterministic reduction ordering.
-- **BST-03** — bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) selecting the **same rows** via RNG-matching draw sequence + call order.
+- **BST-03** — bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg) selecting the **same rows** via RNG-matching draw sequence + call order. _(Scope note, decided 2026-06-07 plan-phase verification: `bagging_by_query` — the query-grouped draw — is **deferred to Phase 7**. It only does anything with a ranking/query objective, and Phase 6 ships none (all ranking objectives are Phase 7, OBJ-04/05/06). Phase 6 keeps a negative guard against `bagging_by_query` but does not implement the query-grouped path; it ships alongside the Phase-7 ranking objectives that exercise it.)_
 - **BST-07** — early stopping (`early_stopping_round`, `first_metric_only`, `early_stopping_min_delta`).
 - **OBJ-01** — core objectives: `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`.
 - **OBJ-02** — `custom` objective (user-supplied grad/hess pass-through).
@@ -160,6 +160,7 @@ Out of scope (explicitly deferred):
 - **GOSS / DART / Random Forest** boosting variants — Phase 7 (BST-04/05/06). This phase builds the plain-GBDT spine only.
 - **Categorical / EFB splits** (TRL-06) — Phase 7.
 - **Remaining objectives** (huber/fair/poisson/quantile/mape/gamma/tweedie, cross-entropy, ranking/lambdarank/rank_xendcg) — Phase 7 (OBJ-04/05/06).
+- **`bagging_by_query`** (query-grouped row subsampling, part of BST-03) — **Phase 7.** Decided 2026-06-07 (plan-phase verification): query-grouped bagging only applies with a ranking/query objective, none of which are in Phase 6's objective set. Phase 6 implements pos/neg row bagging with bit-exact RNG-replay parity (BST-03 / D-13) and keeps a negative guard against `bagging_by_query`; the query-grouped draw (`num_sampled_queries`/`sampled_query_indices`, `gbdt.cpp:227`, `bagging.hpp` query branch) ships in Phase 7 alongside the ranking objectives that exercise it.
 - **Extended + ranking metrics** (ndcg/map/average_precision/auc_mu/...) and per-query metric eval — Phase 7 (MET-03/04).
 - **SHAP/`predict_contrib`, prediction early stopping, monotone/interaction constraints, forced splits/bins, extra-trees, CEGB, refit/continue-training, feature importance** — Phase 7.
 - **Python/PyO3 bindings** — Phase 8 (this phase's API is shaped to map 1:1).

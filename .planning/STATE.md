@@ -4,7 +4,7 @@ milestone: v1.0
 milestone_name: milestone
 status: completed
 stopped_at: Phase 6 context gathered
-last_updated: "2026-06-06T22:36:17.239Z"
+last_updated: "2026-06-06T23:14:56.987Z"
 last_activity: "2026-06-06 -- 05-09 closed the mfb>0 leaf-0 2-ULP bit-exact via a real lib_lightgbm 4.6 FP trace. Ground truth: the corpus is sparse so the real binary collapses most_freq_bin=0/offset=1 (harness mislabeled it 2/offset=0, spuriously activating FixHistogram); C++ seeds child LeafSplits from the parent SplitInfo (kEpsilon provenance), not a re-fold. Fixed both. Commit 2ced5a2."
 progress:
   total_phases: 8
