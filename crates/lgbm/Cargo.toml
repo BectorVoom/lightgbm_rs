@@ -1,0 +1,15 @@
+[package]
+name = "lgbm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+lgbm-model = { path = "../lgbm-model" }
+lgbm-treelearner = { path = "../lgbm-treelearner" }
+lgbm-objective = { path = "../lgbm-objective" }
+lgbm-metric = { path = "../lgbm-metric" }
+lgbm-boosting = { path = "../lgbm-boosting" }
+thiserror = { workspace = true }

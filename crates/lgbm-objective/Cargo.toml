@@ -1,0 +1,16 @@
+[package]
+name = "lgbm-objective"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+# Reuse `lgbm-model::ObjectiveKind::convert_output` for the predict-side transform
+# (Open-Q1: ConvertOutput stays in lgbm-model; this crate owns the training side).
+lgbm-model = { path = "../lgbm-model" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

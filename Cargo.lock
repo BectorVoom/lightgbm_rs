@@ -1725,6 +1725,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "lgbm"
+version = "0.1.0"
+dependencies = [
+ "lgbm-boosting",
+ "lgbm-core",
+ "lgbm-dataset",
+ "lgbm-metric",
+ "lgbm-model",
+ "lgbm-objective",
+ "lgbm-treelearner",
+ "thiserror",
+]
+
+[[package]]
+name = "lgbm-boosting"
+version = "0.1.0"
+dependencies = [
+ "lgbm-core",
+ "lgbm-dataset",
+ "lgbm-metric",
+ "lgbm-model",
+ "lgbm-objective",
+ "lgbm-treelearner",
+ "oracle-harness",
+ "thiserror",
+]
+
+[[package]]
 name = "lgbm-compute"
 version = "0.1.0"
 dependencies = [
@@ -1753,12 +1781,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "lgbm-metric"
+version = "0.1.0"
+dependencies = [
+ "lgbm-core",
+ "lgbm-dataset",
+ "lgbm-model",
+ "oracle-harness",
+ "thiserror",
+]
+
+[[package]]
 name = "lgbm-model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "lgbm-core",
  "lgbm-dataset",
+ "oracle-harness",
+ "thiserror",
+]
+
+[[package]]
+name = "lgbm-objective"
+version = "0.1.0"
+dependencies = [
+ "lgbm-core",
+ "lgbm-dataset",
+ "lgbm-model",
  "oracle-harness",
  "thiserror",
 ]

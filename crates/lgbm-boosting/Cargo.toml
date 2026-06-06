@@ -1,0 +1,22 @@
+[package]
+name = "lgbm-boosting"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+lgbm-model = { path = "../lgbm-model" }
+# The boosting loop drives the Phase-5 SerialTreeLearner via its existing public
+# API — it never names a compute runtime. CMP-01 containment: like
+# `lgbm-treelearner`, this crate has NO GPU-compute-runtime dependency and does
+# not depend on `lgbm-compute`; the compute seam stays isolated below the learner.
+# (Mirror of the comment block in `crates/lgbm-treelearner/Cargo.toml`.)
+lgbm-treelearner = { path = "../lgbm-treelearner" }
+lgbm-objective = { path = "../lgbm-objective" }
+lgbm-metric = { path = "../lgbm-metric" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

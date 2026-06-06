@@ -6,6 +6,10 @@ members = [
     "crates/lgbm-dataset",
     "crates/lgbm-model",
     "crates/lgbm-treelearner",
+    "crates/lgbm-objective",
+    "crates/lgbm-metric",
+    "crates/lgbm-boosting",
+    "crates/lgbm",
     "crates/oracle-harness",
     "xtask",
 ]
