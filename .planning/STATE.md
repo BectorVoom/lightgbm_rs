@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 05-05-PLAN.md
-last_updated: "2026-06-06T02:49:55.877Z"
-last_activity: 2026-06-06 -- Phase 05 plan 05-05 (CR-01 closure) complete
+status: blocked
+stopped_at: "Completed 05-06-PLAN.md — CR-02 closed but port FALSIFIED (BLOCKER CR-03); 05-07 blocked on CR-03 fix"
+last_updated: "2026-06-06T00:00:00.000Z"
+last_activity: 2026-06-06 -- Phase 05 plan 05-06 closed (real lib_lightgbm oracle captured; port falsified → CR-03 raised)
 progress:
   total_phases: 8
   completed_phases: 4
   total_plans: 25
-  completed_plans: 23
-  percent: 50
+  completed_plans: 24
+  percent: 52
 ---
 
 # Project State
@@ -25,12 +25,23 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 05 (tree-learner-split-finding) — EXECUTING
-Plan: 6 of 7 (05-05 gap-closure COMPLETE; next 05-06)
-Status: Ready to execute 05-06
-Last activity: 2026-06-06 -- Phase 05 plan 05-05 (CR-01 closure) complete
+Phase: 05 (tree-learner-split-finding) — BLOCKED (CR-03)
+Plan: 6 of 7 closed (05-06 COMPLETE — real oracle captured, port FALSIFIED); 05-07 BLOCKED on CR-03
+Status: BLOCKED — needs a NEW learner-fix plan (05-08) to close BLOCKER CR-03 before 05-07
+Last activity: 2026-06-06 -- Phase 05 plan 05-06 closed (CR-02 closed; CR-03 raised)
 
-Progress: [█████████░] Phase 5 plans 05-01..05-05 COMPLETE — 05-05 closed CR-01 (BLOCKER) per D-09: a SINGLE offset_for_most_freq_bin helper (most_freq_bin==0 -> offset 1) + compacted offset==1 histogram + the single-feature-group min_bin (min_bin+offset, mirroring DenseBin::Split(max_bin,...)'s hard-coded min_bin=1) make the stored threshold / partition --th / predict fval<=threshold all agree. An oracle-INDEPENDENT learner_parity_routing_self_consistency (get_leaf tally == data_partition leaf_count) reproduces+passes the [4,8] vs [6,6] divergence. The pre-D-09 self-transcription full-tree/per-bin goldens (CR-02) are superseded by 05-06's real lib_lightgbm oracle; row==col equality stays live. kernel_parity 4/4 bit-exact; cargo test --workspace green.
+Progress: [█████████░] Phase 5 plans 05-01..05-06 COMPLETE — but 05-06's REAL lib_lightgbm 4.6 oracle FALSIFIED the port → BLOCKER CR-03. The Rust serial learner grows structurally wrong trees vs the real binary (wrong split points / mis-partitioned leaf_count / leaf outputs like -17.99 vs 0.55; on the most_freq_bin>0 corpus: a 0-row leaf [4,6,0,2], decision_type[0]=0≠2, and a missed zero-sentinel threshold 1.0000000180025095e-35 on the offset==1 default-bin split). CR-02 (real-oracle existence) is CLOSED; the two real-binary gates (learner_parity_{spine,mfb_pos}_real_binary) are committed #[ignore]d as live, un-weakened records. TRL-09/TRL-05/TRL-01 are NOT satisfied — deferred to CR-03 closure. 05-07 (wire subtraction-trick+pool) is BLOCKED because its "re-validate bit-exact against the real goldens" gate cannot pass until the learner matches the real oracle.
+
+### Plan 05-06 result (gap closure — CR-02 closed; BLOCKER CR-03 raised)
+
+Plan 05-06 replaced the self-transcription learner oracle with a REAL pip-installed lib_lightgbm 4.6 binary oracle (D-08) — and the real oracle falsified the port:
+
+- **Real-binary oracle (CR-02 CLOSED):** `learner-oracle-capture` xtask + `xtask/py/learner_oracle_capture.py` train the spine + a NEW most_freq_bin>0 corpus on real `lightgbm==4.6.0` (`deterministic=true force_row_wise=true num_threads=1`, fixed seed), version-assert the wheel, and dump `%.17g` model text to committed `spine_real.txt` / `mfb_pos_real.txt`. Identity-binning pin (consecutive-integer raw values + assert-or-abort on realized bin count/most_freq_bin) rules out a bin-layout artifact. Byte-idempotent; routine `cargo test` needs no toolchain; `LightGBM/` never git-added.
+- **Port FALSIFIED → CR-03 (new BLOCKER):** `learner_parity_spine_real_binary` + `learner_parity_mfb_pos_real_binary` compare the Rust-grown tree to the real goldens bit-exact and FAIL. The divergence is the learner's offset/compaction scan + leaf-output + default-bin (zero-sentinel) + `decision_type` path — distinct from CR-01 (routing self-consistency, closed 05-05) and CR-02 (oracle existence, closed here). The CR-01 routing test only proved internal consistency; it could not see a wrong tree because it never compared to a real oracle — exactly the self-validation gap D-08 set out to expose.
+- **Gates preserved, not weakened:** both real-binary tests are `#[ignore]`d with the divergence specifics in their ignore reason + doc comment; run `cargo test -p oracle-harness --test learner_parity -- --ignored` to see the failures. Do NOT delete or relax them.
+- `cargo test -p oracle-harness --test learner_parity` → 9 passed, 2 ignored. Commits: ee46f4c (Task 1), 6d11d35 (Task 2 — human-gated capture), e0c1312 (Task 3 — falsifies CR-03).
+
+Next: this phase is BLOCKED on CR-03. Author a NEW learner-fix plan (e.g. 05-08) via `/gsd-plan-phase 5` (or `/gsd-discuss-phase 5` first) to make the serial learner reproduce the real goldens bit-exact (fix the spine + mfb>0 divergences above), then un-`#[ignore]` the two gates. Only AFTER CR-03 closes can `/gsd-execute-phase 5 --wave 6` run 05-07 (its re-validation gate then has a chance to pass).
 
 ### Plan 05-05 result (gap closure — CR-01 BLOCKER)
 

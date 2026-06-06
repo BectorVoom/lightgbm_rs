@@ -196,11 +196,16 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 5** *(GAP CLOSURE — blocked on 05-05)*
 
-  - [ ] 05-06-PLAN.md — CR-02 fix (D-08): real `lib_lightgbm` 4.6 oracle — `learner-oracle-capture` xtask + python dumper trains the spine + a new `most_freq_bin>0` corpus deterministically (`deterministic=true force_row_wise=true num_threads=1` fixed seed) on the pip wheel's real binary, commits `spine_real.txt`/`mfb_pos_real.txt`, and validates the Rust learner bit-exact incl. the previously-uncovered offset==1 path (TRL-09, TRL-05, TRL-01) [human-gated capture]
+  - [x] 05-06-PLAN.md — CR-02 fix (D-08): real `lib_lightgbm` 4.6 oracle — `learner-oracle-capture` xtask + python dumper trains the spine + a new `most_freq_bin>0` corpus deterministically (`deterministic=true force_row_wise=true num_threads=1` fixed seed) on the pip wheel's real binary, commits `spine_real.txt`/`mfb_pos_real.txt`, and validates the Rust learner bit-exact incl. the previously-uncovered offset==1 path (TRL-09, TRL-05, TRL-01) [human-gated capture]
+    - **⚠ OUTCOME: CR-02 CLOSED (real oracle exists), but the port is FALSIFIED → new BLOCKER CR-03.** The real binary exposed that the Rust serial learner grows structurally wrong trees (wrong split points / mis-partitioned `leaf_count` / leaf outputs like `-17.99` vs `0.55`; mfb>0: 0-row leaf, missing zero-sentinel split, `decision_type` 0≠2). The two real-binary gates are committed `#[ignore]`d (live record, not weakened). **TRL-09/TRL-05/TRL-01 are NOT satisfied** — deferred to a CR-03 learner-fix plan. See 05-06-SUMMARY.md.
 
-**Wave 6** *(GAP CLOSURE — blocked on 05-05 + 05-06)*
+**Wave 6** *(GAP CLOSURE — BLOCKED on CR-03: 05-07's "re-validate bit-exact against the real goldens" gate cannot pass until the learner matches the real oracle)*
 
-  - [ ] 05-07-PLAN.md — WR-01/WR-02 fix (D-05): wire the dead subtraction-trick + HistogramPool into the live `find_best_splits` growth path (larger child derived by `parent − smaller`, pool slots read/reused) and re-validate bit-exact against the real lib_lightgbm goldens (TRL-01, TRL-02, TRL-05)
+  - [ ] 05-07-PLAN.md — WR-01/WR-02 fix (D-05): wire the dead subtraction-trick + HistogramPool into the live `find_best_splits` growth path (larger child derived by `parent − smaller`, pool slots read/reused) and re-validate bit-exact against the real lib_lightgbm goldens (TRL-01, TRL-02, TRL-05) — **BLOCKED: depends on CR-03 closure (05-06 falsified the port; this plan assumes a parity that does not yet hold)**
+
+**Wave 7** *(GAP CLOSURE — NEW, to be planned: closes BLOCKER CR-03 before 05-07)*
+
+  - [ ] 05-08 (TO PLAN) — CR-03 fix: make the Rust serial learner reproduce the real `lib_lightgbm` 4.6 goldens bit-exact (spine + most_freq_bin>0). Fix the offset/compaction scan + leaf-output + default-bin (zero-sentinel) + `decision_type` divergences surfaced by 05-06's `learner_parity_spine_real_binary` / `learner_parity_mfb_pos_real_binary`, then un-`#[ignore]` those gates. Run `/gsd-plan-phase 5` (or `/gsd-discuss-phase 5`) to author it.
 
 ### Phase 6: GBDT Spine + Core Objectives/Metrics
 
@@ -261,7 +266,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 2. Dataset + Binning | 7/7 | Complete    | 2026-06-05 |
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
-| 5. Tree Learner + Split Finding | 5/7 | In Progress|  |
+| 5. Tree Learner + Split Finding | 6/7 | In Progress|  |
 | 6. GBDT Spine + Core Objectives/Metrics | 0/TBD | Not started | - |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |
