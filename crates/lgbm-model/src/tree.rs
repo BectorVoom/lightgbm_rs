@@ -610,6 +610,53 @@ impl Tree {
             threshold_in_bin: vec![0u32; n_internal as usize],
         })
     }
+
+    /// C++ `Tree::Shrinkage(double rate)` (`tree.h:188`).
+    ///
+    /// Multiplies every `leaf_value_` and `internal_value_` entry by `rate`,
+    /// snapping each product to `+0.0` via [`maybe_round_to_zero`] (the C++
+    /// `MaybeRoundToZero`, `tree.h:258`), and records `shrinkage_ = rate`. This is
+    /// the per-tree learning-rate scaling applied in the GBDT loop BEFORE the score
+    /// update (RESEARCH Pitfall 5 critical-ordering note).
+    pub fn shrinkage(&mut self, rate: f64) {
+        for v in &mut self.leaf_value {
+            *v = maybe_round_to_zero(*v * rate);
+        }
+        for v in &mut self.internal_value {
+            *v = maybe_round_to_zero(*v * rate);
+        }
+        self.shrinkage = rate;
+    }
+
+    /// C++ `Tree::AddBias(double val)` (`tree.h:213`).
+    ///
+    /// Adds `val` to every `leaf_value_` and `internal_value_` entry (each snapped
+    /// via [`maybe_round_to_zero`] / `MaybeRoundToZero`, `tree.h:258`). This is a
+    /// MODEL-TEXT-only adjustment (the init-score baseline folded into the first
+    /// tree) — it does NOT touch any score buffer (RESEARCH Pitfall 5). The C++
+    /// `AddBias` does not change `shrinkage_`.
+    pub fn add_bias(&mut self, val: f64) {
+        for v in &mut self.leaf_value {
+            *v = maybe_round_to_zero(*v + val);
+        }
+        for v in &mut self.internal_value {
+            *v = maybe_round_to_zero(*v + val);
+        }
+    }
+}
+
+/// C++ `Tree::MaybeRoundToZero` (`tree.h:258`): `IsZero(fval) ? 0 : fval`.
+///
+/// Snaps a magnitude below `kZeroThreshold` (1e-35) to a NORMALIZED `+0.0`
+/// (so a `-0.0` product can never leak into the model text — matches the C++
+/// signed-zero behavior relied on by the learner-parity goldens).
+#[inline]
+fn maybe_round_to_zero(fval: f64) -> f64 {
+    if is_zero(fval) {
+        0.0 // normalized +0.0 (never -0.0)
+    } else {
+        fval
+    }
 }
 
 // --- formatting helpers (ToString) ---
@@ -1073,5 +1120,62 @@ mod tests {
         let t = tiny_tree();
         let _ = t.predict(&[f64::NAN]);
         let _ = t.predict(&[f64::INFINITY]);
+    }
+
+    #[test]
+    fn tree_shrinkage_scales_all_values_and_sets_field() {
+        // C++ Tree::Shrinkage (tree.h:188): multiply every leaf + internal value
+        // by `rate` and record shrinkage_ = rate.
+        let mut t = tiny_tree();
+        t.internal_value = vec![15.0];
+        t.shrinkage(0.1);
+        assert_eq!(t.leaf_value, vec![1.0, 2.0]);
+        assert_eq!(t.internal_value, vec![1.5]);
+        assert_eq!(t.shrinkage, 0.1);
+    }
+
+    #[test]
+    fn tree_add_bias_adds_to_all_values_and_keeps_shrinkage() {
+        // C++ Tree::AddBias (tree.h:213): add `val` to every leaf + internal value;
+        // does NOT touch shrinkage_.
+        let mut t = tiny_tree();
+        t.internal_value = vec![5.0];
+        let before = t.shrinkage;
+        t.add_bias(3.0);
+        assert_eq!(t.leaf_value, vec![13.0, 23.0]);
+        assert_eq!(t.internal_value, vec![8.0]);
+        assert_eq!(t.shrinkage, before);
+    }
+
+    #[test]
+    fn tree_shrinkage_snaps_tiny_to_positive_zero() {
+        // A product with |v| < kZeroThreshold (1e-35) snaps to +0.0 (signed-zero
+        // normalized) — C++ MaybeRoundToZero (tree.h:258).
+        let mut t = tiny_tree();
+        t.leaf_value = vec![1e-30, -1e-30];
+        t.internal_value = vec![-1e-30];
+        t.shrinkage(1e-10); // products ~1e-40 < kZeroThreshold -> +0.0
+        for &v in &t.leaf_value {
+            assert_eq!(v, 0.0);
+            assert!(v.is_sign_positive(), "must be +0.0, not -0.0");
+        }
+        assert_eq!(t.internal_value[0], 0.0);
+        assert!(t.internal_value[0].is_sign_positive());
+    }
+
+    #[test]
+    fn tree_add_bias_snaps_tiny_to_positive_zero() {
+        let mut t = tiny_tree();
+        t.leaf_value = vec![0.0, 0.0];
+        t.internal_value = vec![1e-40];
+        // adding a tiny negative to a tiny positive keeps |v| < kZeroThreshold
+        // (1e-35), so MaybeRoundToZero snaps to +0.0.
+        t.add_bias(-1e-40);
+        for &v in &t.leaf_value {
+            assert_eq!(v, 0.0);
+            assert!(v.is_sign_positive());
+        }
+        assert_eq!(t.internal_value[0], 0.0);
+        assert!(t.internal_value[0].is_sign_positive());
     }
 }

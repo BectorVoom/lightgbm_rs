@@ -1299,6 +1299,73 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             .map(|a| std::mem::take(&mut *a.borrow_mut()))
             .unwrap_or_default()
     }
+
+    /// C++ `SerialTreeLearner::AddPredictionToScore` (`serial_tree_learner.h:100-118`).
+    ///
+    /// The training-path score scatter: for every leaf of the just-grown `tree`,
+    /// add that leaf's f64 output to each of its rows' scores, reading the rows
+    /// directly from `data_partition` (the same partition the tree was grown over).
+    /// Accumulation is in f64 (the score buffer is a f64 accumulator, RESEARCH
+    /// score_updater.hpp:123). A single-leaf tree (`num_leaves <= 1`) contributes
+    /// nothing and early-returns, mirroring the C++ guard.
+    ///
+    /// `out_score` is the class-major score slice for the current tree's class; the
+    /// boosting layer (06-02) calls this rather than re-walking the tree per row.
+    ///
+    /// NOTE on partitioning: the learner builds its `DataPartition` locally inside
+    /// `train_inner` (it is not retained on `self`), so the boosting caller passes
+    /// the partition explicitly — the C++ `data_partition_` member is reproduced as
+    /// an argument here, keeping the scatter math identical to the reference.
+    pub fn add_prediction_to_score(
+        &self,
+        tree: &Tree,
+        data_partition: &DataPartition,
+        out_score: &mut [f64],
+    ) {
+        if tree.num_leaves <= 1 {
+            return;
+        }
+        for leaf in 0..tree.num_leaves {
+            let out = tree.leaf_value[leaf as usize];
+            for &row in data_partition.indices_in_leaf(leaf) {
+                out_score[row as usize] += out;
+            }
+        }
+    }
+
+    /// `SerialTreeLearner::RenewTreeOutput` seam (`serial_tree_learner.cpp`,
+    /// `RenewTreeOutput`).
+    ///
+    /// The leaf-output renewal hook the GBDT loop calls after growth and BEFORE
+    /// shrinkage. For objectives whose `IsRenewTreeOutput() == false` (the spine
+    /// L2 objective, 06-02) this is a NO-OP. For `regression_l1` (06-03) the real
+    /// body replaces each leaf's output with the weighted median of that leaf's
+    /// residuals — that math lands with the objective in 06-03.
+    ///
+    /// This Wave-0 seam takes an optional per-leaf renewal closure so the loop
+    /// contract is stable now without coupling the learner to `lgbm-objective`
+    /// (which would invert the crate dependency direction). When `renew` is `None`
+    /// the tree is unchanged (the `IsRenewTreeOutput()==false` path); when `Some`,
+    /// each leaf's output is replaced by `renew(leaf, rows)` over that leaf's rows.
+    pub fn renew_tree_output<F>(
+        &self,
+        tree: &mut Tree,
+        data_partition: &DataPartition,
+        renew: Option<F>,
+    ) where
+        F: Fn(i32, &[u32]) -> f64,
+    {
+        let Some(renew) = renew else {
+            return; // IsRenewTreeOutput() == false — no-op (spine L2).
+        };
+        if tree.num_leaves <= 1 {
+            return;
+        }
+        for leaf in 0..tree.num_leaves {
+            let rows = data_partition.indices_in_leaf(leaf);
+            tree.leaf_value[leaf as usize] = renew(leaf, rows);
+        }
+    }
 }
 
 /// Per-feature byte layout of a pool slot: `(slot_off, slot_len)` where
@@ -1456,6 +1523,99 @@ mod tests {
         assert!(tree.num_leaves >= 2, "a splittable input grows at least 2 leaves");
         // The root split routes low bins left, high bins right.
         assert_eq!(tree.split_feature[0], 0);
+    }
+
+    /// A minimal 2-leaf tree for the score-scatter test (leaf 0 = -3.0, leaf 1 =
+    /// 7.0). Predict/topology fields are irrelevant to `add_prediction_to_score`,
+    /// which reads `leaf_value` + the partition only.
+    fn two_leaf_tree() -> Tree {
+        Tree {
+            num_leaves: 2,
+            num_cat: 0,
+            left_child: vec![-1],
+            right_child: vec![-2],
+            split_feature: vec![0],
+            threshold: vec![1.5],
+            decision_type: vec![2],
+            split_gain: vec![0.0],
+            leaf_value: vec![-3.0, 7.0],
+            leaf_weight: vec![0.0, 0.0],
+            leaf_count: vec![4, 4],
+            internal_value: vec![0.0],
+            internal_weight: vec![0.0],
+            internal_count: vec![8],
+            cat_boundaries: vec![],
+            cat_threshold: vec![],
+            shrinkage: 1.0,
+            is_linear: false,
+            leaf_depth: vec![0, 1],
+            leaf_parent: vec![-1, 0],
+            split_feature_inner: vec![0],
+            threshold_in_bin: vec![2],
+        }
+    }
+
+    #[test]
+    fn add_prediction_to_score_scatters_leaf_values_in_f64() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        // Partition 8 rows into two leaves on the splittable feature: bins
+        // 0,0,1,1 (rows 0..3) <= threshold bin 1 -> stay leaf 0; bins 2,2,3,3
+        // (rows 4..7) > threshold -> right leaf 1.
+        let (f, _g, _h) = splittable_feature();
+        let mut part = DataPartition::new(8, 2);
+        let (lc, rc) = part
+            .split(
+                &backend, &client, 0, 1, &f.bins, f.num_bin, f.min_bin, f.max_bin,
+                /*threshold*/ 1, f.most_freq_bin,
+            )
+            .expect("partition split ok");
+        // The exact split counts depend on the partition's threshold convention;
+        // what matters for the scatter is that the two leaves cover all 8 rows.
+        assert_eq!(lc + rc, 8, "both children together cover every row");
+        assert!(lc > 0 && rc > 0, "both leaves are non-empty");
+
+        let tree = two_leaf_tree();
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 8, -1);
+        let mut score = vec![0.0f64; 8];
+        learner.add_prediction_to_score(&tree, &part, &mut score);
+
+        // Each row's score == its leaf's value. Leaf 0 -> -3.0; leaf 1 -> 7.0.
+        for leaf in 0..2i32 {
+            let want = tree.leaf_value[leaf as usize];
+            for &row in part.indices_in_leaf(leaf) {
+                assert_eq!(score[row as usize], want, "row {row} (leaf {leaf})");
+            }
+        }
+        // Total == leaf0_value * leaf0_count + leaf1_value * leaf1_count (f64).
+        let total: f64 = score.iter().sum();
+        let expect = tree.leaf_value[0] * lc as f64 + tree.leaf_value[1] * rc as f64;
+        assert_eq!(total, expect);
+    }
+
+    #[test]
+    fn add_prediction_to_score_single_leaf_is_noop() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 1, -1);
+        let part = DataPartition::new(4, 1);
+        let mut tree = two_leaf_tree();
+        tree.num_leaves = 1; // single-leaf guard path
+        let mut score = vec![1.0f64; 4];
+        learner.add_prediction_to_score(&tree, &part, &mut score);
+        assert_eq!(score, vec![1.0; 4], "single-leaf tree contributes nothing");
+    }
+
+    #[test]
+    fn renew_tree_output_none_is_noop() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 2, -1);
+        let part = DataPartition::new(8, 2);
+        let mut tree = two_leaf_tree();
+        let before = tree.leaf_value.clone();
+        learner.renew_tree_output(&mut tree, &part, None::<fn(i32, &[u32]) -> f64>);
+        assert_eq!(tree.leaf_value, before, "IsRenewTreeOutput()==false leaves the tree unchanged");
     }
 
     /// `leaf_wise_caps`: a depth-1 cap yields exactly 2 leaves on a splittable
