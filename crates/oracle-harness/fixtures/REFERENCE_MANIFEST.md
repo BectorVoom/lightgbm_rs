@@ -377,3 +377,44 @@ no `external_libs`, no `lib_lightgbm` link, no C++ toolchain at `cargo test` tim
 ```bash
 cargo run -p xtask -- learner-capture
 ```
+
+## REAL Learner Oracle Set (Phase 5, plan 05-06 / D-08 — CR-02 closure)
+
+Captured by `cargo run -p xtask -- learner-oracle-capture` into
+`crates/oracle-harness/tests/fixtures/learner/{spine_real.txt,mfb_pos_real.txt}`.
+These REPLACE the pre-D-09 self-transcription learner goldens (`spine.txt` /
+`real_gh.txt`, which shared the port's offset/`--th` conventions and so validated
+the port against ITSELF — CR-02) with model text dumped from the REAL prebuilt
+`lib_lightgbm` `4.6.0` (the pip wheel's `save_model()`, exactly the
+Phase-3 `model-capture` mechanism — human-approved). Building `lib_lightgbm` from
+source is INFEASIBLE here (the in-repo submodule's `external_libs` are empty), so
+the pip wheel is the authoritative real binary.
+
+- **`spine_real.txt`** — a `most_freq_bin==0` corpus (offset==1 scan+partition
+path) trained on the real binary.
+- **`mfb_pos_real.txt`** — a `most_freq_bin > 0` corpus (offset==0 path); the
+FIRST bit-exact real-binary anchor for the offset==1-vs-offset==0 convention
+fixed in plan 05-05.
+
+- **Training tool (capture-time only):** pip `lightgbm` `4.6.0` —
+NOT a crate dependency and NEVER read at `cargo test` time (the goldens are
+committed). The version is asserted before training (threat T-05-06-03).
+- **Oracle seed:** `97913454` (`0x05D60A6E`).
+- **Deterministic train params:** `deterministic=true force_row_wise=true
+num_threads=1 bagging_fraction=1.0 feature_fraction=1.0` + identity binning
+(`max_bin >= K`, `min_data_in_bin=1`, `bin_construct_sample_cnt >= n_rows`,
+`feature_pre_filter=false`, `min_data_in_leaf=1`), so `binned_value == raw_value`
+and the dump is byte-idempotent.
+- **Binning-pinning (MANDATORY):** the python dumper forces identity binning
+(distinct consecutive integers `0..K-1` as raw values) and ASSERTS the realized
+per-feature bin count + `most_freq_bin` match the harness corpus layout
+(`most_freq_bin > 0` for the mfb>0 corpus), ABORTING the capture on any
+mismatch — so a golden can only ever be trained on the exact bin layout the
+Rust learner consumes (a binning mismatch can never masquerade as a learner
+divergence).
+
+### Exact learner-oracle-capture command
+
+```bash
+LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- learner-oracle-capture
+```

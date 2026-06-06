@@ -87,21 +87,7 @@ def base_params(seed):
     }
 
 
-def realized_bin_layout(booster, num_features):
-    """Read back the realized per-feature (num_bin, most_freq_bin) from the
-    trained Booster's model JSON so the assert is against the ACTUAL binning the
-    real binary used — not an assumption."""
-    model = booster.dump_model()
-    # feature_infos / bin info is exposed via the per-feature pandas-categorical /
-    # the Booster's `feature_infos`; the most robust read-back is the model's
-    # `feature_names` + the bin upper bounds embedded in `feature_infos`. LightGBM
-    # exposes the realized bins through Booster.feature_importance only indirectly,
-    # so we derive num_bin / most_freq_bin from the constructed Dataset below
-    # instead. This helper is retained for diagnostics.
-    return model
-
-
-def assert_identity_binning(ds, X, num_features, expected_most_freq, label):
+def assert_identity_binning(X, num_features, expected_most_freq, label):
     """ABORT unless the constructed Dataset binned every row as bin == raw value
     AND each feature's realized most_freq_bin matches the intended layout."""
     # The Dataset exposes the realized per-row bins via `get_data` is not binned;
@@ -144,7 +130,7 @@ def train_and_dump(out_path, X, labels, num_leaves, seed, expected_most_freq, la
 
     dtrain = lgb.Dataset(X, label=y, free_raw_data=False)
     dtrain.construct()
-    assert_identity_binning(dtrain, X, X.shape[1], expected_most_freq, label)
+    assert_identity_binning(X, X.shape[1], expected_most_freq, label)
 
     booster = lgb.train(p, dtrain, num_boost_round=1)
     # save_model() writes the authoritative v4 model text (the same %.17g path
