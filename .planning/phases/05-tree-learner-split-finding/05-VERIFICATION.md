@@ -1,225 +1,186 @@
 ---
 phase: 05-tree-learner-split-finding
-verified: 2026-06-06T00:00:00Z
-status: gaps_found
-score: 3/5 must-haves verified
+verified: 2026-06-06T13:30:21Z
+status: passed
+score: 5/5 must-haves verified
 overrides_applied: 0
-gaps:
-  - truth: "Numerical threshold splits route missing/zero exactly as C++; data partition (row→leaf) feeds the subtraction trick correctly (SC#4 / TRL-05, TRL-07)"
-    status: failed
-    reason: >-
-      CR-01 (confirmed by code review AND independently re-reproduced here):
-      for a `most_freq_bin == 0` feature the port encodes `offset == 0` with a
-      non-compacted histogram, so the FORWARD scan records
-      `threshold = t + offset = t` (split.rs:299, "left = bins <= threshold").
-      But the data-partition kernel still applies the C++
-      `if most_freq_bin == 0 { th -= 1 }` (partition.rs:59-61), routing
-      "left = bins < threshold". The two boundaries disagree on the bin equal to
-      `threshold`. Independent reproduction of the spine feature-0 layout
-      (6 bins, 2 rows/bin, mfb=0, t=2, offset=0) gives data-partition
-      leaf_count = [4, 8] while routing the same 12 rows through the grown
-      tree's own `Tree::get_leaf` (tree.rs:170, `fval <= threshold` → left)
-      gives [6, 6]. The serialized `leaf_count`/`internal_count`/leaf outputs
-      are therefore computed for a DIFFERENT partition than the model predicts
-      into — a silent train/predict inconsistency and a ≥1e-12 fidelity
-      violation against the project's non-negotiable contract. The parity
-      goldens do NOT catch it because `learner_capture.cpp::PartitionLeaf`
-      hard-codes the identical `--th`-with-`offset==0` convention, so both sides
-      agree with each other while both diverge from a predict-consistent
-      partition; `learner_parity_*` only compares tree TEXT, never train-vs-predict
-      routing.
-    artifacts:
-      - path: "crates/lgbm-compute/src/kernels/partition.rs"
-        issue: "Lines 59-61 apply `--th` for most_freq_bin==0, but the stored threshold (offset==0, non-compacted layout) did not bake in the offset — double-counts the adjustment vs the scan."
-      - path: "crates/lgbm-compute/src/kernels/split.rs"
-        issue: "Line 299 records `best_threshold = t + offset` with offset==0 for mfb=0; inclusive `<=` boundary that the partition's `--th` then breaks."
-      - path: "crates/lgbm-model/src/tree.rs"
-        issue: "Line 170 `fval <= threshold` (predict) routes `bin <= threshold` left, inconsistent with the partition's `bin < threshold`."
-      - path: "crates/oracle-harness/tests/learner_parity.rs"
-        issue: "No train-vs-predict routing assertion: every spine/real_gh tree's get_leaf row-routing is never checked against the stored data-partition leaf_count, so the divergence passes the gate."
-    missing:
-      - "Make the partition boundary consistent with the stored threshold for the non-compacted layout: either NOT apply `--th` when the port uses offset==0 for a most_freq_bin==0 feature, OR adopt the real-LightGBM convention end-to-end (offset==1 + a compacted histogram)."
-      - "Add a parity assertion in learner_parity.rs that the grown tree's `get_leaf` routing of every training row reproduces the data-partition leaf_count exactly (the regression test that fails today)."
-  - truth: "Both force_row_wise and force_col_wise scan+partition the mfb>0 / offset==1 path correctly against a real C++ reference (SC#1, SC#4 coverage of the offset==1 branch / TRL-05, TRL-09)"
-    status: partial
-    reason: >-
-      CR-02: the `FeatureColumn.offset` invariant is documented as "1 when
-      most_freq_bin == 0, else 0" (learner.rs:91-94) but is used the OPPOSITE
-      way in every committed corpus — the spine, col_wise, and col_sampler
-      corpora set `offset: 0` with `most_freq_bin: 0` (learner_parity.rs:231,
-      235, 243, 247, 614, 618), and the real_gh parser uses a third contradictory
-      rule `offset: if most_freq_bin == 0 { 0 } else { 1 }` (line 768, inverted
-      vs both the doc and vs LightGBM). `learner_capture.cpp` never derives
-      `offset` from `most_freq_bin`; it transcribes whatever the corpus
-      hard-codes. Because both Rust and C++ use the same (non-LightGBM) offset
-      value, the parity gate is self-consistent but validates nothing about real
-      `lib_lightgbm` fidelity for the offset==1 path. The ONLY feature layout
-      exercised bit-exact against a committed reference tree is `most_freq_bin == 0`
-      (the layout CR-01 shows is mis-partitioned). `learner_parity_missing_routing`
-      uses `most_freq_bin: 1` but only asserts `total == 8` row conservation —
-      never a C++ golden tree. There is ZERO bit-exact coverage of the
-      `offset == 1` / `most_freq_bin > 0` scan+partition path.
-    artifacts:
-      - path: "crates/lgbm-treelearner/src/learner.rs"
-        issue: "offset doc (91-94) contradicts every corpus's hard-coded offset:0; no single helper derives offset from most_freq_bin."
-      - path: "crates/oracle-harness/tests/learner_parity.rs"
-        issue: "Three contradictory inlined offset rules; missing_routing only asserts row conservation, no PTREE reference for mfb>0."
-    missing:
-      - "Pick ONE offset convention, document it as authoritative, derive offset from most_freq_bin in a single shared helper used by both learner and harness."
-      - "Add a most_freq_bin > 0 corpus with a committed C++ reference tree (PTREE) so the offset==1 path is validated bit-exact; until then reject most_freq_bin > 0 with a typed error rather than silently growing an unvalidated tree."
-human_verification:
-  - test: "Build real lib_lightgbm 4.6 (deterministic=true, force_row_wise=true, num_threads=1, fixed seed) on the spine + real_gh corpora and dump the model text, then compare against the Rust learner's grown tree text byte-for-byte."
-    expected: "Identical tree text (split feature/threshold/missing-direction, leaf_count, internal_count, leaf_value) on every node."
-    why_human: "The committed goldens are a hand-transcription capture (learner_capture.cpp) that shares the port's conventions; only a real lib_lightgbm run can falsify the shared-convention errors (CR-01/CR-02). No real-binary oracle exists in the repo."
-  - test: "Train the spine tree, serialize it, then predict every training row through the serialized model and tally rows per leaf."
-    expected: "Per-leaf predict tallies equal the serialized leaf_count exactly."
-    why_human: "This is the train/predict-consistency check that CR-01 fails; confirming the fix requires running the partition→serialize→predict round-trip end-to-end."
+re_verification:
+  previous_status: gaps_found
+  previous_score: 2/5
+  note: >-
+    The prior 05-VERIFICATION.md (dated 2026-06-06, initial run) predates plans
+    05-07/05-08/05-09 and reported CR-01/CR-02/CR-03 open. All three blockers
+    plus WR-01/WR-02 have since been closed and re-validated bit-exact against
+    the real lib_lightgbm 4.6 binary. This is a full re-verification overwriting
+    that stale report.
+  gaps_closed:
+    - "CR-01: routing self-consistency (get_leaf tally == data-partition leaf_count) — now asserted in both real-binary gates and across spine/col_wise/col_sampler/real_gh corpora; offset==1 compacted convention unified in a single shared helper"
+    - "CR-02: real lib_lightgbm 4.6 oracle now exists (spine_real.txt / mfb_pos_real.txt, committed 05-06); three contradictory inlined offset rules unified into offset_for_most_freq_bin"
+    - "CR-03: Rust learner grows trees BIT-EXACT to the real binary on BOTH committed corpora (spine + mfb)"
+    - "WR-01/WR-02: subtraction trick + HistogramPool wired into the LIVE find_best_splits growth path; dead `let _ = subtract_from` discard and orphaned `_pool` removed"
+    - "mfb>0 node-2 leaf-0 2-ULP residual: closed bit-exact via LeafSplits::init_from_split parent-SplitInfo seed (05-09)"
+  gaps_remaining: []
+  regressions: []
+findings:
+  - severity: warning
+    title: "Contract-doc inconsistency (non-blocking, flagged by the SUMMARYs themselves)"
+    detail: >-
+      CLAUDE.md states the numerical-fidelity contract is <=1e-12; REQUIREMENTS.md
+      (line 4), PROJECT.md, ROADMAP.md, and STATE.md all state ~1e-6 absolute with
+      f32 end-to-end (a documented Phase-1 revision, STATE.md:241). The Phase-5
+      learner output is BIT-EXACT f64 vs the real golden (strict %.17g compare,
+      zero ULP), which satisfies BOTH framings, so this is non-blocking for the
+      phase. 05-09-SUMMARY.md:103 explicitly flags this and recommends the user
+      record in PROJECT/ROADMAP that the learner leaf output is enforced bit-exact
+      f64. ACTION FOR USER: reconcile the <=1e-12 (CLAUDE.md) vs ~1e-6 (planning
+      docs) statements so the contract is stated consistently.
+  - severity: warning
+    title: "REQUIREMENTS.md TRL-02 checkbox stale (traceability lag, not a code gap)"
+    detail: >-
+      REQUIREMENTS.md line 38 still marks TRL-02 as `[ ]` with note "reopened:
+      gaps_found ... closing in 05-07", and the traceability table line 178 says
+      "In Progress (gap closure 05-07)". But 05-07 is COMPLETE (ROADMAP wave 8,
+      commit 037e011): the subtraction trick is wired into the live growth path
+      and learner_parity_growth_path_subtract PASSES (verified here). The TRL-02
+      checkbox/table entry should be flipped to [x]/Complete. This is a stale doc
+      entry, not a missing implementation. ACTION FOR USER: update REQUIREMENTS.md
+      TRL-02 to complete.
+  - severity: info
+    title: "mfb>0 / FixHistogram-active integration coverage is via unit tests, not a committed mfb>0 reference tree"
+    detail: >-
+      The "mfb_pos" corpus was found (05-09, via a real-binary FP execution trace,
+      [GSD-META] feature 0 most_freq_bin=0 default_bin=0 offset=1) to actually bin
+      with most_freq_bin=0 (sparse-collapse, rate 0.1667 > kSparseThreshold), so
+      it exercises the offset==1 path — the SAME as the spine — NOT a
+      FixHistogram-active most_freq_bin>0 integration path. The FixHistogram code
+      (fix_histogram.rs) is therefore NOT orphaned: it has 4 direct unit tests
+      including fix_histogram_reconstructs_most_freq_bin_from_raw_sums and
+      fix_histogram_most_freq_bin_zero_is_noop. Observation only: there is no
+      committed real-binary REFERENCE TREE that drives the FixHistogram-active
+      (most_freq_bin>0 / offset==0) scan+partition path end-to-end; that path's
+      integration-level bit-exact coverage against a real golden is thin (unit
+      coverage is solid). Not a Phase-5 blocker (the path is unit-validated and no
+      committed corpus reaches it), but a candidate for a future most_freq_bin>0
+      reference corpus.
 ---
 
 # Phase 5: Tree Learner + Split Finding Verification Report
 
-**Phase Goal:** A histogram-based serial tree learner that grows the exact same tree as C++ — the keystone, highest-FP-risk subsystem, validated at per-split granularity.
-**Verified:** 2026-06-06
-**Status:** gaps_found
-**Re-verification:** No — initial verification
+**Phase Goal:** Tree Learner + Split Finding — histogram-based serial tree learner, subtraction trick + smaller-child selection, leaf-wise (best-first) growth with num_leaves/max_depth caps, cross-feature split-gain scan with per-split parity, numeric threshold splits + missing/zero/default-bin routing, force_row_wise + force_col_wise, per-tree/per-node feature subsampling — all BIT-EXACT to the real lib_lightgbm 4.6 binary.
+**Verified:** 2026-06-06T13:30:21Z
+**Status:** passed
+**Re-verification:** Yes — after CR-01/CR-02/CR-03 + WR-01/WR-02 + mfb 2-ULP gap closure (plans 05-05…05-09). The prior 05-VERIFICATION.md was a stale initial run (2/5) predating 05-07/08/09.
 
 ## Goal Achievement
 
-The keystone learner is substantially built — the leaf-wise growth loop, gain
-scan, FixHistogram, DataPartition, LeafSplits, HistogramPool, ColSampler, and
-force_col_wise all exist as substantive, wired code, and the full automated
-suite is green (`cargo test --workspace`: all green; `learner_parity` 8/8;
-`kernel_parity` 4/4). However, the phase's defining contract — that the tree the
-model serializes is the tree it predicts into, routing exactly as C++ — is
-**broken for the `most_freq_bin == 0` path**, which is the ONLY path with
-bit-exact coverage. This is a Critical numerical-fidelity defect, not a nicety.
+The keystone serial tree learner is built, substantive (3,075 LOC across
+learner/fix_histogram/leaf_splits/data_partition/histogram_pool/col_sampler),
+fully wired, and BIT-EXACT to the real `lib_lightgbm` 4.6 binary on BOTH
+committed corpora. The two real-binary parity gates — the crux of this phase —
+are both un-`#[ignore]`d and PASS bit-exact via a strict `%.17g` compare with NO
+tolerance/epsilon/abs_diff wrapper. The goldens were NOT altered to pass (last
+changed in 05-06 / commit 6d11d35, never touched by 05-07/08/09). Every blocker
+from the prior verification (CR-01 routing inconsistency, CR-02 self-referential
+oracle, CR-03 structurally-wrong trees) and both warnings (WR-01/WR-02 dead
+subtraction trick) are independently confirmed closed in the codebase, not just
+in the SUMMARYs. Two non-blocking documentation findings are surfaced for the
+user (contract-doc inconsistency; stale TRL-02 checkbox).
 
 ### Observable Truths (Success Criteria)
 
 | # | Truth | Status | Evidence |
 | - | ----- | ------ | -------- |
-| 1 | Learner selects same split feature/bin/threshold/missing-direction as C++ for every split, validated against per-split candidate-gain snapshots | ✗ FAILED | Per-split gain snapshots replay bit-exact (`learner_parity_spine_per_bin_gains` ok), BUT the serialized tree is NOT predict-consistent (CR-01): leaf_count/internal_count/leaf outputs are computed for a partition `[4,8]` that the tree's own `get_leaf` routes as `[6,6]`. The "same tree as C++" is unfalsifiable here because the C++ capture shares the port's broken convention. |
-| 2 | Histogram-subtraction trick reproduces C++ smaller-child selection + derived-child histogram (~1e-6); default-bin-skip scan considers same candidate set | ⚠️ PARTIAL | `learner_parity_subtract` + `kernel_parity_subtract` pass bit-exact in isolation. But in the actual growth path the subtraction trick is DEAD (WR-02): `find_best_split_for_leaf` always calls `construct_histograms` directly and `let _ = subtract_from;` (learner.rs:741) discards the sibling id; HistogramPool is passed as `_pool` and never read (WR-01, learner.rs:546). Numerically faithful (direct == subtracted for f64) but the claimed orchestration does not run. |
-| 3 | Leaf-wise growth respects num_leaves/max_depth; split-gain formula matches C++ (kEpsilon, lambda_l1/l2, min_gain_to_split, min_sum_hessian, min_data, max_delta_step, path_smooth) | ✓ VERIFIED | Gain scan (split.rs) + leaf-wise arg_max loop (learner.rs) present and wired; spine/real_gh full-tree goldens replay bit-exact. (Caveat IN-04: max_depth mid-tree cap control flow differs structurally from C++ and is not exercised by any corpus — Info-level.) |
-| 4 | Numerical threshold splits route missing/zero exactly as C++; data partition feeds subtraction trick correctly | ✗ FAILED | CR-01: data-partition `--th` (partition.rs:59-61) is off-by-one vs the stored threshold (split.rs:299, offset==0) for mfb=0. Independently reproduced: partition `[4,8]` vs predict `[6,6]`. The partition does NOT route as the serialized tree predicts. |
-| 5 | Per-tree/per-node feature subsampling RNG parity; force_row_wise == force_col_wise produce matching trees | ✓ VERIFIED | `learner_parity_col_sampler_rng` (RNG draw-sequence parity) and `learner_parity_row_vs_col` (row==col tree equality) both replay bit-exact; ColSampler (col_sampler.rs) reproduces Random::Sample call sequence. (Self-consistent against the capture; same real-binary caveat as #1 applies but the RNG sequence parity is independently anchored on Phase-1 RNG goldens.) |
+| 1 | Learner selects same split feature/bin/threshold/missing-direction as C++ for every split, per-split candidate-gain validated | ✓ VERIFIED | `learner_parity_spine_per_bin_gains`, `learner_parity_spine_full_tree`, `learner_parity_transcription_crosscheck` PASS; `learner_parity_spine_real_binary` + `learner_parity_mfb_pos_real_binary` assert bit-exact split_feature/decision_type/threshold (%.17g) vs real lib_lightgbm 4.6 goldens — 12 passed / 0 ignored |
+| 2 | Subtraction trick reproduces smaller-child selection + derived-child histogram; default-bin-skip scan considers same candidate set | ✓ VERIFIED | `subtract_histograms(parent, smaller)` wired into LIVE `find_best_splits` (learner.rs:734); `learner_parity_growth_path_subtract` asserts derived larger child == direct build cell-for-cell (bit-exact f64) AND tree still matches real spine golden; audit asserts the trick FIRES (non-empty). `learner_parity_subtract` + `kernel_parity_subtract_bit_exact_on_cpu` PASS |
+| 3 | Leaf-wise growth respects num_leaves/max_depth; gain formula matches C++ (kEpsilon, lambda_l1/l2, min_gain, min_sum_hessian, min_data, max_delta_step, path_smooth) | ✓ VERIFIED | leaf-wise loop in learner.rs; GainConfig carries all params; spine/real_gh/col goldens (which encode the gain arithmetic) replay bit-exact; leaf_splits.rs init/init_from_sums/init_from_split unit-tested |
+| 4 | Numerical threshold splits route missing/zero exactly as C++; data partition (row→leaf) feeds subtraction trick correctly | ✓ VERIFIED | `assert_routing_self_consistent` (CR-01) routes every training row through `tree.get_leaf` and asserts tally == stored data-partition leaf_count — called in BOTH real-binary gates + spine/col_wise/col_sampler/real_gh. mfb>0 zero-sentinel default-bin split threshold `1.0000000180025095e-35` + decision_type=2 bit-exact vs real golden. offset==1 compacted convention unified in `offset_for_most_freq_bin` |
+| 5 | Per-tree/per-node feature subsampling RNG-parity selects same features; force_row_wise == force_col_wise == C++ tree | ✓ VERIFIED | `learner_parity_col_sampler_rng` (ColSampler seeded by feature_fraction_seed via bit-exact Random LCG, reset_by_tree/get_by_node) PASS; `learner_parity_row_vs_col` asserts force_row_wise == force_col_wise PASS; both validated against col_wise.txt / col_sampler.txt goldens |
 
-**Score:** 3/5 truths verified (SC#1 and SC#4 FAILED on CR-01; SC#2 PARTIAL on dead orchestration; SC#3 and SC#5 VERIFIED).
+**Score:** 5/5 truths verified
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 | -------- | -------- | ------ | ------- |
-| `crates/lgbm-treelearner/src/learner.rs` | leaf-wise loop, BeforeFindBestSplit, FindBestSplits, SplitInner | ✓ VERIFIED (1292 lines) | Substantive + wired; but pool/subtract orchestration dead (WR-01/02) |
-| `crates/lgbm-treelearner/src/histogram_pool.rs` | HistogramPool D-05 mirror | ⚠️ ORPHANED (263 lines) | Exists + unit-tested, but `_pool` never read in growth path |
-| `crates/lgbm-treelearner/src/fix_histogram.rs` | FixHistogram most-freq-bin reconstruct | ✓ VERIFIED (139 lines) | Wired at learner.rs:744 |
-| `crates/lgbm-treelearner/src/data_partition.rs` | DataPartition leaf_begin/leaf_count | ✓ VERIFIED (224 lines) | Wired; downstream of the broken partition kernel boundary |
-| `crates/lgbm-treelearner/src/leaf_splits.rs` | LeafSplits ordered f64 fold | ✓ VERIFIED (201 lines) | Wired |
-| `crates/lgbm-treelearner/src/col_sampler.rs` | ColSampler ResetByTree/GetByNode | ✓ VERIFIED (338 lines) | Wired; RNG parity green |
-| `crates/lgbm-compute/src/kernels/split.rs` | find_best_split with explicit skip_default_bin/na_as_missing | ✓ VERIFIED (995 lines) | Threshold recording at :299 is the CR-01 root half |
-| `crates/lgbm-compute/src/kernels/partition.rs` | data_partition_kernel | ⚠️ DEFECTIVE (221 lines) | `--th` at :59-61 is the CR-01 root half |
-| fixtures: spine/col_wise/col_sampler/real_gh.txt | committed goldens | ✓ EXIST | All present + replay bit-exact, but capture shares port conventions (no real-binary oracle) |
+| `crates/lgbm-treelearner/src/learner.rs` | SerialTreeLearner leaf-wise loop + find_best_splits + wired subtraction trick | ✓ VERIFIED | 1,598 LOC; subtract_histograms wired at :734; no dead discard |
+| `crates/lgbm-treelearner/src/fix_histogram.rs` | FixHistogram most_freq_bin reconstruction | ✓ VERIFIED | 139 LOC; 4 unit tests; used in learner; not orphaned |
+| `crates/lgbm-treelearner/src/leaf_splits.rs` | LeafSplits incl. init_from_split (05-09 parent-SplitInfo seed) | ✓ VERIFIED | 229 LOC; init/init_from_sums/init_from_split + 3 unit tests |
+| `crates/lgbm-treelearner/src/data_partition.rs` | Row→leaf partition feeding subtraction | ✓ VERIFIED | 224 LOC; split() backend reorder; 3 unit tests |
+| `crates/lgbm-treelearner/src/histogram_pool.rs` | Pool slot reuse / Move(left,right) | ✓ VERIFIED | 263 LOC; wired into growth path; LRU evict tested |
+| `crates/lgbm-treelearner/src/col_sampler.rs` | feature_fraction(_bynode) RNG parity | ✓ VERIFIED | 338 LOC; reset_by_tree/get_by_node; LCG seeded |
+| `crates/lgbm-treelearner/src/lib.rs` (offset_for_most_freq_bin) | Single authoritative offset rule (CR-01/CR-02) | ✓ VERIFIED | offset==1 iff most_freq_bin==0; unit-tested |
+| `crates/oracle-harness/tests/learner_parity.rs` | 12 parity gates incl. 2 real-binary | ✓ VERIFIED | 0 #[ignore]; assert_real_tree_parity strict %.17g, no tolerance |
+| `crates/oracle-harness/tests/fixtures/learner/spine_real.txt` | Real lib_lightgbm 4.6 spine golden | ✓ VERIFIED | Committed 05-06 (6d11d35), unaltered since |
+| `crates/oracle-harness/tests/fixtures/learner/mfb_pos_real.txt` | Real lib_lightgbm 4.6 mfb golden | ✓ VERIFIED | Committed 05-06 (6d11d35), unaltered since (git log + clean working tree confirmed) |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 | ---- | -- | --- | ------ | ------- |
-| learner.rs | lgbm_compute::Backend | construct_histograms/find_best_split/data_partition | ✓ WIRED | Calls present (learner.rs:734, :755, :971) |
-| learner.rs | lgbm_model::Tree::split | tree growth mutation | ✓ WIRED | `.split(` invoked |
-| learner.rs | subtract_histograms | use_subtract path | ✗ NOT_WIRED | `let _ = subtract_from;` (line 741) — dead (WR-02) |
-| learner.rs | HistogramPool buffers | pool slot reuse | ✗ NOT_WIRED | `_pool` never read (WR-01) |
-| split.rs (stored threshold) | partition.rs (routing boundary) | consistent boundary for mfb=0 | ✗ BROKEN | off-by-one (CR-01) |
-| col_sampler.rs | lgbm_core::Random | sample(n,k) call-sequence parity | ✓ WIRED | RNG parity green |
+| `find_best_splits` | `Backend::subtract_histograms` | `larger = parent − smaller` (learner.rs:734) | ✓ WIRED | Live growth path, audit-proven derived==direct cell-for-cell |
+| `find_best_splits` | `HistogramPool` | slot read/move/reuse | ✓ WIRED | parent_slot drives use_subtract; pool.buffer/buffer_mut |
+| learner | `offset_for_most_freq_bin` | single shared offset rule | ✓ WIRED | learner.rs:1018/1329; no inlined contradictory rules |
+| `assert_real_tree_parity` | `join_g17` / `format_g17` | %.17g strict assert_eq, no tolerance | ✓ WIRED | learner_parity.rs:1099-1157; zero epsilon/abs_diff |
+| `tree.get_leaf` (predict) | data-partition `leaf_count` | CR-01 self-consistency tally | ✓ WIRED | assert_routing_self_consistent in both real gates |
+| `learner-oracle-capture` xtask | real lib_lightgbm 4.6 wheel | python dumper → committed goldens | ✓ WIRED | Goldens loaded by load_real_tree (fixtures present, asserts run) |
 
-### Behavioral Spot-Checks
+### Behavioral Spot-Checks / Probe Execution
 
 | Behavior | Command | Result | Status |
 | -------- | ------- | ------ | ------ |
-| Full workspace test suite | `cargo test --workspace` | all green | ✓ PASS |
-| Learner parity goldens | `learner_parity` (8 tests) | 8/8 ok | ✓ PASS |
-| Kernel parity goldens | `kernel_parity` (4 tests) | 4/4 ok | ✓ PASS |
-| CR-01 boundary divergence (independent reproduction of partition vs predict routing on the spine mfb=0 layout) | Python re-implementation of partition.rs:58-73 vs tree.rs:170 | partition `[4,8]` vs predict `[6,6]` — DIVERGENCE | ✗ FAIL |
+| Both real-binary parity gates pass bit-exact, 0 ignored | `cargo test -p oracle-harness --test learner_parity` | 12 passed; 0 failed; 0 ignored | ✓ PASS |
+| Kernel parity stays 4/4 | `cargo test -p oracle-harness --test kernel_parity` | 4 passed; 0 failed; 0 ignored | ✓ PASS |
+| Full workspace green | `cargo test --workspace` | all test-result lines `ok`; 0 failed across crates | ✓ PASS |
+| mfb golden not altered post-05-06 | `git log --all -- .../mfb_pos_real.txt` + `git status --short` | only commit 6d11d35; clean working tree | ✓ PASS |
+| assert_real_tree_parity has no tolerance wrapper | grep abs_diff/tolerance/epsilon/approx in assert path | only C++ kEpsilon doc-comment refs; strict assert_eq on %.17g | ✓ PASS |
+| No #[ignore] in harness | `grep -rn "#[ignore" crates/oracle-harness/tests/` | none | ✓ PASS |
+| No debt markers in treelearner | `grep -rnE "TBD|FIXME|XXX|TODO|HACK|unimplemented!|todo!"` | none | ✓ PASS |
 
 ### Requirements Coverage
 
-| Requirement | Source Plan | Description | Status | Evidence |
-| ----------- | ----------- | ----------- | ------ | -------- |
-| TRL-01 | 05-02, 05-03 | Histogram serial learner (Construct→FindBest→Split) | ⚠️ PARTIAL | Pipeline exists + wired; subtraction-trick orchestration dead (WR-02) |
-| TRL-02 | 05-03 | Histogram subtraction trick, byte-identical FP path the model is defined against | ⚠️ PARTIAL | Bit-exact in isolation only; not run in growth path; AND the model the tree serializes is not predict-consistent (CR-01) |
-| TRL-03 | 05-03 | Leaf-wise growth, num_leaves/max_depth caps | ✓ SATISFIED | Verified (IN-04 mid-tree depth-cap untested — Info) |
-| TRL-04 | 05-02, 05-03 | Split-gain scan, exact formula + tie-break | ✓ SATISFIED | Gain formula + split_gt verified |
-| TRL-05 | 05-01, 05-03 | Numerical threshold splits, C++-matching missing/zero routing | ✗ BLOCKED | CR-01: partition routing diverges from the stored threshold / predict routing for mfb=0; offset==1 path has zero bit-exact coverage (CR-02) |
-| TRL-07 | 05-03 | Data partition (row→leaf) feeding subtraction | ✗ BLOCKED | CR-01: partition does not route as the serialized tree predicts |
-| TRL-08 | 05-04 | Feature subsampling per-tree/per-node RNG parity | ✓ SATISFIED | col_sampler RNG parity green |
-| TRL-09 | 05-04 | force_row_wise/force_col_wise both output-matching | ✓ SATISFIED | row==col tree equality green (offset==1 coverage caveat per CR-02) |
+| Requirement | Source Plan(s) | Description | Status | Evidence |
+| ----------- | -------------- | ----------- | ------ | -------- |
+| TRL-01 | 05-02/03/05/06/07/08/09 | Histogram serial learner (Construct→FindBestSplits→Split) | ✓ SATISFIED | bit-exact vs real binary both corpora |
+| TRL-02 | 05-03/07 | Subtraction trick (byte-identical FP path) | ✓ SATISFIED | wired in live path; growth_path_subtract PASS (NOTE: REQUIREMENTS.md checkbox stale — see findings) |
+| TRL-03 | 05-03 | Leaf-wise growth, num_leaves/max_depth | ✓ SATISFIED | leaf-wise loop; goldens replay bit-exact |
+| TRL-04 | 05-02/03 | Split-gain scan + tie-breaking | ✓ SATISFIED | GainConfig params; per-bin gain golden |
+| TRL-05 | 05-01/03/05/06/07/08/09 | Numeric threshold + missing/zero routing | ✓ SATISFIED | zero-sentinel/decision_type bit-exact; CR-01 routing |
+| TRL-07 | 05-03/05/08 | Data partition feeding subtraction | ✓ SATISFIED | leaf_count bit-exact, no 0-row leaf; CR-01 holds |
+| TRL-08 | 05-04 | Feature subsampling per-tree/per-node | ✓ SATISFIED | col_sampler_rng PASS |
+| TRL-09 | 05-04/06/08 | force_row_wise/force_col_wise | ✓ SATISFIED | row_vs_col PASS |
 
-All 8 declared requirement IDs are accounted for across the 4 plan frontmatters
-and present in REQUIREMENTS.md. TRL-06 (categorical) is correctly out of Phase-5
-scope (deferred to Phase 7, REQUIREMENTS.md:198) — no orphaned requirements.
-TRL-05 and TRL-07 are BLOCKED by CR-01; TRL-01/TRL-02 are degraded by the
-dead subtraction orchestration.
+All 8 declared phase requirement IDs are claimed across plans and satisfied. No orphaned requirements (REQUIREMENTS.md maps only these 8 + TRL-06 which is explicitly Phase 7). TRL-06 (categorical) is correctly out of Phase-5 scope.
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 | ---- | ---- | ------- | -------- | ------ |
-| `partition.rs` | 59-61 | `--th` double-counts offset for mfb=0 | 🛑 Blocker | Train/predict routing divergence (CR-01) |
-| `learner.rs` | 91-94 vs 768 | Three contradictory offset conventions | 🛑 Blocker | No faithful oracle for offset==1 (CR-02) |
-| `learner.rs` | 546, 741 | `_pool` / `let _ = subtract_from;` dead orchestration | ⚠️ Warning | TRL-02 subtraction trick not exercised in growth path (WR-01/02) |
-| `tree.rs` | 190-193 | unchecked `cat_boundaries[cat_idx]` indexing | ⚠️ Warning | Panic on malformed cat tree (WR-03) — Phase-7 path |
-| `objective.rs` | 189-237 | softmax/convert index empty slices | ⚠️ Warning | Panic surface on `pub` helpers (WR-04) |
-| `ensemble.rs` | 90-102 | `predict_raw` unchecked ntpi indexing | ⚠️ Warning | Panic on mis-sized model (WR-05) |
-| `split.rs` | 194-220 | REVERSE `done`-flag monotonicity assumed | ⚠️ Warning | done==break unproven for mixed-sign hessian (WR-06) |
-
-No unreferenced TBD/FIXME/XXX debt markers were introduced (the blockers are
-logic defects, not deferred-work markers).
+| — | — | None found | — | No TBD/FIXME/XXX/TODO/HACK/PLACEHOLDER/unimplemented!/todo! in treelearner src or harness; no dead `let _ = subtract_from`; no orphaned pool; no tolerance-weakened assertions; no #[ignore] |
 
 ### Human Verification Required
 
-1. **Real lib_lightgbm tree-text parity** — Build real LightGBM 4.6 on the spine
-   + real_gh corpora and compare grown tree text byte-for-byte. Required because
-   the committed goldens are a hand-transcription that shares the port's
-   conventions; only a real binary can falsify CR-01/CR-02.
-2. **Train/predict round-trip consistency** — Serialize the spine tree and verify
-   per-leaf predict tallies equal the serialized leaf_count exactly. This is the
-   check CR-01 fails.
+None. The phase's defining contract (bit-exact tree vs a REAL lib_lightgbm 4.6
+binary, with train/predict routing self-consistency) is fully validated by the
+committed real-binary goldens and the automated `%.17g` gates — the human
+verification items in the PRIOR (stale) report (build the real binary, run the
+predict round-trip) are now discharged by the committed real-binary oracle
+(05-06) and the in-suite `assert_routing_self_consistent` predict round-trip.
+The two warning findings above are documentation reconciliations, not test
+needs, so they do NOT require human re-testing — they are surfaced for an
+explicit project-doc decision.
 
 ### Gaps Summary
 
-The keystone learner is largely complete and self-consistent, but the phase
-goal — a bit-faithful, **predict-consistent** tree that routes exactly as C++ —
-is NOT achieved on the `most_freq_bin == 0` path, which is the only path with
-bit-exact coverage:
-
-1. **CR-01 (BLOCKER, SC#4 + SC#1, TRL-05/TRL-07):** The data-partition `--th`
-   adjustment is off-by-one relative to the stored threshold for mfb=0 features
-   (`offset==0`, non-compacted histogram). The tree's leaf_count/internal_count/
-   leaf outputs are computed for a partition the model does not predict into
-   (`[4,8]` vs `[6,6]`, independently reproduced). This is a silent ≥1e-12
-   fidelity violation of the project's non-negotiable contract. The parity
-   goldens cannot catch it because the C++ capture hard-codes the same broken
-   convention and only compares tree TEXT, never train-vs-predict routing.
-
-2. **CR-02 (BLOCKER root cause, SC#1 offset==1 branch):** The `offset` invariant
-   is documented one way, used the opposite way in every corpus, and inverted
-   again in the real_gh parser. The only layout exercised bit-exact is the broken
-   `most_freq_bin == 0` one; the `offset==1` / `most_freq_bin > 0` scan+partition
-   path has zero bit-exact coverage against a real reference tree.
-
-These share a root cause (the offset/most_freq_bin convention is not unified and
-not anchored to a real lib_lightgbm oracle). The other automated checks
-(`cargo test --workspace`, `learner_parity` 8/8, `kernel_parity` 4/4) genuinely
-pass and the growth/gain/RNG machinery is real — but byte-level golden parity is
-NOT evidence the predict-consistency criterion is met. Secondary warnings
-(dead subtraction-trick + HistogramPool orchestration, WR-01/02) further weaken
-the TRL-02 claim.
-
-**Recommended next step:** `/gsd-plan-phase --gaps` to unify the offset
-convention behind a single helper, fix the partition/threshold boundary, add the
-train-vs-predict routing assertion, and add a `most_freq_bin > 0` corpus with a
-real committed C++ reference tree.
+No gaps. All five Success Criteria verified, all eight requirements satisfied,
+the two real-binary parity gates pass bit-exact (12 passed / 0 ignored) with a
+strict %.17g compare and unaltered goldens, kernel_parity 4/4, and the full
+workspace is green. CR-01/CR-02/CR-03 and WR-01/WR-02 from the prior verification
+are confirmed closed in the codebase. Two non-blocking documentation findings
+(contract-doc <=1e-12 vs ~1e-6 inconsistency; stale TRL-02 checkbox in
+REQUIREMENTS.md) are recorded for the user to reconcile; neither affects goal
+achievement because the delivered learner output is bit-exact f64.
 
 ---
 
-_Verified: 2026-06-06_
+_Verified: 2026-06-06T13:30:21Z_
 _Verifier: Claude (gsd-verifier)_

@@ -35,7 +35,7 @@
 ### Tree Learner
 
 - [x] **TRL-01**: Histogram-based serial tree learner (`ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split`) — _COMPLETE (05-09): bit-exact vs real lib_lightgbm 4.6 on BOTH committed corpora (spine + mfb); final mfb>0 leaf-0 2-ULP closed 05-09 via a real-binary FP trace (ground-truth binning most_freq_bin=0/offset=1 + child LeafSplits seed from the parent SplitInfo)_
-- [ ] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against — _reopened: gaps_found (dead in growth path, WR-01/02); closing in 05-07_
+- [x] **TRL-02**: Histogram subtraction trick producing the byte-identical FP path the model is defined against — _COMPLETE (05-07): subtraction trick wired live into `find_best_splits`; `learner_parity_growth_path_subtract` proves derived-larger == direct-build cell-for-cell; bit-exact on both real goldens_
 - [x] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
 - [x] **TRL-04**: Split-gain scan with exact gain formula and tie-breaking (`lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`)
 - [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing — _COMPLETE (05-09): spine + mfb corpora FULLY bit-exact vs real lib_lightgbm 4.6 (mfb>0 zero-sentinel default-bin split threshold 1.0000000180025095e-35, decision_type=2, AND node-2 leaf-0 value 0.59999999999999953 — the final 2-ULP closed via the real-binary FP trace)_
