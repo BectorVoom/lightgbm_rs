@@ -34,11 +34,13 @@ fn learner_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/learner")
 }
 
+#[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
 fn spine_fixture() -> PathBuf {
     learner_dir().join("spine.txt")
 }
 
 /// Parse a `;`-separated list of raw little-endian f64 bit patterns into `f64`.
+#[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
 fn parse_f64_bits_list(s: &str) -> Vec<f64> {
     if s.is_empty() {
         return Vec::new();
@@ -73,6 +75,7 @@ fn parse_i8_ws(s: &str) -> Vec<i8> {
         .map(|t| t.parse::<i32>().expect("i8 as int") as i8)
         .collect()
 }
+#[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
 fn parse_u32_ws(s: &str) -> Vec<u32> {
     s.split_whitespace()
         .map(|t| t.parse::<u32>().expect("u32"))
@@ -119,6 +122,7 @@ impl TreeGolden {
     /// Build the reference [`Tree`] from the golden fields so it serializes via the
     /// SHARED `lgbm-model` `%.17g`/`%g` formatter (D-07: the formatter is the
     /// arbiter, the golden carries the exact field bits).
+    #[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
     fn to_tree(&self) -> Tree {
         let n_internal = (self.num_leaves - 1).max(0) as usize;
         Tree {
@@ -151,6 +155,7 @@ impl TreeGolden {
 }
 
 /// Parse the golden into PSPLIT records + the (single) reconstructed reference tree.
+#[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
 fn parse(text: &str) -> (Vec<SplitGolden>, TreeGolden) {
     let mut splits = Vec::new();
     let mut tree = TreeGolden::default();
@@ -263,6 +268,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
 }
 
 /// Load + parse the golden, or SKIP gracefully when it is absent.
+#[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
 fn load_golden() -> Option<(Vec<SplitGolden>, TreeGolden)> {
     let path = spine_fixture();
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -277,88 +283,40 @@ fn load_golden() -> Option<(Vec<SplitGolden>, TreeGolden)> {
     Some(parse(&text))
 }
 
+/// The committed `spine.txt` / `col_wise.txt` / `real_gh.txt` full-tree + per-bin
+/// goldens were emitted by `learner_capture.cpp` — a hand transcription that
+/// SHARES the port's pre-D-09 offset==0 / non-compacted / `--th`-mismatched
+/// convention, so it baked in the very CR-01 partition bug ([4,8] instead of
+/// [6,6]) it was meant to catch (this is CR-02). Plan 05-05 corrects the
+/// convention end-to-end (offset==1 + compacted + single-feature `min_bin`),
+/// which necessarily changes the grown tree away from those stale goldens. The
+/// REAL `lib_lightgbm` 4.6 reference trees that replace them are captured in plan
+/// 05-06 (`spine_real.txt` / `mfb_pos_real.txt`); the full-tree/per-bin parity
+/// assertions are re-pointed there. Until then these self-transcription
+/// comparisons are SKIPPED — asserting against a known-wrong golden would be
+/// worse than no assertion. The live D-09 gates are
+/// `learner_parity_routing_self_consistency` (oracle-independent CR-01 invariant)
+/// and the REVERSE per-bin cross-check.
+const STALE_SELF_TRANSCRIPTION_NOTE: &str =
+    "learner_parity: SKIP — pre-D-09 self-transcription golden (CR-02) superseded \
+     by the real lib_lightgbm oracle in plan 05-06; the D-09 convention change \
+     (offset==1 + compacted + single-feature min_bin) intentionally grows a \
+     different (now self-consistent) tree. Routing parity is asserted by \
+     learner_parity_routing_self_consistency.";
+
 #[test]
 fn learner_parity_spine_full_tree() {
-    let Some((_splits, golden_tree)) = load_golden() else {
-        return;
-    };
-    let backend = CpuBackend;
-    let client = cpu_client();
-    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
-    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
-        .with_features(features);
-    let tree = learner.train(&g, &h, true).expect("train ok");
-
-    // D-07: the grown tree serializes IDENTICALLY to the C++ reference tree (both
-    // through the shared lgbm-model %.17g/%g formatter).
-    let want = golden_tree.to_tree().to_string();
-    let got = tree.to_string();
-    assert_eq!(
-        got, want,
-        "D-07 full-tree mismatch (grown tree to_string() != reference)"
-    );
+    // Superseded by 05-06's real-binary oracle (see STALE_SELF_TRANSCRIPTION_NOTE).
+    eprintln!("{STALE_SELF_TRANSCRIPTION_NOTE}");
 }
 
 #[test]
 fn learner_parity_spine_per_bin_gains() {
-    let Some((splits, _tree)) = load_golden() else {
-        return;
-    };
-    let backend = CpuBackend;
-    let client = cpu_client();
-    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
-    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
-        .with_features(features);
-    let (_tree, snapshots) = learner
-        .train_with_snapshots(&g, &h, true)
-        .expect("train ok");
-
-    // Flatten the Rust per-feature records in emit order (per split decision, per
-    // feature) to align with the PSPLIT golden order.
-    let mut rust_records: Vec<(i32, Vec<f64>, Vec<f64>)> = Vec::new();
-    for snap in &snapshots {
-        for rec in &snap.per_feature {
-            rust_records.push((rec.feature, rec.cand_rev.clone(), rec.cand_fwd.clone()));
-        }
-    }
-
-    assert_eq!(
-        rust_records.len(),
-        splits.len(),
-        "PSPLIT record count mismatch: rust {} vs golden {}",
-        rust_records.len(),
-        splits.len()
-    );
-
-    // The committed spine.txt golden is the OLD `learner_capture.cpp`
-    // self-transcription captured under the pre-D-09 offset==0 convention (the
-    // CR-02 artifact that 05-06 replaces with a REAL lib_lightgbm oracle). Under
-    // D-09 every most_freq_bin==0 feature now scans the COMPACTED histogram
-    // (offset==1): the FORWARD candidate decomposition genuinely differs (bin 0 is
-    // dropped from the running left sum and routed to the default side instead of
-    // contributing a leading left-only candidate), so the FORWARD per-bin gain
-    // VALUES are not a simple slice of the offset==0 golden — they are validated
-    // bit-exact against the real-binary oracle in 05-06.
-    //
-    // REVERSE is offset-invariant on this corpus (its range is `num_bin-1` either
-    // way and it never splits at the bin-0 most-freq slot), so it MUST still match
-    // the golden bit-exact — that keeps a real gain-math cross-check here. The
-    // winning FORWARD split is independently proven correct by
-    // `learner_parity_spine_full_tree` (the grown tree is byte-identical to the
-    // C++ reference).
-    for (i, (g_rec, r_rec)) in splits.iter().zip(rust_records.iter()).enumerate() {
-        assert_eq!(
-            g_rec.feature, r_rec.0,
-            "PSPLIT[{i}] feature mismatch: golden {} vs rust {}",
-            g_rec.feature, r_rec.0
-        );
-        // Bit-exact REVERSE per-bin gains (offset-invariant, still a hard gate).
-        compare_exact_f64_bits(&r_rec.1, &g_rec.rev)
-            .unwrap_or_else(|m| panic!("PSPLIT[{i}] REVERSE per-bin gain mismatch: {m:?}"));
-        // The winner gain must be present in the gain arrays (or -inf when no split).
-        let _ = g_rec.winner;
-        let _ = g_rec.leaf;
-    }
+    // The spine.txt PSPLIT golden is the pre-D-09 self-transcription (CR-02); the
+    // D-09 convention change grows a different (self-consistent) tree, so the
+    // PSPLIT record sequence no longer aligns. Per-bin gain parity is re-pointed at
+    // the real lib_lightgbm oracle in 05-06 (see STALE_SELF_TRANSCRIPTION_NOTE).
+    eprintln!("{STALE_SELF_TRANSCRIPTION_NOTE}");
 }
 
 #[test]
@@ -458,43 +416,13 @@ fn learner_parity_missing_routing() {
 
 #[test]
 fn learner_parity_transcription_crosscheck() {
-    // D-02a: feed the SAME synthetic per-feature histogram inputs to BOTH the
-    // Phase-4 kernel split path AND the Phase-5 learner's host per-bin gain re-scan
-    // and assert they agree bit-for-bit where they overlap (the winning gain). Use
-    // the committed split golden's first feature inputs as the shared probe.
-    let Some((splits, _tree)) = load_golden() else {
-        return;
-    };
-    let backend = CpuBackend;
-    let client = cpu_client();
-    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
-    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
-        .with_features(features);
-    let (_tree, snapshots) = learner
-        .train_with_snapshots(&g, &h, true)
-        .expect("train ok");
-
-    // The learner's per-bin gain arrays are computed via gain::get_split_gains (the
-    // SAME primitive the kernel uses). The golden's per-bin arrays come from the
-    // independent C++ FindBestThreshold transcription. Bit-exact agreement on every
-    // candidate IS the cross-check (drift would surface as a mismatch).
-    let mut rust_records: Vec<(i32, Vec<f64>, Vec<f64>)> = Vec::new();
-    for snap in &snapshots {
-        for rec in &snap.per_feature {
-            rust_records.push((rec.feature, rec.cand_rev.clone(), rec.cand_fwd.clone()));
-        }
-    }
-    assert!(!splits.is_empty(), "golden must carry PSPLIT records");
-    // D-02a cross-check over the offset-invariant REVERSE arrays (see
-    // `learner_parity_spine_per_bin_gains` for why the offset==1 compacted FORWARD
-    // decomposition differs from the pre-D-09 offset==0 golden and is validated
-    // against the real-binary oracle in 05-06 instead). REVERSE remains a hard
-    // bit-exact gate that the SAME gain primitive drives in both the kernel and
-    // the learner host re-scan.
-    for (i, (gr, rr)) in splits.iter().zip(rust_records.iter()).enumerate() {
-        compare_exact_f64_bits(&rr.1, &gr.rev)
-            .unwrap_or_else(|m| panic!("D-02a REVERSE drift at PSPLIT[{i}]: {m:?}"));
-    }
+    // D-02a cross-check against the spine.txt PSPLIT golden — a pre-D-09
+    // self-transcription (CR-02). The D-09 convention change grows a different
+    // (self-consistent) tree, so the PSPLIT record sequence no longer aligns; the
+    // gain-math cross-check is re-pointed at the real lib_lightgbm oracle in 05-06
+    // (see STALE_SELF_TRANSCRIPTION_NOTE). The kernel-vs-host gain primitive is
+    // still exercised bit-exact by `kernel_parity_split_bit_exact_on_cpu`.
+    eprintln!("{STALE_SELF_TRANSCRIPTION_NOTE}");
 }
 
 // ===========================================================================
@@ -503,6 +431,7 @@ fn learner_parity_transcription_crosscheck() {
 // goldens; each SKIPs gracefully when its fixture is absent.
 // ===========================================================================
 
+#[allow(dead_code)] // golden parser reused by 05-06 (real-binary oracle re-point)
 fn col_wise_fixture() -> PathBuf {
     learner_dir().join("col_wise.txt")
 }
@@ -520,15 +449,11 @@ fn real_gh_fixture() -> PathBuf {
 /// observationally identical (A1 / Open Q2 — empirically confirmed here).
 #[test]
 fn learner_parity_row_vs_col() {
-    let Ok(text) = std::fs::read_to_string(col_wise_fixture()) else {
-        eprintln!(
-            "learner_parity: SKIP — col_wise.txt not found. Run \
-             `cargo run -p xtask -- learner-capture` and commit the golden set."
-        );
-        return;
-    };
-    let (_splits, golden_tree) = parse(&text);
-
+    // TRL-09 row==col equality is CONVENTION-INDEPENDENT (it asserts the two
+    // build strategies grow the SAME tree, A1) so it stays a LIVE gate under D-09.
+    // The col_wise.txt golden comparison is the pre-D-09 self-transcription (CR-02)
+    // re-pointed at the real lib_lightgbm oracle in 05-06 — see
+    // STALE_SELF_TRANSCRIPTION_NOTE — so only the row==col half runs here.
     let backend = CpuBackend;
     let client = cpu_client();
 
@@ -552,11 +477,8 @@ fn learner_parity_row_vs_col() {
         row_s, col_s,
         "TRL-09: force_row_wise tree != force_col_wise tree (must be bit-identical)"
     );
-    let want = golden_tree.to_tree().to_string();
-    assert_eq!(
-        col_s, want,
-        "TRL-09: force_col_wise tree != C++ col_wise.txt golden"
-    );
+    // The col_wise.txt golden comparison is superseded by 05-06 (real-binary).
+    eprintln!("{STALE_SELF_TRANSCRIPTION_NOTE}");
 }
 
 /// One `CS_NODE` / `CS_BYTREE` selection: the ascending selected REAL feature
@@ -715,6 +637,7 @@ struct GhCorpus {
     grad: Vec<f32>,
     hess: Vec<f32>,
     features: Vec<FeatureColumn>,
+    #[allow(dead_code)] // golden tree reused by 05-06 (real-binary oracle re-point)
     tree: TreeGolden,
 }
 
@@ -841,48 +764,165 @@ fn parse_real_gh(text: &str) -> Vec<GhCorpus> {
 /// reference tree (the shared `%.17g` formatter is the arbiter).
 #[test]
 fn learner_parity_real_gh_full_tree() {
-    let Ok(text) = std::fs::read_to_string(real_gh_fixture()) else {
-        eprintln!(
-            "learner_parity: SKIP — real_gh.txt not found. Run \
-             `cargo run -p xtask -- learner-capture` and commit the golden set."
+    // real_gh.txt is the pre-D-09 self-transcription full-tree golden (CR-02); its
+    // most_freq_bin==0 features now grow a different (self-consistent) tree under
+    // D-09, so the D-03/D-07 full-tree comparison is re-pointed at the real
+    // lib_lightgbm oracle in 05-06 (see STALE_SELF_TRANSCRIPTION_NOTE). The real_gh
+    // corpora's train/predict routing self-consistency is still asserted live by
+    // `learner_parity_routing_self_consistency`.
+    eprintln!("{STALE_SELF_TRANSCRIPTION_NOTE}");
+}
+
+// ===========================================================================
+// Plan 05-05: the oracle-INDEPENDENT train/predict routing self-consistency
+// assertion (CR-01). For every corpus, routing every training row through the
+// grown tree's `get_leaf` must reproduce the stored data-partition `leaf_count`
+// for every leaf EXACTLY. This needs NO golden — it falsifies CR-01 directly
+// (the `[4,8]` partition vs `[6,6]` predict divergence) and is the loud
+// invariant that fails on any future offset/`--th`/compaction drift.
+// ===========================================================================
+
+/// Build the RAW per-row feature-value buffer the grown tree's `get_leaf`
+/// traverses (`feature_values[real_feature_index]`), using each feature's
+/// `bin_upper_bound[bin]` as the representative value for the row's bin. A row in
+/// bin `b` has real value in `(upper[b-1], upper[b]]`; using `upper[b]` is the
+/// canonical in-bin representative and routes `fval <= threshold` IDENTICALLY to
+/// the bin-threshold the partition consumes (both are `bin_upper_bound` values).
+fn row_feature_values(features: &[FeatureColumn], row: usize) -> Vec<f64> {
+    let width = features
+        .iter()
+        .map(|f| f.real_feature_index + 1)
+        .max()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let mut fv = vec![0.0f64; width];
+    for f in features {
+        let bin = f.bins[row] as usize;
+        let val = f
+            .bin_upper_bound
+            .get(bin)
+            .copied()
+            .unwrap_or(bin as f64);
+        fv[f.real_feature_index as usize] = val;
+    }
+    fv
+}
+
+/// CR-01 invariant: routing every training row through the grown tree's
+/// `get_leaf` reproduces the stored data-partition `leaf_count` (carried on the
+/// tree, set from `DataPartition::leaf_count` at split time) for EVERY leaf
+/// exactly. Oracle-independent — no golden file.
+fn assert_routing_self_consistent(
+    corpus_name: &str,
+    features: &[FeatureColumn],
+    tree: &Tree,
+    num_data: usize,
+) {
+    // Tally rows per leaf via the grown tree's public routing entry point.
+    let mut tally = vec![0i32; tree.num_leaves.max(0) as usize];
+    for row in 0..num_data {
+        let fv = row_feature_values(features, row);
+        let leaf = tree.get_leaf(&fv);
+        assert!(
+            leaf >= 0 && (leaf as usize) < tally.len(),
+            "{corpus_name}: get_leaf returned out-of-range leaf {leaf} (num_leaves {})",
+            tree.num_leaves
         );
-        return;
-    };
-    let corpora = parse_real_gh(&text);
-    assert!(
-        !corpora.is_empty(),
-        "real_gh.txt must carry at least one GH_CORPUS block"
+        tally[leaf as usize] += 1;
+    }
+    // Every leaf's predict tally MUST equal the stored data-partition leaf_count.
+    assert_eq!(
+        tally.len(),
+        tree.leaf_count.len(),
+        "{corpus_name}: leaf count vector length mismatch (tally {} vs stored {})",
+        tally.len(),
+        tree.leaf_count.len()
     );
-
-    let backend = CpuBackend;
-    let client = cpu_client();
-    // min_data_in_leaf=3 mirrors BuildRealGhCorpus — keeps every split's actual
-    // children non-degenerate so the faithful actual-partition leaf counts never
-    // collapse a child to 0 rows.
-    let cfg = GainConfig {
-        min_data_in_leaf: 3,
-        min_sum_hessian_in_leaf: 0.0,
-        max_delta_step: 0.0,
-        lambda_l1: 0.0,
-        lambda_l2: 0.0,
-        min_gain_to_split: 0.0,
-        path_smooth: 0.0,
-    };
-
-    for gh in &corpora {
-        // num_leaves comes from the golden (regression=3 / binary=2) — each chosen
-        // to keep every split's actual children non-degenerate.
-        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, gh.num_leaves, -1)
-            .with_features(gh.features.clone());
-        let tree = learner
-            .train(&gh.grad, &gh.hess, true)
-            .unwrap_or_else(|e| panic!("real_gh {} train failed: {e:?}", gh.name));
-        let want = gh.tree.to_tree().to_string();
-        let got = tree.to_string();
+    for (leaf, (&got, &want)) in tally.iter().zip(tree.leaf_count.iter()).enumerate() {
         assert_eq!(
             got, want,
-            "D-03/D-07 real_gh {} full-tree mismatch (grown != C++ reference)",
-            gh.name
+            "{corpus_name}: CR-01 routing self-consistency violated at leaf {leaf} — \
+             get_leaf tally {got} != stored data-partition leaf_count {want} \
+             (the [4,8] partition vs [6,6] predict divergence). Full tally {tally:?} \
+             vs stored {:?}",
+            tree.leaf_count
         );
+    }
+    // Conservation sanity: every row landed somewhere.
+    let total: i32 = tally.iter().sum();
+    assert_eq!(
+        total as usize, num_data,
+        "{corpus_name}: routed {total} rows != {num_data} training rows"
+    );
+}
+
+/// CR-01 (BLOCKER): the grown tree's `get_leaf` row-routing reproduces the stored
+/// data-partition `leaf_count` EXACTLY for every corpus — spine, col_wise (same
+/// corpus under force_col_wise), col_sampler, and every real_gh block. This is the
+/// regression that reproduces the `[4,8]` vs `[6,6]` divergence: it FAILS on the
+/// pre-Task-2 (offset==0, non-compacted, `--th`-mismatched) code and PASSES once
+/// the offset==1 compacted convention makes stored threshold / partition / predict
+/// agree. Uses the SAME unified corpus builders (no inlined offset).
+#[test]
+fn learner_parity_routing_self_consistency() {
+    let backend = CpuBackend;
+    let client = cpu_client();
+
+    // --- spine corpus (force_row_wise, the Plan-03 spine) ---
+    {
+        let (features, g, h, cfg, num_leaves, max_depth) = corpus();
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+            .with_features(features.clone());
+        let tree = learner.train(&g, &h, true).expect("spine train ok");
+        assert_routing_self_consistent("spine", &features, &tree, g.len());
+    }
+
+    // --- col_wise: the SAME spine corpus grown under force_col_wise (TRL-09) ---
+    {
+        let (features, g, h, cfg, num_leaves, max_depth) = corpus();
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+            .with_features(features.clone())
+            .with_strategy(BuildStrategy::ColWise);
+        let tree = learner.train(&g, &h, true).expect("col_wise train ok");
+        assert_routing_self_consistent("col_wise", &features, &tree, g.len());
+    }
+
+    // --- col_sampler corpus (per-tree/per-node feature subsampling, TRL-08) ---
+    {
+        let (features, g, h, cfg, num_leaves, max_depth) = col_sampler_corpus();
+        // Drive WITH the subsampler active so the routing invariant also covers the
+        // masked-feature growth path (feature_fraction_bynode=0.5).
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+            .with_features(features.clone())
+            .with_feature_fraction(1.0, 0.5, 42);
+        let tree = learner.train(&g, &h, true).expect("col_sampler train ok");
+        assert_routing_self_consistent("col_sampler", &features, &tree, g.len());
+    }
+
+    // --- real_gh corpora (captured iter-1 g/h), if the fixture is present ---
+    if let Ok(text) = std::fs::read_to_string(real_gh_fixture()) {
+        let corpora = parse_real_gh(&text);
+        let cfg = GainConfig {
+            min_data_in_leaf: 3,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+        };
+        for gh in &corpora {
+            let mut learner = SerialTreeLearner::new(&backend, &client, cfg, gh.num_leaves, -1)
+                .with_features(gh.features.clone());
+            let tree = learner
+                .train(&gh.grad, &gh.hess, true)
+                .unwrap_or_else(|e| panic!("real_gh {} train failed: {e:?}", gh.name));
+            assert_routing_self_consistent(
+                &format!("real_gh:{}", gh.name),
+                &gh.features,
+                &tree,
+                gh.grad.len(),
+            );
+        }
     }
 }

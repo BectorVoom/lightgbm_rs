@@ -972,8 +972,23 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let new_left = best_leaf;
         let new_right = tree.num_leaves;
 
-        // Partition this leaf's rows (TRL-07) via the Backend op. min/max bin +
-        // most_freq_bin come from the feature column.
+        // Partition this leaf's rows (TRL-07) via the Backend op.
+        //
+        // SINGLE-FEATURE-GROUP min_bin convention (D-09, the CR-01 fix): the C++
+        // single-feature `FeatureGroup::Split` (`feature_group.h`, `num_feature_
+        // == 1`) dispatches to `DenseBin::Split(max_bin, …)` which HARD-CODES
+        // `min_bin = 1` and `USE_MIN_BIN = false` (`dense_bin.hpp:423-433`). For a
+        // `most_freq_bin == 0` (offset==1) feature this `min_bin = 1` makes the
+        // verbatim `th = threshold + min_bin; --th` collapse to `th = threshold`,
+        // so `bin > threshold → right` / `bin <= threshold → left` — EXACTLY the
+        // predict-time `fval <= bin_upper_bound[threshold]` routing. Passing the
+        // raw `min_bin == 0` instead (as before) left `th = threshold - 1`, routing
+        // `bin == threshold` RIGHT while predict routed it LEFT — the `[4,8]` vs
+        // `[6,6]` CR-01 divergence. We mirror the C++ overload by passing
+        // `min_bin + offset` (== 1 for the offset==1 single-feature spine, == the
+        // raw min_bin for offset==0). max_bin / most_freq_bin are unchanged; the
+        // partition `--th` body stays verbatim.
+        let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
         data_partition.split(
             self.backend,
             self.client,
@@ -981,7 +996,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             new_right,
             &f.bins,
             f.num_bin,
-            f.min_bin,
+            partition_min_bin,
             f.max_bin,
             best.threshold,
             f.most_freq_bin,
