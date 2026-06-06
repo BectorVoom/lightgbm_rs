@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: blocked
-stopped_at: "Completed 05-06-PLAN.md — CR-02 closed but port FALSIFIED (BLOCKER CR-03); 05-07 blocked on CR-03 fix"
+status: executing
+stopped_at: "Planned 05-08 (CR-03 learner-fix) + re-sequenced 05-07 to wave 8; ready to execute wave 7"
 last_updated: "2026-06-06T00:00:00.000Z"
-last_activity: 2026-06-06 -- Phase 05 plan 05-06 closed (real lib_lightgbm oracle captured; port falsified → CR-03 raised)
+last_activity: 2026-06-06 -- Phase 05: planned 05-08 (CR-03 fix, 0 blockers); 05-07 re-sequenced behind it
 progress:
   total_phases: 8
   completed_phases: 4
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 05 (tree-learner-split-finding) — BLOCKED (CR-03)
-Plan: 6 of 7 closed (05-06 COMPLETE — real oracle captured, port FALSIFIED); 05-07 BLOCKED on CR-03
-Status: BLOCKED — needs a NEW learner-fix plan (05-08) to close BLOCKER CR-03 before 05-07
-Last activity: 2026-06-06 -- Phase 05 plan 05-06 closed (CR-02 closed; CR-03 raised)
+Phase: 05 (tree-learner-split-finding) — EXECUTING (CR-03 fix planned)
+Plan: 6 of 8 closed (05-06 COMPLETE — real oracle, port FALSIFIED); 05-08 (CR-03 fix) PLANNED, wave 7; 05-07 re-sequenced to wave 8
+Status: Ready to execute wave 7 (05-08 CR-03 learner-fix), then wave 8 (05-07 subtraction-trick wiring)
+Last activity: 2026-06-06 -- planned 05-08 (CR-03 fix, plan-checker 0 blockers); 05-07 → wave 8
 
 Progress: [█████████░] Phase 5 plans 05-01..05-06 COMPLETE — but 05-06's REAL lib_lightgbm 4.6 oracle FALSIFIED the port → BLOCKER CR-03. The Rust serial learner grows structurally wrong trees vs the real binary (wrong split points / mis-partitioned leaf_count / leaf outputs like -17.99 vs 0.55; on the most_freq_bin>0 corpus: a 0-row leaf [4,6,0,2], decision_type[0]=0≠2, and a missed zero-sentinel threshold 1.0000000180025095e-35 on the offset==1 default-bin split). CR-02 (real-oracle existence) is CLOSED; the two real-binary gates (learner_parity_{spine,mfb_pos}_real_binary) are committed #[ignore]d as live, un-weakened records. TRL-09/TRL-05/TRL-01 are NOT satisfied — deferred to CR-03 closure. 05-07 (wire subtraction-trick+pool) is BLOCKED because its "re-validate bit-exact against the real goldens" gate cannot pass until the learner matches the real oracle.
 
