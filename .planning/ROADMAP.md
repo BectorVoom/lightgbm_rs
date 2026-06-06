@@ -231,7 +231,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 1** *(Wave-0 foundation — scaffolds + extensions + failing end-to-end test)*
 
-  - [ ] 06-01-PLAN.md — Scaffold the 4 new crates (lgbm-objective/metric/boosting/lgbm) + error boundaries; Tree shrinkage/add_bias; learner add_prediction_to_score/renew_tree_output hook; failing boosting_parity scaffold + capture stub
+  - [x] 06-01-PLAN.md — Scaffold the 4 new crates (lgbm-objective/metric/boosting/lgbm) + error boundaries; Tree shrinkage/add_bias; learner add_prediction_to_score/renew_tree_output hook; failing boosting_parity scaffold + capture stub
 
 **Wave 2** *(blocked on 06-01 — the minimal end-to-end spine, D-14/D-15)*
 
@@ -248,7 +248,6 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 5** *(blocked on 06-04 — bagging + early-stop axes + full matrix, D-17 steps 3+4)*
 
   - [ ] 06-05-PLAN.md — BaggingSampleStrategy (RNG-replay D-13 golden) + OOB score update + early stopping (BST-07) + metric infra (MET-02); full ~40-cell D-07 cross-product replay
-
 
 ### Phase 7: Parity-Completing Variants
 
@@ -294,6 +293,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
-| 6. GBDT Spine + Core Objectives/Metrics | 0/5 | Plans complete | - |
+| 6. GBDT Spine + Core Objectives/Metrics | 1/5 | In Progress|  |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

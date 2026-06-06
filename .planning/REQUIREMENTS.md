@@ -46,8 +46,8 @@
 
 ### Boosting & Sample Strategies
 
-- [ ] **BST-01**: GBDT training loop (`TrainOneIter`, `UpdateScore`, per-class trees, shrinkage, `boost_from_average`)
-- [ ] **BST-02**: Score updater accumulation with deterministic reduction ordering
+- [x] **BST-01**: GBDT training loop (`TrainOneIter`, `UpdateScore`, per-class trees, shrinkage, `boost_from_average`)
+- [x] **BST-02**: Score updater accumulation with deterministic reduction ordering
 - [ ] **BST-03**: Bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) with RNG-matching sequence
 - [ ] **BST-04**: GOSS sample strategy (`top_rate`/`other_rate`) with matching gradient-magnitude sort and amplification factor
 - [ ] **BST-05**: DART boosting (`drop_rate`, `max_drop`, `skip_drop`, `uniform_drop`, `xgboost_dart_mode`, `drop_seed`)
@@ -58,7 +58,7 @@
 
 - [ ] **OBJ-01**: Core objectives — `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`
 - [ ] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
-- [ ] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
+- [x] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`
 - [ ] **OBJ-05**: Cross-entropy objectives — `cross_entropy`, `cross_entropy_lambda`
 - [ ] **OBJ-06**: Ranking objectives — `lambdarank`, `rank_xendcg` (query boundaries, DCGCalculator, `objective_seed`)
@@ -182,13 +182,13 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | TRL-07 | Phase 5 | Complete (05-08, CR-03 closed — leaf_count/topology bit-exact, no 0-row leaf) |
 | TRL-08 | Phase 5 | Complete (05-04) |
 | TRL-09 | Phase 5 | Complete (05-04) |
-| BST-01 | Phase 6 | Pending |
-| BST-02 | Phase 6 | Pending |
+| BST-01 | Phase 6 | Complete |
+| BST-02 | Phase 6 | Complete |
 | BST-03 | Phase 6 | Pending |
 | BST-07 | Phase 6 | Pending |
 | OBJ-01 | Phase 6 | Pending |
 | OBJ-02 | Phase 6 | Pending |
-| OBJ-03 | Phase 6 | Pending |
+| OBJ-03 | Phase 6 | Complete |
 | MET-01 | Phase 6 | Pending |
 | MET-02 | Phase 6 | Pending |
 | API-01 | Phase 6 | Pending |
