@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: "05-09 COMPLETE — mfb>0 node-2 leaf-0 2.3e-16 (one f64 ULP) residual CLOSED bit-exact via a real lib_lightgbm 4.6 FP execution trace. Phase 5 (tree-learner-split-finding) COMPLETE: the serial learner is bit-exact to the real binary on BOTH committed corpora (spine + mfb). learner_parity 12 passed / 0 ignored; kernel_parity 4/4; cargo test --workspace green."
-stopped_at: "05-09 COMPLETE (Phase 5 keystone learner bit-exact vs real lib_lightgbm 4.6 on both corpora)"
-last_updated: "2026-06-06T13:30:00.000Z"
-last_activity: "2026-06-06 -- 05-09 closed the mfb>0 leaf-0 2-ULP bit-exact. A real lib_lightgbm 4.6 CPU-only single-thread FP trace gave ground truth: the corpus is sparse so the real binary collapses most_freq_bin=0/offset=1 (the harness mislabeled it 2/offset=0, spuriously activating FixHistogram); and C++ seeds child LeafSplits from the parent SplitInfo (carrying the kEpsilon provenance), not a re-fold. Fixed both; un-#[ignore]d the gate; assert_real_tree_parity byte-unchanged; LightGBM/ never git-added. Commit 2ced5a2."
+status: completed
+stopped_at: Phase 6 context gathered
+last_updated: "2026-06-06T22:36:17.239Z"
+last_activity: "2026-06-06 -- 05-09 closed the mfb>0 leaf-0 2-ULP bit-exact via a real lib_lightgbm 4.6 FP trace. Ground truth: the corpus is sparse so the real binary collapses most_freq_bin=0/offset=1 (harness mislabeled it 2/offset=0, spuriously activating FixHistogram); C++ seeds child LeafSplits from the parent SplitInfo (kEpsilon provenance), not a re-fold. Fixed both. Commit 2ced5a2."
 progress:
   total_phases: 8
   completed_phases: 5
@@ -303,6 +303,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-06T13:30:00.000Z
-Stopped at: 05-09 COMPLETE — Phase 5 keystone serial learner bit-exact vs real lib_lightgbm 4.6 on both committed corpora (spine + mfb)
-Resume file: None (Phase 5 complete; next: plan Phase 6)
+Last session: 2026-06-06T22:36:17.232Z
+Stopped at: Phase 6 context gathered
+Resume file: .planning/phases/06-gbdt-spine-core-objectives-metrics/06-CONTEXT.md
