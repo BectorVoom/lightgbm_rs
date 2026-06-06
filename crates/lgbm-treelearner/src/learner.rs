@@ -88,9 +88,12 @@ pub struct FeatureColumn {
     /// C++ `num_bin` — this feature's bin count (the histogram has `2*num_bin`
     /// cells).
     pub num_bin: u32,
-    /// The threshold-offset arithmetic descriptor (`meta_->offset`): 1 when
-    /// `most_freq_bin == 0`, else 0. Drives the FORWARD-scan range + the threshold
-    /// recording (`t+offset` / `t-1+offset`).
+    /// The threshold-offset arithmetic descriptor (`meta_->offset`). This MUST be
+    /// derived from [`crate::offset_for_most_freq_bin`] — the single authoritative
+    /// rule (`most_freq_bin == 0 -> 1`, else `0`) that supersedes D-01 per D-09. Do
+    /// NOT inline the rule here; the helper is the sole source. It drives the
+    /// FORWARD/REVERSE compacted-scan range (`num_bin - offset` cells) and the
+    /// threshold recording (`t + offset` / `t - 1 + offset`).
     pub offset: i32,
     /// C++ `min_bin` — the feature's first bin in its FeatureGroup (the
     /// `data_partition` `USE_MIN_BIN` lower bound). For a single-feature group

@@ -228,7 +228,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
     let f0 = FeatureColumn {
         bins: vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
         num_bin: 6,
-        offset: 0,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
         min_bin: 0,
         max_bin: 5,
         default_bin: 6,
@@ -240,7 +240,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
     let f1 = FeatureColumn {
         bins: vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3],
         num_bin: 4,
-        offset: 0,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
         min_bin: 0,
         max_bin: 3,
         default_bin: 4,
@@ -414,7 +414,7 @@ fn learner_parity_missing_routing() {
     let f = FeatureColumn {
         bins: vec![0u32, 1, 1, 1, 2, 2, 3, 3],
         num_bin: 4,
-        offset: 0,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(1),
         min_bin: 0,
         max_bin: 3,
         default_bin: 1, // < num_bin, but missing_type None -> skip_default_bin == false
@@ -611,7 +611,7 @@ fn col_sampler_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, 
         FeatureColumn {
             bins,
             num_bin,
-            offset: 0,
+            offset: lgbm_treelearner::offset_for_most_freq_bin(0),
             min_bin: 0,
             max_bin: num_bin - 1,
             default_bin: num_bin,
@@ -765,7 +765,7 @@ fn parse_real_gh(text: &str) -> Vec<GhCorpus> {
                     features.push(FeatureColumn {
                         bins,
                         num_bin,
-                        offset: if most_freq_bin == 0 { 0 } else { 1 },
+                        offset: lgbm_treelearner::offset_for_most_freq_bin(most_freq_bin),
                         min_bin,
                         max_bin,
                         default_bin,
