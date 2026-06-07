@@ -919,6 +919,17 @@ fn boosting_oracle_capture() -> Result<()> {
         "custom_spine_model.txt",
         "custom_spine_pred.txt",
         "custom_crossanchor_l2_model.txt",
+        // multiclass / multiclassova spine (06-04).
+        "multiclass_spine_model.txt",
+        "multiclassova_spine_model.txt",
+        // D-07 cross-product matrix index (06-05).
+        "matrix_best_iterations.txt",
+        // a representative matrix cell per objective (the full set is enumerated in
+        // boosting_parity::early_stopping + the REFERENCE_MANIFEST.md).
+        "regression_bag1_es0_bfa1_model.txt",
+        "regression_bag0_es1_bfa1_model.txt",
+        "binary_bag1_es0_bfa1_model.txt",
+        "multiclass_bag0_es1_bfa1_model.txt",
     ] {
         let p = out_dir.join(name);
         if !p.is_file() {

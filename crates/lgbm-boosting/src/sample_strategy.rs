@@ -96,7 +96,6 @@ impl BaggingConfig {
 /// C++ `BaggingSampleStrategy` (bagging.hpp) — owns the per-block RNG state, the
 /// bagged-index buffer, and the in-bag count, and reproduces the C++ draw/call
 /// sequence bit-exact.
-#[derive(Debug, Clone)]
 pub struct BaggingSampleStrategy {
     config: BaggingConfig,
     /// `num_data_` — total rows.
@@ -110,6 +109,13 @@ pub struct BaggingSampleStrategy {
     bag_data_indices: Vec<i32>,
     /// `need_re_bagging_` — set true at construction so iter 0 always bags.
     need_re_bagging: bool,
+    /// `bagging_rands_` — the per-block `Random(bagging_seed + i)` instances,
+    /// constructed ONCE in `reset_sample_config` and ADVANCED continuously across
+    /// `bagging()` calls (CRITICAL: C++ creates these once in ResetSampleConfig; the
+    /// `BaggingHelper` reuses them so each `bagging_freq`-th iteration draws a NEW bag
+    /// from the continuing RNG stream — recreating them per draw would re-draw the
+    /// SAME bag every iteration, diverging from the reference).
+    bagging_rands: Vec<Random>,
 }
 
 impl BaggingSampleStrategy {
@@ -133,6 +139,12 @@ impl BaggingSampleStrategy {
             // bag_data_cnt_ = trunc(bagging_fraction * num_data).
             (config.bagging_fraction * nd as f64) as i32
         };
+        // Per-block RNG seeding — constructed ONCE (C++ ResetSampleConfig:177-181)
+        // and advanced continuously across draws.
+        let n_blocks = ((nd + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK).max(0);
+        let bagging_rands: Vec<Random> = (0..n_blocks)
+            .map(|i| Random::new(config.bagging_seed + i))
+            .collect();
         Self {
             config,
             num_data: nd,
@@ -140,6 +152,7 @@ impl BaggingSampleStrategy {
             bag_data_cnt,
             bag_data_indices: Vec::new(),
             need_re_bagging: true,
+            bagging_rands,
         }
     }
 
@@ -171,12 +184,10 @@ impl BaggingSampleStrategy {
         }
         self.need_re_bagging = false;
         let cnt = self.num_data;
-        // Per-block RNG seeding (rebuilt every draw so each bag is reproducible from
-        // (bagging_seed, fraction, num_data, block 1024) — a pure function, D-13).
-        let n_blocks = ((cnt + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK).max(0);
-        let mut rands: Vec<Random> = (0..n_blocks)
-            .map(|i| Random::new(self.config.bagging_seed + i))
-            .collect();
+        // The per-block Random instances ADVANCE across draws (created once in
+        // reset_sample_config) — each bagging_freq-th iteration draws from the
+        // CONTINUING stream, matching C++ bagging_rands_ reuse.
+        let rands = &mut self.bagging_rands;
 
         let mut buf = vec![0i32; cnt as usize];
         let mut left = 0usize;

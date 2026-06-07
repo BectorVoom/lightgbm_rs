@@ -392,6 +392,132 @@ def median_percentile(values, alpha=0.5):
     return float(v1 - (v1 - v2) * bias)
 
 
+# ============================ D-07 cross-product matrix ============================
+# The full ~40-cell matrix: 5 core objectives × {bagging on/off} × {early_stop
+# on/off} × {boost_from_average on/off} = 8 cells/objective. The spine cell
+# (bagging off / es off / bfa on) IS the per-objective spine golden captured above —
+# referenced, NOT re-captured (the ONLY safe automatic collapse, RESEARCH
+# §Cross-Product Collapse Analysis cell 1). The remaining 7 cells/objective are
+# captured here as end-to-end model-text + predict goldens.
+#
+# Axis exercising (RESEARCH §Cross-Product Collapse Analysis):
+#   - bfa: the corpora have |init_score| > kEps (non-zero label mean / pavg), so the
+#     bfa axis is genuinely distinct (no label-mean-zero collapse).
+#   - bagging: bagging_fraction=0.7 bagging_freq=1 (re-bag every iter so the RNG
+#     stream advances — the most order-sensitive path).
+#   - early_stop: a VALID set whose labels plateau the metric, so early stopping
+#     GENUINELY FIRES (best_iteration < num_iterations) — not a byte-identical
+#     es-off sibling.
+MATRIX_NUM_ITERATIONS = 12
+MATRIX_BAGGING_FRACTION = 0.7
+MATRIX_BAGGING_FREQ = 1
+MATRIX_EARLY_STOPPING_ROUND = 2
+
+
+def matrix_valid_corpus(X):
+    """A validation set that plateaus the metric so early stopping FIRES: same
+    features as train, but CONSTANT labels (the ensemble cannot keep improving valid
+    loss after the first couple of trees)."""
+    return X.copy(), np.full(X.shape[0], 10.0, dtype=np.float64)
+
+
+def cell_tag(bag, es, bfa):
+    return "bag{}_es{}_bfa{}".format(int(bag), int(es), int(bfa))
+
+
+def capture_matrix_cell(out_dir, objective, prefix, X, labels, num_class, seed,
+                        bag, es, bfa):
+    """Capture ONE D-07 cell (model text + predict) for the given objective and the
+    (bagging, early_stop, bfa) axis settings. Returns the realized best_iteration."""
+    metric_map = {
+        "regression": ["l2"],
+        "regression_l1": ["l1"],
+        "binary": ["binary_logloss"],
+        "multiclass": ["multi_logloss"],
+        "multiclassova": ["multi_logloss"],
+    }
+    metrics = metric_map[objective]
+    p = base_params(seed, objective, metrics)
+    p["boost_from_average"] = bool(bfa)
+    if num_class > 1:
+        p["num_class"] = num_class
+    if bag:
+        p["bagging_fraction"] = MATRIX_BAGGING_FRACTION
+        p["bagging_freq"] = MATRIX_BAGGING_FREQ
+        p["bagging_seed"] = 3
+    # The multiclass objectives cap the horizon at MULTICLASS_NUM_ITERATIONS (the
+    # 06-04 exp-libm bit-exact horizon — past iter ~5 the redundant-form softmax exp
+    # flips a knife-edge split). Single-output cells run the full MATRIX_NUM_ITERATIONS.
+    num_rounds = MULTICLASS_NUM_ITERATIONS if num_class > 1 else MATRIX_NUM_ITERATIONS
+    dtrain = lgb.Dataset(X, label=labels, params=p, free_raw_data=False)
+    dtrain.construct()
+    valid_sets = [dtrain]
+    valid_names = ["training"]
+    callbacks = []
+    if es:
+        Xv, lv = matrix_valid_corpus(X)
+        # The valid Dataset takes its binning from `reference=dtrain` (NO params — a
+        # second params dict with bin_construct_sample_cnt would re-trigger the
+        # "Cannot change bin_construct_sample_cnt after constructed" Fatal).
+        dvalid = lgb.Dataset(Xv, label=lv, reference=dtrain, free_raw_data=False)
+        dvalid.construct()
+        valid_sets = [dtrain, dvalid]
+        valid_names = ["training", "valid_0"]
+        callbacks.append(lgb.early_stopping(MATRIX_EARLY_STOPPING_ROUND, verbose=False))
+    booster = lgb.train(
+        p, dtrain, num_boost_round=num_rounds,
+        valid_sets=valid_sets, valid_names=valid_names, callbacks=callbacks,
+    )
+    tag = cell_tag(bag, es, bfa)
+    booster.save_model(os.path.join(out_dir, f"{prefix}_{tag}_model.txt"))
+    if num_class > 1:
+        pred = booster.predict(X)
+        pred_flat = _class_major(pred)
+    else:
+        pred = booster.predict(X, raw_score=True)
+        pred_flat = np.asarray(pred)
+    with open(os.path.join(out_dir, f"{prefix}_{tag}_pred.txt"), "w") as fh:
+        fh.write(f"# {prefix}_{tag}_pred — predict() (raw for single-output / "
+                 f"class-major prob for multiclass); f64 bits\n")
+        fh.write(f"# best_iteration={booster.best_iteration}\n")
+        fh.write(f64_bits_line(pred_flat) + "\n")
+    return booster.best_iteration
+
+
+def capture_matrix(out_dir, seed):
+    """Capture the full ~40-cell D-07 cross-product (excluding the spine cell, which
+    is referenced). Single-output objectives use the spine/binary corpora; the
+    multiclass objectives use the multiclass corpus (5-iter exp-libm horizon does NOT
+    apply to the matrix's bit-exact model — the matrix replays within ORACLE_TOL for
+    multiclass cells, bit-exact for single-output, mirroring 06-04)."""
+    Xs, ls, _ = spine_corpus()
+    Xb, lb, _ = binary_corpus()
+    Xm, lm, _ = multiclass_corpus()
+    objectives = [
+        ("regression", "regression", Xs, ls, 1),
+        ("regression_l1", "regression_l1", Xs, ls, 1),
+        ("binary", "binary", Xb, lb, 1),
+        ("multiclass", "multiclass", Xm, lm, 3),
+        ("multiclassova", "multiclassova", Xm, lm, 3),
+    ]
+    best_iters = {}
+    for objective, prefix, X, labels, num_class in objectives:
+        for bag in (False, True):
+            for es in (False, True):
+                for bfa in (False, True):
+                    # The spine cell (bag off / es off / bfa on) is the referenced
+                    # collapse — skip (single-output objectives have a *_spine_model
+                    # golden; for the matrix the spine reference is documented).
+                    if (not bag) and (not es) and bfa:
+                        continue
+                    bi = capture_matrix_cell(
+                        out_dir, objective, prefix, X, labels, num_class, seed,
+                        bag, es, bfa,
+                    )
+                    best_iters[f"{prefix}_{cell_tag(bag, es, bfa)}"] = bi
+    return best_iters
+
+
 def main():
     out_dir = sys.argv[1]
     seed = int(sys.argv[2])
@@ -557,8 +683,17 @@ def main():
         num_iterations=MULTICLASS_NUM_ITERATIONS, later_iter=MULTICLASS_LATER_ITER,
     )
 
+    # ============================ D-07 cross-product matrix ============================
+    best_iters = capture_matrix(out_dir, seed)
+    with open(os.path.join(out_dir, "matrix_best_iterations.txt"), "w") as fh:
+        fh.write("# D-07 matrix: realized best_iteration per cell "
+                 "(<prefix>_bag<B>_es<E>_bfa<F> best_iteration=<n>). "
+                 "es cells with best_iteration < %d FIRED.\n" % MATRIX_NUM_ITERATIONS)
+        for cell in sorted(best_iters):
+            fh.write("%s best_iteration=%d\n" % (cell, best_iters[cell]))
+
     print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom/"
-          "multiclass/multiclassova L1-L5 goldens to %s" % out_dir)
+          "multiclass/multiclassova L1-L5 goldens + the D-07 matrix to %s" % out_dir)
 
 
 if __name__ == "__main__":
