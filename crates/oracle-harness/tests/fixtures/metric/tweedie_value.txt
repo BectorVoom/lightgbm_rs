@@ -1,0 +1,2 @@
+# tweedie real-binary tweedie value at round 5; f64 bits
+4621783000126319849

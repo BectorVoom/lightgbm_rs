@@ -1,0 +1,2 @@
+# gamma_deviance real-binary gamma_deviance value at round 5; f64 bits
+4609053833092387304

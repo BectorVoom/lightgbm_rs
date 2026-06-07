@@ -1,0 +1,2 @@
+# huber real-binary huber value at round 5; f64 bits
+4612561923188258341

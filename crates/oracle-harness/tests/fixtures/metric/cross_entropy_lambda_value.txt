@@ -1,0 +1,2 @@
+# cross_entropy_lambda real-binary cross_entropy_lambda value at round 5; f64 bits
+4603517360034643203

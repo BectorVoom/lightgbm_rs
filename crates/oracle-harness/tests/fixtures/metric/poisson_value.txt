@@ -1,0 +1,2 @@
+# poisson real-binary poisson value at round 5; f64 bits
+13841824116268204068

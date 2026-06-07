@@ -1,0 +1,2 @@
+# mape real-binary mape value at round 5; f64 bits
+4603342334545661376

@@ -1,0 +1,2 @@
+# gamma real-binary gamma value at round 5; f64 bits
+4613317631928861675
