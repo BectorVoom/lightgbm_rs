@@ -3,3 +3,8 @@ __pycache__/
 
 # Python virtual environment (Phase 8 toolchain)
 /.venv/
+
+# Built Python extension (maturin develop editable install) + pytest cache
+crates/lgbm-python/python/lightgbm_rs/_core*.so
+*.pyc
+.pytest_cache/
