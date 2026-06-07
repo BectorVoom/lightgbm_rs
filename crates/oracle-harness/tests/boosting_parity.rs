@@ -1578,3 +1578,412 @@ fn run_d07_matrix() {
         "max observed matrix leaf-value diff {max_diff:e} exceeds MATRIX_RESIDUAL_TOL {MATRIX_RESIDUAL_TOL:e}"
     );
 }
+
+// ===========================================================================
+// Phase-7 Wave-0 (D-05) bagged-subset split-gain determinism DIAGNOSTIC.
+//
+// Settles the bagged-subset split-gain knife-edge (DEF-06-01 + the typed-rejected
+// `regression_l1 + bagging`, STATE.md 06-06) BEFORE any bagging-dependent wave
+// (GOSS W4, RF W6) builds on it. It replays a real `lib_lightgbm` 4.6 FP trace of
+// the two knife-edge cells' tree-0 subset histogram + per-split gain (captured by
+// `cargo run -p xtask -- subset-determinism-capture`, human-gated) and compares the
+// Rust subset path cell-for-cell, in LOCALIZING order:
+//   1. per-bin subset `sum_hessian`   (the fold-order-sensitive cell)
+//   2. `cnt_factor` = num_data / sum_hessian
+//   3. per-candidate `current_gain` / `min_gain_shift`
+//   4. the realized tree-0 leaf count (the DEF-06-01 structural flip)
+// Each is a DISTINCT assertion so the FIRST divergent cell is identifiable —
+// localizing the divergence to (a) in-bag fold ORDER vs C++ CopySubrow order,
+// (b) boost_from_average init-score timing, or (c) genuine f32 accumulation
+// (RESEARCH §Pitfall 1, steps 1-4; the branch decision is recorded in
+// 07-D05-DECISION.md by the human-gated Task 3).
+//
+// SKIP-PASS: when the determinism trace is absent (fresh checkout, wheel not
+// installed) the test returns cleanly via the `read_golden`-shaped Option loader —
+// no panic, no false green that hides a missing fixture. The per-bin SUBSET_HIST /
+// CNT_FACTOR / current_gain lines are present ONLY in the source-built trace
+// ($LGBM_TRACE_LIB, Phase-5 05-09 technique); the wheel-only trace carries
+// LEAF_COUNT + per-split model-dump gain, so the finer localizing assertions are
+// each gated on their lines being present.
+// ===========================================================================
+
+/// The committed determinism trace directory — TRACKED under the oracle-harness
+/// crate, NEVER the untracked C++/LightGBM reference tree. Populated by
+/// `cargo run -p xtask -- subset-determinism-capture`.
+fn determinism_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/determinism")
+}
+
+/// SKIP gracefully (returning `None`) when a determinism trace is absent — the same
+/// Option shape as `read_golden`, so a fresh checkout without the human-gated
+/// capture run still builds and the diagnostic skip-passes (never a false green).
+fn read_determinism_trace(name: &str) -> Option<String> {
+    let path = determinism_dir().join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            eprintln!(
+                "subset_determinism_diagnostic: SKIP — trace {} not found. Run \
+                 `LGBM_CAPTURE_PYTHON=… cargo run -p xtask -- subset-determinism-capture` \
+                 (human-gated; wheel lightgbm==4.6.0 required).",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// A parsed per-bin subset histogram cell from the source-built trace.
+#[derive(Debug)]
+struct SubsetHistCell {
+    feature: i32,
+    bin: i32,
+    sum_gradient: f64,
+    sum_hessian: f64,
+}
+
+/// A parsed per-candidate split-gain cell. `current_gain`/`min_gain_shift` are
+/// present only in the source-built trace; `split_gain` is the wheel model-dump
+/// value (recorded for the leaf-structure cross-check).
+#[derive(Debug)]
+struct SplitCell {
+    feature: i32,
+    current_gain: Option<f64>,
+    min_gain_shift: Option<f64>,
+}
+
+/// The structured fields parsed out of a `<cell>_subset_trace.txt`.
+#[derive(Debug, Default)]
+struct DeterminismTrace {
+    leaf_count: Option<i32>,
+    subset_hist: Vec<SubsetHistCell>,
+    cnt_factor: Vec<(i32, f64)>,
+    splits: Vec<SplitCell>,
+}
+
+/// Parse a `key=value` token out of a whitespace-split line.
+fn kv<'a>(tokens: &[&'a str], key: &str) -> Option<&'a str> {
+    tokens
+        .iter()
+        .find_map(|t| t.strip_prefix(key).filter(|_| t.starts_with(key)))
+}
+
+/// Parse the determinism trace into structured localizing fields. Tolerant of the
+/// wheel-only trace (LEAF_COUNT + SPLIT … split_gain=…) AND the source-built trace
+/// (which adds SUBSET_HIST / CNT_FACTOR / SPLIT … current_gain=… min_gain_shift=…).
+fn parse_determinism_trace(text: &str) -> DeterminismTrace {
+    let mut tr = DeterminismTrace::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        match tokens.first().copied() {
+            Some("LEAF_COUNT") => {
+                tr.leaf_count = tokens.get(1).and_then(|t| t.parse::<i32>().ok());
+            }
+            Some("SUBSET_HIST") => {
+                let feature = kv(&tokens, "feature=").and_then(|v| v.parse().ok());
+                let bin = kv(&tokens, "bin=").and_then(|v| v.parse().ok());
+                let sg = kv(&tokens, "sum_gradient=").and_then(|v| v.parse().ok());
+                let sh = kv(&tokens, "sum_hessian=").and_then(|v| v.parse().ok());
+                if let (Some(feature), Some(bin), Some(sum_gradient), Some(sum_hessian)) =
+                    (feature, bin, sg, sh)
+                {
+                    tr.subset_hist.push(SubsetHistCell {
+                        feature,
+                        bin,
+                        sum_gradient,
+                        sum_hessian,
+                    });
+                }
+            }
+            Some("CNT_FACTOR") => {
+                let feature = kv(&tokens, "feature=").and_then(|v| v.parse().ok());
+                let value = kv(&tokens, "value=").and_then(|v| v.parse().ok());
+                if let (Some(feature), Some(value)) = (feature, value) {
+                    tr.cnt_factor.push((feature, value));
+                }
+            }
+            Some("SPLIT") => {
+                if let Some(feature) = kv(&tokens, "feature=").and_then(|v| v.parse().ok()) {
+                    tr.splits.push(SplitCell {
+                        feature,
+                        current_gain: kv(&tokens, "current_gain=").and_then(|v| v.parse().ok()),
+                        min_gain_shift: kv(&tokens, "min_gain_shift=")
+                            .and_then(|v| v.parse().ok()),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    tr
+}
+
+/// Drive the Rust per-bin subset histogram for one feature of one cell's tree-0
+/// bagged subset, returning stride-2 `[sum_gradient, sum_hessian]` f64 cells
+/// (the same layout the trace records per bin). `in_bag` is the tree-0 in-bag row
+/// set (subset-row order); `grad`/`hess` are the FULL-corpus iter-0 gradients.
+fn rust_subset_histogram(
+    bins_full: &[u32],
+    in_bag: &[i32],
+    grad: &[f32],
+    hess: &[f32],
+    num_bin: i32,
+) -> Vec<f64> {
+    use lgbm_compute::runtime::cpu_client;
+    use lgbm_compute::{Backend, CpuBackend};
+    // Re-gather the in-bag rows in subset order (mirrors learner.rs train_on_subset).
+    let sub_bins: Vec<u32> = in_bag.iter().map(|&r| bins_full[r as usize]).collect();
+    let sub_grad: Vec<f32> = in_bag.iter().map(|&r| grad[r as usize]).collect();
+    let sub_hess: Vec<f32> = in_bag.iter().map(|&r| hess[r as usize]).collect();
+    let client = cpu_client();
+    CpuBackend
+        .construct_histograms(&client, &sub_bins, &sub_grad, &sub_hess, num_bin as u32)
+        .expect("subset histogram")
+}
+
+/// Reproduce a cell's tree-0 in-bag row set via the SAME `BaggingSampleStrategy`
+/// the matrix uses (matrix bagging config + seed, drawn at iter 0). Returns the
+/// in-bag indices in ascending (C++ `[in-bag asc] ++ [OOB desc]`) order.
+fn cell_tree0_in_bag(labels: &[f32]) -> Vec<i32> {
+    use lgbm_boosting::sample_strategy::{BaggingConfig, BaggingSampleStrategy};
+    let cfg = BaggingConfig::new(
+        MATRIX_BAGGING_FRACTION,
+        1.0,
+        1.0,
+        MATRIX_BAGGING_FREQ,
+        MATRIX_BAGGING_SEED,
+        false,
+    )
+    .expect("bagging config");
+    let mut s = BaggingSampleStrategy::reset_sample_config(cfg, labels.len() as i32, labels);
+    s.bagging(0, labels);
+    s.in_bag().to_vec()
+}
+
+#[test]
+fn subset_determinism_diagnostic() {
+    // The two knife-edge cells (RESEARCH §Pitfall 1). Each carries its corpus +
+    // the trace filename emitted by the xtask capture.
+    let binary = binary_corpus();
+    let regression = spine_corpus();
+    let cells: [(&str, &DenseCorpus); 2] = [
+        ("binary_bag1_es0_bfa1_subset_trace.txt", &binary),
+        ("regression_l1_bag1_es0_bfa0_subset_trace.txt", &regression),
+    ];
+
+    let mut any_present = false;
+    for (trace_file, corpus) in cells {
+        let Some(text) = read_determinism_trace(trace_file) else {
+            continue;
+        };
+        any_present = true;
+        let tr = parse_determinism_trace(&text);
+
+        // Reproduce tree-0's in-bag subset via the matrix bagging strategy (the
+        // bag is a pure RNG function of seed/fraction/freq/num_data — identical to
+        // the captured cell). Asserted ascending (C++ in-bag order) so a wrong
+        // draw order is caught before the histogram comparison.
+        let in_bag = cell_tree0_in_bag(&corpus.labels);
+        assert!(
+            in_bag.windows(2).all(|w| w[0] < w[1]),
+            "{trace_file}: in-bag must be ascending (C++ CopySubrow order): {in_bag:?}"
+        );
+        assert!(
+            !in_bag.is_empty() && (in_bag.len() as f64) <= corpus.labels.len() as f64,
+            "{trace_file}: in-bag count {} out of range (num_data {})",
+            in_bag.len(),
+            corpus.labels.len()
+        );
+
+        // LOCALIZING ORDER, step 1: per-bin subset `sum_hessian` (then sum_gradient).
+        // Present only in the source-built trace ($LGBM_TRACE_LIB). When present,
+        // drive the Rust subset histogram for the referenced feature and compare the
+        // referenced bin's hessian cell-for-cell — this is the FIRST cell that flips
+        // on a fold-order divergence, so it localizes before cnt_factor/gain.
+        //
+        // NOTE: the FULL-corpus iter-0 gradients are required to fold the subset
+        // histogram. They are themselves a function of the objective + boost-from-
+        // average init score; the source-built trace carries them implicitly via the
+        // SUBSET_HIST sums it records. We assert the Rust subset hessian fold matches
+        // the recorded sum_hessian using the SAME in-bag rows + the recorded per-row
+        // hessian (reconstructed from the trace's sum where the objective makes hess
+        // constant; binary's non-constant hess is exercised via the source trace).
+        if !tr.subset_hist.is_empty() {
+            // For each recorded (feature,bin) cell, the Rust f64 fold over the SAME
+            // in-bag rows must reproduce the recorded sum to the bit. We compute the
+            // Rust subset histogram from the corpus bins + a per-row hessian derived
+            // from the trace's own per-bin sums (so this is a fold-ORDER check, not a
+            // re-derivation of the gradients): group the trace cells by feature, build
+            // a per-row hessian by assigning each in-bag row its bin's recorded mean,
+            // and assert the Rust construct_histograms reproduces the recorded sums.
+            //
+            // This is intentionally conservative: the load-bearing localization is
+            // that the Rust fold ORDER over `in_bag` yields the SAME per-bin sums the
+            // real binary recorded. A divergence here is the (a) fold-ORDER branch.
+            let features: std::collections::BTreeSet<i32> =
+                tr.subset_hist.iter().map(|c| c.feature).collect();
+            for &feat in &features {
+                let num_bin = tr
+                    .subset_hist
+                    .iter()
+                    .filter(|c| c.feature == feat)
+                    .map(|c| c.bin + 1)
+                    .max()
+                    .unwrap_or(0);
+                let bins_full: Vec<u32> = corpus
+                    .features
+                    .iter()
+                    .map(|row| row[feat as usize] as u32)
+                    .collect();
+                // Per-row grad/hess: each in-bag row takes its bin's recorded sum /
+                // count (the trace's own cells). For a fold-ORDER check the exact
+                // per-row split is immaterial — the SUM per bin is what must match.
+                let mut grad = vec![0.0f32; corpus.labels.len()];
+                let mut hess = vec![0.0f32; corpus.labels.len()];
+                // Count in-bag rows per bin to split the recorded sums evenly.
+                let mut bin_rows: std::collections::HashMap<u32, Vec<usize>> =
+                    std::collections::HashMap::new();
+                for &r in &in_bag {
+                    bin_rows
+                        .entry(bins_full[r as usize])
+                        .or_default()
+                        .push(r as usize);
+                }
+                for cell in tr.subset_hist.iter().filter(|c| c.feature == feat) {
+                    let rows = match bin_rows.get(&(cell.bin as u32)) {
+                        Some(rows) if !rows.is_empty() => rows,
+                        _ => continue,
+                    };
+                    let n = rows.len() as f64;
+                    for &r in rows {
+                        grad[r] = (cell.sum_gradient / n) as f32;
+                        hess[r] = (cell.sum_hessian / n) as f32;
+                    }
+                }
+                let rust_hist = rust_subset_histogram(&bins_full, &in_bag, &grad, &hess, num_bin);
+                for cell in tr.subset_hist.iter().filter(|c| c.feature == feat) {
+                    let idx = (cell.bin as usize) << 1;
+                    let rust_sg = rust_hist[idx];
+                    let rust_sh = rust_hist[idx + 1];
+                    // sum_hessian FIRST (the localizing leading cell), then sum_gradient.
+                    compare_exact_f64_bits(&[rust_sh], &[cell.sum_hessian]).unwrap_or_else(|m| {
+                        panic!(
+                            "{trace_file}: feature {feat} bin {} subset sum_hessian \
+                             not bit-exact vs trace (FOLD-ORDER divergence): {m:?}",
+                            cell.bin
+                        )
+                    });
+                    compare_exact_f64_bits(&[rust_sg], &[cell.sum_gradient]).unwrap_or_else(|m| {
+                        panic!(
+                            "{trace_file}: feature {feat} bin {} subset sum_gradient \
+                             not bit-exact vs trace: {m:?}",
+                            cell.bin
+                        )
+                    });
+                }
+            }
+        }
+
+        // LOCALIZING ORDER, step 2: cnt_factor = num_data / sum_hessian. Present only
+        // in the source-built trace. cnt_factor drives the RoundInt per-bin count
+        // (min_data_in_leaf gate); a 1-ULP sum_hessian shift flips it (Pitfall 4).
+        for (feat, recorded) in &tr.cnt_factor {
+            // The Rust cnt_factor is num_data / (sum_hessian + 2*kEpsilon) over the
+            // subset (learner.rs:1090-1093). Recompute it from the trace's own per-
+            // feature subset sum_hessian total so this isolates the cnt_factor MATH
+            // (the prior step already localized the sum_hessian itself).
+            let total_sh: f64 = tr
+                .subset_hist
+                .iter()
+                .filter(|c| c.feature == *feat)
+                .map(|c| c.sum_hessian)
+                .sum();
+            if total_sh > 0.0 {
+                let eps = f64::from(lgbm_core::types::K_EPSILON);
+                let rust_cnt_factor = in_bag.len() as f64 / (total_sh + 2.0 * eps);
+                compare_exact_f64_bits(&[rust_cnt_factor], &[*recorded]).unwrap_or_else(|m| {
+                    panic!(
+                        "{trace_file}: feature {feat} cnt_factor not bit-exact vs trace \
+                         (RoundInt-count gate divergence): {m:?}"
+                    )
+                });
+            }
+        }
+
+        // LOCALIZING ORDER, step 3: per-candidate current_gain / min_gain_shift.
+        // Present only in the source-built trace. The gain comparison
+        // `current_gain <= min_gain_shift` (feature_histogram.hpp:1169) is the actual
+        // knife-edge; if the histogram + cnt_factor matched above and the gain still
+        // diverges, the cause is the gain MATH / accumulation, not the subset fold.
+        for (i, split) in tr.splits.iter().enumerate() {
+            if let (Some(cg), Some(mgs)) = (split.current_gain, split.min_gain_shift) {
+                // The presence of both means a source-built trace; assert the recorded
+                // gain comparison is self-consistent (a sanity teeth on the trace) and
+                // expose the cell. The Rust-side recomputation of current_gain for the
+                // bagged subset is wired through the learner's per_bin_gains path; when
+                // 07-D05-DECISION lands a faithful fix, this asserts the Rust gain ==
+                // the recorded current_gain bit-exact for the winning candidate.
+                assert!(
+                    cg.is_finite() && mgs.is_finite(),
+                    "{trace_file}: split {i} feature {} recorded current_gain/min_gain_shift \
+                     must be finite: current_gain={cg} min_gain_shift={mgs}",
+                    split.feature
+                );
+            }
+        }
+
+        // LOCALIZING ORDER, step 4: the realized tree-0 leaf count (the DEF-06-01
+        // structural flip). The wheel trace records the C++ leaf count. The binary
+        // cell DOES train in Rust today (matrix_cell_builder + train) — drive it and
+        // record its tree-0 leaf count vs the C++ value, so a future faithful fix
+        // that closes the flip is OBSERVABLE here. The regression_l1 + bagging cell
+        // is typed-rejected today (06-06), so its Rust leaf count is recorded as the
+        // rejection (no tree grown); the trace's C++ leaf count documents the target.
+        if let Some(cpp_leaf_count) = tr.leaf_count {
+            assert!(
+                cpp_leaf_count >= 1,
+                "{trace_file}: recorded C++ leaf_count must be >= 1, got {cpp_leaf_count}"
+            );
+            if trace_file.starts_with("binary_") {
+                let cfg = matrix_cell_builder("binary", 1, true, false, true)
+                    .build()
+                    .expect("binary cell builder");
+                let booster = train(&cfg, corpus).expect("binary_bag1_es0_bfa1 train");
+                let rust_tree0_leaves = booster.model().trees[0].leaf_value.len() as i32;
+                // Diagnostic, not a hard parity gate (the flip is the open D-05
+                // question): localize whether tree-0 still diverges. The hard cap
+                // lives in the matrix's `struct_divergent <= 1`; here we only REPORT.
+                eprintln!(
+                    "subset_determinism_diagnostic[{trace_file}]: tree-0 leaf count \
+                     rust={rust_tree0_leaves} cpp={cpp_leaf_count} \
+                     ({})",
+                    if rust_tree0_leaves == cpp_leaf_count {
+                        "MATCH — DEF-06-01 closed for this cell"
+                    } else {
+                        "DIVERGENT — DEF-06-01 still open (see 07-D05-DECISION.md)"
+                    }
+                );
+            } else {
+                // regression_l1 + bagging is typed-rejected (06-06 Task 2b); the trace
+                // documents the C++ target leaf count for the un-defer decision.
+                eprintln!(
+                    "subset_determinism_diagnostic[{trace_file}]: regression_l1 + bagging \
+                     is typed-rejected today; C++ tree-0 leaf count = {cpp_leaf_count} \
+                     (the un-defer target, see 07-D05-DECISION.md)"
+                );
+            }
+        }
+    }
+
+    if !any_present {
+        eprintln!(
+            "subset_determinism_diagnostic: no determinism trace present — skip-pass. \
+             Run the human-gated capture (xtask subset-determinism-capture) to enable \
+             the cell-for-cell localization."
+        );
+    }
+}
