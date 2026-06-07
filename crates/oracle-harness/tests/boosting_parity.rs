@@ -2809,6 +2809,88 @@ fn poisson_max_delta_step_axis() {
     replay_exp_log_param_cell("poisson", "poisson_max_delta_step", 0.1);
 }
 
+// ---- DEF-07-02/03 root-cause diagnostic: the most_freq_bin==0 / offset
+//      histogram+scan contract (07-13 Task 1) -------------------------------
+//
+// This pins the EXACT C++ `lib_lightgbm` 4.6 contract proven by the source-built
+// FP execution trace in `.planning/debug/split-gain-knife-edge-07-02.md`:
+//
+//   For a `most_freq_bin == 0` feature (offset == 1) C++ does NOT physically
+//   compact the per-feature histogram. `Dataset::FixHistogram`
+//   (dataset.cpp:1488-1506) is a no-op for mfb==0, the full buffer is kept, and
+//   the REVERSE/FORWARD scan bounds the range `t = num_bin-1-offset .. 1-offset`
+//   reading `GET_GRAD(data_, t) = data_[t<<1]` — i.e. physical cell `t` holds
+//   REAL bin `t`. The most-freq (bin-0) mass is carried as the implicit
+//   `sum_total − Σ(scanned)` default and is never directly read by the bounded
+//   scan (feature_histogram.hpp:854-936 / :937-1030).
+//
+// The PROVEN bug (debug doc Resolution): the Rust learner DOUBLE-APPLIES the
+// offset — `compact_histogram` physically shifts real bin `c+offset → c` and
+// DROPS real bin 0, AND THEN the offset-bounded scan applies `offset` again, so
+// Rust physical cell `t` reads a DIFFERENT real bin than C++. On the small
+// NON-CONSTANT-HESSIAN gamma tree-0 node {original rows 2,3} (row3 f1==0==mfb)
+// this mis-places per-bin g/h and flips the split: Rust net_gain 1.0416667 vs
+// C++ 0.0333 (==golden split_gain[2] 0.375479 is the SIBLING 8-row node; the
+// bogus 1.0417 outranks it, flipping which leaf grows next).
+//
+// Ground truth from the source-built lib_lightgbm 4.6 trace (BIT-EXACT golden):
+//   gamma tree-0 split_gain = [5.06897, 1.8, 0.375479]  leaf_count = [2,4,2,4]
+// The Rust bug currently produces:
+//   gamma tree-0 split_gain = [5.0689654, 1.8, 1.0416667]  leaf_count = [1,8,2,1]
+//
+// This diagnostic MUST FAIL on the current compacted model (the byte target the
+// 07-13 Task-2 fix turns green). It asserts the tree-0 split-gain/topology
+// contract directly (NOT via the leaf_value goldens) so the divergence is
+// isolated to the histogram representation, independent of the un-#[ignore]
+// state of the gamma matrix cells.
+#[test]
+fn mfb_zero_offset_histogram_contract() {
+    let (booster, _) = train_exp_log_spine("gamma");
+    let tree0 = &booster.model().trees[0];
+
+    // The third split is the divergent one: the C++/golden grows the 8-row
+    // (f0 ∈ {2,3,4,5}) side with net_gain 0.375479; the buggy Rust grows the
+    // bogus node{2,3} f1 split with net_gain 1.0416667. Pin the C++ byte target.
+    assert!(
+        tree0.split_gain.len() >= 3,
+        "gamma tree-0 must have grown 3 splits (num_leaves=4), got split_gain={:?}",
+        tree0.split_gain
+    );
+    let net_gain = tree0.split_gain[2];
+    let bogus = 1.0416667_f32;
+    let golden = 0.375479_f32;
+    assert!(
+        (net_gain - bogus).abs() > 1e-3,
+        "mfb==0/offset BUG: gamma tree-0 split_gain[2] is the bogus compacted-histogram \
+         net_gain {net_gain} (≈1.0416667) — the double-applied-offset divergence. \
+         C++ ground truth is ≈0.375479 (split_gain={:?}).",
+        tree0.split_gain
+    );
+    assert!(
+        (net_gain - golden).abs() < 1e-3,
+        "gamma tree-0 split_gain[2] {net_gain} != C++ ground-truth ≈0.375479 \
+         (split_gain={:?})",
+        tree0.split_gain
+    );
+
+    // Topology byte target: golden leaf_count [2,4,2,4] (Rust bug = [1,8,2,1]).
+    assert_eq!(
+        tree0.leaf_count,
+        vec![2, 4, 2, 4],
+        "gamma tree-0 leaf_count must be the golden [2,4,2,4] (the C++ topology); \
+         the mfb==0/offset bug grows [1,8,2,1]. split_gain={:?}",
+        tree0.split_gain
+    );
+    // Full split-gain byte target against the committed golden tree-0.
+    let g = &tree0.split_gain;
+    assert!(
+        (g[0] - 5.06897_f32).abs() < 1e-3
+            && (g[1] - 1.8_f32).abs() < 1e-3
+            && (g[2] - 0.375479_f32).abs() < 1e-3,
+        "gamma tree-0 split_gain {g:?} != golden [5.06897, 1.8, 0.375479]"
+    );
+}
+
 // ---- gamma (subclasses poisson; exp(-score) grad/hess) ----
 //
 // DEF-07-02 (extended in 07-03; ignore-pending-fix, NOT mask): ALL gamma cells hit
