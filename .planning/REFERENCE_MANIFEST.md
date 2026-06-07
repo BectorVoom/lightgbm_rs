@@ -139,3 +139,55 @@ golden). The capture is byte-idempotent (empty `git diff` on a re-run). NEVER
 - `boosting_parity.rs::goss_parity_matrix` — trains each cell via `boosting=goss`
   and asserts the per-tree leaf values BIT-EXACT against the real-binary golden on
   the overlapping trees. Both skip-pass until the fixtures are captured.
+
+# Phase 7 W5 — DART (BST-05) Oracle Fixtures (plan 07-06)
+
+DART (Dropouts meet Multiple Additive Regression Trees) goldens, captured on the real
+prebuilt `lib_lightgbm` 4.6 pip wheel. Normal `cargo test` reads the committed fixtures
+and needs none of this.
+
+## Pinned Reference
+
+- **pip `lightgbm` version:** `4.6.0` (`DART_ORACLE_LIGHTGBM_VERSION`)
+- **Train seed:** `0x60057000` (`DART_ORACLE_SEED`, == `BOOSTING_ORACLE_SEED`)
+- **Drop (RNG) seed:** `4` (`DART_DROP_SEED`, the single advancing `Random(drop_seed)`,
+  config.h:463, dart.hpp:45)
+
+## Deterministic Capture Flags
+
+- `boosting=dart`
+- `drop_rate=0.1 max_drop=50 skip_drop=0.5` (cell defaults); the matrix varies
+  `uniform_drop ∈ {0,1}` × `xgboost_dart_mode ∈ {0,1}` (the 4 normalize branches) × `bag ∈ {0,1}`
+- `deterministic=true force_row_wise=true num_threads=1`
+- identity binning (as above); 24-row corpus (shared with GOSS)
+
+## Exact Capture Command
+
+```bash
+LGBM_CAPTURE_PYTHON=<python-with-lightgbm-4.6.0> \
+  cargo run -p xtask -- dart-oracle-capture
+```
+
+which runs `xtask/py/dart_oracle_capture.py <out_dir> 0x60057000 4 4.6.0` and writes,
+under `crates/oracle-harness/tests/fixtures/dart/`:
+
+| Fixture | Kind | Contents |
+|---------|------|----------|
+| `dart_u{U}_x{X}_bag{B}_model.txt` (8 cells) | L5 model parity | real lib_lightgbm 4.6 `%.17g` model text for the uniform_drop×xgboost_dart_mode×{bag} cell; the normalized tree weights are baked into the stored leaf values by DART's Shrinkage sequence |
+| `dart_u{U}_x{X}_bag{B}_pred.txt` (8 cells) | predict | per-row transformed `predict()` (f64 bits) for the cell |
+| `dart_drop_seed4_iter12.txt` | drop RNG-replay | dropped tree indices PER ITERATION the `dart.hpp` DroppingTrees produces over the bit-exact C++ `Random` LCG (`random.h`), with the tree_weight/sum_weight evolution mirroring Normalize; carries the per-iter tree_weight history as f64 bits |
+
+The drop RNG-replay golden freezes the algorithm spec over the bit-exact LCG (the wheel
+cannot expose internal drop indices — identical posture to the GOSS `goss_rng_replay`
+golden). The capture is byte-idempotent (empty `git diff` on a re-run). NEVER `git add`
+the `LightGBM/` tree.
+
+## Replay
+
+- `boosting_parity.rs::dart_drop_rng_replay` — reproduces `DART::DroppingTrees`'s draw
+  order over the recorded tree_weight history + the advancing `Random(drop_seed)` and
+  asserts the dropped indices per iteration BIT-EXACT.
+- `boosting_parity.rs::dart_parity_matrix` — trains each cell via `boosting=dart` and
+  asserts the per-tree leaf values BIT-EXACT against the real-binary golden on the
+  overlapping trees (all 4 normalize branches × {bag}) + predict() within ORACLE_TOL.
+  Both skip-pass until the fixtures are captured.

@@ -304,7 +304,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 07-06-PLAN.md — DART (BST-05): drop+normalize (4 branches) + drop RNG-replay
+- [x] 07-06-PLAN.md — DART (BST-05): drop+normalize (4 branches) + drop RNG-replay
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
@@ -359,5 +359,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 4/12 | In Progress|  |
+| 7. Parity-Completing Variants | 5/12 | In Progress|  |
 | 8. Python Bindings | 0/TBD | Not started | - |
