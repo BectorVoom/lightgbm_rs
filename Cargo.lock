@@ -1811,6 +1811,7 @@ version = "0.1.0"
 dependencies = [
  "lgbm-core",
  "lgbm-dataset",
+ "lgbm-metric",
  "lgbm-model",
  "oracle-harness",
  "thiserror",

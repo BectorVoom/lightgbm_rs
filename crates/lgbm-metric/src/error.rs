@@ -41,6 +41,29 @@ pub enum MetricError {
         /// The unrecognized / out-of-scope metric name.
         name: String,
     },
+
+    /// A ranking label was negative or exceeded the `label_gain` table size
+    /// (threat T-07-09-02). Mirrors `DCGCalculator::CheckLabel`
+    /// (`dcg_calculator.cpp:147-162`): rank labels must be non-negative ints
+    /// `< label_gain_.size()`. Surfaced as a typed error before any DCG indexing,
+    /// never an out-of-bounds gain-table access.
+    #[error("ranking label out of range: label `{label}` not in [0, {num_gains})")]
+    LabelOutOfRange {
+        /// The offending (truncated-to-int) label value.
+        label: i64,
+        /// The size of the `label_gain` table (the exclusive upper bound).
+        num_gains: usize,
+    },
+
+    /// The supplied `query_boundaries` were malformed (threat T-07-09-01):
+    /// non-monotonic, not starting at 0, or not ending at `num_data`. Validated
+    /// before per-query iteration so a hostile boundary array can never index
+    /// out of bounds or feed a negative-length query to DCG.
+    #[error("invalid query_boundaries: {what}")]
+    InvalidQueryBoundaries {
+        /// Human-readable description of the violated boundary invariant.
+        what: String,
+    },
 }
 
 #[cfg(test)]

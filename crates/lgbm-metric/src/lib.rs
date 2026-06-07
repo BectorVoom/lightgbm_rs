@@ -19,13 +19,17 @@
 //! binary_logloss/binary_error/AUC/multi_logloss) land in 06-04+.
 
 pub mod binary;
+pub mod dcg_calculator;
 pub mod error;
 pub mod multiclass;
+pub mod rank;
 pub mod regression;
 pub mod xentropy;
 
 pub use binary::BinaryMetric;
+pub use dcg_calculator::DcgCalculator;
 pub use error::MetricError;
 pub use multiclass::{AucMu, MultiError, MultiLogloss};
+pub use rank::RankMetric;
 pub use regression::{Metric, RegressionMetricParams};
 pub use xentropy::XentropyMetric;

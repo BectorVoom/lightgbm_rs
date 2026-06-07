@@ -342,6 +342,18 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
         0.0,
     )?;
 
+    // `label_gain` (config.h:994) — comma-separated doubles; empty default. The
+    // DCGCalculator::DefaultLabelGain fallback is applied at objective/metric ctor.
+    get_double_vec(&resolved, "label_gain", &mut cfg.label_gain)?;
+
+    // `eval_at` (config.h:1060; aliases resolved to `eval_at` in alias.rs) —
+    // comma-separated ints; empty default → DefaultEvalAt `[1..=5]` at ctor.
+    get_int_vec(&resolved, "eval_at", &mut cfg.eval_at)?;
+    for &k in &cfg.eval_at {
+        // DCGCalculator::DefaultEvalAt CHECK_GT(eval_at[i], 0) (dcg_calculator.cpp:28).
+        check_gt("eval_at", k, 0)?;
+    }
+
     get_int(&resolved, "metric_freq", &mut cfg.metric_freq)?;
     check_gt("metric_freq", cfg.metric_freq, 0)?;
 
@@ -524,6 +536,52 @@ fn get_bool(
 ) -> Result<bool, ConfigError> {
     if let Some(v) = present(params, name) {
         *out = parse_bool(name, v)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Parse a comma-separated list of ints (C++ `Common::StringToArray<int>`), e.g.
+/// `eval_at="1,3,5"`. An absent/empty value leaves `out` untouched.
+fn get_int_vec(
+    params: &HashMap<String, String>,
+    name: &str,
+    out: &mut Vec<i32>,
+) -> Result<bool, ConfigError> {
+    if let Some(v) = present(params, name) {
+        let mut parsed = Vec::new();
+        for tok in v.split(',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            parsed.push(parse_int(name, t)?);
+        }
+        *out = parsed;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Parse a comma-separated list of doubles (C++ `Common::StringToArray<double>`),
+/// e.g. `label_gain="0,1,3,7"`. An absent/empty value leaves `out` untouched.
+fn get_double_vec(
+    params: &HashMap<String, String>,
+    name: &str,
+    out: &mut Vec<f64>,
+) -> Result<bool, ConfigError> {
+    if let Some(v) = present(params, name) {
+        let mut parsed = Vec::new();
+        for tok in v.split(',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            parsed.push(parse_double(name, t)?);
+        }
+        *out = parsed;
         Ok(true)
     } else {
         Ok(false)

@@ -10,6 +10,11 @@ lgbm-dataset = { path = "../lgbm-dataset" }
 # Reuse `lgbm-model::ObjectiveKind::convert_output` for the predict-side transform
 # (Open-Q1: ConvertOutput stays in lgbm-model; this crate owns the training side).
 lgbm-model = { path = "../lgbm-model" }
+# The shared init-once `DcgCalculator` (gain/discount tables) lives in lgbm-metric
+# and is consumed by BOTH the ranking objectives (here) and the ranking metrics
+# (D-02/D-03: one coherent group sharing query infrastructure). No cycle —
+# lgbm-metric does not depend on lgbm-objective.
+lgbm-metric = { path = "../lgbm-metric" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

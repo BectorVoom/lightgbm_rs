@@ -24,6 +24,7 @@ pub mod custom;
 pub mod error;
 pub mod multiclass;
 pub mod percentile;
+pub mod rank;
 pub mod regression;
 pub mod xentropy;
 
@@ -31,6 +32,7 @@ pub use binary::Binary;
 pub use custom::CustomObjective;
 pub use error::ObjectiveError;
 pub use multiclass::{MulticlassOva, MulticlassSoftmax};
+pub use rank::{Lambdarank, RankXendcg};
 pub use regression::Objective;
 pub use xentropy::{Xentropy, XentropyKind};
 

@@ -17,8 +17,12 @@
 //! `num_model_per_iteration > 1`; the loop grows that many trees per iteration over
 //! the class-major score/grad/hess layout (multiclass_objective.hpp:149/255).
 
+use std::cell::RefCell;
+
+use lgbm_core::random::Random;
 use lgbm_objective::{
-    Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, ObjectiveError, Xentropy,
+    Binary, CustomObjective, Lambdarank, MulticlassOva, MulticlassSoftmax, Objective,
+    ObjectiveError, RankXendcg, Xentropy,
 };
 
 /// The training-side objective the boosting loop drives.
@@ -38,18 +42,43 @@ pub enum BoostObjective<'a> {
     /// `cross_entropy` / `cross_entropy_lambda` (OBJ-05) — single-output
     /// cross-entropy point loss over labels in `[0, 1]`.
     Xentropy(Xentropy),
+    /// `lambdarank` (OBJ-06) — per-query pairwise LambdaRank with NDCG. Single
+    /// output (one tree/iter) over the whole corpus; captures `query_boundaries` +
+    /// labels at construction. `boost_from_average` is OFF (ranking has no mean
+    /// init — C++ `BoostFromScore` is not defined for ranking; NeedAccuratePrediction
+    /// is false).
+    Lambdarank(Lambdarank),
+    /// `rank_xendcg` (OBJ-06) — per-query cross-entropy NDCG. Single output; draws a
+    /// per-query gamma via `Random(objective_seed + q)`, advanced across iterations
+    /// through the [`RefCell`]-held `rands` (mirroring the C++ mutable `rands_`).
+    RankXendcg {
+        /// The objective (captures `objective_seed` + `query_boundaries`).
+        obj: RankXendcg,
+        /// The per-query RNG, built once at construction and advanced on every
+        /// `get_gradients` (C++ `mutable std::vector<Random> rands_`).
+        rands: RefCell<Vec<Random>>,
+    },
 }
 
 impl<'a> BoostObjective<'a> {
+    /// Construct the [`BoostObjective::RankXendcg`] variant, building its per-query
+    /// RNG once (the C++ `Init` `rands_` build). The RNG advances across iterations.
+    pub fn rank_xendcg(obj: RankXendcg) -> Self {
+        let rands = RefCell::new(obj.make_rands());
+        BoostObjective::RankXendcg { obj, rands }
+    }
+
     /// C++ `objective->NumModelPerIteration()` — the number of trees grown per
     /// iteration (and the class-major stride). `num_class` for the multiclass
-    /// variants, `1` for the single-output objectives (regression/binary/custom).
+    /// variants, `1` for the single-output objectives (regression/binary/custom/rank).
     pub fn num_model_per_iteration(&self) -> i32 {
         match self {
             BoostObjective::Builtin(_)
             | BoostObjective::Binary(_)
             | BoostObjective::Custom(_)
-            | BoostObjective::Xentropy(_) => 1,
+            | BoostObjective::Xentropy(_)
+            | BoostObjective::Lambdarank(_)
+            | BoostObjective::RankXendcg { .. } => 1,
             BoostObjective::Multiclass(m) => m.num_model_per_iteration(),
             BoostObjective::MulticlassOva(o) => o.num_model_per_iteration(),
         }
@@ -66,6 +95,10 @@ impl<'a> BoostObjective<'a> {
             BoostObjective::Binary(b) => b.boost_from_score(label),
             BoostObjective::Xentropy(x) => x.boost_from_score(label),
             BoostObjective::Custom(_) => 0.0,
+            // Ranking objectives have no mean/median init score (C++ ranking
+            // BoostFromScore is undefined; training starts from 0). boost_from_average
+            // is also disabled for them (see boost_from_average_enabled).
+            BoostObjective::Lambdarank(_) | BoostObjective::RankXendcg { .. } => 0.0,
             BoostObjective::Multiclass(m) => m.boost_from_score(class_id),
             BoostObjective::MulticlassOva(o) => o.boost_from_score(class_id),
         }
@@ -80,7 +113,9 @@ impl<'a> BoostObjective<'a> {
             // concept / single output).
             BoostObjective::Builtin(_)
             | BoostObjective::Custom(_)
-            | BoostObjective::Xentropy(_) => true,
+            | BoostObjective::Xentropy(_)
+            | BoostObjective::Lambdarank(_)
+            | BoostObjective::RankXendcg { .. } => true,
             BoostObjective::Binary(b) => b.class_need_train(label),
             BoostObjective::Multiclass(m) => m.class_need_train(class_id),
             BoostObjective::MulticlassOva(o) => o.class_need_train(class_id),
@@ -89,9 +124,16 @@ impl<'a> BoostObjective<'a> {
 
     /// Whether `BoostFromAverage` may run at all for this objective. The C++ loop
     /// skips BoostFromAverage entirely when `objective_function_ == nullptr` (the
-    /// custom path) — so this is `false` for [`BoostObjective::Custom`].
+    /// custom path), and ranking objectives have no mean init (NeedAccuratePrediction
+    /// is false; the C++ `BoostFromScore` returns the default 0 for ranking) — so this
+    /// is `false` for custom and the two ranking variants.
     pub fn boost_from_average_enabled(&self) -> bool {
-        !matches!(self, BoostObjective::Custom(_))
+        !matches!(
+            self,
+            BoostObjective::Custom(_)
+                | BoostObjective::Lambdarank(_)
+                | BoostObjective::RankXendcg { .. }
+        )
     }
 
     /// C++ `obj->GetGradients(score, grad, hess)` (or the custom closure in its
@@ -119,6 +161,14 @@ impl<'a> BoostObjective<'a> {
             BoostObjective::Custom(c) => c.get_gradients(score, gradients, hessians),
             BoostObjective::Multiclass(m) => m.get_gradients(score, gradients, hessians),
             BoostObjective::MulticlassOva(o) => o.get_gradients(score, gradients, hessians),
+            // Lambdarank captures labels + query_boundaries at construction.
+            BoostObjective::Lambdarank(l) => l.get_gradients(score, gradients, hessians),
+            // rank_xendcg advances its per-query RNG across iterations (the C++
+            // mutable rands_); the borrow is released before return.
+            BoostObjective::RankXendcg { obj, rands } => {
+                let mut rands = rands.borrow_mut();
+                obj.get_gradients(score, label, &mut rands, gradients, hessians)
+            }
         }
     }
 
@@ -130,7 +180,9 @@ impl<'a> BoostObjective<'a> {
             | BoostObjective::Custom(_)
             | BoostObjective::Multiclass(_)
             | BoostObjective::MulticlassOva(_)
-            | BoostObjective::Xentropy(_) => false,
+            | BoostObjective::Xentropy(_)
+            | BoostObjective::Lambdarank(_)
+            | BoostObjective::RankXendcg { .. } => false,
         }
     }
 
@@ -147,7 +199,9 @@ impl<'a> BoostObjective<'a> {
             | BoostObjective::Custom(_)
             | BoostObjective::Multiclass(_)
             | BoostObjective::MulticlassOva(_)
-            | BoostObjective::Xentropy(_) => 0.0,
+            | BoostObjective::Xentropy(_)
+            | BoostObjective::Lambdarank(_)
+            | BoostObjective::RankXendcg { .. } => 0.0,
         }
     }
 }

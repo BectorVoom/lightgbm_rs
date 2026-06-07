@@ -255,6 +255,10 @@ pub struct Config {
     pub lambdarank_norm: bool,
     /// `double lambdarank_position_bias_regularization`. config.h default: 0.0.
     pub lambdarank_position_bias_regularization: f64,
+    /// `std::vector<double> label_gain` (config.h:994). Empty by default — the
+    /// `DCGCalculator::DefaultLabelGain` fallback (`2^i - 1`, 31 entries) is
+    /// applied by the ranking objective/metric at construction.
+    pub label_gain: Vec<f64>,
 
     // --- Metric config ---
     /// `int metric_freq`. config.h default: 1.
@@ -263,6 +267,10 @@ pub struct Config {
     pub is_provide_training_metric: bool,
     /// `int multi_error_top_k`. config.h default: 1.
     pub multi_error_top_k: i32,
+    /// `std::vector<int> eval_at` (config.h:1060; aliases ndcg_eval_at/ndcg_at/
+    /// map_eval_at/map_at). Empty by default — `DCGCalculator::DefaultEvalAt`
+    /// fills `[1,2,3,4,5]` when empty at ndcg/map construction.
+    pub eval_at: Vec<i32>,
 
     // --- Derived sub-seeds (config_auto.cpp members; config.h defaults) ---
     /// `int data_random_seed`. config.h default: 1 (overwritten by seed derivation).
@@ -394,10 +402,12 @@ impl Default for Config {
             lambdarank_truncation_level: 30,
             lambdarank_norm: true,
             lambdarank_position_bias_regularization: 0.0,
+            label_gain: Vec::new(),
 
             metric_freq: 1,
             is_provide_training_metric: false,
             multi_error_top_k: 1,
+            eval_at: Vec::new(),
 
             // config.h defaults (overwritten by from_params seed derivation when `seed` is given).
             data_random_seed: 1,
