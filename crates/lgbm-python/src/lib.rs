@@ -16,6 +16,7 @@ pub mod booster;
 pub mod dataset;
 pub mod error;
 pub mod marshal;
+pub mod params;
 
 use booster::{train, Booster};
 use dataset::Dataset;

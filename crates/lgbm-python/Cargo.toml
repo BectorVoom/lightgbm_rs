@@ -13,10 +13,24 @@ lgbm-model = { path = "../lgbm-model" }
 # pyo3 0.27 is the floor required by pyo3-polars 0.26; numpy 0.27 is the
 # pyo3-0.27-compatible rust-numpy release. Mixing numpy 0.28 (needs pyo3 0.28)
 # with pyo3-polars 0.26 will NOT compile — these three must move together.
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
+# NOTE: `extension-module` is deliberately NOT enabled here. It tells pyo3 to
+# leave libpython unlinked (the host interpreter provides the symbols at import
+# time) — correct for the maturin wheel build, which adds it via
+# `[tool.maturin].features = ["pyo3/extension-module"]`, but it makes a
+# `cargo test` binary fail to link (no interpreter → undefined Py* symbols).
+# Enabling it ONLY through maturin lets `cargo test` link libpython and run the
+# Rust units (08-05 D-08 coercion seam), while the wheel still builds as a
+# proper extension module.
+pyo3 = { version = "0.27", features = ["abi3-py39"] }
 numpy = "0.27"
 pyo3-polars = "0.26"
 
+[dev-dependencies]
+# `auto-initialize` boots a CPython interpreter for `cargo test` so the Rust
+# units can drive a live `PyDict`/`Python::attach` (the D-08 coercion paths).
+pyo3 = { version = "0.27", features = ["abi3-py39", "auto-initialize"] }
+
 [lib]
-# The compiled extension module (`lightgbm_rs._core`, D-11/D-12).
-crate-type = ["cdylib"]
+# The compiled extension module (`lightgbm_rs._core`, D-11/D-12). `rlib` is added
+# so the `cargo test` harness can link the crate as a normal Rust library.
+crate-type = ["cdylib", "rlib"]
