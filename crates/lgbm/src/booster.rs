@@ -538,6 +538,24 @@ impl Booster {
         );
     }
 
+    /// Whole-ensemble leaf-refit on new `(rows, labels)` for the regression (L2)
+    /// default objective — the high-level mirror of `Booster.refit(data, label)`
+    /// (PYB-04 / ADV-06). Delegates to [`GbdtModel::refit_ensemble_l2`], which
+    /// reproduces the C++ `RefitTree` iterative loop (grad/hess on the score
+    /// accumulated from the refit trees, per-tree leaf blend by `decay`). In place.
+    pub fn refit_data(
+        &mut self,
+        rows: &[Vec<f64>],
+        labels: &[f32],
+        decay: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) {
+        self.model
+            .refit_ensemble_l2(rows, labels, decay, use_l1, l1, l2);
+    }
+
     /// Serialize the model to LightGBM-compatible v4 model text (Phase-3
     /// byte-stable `%.17g`/`%g` formatter). Delegates to
     /// [`lgbm_model::model_text::save`].

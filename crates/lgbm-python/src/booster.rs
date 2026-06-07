@@ -111,24 +111,12 @@ impl Booster {
                 rows.len()
             )));
         }
-        let num_trees = self.inner.model().num_iteration() as usize;
-        // GIL RELEASED around the CPU-bound per-tree refit (D-13/SC#1).
+        // GIL RELEASED around the CPU-bound ensemble refit (D-13/SC#1). The facade
+        // reproduces the C++ RefitTree iterative loop (grad/hess on the score
+        // accumulated from the refit trees, per-tree leaf decay-blend).
         py.detach(|| {
-            for tree_index in 0..num_trees {
-                // L2 grad/hess from the current raw margin over the new data:
-                // grad = pred - label, hess = 1 (the default-objective refit the
-                // official package performs when no custom objective is set).
-                let preds = self.inner.predict_raw_batch(&rows, 0, -1);
-                let mut gradients = vec![0.0f32; rows.len()];
-                let hessians = vec![1.0f32; rows.len()];
-                for (i, p) in preds.iter().enumerate() {
-                    let pred = p.first().copied().unwrap_or(0.0);
-                    gradients[i] = (pred - labels[i] as f64) as f32;
-                }
-                self.inner.refit(
-                    tree_index, &rows, &gradients, &hessians, decay_rate, false, 0.0, 0.0,
-                );
-            }
+            self.inner
+                .refit_data(&rows, &labels, decay_rate, false, 0.0, 0.0);
         });
         Ok(())
     }

@@ -263,6 +263,68 @@ impl GbdtModel {
             );
         }
     }
+
+    /// Whole-ensemble leaf-refit on new `(rows, labels)` for the REGRESSION (L2)
+    /// default objective — the model-layer mirror of `GBDT::RefitTree` /
+    /// `Booster.refit(data, label)` (ADV-06). This is the high-level refit the
+    /// Python `Booster.refit` exposes: it reproduces the C++ iterative loop exactly,
+    /// computing per-row grad/hess (`grad = score - label`, `hess = 1` for L2) on
+    /// the score accumulated FROM THE REFIT TREES iteration-by-iteration (NOT from
+    /// the original full prediction), then leaf-refitting each tree in turn and
+    /// adding its new predictions to the running refit score.
+    ///
+    /// `rows` are the new RAW feature rows (width `max_feature_idx + 1`); `labels`
+    /// the new f32 targets (length `rows.len()`). `decay` is `refit_decay_rate`;
+    /// `use_l1`/`l1`/`l2` mirror the leaf-output config. The refit is in place.
+    ///
+    /// Limited to single-output (regression/binary-margin) ensembles
+    /// (`num_tree_per_iteration == 1`); the multiclass refit (per-class grad/hess
+    /// stride) is not exercised by the Phase-8 Python path and is left for a future
+    /// slice. A no-op when there are no trees or rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refit_ensemble_l2(
+        &mut self,
+        rows: &[Vec<f64>],
+        labels: &[f32],
+        decay: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) {
+        let ntpi = self.num_tree_per_iteration.max(1) as usize;
+        let nd = rows.len();
+        if nd == 0 || self.trees.is_empty() || ntpi != 1 {
+            return;
+        }
+        let num_iterations = self.trees.len() / ntpi;
+        // C++ `RefitTree` re-scores from the refit trees themselves: the running
+        // score starts at ZERO (verified empirically — the first refit tree's leaf
+        // equals `-sum_grad/sum_hess` with `grad = -label`, i.e. score init = 0),
+        // then each refit tree's prediction is added back (`AddScore(new_tree)`).
+        let mut score = vec![0.0f64; nd];
+        let mut gradients = vec![0.0f32; nd];
+        let hessians = vec![1.0f32; nd]; // L2 hessian is constant 1.
+        for iter in 0..num_iterations {
+            // L2 grad on the CURRENT refit score: grad = score - label.
+            for r in 0..nd {
+                gradients[r] = (score[r] - labels[r] as f64) as f32;
+            }
+            let model_index = iter * ntpi; // ntpi == 1.
+            // The official `Booster.refit` re-loads each tree's `shrinkage` as 1.0
+            // (model text emits `shrinkage=1`; the learning-rate scale is baked into
+            // the stored leaf values). So `refit_leaf`'s fresh Newton output must NOT
+            // be re-scaled by the original learning rate — set the effective
+            // shrinkage to 1.0 (verified empirically: a decay=0 refit leaf equals
+            // `-sum_grad/sum_hess` with NO 0.1 factor).
+            self.trees[model_index].shrinkage = 1.0;
+            self.refit_one_tree(model_index, rows, &gradients, &hessians, decay, use_l1, l1, l2);
+            // AddScore(new_tree): the refit tree's predictions add to the running
+            // score (the stored leaf values already carry the shrinkage scale).
+            for (r, row) in rows.iter().enumerate() {
+                score[r] += self.trees[model_index].predict(row);
+            }
+        }
+    }
 }
 
 /// The `PredictionEarlyStopInstance` margin callback (`prediction_early_stop.cpp`).
