@@ -1,0 +1,4 @@
+# DART (BST-05) oracle fixtures — real lib_lightgbm 4.6 parity goldens + the
+# drop_seed RNG-replay golden (dropped tree indices per iteration, bit-exact).
+# Populated by `cargo run -p xtask -- dart-oracle-capture`. NEVER the untracked
+# LightGBM/ reference tree.

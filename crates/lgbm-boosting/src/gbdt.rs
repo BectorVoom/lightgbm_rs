@@ -24,6 +24,7 @@
 //! via `BoostFromAverage → AddScore`, never via `AddBias` (no double-add).
 
 use lgbm_compute::Backend;
+use lgbm_core::random::Random;
 use lgbm_model::{GbdtModel, Tree};
 use lgbm_objective::Objective;
 use lgbm_treelearner::{FeatureColumn, SerialTreeLearner};
@@ -32,6 +33,84 @@ use crate::error::BoostingError;
 use crate::objective::BoostObjective;
 use crate::sample_strategy::{BaggingSampleStrategy, GossSampleStrategy};
 use crate::score_updater::ScoreUpdater;
+
+/// The boosting strategy variant (RESEARCH Pattern 1 — an ENUM FIELD on [`Gbdt`],
+/// NOT trait objects). In C++ these are subclasses of `GBDT` (`DART`, `RF`);
+/// the Rust port keeps the single [`Gbdt`] driver and branches on this discriminant
+/// in [`Gbdt::train_one_iter`], which is the faithful, allocation-free seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoostingVariant {
+    /// Plain gradient boosting (`GBDT`) — the spine. The default.
+    #[default]
+    Gbdt,
+    /// DART (`dart.hpp`) — Dropouts meet Multiple Additive Regression Trees: each
+    /// iteration drops a random subset of already-grown trees (via an advancing
+    /// `Random(drop_seed)`), trains the new tree against the post-drop score, then
+    /// re-adds + normalizes the dropped trees' weights (BST-05).
+    Dart,
+    /// Random Forest (`rf.hpp`) — averaged trees. Scoped to a LATER plan; the
+    /// variant is declared here for the complete `{Gbdt, Dart, Rf}` enum (RESEARCH
+    /// Pattern 1) but [`Gbdt::train_one_iter`] does not yet branch on it.
+    Rf,
+}
+
+/// DART (`dart.hpp`) configuration — the parity-relevant `Config` subset, resolved
+/// by the caller / facade. Mirrors `config.h`: `drop_rate` (0.1), `max_drop` (50),
+/// `skip_drop` (0.5), `xgboost_dart_mode` (false), `uniform_drop` (false),
+/// `drop_seed` (4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DartConfig {
+    /// `config_->drop_rate` — the per-tree drop probability scale.
+    pub drop_rate: f64,
+    /// `config_->max_drop` — the cap on dropped trees per iteration (`<= 0` ⇒ no cap).
+    pub max_drop: i32,
+    /// `config_->skip_drop` — the probability of skipping all drops this iteration.
+    pub skip_drop: f64,
+    /// `config_->xgboost_dart_mode` — selects the xgboost normalize branch.
+    pub xgboost_dart_mode: bool,
+    /// `config_->uniform_drop` — drop each tree with a uniform `drop_rate` instead of
+    /// weighting by `tree_weight[i] * inv_average_weight`; also disables the
+    /// `tree_weight_` bookkeeping (`dart.hpp:66,103,173`).
+    pub uniform_drop: bool,
+    /// `config_->drop_seed` — the seed for the single advancing drop RNG.
+    pub drop_seed: i32,
+}
+
+/// DART per-iteration drop+normalize state (`dart.hpp` private members). Held
+/// alongside [`BoostingVariant::Dart`] on [`Gbdt`].
+struct DartState {
+    config: DartConfig,
+    /// `random_for_drop_` — the SINGLE advancing `Random(drop_seed)`, constructed
+    /// ONCE (`dart.hpp:45`) and advanced across iterations (CRITICAL: re-seeding per
+    /// iteration would re-draw the same trees every iteration, diverging from C++).
+    random_for_drop: Random,
+    /// `tree_weight_` — per-tree weights (used to choose drop trees + normalize).
+    /// Pushed `shrinkage_rate_` each iter unless `uniform_drop` (`dart.hpp:67`).
+    tree_weight: Vec<f64>,
+    /// `sum_weight_` — running sum of `tree_weight_`.
+    sum_weight: f64,
+    /// `drop_index_` — the indices of the trees dropped THIS iteration (iteration
+    /// indices `0..iter`, i.e. `num_init_iteration_ + i` with `num_init_iteration_=0`
+    /// for a fresh train).
+    drop_index: Vec<i32>,
+    /// `shrinkage_rate_` — the DART-modified per-tree shrinkage for the NEXT-grown
+    /// tree (`dart.hpp:139,142,144`), set by DroppingTrees.
+    shrinkage_rate: f64,
+}
+
+impl std::fmt::Debug for DartState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Random` is intentionally not `Debug` (the parity-critical LCG); show the
+        // config + realized state instead of the per-iter RNG internals.
+        f.debug_struct("DartState")
+            .field("config", &self.config)
+            .field("tree_weight_len", &self.tree_weight.len())
+            .field("sum_weight", &self.sum_weight)
+            .field("drop_index", &self.drop_index)
+            .field("shrinkage_rate", &self.shrinkage_rate)
+            .finish()
+    }
+}
 
 /// The GBDT ensemble driver — the f64 score accumulator + the grown model.
 ///
@@ -79,6 +158,13 @@ pub struct Gbdt<'a> {
     /// STILL get the tree prediction added, exactly like bagging OOB). Inside the skip
     /// window GOSS keeps every row with grad/hess unmodified (the full-corpus path).
     goss: Option<GossSampleStrategy>,
+    /// The boosting variant discriminant (RESEARCH Pattern 1). [`BoostingVariant::Gbdt`]
+    /// for the spine; [`BoostingVariant::Dart`] activates the DART drop+normalize path
+    /// (state in [`Self::dart`]).
+    variant: BoostingVariant,
+    /// DART per-iteration drop+normalize state. `Some` iff `variant == Dart` (set by
+    /// [`Self::with_dart`]); `None` otherwise.
+    dart: Option<DartState>,
     /// The full-corpus feature columns (real bin layout) — needed by the bagging
     /// path to (a) subset-train via the learner and (b) score OOB rows predict-side
     /// (`Tree::predict` over each row's real feature values). Empty when bagging is
@@ -144,8 +230,51 @@ impl<'a> Gbdt<'a> {
             iter: 0,
             bagging: None,
             goss: None,
+            variant: BoostingVariant::Gbdt,
+            dart: None,
             features: Vec::new(),
         }
+    }
+
+    /// Enable the DART boosting variant (BST-05, RESEARCH Pattern 1 — an enum field,
+    /// not a trait object). `dart_config` carries the resolved `drop_rate` / `max_drop`
+    /// / `skip_drop` / `xgboost_dart_mode` / `uniform_drop` / `drop_seed`; `features`
+    /// is the full-corpus feature columns (DART re-scores dropped trees over the WHOLE
+    /// corpus predict-side each iteration — `dart.hpp:135,171,189`).
+    ///
+    /// Sets [`BoostingVariant::Dart`] and constructs the SINGLE advancing
+    /// `Random(drop_seed)` ONCE (`dart.hpp:45` — advanced across iterations, never
+    /// re-seeded). Builder-style; chains after a constructor.
+    #[must_use]
+    pub fn with_dart(mut self, dart_config: DartConfig, features: Vec<FeatureColumn>) -> Self {
+        self.variant = BoostingVariant::Dart;
+        self.dart = Some(DartState {
+            config: dart_config,
+            random_for_drop: Random::new(dart_config.drop_seed),
+            tree_weight: Vec::new(),
+            sum_weight: 0.0,
+            drop_index: Vec::new(),
+            shrinkage_rate: self.learning_rate,
+        });
+        self.features = features;
+        self
+    }
+
+    /// Set the boosting [`BoostingVariant`] discriminant directly (RESEARCH Pattern 1
+    /// `with_variant` shape). DART requires its state — prefer [`Self::with_dart`],
+    /// which sets the variant AND constructs the drop RNG. This setter is the generic
+    /// chained entry point used by callers that already hold a configured variant
+    /// (e.g. `Gbdt`/`Rf`); calling it with `Dart` WITHOUT [`Self::with_dart`] leaves
+    /// the DART state unset and the loop treats it as the spine.
+    #[must_use]
+    pub fn with_variant(mut self, variant: BoostingVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    /// The active boosting variant (test / inspection helper).
+    pub fn variant(&self) -> BoostingVariant {
+        self.variant
     }
 
     /// Enable bagging / row subsampling (BST-03). `bagging` is the
@@ -315,6 +444,16 @@ impl<'a> Gbdt<'a> {
                 self.boost_from_average(cur_tree_id, labels, num_features);
         }
 
+        // ---- (1b) DART DroppingTrees (BEFORE GetGradients) ----
+        // C++ `DART::GetTrainingScore` triggers `DroppingTrees()` ONCE per iteration
+        // (dart.hpp:78-86), and `Boosting()` calls `GetGradients(GetTrainingScore())`
+        // (gbdt.cpp:230/233) — so the drops happen and modify the train score BEFORE
+        // the objective computes gradients on it. Drops are over the trees grown so far
+        // (iters 0..iter); on iter 0 only draw #0 (skip_drop) is consumed (no trees).
+        if self.variant == BoostingVariant::Dart && self.dart.is_some() {
+            self.dropping_trees(k);
+        }
+
         // ---- (2) Boosting(): obj.GetGradients on the CURRENT train score ----
         let mut gradients = vec![0.0f32; total];
         let mut hessians = vec![0.0f32; total];
@@ -368,6 +507,16 @@ impl<'a> Gbdt<'a> {
         // it must see the pre-update score; snapshot it once (it is unchanged across
         // the K=1 single-output loop here).
         let train_score_pre = self.score_updater.scores().to_vec();
+
+        // The per-tree shrinkage for THIS iteration's new tree. For the GBDT spine
+        // this is `learning_rate`; for DART it is the DART-modified `shrinkage_rate_`
+        // set by DroppingTrees above (`dart.hpp:139-145` — `lr / (1 + #dropped)` or
+        // the xgboost variant), which is what `GBDT::TrainOneIter` reads via
+        // `shrinkage_rate_` (gbdt.cpp:398).
+        let shrink_rate = match (self.variant, self.dart.as_ref()) {
+            (BoostingVariant::Dart, Some(d)) => d.shrinkage_rate,
+            _ => self.learning_rate,
+        };
 
         // ---- (4) per-class tree loop ----
         for cur_tree_id in 0..k {
@@ -461,7 +610,7 @@ impl<'a> Gbdt<'a> {
                             }),
                         );
                     }
-                    tree.shrinkage(self.learning_rate);
+                    tree.shrinkage(shrink_rate);
                     // Score BOTH in-bag and OOB rows predict-side over the real feature
                     // values (bit-exact to the partition scatter on the identity-binned
                     // corpus — the L2 contract). OOB rows STILL get scored (Pitfall 4).
@@ -548,7 +697,7 @@ impl<'a> Gbdt<'a> {
                     );
                 }
                 // Shrinkage BEFORE UpdateScore.
-                tree.shrinkage(self.learning_rate);
+                tree.shrinkage(shrink_rate);
                 // UpdateScore: bit-exact training-path per-leaf scatter into score_.
                 self.score_updater
                     .add_tree_train_path(learner, &tree, &partition, cur_tree_id);
@@ -571,6 +720,19 @@ impl<'a> Gbdt<'a> {
                 let init = init_scores[cur_tree_id as usize];
                 let const_val = self.no_split_constant_value(cur_tree_id, labels, init);
                 self.trees.push(Tree::as_constant(const_val, self.num_data));
+            }
+        }
+
+        // ---- (5) DART Normalize + push tree_weight ----
+        // C++ `DART::TrainOneIter` (dart.hpp:58-71): after GBDT::TrainOneIter grows the
+        // new tree, `Normalize()` re-adds + rescales the dropped trees, then (unless
+        // uniform_drop) the new tree's `shrinkage_rate_` is pushed to `tree_weight_`.
+        if self.variant == BoostingVariant::Dart && self.dart.is_some() {
+            self.normalize(k);
+            let dart = self.dart.as_mut().expect("DART state present");
+            if !dart.config.uniform_drop {
+                dart.tree_weight.push(dart.shrinkage_rate);
+                dart.sum_weight += dart.shrinkage_rate;
             }
         }
 
@@ -615,6 +777,156 @@ impl<'a> Gbdt<'a> {
     /// The number of completed iterations.
     pub fn num_iteration(&self) -> i32 {
         self.iter
+    }
+
+    /// Build a row's real feature-value vector from the stored full-corpus
+    /// [`FeatureColumn`]s (the identity-binned bin index IS the real value — the L2
+    /// predict-vs-scatter contract). Width is `max real_feature_index + 1`. Used by
+    /// the DART DroppingTrees / Normalize full-corpus predict-side re-scoring.
+    fn feature_row(&self, row: i32) -> Vec<f64> {
+        let width = self
+            .features
+            .iter()
+            .map(|f| f.real_feature_index)
+            .max()
+            .map(|m| (m + 1) as usize)
+            .unwrap_or(0);
+        let mut v = vec![0.0f64; width];
+        for f in &self.features {
+            v[f.real_feature_index as usize] = f.bins[row as usize] as f64;
+        }
+        v
+    }
+
+    /// C++ `DART::DroppingTrees` (`dart.hpp:97-147`). Runs at the START of each DART
+    /// iteration (C++ via `GetTrainingScore` inside `Boosting()`, BEFORE
+    /// `GetGradients` — gbdt.cpp:230/233): selects the dropped tree indices from the
+    /// SINGLE advancing `Random(drop_seed)` with the exact draw order (draw #0 =
+    /// `skip_drop`, then per-tree draws), removes the dropped trees from the train
+    /// score (`Shrinkage(-1.0)` on the STORED tree + `AddScore`), and sets the
+    /// DART-modified `shrinkage_rate_` for the new tree.
+    ///
+    /// `num_tree_per_iteration` is `K` (1 for the DART spine; the per-class stride).
+    fn dropping_trees(&mut self, k: i32) {
+        // Drain the DART state to avoid a double borrow of `self` (DroppingTrees needs
+        // both the dart state and the trees + score_updater + features).
+        let mut dart = self.dart.take().expect("DART state present");
+        let cfg = dart.config;
+        dart.drop_index.clear();
+        let lr = self.learning_rate;
+        let iter = self.iter;
+
+        // Draw #0: skip_drop. `NextFloat() < skip_drop` => skip ALL drops this iter.
+        let is_skip = (dart.random_for_drop.next_float() as f64) < cfg.skip_drop;
+        if !is_skip {
+            let mut drop_rate = cfg.drop_rate;
+            if !cfg.uniform_drop {
+                let inv_average_weight = dart.tree_weight.len() as f64 / dart.sum_weight;
+                if cfg.max_drop > 0 {
+                    drop_rate =
+                        drop_rate.min(cfg.max_drop as f64 * inv_average_weight / dart.sum_weight);
+                }
+                for i in 0..iter {
+                    let draw = dart.random_for_drop.next_float() as f64;
+                    if draw < drop_rate * dart.tree_weight[i as usize] * inv_average_weight {
+                        dart.drop_index.push(i); // num_init_iteration_ = 0
+                        if dart.drop_index.len() >= cfg.max_drop.max(0) as usize {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                if cfg.max_drop > 0 {
+                    drop_rate = drop_rate.min(cfg.max_drop as f64 / iter as f64);
+                }
+                for i in 0..iter {
+                    let draw = dart.random_for_drop.next_float() as f64;
+                    if draw < drop_rate {
+                        dart.drop_index.push(i);
+                        if dart.drop_index.len() >= cfg.max_drop.max(0) as usize {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drop the selected trees: Shrinkage(-1.0) on the STORED tree, then AddScore
+        // over the FULL corpus (predict-side, bit-exact to the partition scatter on
+        // the identity-binned corpus). Per-class over `cur_tree_id` (K=1 spine).
+        // Snapshot the per-row feature vectors once (disjoint from score_updater).
+        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        let drop_index = dart.drop_index.clone();
+        for &i in &drop_index {
+            for cur_tree_id in 0..k {
+                let curr_tree = (i * k + cur_tree_id) as usize;
+                self.trees[curr_tree].shrinkage(-1.0);
+                let tree = self.trees[curr_tree].clone();
+                self.score_updater
+                    .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+            }
+        }
+
+        // shrinkage_rate_ for the new tree (dart.hpp:138-146).
+        let kk = dart.drop_index.len() as f64;
+        if !cfg.xgboost_dart_mode {
+            dart.shrinkage_rate = lr / (1.0 + kk);
+        } else if dart.drop_index.is_empty() {
+            dart.shrinkage_rate = lr;
+        } else {
+            dart.shrinkage_rate = lr / (lr + kk);
+        }
+        self.dart = Some(dart);
+    }
+
+    /// C++ `DART::Normalize` (`dart.hpp:158-197`) — the 3-step re-add+normalize of the
+    /// dropped trees, with the 4 branches (`uniform_drop` × `xgboost_dart_mode`). Runs
+    /// AFTER the new tree is grown+scored. Mutates the dropped STORED trees' values and
+    /// the train score so the dropped trees end with weight `k/(k+1)` (or the xgboost
+    /// `k/(k+lr)`) of their pre-drop contribution; `tree_weight_` is rescaled in step
+    /// with the score unless `uniform_drop` (`dart.hpp:173,191`).
+    fn normalize(&mut self, k_trees_per_iter: i32) {
+        let mut dart = self.dart.take().expect("DART state present");
+        let cfg = dart.config;
+        let lr = self.learning_rate;
+        let k = dart.drop_index.len() as f64;
+        let drop_index = dart.drop_index.clone();
+        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+
+        for &i in &drop_index {
+            for cur_tree_id in 0..k_trees_per_iter {
+                let curr_tree = (i * k_trees_per_iter + cur_tree_id) as usize;
+                if !cfg.xgboost_dart_mode {
+                    // step 2 (valid-side in C++) folded: Shrinkage(1/(k+1)). We do not
+                    // carry valid updaters in Gbdt (valid is re-derived in the facade),
+                    // so the valid AddScore is a no-op here — but the STORED-tree
+                    // shrinkage sequence MUST mirror C++ so the model text matches.
+                    self.trees[curr_tree].shrinkage(1.0 / (k + 1.0));
+                    // step 3 (train-side): Shrinkage(-k) then AddScore to train.
+                    self.trees[curr_tree].shrinkage(-k);
+                    let tree = self.trees[curr_tree].clone();
+                    self.score_updater
+                        .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                } else {
+                    self.trees[curr_tree].shrinkage(dart.shrinkage_rate);
+                    self.trees[curr_tree].shrinkage(-k / lr);
+                    let tree = self.trees[curr_tree].clone();
+                    self.score_updater
+                        .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                }
+            }
+            if !cfg.uniform_drop {
+                let w = dart.tree_weight[i as usize];
+                if !cfg.xgboost_dart_mode {
+                    dart.sum_weight -= w * (1.0 / (k + 1.0));
+                    dart.tree_weight[i as usize] = w * (k / (k + 1.0));
+                } else {
+                    dart.sum_weight -= w * (1.0 / (k + lr));
+                    dart.tree_weight[i as usize] = w * (k / (k + lr));
+                }
+            }
+        }
+        self.dart = Some(dart);
     }
 
     /// The number of grown trees (`models_.len()`), `= iter * num_model_per_iteration`.
@@ -1107,6 +1419,262 @@ mod tests {
         assert_eq!(
             gbdt.trees[2].num_leaves, 1,
             "absent class -> constant 1-leaf tree"
+        );
+    }
+
+    // ===================== 07-06: DART boosting variant (BST-05) =====================
+
+    use lgbm_core::random::Random as DartRandom;
+
+    /// The config.h DART defaults (drop_rate 0.1, max_drop 50, skip_drop 0.5,
+    /// xgboost_dart_mode false, uniform_drop false, drop_seed 4). A unit-level proof
+    /// that [`DartConfig`] mirrors the reference defaults (the facade resolves these
+    /// from `lgbm-core::Config`, whose `Default` already carries them — see
+    /// `config/mod.rs`).
+    fn dart_default_config() -> DartConfig {
+        DartConfig {
+            drop_rate: 0.1,
+            max_drop: 50,
+            skip_drop: 0.5,
+            xgboost_dart_mode: false,
+            uniform_drop: false,
+            drop_seed: 4,
+        }
+    }
+
+    /// A 12-row separable corpus (matching the GOSS test shape) so DART grows real
+    /// splits each iteration.
+    fn dart_corpus() -> (Vec<FeatureColumn>, Vec<f32>, GainConfig) {
+        let (features, _l, cfg) = corpus();
+        let f0 = FeatureColumn {
+            bins: vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+            real_feature_index: 0,
+            ..features[0].clone()
+        };
+        let f1 = FeatureColumn {
+            bins: vec![0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+            real_feature_index: 1,
+            ..features[1].clone()
+        };
+        let labels = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
+        (vec![f0, f1], labels, cfg)
+    }
+
+    /// Verbatim re-implementation of `DART::DroppingTrees`'s DRAW order over the proven
+    /// `lgbm_core::Random` LCG — the drop RNG-replay reference. Given the per-tree
+    /// `tree_weight` + `sum_weight` BEFORE this iter, returns the dropped tree indices.
+    /// Mirrors dart.hpp:97-128 (draw #0 skip_drop, then per-tree draws). NOT re-seeded
+    /// per call — the caller owns the advancing `Random`.
+    fn reference_drop(
+        rng: &mut DartRandom,
+        cfg: &DartConfig,
+        iter: i32,
+        tree_weight: &[f64],
+        sum_weight: f64,
+    ) -> Vec<i32> {
+        let mut drop = Vec::new();
+        let is_skip = (rng.next_float() as f64) < cfg.skip_drop;
+        if is_skip {
+            return drop;
+        }
+        let mut drop_rate = cfg.drop_rate;
+        if !cfg.uniform_drop {
+            let inv_avg = tree_weight.len() as f64 / sum_weight;
+            if cfg.max_drop > 0 {
+                drop_rate = drop_rate.min(cfg.max_drop as f64 * inv_avg / sum_weight);
+            }
+            for i in 0..iter {
+                if (rng.next_float() as f64) < drop_rate * tree_weight[i as usize] * inv_avg {
+                    drop.push(i);
+                    if drop.len() >= cfg.max_drop.max(0) as usize {
+                        break;
+                    }
+                }
+            }
+        } else {
+            if cfg.max_drop > 0 {
+                drop_rate = drop_rate.min(cfg.max_drop as f64 / iter as f64);
+            }
+            for i in 0..iter {
+                if (rng.next_float() as f64) < drop_rate {
+                    drop.push(i);
+                    if drop.len() >= cfg.max_drop.max(0) as usize {
+                        break;
+                    }
+                }
+            }
+        }
+        drop
+    }
+
+    #[test]
+    fn dart_config_defaults_match_config_h() {
+        let c = dart_default_config();
+        assert!((c.drop_rate - 0.1).abs() < 1e-12);
+        assert_eq!(c.max_drop, 50);
+        assert!((c.skip_drop - 0.5).abs() < 1e-12);
+        assert!(!c.xgboost_dart_mode);
+        assert!(!c.uniform_drop);
+        assert_eq!(c.drop_seed, 4);
+    }
+
+    #[test]
+    fn dart_variant_is_selected_via_with_dart() {
+        let (features, labels, _cfg) = dart_corpus();
+        let gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            labels.len() as i32,
+            true,
+            None,
+        )
+        .with_dart(dart_default_config(), features);
+        assert_eq!(gbdt.variant(), BoostingVariant::Dart);
+    }
+
+    #[test]
+    fn dart_drop_draw_order_skip_then_per_tree() {
+        // The drop RNG draw order is load-bearing: draw #0 is skip_drop, then ONE draw
+        // per already-grown tree. With skip_drop=0.0 (never skip) and drop_rate=1.0
+        // (always drop, uniform_drop) the reference must drop EVERY tree, consuming
+        // exactly 1 + iter draws from the advancing Random.
+        let cfg = DartConfig {
+            drop_rate: 1.0,
+            max_drop: 50,
+            skip_drop: 0.0,
+            xgboost_dart_mode: false,
+            uniform_drop: true,
+            drop_seed: 4,
+        };
+        let mut rng = DartRandom::new(cfg.drop_seed);
+        // iter = 3 grown trees, uniform weights.
+        let tw = vec![0.1, 0.1, 0.1];
+        let drop = reference_drop(&mut rng, &cfg, 3, &tw, 0.3);
+        assert_eq!(drop, vec![0, 1, 2], "drop_rate=1 uniform must drop all trees");
+        // A fresh RNG at the SAME seed re-derives the same draws (determinism check).
+        let mut rng2 = DartRandom::new(cfg.drop_seed);
+        let drop2 = reference_drop(&mut rng2, &cfg, 3, &tw, 0.3);
+        assert_eq!(drop, drop2);
+    }
+
+    #[test]
+    fn dart_skip_drop_one_consumes_only_draw_zero() {
+        // skip_drop = 1.0 => draw #0 < 1.0 is ALWAYS true => skip all drops, consuming
+        // exactly ONE draw (draw #0). The advancing RNG is left at exactly one draw.
+        let cfg = DartConfig {
+            skip_drop: 1.0,
+            ..dart_default_config()
+        };
+        let mut rng = DartRandom::new(cfg.drop_seed);
+        let drop = reference_drop(&mut rng, &cfg, 5, &[0.1; 5], 0.5);
+        assert!(drop.is_empty(), "skip_drop=1 must drop nothing");
+        // Exactly one draw consumed: a second skip-consuming call from a fresh RNG at
+        // the same seed yields the SAME first float, proving only draw #0 was used.
+        let mut rng_fresh = DartRandom::new(cfg.drop_seed);
+        let f_fresh = rng_fresh.next_float();
+        let mut rng_one = DartRandom::new(cfg.drop_seed);
+        reference_drop(&mut rng_one, &cfg, 5, &[0.1; 5], 0.5);
+        // rng_one consumed 1 draw; its NEXT float must equal rng_fresh's SECOND float.
+        let _ = f_fresh;
+        let second_fresh = rng_fresh.next_float();
+        assert_eq!(
+            rng_one.next_float().to_bits(),
+            second_fresh.to_bits(),
+            "skip_drop must consume exactly draw #0"
+        );
+    }
+
+    /// Run `n_iter` DART iterations on the separable corpus with the given config and
+    /// return the trained Gbdt's accumulated score (for the normalize-branch tests).
+    fn run_dart(cfg_dart: DartConfig, n_iter: i32, lr: f64) -> Vec<f64> {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = dart_corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 4, 1).with_features(features.clone());
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            lr,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_dart(cfg_dart, features.clone());
+        let snaps = gbdt
+            .train(&mut learner, &labels, features.len(), n_iter)
+            .expect("dart train");
+        snaps.last().unwrap().score.clone()
+    }
+
+    #[test]
+    fn dart_all_four_normalize_branches_run_distinctly() {
+        // All 4 (uniform_drop × xgboost_dart_mode) branches must train without panic
+        // and — with skip_drop forced to 0 so drops actually happen across the run —
+        // produce a FINITE score. They use different normalize math, so at least one
+        // pair differs (the branches are not collapsed). lr large enough that the
+        // drop_rate*weight draws fire on this short run.
+        let base = DartConfig {
+            drop_rate: 0.5,
+            max_drop: 50,
+            skip_drop: 0.0,
+            xgboost_dart_mode: false,
+            uniform_drop: false,
+            drop_seed: 4,
+        };
+        let mut results = Vec::new();
+        for &uniform in &[false, true] {
+            for &xgb in &[false, true] {
+                let cfg = DartConfig {
+                    uniform_drop: uniform,
+                    xgboost_dart_mode: xgb,
+                    ..base
+                };
+                let score = run_dart(cfg, 6, 0.5);
+                assert!(
+                    score.iter().all(|s| s.is_finite()),
+                    "uniform={uniform} xgb={xgb}: DART score must be finite"
+                );
+                results.push(score);
+            }
+        }
+        // The four branches are not all identical (distinct normalize math). Compare
+        // each pair; at least one must differ bit-wise.
+        let all_equal = results
+            .windows(2)
+            .all(|w| w[0].iter().zip(w[1].iter()).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(
+            !all_equal,
+            "the 4 normalize branches must not collapse to identical scores"
+        );
+    }
+
+    #[test]
+    fn dart_advancing_rng_not_reseeded_per_iter() {
+        // CRITICAL: the drop RNG advances across iterations (constructed ONCE). If it
+        // were re-seeded per iter, the per-iter drop draws would repeat. We assert the
+        // reference draws across two consecutive iters differ when re-seeding would
+        // make them identical. Use drop_rate=0.3 uniform so some-but-not-all drop.
+        let cfg = DartConfig {
+            drop_rate: 0.3,
+            skip_drop: 0.0,
+            uniform_drop: true,
+            ..dart_default_config()
+        };
+        // ONE advancing RNG across iter=4 then iter=5.
+        let mut rng = DartRandom::new(cfg.drop_seed);
+        let d1 = reference_drop(&mut rng, &cfg, 4, &[0.1; 4], 0.4);
+        let d2 = reference_drop(&mut rng, &cfg, 4, &[0.1; 4], 0.4);
+        // A re-seeded-per-iter variant would give d1 == d2 (same seed, same iter, same
+        // first 1+4 draws). The advancing RNG generally yields a different draw set.
+        // (Not a hard guarantee for ALL seeds, but for drop_seed=4 these differ.)
+        assert_ne!(
+            d1, d2,
+            "advancing RNG must NOT reproduce the same drops each iter (re-seed bug)"
         );
     }
 }

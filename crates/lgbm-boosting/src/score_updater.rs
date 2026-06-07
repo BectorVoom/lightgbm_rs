@@ -138,6 +138,35 @@ impl ScoreUpdater {
             self.score[off + row as usize] += out;
         }
     }
+
+    /// C++ DART `train_score_updater_->AddScore(model, cur_tree_id)`
+    /// (`dart.hpp:135,171,189`): add `multiply * tree.predict(row)` to EVERY row of
+    /// class `cur_tree_id`, traversing the tree by each row's real feature values.
+    /// DART's DroppingTrees / Normalize re-score dropped trees over the FULL corpus
+    /// (the C++ `AddScore` over the whole data partition); on the identity-binned
+    /// corpus the per-row predict is bit-exact to the partition scatter (the L2
+    /// contract — see [`Self::add_tree_predict_path`]). `multiply` scales the tree's
+    /// contribution (e.g. `-1.0` to drop, `1/(k+1)` to normalize a step) — this
+    /// mirrors the C++ pattern of `Shrinkage(factor)` then `AddScore`, but applied to
+    /// the SCORE only (the stored tree mutation is done separately by the caller so
+    /// the model text and score stay in lockstep). Constant (`num_leaves<=1`) trees
+    /// contribute their single leaf value × `multiply` to every row.
+    pub fn add_tree_scaled_all<FRow>(
+        &mut self,
+        tree: &Tree,
+        cur_tree_id: i32,
+        multiply: f64,
+        feature_row: FRow,
+    ) where
+        FRow: Fn(i32) -> Vec<f64>,
+    {
+        let off = self.offset(cur_tree_id);
+        let nd = self.num_data as usize;
+        for row in 0..nd {
+            let out = tree.predict(&feature_row(row as i32)) * multiply;
+            self.score[off + row] += out;
+        }
+    }
 }
 
 #[cfg(test)]
