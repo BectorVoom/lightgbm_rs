@@ -464,6 +464,26 @@ impl<'a> Gbdt<'a> {
         self.iter
     }
 
+    /// The number of grown trees (`models_.len()`), `= iter * num_model_per_iteration`.
+    pub fn num_trees(&self) -> usize {
+        self.trees.len()
+    }
+
+    /// Read-only view of the grown trees (for incremental valid-set prediction).
+    pub fn trees(&self) -> &[Tree] {
+        &self.trees
+    }
+
+    /// Pop the trailing `count` trees (the early-stopping trim, gbdt.cpp:484): on a
+    /// stop, the trees grown AFTER `best_iteration` are removed so prediction defaults
+    /// to `best_iteration`. Also rewinds `iter` to the retained-tree count / K.
+    pub fn pop_trailing_trees(&mut self, count: usize) {
+        let keep = self.trees.len().saturating_sub(count);
+        self.trees.truncate(keep);
+        let k = self.objective.num_model_per_iteration().max(1) as usize;
+        self.iter = (self.trees.len() / k) as i32;
+    }
+
     /// Assemble the grown ensemble into a [`GbdtModel`] for serialization /
     /// predict (the Phase-3 container). `objective_string` is the verbatim
     /// `objective=` line; `max_feature_idx` is `max real_feature_index` across

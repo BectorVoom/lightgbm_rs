@@ -54,6 +54,17 @@ impl EvalMetric {
             EvalMetric::Multi(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
         }
     }
+
+    /// C++ `factor_to_bigger_better` — `+1` for AUC, `-1` for the losses. Drives
+    /// the early-stopping comparison direction (BST-07).
+    fn factor_to_bigger_better(&self) -> f64 {
+        match self {
+            EvalMetric::Reg(m) => m.factor_to_bigger_better(),
+            EvalMetric::Bin(m) => m.factor_to_bigger_better(),
+            // multi_logloss is a loss: lower is better.
+            EvalMetric::Multi(_) => -1.0,
+        }
+    }
 }
 
 /// A dense, identity-binned training corpus: raw integer-valued features (one
@@ -266,6 +277,47 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
     train_inner(config, corpus, boost_obj, transformed_labels, metrics)
 }
 
+/// Train a [`Booster`] with an optional validation set (BST-07 early stopping +
+/// MET-02 valid-metric eval history). When `config.early_stopping_round > 0` a
+/// validation set is REQUIRED (else a typed error); when bagging is configured
+/// (`bagging_freq > 0 && bagging_fraction < 1`) the per-iter loop draws the bag
+/// over the RNG (D-13) and scores in-bag + OOB rows.
+///
+/// # Errors
+/// [`LgbmError`] for an unsupported objective/metric, an invalid corpus,
+/// early stopping without a valid set, `bagging_by_query = true` (Phase-7
+/// deferral), or a loop/learner failure — never a panic (Security V5).
+pub fn train_with_valid(
+    config: &Config,
+    corpus: &DenseCorpus,
+    valid: &DenseCorpus,
+) -> Result<Booster, LgbmError> {
+    let first = config.objective.split_whitespace().next().unwrap_or("");
+    let (boost_obj, transformed_labels): (BoostObjective<'static>, Vec<f32>) = match first {
+        "binary" => {
+            let b = Binary::new(config.sigmoid).map_err(LgbmError::Objective)?;
+            (BoostObjective::Binary(b), corpus.labels.clone())
+        }
+        "multiclass" | "softmax" => {
+            let m = MulticlassSoftmax::new(config.num_class, &corpus.labels)
+                .map_err(LgbmError::Objective)?;
+            (BoostObjective::Multiclass(m), corpus.labels.clone())
+        }
+        "multiclassova" | "multiclass_ova" | "ova" | "ovr" => {
+            let o = MulticlassOva::new(config.num_class, config.sigmoid, &corpus.labels)
+                .map_err(LgbmError::Objective)?;
+            (BoostObjective::MulticlassOva(o), corpus.labels.clone())
+        }
+        _ => {
+            let o = Objective::from_config(config).map_err(LgbmError::Objective)?;
+            let lbl = o.transform_labels(&corpus.labels);
+            (BoostObjective::Builtin(o), lbl)
+        }
+    };
+    let metrics = eval_metrics_for(first, config);
+    train_inner_full(config, corpus, Some(valid), boost_obj, transformed_labels, metrics)
+}
+
 /// Train with a user-supplied `custom` objective closure (OBJ-02 / D-04). The
 /// closure maps the current raw scores (f32) to `(grad, hess)`; `boost_from_average`
 /// is forced OFF for custom (mirroring the C++ `obj == null` path).
@@ -295,6 +347,8 @@ where
 
 /// The shared training driver: identity-binned columns → the [`Gbdt`] loop →
 /// per-round eval history → [`Booster`]. Generic over the [`BoostObjective`].
+/// Delegates to [`train_inner_full`] with no validation set / no early stopping
+/// (the 06-02..06-04 behavior, preserved byte-for-byte).
 fn train_inner(
     config: &Config,
     corpus: &DenseCorpus,
@@ -302,20 +356,33 @@ fn train_inner(
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
 ) -> Result<Booster, LgbmError> {
-    // Build the canonical `objective=` model line. LightGBM appends `num_class:` /
-    // `sigmoid:` tokens for the multiclass objectives (e.g.
-    // `multiclass num_class:3`, `multiclassova num_class:3 sigmoid:1`); the
-    // single-output objectives use the bare name. This is BOTH the predict-side
-    // ConvertOutput source AND the serialized model objective line (round-trip).
+    train_inner_full(config, corpus, None, boost_obj, labels, metrics)
+}
+
+/// The full training driver (06-05): per-iteration loop with bagging (BST-03),
+/// metric-eval cadence (`metric_freq`, multi-metric, `is_provide_training_metric`;
+/// MET-02), early stopping over an optional validation set (BST-07), and the
+/// trailing-tree pop. When `valid` is `None`, `early_stopping_round == 0`,
+/// `bagging_freq == 0` / `bagging_fraction == 1`, this reproduces the prior-wave
+/// loop exactly.
+fn train_inner_full(
+    config: &Config,
+    corpus: &DenseCorpus,
+    valid: Option<&DenseCorpus>,
+    boost_obj: BoostObjective<'_>,
+    labels: Vec<f32>,
+    metrics: Vec<EvalMetric>,
+) -> Result<Booster, LgbmError> {
+    use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};
+
     let objective_string = canonical_objective_string(config);
     let objective_kind = ObjectiveKind::parse(&objective_string)
-        // Custom objective (`objective = "custom"`/"none") has no predict-side
-        // transform: fall back to identity (regression) for predict_row_raw.
         .unwrap_or(ObjectiveKind::Regression { sqrt: false });
 
     // ---- identity-binned feature columns ----
     let features = build_feature_columns(corpus)?;
     let num_data = corpus.features.len() as i32;
+    let num_class = config.num_class.max(1);
     let num_features = features.len();
     let max_feature_idx = features
         .iter()
@@ -323,7 +390,7 @@ fn train_inner(
         .max()
         .unwrap_or(-1);
 
-    // ---- the learner (single-output spine; K = num_class = 1) ----
+    // ---- the learner ----
     let backend = CpuBackend;
     let client = cpu_client();
     let gain = GainConfig::from_config(config);
@@ -334,40 +401,165 @@ fn train_inner(
         config.num_leaves,
         config.max_depth,
     )
-    .with_features(features);
+    .with_features(features.clone());
 
-    // ---- the GBDT loop ----
+    // ---- the GBDT loop (optionally with bagging, BST-03) ----
+    let bagging_on = config.bagging_freq > 0 && config.bagging_fraction < 1.0;
     let mut gbdt = Gbdt::with_objective(
         boost_obj,
         config.learning_rate,
-        config.num_class.max(1),
+        num_class,
         num_data,
         config.boost_from_average,
         None,
     );
-    let snaps: Vec<IterSnapshot> = gbdt
-        .train(&mut learner, &labels, num_features, config.num_iterations)
+    if bagging_on {
+        // BaggingConfig::new rejects bagging_by_query=true (explicit Phase-7 deferral).
+        let bag_cfg = BaggingConfig::new(
+            config.bagging_fraction,
+            config.pos_bagging_fraction,
+            config.neg_bagging_fraction,
+            config.bagging_freq,
+            config.bagging_seed,
+            config.bagging_by_query,
+        )
         .map_err(LgbmError::Boosting)?;
+        let strat = BaggingSampleStrategy::reset_sample_config(bag_cfg, num_data, &labels);
+        gbdt = gbdt.with_bagging(strat, features.clone());
+    }
 
-    // ---- eval history (per-round metrics on the training scores) ----
-    let mut eval_history: Vec<(String, Vec<f64>)> = metrics
+    // ---- early stopping setup (BST-07) ----
+    let es_enabled = config.early_stopping_round > 0;
+    if es_enabled && valid.is_none() {
+        return Err(LgbmError::Boosting(
+            lgbm_boosting::BoostingError::EarlyStoppingWithoutValidSet,
+        ));
+    }
+    // The validation set's metric values drive the stop decision; we maintain an
+    // incremental f64 valid score accumulator (class-major) updated each iter.
+    let (valid_feat_rows, valid_labels): (Vec<Vec<f64>>, Vec<f32>) = match valid {
+        Some(v) => (v.features.clone(), v.labels.clone()),
+        None => (Vec::new(), Vec::new()),
+    };
+    let valid_nd = valid_feat_rows.len() as i32;
+    // class-major valid score buffer (num_class blocks of valid_nd).
+    let mut valid_score = vec![0.0f64; (valid_nd.max(0) as usize) * num_class as usize];
+    let mut prev_tree_count = 0usize;
+    // Inject the valid set's boost_from_average init (C++ BoostFromAverage adds the
+    // init to EVERY valid score updater). The training init is folded into tree 0's
+    // leaves via AddBias, so re-predicting trees over the valid rows already includes
+    // it — we therefore re-derive valid scores by predicting the grown trees per iter
+    // (which carry the AddBias-folded init), needing no separate init injection.
+
+    let metric_specs: Vec<MetricSpec> = metrics
         .iter()
-        .map(|m| (m.name(), Vec::with_capacity(snaps.len())))
+        .map(|m| MetricSpec {
+            name: m.name(),
+            factor_to_bigger_better: m.factor_to_bigger_better(),
+        })
         .collect();
-    for snap in &snaps {
-        for (mi, m) in metrics.iter().enumerate() {
-            let v = m.eval(&snap.score, &corpus.labels)?;
-            eval_history[mi].1.push(v);
+    let mut early = EarlyStopping::new(
+        config.early_stopping_round,
+        config.early_stopping_min_delta,
+        config.first_metric_only,
+        num_class,
+        if valid.is_some() { 1 } else { 0 },
+        metric_specs,
+    );
+
+    // eval history: training metrics (when is_provide_training_metric) + valid metrics.
+    let provide_train = config.is_provide_training_metric || valid.is_none();
+    let metric_freq = config.metric_freq.max(1);
+    let mut train_eval_history: Vec<(String, Vec<f64>)> = metrics
+        .iter()
+        .map(|m| (format!("training {}", m.name()), Vec::new()))
+        .collect();
+    let mut valid_eval_history: Vec<(String, Vec<f64>)> = metrics
+        .iter()
+        .map(|m| (format!("valid_0 {}", m.name()), Vec::new()))
+        .collect();
+    // The legacy training-only eval history (06-02..06-04 keyed by bare metric name).
+    let mut legacy_eval_history: Vec<(String, Vec<f64>)> = metrics
+        .iter()
+        .map(|m| (m.name(), Vec::new()))
+        .collect();
+
+    let mut iter_scores: Vec<Vec<f64>> = Vec::new();
+    let mut iter_grad_hess: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+
+    let total_iters = config.num_iterations.max(0);
+    let mut ran_iters = 0i32;
+    for it in 0..total_iters {
+        let snap: IterSnapshot = gbdt
+            .train_one_iter(&mut learner, &labels, num_features)
+            .map_err(LgbmError::Boosting)?;
+        ran_iters = it + 1;
+        iter_scores.push(snap.score.clone());
+        iter_grad_hess.push((snap.gradients.clone(), snap.hessians.clone()));
+
+        // Incremental valid-score update: predict the trees grown THIS iter over the
+        // valid rows (class-major), adding to the running valid_score.
+        if valid_nd > 0 {
+            let trees = gbdt.trees();
+            for (t_idx, tree) in trees.iter().enumerate().skip(prev_tree_count) {
+                let cur_tree_id = (t_idx % num_class as usize) as i32;
+                let off = (cur_tree_id as usize) * valid_nd as usize;
+                for (r, row) in valid_feat_rows.iter().enumerate() {
+                    valid_score[off + r] += tree.predict(row);
+                }
+            }
+            prev_tree_count = trees.len();
+        }
+
+        // Metric eval cadence (metric_freq gate; MET-02). Always eval on the LAST
+        // iter and on every freq multiple, matching the C++ OutputMetric cadence.
+        let do_eval = (it + 1) % metric_freq == 0 || it + 1 == total_iters;
+        if do_eval {
+            // training metrics.
+            if provide_train {
+                for (mi, m) in metrics.iter().enumerate() {
+                    let v = m.eval(&snap.score, &corpus.labels)?;
+                    train_eval_history[mi].1.push(v);
+                    legacy_eval_history[mi].1.push(v);
+                }
+            }
+            // valid metrics + early-stop decision.
+            if valid_nd > 0 {
+                let mut row = Vec::with_capacity(metrics.len());
+                for (mi, m) in metrics.iter().enumerate() {
+                    let v = m.eval(&valid_score, &valid_labels)?;
+                    valid_eval_history[mi].1.push(v);
+                    row.push(v);
+                }
+                if es_enabled {
+                    let stop = early.update(it, &EvalSnapshot { values: vec![row] });
+                    if stop {
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    let iter_scores: Vec<Vec<f64>> = snaps.iter().map(|s| s.score.clone()).collect();
-    let iter_grad_hess: Vec<(Vec<f32>, Vec<f32>)> = snaps
-        .iter()
-        .map(|s| (s.gradients.clone(), s.hessians.clone()))
-        .collect();
+    // best_iteration + trailing-tree pop (BST-07).
+    let best_iteration = if es_enabled {
+        let pop = early.trailing_trees_to_pop(ran_iters);
+        if pop > 0 {
+            gbdt.pop_trailing_trees(pop as usize);
+        }
+        early.best_iteration()
+    } else {
+        gbdt.num_iteration()
+    };
 
-    let best_iteration = gbdt.num_iteration();
+    // Assemble the public eval_history: legacy bare-name training metrics (so the
+    // 06-02..06-04 replay keys still resolve) PLUS the valid_0 metrics when present.
+    let mut eval_history: Vec<(String, Vec<f64>)> = legacy_eval_history;
+    if valid_nd > 0 {
+        eval_history.extend(valid_eval_history);
+    }
+    let _ = train_eval_history; // training metrics are captured in legacy keys above
+
     let model = gbdt.into_model(
         objective_string,
         max_feature_idx,
@@ -548,6 +740,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn early_stopping_fires_and_pops_trailing_trees() {
+        // Train with a valid set that plateaus quickly so early stopping FIRES before
+        // num_iterations; best_iteration < num_iterations and the trailing trees are
+        // popped (model tree count == best_iteration).
+        let train_corpus = spine_corpus();
+        // A valid set whose labels are CONSTANT so the metric plateaus fast (the
+        // model can't keep improving valid l2 after the first couple of trees).
+        let valid_corpus = DenseCorpus {
+            features: spine_corpus().features,
+            labels: vec![10.0f32; 12], // constant => valid metric plateaus
+        };
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(30)
+            .learning_rate(0.3)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .early_stopping_round(2)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        let booster = train_with_valid(&cfg, &train_corpus, &valid_corpus).unwrap();
+        assert!(
+            booster.best_iteration < 30,
+            "early stopping must fire before num_iterations (best_iteration={})",
+            booster.best_iteration
+        );
+        assert!(booster.best_iteration >= 1);
+        // The model's tree count == best_iteration (trailing trees popped).
+        assert_eq!(
+            booster.model().trees.len() as i32,
+            booster.best_iteration,
+            "trailing trees must be popped to best_iteration"
+        );
+        // valid_0 metrics are in the eval history (MET-02).
+        assert!(
+            booster.eval_history.iter().any(|(n, _)| n.starts_with("valid_0")),
+            "valid metrics must be recorded: {:?}",
+            booster.eval_history.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn early_stopping_without_valid_set_is_typed_error() {
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(10)
+            .early_stopping_round(3)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        let err = train(&cfg, &spine_corpus()).unwrap_err();
+        assert!(matches!(err, LgbmError::Boosting(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn bagging_by_query_rejected_via_facade() {
+        // bagging_by_query=true must surface as a typed error (Phase-7 deferral),
+        // not silently row-bag.
+        let mut base = Config::default();
+        base.objective = "regression".into();
+        base.num_iterations = 5;
+        base.num_leaves = 4;
+        base.min_data_in_leaf = 1;
+        base.bagging_freq = 1;
+        base.bagging_fraction = 0.7;
+        base.bagging_by_query = true;
+        let cfg = TrainingBuilder::new().from_config(base).build().unwrap();
+        let err = train(&cfg, &spine_corpus()).unwrap_err();
+        assert!(matches!(err, LgbmError::Boosting(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn metric_freq_thins_eval_history() {
+        // metric_freq=3 over 9 iters => training metrics recorded on iters 3,6,9
+        // (the cadence gate), i.e. 3 values, not 9.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(9)
+            .learning_rate(0.1)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .metric_freq(3)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        let booster = train(&cfg, &spine_corpus()).unwrap();
+        // legacy l2 history thinned to the freq cadence.
+        let (_n, vals) = booster
+            .eval_history
+            .iter()
+            .find(|(n, _)| n == "l2")
+            .unwrap();
+        assert_eq!(vals.len(), 3, "metric_freq=3 over 9 iters => 3 recorded rounds");
     }
 
     #[test]

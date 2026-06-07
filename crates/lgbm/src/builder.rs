@@ -136,6 +136,58 @@ impl TrainingBuilder {
         self
     }
 
+    /// `bagging_fraction` (row subsampling rate, `(0, 1]`; BST-03). Paired with
+    /// [`bagging_freq`](Self::bagging_freq) and [`bagging_seed`](Self::bagging_seed).
+    pub fn bagging_fraction(mut self, v: f64) -> Self {
+        self.params.insert("bagging_fraction".into(), v.to_string());
+        self
+    }
+
+    /// `bagging_freq` (re-bag every k iters; `0` disables bagging).
+    pub fn bagging_freq(mut self, k: i32) -> Self {
+        self.params.insert("bagging_freq".into(), k.to_string());
+        self
+    }
+
+    /// `bagging_seed` (the per-block RNG seed base; C++ default 3).
+    pub fn bagging_seed(mut self, seed: i32) -> Self {
+        self.params.insert("bagging_seed".into(), seed.to_string());
+        self
+    }
+
+    /// `early_stopping_round` (stop after this many non-improving rounds; `0`
+    /// disables early stopping; BST-07).
+    pub fn early_stopping_round(mut self, n: i32) -> Self {
+        self.params.insert("early_stopping_round".into(), n.to_string());
+        self
+    }
+
+    /// `early_stopping_min_delta` (an improvement must exceed this to count).
+    pub fn early_stopping_min_delta(mut self, v: f64) -> Self {
+        self.params
+            .insert("early_stopping_min_delta".into(), v.to_string());
+        self
+    }
+
+    /// `first_metric_only` (use only the first metric for the stop decision).
+    pub fn first_metric_only(mut self, on: bool) -> Self {
+        self.params.insert("first_metric_only".into(), on.to_string());
+        self
+    }
+
+    /// `metric_freq` (evaluate metrics every k iters; MET-02).
+    pub fn metric_freq(mut self, k: i32) -> Self {
+        self.params.insert("metric_freq".into(), k.to_string());
+        self
+    }
+
+    /// `is_provide_training_metric` (add the training set to the eval list; MET-02).
+    pub fn is_provide_training_metric(mut self, on: bool) -> Self {
+        self.params
+            .insert("is_provide_training_metric".into(), on.to_string());
+        self
+    }
+
     /// Resolve the accumulated params (or the `from_config` preset) into a
     /// validated [`Config`] (D-02 — routed through `Config::from_params`'s alias
     /// table + CHECK validation).

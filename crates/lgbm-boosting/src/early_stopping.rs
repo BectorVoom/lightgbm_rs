@@ -253,6 +253,31 @@ mod tests {
         assert_eq!(es.trailing_trees_to_pop(5), 6);
     }
 
+    // ===================== metric_infra (MET-02) =====================
+    // The metric-eval cadence (metric_freq) + training-metric inclusion lives in the
+    // facade loop; here we prove the decision-machine pieces it relies on: the
+    // multi-metric EvalSnapshot shape and per-metric factor handling.
+
+    #[test]
+    fn metric_infra_multi_metric_snapshot_all_evaluated() {
+        // Two metrics, NOT first_metric_only: BOTH metrics participate in the stop
+        // decision (a plateau in EITHER can trigger the round-based stop).
+        let mut es = EarlyStopping::new(1, 0.0, false, 1, 1, loss_specs(2));
+        es.update(0, &EvalSnapshot { values: vec![vec![5.0, 5.0]] }); // best_iter both=0
+        // metric0 keeps improving, metric1 plateaus => metric1 stops at iter1.
+        assert!(es.update(1, &EvalSnapshot { values: vec![vec![4.0, 5.0]] }));
+    }
+
+    #[test]
+    fn metric_infra_multiple_valid_sets_tracked_independently() {
+        // Two valid sets, one metric: each set's best is tracked independently; a
+        // plateau in set 0 triggers even while set 1 improves.
+        let mut es = EarlyStopping::new(1, 0.0, false, 1, 2, loss_specs(1));
+        es.update(0, &EvalSnapshot { values: vec![vec![5.0], vec![9.0]] });
+        // set0 plateaus (5.0), set1 improves (8.0) => set0 stops at iter1.
+        assert!(es.update(1, &EvalSnapshot { values: vec![vec![5.0], vec![8.0]] }));
+    }
+
     #[test]
     fn auc_factor_plus_one_bigger_is_better() {
         // AUC: factor +1, so a LARGER auc => larger cur => improvement.

@@ -16,7 +16,7 @@ pub mod builder;
 pub mod error;
 
 // --- public training API (Phase 6) ---
-pub use booster::{train, train_custom, Booster, DenseCorpus};
+pub use booster::{train, train_custom, train_with_valid, Booster, DenseCorpus};
 pub use builder::TrainingBuilder;
 pub use error::LgbmError;
 
