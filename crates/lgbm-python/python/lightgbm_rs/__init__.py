@@ -19,6 +19,8 @@ from .callback import (
 )
 from .engine import CVBooster, cv
 from .engine import train as train
+from .plotting import plot_importance, plot_metric, plot_tree
+from .sklearn import LGBMClassifier, LGBMModel, LGBMRanker, LGBMRegressor
 
 
 def dataset_from_csr(csr, label):
@@ -100,6 +102,13 @@ __all__ = [
     "log_evaluation",
     "record_evaluation",
     "reset_parameter",
+    "LGBMModel",
+    "LGBMRegressor",
+    "LGBMClassifier",
+    "LGBMRanker",
+    "plot_importance",
+    "plot_metric",
+    "plot_tree",
     "dataset_from_csr",
     "dataset_from_csc",
     "dataset_from_polars",
