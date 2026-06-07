@@ -191,3 +191,47 @@ the `LightGBM/` tree.
   asserts the per-tree leaf values BIT-EXACT against the real-binary golden on the
   overlapping trees (all 4 normalize branches × {bag}) + predict() within ORACLE_TOL.
   Both skip-pass until the fixtures are captured.
+
+# Phase 7 W6 — Random Forest (BST-06) Oracle Fixtures (plan 07-07)
+
+## Provenance
+
+The Random Forest (`boosting=rf`) averaged-tree variant with mandatory bagging
+(`bagging_fraction=0.7 bagging_freq=1`) over the single-output (regression) and
+multiclass axes, trained on the real prebuilt `lib_lightgbm` 4.6 pip wheel and dumped
+as `%.17g` model text + per-row `predict()` (f64 bits). RF stores the RAW per-tree leaf
+values (averaging happens at predict via `average_output`), renews leaves only when
+`obj->IsRenewTreeOutput()` (a no-op for L2 — the leaf is the learner's gradient-fit
+Newton output over the bagged subset, then `AddBias(init)`), and applies NO
+learning-rate shrinkage (`shrinkage_rate_=1.0`). The bagged-subset leaf structure
+inherits the 07-01 D-05 FAITHFUL-FIX posture.
+
+## Capture
+
+```bash
+LGBM_CAPTURE_PYTHON=/tmp/lgbm-capture-venv/bin/python \
+  cargo run -p xtask -- rf-oracle-capture
+```
+
+which runs `xtask/py/rf_oracle_capture.py <out_dir> 0x60057000 3 4.6.0` and writes,
+under `crates/oracle-harness/tests/fixtures/rf/`:
+
+| Fixture | Kind | Contents |
+|---------|------|----------|
+| `rf_single_bag_model.txt` | L5 model parity | real lib_lightgbm 4.6 `%.17g` model text for the single-output (regression) RF cell (12 averaged trees, mandatory bagging, `average_output`) |
+| `rf_single_bag_pred.txt` | predict | per-row averaged `predict()` (f64 bits) — the per-tree sum / num_iteration |
+| `rf_multi_bag_model.txt` | L5 model parity | real lib_lightgbm 4.6 `%.17g` model text for the multiclass RF cell (36 trees = 12 iters × 3 classes, class-major) |
+| `rf_multi_bag_pred.txt` | predict | per-row per-class averaged `predict()` (f64 bits, class-major) |
+
+The capture is byte-idempotent (empty `git diff` on a re-run). NEVER `git add` the
+`LightGBM/` tree.
+
+## Replay
+
+- `boosting_parity.rs::rf_single_parity` — trains via `boosting=rf` and asserts the
+  per-tree leaf values BIT-EXACT against the real-binary golden (averaged trees +
+  mandatory bagging, `average_output`) + predict() within ORACLE_TOL.
+- `boosting_parity.rs::rf_multi_parity` — asserts the class-major STRUCTURE exactly
+  (tree count == iters × num_class, the stride) + predict() within ORACLE_TOL (the
+  documented multiclass softmax exp-libm ~1-ULP residual, 06-04-SUMMARY).
+  Both skip-pass until the fixtures are captured.

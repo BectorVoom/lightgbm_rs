@@ -308,7 +308,7 @@ Plans:
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 07-07-PLAN.md — Random Forest (BST-06): averaged trees + mandatory bagging
+- [x] 07-07-PLAN.md — Random Forest (BST-06): averaged trees + mandatory bagging
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
@@ -359,5 +359,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 6/12 | In Progress|  |
+| 7. Parity-Completing Variants | 7/12 | In Progress|  |
 | 8. Python Bindings | 0/TBD | Not started | - |

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 07-04-PLAN.md
-last_updated: "2026-06-07T07:18:00.415Z"
-last_activity: "2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02"
+stopped_at: Completed 07-07-PLAN.md
+last_updated: "2026-06-07T07:41:44.772Z"
+last_activity: "2026-06-07 -- 07-07 complete: Random Forest (BST-06) BoostingVariant::Rf — averaged trees + mandatory bagging + no shrinkage; real-binary parity (single bit-exact, multiclass structure+predict within ORACLE_TOL), BST-06 complete"
 progress:
   total_phases: 8
   completed_phases: 6
   total_plans: 45
-  completed_plans: 39
+  completed_plans: 40
   percent: 75
 ---
 
@@ -26,9 +26,23 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 07 (parity-completing-variants) — EXECUTING
-Plan: 7 of 12 (07-01, 07-02 complete)
+Plan: 8 of 12 (07-01..07-07 complete)
 Status: Ready to execute
-Last activity: 2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02
+Last activity: 2026-06-07 -- 07-07 complete: Random Forest (BST-06) BoostingVariant::Rf — averaged trees + mandatory bagging + no shrinkage; real-binary parity, BST-06 complete
+
+### Plan 07-07 result (BST-06 — Random Forest BoostingVariant::Rf, COMPLETE)
+
+Plan 07-07 added Random Forest as the third `BoostingVariant::Rf` branch on the single `Gbdt` driver (RESEARCH Pattern 1), faithful 1:1 to `rf.hpp`, and validated it against real lib_lightgbm 4.6.
+
+- **RF semantics (rf.hpp:90-182):** grad/hess derived ONCE from a CONSTANT `BoostFromAverage` init-score buffer (`RF::Boosting`, reused every iter); AVERAGED (not accumulated) trees via the `MultiplyScore(iter); AddScore; MultiplyScore(1/(iter+1))` running-average sandwich with NO learning-rate shrinkage (shrinkage_rate_=1.0); per-tree `RenewTreeOutput` GATED on `obj->IsRenewTreeOutput()` (a no-op for L2 — the learner's gradient-fit `-sum_grad/sum_hess` Newton output; active for L1/quantile/mape via `renew_leaf_output`) with `residual_getter = label - init_scores_[k]` (constant pred); `average_output` prediction (per-tree sum / num_iteration).
+- **2 typed CHECKs (rf.hpp:35-40,91-93):** objective != null (custom rejected) AND (bagging active OR feature_fraction<1) → `BoostingError::RfConfig`, enforced at the top of the RF path before any tree grows.
+- **Mandatory bagging:** RF reuses the proven `BaggingSampleStrategy` (the 07-01 bit-exact bagging RNG golden carries over) — no new RNG.
+- **[Rule 1 bug, capture-revealed]:** the first RF cut renewed unconditionally to a mean residual; the real-binary capture showed the L2 leaf is the learner's Newton output (rust 2.5 vs cpp 2.5000000000000036, f64 fold order). Gating renew on `IsRenewTreeOutput()` made the single-output cell BIT-EXACT.
+- **Real-binary parity (rf-oracle-capture, 4.6.0, byte-idempotent):** `rf_single_parity` BIT-EXACT leaf values (12 averaged trees, mandatory bagging, `average_output`); `rf_multi_parity` class-major structure exact (36 trees = 12 iters × 3 classes) + predict within ORACLE_TOL (documented exp-libm residual). Both teeth-verified.
+- **No DEF-07-02-style deferral needed** — RF reached faithful parity; BST-06 marked COMPLETE.
+- **gate:** `cargo test --workspace` GREEN (boosting_parity 60 passed / 13 ignored DEF-07-02); learner_parity 12/12, kernel_parity 4/4 (spine NOT regressed); build --tests exit 0; clippy clean on RF code; `LightGBM/` never git-added. Commits: ce45915 (T1), 7743e1f (T2), f4969ab (T3 capture + renew-gate fix).
+
+Next: `/gsd-execute-phase 7 --wave 7+` runs the remaining 07-08..07-12 plans (DEF-07-02 learner-fix + remaining variants/objectives). RF (BST-06) is done.
 
 ### Plan 07-02 result (OBJ-04 family A — ship-green/defer-blocked, DEF-07-02)
 
@@ -348,6 +362,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 07 P03 | 20min | 3 tasks | 119 files |
 | Phase 07 P06 | 35min | 3 tasks | 26 files |
 | Phase 07 P04 | 11min | 3 tasks | 48 files |
+| Phase 07 P07-07 | ~1 session | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -408,6 +423,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-03: gamma (all) + tweedie bfa-off/axis deferred DEF-07-02 (extended) — non-constant-hessian learner f64 split-gain knife-edge; g/h faithful into tree
 - [Phase ?]: 07-04: average_precision is a binary-task metric (binary_metric.hpp); placed in BinaryMetric per C++ metric.cpp, not multiclass
 - [Phase ?]: 07-04: poisson/gamma/tweedie regression metrics apply exp ConvertOutput; quantile/huber/fair/mape use identity ConvertOutput (raw score)
+- [Phase ?]: 07-07: RF (BST-06) ships as BoostingVariant::Rf — averaged trees (MultiplyScore running-average, shrinkage 1.0), grad/hess derived once from a constant init buffer, RenewTreeOutput gated on IsRenewTreeOutput (capture-revealed L2 bug fix), 2 typed CHECKs; real-binary parity (single bit-exact, multiclass structure+predict within ORACLE_TOL); BST-06 complete.
 
 ### Pending Todos
 
@@ -437,6 +453,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T07:17:50.677Z
+Last session: 2026-06-07T07:41:39.466Z
 Stopped at: Completed 07-04-PLAN.md
 Resume file: None
