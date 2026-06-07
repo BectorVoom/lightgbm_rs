@@ -288,7 +288,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 07-02-PLAN.md — Objectives breadth A (OBJ-04): huber/fair/quantile/mape
+- [x] 07-02-PLAN.md — Objectives breadth A (OBJ-04): huber/fair/quantile/mape
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -359,5 +359,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 0/12 | Planned | - |
+| 7. Parity-Completing Variants | 2/12 | In Progress|  |
 | 8. Python Bindings | 0/TBD | Not started | - |

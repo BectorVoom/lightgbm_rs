@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 7 context gathered
-last_updated: "2026-06-07T05:20:00.000Z"
-last_activity: 2026-06-07 -- Phase 07 Plan 01 complete (D-05 faithful-fix)
+stopped_at: Completed 07-02-PLAN.md (OBJ-04 family A — ship-green/defer DEF-07-02)
+last_updated: "2026-06-07T06:10:00.000Z"
+last_activity: 2026-06-07 -- Phase 07 Plan 02 complete (huber/mape/quantile-spine GREEN; fair + quantile-bagged deferred DEF-07-02)
 progress:
   total_phases: 8
   completed_phases: 6
   total_plans: 45
-  completed_plans: 34
-  percent: 76
+  completed_plans: 35
+  percent: 78
 ---
 
 # Project State
@@ -26,9 +26,59 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 07 (parity-completing-variants) — EXECUTING
-Plan: 2 of 12
-Status: Executing Phase 07 (07-01 Wave 0 / D-05 COMPLETE)
-Last activity: 2026-06-07 -- Phase 07 Plan 01 complete (D-05 faithful-fix)
+Plan: 3 of 12 (07-01, 07-02 complete)
+Status: Executing Phase 07 — 07-02 COMPLETE (ship-green/defer-blocked applied; DEF-07-02 recorded)
+Last activity: 2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02
+
+### Plan 07-02 result (OBJ-04 family A — ship-green/defer-blocked, DEF-07-02)
+
+The "ship green, defer blocked cells" disposition (human-chosen) is applied and 07-02 is COMPLETE.
+
+- **GREEN (committed faithful, 87 byte-idempotent fixtures):** huber 5/5 (clip ±alpha; param-axis horizon fixed to 12 iters), mape 4/4 (weighted-median renew), quantile SPINE 3/5 (spine/scores/gradients) via the f32-alpha percentile fidelity fix (C++ `alpha_` is `score_t`/f32).
+- **DEFERRED (DEF-07-02, `#[ignore]` ignore-pending-fix — NOT mask):** fair ALL 5 cells (tiny non-constant hessian amplifies a learner-level f64 split-gain knife-edge: spine tree 2 ~1.3, bfa-OFF loop tree 0 ~64–69); quantile loop matrix (bagged tree 4 ~0.18–0.36 + 12-vs-10-tree structural; non-bagged tree 11 ~0.009–0.094); quantile alpha=0.1 axis (tree 11). g/h INTO each tree bit-exact ⇒ NOT an objective bug; needs an 07-01-style source-built lib_lightgbm 4.6 FP trace. No tolerance weakened, no horizon capped.
+- **DEF-07-02 recorded** in `.planning/phases/07-parity-completing-variants/deferred-items.md` (the fair tiny-hessian split knife-edge + the quantile bagged-renew 12-vs-10-tree structural divergence; affected ignored cells; huber/mape/quantile-spine shipped faithfully).
+- **Out-of-scope untracked goldens** (`regression_sqrt_*` 06-06, `regression_mf2es_*` 06-04/CR-02) moved to `.out-of-scope-fixtures-holding/` (untracked, NOT committed, NOT deleted) so they don't contaminate the green run — separate gaps, not 07-02.
+- **gate:** `cargo test --workspace` GREEN (boosting_parity 38 passed / 7 ignored / 0 failed); `cargo build --workspace --tests` exit 0; clippy clean on edited files; spine UNREGRESSED (learner_parity 12/12, kernel_parity 4/4, regression_l1 4/4 incl bagging, binary spine 3/3, early_stopping 2/2). `LightGBM/` never git-added. Commits: cdb02be (T1), 2b41afc (T2), aa80c2e (checkpoint), e3083cd (faithful fixes + fixtures + ignores), 9323b36 (DEF-07-02 doc).
+- **OBJ-04 status:** PARTIALLY delivered (huber/mape/quantile-spine faithful; fair + quantile-bagged pending DEF-07-02 learner-fix plan) — NOT marked complete in REQUIREMENTS.
+
+Next: author a dedicated 07-01-style learner-level split-gain FP-trace fix plan (DEF-07-02) for the fair tiny-hessian knife-edge + the quantile bagged-renew 12-vs-10-tree divergence, then flip the ignored cells green. 07-03 (exp/log objectives) is unblocked.
+
+### Plan 07-02 CHECKPOINT (OBJ-04 family A — Task 3 capture run; superseded by the 07-02 result above)
+
+Task 3 ran the real-binary `lightgbm==4.6.0` capture (via `/tmp/lgbm-capture-venv`) and flipped the
+family-A parity cells from skip → assert. Family-A fixtures are **byte-idempotent** (87 files, 0 diff
+across 3 runs). Two GREEN objectives, two BLOCKED.
+
+- **GREEN (legitimate fixes, no masking):**
+  - **huber 5/5** — fixed `replay_family_a_param_cell` to train MATRIX_NUM_ITERATIONS (12), matching
+    the capture's `capture_family_a_cell` (was 10 → tree-count mismatch 10 vs 12).
+  - **mape 4/4** — green as captured.
+  - **quantile spine/scores/gradients 3/5** — fixed quantile to round `alpha` through f32 (C++
+    `alpha_` is `score_t`/f32; `PercentileFun(label_t)` in BoostFromScore narrows to f32). Renew uses
+    `(alpha as f32) as f64`; boost_from_score additionally casts the percentile result to f32. Updated
+    two lgbm-objective unit tests to the faithful f32-alpha values (lgbm-objective 50/50 green).
+- **BLOCKED (deep learner-level divergence — same depth as 07-01 D-05; NOT masked):**
+  - **fair (ALL 5 cells past the es-trim):** non-constant TINY hessian `c²/(|x|+c)²` amplifies an f64
+    histogram/split-gain knife-edge. Spine diverges from **tree 2** (maxdiff ~1.3); bfa-OFF loop cells
+    diverge at **tree 0** (maxdiff ~64–69 — fair's tiny `sum_hess` makes the Newton step `-g/h` huge
+    and sensitivity-amplified). g/h INTO each tree is bit-exact (iter-1/2 scores bit-exact), so the
+    divergence is learner-side, not objective-side. `fair_c_axis` (fair_c=2.0) happens to pass.
+  - **quantile bagged cells (`quantile_bag1_*`):** diverge at **tree 4** (maxdiff ~0.18–0.36) AND
+    grow **12 trees vs C++'s 10** (structural bagged-renew divergence; best_iteration=0, no ES). The
+    D-05 faithful-fix posture says these must assert parity — they cannot. STOP per the bagged-cell
+    no-mask directive.
+  - **quantile non-bagged 12-iter cells:** diverge only at **tree 11** (~0.009–0.094, deep horizon).
+- **Out-of-scope (06-06):** the capture also re-emitted the never-tracked `regression_sqrt_*` /
+  `regression_mf2es_*` goldens; `reg_sqrt_spine_matches_real_binary` now FAILS (rust 2.14 vs cpp 4.59
+  — reg_sqrt ConvertOutput inversion). Left UNTRACKED (not 07-02 scope); a separate 06-06 gap.
+- **Gate:** `cargo build --workspace --tests` exit 0; spine UNREGRESSED (learner_parity 12/12,
+  kernel_parity 4/4, regression_l1 4/4 incl. bagging, binary spine 3/3, early_stopping 2/2). No commit
+  made — checkpoint returned for a dedicated fair/quantile-bagged learner-fix decision. `LightGBM/`
+  never git-added.
+
+Next: author a dedicated learner-fix plan (modeled on 07-01 D-05: source-built FP trace) for the fair
+tiny-hessian histogram/split knife-edge and the quantile bagged-renew 12-vs-10-tree structural
+divergence, THEN flip the remaining cells green. huber/mape/quantile-spine fixes are ready to commit.
 
 ### Plan 07-01 result (Wave 0 / D-05 — bagged-subset split-gain determinism FAITHFUL-FIX)
 
@@ -358,7 +408,7 @@ None yet.
 - [Phase 5 / 05-09 RESOLVED, 2026-06-06]: the user chose Option (1). A real lib_lightgbm 4.6 CPU-only single-thread FP execution trace gave ground truth and the residual is now CLOSED bit-exact. The trace overturned the prior premise: the mfb_pos corpus is SPARSE so the real BinMapper collapses most_freq_bin_ = default_bin_ = ValueToBin(0) = 0 (bin.cpp:491-499) → most_freq_bin=0, offset=1, FixHistogram NO-OP (the spine path). The harness had mislabeled it most_freq_bin=2/offset=0, which spuriously activated FixHistogram on node-2's direct build and reconstructed a ~1e-15 bin-2 hessian that polluted the REVERSE scan by 2 ULPs. ALSO: C++ seeds each child LeafSplits DIRECTLY from the parent SplitInfo (best_split_info.left_sum_hessian = best_sum_left_hessian - kEpsilon, feature_histogram.hpp:1042; serial_tree_learner.cpp:851-871), NOT a re-fold — the prior re-fold lost the kEpsilon provenance (4.0 vs C++ 4.000000000000001). Fix (commit 2ced5a2): corrected the corpus to most_freq_bin=0/offset=1 + added LeafSplits::init_from_split seeded from the parent SplitInfo. learner_parity_mfb_pos_real_binary un-#[ignore]d + PASSING bit-exact (node-2 leaf-0 = 0.59999999999999953). The authorized LeafSplits-seam (excluded by the original 3-file scope) was the correct seam. NO tolerance introduced; assert_real_tree_parity byte-unchanged; LightGBM/ never git-added. Phase 5 COMPLETE.
 - [Phase 5 / contract-doc reconciliation, 2026-06-06; RESOLVED 2026-06-07]: the stale CLAUDE.md `1e-12` framing has been reconciled to the authoritative ~1e-6 (f32) contract (the 2026-06-05 Phase-1 decision). CLAUDE.md Core Value + Numerical constraint now mirror PROJECT.md, and PROJECT.md's Core Value was enriched to record the two-regime reality: the `cubecl-cpu` f64-fold path is the deterministic anchor / hard merge gate and is **bit-exact** to C++ where the algorithm permits (binning; the serial tree learner is bit-exact vs real lib_lightgbm 4.6 on both committed corpora), while `cubecl-hip` (f32) is the ~1e-6 best-effort gate. All four contract docs (CLAUDE/PROJECT/REQUIREMENTS/ROADMAP) now agree on the ~1e-6-f32-with-bit-exact-CPU-anchor framing; the 2.3e-16 learner residual was closed bit-exact in 05-09 regardless. Historical phase-outcome bullets that say "inside the ≤1e-12 contract" are left as accurate past-tense records.
 
-- [Phase 7 / 07-02 checkpoint:human-verify, 2026-06-07 — BLOCKING-HUMAN]: Plan 07-02 (OBJ-04 family A: huber/fair/quantile/mape) Tasks 1–2 are COMPLETE and committed (`cdb02be` objectives + grad/hess/renew/CHECK; `2b41afc` builder setters + capture emitter + skip-pass parity cells). Task 3 is the human-gated real-binary golden CAPTURE: `lightgbm==4.6.0` is NOT installed in this environment (Phase-5/6 capture posture), so the goldens cannot be emitted autonomously. The huber/fair/quantile/mape parity cells SKIP-PASS cleanly until the fixtures exist. TO RESUME: (1) `pip install lightgbm==4.6.0`; (2) `LGBM_CAPTURE_PYTHON=… cargo run -p xtask -- boosting-oracle-capture` (version-asserts 4.6.0, writes fixtures under crates/oracle-harness/tests/fixtures/boosting/, incl. `<obj>_spine_model.txt`, `<obj>_bag<B>_es<E>_bfa<F>_model.txt`, the param-axis cells, `family_a_best_iterations.txt`); (3) re-run to confirm byte-idempotent regen; (4) `cargo test -p oracle-harness --test boosting_parity huber fair quantile mape` and confirm the cells flip skip→GREEN; (5) confirm quantile/mape bagged cells behave per the 07-01 D-05 faithful-fix posture. Then SUMMARY.md + STATE advance + ROADMAP update finalize the plan. NEVER git-add LightGBM/.
+- [Phase 7 / 07-02 checkpoint:human-verify, 2026-06-07 — RESOLVED]: the human chose the "ship green, defer blocked cells" disposition. The capture ran (byte-idempotent, 87 fixtures), huber/mape/quantile-spine shipped faithful GREEN (committed), and fair (all) + quantile bagged/iterated were `#[ignore]`'d under DEF-07-02 (07-01-class learner-level split-gain knife-edge; g/h bit-exact ⇒ not an objective bug). 07-02 is COMPLETE. The remaining cells are tracked by DEF-07-02 for a dedicated source-built lib_lightgbm 4.6 FP-trace learner-fix plan. NEVER git-add LightGBM/.
 
 ## Deferred Items
 
@@ -366,12 +416,13 @@ Items acknowledged and carried forward from previous milestone close:
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
+| Phase 7 | DEF-07-02: fair (all) + quantile bagged/iterated learner-level f64 split-gain knife-edge (g/h bit-exact; needs source-built lib_lightgbm 4.6 FP trace, 07-01 method). OBJ-04 partial — huber/mape/quantile-spine shipped faithful. | Open (#[ignore]'d, not masked) | 07-02 (deferred-items.md) |
 | v2 | QNT-01 quantized/discretized gradient training | Deferred (v2) | Roadmap |
 | v2 | LIN-01 linear-tree leaves | Deferred (v2) | Roadmap |
 | v2 | ING-01/02/03 text-file / binary-cache / Arrow ingestion | Deferred (v2) | Roadmap |
 
 ## Session Continuity
 
-Last session: 2026-06-07T05:19:18Z
-Stopped at: 07-02 Tasks 1–2 committed (cdb02be, 2b41afc); PAUSED at Task 3 checkpoint:human-verify (blocking-human) — lightgbm==4.6.0 capture wheel not installed
-Resume file: .planning/phases/07-parity-completing-variants/07-02-PLAN.md
+Last session: 2026-06-07T06:10:00Z
+Stopped at: Completed 07-02-PLAN.md — huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02; SUMMARY + STATE + ROADMAP updated
+Resume file: None
