@@ -411,6 +411,32 @@ fn train_inner_full(
         .max()
         .unwrap_or(-1);
 
+    // T-07-11-02: per-feature constraint/penalty vectors must match num_features
+    // when non-empty — mirrors the C++ length CHECKs in GBDT::Init (gbdt.cpp:58)
+    // and CostEfficientGradientBoosting::Init (cost_effective_gradient_boosting.hpp
+    // :47-60). Validate BEFORE any tree grows; a wrong-length vector is otherwise
+    // silently accepted (the .get()-guarded accessors treat missing entries as
+    // unconstrained / zero-penalty), applying constraints to the wrong features.
+    for (param, len) in [
+        ("monotone_constraints", config.monotone_constraints.len()),
+        (
+            "cegb_penalty_feature_coupled",
+            config.cegb_penalty_feature_coupled.len(),
+        ),
+        (
+            "cegb_penalty_feature_lazy",
+            config.cegb_penalty_feature_lazy.len(),
+        ),
+    ] {
+        if len != 0 && len != num_features {
+            return Err(LgbmError::InvalidConstraintLength {
+                param,
+                actual: len,
+                num_features,
+            });
+        }
+    }
+
     // ---- the learner ----
     let backend = CpuBackend;
     let client = cpu_client();
@@ -938,6 +964,79 @@ mod tests {
             ),
             "expected RfConfig, got {err:?}"
         );
+    }
+
+    #[test]
+    fn wrong_length_constraint_vectors_are_typed_errors() {
+        // T-07-11-02: a per-feature constraint/penalty vector whose length != the
+        // 2-feature corpus must surface a typed InvalidConstraintLength BEFORE any
+        // tree grows — mirroring the C++ GBDT::Init / CEGB::Init length CHECKs —
+        // rather than silently applying constraints to the wrong features.
+        let corpus = spine_corpus(); // 2 features
+        let expect_err = |cfg: Config, param: &str| {
+            let err = train(&cfg, &corpus)
+                .expect_err("wrong-length constraint vector must error");
+            match err {
+                LgbmError::InvalidConstraintLength {
+                    param: p,
+                    actual,
+                    num_features,
+                } => {
+                    assert_eq!(p, param, "param name");
+                    assert_eq!(actual, 3, "actual len");
+                    assert_eq!(num_features, 2, "num_features");
+                }
+                other => panic!("expected InvalidConstraintLength for {param}, got {other:?}"),
+            }
+        };
+
+        // monotone_constraints: 3 entries (all valid values) vs 2 features.
+        expect_err(
+            TrainingBuilder::new()
+                .objective("regression")
+                .num_iterations(1)
+                .num_leaves(4)
+                .min_data_in_leaf(1)
+                .monotone_constraints(&[1, -1, 0])
+                .build()
+                .unwrap(),
+            "monotone_constraints",
+        );
+
+        // cegb_penalty_feature_coupled: 3 entries vs 2 features.
+        let mut coupled = Config::default();
+        coupled.objective = "regression".into();
+        coupled.num_iterations = 1;
+        coupled.num_leaves = 4;
+        coupled.min_data_in_leaf = 1;
+        coupled.cegb_penalty_feature_coupled = vec![0.1, 0.2, 0.3];
+        expect_err(
+            TrainingBuilder::new().from_config(coupled).build().unwrap(),
+            "cegb_penalty_feature_coupled",
+        );
+
+        // cegb_penalty_feature_lazy: 3 entries vs 2 features.
+        let mut lazy = Config::default();
+        lazy.objective = "regression".into();
+        lazy.num_iterations = 1;
+        lazy.num_leaves = 4;
+        lazy.min_data_in_leaf = 1;
+        lazy.cegb_penalty_feature_lazy = vec![0.1, 0.2, 0.3];
+        expect_err(
+            TrainingBuilder::new().from_config(lazy).build().unwrap(),
+            "cegb_penalty_feature_lazy",
+        );
+
+        // A correctly-sized (len == 2) monotone vector still trains.
+        let ok = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(1)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .monotone_constraints(&[1, 0])
+            .build()
+            .unwrap();
+        assert!(train(&ok, &corpus).is_ok(), "len==num_features must train");
     }
 
     #[test]

@@ -53,6 +53,27 @@ pub enum LgbmError {
         /// Human-readable description of the corpus defect.
         detail: String,
     },
+
+    /// A per-feature constraint/penalty vector (`monotone_constraints`,
+    /// `cegb_penalty_feature_coupled`, or `cegb_penalty_feature_lazy`) was
+    /// non-empty but its length did not equal `num_features` (T-07-11-02).
+    /// Mirrors the C++ length CHECKs — `GBDT::Init` (`gbdt.cpp:58`,
+    /// `CHECK_EQ(num_total_features, monotone_constraints.size())`) and
+    /// `CostEfficientGradientBoosting::Init`
+    /// (`cost_effective_gradient_boosting.hpp:47-60`, `Log::Fatal` "should be the
+    /// same size as feature number") — surfaced here as a typed error before any
+    /// tree grows rather than silently applying constraints to the wrong features.
+    #[error(
+        "invalid {param} length: {actual} != num_features {num_features}"
+    )]
+    InvalidConstraintLength {
+        /// The offending config parameter name.
+        param: &'static str,
+        /// The vector's actual length.
+        actual: usize,
+        /// The expected length (number of features).
+        num_features: usize,
+    },
 }
 
 #[cfg(test)]
