@@ -18,9 +18,9 @@ use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
 use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::MissingType;
-use lgbm_metric::{BinaryMetric, Metric};
+use lgbm_metric::{BinaryMetric, Metric, MultiLogloss};
 use lgbm_model::{GbdtModel, ObjectiveKind};
-use lgbm_objective::{Binary, CustomObjective, Objective};
+use lgbm_objective::{Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective};
 use lgbm_treelearner::learner::FeatureColumn;
 use lgbm_treelearner::{offset_for_most_freq_bin, SerialTreeLearner};
 
@@ -34,6 +34,8 @@ enum EvalMetric {
     Reg(Metric),
     /// A binary metric (`binary_logloss`/`binary_error`/`auc`).
     Bin(BinaryMetric),
+    /// The `multi_logloss` metric over the class-major score buffer.
+    Multi(MultiLogloss),
 }
 
 impl EvalMetric {
@@ -41,6 +43,7 @@ impl EvalMetric {
         match self {
             EvalMetric::Reg(m) => m.name().to_string(),
             EvalMetric::Bin(m) => m.name().to_string(),
+            EvalMetric::Multi(m) => m.name().to_string(),
         }
     }
 
@@ -48,6 +51,7 @@ impl EvalMetric {
         match self {
             EvalMetric::Reg(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
             EvalMetric::Bin(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
+            EvalMetric::Multi(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
         }
     }
 }
@@ -239,6 +243,18 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
             let b = Binary::new(config.sigmoid).map_err(LgbmError::Objective)?;
             (BoostObjective::Binary(b), corpus.labels.clone())
         }
+        "multiclass" | "softmax" => {
+            // The integer class labels feed Init (label range check) + the per-row
+            // strided softmax gather; they pass through unchanged (no transform).
+            let m = MulticlassSoftmax::new(config.num_class, &corpus.labels)
+                .map_err(LgbmError::Objective)?;
+            (BoostObjective::Multiclass(m), corpus.labels.clone())
+        }
+        "multiclassova" | "multiclass_ova" | "ova" | "ovr" => {
+            let o = MulticlassOva::new(config.num_class, config.sigmoid, &corpus.labels)
+                .map_err(LgbmError::Objective)?;
+            (BoostObjective::MulticlassOva(o), corpus.labels.clone())
+        }
         _ => {
             // regression / regression_l1 (+ aliases) route through the enum factory.
             let o = Objective::from_config(config).map_err(LgbmError::Objective)?;
@@ -246,7 +262,7 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
             (BoostObjective::Builtin(o), lbl)
         }
     };
-    let metrics = eval_metrics_for(first, config.sigmoid);
+    let metrics = eval_metrics_for(first, config);
     train_inner(config, corpus, boost_obj, transformed_labels, metrics)
 }
 
@@ -365,14 +381,26 @@ fn train_inner(
 
 /// The per-objective default eval metrics (matching the capture's `metric=` list):
 /// `[l2, rmse]` for regression, `[l1, l2, rmse]` for regression_l1,
-/// `[binary_logloss, binary_error, auc]` for binary.
-fn eval_metrics_for(objective_first_token: &str, sigmoid: f64) -> Vec<EvalMetric> {
+/// `[binary_logloss, binary_error, auc]` for binary, `[multi_logloss]` for
+/// multiclass/multiclassova.
+fn eval_metrics_for(objective_first_token: &str, config: &Config) -> Vec<EvalMetric> {
+    let sigmoid = config.sigmoid;
     match objective_first_token {
         "binary" => vec![
             EvalMetric::Bin(BinaryMetric::BinaryLogloss { sigmoid }),
             EvalMetric::Bin(BinaryMetric::BinaryError { sigmoid }),
             EvalMetric::Bin(BinaryMetric::Auc),
         ],
+        "multiclass" | "softmax" => vec![EvalMetric::Multi(MultiLogloss::new(
+            ObjectiveKind::Multiclass { num_class: config.num_class },
+            config.num_class,
+        ))],
+        "multiclassova" | "multiclass_ova" | "ova" | "ovr" => {
+            vec![EvalMetric::Multi(MultiLogloss::new(
+                ObjectiveKind::MulticlassOva { num_class: config.num_class, sigmoid },
+                config.num_class,
+            ))]
+        }
         "regression_l1" | "l1" | "mean_absolute_error" | "mae" => {
             vec![EvalMetric::Reg(Metric::L1), EvalMetric::Reg(Metric::L2), EvalMetric::Reg(Metric::Rmse)]
         }

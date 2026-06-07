@@ -643,6 +643,48 @@ impl Tree {
             *v = maybe_round_to_zero(*v + val);
         }
     }
+
+    /// C++ `Tree::AsConstantTree(double val, int count = 0)` (`tree.h:232-240`):
+    /// build a degenerate 1-leaf tree whose single leaf output is the constant
+    /// `val`, with `shrinkage_ = 1.0f` (forced) and `leaf_count_[0] = count`.
+    ///
+    /// This backs the GBDT loop's `class_need_train_[k] == false` (and the
+    /// no-split) path (gbdt.cpp:419-434): instead of training, a constant tree is
+    /// pushed so `models_.len()` stays `iter * num_tree_per_iteration` (Pitfall 6).
+    /// The constant is the per-class init score (or 0 for the extend-with-zeros
+    /// case). `num_cat = 0`, all split/internal arrays empty, one leaf at depth 0
+    /// with parent -1 — exactly the C++ `Tree(2,…)` default reduced to a single
+    /// leaf.
+    pub fn as_constant(constant_value: f64) -> Tree {
+        Tree {
+            num_leaves: 1,
+            num_cat: 0,
+            left_child: Vec::new(),
+            right_child: Vec::new(),
+            split_feature: Vec::new(),
+            threshold: Vec::new(),
+            decision_type: Vec::new(),
+            split_gain: Vec::new(),
+            // The C++ AsConstantTree does NOT round-to-zero the value (it assigns
+            // leaf_value_[0] = val directly); a near-zero init thus stays as-is in
+            // the constant tree's single leaf.
+            leaf_value: vec![constant_value],
+            leaf_weight: vec![0.0],
+            leaf_count: vec![0],
+            internal_value: Vec::new(),
+            internal_weight: Vec::new(),
+            internal_count: Vec::new(),
+            cat_boundaries: Vec::new(),
+            cat_threshold: Vec::new(),
+            // C++ forces shrinkage_ = 1.0f for a constant tree.
+            shrinkage: 1.0,
+            is_linear: false,
+            leaf_depth: vec![0],
+            leaf_parent: vec![-1],
+            split_feature_inner: Vec::new(),
+            threshold_in_bin: Vec::new(),
+        }
+    }
 }
 
 /// C++ `Tree::MaybeRoundToZero` (`tree.h:258`): `IsZero(fval) ? 0 : fval`.
@@ -947,6 +989,22 @@ mod tests {
         assert_eq!(t.predict(&[1.0]), 10.0);
         assert_eq!(t.predict(&[9.0]), 20.0);
         assert_eq!(t.predict_leaf_index(&[9.0]), 1);
+    }
+
+    #[test]
+    fn as_constant_builds_one_leaf_tree() {
+        // C++ AsConstantTree: num_leaves=1, shrinkage=1.0, leaf_value[0]=val.
+        let t = Tree::as_constant(0.7);
+        assert_eq!(t.num_leaves, 1);
+        assert_eq!(t.shrinkage, 1.0);
+        assert_eq!(t.leaf_value, vec![0.7]);
+        assert_eq!(t.num_cat, 0);
+        assert!(t.split_feature.is_empty());
+        // A 1-leaf tree predicts its constant for any input.
+        assert_eq!(t.predict(&[1.0, 2.0, 3.0]), 0.7);
+        assert_eq!(t.predict(&[]), 0.7);
+        // Zero constant (the extend-with-zeros case).
+        assert_eq!(Tree::as_constant(0.0).predict(&[0.0]), 0.0);
     }
 
     #[test]

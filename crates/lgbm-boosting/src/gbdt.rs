@@ -34,10 +34,12 @@ use crate::score_updater::ScoreUpdater;
 
 /// The GBDT ensemble driver — the f64 score accumulator + the grown model.
 ///
-/// 06-02 scope: single-output regression spine (K = 1), single-threaded
+/// Grows `K = objective.num_model_per_iteration()` trees per iteration over the
+/// class-major score/grad/hess layout (`offset = num_data * cur_tree_id`): `K = 1`
+/// for the single-output objectives (regression/regression_l1/binary/custom) and
+/// `K = num_class` for `multiclass`/`multiclassova` (06-04). Single-threaded
 /// deterministic core, bagging OFF, early-stopping OFF, `boost_from_average`
-/// honored (the C++ regression default). Per-class generalization (multiclass),
-/// bagging, and early stopping land in 06-04/06-05.
+/// honored per class (the C++ default). Bagging + early stopping land in 06-05.
 pub struct Gbdt<'a> {
     /// The f64 score accumulator (`score_`).
     score_updater: ScoreUpdater,
@@ -144,7 +146,10 @@ impl<'a> Gbdt<'a> {
         if !(self.boost_from_average || num_features == 0) {
             return 0.0;
         }
-        let init = self.objective.boost_from_score(labels);
+        // Per-class init (C++ obj->BoostFromScore(cur_tree_id)): the label mean /
+        // median / logit for single-output, the log-class-prob / per-class binary
+        // logit for multiclass.
+        let init = self.objective.boost_from_score(cur_tree_id, labels);
         if Objective::init_score_is_significant(init) {
             self.score_updater.add_constant(init, cur_tree_id);
         }
@@ -176,12 +181,17 @@ impl<'a> Gbdt<'a> {
                 actual: labels.len(),
             });
         }
-        let total = nd * self.num_class.max(1) as usize;
+        // K = num_model_per_iteration (num_class for multiclass/ova, 1 otherwise).
+        // The objective is authoritative — it MUST agree with self.num_class for the
+        // multiclass variants (set by the facade); the loop trusts the objective.
+        let k = self.objective.num_model_per_iteration().max(1);
+        let total = nd * k as usize;
 
         // ---- (1) BoostFromAverage FIRST, per class, only on iter 0 ----
-        // K = 1 here (single-output spine); the loop is class-generalization-ready.
-        let mut init_scores = vec![0.0f64; self.num_class.max(1) as usize];
-        for cur_tree_id in 0..self.num_class.max(1) {
+        // K trees/iter over the class-major layout (offset = num_data * cur_tree_id,
+        // Pattern 4). For multiclass each class gets its own init score.
+        let mut init_scores = vec![0.0f64; k as usize];
+        for cur_tree_id in 0..k {
             init_scores[cur_tree_id as usize] =
                 self.boost_from_average(cur_tree_id, labels, num_features);
         }
@@ -189,8 +199,11 @@ impl<'a> Gbdt<'a> {
         // ---- (2) Boosting(): obj.GetGradients on the CURRENT train score ----
         let mut gradients = vec![0.0f32; total];
         let mut hessians = vec![0.0f32; total];
-        // Single class (K=1): the whole score buffer is class 0's. (Multiclass in
-        // 06-04 strides per class and the objective gathers across classes.)
+        // The objective receives the WHOLE class-major score buffer. Single-output
+        // objectives treat it as their one class; the multiclass softmax gathers
+        // strided `rec[k]=score[num_data*k+i]` across classes (Pattern 4 — a
+        // row-major layout would silently diverge), and multiclassova dispatches to
+        // each per-class binary at offset `num_data*i`.
         self.objective.get_gradients(
             self.score_updater.scores(),
             labels,
@@ -208,12 +221,33 @@ impl<'a> Gbdt<'a> {
         let train_score_pre = self.score_updater.scores().to_vec();
 
         // ---- (4) per-class tree loop ----
-        for cur_tree_id in 0..self.num_class.max(1) {
+        for cur_tree_id in 0..k {
             let offset = (cur_tree_id as usize) * nd;
+
+            // class_need_train gate (gbdt.cpp:390): when false (a class is absent /
+            // is the entire corpus), DO NOT train — push a constant 1-leaf tree
+            // carrying this class's init score so models_.len() stays iter*K
+            // (Pitfall 6). The init was already injected into score_ via
+            // BoostFromAverage→AddScore on iter 0, so no further score change.
+            if !self.objective.class_need_train(cur_tree_id, labels) {
+                let init = init_scores[cur_tree_id as usize];
+                // gbdt.cpp:419-434: on the first iteration push AsConstantTree(init);
+                // subsequent iterations extend with AsConstantTree(0). The init only
+                // entered score_ once (iter 0 BoostFromAverage), never re-added.
+                let is_first_iter =
+                    self.trees.len() < k as usize;
+                let const_val = if is_first_iter { init } else { 0.0 };
+                self.trees.push(Tree::as_constant(const_val));
+                continue;
+            }
+
             let grad = &gradients[offset..offset + nd];
             let hess = &hessians[offset..offset + nd];
 
-            let is_first_tree = self.trees.len() < self.num_class.max(1) as usize;
+            // is_first_tree is true while fewer than K trees exist (the first
+            // iteration's per-class trees), matching C++
+            // `models_.size() < num_tree_per_iteration_` (gbdt.cpp:402).
+            let is_first_tree = self.trees.len() < k as usize;
             // learner.train() builds + returns the partition for the bit-exact
             // training-path score scatter (C++ data_partition_).
             let (mut tree, partition) =
@@ -256,12 +290,19 @@ impl<'a> Gbdt<'a> {
                 if Objective::init_score_is_significant(init) {
                     tree.add_bias(init);
                 }
+                self.trees.push(tree);
             } else {
-                // Degenerate 1-leaf tree (no positive-gain split): no score change
-                // beyond the constant already injected by BoostFromAverage. The
-                // tree is still pushed so models_.len() == iter * K (Pitfall 6).
+                // No positive-gain split (gbdt.cpp:419-434): the learner returned a
+                // 1-leaf tree. C++ discards it and pushes AsConstantTree(init) on the
+                // first iteration (extend-with-zeros afterward). The init already
+                // entered score_ once via BoostFromAverage→AddScore (iter 0), so
+                // there is NO further score change. Pushing the constant keeps
+                // models_.len() == iter * K (Pitfall 6).
+                let init = init_scores[cur_tree_id as usize];
+                let is_first_iter = self.trees.len() < k as usize;
+                let const_val = if is_first_iter { init } else { 0.0 };
+                self.trees.push(Tree::as_constant(const_val));
             }
-            self.trees.push(tree);
         }
 
         self.iter += 1;
@@ -294,6 +335,12 @@ impl<'a> Gbdt<'a> {
     /// Read-only view of the f64 score buffer (`score_`).
     pub fn scores(&self) -> &[f64] {
         self.score_updater.scores()
+    }
+
+    /// Read-only view of one class's score slice (`[num_data*k, num_data*(k+1))`).
+    /// Test/inspection helper for the class-major layout.
+    pub fn score_updater_class(&self, cur_tree_id: i32) -> &[f64] {
+        self.score_updater.class_scores(cur_tree_id)
     }
 
     /// The number of completed iterations.
@@ -495,5 +542,107 @@ mod tests {
         let delta_half = s_half[0] - 3.0;
         assert!((delta_half - delta_full * 0.5).abs() < 1e-9,
             "lr=0.5 delta {delta_half} must be half of lr=1.0 delta {delta_full}");
+    }
+
+    // ===================== 06-04: multiclass loop =====================
+
+    use lgbm_objective::MulticlassSoftmax;
+
+    /// An 8-row, 2-feature corpus with 3-class integer labels (separable by f0).
+    fn multiclass_corpus() -> (Vec<FeatureColumn>, Vec<f32>, GainConfig) {
+        let (features, _spine_labels, cfg) = corpus();
+        // 3 classes: rows 0-2 class 0, rows 3-5 class 1, rows 6-7 class 2.
+        let labels = vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0];
+        (features, labels, cfg)
+    }
+
+    #[test]
+    fn multiclass_loop_grows_num_class_trees_per_iter() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = multiclass_corpus();
+        let num_data = labels.len() as i32;
+        let num_class = 3;
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 2, 1)
+            .with_features(features.clone());
+        let obj = MulticlassSoftmax::new(num_class, &labels).unwrap();
+        let mut gbdt = Gbdt::with_objective(
+            BoostObjective::Multiclass(obj),
+            0.1,
+            num_class,
+            num_data,
+            true,
+            None,
+        );
+        let snap = gbdt
+            .train_one_iter(&mut learner, &labels, features.len())
+            .expect("multiclass iter");
+        // Exactly 3 trees after one iteration.
+        assert_eq!(gbdt.trees.len(), 3, "one iter must push num_class=3 trees");
+        // grad/hess/score are length num_data * num_class, class-major.
+        assert_eq!(snap.gradients.len(), (num_data * num_class) as usize);
+        assert_eq!(snap.hessians.len(), (num_data * num_class) as usize);
+        assert_eq!(snap.score.len(), (num_data * num_class) as usize);
+    }
+
+    #[test]
+    fn multiclass_boost_from_average_runs_per_class() {
+        let (_features, labels, _cfg) = multiclass_corpus();
+        let num_class = 3;
+        let obj = MulticlassSoftmax::new(num_class, &labels).unwrap();
+        let mut gbdt = Gbdt::with_objective(
+            BoostObjective::Multiclass(obj),
+            0.1,
+            num_class,
+            labels.len() as i32,
+            true,
+            None,
+        );
+        // Drive BoostFromAverage per class; each class's init = log(max(kEps, p_k)).
+        let mut inits = Vec::new();
+        for k in 0..num_class {
+            inits.push(gbdt.boost_from_average(k, &labels, 2));
+        }
+        assert_eq!(inits.len(), 3);
+        // class 0 (3/8) and class 1 (3/8) share an init; class 2 (2/8) differs.
+        assert!((inits[0] - inits[1]).abs() < 1e-12, "equal-count classes share init");
+        assert!((inits[0] - inits[2]).abs() > 1e-9, "class 2 init differs");
+        // Each class's score slice holds its own init constant after BoostFromAverage.
+        for k in 0..num_class {
+            let cls = gbdt.score_updater_class(k);
+            for &s in cls {
+                assert!((s - inits[k as usize]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn class_need_train_false_pushes_constant_tree() {
+        // A class entirely absent from the corpus -> class_init_probs = 0 ->
+        // class_need_train false -> a constant 1-leaf tree, tree count stays iter*K.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, _l, cfg) = corpus();
+        // 3 classes declared but class 2 NEVER appears (only labels 0/1 present).
+        let labels = vec![0.0f32, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let num_class = 3;
+        let num_data = labels.len() as i32;
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 2, 1)
+            .with_features(features.clone());
+        let obj = MulticlassSoftmax::new(num_class, &labels).unwrap();
+        // class 2 is absent.
+        assert!(!obj.class_need_train(2), "absent class must not train");
+        let mut gbdt = Gbdt::with_objective(
+            BoostObjective::Multiclass(obj),
+            0.1,
+            num_class,
+            num_data,
+            true,
+            None,
+        );
+        gbdt.train_one_iter(&mut learner, &labels, features.len()).unwrap();
+        // Still exactly 3 trees (Pitfall 6); class 2's is a constant 1-leaf tree.
+        assert_eq!(gbdt.trees.len(), 3);
+        assert_eq!(gbdt.trees[2].num_leaves, 1, "absent class -> constant 1-leaf tree");
     }
 }
