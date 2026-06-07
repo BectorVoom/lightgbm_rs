@@ -350,7 +350,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 08-02-PLAN.md — Crate scaffold (pinned pyo3 0.27 / numpy 0.27.1 / pyo3-polars 0.26.0) + minimal PyO3 numpy-dense train→predict with GIL release + A/B parity (PYB-01)
+- [x] 08-02-PLAN.md — Crate scaffold (pinned pyo3 0.27 / numpy 0.27.1 / pyo3-polars 0.26.0) + minimal PyO3 numpy-dense train→predict with GIL release + A/B parity (PYB-01)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -392,4 +392,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
 | 7. Parity-Completing Variants | 12/12 | Complete    | 2026-06-07 |
-| 8. Python Bindings | 0/8 | Planned | - |
+| 8. Python Bindings | 2/8 | In Progress|  |

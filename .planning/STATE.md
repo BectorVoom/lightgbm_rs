@@ -26,9 +26,15 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 08 (python-bindings) — EXECUTING
-Plan: 2 of 8
-Status: Executing Phase 08 (08-01 complete)
-Last activity: 2026-06-07 -- Completed 08-01 (D-02 raw→bin→train + Booster methods + feval hook)
+Plan: 3 of 8
+Status: Executing Phase 08 (08-01, 08-02 complete; Wave 3 next)
+Last activity: 2026-06-08 -- Completed 08-02 (PyO3 lgbm-python crate: numpy train/predict, GIL release, A/B parity vs real lightgbm 4.6 green within 1e-6)
+
+### Plan 08-02 result (PYB-01/PYB-02 PyO3 thinnest slice — COMPLETE)
+
+Plan 08-02 stood up the `lgbm-python` cdylib (`lightgbm_rs._core`) — the thin PyO3 seam over the `lgbm` facade — with the pinned pyo3 0.27 / numpy 0.27 / pyo3-polars 0.26 triangle, a `LightGBMError` + `From<LgbmError>` taxonomy, numpy f64 dense marshalling (contiguity-explicit), `#[pyclass] Dataset`/`Booster`, and a GIL-released (`Python::detach`) `train`/`predict` returning owned numpy arrays. The 6-test pytest suite is green against a `maturin develop` editable install in the project `.venv`, including the **A/B parity test vs real lightgbm 4.6 (L2 regression, atol=1e-6)** and the **GIL-release proof**.
+
+**Process note:** the assigned executor subagent died on a transient API socket error mid-plan (skeleton authored but uncommitted, `booster.rs` missing); the orchestrator recovered inline — finished `booster.rs`, added the maturin-required `README.md`, authored Task 3, built + tested green, committed in 2 atomic commits + SUMMARY. A uv `.venv` toolchain (maturin/numpy/lightgbm==4.6/polars/pyarrow/scikit-learn/pandas/pytest) was provisioned for the whole phase and gitignored.
 
 ### Plan 08-01 result (PYB-01 facade gap + PYB-04 enabling — COMPLETE)
 
