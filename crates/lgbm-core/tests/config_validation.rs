@@ -82,6 +82,33 @@ fn named_invalid_cases_return_typed_errors() {
         Config::from_params(&params(&[("cegb_tradeoff", "-1")])),
         Err(ConfigError::OutOfRange { .. })
     ));
+    // ADV-06: refit_decay_rate outside [0,1] → OutOfRange (config.h CHECK [0,1]).
+    assert!(matches!(
+        Config::from_params(&params(&[("refit_decay_rate", "1.5")])),
+        Err(ConfigError::OutOfRange { .. })
+    ));
+    assert!(matches!(
+        Config::from_params(&params(&[("refit_decay_rate", "-0.1")])),
+        Err(ConfigError::OutOfRange { .. })
+    ));
+}
+
+#[test]
+fn adv_refit_importance_params_resolve() {
+    // ADV-06: refit_decay_rate default 0.9; valid in-range resolves.
+    let c = Config::from_params(&params(&[])).unwrap();
+    assert_eq!(c.refit_decay_rate, 0.9, "default refit_decay_rate");
+    assert_eq!(c.saved_feature_importance_type, 0, "default split selector");
+    let c = Config::from_params(&params(&[("refit_decay_rate", "0.0")])).unwrap();
+    assert_eq!(c.refit_decay_rate, 0.0);
+    let c = Config::from_params(&params(&[("refit_decay_rate", "1.0")])).unwrap();
+    assert_eq!(c.refit_decay_rate, 1.0);
+    // ADV-06: input_model string passes through (+ aliases model_input/model_in).
+    let c = Config::from_params(&params(&[("model_input", "base.txt")])).unwrap();
+    assert_eq!(c.input_model, "base.txt");
+    // ADV-07: saved_feature_importance_type selects split(0)/gain(1).
+    let c = Config::from_params(&params(&[("saved_feature_importance_type", "1")])).unwrap();
+    assert_eq!(c.saved_feature_importance_type, 1);
 }
 
 #[test]

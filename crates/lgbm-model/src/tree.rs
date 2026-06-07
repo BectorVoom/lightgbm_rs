@@ -995,6 +995,62 @@ impl Tree {
         self.shrinkage = rate;
     }
 
+    /// C++ `Tree::SetLeafOutput(int leaf, double output)` (`tree.h:294`): overwrite
+    /// a single leaf's stored output. Used by the leaf-refit path (ADV-06) to write
+    /// the decay-blended output back into the existing tree structure. Unlike
+    /// [`Self::shrinkage`] / [`Self::add_bias`] this does NOT snap to zero — C++
+    /// `SetLeafOutput` is a raw assignment.
+    pub fn set_leaf_output(&mut self, leaf: usize, output: f64) {
+        self.leaf_value[leaf] = output;
+    }
+
+    /// C++ `SerialTreeLearner::FitByExistingTree` leaf-refit blend
+    /// (`serial_tree_learner.cpp:268-276`), per leaf:
+    /// `new_output = CalculateSplittedLeafOutput(sum_grad, kEpsilon + sum_hess, l1, l2)
+    /// * shrinkage()`; then
+    /// `SetLeafOutput(leaf, decay*old_output + (1-decay)*new_output)`.
+    ///
+    /// `decay` is `config_->refit_decay_rate` (config.h default 0.9, CHECK `[0,1]`).
+    /// `sum_grad` / `sum_hess` are the per-leaf gradient / hessian sums over the rows
+    /// that route to `leaf` (the C++ `data_partition_->GetIndexOnLeaf` accumulation,
+    /// with `sum_hess` seeded by the `kEpsilon` start). `use_l1` / `l1` / `l2` mirror
+    /// the leaf-output config (`lambda_l1`/`lambda_l2`). The tree's stored
+    /// [`Self::shrinkage`] scales the fresh Newton output BEFORE the blend (so a
+    /// shrunk model keeps its learning-rate scale on the refit slice).
+    ///
+    /// `decay = 1.0` leaves the leaf unchanged (all-old); `decay = 0.0` replaces it
+    /// with the fresh shrunk output (all-new) — the two parity corners (07-RESEARCH
+    /// §Oracle Axis Matrix → Refit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn refit_leaf(
+        &mut self,
+        leaf: usize,
+        sum_grad: f64,
+        sum_hess: f64,
+        decay: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) {
+        // C++ `double sum_hess = kEpsilon;` then accumulates — the caller passes the
+        // raw row-sum, and we add kEpsilon here to match the C++ seed exactly.
+        let hess = sum_hess + lgbm_core::types::K_EPSILON as f64;
+        // `CalculateSplittedLeafOutput<USE_L1,false,false>` (feature_histogram.hpp,
+        // mirrored bit-for-bit from `lgbm_compute::gain::calculate_splitted_leaf_output`
+        // — inlined here so the model layer does not take a kernel-layer dependency
+        // edge): `use_l1 ? -ThresholdL1(g,l1)/(h+l2) : -g/(h+l2)`.
+        let output = if use_l1 {
+            let reg_s = (sum_grad.abs() - l1).max(0.0);
+            let sign = (sum_grad > 0.0) as i32 as f64 - (sum_grad < 0.0) as i32 as f64;
+            -(sign * reg_s) / (hess + l2)
+        } else {
+            -sum_grad / (hess + l2)
+        };
+        let new_leaf_output = output * self.shrinkage;
+        let old_leaf_output = self.leaf_value[leaf];
+        self.leaf_value[leaf] = decay * old_leaf_output + (1.0 - decay) * new_leaf_output;
+    }
+
     /// C++ `Tree::AddBias(double val)` (`tree.h:213`).
     ///
     /// Adds `val` to every `leaf_value_` and `internal_value_` entry (each snapped
@@ -1807,5 +1863,50 @@ mod tests {
         }
         assert_eq!(t.internal_value[0], 0.0);
         assert!(t.internal_value[0].is_sign_positive());
+    }
+
+    #[test]
+    fn set_leaf_output_raw_assign() {
+        // SetLeafOutput is a raw assignment — no MaybeRoundToZero snap.
+        let mut t = tiny_tree();
+        t.set_leaf_output(1, 1e-40);
+        assert_eq!(t.leaf_value[1], 1e-40);
+        t.set_leaf_output(0, -3.5);
+        assert_eq!(t.leaf_value[0], -3.5);
+    }
+
+    #[test]
+    fn refit_leaf_decay_corners() {
+        // ADV-06 leaf-refit blend: new_output = -sum_grad/(sum_hess+kEpsilon) *
+        // shrinkage; leaf = decay*old + (1-decay)*new.
+        // decay = 1.0 => unchanged (all-old).
+        let mut t = tiny_tree(); // leaf_value = [10, 20], shrinkage = 1.0
+        t.refit_leaf(0, /*g*/ 4.0, /*h*/ 2.0, /*decay*/ 1.0, false, 0.0, 0.0);
+        assert_eq!(t.leaf_value[0], 10.0, "decay=1 must leave the leaf unchanged");
+
+        // decay = 0.0 => all-new: -4/(2+kEps)*1.0 ≈ -2.0.
+        let mut t = tiny_tree();
+        t.refit_leaf(0, 4.0, 2.0, 0.0, false, 0.0, 0.0);
+        assert!(
+            (t.leaf_value[0] - (-4.0 / (2.0 + lgbm_core::types::K_EPSILON as f64))).abs() < 1e-9,
+            "decay=0 must replace the leaf with the fresh shrunk output, got {}",
+            t.leaf_value[0]
+        );
+
+        // Mid blend (decay = 0.5): 0.5*10 + 0.5*(-2.0) = 4.0 (within kEpsilon).
+        let mut t = tiny_tree();
+        t.refit_leaf(0, 4.0, 2.0, 0.5, false, 0.0, 0.0);
+        let new = -4.0 / (2.0 + lgbm_core::types::K_EPSILON as f64);
+        assert!((t.leaf_value[0] - (0.5 * 10.0 + 0.5 * new)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn refit_leaf_respects_shrinkage() {
+        // A shrunk tree keeps its learning-rate scale on the refit slice.
+        let mut t = tiny_tree();
+        t.shrinkage = 0.1;
+        t.refit_leaf(1, 4.0, 2.0, 0.0, false, 0.0, 0.0);
+        let new = (-4.0 / (2.0 + lgbm_core::types::K_EPSILON as f64)) * 0.1;
+        assert!((t.leaf_value[1] - new).abs() < 1e-9);
     }
 }

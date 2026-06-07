@@ -1386,6 +1386,53 @@ impl<'a> Gbdt<'a> {
         &self.trees
     }
 
+    /// ADV-06 continue-training (`input_model`): seed this driver with the trees of
+    /// a previously-trained ensemble so subsequent [`Self::train_one_iter`] calls
+    /// APPEND new trees on top (C++ `GBDT::InitTrain` with `num_init_iteration_ =
+    /// models_.size() / num_tree_per_iteration_`, gbdt.cpp:38-40 + the
+    /// `(i + num_init_iteration_)` curr-tree indexing at gbdt.cpp:200/773).
+    ///
+    /// `loaded_trees` are the loaded model's trees (flat, `[i*K + k]`); `features`
+    /// are the full-corpus feature columns used to re-derive the loaded ensemble's
+    /// per-row contribution to `score_` (the C++ `train_score_updater_` is
+    /// re-initialized by predicting the loaded ensemble over the training data on a
+    /// `ResetTrainingData`, gbdt.cpp:726-790). After seeding, `iter` equals the
+    /// loaded iteration count, so `BoostFromAverage` is skipped (models_ is
+    /// non-empty) and the next trained tree is iteration `num_init_iteration`.
+    ///
+    /// Builder-style; chains after a constructor. The caller MUST pass the same
+    /// objective / num_class the loaded model was trained with.
+    #[must_use]
+    pub fn with_loaded_model(mut self, loaded_trees: Vec<Tree>, features: Vec<FeatureColumn>) -> Self {
+        self.features = features;
+        let k = self.objective.num_model_per_iteration().max(1);
+        // Re-initialize score_ by adding each loaded tree's prediction over the full
+        // corpus (the C++ ResetTrainingData re-score). The identity-binned bin index
+        // IS the real feature value (the L2 predict-vs-scatter contract). Snapshot the
+        // per-row feature vectors once (like the DART/RF re-score paths) so the
+        // per-tree closure is a cheap index into the shared buffer.
+        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        for (i, tree) in loaded_trees.iter().enumerate() {
+            let cur_tree_id = (i as i32) % k;
+            self.score_updater
+                .add_tree_scaled_all(tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+        }
+        let num_loaded = loaded_trees.len();
+        self.trees = loaded_trees;
+        // num_init_iteration_ = models_.size() / num_tree_per_iteration_.
+        self.iter = (num_loaded / k as usize) as i32;
+        self
+    }
+
+    /// The number of init iterations carried from a loaded `input_model` (C++
+    /// `num_init_iteration_`). For a fresh train this is 0; after
+    /// [`Self::with_loaded_model`] it is the loaded iteration count. Subsequently it
+    /// equals [`Self::num_iteration`] until the first appended tree advances `iter`.
+    pub fn num_init_iteration(&self) -> i32 {
+        let k = self.objective.num_model_per_iteration().max(1) as usize;
+        (self.trees.len() / k) as i32
+    }
+
     /// Pop the trailing `count` trees (the early-stopping trim, gbdt.cpp:484): on a
     /// stop, the trees grown AFTER `best_iteration` are removed so prediction defaults
     /// to `best_iteration`. Also rewinds `iter` to the retained-tree count / K.
@@ -2321,5 +2368,56 @@ mod tests {
             (avg_pred - score_row0).abs() < 1e-9,
             "RF predict average {avg_pred} must match the running-average score {score_row0}"
         );
+    }
+
+    #[test]
+    fn continue_training_seeds_num_init_iteration_and_appends() {
+        // ADV-06 continue-training: a baseline model of N trees, loaded via
+        // with_loaded_model, must set num_init_iteration to N and APPEND on train.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+
+        // --- baseline: grow 3 trees and capture them ---
+        let mut base_learner =
+            SerialTreeLearner::new(&backend, &client, cfg.clone(), 2, 1).with_features(features.clone());
+        let mut base = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        );
+        base.train(&mut base_learner, &labels, features.len(), 3)
+            .expect("base train");
+        let base_trees = base.trees().to_vec();
+        let base_count = base_trees.len();
+        assert_eq!(base_count, 3, "K=1, 3 iters => 3 trees");
+
+        // --- continue: load the baseline and append 2 more iterations ---
+        let mut cont_learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let mut cont = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_loaded_model(base_trees, features.clone());
+
+        // num_init_iteration == the loaded count; iter starts there.
+        assert_eq!(cont.num_init_iteration(), 3);
+        assert_eq!(cont.num_iteration(), 3);
+
+        cont.train(&mut cont_learner, &labels, features.len(), 2)
+            .expect("continue train");
+
+        // The tree count grows from the loaded base (3 -> 5), not from zero.
+        assert_eq!(cont.num_trees(), base_count + 2, "must append, not restart");
+        assert_eq!(cont.num_iteration(), 5);
     }
 }
