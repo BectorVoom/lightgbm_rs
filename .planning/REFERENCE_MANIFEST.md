@@ -55,8 +55,15 @@ Under `crates/oracle-harness/tests/fixtures/determinism/`:
 
 | Fixture | Cell | Contents |
 |---------|------|----------|
-| `binary_bag1_es0_bfa1_subset_trace.txt` | `binary_bag1_es0_bfa1` (DEF-06-01: tree 0 rust 2 vs cpp 4 leaves) | tree-0 in-bag subset, per-bin `sum_gradient`/`sum_hessian`, `cnt_factor`, per-split `current_gain`/`min_gain_shift`, realized leaf count |
-| `regression_l1_bag1_es0_bfa0_subset_trace.txt` | `regression_l1_bag1_es0_bfa0` (tree 0 rust:0.0 vs cpp:11.0) | same trace shape |
+| `binary_bag1_es0_bfa1_subset_trace.txt` | `binary_bag1_es0_bfa1` (was DEF-06-01: tree 0 rust 2 vs cpp 4 leaves — CLOSED by D-05 faithful-fix) | SOURCE-BUILT lib_lightgbm 4.6 FP trace: per-candidate `current_gain`/`min_gain_shift` (BUMPED sum_hessian) for the root + the two deeper 1-ULP-accept nodes, documented per-bin `sum_gradient`/`sum_hessian`, realized leaf count (4) |
+| `regression_l1_bag1_es0_bfa0_subset_trace.txt` | `regression_l1_bag1_es0_bfa0` (was tree 0 rust:0.0 vs cpp:11.0 — UN-DEFERRED by D-05 faithful-fix) | constant no-split tree-0 (leaf_count=1, leaf_value=11.0 = label median via ObtainAutomaticInitialScore fallback) |
+
+The committed traces are the SOURCE-BUILT capture (Phase-5 05-09 technique): a
+`lib_lightgbm` 4.6 (VERSION 4.6.0.99) CPU-only single-thread CLI was instrumented
+(`FindBestThresholdSequentially` `.to_bits()` dumps gated on `LGBM_FP_TRACE`) to
+record the per-candidate `current_gain`/`min_gain_shift` the prebuilt wheel cannot
+expose. The `LightGBM/` tree and the `/tmp` build were NEVER git-added; the C++
+instrumentation was reverted after capture. See `07-D05-DECISION.md`.
 
 ## Replay
 
