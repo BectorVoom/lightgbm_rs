@@ -343,16 +343,39 @@ Plans:
   3. The sklearn-style wrapper API (`LGBMClassifier`/`LGBMRegressor`/`LGBMRanker`) matches the official wrappers' semantics.
   4. Python `custom` objective/metric callbacks and `Booster.refit()` work and reproduce reference outputs.
 
-**Plans**: 8 plans (dependency-ordered sequential waves; MVP vertical slices over the validated Rust facade)
-Plans:
+**Plans**: 8 plans (dependency-ordered sequential waves; MVP vertical slices over the validated Rust facade)Plans:
+**Wave 1**
+
 - [ ] 08-01-PLAN.md — Rust facade slice: D-02 raw→bin→train bridge + new Booster methods (batch predict / feature_importance / refit / model text I/O), oracle-tested
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 08-02-PLAN.md — Crate scaffold (pinned pyo3 0.27 / numpy 0.27.1 / pyo3-polars 0.26.0) + minimal PyO3 numpy-dense train→predict with GIL release + A/B parity (PYB-01)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 08-03-PLAN.md — Widen input: f32/f64 dense + scipy CSR/CSC sparse (PYB-02)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 08-04-PLAN.md — polars zero-copy via Arrow + dtype→categorical routing (PYB-02/D-03/D-04)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 08-05-PLAN.md — params dict coercion + recognized-but-unimplemented rejection (D-06/07/08)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 08-06-PLAN.md — custom obj/metric callbacks + Booster.refit() (PYB-04)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 08-07-PLAN.md — sklearn wrappers + callbacks list + lgb.cv + plotting (PYB-03/D-09)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
 - [ ] 08-08-PLAN.md — persistence: C++-compatible text I/O + pickle (D-10)
+
 **UI hint**: no
 
 ## Progress
