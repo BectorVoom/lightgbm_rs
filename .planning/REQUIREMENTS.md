@@ -82,11 +82,11 @@
 
 ### Constraints & Advanced Parity
 
-- [ ] **ADV-01**: Monotone constraints (basic, intermediate, advanced; `monotone_penalty`)
-- [ ] **ADV-02**: Interaction constraints (`interaction_constraints`)
-- [ ] **ADV-03**: Forced splits / forced bins (JSON-driven)
-- [ ] **ADV-04**: Extra trees (`extra_trees`, `extra_seed`) randomized thresholds
-- [ ] **ADV-05**: CEGB cost-effective gradient boosting (`cegb_tradeoff`, penalties)
+- [x] **ADV-01**: Monotone constraints (basic, intermediate, advanced; `monotone_penalty`)
+- [x] **ADV-02**: Interaction constraints (`interaction_constraints`)
+- [x] **ADV-03**: Forced splits / forced bins (JSON-driven)
+- [x] **ADV-04**: Extra trees (`extra_trees`, `extra_seed`) randomized thresholds
+- [x] **ADV-05**: CEGB cost-effective gradient boosting (`cegb_tradeoff`, penalties)
 - [ ] **ADV-06**: Refit / continue training (`refit_decay_rate`, `input_model`) for `Booster.refit()`
 - [ ] **ADV-07**: Feature importance reporting (split/gain, `saved_feature_importance_type`)
 
@@ -204,11 +204,11 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | MET-04 | Phase 7 | Complete |
 | PRD-04 | Phase 7 | Complete |
 | PRD-05 | Phase 7 | Complete |
-| ADV-01 | Phase 7 | Pending |
-| ADV-02 | Phase 7 | Pending |
-| ADV-03 | Phase 7 | Pending |
-| ADV-04 | Phase 7 | Pending |
-| ADV-05 | Phase 7 | Pending |
+| ADV-01 | Phase 7 | Complete |
+| ADV-02 | Phase 7 | Complete |
+| ADV-03 | Phase 7 | Complete |
+| ADV-04 | Phase 7 | Complete |
+| ADV-05 | Phase 7 | Complete |
 | ADV-06 | Phase 7 | Pending |
 | ADV-07 | Phase 7 | Pending |
 | PYB-01 | Phase 8 | Pending |
