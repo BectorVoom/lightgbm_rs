@@ -195,6 +195,30 @@ pub const CATEGORICAL_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// goldens byte-idempotent. Recorded in REFERENCE_MANIFEST.md.
 pub const CATEGORICAL_ORACLE_SEED: i32 = LEARNER_ORACLE_SEED;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W8 ranking
+/// (OBJ-06 / MET-04) oracle (plan 07-09). Reuses the SAME prebuilt-wheel binary;
+/// `rank-oracle-capture` asserts the installed version matches BEFORE training so a
+/// wrong version can never silently emit divergent ranking goldens (threat
+/// T-07-09-SC).
+pub const RANK_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W8 ranking oracle (plan 07-09). The SAME
+/// seed the boosting matrix uses ([`BOOSTING_ORACLE_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the ranking
+/// goldens byte-idempotent (empty `git diff` on a re-capture). Recorded in
+/// REFERENCE_MANIFEST.md.
+pub const RANK_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
+
+/// The per-block RNG seed base for ranking's query-grouped bagging (C++
+/// `config_->bagging_seed`, bagging.hpp). Pinned so the bagging_by_query RNG-replay
+/// golden is reproducible.
+pub const RANK_BAGGING_SEED: i32 = 3;
+
+/// The `objective_seed` used by `rank_xendcg`'s per-query gamma RNG
+/// (`Random(objective_seed + q)`, config.h:920 default 5). Pinned so the rank_xendcg
+/// objective_seed RNG-replay golden is reproducible.
+pub const RANK_OBJECTIVE_SEED: i32 = 5;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -211,6 +235,7 @@ fn main() -> Result<()> {
         Some("rf-oracle-capture") => rf_oracle_capture(),
         Some("metric-oracle-capture") => metric_oracle_capture(),
         Some("categorical-oracle-capture") => categorical_oracle_capture(),
+        Some("rank-oracle-capture") => rank_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
@@ -1432,6 +1457,98 @@ fn goss_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- goss-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/goss/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `rank-oracle-capture` — Phase-7 W8 ranking (OBJ-06 / MET-04) golden capture
+/// (plan 07-09).
+///
+/// Shells out to `xtask/py/rank_oracle_capture.py` (the real prebuilt `lib_lightgbm`
+/// 4.6 wheel) to train a QUERY/group corpus for lambdarank/rank_xendcg across
+/// `{bagging_by_query on/off} × {early_stop on/off}` and dump:
+///   (1) per-cell model-text parity goldens `rank_{obj}_byq{Q}_es{E}_model.txt`,
+///   (2) per-query ndcg/map metric values + per-row raw scores + labels
+///       (`rank_{obj}_scores.txt` / `rank_ndcg.txt` / `rank_map.txt`),
+///   (3) the bagging_by_query RNG-replay golden (`bagging_by_query_seed{S}.txt` —
+///       sampled query indices + expanded rows + sampled_query_boundaries over the
+///       bit-exact C++ LCG), and
+///   (4) the rank_xendcg objective_seed RNG-replay golden
+///       (`rank_xendcg_objseed{S}.txt` — the per-query gamma draw order).
+///
+/// Trained with `deterministic=true force_row_wise=true num_threads=1
+/// seed=RANK_ORACLE_SEED` so re-running is byte-idempotent. The version is asserted
+/// FIRST (threat T-07-09-SC); `LightGBM/` is NEVER `git add`ed.
+fn rank_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/rank_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Goldens live under the TRACKED oracle-harness crate dir — NEVER LightGBM/.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/rank");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask rank-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        RANK_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = RANK_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask rank-oracle-capture: training lambdarank/rank_xendcg on a query corpus \
+         (real lib_lightgbm) + dumping per-query ndcg/map + the two RNG-replay goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(RANK_ORACLE_SEED.to_string())
+            .arg(RANK_BAGGING_SEED.to_string())
+            .arg(RANK_OBJECTIVE_SEED.to_string())
+            .arg(RANK_ORACLE_LIGHTGBM_VERSION),
+        "rank_oracle_capture.py",
+    )?;
+
+    // The two RNG-replay goldens are always written (they need no wheel-internal
+    // state); at least one model cell + the metric goldens too.
+    for name in [
+        "bagging_by_query_seed3.txt",
+        "rank_xendcg_objseed5.txt",
+        "rank_lambdarank_byq0_es0_model.txt",
+    ] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask rank-oracle-capture: done. Wrote ranking goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- rank-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/rank/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())

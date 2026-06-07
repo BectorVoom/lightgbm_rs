@@ -1,0 +1,4 @@
+# rank_xendcg ndcg@k (real lib_lightgbm 4.6), one per eval_at.
+ndcg@1=4607182418800017408
+ndcg@3=4606471528182496865
+ndcg@5=4606948448163721944

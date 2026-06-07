@@ -491,7 +491,24 @@ fn train_inner_full(
         .map_err(LgbmError::Boosting)?;
         gbdt = gbdt.with_goss(goss, features.clone());
     } else if bagging_on {
-        // BaggingConfig::new rejects bagging_by_query=true (explicit Phase-7 deferral).
+        // bagging_by_query (07-09): the query-grouped draw + expansion is implemented
+        // in BaggingSampleStrategy::bagging_by_query and proven by the rank_parity
+        // RNG-replay golden, but it requires query/group boundaries to bag by. The
+        // `DenseCorpus` facade carries no query metadata yet (ranking end-to-end
+        // training over the facade is a later surface), so a `bagging_by_query=true`
+        // request here is rejected with an honest typed error (mirroring the C++
+        // `Log::Fatal("Ranking tasks require query information")`) rather than silently
+        // falling through to ROW bagging.
+        if config.bagging_by_query {
+            return Err(LgbmError::Boosting(lgbm_boosting::BoostingError::Objective(
+                lgbm_objective::ObjectiveError::Unsupported {
+                    name: "bagging_by_query requires query/group boundaries, which the \
+                           DenseCorpus training facade does not carry yet (the query-grouped \
+                           draw itself is implemented + RNG-replay tested in rank_parity)"
+                        .to_string(),
+                },
+            )));
+        }
         let bag_cfg = BaggingConfig::new(
             config.bagging_fraction,
             config.pos_bagging_fraction,
@@ -1020,8 +1037,10 @@ mod tests {
 
     #[test]
     fn bagging_by_query_rejected_via_facade() {
-        // bagging_by_query=true must surface as a typed error (Phase-7 deferral),
-        // not silently row-bag.
+        // 07-09: the query-grouped draw is implemented + RNG-replay tested
+        // (rank_parity), but the DenseCorpus facade carries no query/group boundaries
+        // to bag by, so bagging_by_query=true here surfaces as a typed error (honest
+        // "query information required"), NOT a silent fall-through to row bagging.
         let mut base = Config::default();
         base.objective = "regression".into();
         base.num_iterations = 5;

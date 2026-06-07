@@ -356,6 +356,64 @@ impl TrainingBuilder {
         self
     }
 
+    /// `bagging_by_query` (BST-03 / 07-09) — when `true`, the bagging draw's minimal
+    /// unit is a whole QUERY (un-deferred in 07-09 alongside the ranking objectives).
+    /// Note the C++ `CheckParamConflict` forces this OFF unless
+    /// `data_sample_strategy == "bagging"` (set.rs:490-492), so pair it with default
+    /// bagging + a `bagging_freq`/`bagging_fraction`.
+    pub fn bagging_by_query(mut self, on: bool) -> Self {
+        self.params.insert("bagging_by_query".into(), on.to_string());
+        self
+    }
+
+    /// `objective_seed` (OBJ-06 / rank_xendcg) — the seed base for the per-query
+    /// gamma RNG (`Random(objective_seed + q)`); config.h default 5. Routes into
+    /// `lgbm-core::Config.objective_seed` via `Config::from_params` (set.rs:300).
+    pub fn objective_seed(mut self, seed: i32) -> Self {
+        self.params.insert("objective_seed".into(), seed.to_string());
+        self
+    }
+
+    /// `eval_at` (MET-04 / ndcg/map) — the `@k` cutoffs as a comma-separated list,
+    /// e.g. `"1,3,5"` (aliases ndcg_eval_at/ndcg_at/map_eval_at/map_at; config.h
+    /// default empty → DefaultEvalAt `[1..=5]`). Routes into
+    /// `lgbm-core::Config.eval_at`.
+    pub fn eval_at(mut self, ks: &[i32]) -> Self {
+        let csv = ks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(",");
+        self.params.insert("eval_at".into(), csv);
+        self
+    }
+
+    /// `label_gain` (OBJ-06 / MET-04) — the per-label gain table as a comma-separated
+    /// list, e.g. `"0,1,3,7"` (config.h default empty → DefaultLabelGain `2^i - 1`).
+    /// Routes into `lgbm-core::Config.label_gain`.
+    pub fn label_gain(mut self, gains: &[f64]) -> Self {
+        let csv = gains
+            .iter()
+            .map(|g| g.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.params.insert("label_gain".into(), csv);
+        self
+    }
+
+    /// `lambdarank_truncation_level` (OBJ-06 / lambdarank) — the max pair rank for
+    /// the lambda accumulation + the ideal-DCG truncation (config.h default 30,
+    /// `> 0`). Routes into `lgbm-core::Config.lambdarank_truncation_level`.
+    pub fn lambdarank_truncation_level(mut self, n: i32) -> Self {
+        self.params
+            .insert("lambdarank_truncation_level".into(), n.to_string());
+        self
+    }
+
+    /// `lambdarank_norm` (OBJ-06 / lambdarank) — normalize the lambdas by the score
+    /// distance + the `log2(1 + sum_lambdas)` factor (config.h default true). Routes
+    /// into `lgbm-core::Config.lambdarank_norm`.
+    pub fn lambdarank_norm(mut self, on: bool) -> Self {
+        self.params.insert("lambdarank_norm".into(), on.to_string());
+        self
+    }
+
     /// `metric_freq` (evaluate metrics every k iters; MET-02).
     pub fn metric_freq(mut self, k: i32) -> Self {
         self.params.insert("metric_freq".into(), k.to_string());
@@ -578,6 +636,63 @@ mod tests {
             .unwrap();
         assert!((cfg0.poisson_max_delta_step - 0.7).abs() < 1e-12);
         assert!((cfg0.tweedie_variance_power - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ranking_setters_route_into_config() {
+        // OBJ-06 / MET-04 (07-09): objective_seed/eval_at/label_gain/
+        // lambdarank_truncation_level/lambdarank_norm/sigmoid + objective=lambdarank
+        // must round-trip into Config.
+        let cfg = TrainingBuilder::new()
+            .objective("lambdarank")
+            .num_iterations(5)
+            .num_leaves(4)
+            .objective_seed(7)
+            .eval_at(&[1, 3, 5])
+            .label_gain(&[0.0, 1.0, 3.0, 7.0])
+            .lambdarank_truncation_level(20)
+            .lambdarank_norm(false)
+            .sigmoid(2.0)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.objective, "lambdarank");
+        assert_eq!(cfg.objective_seed, 7);
+        assert_eq!(cfg.eval_at, vec![1, 3, 5]);
+        assert_eq!(cfg.label_gain, vec![0.0, 1.0, 3.0, 7.0]);
+        assert_eq!(cfg.lambdarank_truncation_level, 20);
+        assert!(!cfg.lambdarank_norm);
+        assert!((cfg.sigmoid - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rank_xendcg_and_metrics_route_into_config() {
+        let cfg = TrainingBuilder::new()
+            .objective("rank_xendcg")
+            .metric("ndcg,map")
+            .num_iterations(5)
+            .num_leaves(4)
+            .objective_seed(5)
+            .eval_at(&[1, 2])
+            .build()
+            .unwrap();
+        assert_eq!(cfg.objective, "rank_xendcg");
+        assert_eq!(cfg.eval_at, vec![1, 2]);
+    }
+
+    #[test]
+    fn bagging_by_query_setter_routes_into_config() {
+        // 07-09: bagging_by_query=true round-trips when data_sample_strategy=bagging
+        // (the default); the C++ CheckParamConflict keeps it on in that case.
+        let cfg = TrainingBuilder::new()
+            .objective("lambdarank")
+            .num_iterations(5)
+            .num_leaves(4)
+            .bagging_fraction(0.7)
+            .bagging_freq(1)
+            .bagging_by_query(true)
+            .build()
+            .unwrap();
+        assert!(cfg.bagging_by_query, "bagging_by_query=true must round-trip");
     }
 
     #[test]

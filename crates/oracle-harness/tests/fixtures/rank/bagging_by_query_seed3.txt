@@ -1,0 +1,13 @@
+# bagging_by_query (BST-03 / 07-09) RNG-replay golden.
+#
+# The sampled query indices + sampled_query_boundaries + expanded row indices
+# the bagging.hpp query branch (bagging.hpp:52-104) produces over the EXACT C++
+# Random LCG (random.h), sized by num_data (bagging.hpp:178-181). The wheel
+# cannot expose internal bag indices, so this freezes the algorithm spec over
+# the bit-exact LCG. The Rust BaggingSampleStrategy::bagging_by_query reproduces
+# it bit-exact (rank_parity::bagging_by_query_rng_replay).
+#
+# seed=<S> fraction=<F> num_data=<N> query_boundaries=<csv i32> sampled_queries=<csv i32> sampled_query_boundaries=<csv i32> expanded_rows=<csv i32>
+seed=3 fraction=0.7 num_data=30 query_boundaries=0,3,8,12,18,23,30 sampled_queries=0,1,2,3,4 sampled_query_boundaries=0,3,8,12,18,23 expanded_rows=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+seed=3 fraction=0.5 num_data=30 query_boundaries=0,3,8,12,18,23,30 sampled_queries=0,1,2,3,4 sampled_query_boundaries=0,3,8,12,18,23 expanded_rows=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+seed=7 fraction=0.6 num_data=30 query_boundaries=0,3,8,12,18,23,30 sampled_queries=0,1,2,3,4,5 sampled_query_boundaries=0,3,8,12,18,23,30 expanded_rows=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29

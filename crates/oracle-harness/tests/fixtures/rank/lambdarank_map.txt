@@ -1,0 +1,4 @@
+# lambdarank map@k (real lib_lightgbm 4.6), one per eval_at.
+map@1=4607182418800017408
+map@3=4606932218820719047
+map@5=4606556918851771505
