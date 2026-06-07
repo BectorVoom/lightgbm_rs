@@ -34,6 +34,12 @@ use crate::objective::BoostObjective;
 use crate::sample_strategy::{BaggingSampleStrategy, GossSampleStrategy};
 use crate::score_updater::ScoreUpdater;
 
+/// The resolved Random Forest `Boosting()` output: the per-class init scores plus
+/// the ONCE-derived class-major gradients and hessians (`rf.hpp:90-109`
+/// `init_scores_`/`gradients_`/`hessians_`). Factored into a type alias to keep the
+/// [`Gbdt::rf_boosting`] signature readable.
+type RfBoosting = (Vec<f64>, Vec<f32>, Vec<f32>);
+
 /// The boosting strategy variant (RESEARCH Pattern 1 — an ENUM FIELD on [`Gbdt`],
 /// NOT trait objects). In C++ these are subclasses of `GBDT` (`DART`, `RF`);
 /// the Rust port keeps the single [`Gbdt`] driver and branches on this discriminant
@@ -48,9 +54,15 @@ pub enum BoostingVariant {
     /// `Random(drop_seed)`), trains the new tree against the post-drop score, then
     /// re-adds + normalizes the dropped trees' weights (BST-05).
     Dart,
-    /// Random Forest (`rf.hpp`) — averaged trees. Scoped to a LATER plan; the
-    /// variant is declared here for the complete `{Gbdt, Dart, Rf}` enum (RESEARCH
-    /// Pattern 1) but [`Gbdt::train_one_iter`] does not yet branch on it.
+    /// Random Forest (`rf.hpp`) — AVERAGED (not accumulated) trees with MANDATORY
+    /// randomization (bagging or feature sub-sampling) and NO learning-rate
+    /// shrinkage. Each iteration trains one tree per class on a fresh bagged subset
+    /// against grad/hess derived ONCE from a constant `BoostFromAverage` init score
+    /// (`rf.hpp:90-109`), renews the leaf outputs to the mean residual `label -
+    /// init_score` (`rf.hpp:149-152`), and folds the tree into `score_` as a running
+    /// average via `MultiplyScore(iter); AddScore; MultiplyScore(1/(iter+1))`
+    /// (`rf.hpp:157-159`). Prediction divides the tree sum by `num_iteration`
+    /// (`average_output_`, gbdt_prediction.cpp:57-59). State in [`Gbdt::rf`] (BST-06).
     Rf,
 }
 
@@ -74,6 +86,53 @@ pub struct DartConfig {
     pub uniform_drop: bool,
     /// `config_->drop_seed` — the seed for the single advancing drop RNG.
     pub drop_seed: i32,
+}
+
+/// Random Forest (`rf.hpp`) configuration — the parity-relevant `Config` subset
+/// for the two mandatory-randomization CHECKs (`rf.hpp:35-40`). RF requires EITHER
+/// active row bagging OR active feature sub-sampling; the facade resolves these
+/// from `Config` and the [`Gbdt`] driver enforces them at the top of the RF path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RfConfig {
+    /// Whether row bagging is active for this run (`bagging_freq > 0 && 0 <
+    /// bagging_fraction < 1`). One of `bagging_active` / `feature_subsampling_active`
+    /// MUST be true (`rf.hpp:36-37`).
+    pub bagging_active: bool,
+    /// Whether feature sub-sampling is active (`0 < feature_fraction < 1`). The
+    /// alternative randomization source to bagging (`rf.hpp:37`).
+    pub feature_subsampling_active: bool,
+}
+
+/// Random Forest per-train state (`rf.hpp` private members). Held alongside
+/// [`BoostingVariant::Rf`] on [`Gbdt`]. RF computes grad/hess ONCE from a constant
+/// init-score buffer (`rf.hpp:90-109 Boosting()`) and reuses them every iteration —
+/// the trees differ only through the per-iteration bagged subset, not the gradient
+/// distribution (that is the "random forest of regression trees on a fixed target"
+/// semantics). The per-tree leaf outputs are RENEWED to the mean residual
+/// `label - init_score` and the score buffer is kept as a running AVERAGE.
+struct RfState {
+    config: RfConfig,
+    /// `init_scores_` (`rf.hpp:94-97,230`) — the per-class constant init score
+    /// (`BoostFromAverage(class, update_scorer=false)`), the target the per-tree
+    /// residual getter (`label - init_scores_[k]`) closes over (`rf.hpp:149-150`).
+    init_scores: Vec<f64>,
+    /// `gradients_` — computed ONCE in [`Gbdt::rf_boosting`] from the constant
+    /// init-score buffer (`rf.hpp:90-109`) and reused every iteration (NOT
+    /// re-derived from the accumulated score). Class-major (`num_data * K`).
+    gradients: Vec<f32>,
+    /// `hessians_` — the once-computed hessians (same layout as `gradients`).
+    hessians: Vec<f32>,
+}
+
+impl std::fmt::Debug for RfState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RfState")
+            .field("config", &self.config)
+            .field("init_scores", &self.init_scores)
+            .field("gradients_len", &self.gradients.len())
+            .field("hessians_len", &self.hessians.len())
+            .finish()
+    }
 }
 
 /// DART per-iteration drop+normalize state (`dart.hpp` private members). Held
@@ -165,6 +224,10 @@ pub struct Gbdt<'a> {
     /// DART per-iteration drop+normalize state. `Some` iff `variant == Dart` (set by
     /// [`Self::with_dart`]); `None` otherwise.
     dart: Option<DartState>,
+    /// Random Forest per-train state. `Some` iff `variant == Rf` (set by
+    /// [`Self::with_rf`]); `None` otherwise. Holds the once-computed grad/hess + the
+    /// per-class init scores (`rf.hpp` `gradients_`/`hessians_`/`init_scores_`).
+    rf: Option<RfState>,
     /// The full-corpus feature columns (real bin layout) — needed by the bagging
     /// path to (a) subset-train via the learner and (b) score OOB rows predict-side
     /// (`Tree::predict` over each row's real feature values). Empty when bagging is
@@ -232,6 +295,7 @@ impl<'a> Gbdt<'a> {
             goss: None,
             variant: BoostingVariant::Gbdt,
             dart: None,
+            rf: None,
             features: Vec::new(),
         }
     }
@@ -257,6 +321,37 @@ impl<'a> Gbdt<'a> {
             shrinkage_rate: self.learning_rate,
         });
         self.features = features;
+        self
+    }
+
+    /// Enable the Random Forest boosting variant (BST-06, RESEARCH Pattern 1 — an
+    /// enum field, not a trait object). `rf_config` carries the resolved
+    /// mandatory-randomization flags (`bagging_active` / `feature_subsampling_active`);
+    /// `features` is the full-corpus feature columns (RF re-scores each grown tree
+    /// over the WHOLE corpus predict-side to keep the running-average score buffer,
+    /// `rf.hpp:157-159`, exactly like the bagging OOB path).
+    ///
+    /// Sets [`BoostingVariant::Rf`], `average_output` (no shrinkage — RF averages),
+    /// and the per-train [`RfState`]. The two RF CHECKs (`rf.hpp:35-40,91-93`) are
+    /// enforced at the top of the RF train path in [`Self::train_one_iter`] (iter 0)
+    /// so they surface as a typed [`BoostingError::RfConfig`] rather than a panic.
+    /// Builder-style; chains after a constructor. The caller MUST also enable bagging
+    /// via [`Self::with_bagging`] when `bagging_active` is true (RF reuses the proven
+    /// [`BaggingSampleStrategy`]; the 07-01 bit-exact bagging RNG golden carries over).
+    #[must_use]
+    pub fn with_rf(mut self, rf_config: RfConfig, features: Vec<FeatureColumn>) -> Self {
+        self.variant = BoostingVariant::Rf;
+        self.rf = Some(RfState {
+            config: rf_config,
+            init_scores: Vec::new(),
+            gradients: Vec::new(),
+            hessians: Vec::new(),
+        });
+        // RF re-scores grown trees over the whole corpus (running average); keep the
+        // feature columns even when bagging also sets them (idempotent).
+        if !features.is_empty() {
+            self.features = features;
+        }
         self
     }
 
@@ -434,6 +529,17 @@ impl<'a> Gbdt<'a> {
         // multiclass variants (set by the facade); the loop trusts the objective.
         let k = self.objective.num_model_per_iteration().max(1);
         let total = nd * k as usize;
+
+        // ---- RANDOM FOREST branch (BST-06, rf.hpp) ----
+        // RF is structurally distinct from the GBDT spine: grad/hess are derived ONCE
+        // from a constant init-score buffer (not the accumulated score), trees are
+        // AVERAGED (running-average score buffer) instead of accumulated with a
+        // learning rate, and leaf outputs are renewed to the mean residual `label -
+        // init_score`. Handle the whole RF iteration here and return — keeping the
+        // spine path below byte-unchanged.
+        if self.variant == BoostingVariant::Rf && self.rf.is_some() {
+            return self.train_one_iter_rf(learner, labels, num_features, k, nd, total);
+        }
 
         // ---- (1) BoostFromAverage FIRST, per class, only on iter 0 ----
         // K trees/iter over the class-major layout (offset = num_data * cur_tree_id,
@@ -744,6 +850,325 @@ impl<'a> Gbdt<'a> {
         })
     }
 
+    /// C++ `RF::Boosting` (`rf.hpp:90-109`) — compute the per-class init score
+    /// (`BoostFromAverage(class, update_scorer=false)`) and derive grad/hess ONCE
+    /// from a CONSTANT init-score buffer (every row of class `k` set to
+    /// `init_scores_[k]`), NOT from the accumulated `score_`. RF reuses these
+    /// gradients every iteration — the trees differ only through the per-iteration
+    /// bagged subset. Also enforces the two RF CHECKs (`rf.hpp:35-40,91-93`): the
+    /// objective must be non-custom and either bagging OR feature sub-sampling must
+    /// be active.
+    ///
+    /// Returns the resolved `(init_scores, gradients, hessians)`.
+    ///
+    /// # Errors
+    /// [`BoostingError::RfConfig`] when the objective is custom (`obj == nullptr`)
+    /// or neither randomization source is active; objective errors propagate.
+    fn rf_boosting(
+        &mut self,
+        labels: &[f32],
+        k: i32,
+        nd: usize,
+        total: usize,
+    ) -> Result<RfBoosting, BoostingError> {
+        let cfg = self.rf.as_ref().expect("RF state present").config;
+
+        // CHECK 1 (rf.hpp:91-93): RF requires a built-in objective (objective_function_
+        // != nullptr). The custom objective maps to the C++ nullptr path.
+        if !self.objective.boost_from_average_enabled() {
+            return Err(BoostingError::RfConfig {
+                what: "RF (boosting=rf) requires a built-in objective; the custom \
+                       objective is not supported (rf.hpp:91-93)"
+                    .to_string(),
+            });
+        }
+        // CHECK 2 (rf.hpp:35-40): RF requires mandatory randomization — either active
+        // row bagging OR active feature sub-sampling. Without either, every tree is
+        // identical and the forest collapses.
+        if !cfg.bagging_active && !cfg.feature_subsampling_active {
+            return Err(BoostingError::RfConfig {
+                what: "RF (boosting=rf) requires either active bagging \
+                       (bagging_freq > 0 && 0 < bagging_fraction < 1) or active \
+                       feature sub-sampling (0 < feature_fraction < 1) (rf.hpp:35-40)"
+                    .to_string(),
+            });
+        }
+
+        // Per-class init score. C++ `RF::Boosting` calls `BoostFromAverage(class,
+        // false)` — update_scorer=false, so it does NOT touch score_ (RF maintains
+        // score_ as a running average, seeded by the first tree, not by an additive
+        // init). We therefore compute the init via the objective directly here rather
+        // than through `boost_from_average` (which adds to score_).
+        let mut init_scores = vec![0.0f64; k as usize];
+        for cur_tree_id in 0..k {
+            init_scores[cur_tree_id as usize] = self.objective.boost_from_score(cur_tree_id, labels);
+        }
+
+        // Derive grad/hess ONCE from the constant init-score buffer (rf.hpp:98-108).
+        let mut const_scores = vec![0.0f64; total];
+        for (j, &init) in init_scores.iter().enumerate() {
+            let off = j * nd;
+            for s in &mut const_scores[off..off + nd] {
+                *s = init;
+            }
+        }
+        let mut gradients = vec![0.0f32; total];
+        let mut hessians = vec![0.0f32; total];
+        self.objective
+            .get_gradients(&const_scores, labels, &mut gradients, &mut hessians)?;
+
+        Ok((init_scores, gradients, hessians))
+    }
+
+    /// C++ `RF::TrainOneIter` (`rf.hpp:111-182`). One Random-Forest iteration:
+    /// draw the mandatory bag, grow one tree per class on the in-bag subset against
+    /// the ONCE-derived constant grad/hess, renew each leaf to the mean residual
+    /// `label - init_score`, `AddBias(init_score)`, and fold the tree into `score_`
+    /// as a RUNNING AVERAGE (`MultiplyScore(iter); AddScore; MultiplyScore(1/(iter+1))`,
+    /// rf.hpp:157-159) with NO learning-rate shrinkage. Returns the per-iter snapshot.
+    ///
+    /// # Errors
+    /// [`BoostingError::RfConfig`] from the iter-0 CHECKs; learner/objective errors
+    /// propagate.
+    fn train_one_iter_rf<B: Backend>(
+        &mut self,
+        learner: &mut SerialTreeLearner<'_, B>,
+        labels: &[f32],
+        _num_features: usize,
+        k: i32,
+        nd: usize,
+        total: usize,
+    ) -> Result<IterSnapshot, BoostingError> {
+        // On the first iteration, run RF::Boosting once: enforce the CHECKs + derive
+        // the constant grad/hess + init scores. Subsequent iterations reuse them.
+        if self.iter == 0 {
+            let (init_scores, gradients, hessians) = self.rf_boosting(labels, k, nd, total)?;
+            let rf = self.rf.as_mut().expect("RF state present");
+            rf.init_scores = init_scores;
+            rf.gradients = gradients;
+            rf.hessians = hessians;
+        }
+
+        // Snapshot the once-derived grad/hess + init scores (cloned out so the
+        // borrow checker is happy across the learner + score_updater mut-borrows).
+        let (init_scores, gradients, hessians) = {
+            let rf = self.rf.as_ref().expect("RF state present");
+            (
+                rf.init_scores.clone(),
+                rf.gradients.clone(),
+                rf.hessians.clone(),
+            )
+        };
+
+        // ---- mandatory bagging (rf.hpp:113-117) ----
+        // RF MUST bag (or feature-subsample). The bag is drawn over the proven
+        // BaggingSampleStrategy (07-01 bit-exact RNG golden). When feature
+        // sub-sampling is the randomization source (no row bagging), there is no
+        // subset and trees train on the full corpus (the col-sampler differs per
+        // tree — that wiring lives in the learner; here use_subset is false).
+        // RF folds EVERY row into the running-average score (rf_update_score scores
+        // the full corpus predict-side), so the OOB index set is not needed
+        // separately — only the in-bag subset for TRAINING the tree.
+        let (use_subset, sample_in_bag) = if let Some(bag) = self.bagging.as_mut() {
+            bag.bagging(self.iter, labels);
+            if bag.is_use_subset() {
+                (true, bag.in_bag().to_vec())
+            } else {
+                (false, Vec::new())
+            }
+        } else {
+            (false, Vec::new())
+        };
+
+        // The running-average rescale factor base (rf.hpp:157,159): num_init_iteration_
+        // is 0 for a fresh train, so MultiplyScore(iter); ...; MultiplyScore(1/(iter+1)).
+        let iter = self.iter as f64;
+
+        // ---- per-class tree loop (rf.hpp:129-179) ----
+        for cur_tree_id in 0..k {
+            let offset = (cur_tree_id as usize) * nd;
+            let init = init_scores[cur_tree_id as usize];
+
+            // class_need_train gate (rf.hpp:132): a class that is not trained pushes a
+            // constant tree (BoostFromScore / init) once, still folded into the
+            // running average so models_.len() stays iter*K.
+            if !self.objective.class_need_train(cur_tree_id, labels) {
+                let is_first_iter = self.trees.len() < k as usize;
+                if is_first_iter {
+                    let const_val = init; // rf.hpp:163-170 (objective non-null branch)
+                    let tree = Tree::as_constant(const_val, self.num_data);
+                    self.rf_update_score(&tree, cur_tree_id, iter);
+                    self.trees.push(tree);
+                } else {
+                    // Extend with a 1-leaf zero tree (no additional score move).
+                    self.trees.push(Tree::as_constant(0.0, self.num_data));
+                }
+                continue;
+            }
+
+            let grad = &gradients[offset..offset + nd];
+            let hess = &hessians[offset..offset + nd];
+            let is_first_tree = self.trees.len() < k as usize;
+
+            // Grow the tree on the bagged subset (or full corpus when feature-only
+            // randomization). RF residual_getter = `label - init_scores_[k]` (a
+            // CONSTANT pred, rf.hpp:149-150) — NOT the accumulated score (the GBDT
+            // spine uses `label - score`). RF ALWAYS renews (rf.hpp:150-152 calls
+            // RenewTreeOutput unconditionally for a grown tree).
+            let mut tree;
+            if use_subset {
+                let in_bag = sample_in_bag.clone();
+                let (grown, subset_partition) = learner
+                    .train_on_subset_returning_partition(&in_bag, grad, hess, is_first_tree)?;
+                tree = grown;
+                if tree.num_leaves > 1 {
+                    Self::rf_renew_subset(learner, &mut tree, &subset_partition, &in_bag, labels, init);
+                    // NO shrinkage (rf.hpp shrinkage_rate_ = 1.0).
+                    if Objective::init_score_is_significant(init) {
+                        tree.add_bias(init);
+                    }
+                    // Fold into the running-average score over BOTH in-bag and OOB
+                    // rows (rf.hpp UpdateScore via MultiplyScore sandwich). RF scores
+                    // EVERY row (the predict-side full-corpus add), so do it as the
+                    // running-average rescale below.
+                    self.rf_update_score(&tree, cur_tree_id, iter);
+                    self.trees.push(tree);
+                } else {
+                    // No-split bagged tree: constant = init (rf.hpp falls back to the
+                    // init score for the constant), folded into the running average.
+                    let const_tree = Tree::as_constant(init, self.num_data);
+                    self.rf_update_score(&const_tree, cur_tree_id, iter);
+                    self.trees.push(const_tree);
+                }
+                continue;
+            }
+
+            // Feature-only randomization (no row bagging): grow on the full corpus.
+            let (grown, partition) = learner.train_returning_partition(grad, hess, is_first_tree)?;
+            tree = grown;
+            if tree.num_leaves > 1 {
+                self.rf_renew_full(&mut tree, &partition, learner, labels, init);
+                if Objective::init_score_is_significant(init) {
+                    tree.add_bias(init);
+                }
+                self.rf_update_score(&tree, cur_tree_id, iter);
+                self.trees.push(tree);
+            } else {
+                let const_tree = Tree::as_constant(init, self.num_data);
+                self.rf_update_score(&const_tree, cur_tree_id, iter);
+                self.trees.push(const_tree);
+            }
+        }
+
+        self.iter += 1;
+        Ok(IterSnapshot {
+            gradients,
+            hessians,
+            score: self.score_updater.scores().to_vec(),
+        })
+    }
+
+    /// RF running-average score fold (`rf.hpp:157-159`): `MultiplyScore(iter);
+    /// AddScore(tree); MultiplyScore(1/(iter+1))` — keep `score_` as the mean of the
+    /// `iter+1` per-tree raw outputs. The tree is added over the FULL corpus
+    /// predict-side (every row scored, like the bagging OOB path) — bit-exact to the
+    /// partition scatter on the identity-binned corpus (the L2 contract). `num_init_
+    /// iteration_` is 0 for a fresh train, so the factors are exactly `iter` and
+    /// `1/(iter+1)`.
+    fn rf_update_score(&mut self, tree: &Tree, cur_tree_id: i32, iter: f64) {
+        // MultiplyScore(cur_tree_id, iter) — un-average back to a sum of `iter` trees.
+        self.score_updater.multiply_score(iter, cur_tree_id);
+        // AddScore(tree) over the full corpus (predict-side, every row). Use the
+        // running-average helper with multiply=1.0 (raw add). The identity-binned bin
+        // index IS the real feature value (the L2 predict-vs-scatter contract).
+        let features = &self.features;
+        let feature_row = |row: i32| -> Vec<f64> {
+            let width = features
+                .iter()
+                .map(|f| f.real_feature_index)
+                .max()
+                .map(|m| (m + 1) as usize)
+                .unwrap_or(0);
+            let mut v = vec![0.0f64; width];
+            for f in features {
+                v[f.real_feature_index as usize] = f.bins[row as usize] as f64;
+            }
+            v
+        };
+        // A constant (num_leaves<=1) tree still contributes its leaf value to every
+        // row — add_tree_scaled_all handles both grown and constant trees.
+        self.score_updater
+            .add_tree_scaled_all(tree, cur_tree_id, 1.0, feature_row);
+        // MultiplyScore(cur_tree_id, 1/(iter+1)) — re-average over `iter+1` trees.
+        self.score_updater.multiply_score(1.0 / (iter + 1.0), cur_tree_id);
+    }
+
+    /// RF leaf renewal on the FULL-corpus path (`rf.hpp:150-152`,
+    /// serial_tree_learner.cpp RenewTreeOutput): overwrite each leaf's output with
+    /// the mean residual `label - init_score` over its rows (the C++ residual_getter
+    /// `label[i] - pred` with `pred = init_scores_[cur_tree_id]`, a CONSTANT). RF
+    /// renews UNCONDITIONALLY (unlike the GBDT spine which only renews regression_l1).
+    fn rf_renew_full<B: Backend>(
+        &self,
+        tree: &mut Tree,
+        partition: &lgbm_treelearner::DataPartition,
+        learner: &SerialTreeLearner<'_, B>,
+        labels: &[f32],
+        init: f64,
+    ) {
+        learner.renew_tree_output(
+            tree,
+            partition,
+            Some(|_leaf: i32, rows: &[u32]| {
+                // Mean residual `label - init` over the leaf's rows (rf.hpp uses the
+                // mean — RenewTreeOutput with the residual_getter over a regression
+                // objective averages the residuals; PercentileFun is L1-only and RF's
+                // built-in objectives here are L2-family, so the renew is the mean).
+                if rows.is_empty() {
+                    return 0.0;
+                }
+                let sum: f64 = rows
+                    .iter()
+                    .map(|&r| labels[r as usize] as f64 - init)
+                    .sum();
+                sum / rows.len() as f64
+            }),
+        );
+    }
+
+    /// RF leaf renewal on the BAGGED-SUBSET path (`rf.hpp:150-152` with the subset
+    /// index mapping). Mirrors [`Self::rf_renew_full`] but maps each leaf's
+    /// subset-row index through `in_bag[sr]` to the full-corpus row before forming the
+    /// residual `label[fr] - init`.
+    fn rf_renew_subset<B: Backend>(
+        learner: &SerialTreeLearner<'_, B>,
+        tree: &mut Tree,
+        subset_partition: &lgbm_treelearner::DataPartition,
+        in_bag: &[i32],
+        labels: &[f32],
+        init: f64,
+    ) {
+        // The partition's per-leaf rows are SUBSET indices; map each through
+        // `in_bag[sr]` to the full-corpus row before forming the residual.
+        learner.renew_tree_output(
+            tree,
+            subset_partition,
+            Some(|_leaf: i32, subset_rows: &[u32]| {
+                if subset_rows.is_empty() {
+                    return 0.0;
+                }
+                let sum: f64 = subset_rows
+                    .iter()
+                    .map(|&sr| {
+                        let fr = in_bag[sr as usize] as usize;
+                        labels[fr] as f64 - init
+                    })
+                    .sum();
+                sum / subset_rows.len() as f64
+            }),
+        );
+    }
+
     /// Run the full boosting loop for `num_iterations` (the spine driver).
     /// Returns the per-iteration [`IterSnapshot`]s (for the layered goldens).
     ///
@@ -960,13 +1385,17 @@ impl<'a> Gbdt<'a> {
         feature_names: String,
         feature_infos: String,
     ) -> GbdtModel {
+        // RF emits `average_output` (rf.hpp ctor sets `average_output_ = true`): the
+        // stored tree leaf values are the RAW per-tree outputs, and prediction
+        // divides the tree sum by num_iteration (gbdt_prediction.cpp:57-59).
+        let average_output = self.variant == BoostingVariant::Rf;
         GbdtModel {
             trees: self.trees,
             num_class: self.num_class,
             num_tree_per_iteration: self.num_class.max(1),
             label_index: 0,
             max_feature_idx,
-            average_output: false,
+            average_output,
             objective_string: Some(objective_string),
             feature_names,
             feature_infos,
@@ -1675,6 +2104,197 @@ mod tests {
         assert_ne!(
             d1, d2,
             "advancing RNG must NOT reproduce the same drops each iter (re-seed bug)"
+        );
+    }
+
+    // ===================== 07-07: Random Forest boosting variant (BST-06) =========
+
+    fn rf_config_bagging() -> RfConfig {
+        RfConfig {
+            bagging_active: true,
+            feature_subsampling_active: false,
+        }
+    }
+
+    /// A bagging strategy over the test corpus (fraction 0.7, freq 1) — RF's
+    /// mandatory randomization, reusing the proven BaggingSampleStrategy (07-01).
+    fn rf_bagging_strategy(num_data: i32, labels: &[f32]) -> BaggingSampleStrategy {
+        let cfg = BaggingConfig::new(0.7, 1.0, 1.0, 1, 3, false).expect("bagging config");
+        BaggingSampleStrategy::reset_sample_config(cfg, num_data, labels)
+    }
+
+    #[test]
+    fn rf_variant_is_selected_via_with_rf() {
+        let (features, labels, _cfg) = corpus();
+        let gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            labels.len() as i32,
+            true,
+            None,
+        )
+        .with_rf(rf_config_bagging(), features.clone());
+        assert_eq!(gbdt.variant(), BoostingVariant::Rf);
+    }
+
+    #[test]
+    fn rf_no_objective_is_typed_error() {
+        // CHECK 1 (rf.hpp:91-93): RF requires a built-in objective; custom rejected.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        // A trivial custom objective (preds -> zero grad/hess).
+        let custom = lgbm_objective::CustomObjective::new(|preds: &[f64]| {
+            (vec![0.0f32; preds.len()], vec![1.0f32; preds.len()])
+        });
+        let mut gbdt = Gbdt::with_objective(
+            BoostObjective::Custom(custom),
+            1.0,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_rf(rf_config_bagging(), features.clone())
+        .with_bagging(rf_bagging_strategy(num_data, &labels), features.clone());
+        let err = gbdt
+            .train_one_iter(&mut learner, &labels, features.len())
+            .expect_err("RF with custom objective must be a typed error");
+        assert!(
+            matches!(err, BoostingError::RfConfig { .. }),
+            "expected RfConfig, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rf_no_randomization_is_typed_error() {
+        // CHECK 2 (rf.hpp:35-40): neither bagging nor feature sub-sampling active.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let rf_cfg = RfConfig {
+            bagging_active: false,
+            feature_subsampling_active: false,
+        };
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            1.0,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_rf(rf_cfg, features.clone());
+        let err = gbdt
+            .train_one_iter(&mut learner, &labels, features.len())
+            .expect_err("RF with no randomization must be a typed error");
+        assert!(
+            matches!(err, BoostingError::RfConfig { .. }),
+            "expected RfConfig, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rf_score_is_running_average_no_shrinkage() {
+        // RF folds each tree into score_ as a running AVERAGE (MultiplyScore
+        // sandwich), with NO learning-rate shrinkage. After N iters, every row's
+        // score must equal the mean of the per-tree (renewed) raw outputs over that
+        // row — bounded by the label range [1, 5] regardless of N (a learning-rate
+        // accumulation would drift past the labels). We assert the score stays in
+        // the label hull and that adding more trees does NOT push it out (the
+        // averaging invariant), distinguishing RF from the additive GBDT spine.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1, // learning rate is IGNORED by RF (shrinkage 1.0) — averaging only
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_rf(rf_config_bagging(), features.clone())
+        .with_bagging(rf_bagging_strategy(num_data, &labels), features.clone());
+
+        let snaps = gbdt
+            .train(&mut learner, &labels, features.len(), 8)
+            .expect("rf train");
+        assert_eq!(snaps.len(), 8);
+        let final_score = &snaps[7].score;
+        // Averaging invariant: every row's averaged score is within the label hull
+        // [1, 5] (an additive lr-shrinkage path would NOT respect this bound after
+        // 8 fully-fit trees). Allow a small epsilon for renew/residual rounding.
+        for &s in final_score {
+            assert!(
+                (0.5..=5.5).contains(&s),
+                "RF averaged score {s} must stay within the label hull (no lr accumulation)"
+            );
+        }
+        // The model emits average_output.
+        let model = gbdt.into_model(
+            "regression".to_string(),
+            1,
+            "Column_0 Column_1".to_string(),
+            "[0:1] [0:1]".to_string(),
+        );
+        assert!(model.average_output, "RF model must set average_output");
+    }
+
+    #[test]
+    fn rf_predict_averages_tree_outputs() {
+        // RF predict = (sum of stored RAW tree outputs) / num_iteration. The stored
+        // leaf values are the RAW per-tree outputs; the GbdtModel carries
+        // average_output. Verify the running-average score buffer equals the
+        // predict-side average for a representative row (the L2 predict-vs-scatter
+        // contract on the identity-binned corpus).
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            1.0,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_rf(rf_config_bagging(), features.clone())
+        .with_bagging(rf_bagging_strategy(num_data, &labels), features.clone());
+        let snaps = gbdt
+            .train(&mut learner, &labels, features.len(), 6)
+            .expect("rf train");
+        let n_iter = gbdt.num_iteration();
+        let model = gbdt.into_model(
+            "regression".to_string(),
+            1,
+            "Column_0 Column_1".to_string(),
+            "[0:1] [0:1]".to_string(),
+        );
+        // Row 0 has features (0,0). predict_raw is the SUM of the trees; the averaged
+        // prediction is that / num_iteration.
+        let row0 = vec![0.0f64, 0.0];
+        let raw_sum = model.predict_raw(&row0, 0, -1)[0];
+        let avg_pred = raw_sum / n_iter as f64;
+        // The running-average score buffer for row 0 must match the predict-side
+        // average (both are the mean of the per-tree raw outputs over row 0).
+        let score_row0 = snaps[5].score[0];
+        assert!(
+            (avg_pred - score_row0).abs() < 1e-9,
+            "RF predict average {avg_pred} must match the running-average score {score_row0}"
         );
     }
 }

@@ -101,6 +101,25 @@ pub enum BoostingError {
         /// Human-readable description of the deferred combination.
         what: String,
     },
+
+    /// A Random Forest (`boosting=rf`) config check failed (BST-06, threat
+    /// T-07-07-01). Mirrors the C++ `RF::Init` / `RF::Boosting` invariants
+    /// (`rf.hpp:35-40,91-93`), enforced at the TOP of the RF train path BEFORE any
+    /// tree grows:
+    /// - `RF::Boosting` requires `objective_function_ != nullptr` — RF does NOT
+    ///   support a custom objective (it re-derives grad/hess from the built-in
+    ///   `BoostFromAverage` init score). The Rust port maps the `custom` objective
+    ///   (`BoostObjective::Custom`) to this error.
+    /// - `RF::Init` requires mandatory randomization: either active row bagging
+    ///   (`bagging_freq > 0 && 0 < bagging_fraction < 1`) OR active feature
+    ///   sub-sampling (`0 < feature_fraction < 1`). Without either, every tree
+    ///   would be identical and the "forest" would collapse to one tree — C++
+    ///   `CHECK`s this; the Rust port surfaces it as this typed error.
+    #[error("invalid RF config: {what}")]
+    RfConfig {
+        /// Human-readable description of the violated RF invariant.
+        what: String,
+    },
 }
 
 #[cfg(test)]

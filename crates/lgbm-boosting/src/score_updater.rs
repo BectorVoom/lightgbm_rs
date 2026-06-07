@@ -87,6 +87,22 @@ impl ScoreUpdater {
         }
     }
 
+    /// C++ `ScoreUpdater::MultiplyScore(double val, int cur_tree_id)`
+    /// (score_updater.hpp:63-69): multiply every row of class `cur_tree_id` by
+    /// `val`. Used by the Random Forest variant (`rf.hpp:157-159,205-210`) to keep
+    /// `score_` as a RUNNING AVERAGE of the per-tree raw outputs: each iter does
+    /// `MultiplyScore(iter)` (un-average back to a sum), `AddScore(new_tree)` (add
+    /// the raw tree), then `MultiplyScore(1/(iter+1))` (re-average over the now
+    /// `iter+1` trees). NO learning-rate shrinkage is applied — RF averages, it does
+    /// not accumulate shrunk increments.
+    pub fn multiply_score(&mut self, val: f64, cur_tree_id: i32) {
+        let off = self.offset(cur_tree_id);
+        let end = off + self.num_data as usize;
+        for s in &mut self.score[off..end] {
+            *s *= val;
+        }
+    }
+
     /// C++ training-path `ScoreUpdater::AddScore(tree_learner, tree, cur_tree_id)`
     /// (score_updater.hpp:88-92): delegate to
     /// `SerialTreeLearner::add_prediction_to_score` over class `cur_tree_id`'s
@@ -195,6 +211,29 @@ mod tests {
         assert_eq!(su.class_scores(1), &[0.0, 0.0, 0.0]);
         su.add_constant(-1.0, 1); // class 1 only
         assert_eq!(su.class_scores(1), &[-1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn multiply_score_is_per_class_and_running_average() {
+        // 2 classes, 3 rows each.
+        let mut su = ScoreUpdater::new(3, 2, None);
+        su.add_constant(2.0, 0); // class 0 = [2,2,2]
+        su.add_constant(4.0, 1); // class 1 = [4,4,4]
+        su.multiply_score(0.5, 0); // class 0 only -> [1,1,1]
+        assert_eq!(su.class_scores(0), &[1.0, 1.0, 1.0]);
+        assert_eq!(su.class_scores(1), &[4.0, 4.0, 4.0]);
+
+        // RF running-average pattern: start with the iter-0 average a0, add raw t1.
+        // After iter 0 score holds a0 (the average of 1 tree). At iter_=1:
+        //   MultiplyScore(1) -> a0 (un-average over 1 tree, no-op for iter 1)
+        //   AddScore(t1)     -> a0 + t1
+        //   MultiplyScore(1/2) -> (a0 + t1)/2  == the mean of {a0, t1}
+        let mut rf = ScoreUpdater::new(1, 1, None);
+        rf.add_constant(10.0, 0); // a0 = 10 (the first tree's raw output, "averaged" over 1)
+        rf.multiply_score(1.0, 0); // iter_ = 1
+        rf.add_constant(20.0, 0); // + raw tree t1
+        rf.multiply_score(0.5, 0); // 1/(iter_+1) = 1/2
+        assert_eq!(rf.class_scores(0), &[15.0]); // mean(10, 20)
     }
 
     #[test]
