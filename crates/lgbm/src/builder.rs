@@ -183,6 +183,47 @@ impl TrainingBuilder {
         self
     }
 
+    /// `boosting` (the boosting type / sample-strategy alias, e.g. `"gbdt"` or
+    /// `"goss"`; BST-04). `boosting=goss` is the C++ alias-expansion that resolves to
+    /// `boosting=gbdt` + `data_sample_strategy=goss` (config.cpp; `set.rs:472-476`).
+    pub fn boosting(mut self, kind: &str) -> Self {
+        self.params.insert("boosting".into(), kind.into());
+        self
+    }
+
+    /// `data_sample_strategy` (`"bagging"` (default) or `"goss"`; BST-04). Routes into
+    /// `lgbm-core::Config.data_sample_strategy` via `Config::from_params`. Prefer
+    /// [`goss`](Self::goss) for the GOSS convenience.
+    pub fn data_sample_strategy(mut self, strategy: &str) -> Self {
+        self.params
+            .insert("data_sample_strategy".into(), strategy.into());
+        self
+    }
+
+    /// `top_rate` (GOSS — the retained-largest-gradient fraction; config.h default
+    /// 0.2, CHECK `[0,1]` with `top_rate + other_rate <= 1`; BST-04). Routes into
+    /// `lgbm-core::Config.top_rate` via `Config::from_params` (set.rs:201-203).
+    pub fn top_rate(mut self, v: f64) -> Self {
+        self.params.insert("top_rate".into(), v.to_string());
+        self
+    }
+
+    /// `other_rate` (GOSS — the randomly-sampled fraction of the rest; config.h
+    /// default 0.1, CHECK `[0,1]` with `top_rate + other_rate <= 1`; BST-04). Routes
+    /// into `lgbm-core::Config.other_rate` via `Config::from_params` (set.rs:205-207).
+    pub fn other_rate(mut self, v: f64) -> Self {
+        self.params.insert("other_rate".into(), v.to_string());
+        self
+    }
+
+    /// GOSS convenience (BST-04): select gradient-based one-side sampling with the
+    /// given `top_rate` / `other_rate`. Equivalent to
+    /// `.boosting("goss").top_rate(top).other_rate(other)` — the `boosting=goss`
+    /// alias-expansion sets `data_sample_strategy=goss` + `boosting=gbdt`.
+    pub fn goss(self, top_rate: f64, other_rate: f64) -> Self {
+        self.boosting("goss").top_rate(top_rate).other_rate(other_rate)
+    }
+
     /// `early_stopping_round` (stop after this many non-improving rounds; `0`
     /// disables early stopping; BST-07).
     pub fn early_stopping_round(mut self, n: i32) -> Self {
@@ -255,6 +296,51 @@ mod tests {
         assert!(cfg.boost_from_average);
         assert_eq!(cfg.seed, 7);
         assert!(cfg.deterministic);
+    }
+
+    #[test]
+    fn goss_setters_route_into_config() {
+        // BST-04: top_rate/other_rate/data_sample_strategy must round-trip into Config.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .data_sample_strategy("goss")
+            .top_rate(0.2)
+            .other_rate(0.1)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.data_sample_strategy, "goss");
+        assert!((cfg.top_rate - 0.2).abs() < 1e-12);
+        assert!((cfg.other_rate - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn boosting_goss_alias_expands_to_gbdt_plus_data_sample_strategy() {
+        // The C++ alias-expansion: boosting=goss => boosting=gbdt + data_sample_strategy=goss
+        // (set.rs:472-476). Both the `.boosting("goss")` setter and the `.goss(..)`
+        // convenience must trigger it.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .boosting("goss")
+            .build()
+            .unwrap();
+        assert_eq!(cfg.boosting, "gbdt", "goss alias must expand boosting to gbdt");
+        assert_eq!(cfg.data_sample_strategy, "goss");
+
+        let cfg2 = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .goss(0.1, 0.05)
+            .build()
+            .unwrap();
+        assert_eq!(cfg2.boosting, "gbdt");
+        assert_eq!(cfg2.data_sample_strategy, "goss");
+        assert!((cfg2.top_rate - 0.1).abs() < 1e-12);
+        assert!((cfg2.other_rate - 0.05).abs() < 1e-12);
     }
 
     #[test]

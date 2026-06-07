@@ -119,6 +119,23 @@ pub const SUBSET_DETERMINISM_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// (empty `git diff` on a re-capture). Recorded in REFERENCE_MANIFEST.md.
 pub const SUBSET_DETERMINISM_SEED: i32 = BOOSTING_ORACLE_SEED;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W4 GOSS
+/// (BST-04) oracle (plan 07-05). Reuses the SAME prebuilt-wheel binary;
+/// `goss-oracle-capture` asserts the installed version matches BEFORE training so a
+/// wrong version can never silently emit divergent GOSS goldens (threat T-07-05-SC).
+pub const GOSS_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W4 GOSS oracle (plan 07-05). The SAME
+/// seed the boosting matrix uses ([`BOOSTING_ORACLE_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the GOSS goldens
+/// byte-idempotent (empty `git diff` on a re-capture). Recorded in
+/// REFERENCE_MANIFEST.md.
+pub const GOSS_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
+
+/// The per-block RNG seed base for GOSS sampling (C++ `config_->bagging_seed`,
+/// goss.hpp:97). Pinned so the RNG-replay golden is reproducible.
+pub const GOSS_BAGGING_SEED: i32 = 3;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -130,12 +147,13 @@ fn main() -> Result<()> {
         Some("learner-oracle-capture") => learner_oracle_capture(),
         Some("boosting-oracle-capture") => boosting_oracle_capture(),
         Some("subset-determinism-capture") => subset_determinism_capture(),
+        Some("goss-oracle-capture") => goss_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
-                 subset-determinism-capture)"
+                 subset-determinism-capture | goss-oracle-capture)"
             );
         }
         None => {
@@ -143,7 +161,7 @@ fn main() -> Result<()> {
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
-                 subset-determinism-capture>"
+                 subset-determinism-capture | goss-oracle-capture>"
             );
             Ok(())
         }
@@ -1079,6 +1097,90 @@ fn subset_determinism_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- subset-determinism-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/determinism/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `goss-oracle-capture` — Phase-7 W4 (BST-04) GOSS sample-strategy oracle capture
+/// (plan 07-05).
+///
+/// Trains the GOSS axis (top_rate × other_rate × {es} × {bfa}; GOSS forbids bagging
+/// so there is NO bag axis) on the real prebuilt `lib_lightgbm` 4.6 pip wheel and
+/// dumps (1) the per-cell model-text parity goldens `goss_t{T}_o{O}_es{E}_bfa{B}_model.txt`
+/// and (2) the dedicated RNG-replay golden `goss_rng_replay.txt` (the kept/dropped row
+/// indices + the pre-draw grad/hess so the Rust `GossSampleStrategy` reproduces the
+/// draw + ArgMaxAtK threshold bit-exact). Trained with `deterministic=true
+/// force_row_wise=true num_threads=1 seed=GOSS_ORACLE_SEED bagging_seed=GOSS_BAGGING_SEED`
+/// so re-running is byte-idempotent (empty `git diff`).
+///
+/// The version is asserted FIRST (threat T-07-05-SC): a wrong wheel must never
+/// silently emit divergent GOSS goldens. The pip `lightgbm` is a CAPTURE-time tool
+/// only — never a crate dependency and never read at `cargo test` time (the goldens
+/// are committed). NEVER `git add` the `LightGBM/` tree.
+fn goss_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/goss_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Goldens live under the TRACKED oracle-harness crate dir — NEVER LightGBM/.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/goss");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask goss-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        GOSS_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = GOSS_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask goss-oracle-capture: training the GOSS top_rate×other_rate×{{es}}×{{bfa}} \
+         cells on real lib_lightgbm and dumping the model + RNG-replay goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(GOSS_ORACLE_SEED.to_string())
+            .arg(GOSS_BAGGING_SEED.to_string())
+            .arg(GOSS_ORACLE_LIGHTGBM_VERSION),
+        "goss_oracle_capture.py",
+    )?;
+
+    // The RNG-replay golden is always written; at least the canonical cell model.
+    for name in ["goss_rng_replay.txt", "goss_t200_o100_es0_bfa1_model.txt"] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask goss-oracle-capture: done. Wrote GOSS goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- goss-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/goss/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())

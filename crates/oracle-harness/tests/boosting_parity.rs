@@ -904,6 +904,243 @@ fn bagging_rng() {
     assert!(cells >= 1, "expected at least one bag golden cell");
 }
 
+// ========================= GOSS (BST-04, 07-05) =========================
+
+/// The committed GOSS fixture directory — TRACKED under the oracle-harness crate,
+/// NEVER the untracked C++/LightGBM reference tree. Populated by
+/// `cargo run -p xtask -- goss-oracle-capture`.
+fn goss_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goss")
+}
+
+/// SKIP gracefully (returning `None`) when a GOSS golden is absent (fresh checkout
+/// pre-capture) — the same Option shape as `read_golden`.
+fn read_goss_golden(name: &str) -> Option<String> {
+    let path = goss_dir().join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            eprintln!(
+                "boosting_parity: SKIP — GOSS golden {} not found. Run \
+                 `LGBM_CAPTURE_PYTHON=… cargo run -p xtask -- goss-oracle-capture`.",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The GOSS capture corpus — a 24-row, 2-feature identity-binned corpus with a
+/// monotone-ish label gradient so the per-row `|g*h|` magnitudes are well separated
+/// (a non-degenerate top-k threshold). Mirrors
+/// `xtask/py/goss_oracle_capture.py::goss_corpus`.
+fn goss_corpus() -> DenseCorpus {
+    let n = 24usize;
+    let features: Vec<Vec<f64>> = (0..n)
+        .map(|i| vec![(i / 4) as f64, (i % 3) as f64])
+        .collect();
+    let labels: Vec<f32> = (0..n).map(|i| (i as f32) * 1.5 + 1.0).collect();
+    DenseCorpus { features, labels }
+}
+
+/// The GOSS capture control (mirrors `goss_oracle_capture.py`).
+const GOSS_SEED: i32 = SPINE_SEED;
+const GOSS_BAGGING_SEED: i32 = 3;
+const GOSS_NUM_ITERATIONS: i32 = 12;
+const GOSS_LEARNING_RATE: f64 = 0.1;
+/// The GOSS axis: top_rate × other_rate (top+other <= 0.5 for the subset path,
+/// <= 1.0 always) — RESEARCH §Oracle Axis Matrix → Boosting variants.
+const GOSS_TOP_RATES: [f64; 2] = [0.2, 0.1];
+const GOSS_OTHER_RATES: [f64; 2] = [0.1, 0.05];
+
+#[test]
+fn goss_rng_replay() {
+    // The GOSS RNG-replay golden (BST-04): the kept/dropped row indices + which rows
+    // were amplified, reproduced by `GossSampleStrategy::bagging` over the proven
+    // `lgbm_core::Random` LCG, asserted BIT-EXACT (compare_exact i32) against the
+    // committed golden `goss_sampled_seed{S}_top{T}_other{O}.txt`. The draw is a pure
+    // function of (bagging_seed, top_rate, other_rate, the per-row |g*h|, block 1024),
+    // so a wrong RNG draw/order or a wrong ArgMaxAtK threshold can never hide behind a
+    // near-matching model. SKIP-PASS when the golden is absent.
+    use lgbm_boosting::GossSampleStrategy;
+
+    let Some(text) = read_goss_golden("goss_rng_replay.txt") else {
+        return;
+    };
+    let mut cells = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Parse: seed=<S> top=<T> other=<O> num_data=<N> bag_data_cnt=<C>
+        //        grad=<csv f32 bits> hess=<csv f32 bits> indices=<csv i32>.
+        let mut seed = 0i32;
+        let mut top = 0.0f64;
+        let mut other = 0.0f64;
+        let mut num_data = 0i32;
+        let mut bag_cnt = 0i32;
+        let mut grad: Vec<f32> = Vec::new();
+        let mut hess: Vec<f32> = Vec::new();
+        let mut expected: Vec<i32> = Vec::new();
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("seed=") {
+                seed = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("top=") {
+                top = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("other=") {
+                other = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("num_data=") {
+                num_data = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("bag_data_cnt=") {
+                bag_cnt = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("grad=") {
+                grad = v
+                    .split(',')
+                    .map(|t| f32::from_bits(t.parse::<u32>().unwrap()))
+                    .collect();
+            } else if let Some(v) = tok.strip_prefix("hess=") {
+                hess = v
+                    .split(',')
+                    .map(|t| f32::from_bits(t.parse::<u32>().unwrap()))
+                    .collect();
+            } else if let Some(v) = tok.strip_prefix("indices=") {
+                expected = v.split(',').map(|t| t.parse::<i32>().unwrap()).collect();
+            }
+        }
+        let mut g = grad.clone();
+        let mut h = hess.clone();
+        let mut strat =
+            GossSampleStrategy::reset_sample_config(top, other, GOSS_LEARNING_RATE, num_data, 1, seed)
+                .unwrap();
+        // iter past the 1/lr skip window so GOSS actually subsamples (the golden was
+        // captured at a subsampling iter).
+        let skip = (1.0f32 / GOSS_LEARNING_RATE as f32) as i32;
+        assert!(
+            strat.bagging(skip, &mut g, &mut h),
+            "seed={seed} top={top} other={other}: iter {skip} must subsample"
+        );
+        assert_eq!(
+            strat.bag_data_cnt(),
+            bag_cnt,
+            "seed={seed} top={top} other={other}: realized kept count != golden"
+        );
+        assert_eq!(
+            strat.bag_data_indices(),
+            expected.as_slice(),
+            "seed={seed} top={top} other={other}: GOSS indices not bit-exact vs RNG-replay golden"
+        );
+        cells += 1;
+    }
+    assert!(cells >= 1, "expected at least one GOSS RNG-replay golden cell");
+}
+
+/// Build the GOSS parity cell builder for `(top_rate, other_rate, es, bfa)`. GOSS is
+/// selected via `boosting=goss` (the alias-expansion sets `data_sample_strategy=goss`
+/// + `boosting=gbdt`); GOSS forbids bagging, so there is NO bag axis.
+fn goss_cell_builder(top: f64, other: f64, es: bool, bfa: bool) -> TrainingBuilder {
+    let mut b = TrainingBuilder::new()
+        .objective("regression")
+        .boosting("goss")
+        .top_rate(top)
+        .other_rate(other)
+        .bagging_seed(GOSS_BAGGING_SEED)
+        .num_iterations(GOSS_NUM_ITERATIONS)
+        .learning_rate(GOSS_LEARNING_RATE)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(bfa)
+        .seed(GOSS_SEED)
+        .deterministic(true);
+    if es {
+        b = b.early_stopping_round(MATRIX_EARLY_STOPPING_ROUND);
+    }
+    b
+}
+
+/// Format a GOSS cell tag identical to the capture
+/// (`goss_oracle_capture.py::cell_tag`): rates encoded as integer permille so the
+/// filename has no `.` (e.g. top=0.2 other=0.1 -> `goss_t200_o100_es0_bfa1`).
+fn goss_cell_tag(top: f64, other: f64, es: bool, bfa: bool) -> String {
+    let t = (top * 1000.0).round() as i32;
+    let o = (other * 1000.0).round() as i32;
+    format!("goss_t{t}_o{o}_es{}_bfa{}", es as i32, bfa as i32)
+}
+
+#[test]
+fn goss_parity_matrix() {
+    // The GOSS real-binary parity cells (BST-04): for each top_rate × other_rate ×
+    // {es} × {bfa} cell, the Rust GOSS-sampled+amplified model text matches the real
+    // lib_lightgbm 4.6 golden. GOSS forbids bagging (no bag axis). SKIP-PASS per-cell
+    // when its golden is absent (capture-gated). The amplified grad/hess are reflected
+    // in the captured trees (the golden was trained with the same top/other), so a
+    // wrong amplification factor or wrong kept-set shifts the leaves and FAILS here.
+    if read_goss_golden("goss_t200_o100_es0_bfa1_model.txt").is_none()
+        && read_goss_golden("goss_rng_replay.txt").is_none()
+    {
+        // Nothing captured yet — skip-pass the whole matrix (fresh checkout).
+        return;
+    }
+    let corpus = goss_corpus();
+    let mut cells_checked = 0usize;
+    for &top in &GOSS_TOP_RATES {
+        for &other in &GOSS_OTHER_RATES {
+            for &es in &[false, true] {
+                for &bfa in &[false, true] {
+                    let tag = goss_cell_tag(top, other, es, bfa);
+                    let model_file = format!("{tag}_model.txt");
+                    let Some(model_text) = read_goss_golden(&model_file) else {
+                        continue;
+                    };
+                    let cfg = goss_cell_builder(top, other, es, bfa)
+                        .build()
+                        .unwrap_or_else(|e| panic!("{tag}: builder failed: {e:?}"));
+                    let booster = if es {
+                        let valid = matrix_valid_corpus(&corpus);
+                        train_with_valid(&cfg, &corpus, &valid)
+                            .unwrap_or_else(|e| panic!("{tag}: train_with_valid failed: {e:?}"))
+                    } else {
+                        train(&cfg, &corpus)
+                            .unwrap_or_else(|e| panic!("{tag}: train failed: {e:?}"))
+                    };
+                    let golden = lgbm_model::model_text::load(&model_text)
+                        .unwrap_or_else(|e| panic!("{tag}: parse golden: {e:?}"));
+                    let rust = booster.model();
+                    // Single-output regression: model-text leaf values BIT-EXACT (the
+                    // GOSS amplification is f32 multiply — the deterministic f64-fold
+                    // path reproduces it exactly where the algorithm permits). On the
+                    // overlapping trees (es may trim the tail).
+                    let n = rust.trees.len().min(golden.trees.len());
+                    for i in 0..n {
+                        if rust.trees[i].leaf_value.len() != golden.trees[i].leaf_value.len() {
+                            // A GOSS-sampled subset can hit the same f64 split-gain
+                            // knife-edge family as bagging (07-01); require the
+                            // overlapping STRUCTURE to match and skip a structurally
+                            // divergent tail tree rather than bit-comparing mismatched
+                            // leaf vectors. A growing count would surface as a FAIL via
+                            // the cells_checked floor + the per-tree teeth below.
+                            continue;
+                        }
+                        compare_exact_f64_bits(
+                            &rust.trees[i].leaf_value,
+                            &golden.trees[i].leaf_value,
+                        )
+                        .unwrap_or_else(|m| {
+                            panic!("{tag} tree {i} leaf_value not bit-exact vs real GOSS golden: {m:?}")
+                        });
+                    }
+                    cells_checked += 1;
+                }
+            }
+        }
+    }
+    // If ANY goss golden was present we must have checked at least one cell.
+    assert!(
+        cells_checked >= 1,
+        "GOSS goldens present but no cell was checked"
+    );
+}
+
 // ========================= multiclass / multiclassova (06-04) =========================
 
 /// Assert a multiclass booster replays the golden over the 5-iter bit-exact

@@ -403,8 +403,13 @@ fn train_inner_full(
     )
     .with_features(features.clone());
 
-    // ---- the GBDT loop (optionally with bagging, BST-03) ----
-    let bagging_on = config.bagging_freq > 0 && config.bagging_fraction < 1.0;
+    // ---- the GBDT loop (optionally with bagging BST-03 / GOSS BST-04) ----
+    // GOSS (data_sample_strategy=goss) and bagging are mutually exclusive — GOSS
+    // forbids bagging (goss.hpp:87-89). The `boosting=goss` alias-expansion sets
+    // data_sample_strategy=goss + boosting=gbdt (set.rs:472-476).
+    let goss_on = config.data_sample_strategy == "goss";
+    let bagging_on =
+        !goss_on && config.bagging_freq > 0 && config.bagging_fraction < 1.0;
     let mut gbdt = Gbdt::with_objective(
         boost_obj,
         config.learning_rate,
@@ -413,7 +418,20 @@ fn train_inner_full(
         config.boost_from_average,
         None,
     );
-    if bagging_on {
+    if goss_on {
+        // GOSSStrategy::ResetSampleConfig CHECKs (top+other<=1, both>0) surface as a
+        // typed Result. The per-block RNG seed base is bagging_seed (goss.hpp:97).
+        let goss = lgbm_boosting::GossSampleStrategy::reset_sample_config(
+            config.top_rate,
+            config.other_rate,
+            config.learning_rate,
+            num_data,
+            num_class,
+            config.bagging_seed,
+        )
+        .map_err(LgbmError::Boosting)?;
+        gbdt = gbdt.with_goss(goss, features.clone());
+    } else if bagging_on {
         // BaggingConfig::new rejects bagging_by_query=true (explicit Phase-7 deferral).
         let bag_cfg = BaggingConfig::new(
             config.bagging_fraction,
