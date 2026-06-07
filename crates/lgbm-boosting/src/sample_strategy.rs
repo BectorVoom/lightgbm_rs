@@ -128,8 +128,8 @@ impl BaggingSampleStrategy {
         let nd = num_data.max(0);
         // C++ balance_bagging_cond: pos or neg fraction < 1 (with positives present).
         let num_pos = labels.iter().filter(|&&l| l > 0.0).count() as i32;
-        let balanced = (config.pos_bagging_fraction < 1.0 || config.neg_bagging_fraction < 1.0)
-            && num_pos > 0;
+        let balanced =
+            (config.pos_bagging_fraction < 1.0 || config.neg_bagging_fraction < 1.0) && num_pos > 0;
         let bag_data_cnt = if balanced {
             // bag_data_cnt_ = trunc(num_pos * pos_frac) + trunc(num_neg * neg_frac).
             let num_neg = nd - num_pos;
@@ -242,6 +242,15 @@ impl BaggingSampleStrategy {
         self.bag_data_cnt < self.num_data
     }
 
+    /// Whether bagging will actually subset the corpus, derived from the config
+    /// (`bag_data_cnt < num_data`, computed at `reset_sample_config`) — available
+    /// BEFORE the first draw. Identical predicate to [`Self::is_use_subset`] but
+    /// callable pre-draw, used by the GBDT loop to typed-reject `regression_l1 +
+    /// bagging` (06-06 Task 2b) before any tree is grown.
+    pub fn is_bagging_active(&self) -> bool {
+        self.bag_data_cnt < self.num_data
+    }
+
     /// The in-bag row indices (`bag_data_indices_[..bag_data_cnt]`).
     pub fn in_bag(&self) -> &[i32] {
         &self.bag_data_indices[..self.bag_data_cnt.max(0) as usize]
@@ -322,7 +331,11 @@ mod tests {
                 expected.as_slice(),
                 "seed={seed} frac={frac}: bag_data_indices must match RNG-replay golden"
             );
-            assert_eq!(s.bag_data_cnt(), exp_cnt, "seed={seed} frac={frac}: realized in-bag count");
+            assert_eq!(
+                s.bag_data_cnt(),
+                exp_cnt,
+                "seed={seed} frac={frac}: realized in-bag count"
+            );
         }
     }
 
@@ -337,9 +350,16 @@ mod tests {
         let mut s = BaggingSampleStrategy::reset_sample_config(plain_cfg(0.6, 1, 3), 30, &labels);
         s.bagging(0, &labels);
         let in_bag = s.in_bag();
-        assert!(in_bag.windows(2).all(|w| w[0] < w[1]), "in-bag must be ascending: {in_bag:?}");
+        assert!(
+            in_bag.windows(2).all(|w| w[0] < w[1]),
+            "in-bag must be ascending: {in_bag:?}"
+        );
         // The two partitions together are a permutation of 0..30 (every row drawn).
-        let mut all: Vec<i32> = in_bag.iter().chain(s.out_of_bag().iter()).copied().collect();
+        let mut all: Vec<i32> = in_bag
+            .iter()
+            .chain(s.out_of_bag().iter())
+            .copied()
+            .collect();
         all.sort_unstable();
         assert_eq!(all, (0..30).collect::<Vec<_>>());
     }
@@ -362,12 +382,13 @@ mod tests {
         // pos_frac=1.0, neg_frac=0.5: positives ALWAYS in-bag (draw < 1.0 always
         // true for next_float in [0, ~0.99997)), negatives subsampled at 0.5.
         // 10 rows: 4 positive, 6 negative.
-        let labels = vec![
-            1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0,
-        ];
+        let labels = vec![1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0];
         let cfg = BaggingConfig::new(1.0, 1.0, 0.5, 1, 3, false).unwrap();
         let mut s = BaggingSampleStrategy::reset_sample_config(cfg, 10, &labels);
-        assert!(s.balanced, "pos/neg fractions < 1 with positives present => balanced");
+        assert!(
+            s.balanced,
+            "pos/neg fractions < 1 with positives present => balanced"
+        );
         // bag_data_cnt = trunc(4*1.0) + trunc(6*0.5) = 4 + 3 = 7.
         assert_eq!(s.bag_data_cnt(), 7);
         s.bagging(0, &labels);
@@ -375,7 +396,10 @@ mod tests {
         let in_bag: std::collections::BTreeSet<i32> = s.in_bag().iter().copied().collect();
         for (i, &l) in labels.iter().enumerate() {
             if l > 0.0 {
-                assert!(in_bag.contains(&(i as i32)), "positive row {i} must be in-bag");
+                assert!(
+                    in_bag.contains(&(i as i32)),
+                    "positive row {i} must be in-bag"
+                );
             }
         }
     }

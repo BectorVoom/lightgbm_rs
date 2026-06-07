@@ -220,6 +220,29 @@ impl<'a> Gbdt<'a> {
                 actual: labels.len(),
             });
         }
+        // TYPED-REJECT (06-06 Task 2b — decision: typed-reject): regression_l1 +
+        // bagging is DEFERRED past Phase 6. The faithful subset-path median-residual
+        // renewal below IS retained (8330cee) and full-corpus regression_l1 stays
+        // bit-exact, but regression_l1 over a bagged SUBSET diverges from C++ in leaf
+        // STRUCTURE (the L1 sign-gradient split-gain is a knife-edge over the bagged
+        // subset — e.g. rust:0.0 vs cpp:11.0 at regression_l1_bag1_es0_bfa0 tree 0).
+        // No leaf-VALUE renewal can fix a divergent leaf STRUCTURE, so we reject the
+        // combination here — BEFORE any tree is grown — rather than ship wrong-but-
+        // similar leaves. `is_renew_tree_output()` is true ONLY for regression_l1.
+        let l1_bagging = self.objective.is_renew_tree_output()
+            && self
+                .bagging
+                .as_ref()
+                .is_some_and(|bag| bag.is_bagging_active());
+        if l1_bagging {
+            return Err(BoostingError::UnsupportedConfig {
+                what: "regression_l1 + bagging (L1 sign-gradient split-gain \
+                       knife-edge over the bagged subset diverges from the C++ \
+                       leaf structure; deferred past Phase 6)"
+                    .to_string(),
+            });
+        }
+
         // K = num_model_per_iteration (num_class for multiclass/ova, 1 otherwise).
         // The objective is authoritative — it MUST agree with self.num_class for the
         // multiclass variants (set by the facade); the loop trusts the objective.
@@ -284,8 +307,7 @@ impl<'a> Gbdt<'a> {
                 // gbdt.cpp:419-434: on the first iteration push AsConstantTree(init);
                 // subsequent iterations extend with AsConstantTree(0). The init only
                 // entered score_ once (iter 0 BoostFromAverage), never re-added.
-                let is_first_iter =
-                    self.trees.len() < k as usize;
+                let is_first_iter = self.trees.len() < k as usize;
                 let const_val = if is_first_iter { init } else { 0.0 };
                 self.trees.push(Tree::as_constant(const_val, self.num_data));
                 continue;
@@ -310,12 +332,26 @@ impl<'a> Gbdt<'a> {
                     .expect("use_subset implies a bagging strategy");
                 let in_bag: Vec<i32> = bag.in_bag().to_vec();
                 let oob: Vec<i32> = bag.out_of_bag().to_vec();
-                let (mut tree, subset_partition) = learner
-                    .train_on_subset_returning_partition(&in_bag, grad, hess, is_first_tree)?;
+                let (mut tree, subset_partition) = learner.train_on_subset_returning_partition(
+                    &in_bag,
+                    grad,
+                    hess,
+                    is_first_tree,
+                )?;
                 if tree.num_leaves > 1 {
                     // RenewTreeOutput on the SUBSET path (WR-03 fix, mirrors C++
                     // serial_tree_learner.cpp:920-958 + gbdt.cpp:430): no-op for L2
-                    // (IsRenewTreeOutput()==false), ACTIVE for regression_l1. The
+                    // (IsRenewTreeOutput()==false), ACTIVE for regression_l1.
+                    //
+                    // RETAINED-BUT-CURRENTLY-UNEXERCISED (06-06 Task 2b): the ONLY
+                    // renew+bagging combination today is regression_l1 + bagging, which
+                    // is typed-rejected at the top of `train_one_iter` (the L1 bagged-
+                    // subset leaf STRUCTURE diverges from C++; deferred past Phase 6).
+                    // This renewal closure is therefore unreachable for regression_l1 +
+                    // bagging right now, but it is KEPT faithful to C++ for any FUTURE
+                    // renew objective that bags — do NOT delete it. (Not reverting
+                    // 8330cee.)
+                    //
                     // subset partition's `indices_in_leaf` are subset-row indices; map
                     // each through `in_bag[sr]` to the FULL-corpus row (the C++
                     // `bag_mapper[index_mapper[i]]`) and take the median RESIDUAL
@@ -374,8 +410,12 @@ impl<'a> Gbdt<'a> {
                         cur_tree_id,
                         &feature_row,
                     );
-                    self.score_updater
-                        .add_tree_predict_path(&tree, &oob, cur_tree_id, &feature_row);
+                    self.score_updater.add_tree_predict_path(
+                        &tree,
+                        &oob,
+                        cur_tree_id,
+                        &feature_row,
+                    );
                     let init = init_scores[cur_tree_id as usize];
                     if Objective::init_score_is_significant(init) {
                         tree.add_bias(init);
@@ -540,11 +580,11 @@ impl<'a> Gbdt<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lgbm_compute::CpuBackend;
     use lgbm_compute::gain::GainConfig;
     use lgbm_compute::runtime::cpu_client;
-    use lgbm_compute::CpuBackend;
-    use lgbm_treelearner::learner::FeatureColumn;
     use lgbm_dataset::bin_mapper::MissingType;
+    use lgbm_treelearner::learner::FeatureColumn;
 
     /// A tiny 2-feature corpus that produces a real (>1-leaf) split, mirroring the
     /// learner_parity spine shape. 8 rows, 2 binary-ish features.
@@ -609,7 +649,10 @@ mod tests {
         // label mean = (4*1 + 4*5)/8 = 24/8 = 3.0.
         assert!((init - 3.0).abs() < 1e-12);
         for &s in gbdt.scores() {
-            assert!((s - 3.0).abs() < 1e-12, "score_ must hold init before trees");
+            assert!(
+                (s - 3.0).abs() < 1e-12,
+                "score_ must hold init before trees"
+            );
         }
         // No trees yet -> AddBias has not run.
         assert_eq!(gbdt.num_iteration(), 0);
@@ -644,7 +687,12 @@ mod tests {
         // The grad at iter 0 is score-label = 3 - label; the tree fits -grad-ish.
         // The post-iter score for the label-1 rows should be < the label-5 rows.
         let s = &snap.score;
-        assert!(s[0] < s[7], "label-1 row score {} < label-5 row score {}", s[0], s[7]);
+        assert!(
+            s[0] < s[7],
+            "label-1 row score {} < label-5 row score {}",
+            s[0],
+            s[7]
+        );
     }
 
     #[test]
@@ -654,14 +702,7 @@ mod tests {
         let (features, _labels, cfg) = corpus();
         let mut learner =
             SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
-        let mut gbdt = Gbdt::new(
-            Objective::Regression { sqrt: false },
-            0.1,
-            1,
-            8,
-            true,
-            None,
-        );
+        let mut gbdt = Gbdt::new(Objective::Regression { sqrt: false }, 0.1, 1, 8, true, None);
         let bad_labels = vec![1.0f32; 7]; // wrong length
         let err = gbdt
             .train_one_iter(&mut learner, &bad_labels, features.len())
@@ -702,8 +743,10 @@ mod tests {
         // exactly half the delta at lr=1.0.
         let delta_full = s1[0] - 3.0;
         let delta_half = s_half[0] - 3.0;
-        assert!((delta_half - delta_full * 0.5).abs() < 1e-9,
-            "lr=0.5 delta {delta_half} must be half of lr=1.0 delta {delta_full}");
+        assert!(
+            (delta_half - delta_full * 0.5).abs() < 1e-9,
+            "lr=0.5 delta {delta_half} must be half of lr=1.0 delta {delta_full}"
+        );
     }
 
     // ===================== 06-04: multiclass loop =====================
@@ -725,8 +768,8 @@ mod tests {
         let (features, labels, cfg) = multiclass_corpus();
         let num_data = labels.len() as i32;
         let num_class = 3;
-        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 2, 1)
-            .with_features(features.clone());
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
         let obj = MulticlassSoftmax::new(num_class, &labels).unwrap();
         let mut gbdt = Gbdt::with_objective(
             BoostObjective::Multiclass(obj),
@@ -767,7 +810,10 @@ mod tests {
         }
         assert_eq!(inits.len(), 3);
         // class 0 (3/8) and class 1 (3/8) share an init; class 2 (2/8) differs.
-        assert!((inits[0] - inits[1]).abs() < 1e-12, "equal-count classes share init");
+        assert!(
+            (inits[0] - inits[1]).abs() < 1e-12,
+            "equal-count classes share init"
+        );
         assert!((inits[0] - inits[2]).abs() > 1e-9, "class 2 init differs");
         // Each class's score slice holds its own init constant after BoostFromAverage.
         for k in 0..num_class {
@@ -793,8 +839,8 @@ mod tests {
         let (features, labels, cfg) = corpus();
         let num_data = labels.len() as i32;
         // Build identity FeatureColumns for the corpus (offset rule already applied).
-        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 2, 1)
-            .with_features(features.clone());
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
         let bag_cfg = BaggingConfig::new(0.5, 1.0, 1.0, 1, 3, false).unwrap();
         let strat = BaggingSampleStrategy::reset_sample_config(bag_cfg, num_data, &labels);
         assert!(strat.bag_data_cnt() < num_data, "fraction 0.5 must subset");
@@ -813,7 +859,11 @@ mod tests {
         // init = label mean = 3.0. Every row's post-iter score must differ from init
         // (the tree split moved both leaves), proving OOB rows were ALSO scored.
         let init = 3.0f64;
-        let changed = snap.score.iter().filter(|&&s| (s - init).abs() > 1e-9).count();
+        let changed = snap
+            .score
+            .iter()
+            .filter(|&&s| (s - init).abs() > 1e-9)
+            .count();
         assert_eq!(
             changed, num_data as usize,
             "every row (in-bag + OOB) must be scored: {:?}",
@@ -834,8 +884,8 @@ mod tests {
         let labels = vec![0.0f32, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let num_class = 3;
         let num_data = labels.len() as i32;
-        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 2, 1)
-            .with_features(features.clone());
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
         let obj = MulticlassSoftmax::new(num_class, &labels).unwrap();
         // class 2 is absent.
         assert!(!obj.class_need_train(2), "absent class must not train");
@@ -847,9 +897,13 @@ mod tests {
             true,
             None,
         );
-        gbdt.train_one_iter(&mut learner, &labels, features.len()).unwrap();
+        gbdt.train_one_iter(&mut learner, &labels, features.len())
+            .unwrap();
         // Still exactly 3 trees (Pitfall 6); class 2's is a constant 1-leaf tree.
         assert_eq!(gbdt.trees.len(), 3);
-        assert_eq!(gbdt.trees[2].num_leaves, 1, "absent class -> constant 1-leaf tree");
+        assert_eq!(
+            gbdt.trees[2].num_leaves, 1,
+            "absent class -> constant 1-leaf tree"
+        );
     }
 }

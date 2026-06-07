@@ -71,6 +71,25 @@ pub enum BoostingError {
     /// panicking on an empty vector.
     #[error("early_stopping_round > 0 requires at least one validation set")]
     EarlyStoppingWithoutValidSet,
+
+    /// A config combination that is in scope for the C++ reference but DEFERRED in
+    /// this phase is rejected here with an honest, decision-backed typed error
+    /// rather than silently producing wrong-but-similar output.
+    ///
+    /// Phase-6 instance (06-06, Task 2b — typed-reject decision): `regression_l1 +
+    /// bagging`. The faithful subset-path median-residual renewal IS implemented and
+    /// retained (8330cee), and full-corpus `regression_l1` stays bit-exact; but
+    /// `regression_l1` over a bagged SUBSET diverges from C++ in leaf STRUCTURE (the
+    /// L1 sign-gradient split-gain is a knife-edge over the bagged subset — e.g. a
+    /// 2-vs-3-leaf split-count divergence, `rust:0.0` vs `cpp:11.0` at
+    /// `regression_l1_bag1_es0_bfa0` tree 0). No leaf-VALUE renewal can fix a
+    /// divergent leaf STRUCTURE, so the combination is typed-rejected in Phase 6 and
+    /// deferred to a later phase (see ROADMAP / REQUIREMENTS deferral notes).
+    #[error("unsupported config (deferred): {what}")]
+    UnsupportedConfig {
+        /// Human-readable description of the deferred combination.
+        what: String,
+    },
 }
 
 #[cfg(test)]

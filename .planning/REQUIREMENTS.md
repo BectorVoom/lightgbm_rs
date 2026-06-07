@@ -57,6 +57,7 @@
 ### Objective Functions
 
 - [x] **OBJ-01**: Core objectives — `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`
+  - **Deferral (06-06 Task 2b — typed-reject):** `regression_l1 + bagging` is typed-rejected in Phase 6 (`BoostingError::UnsupportedConfig`) and deferred to a later phase. Full-corpus `regression_l1` is bit-exact; but `regression_l1` over a bagged SUBSET diverges from C++ in leaf STRUCTURE (an L1 sign-gradient split-gain knife-edge — `rust:0.0` vs `cpp:11.0` at `regression_l1_bag1_es0_bfa0` tree 0), which no leaf-value renewal can fix. The faithful subset-path renewal is implemented + retained (8330cee) for future renew objectives. See ROADMAP Phase 6 Deferral + `phases/06.../deferred-items.md` (DEF-06-01 tracks the related `binary + bagging + bfa` knife-edge).
 - [x] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
 - [x] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`

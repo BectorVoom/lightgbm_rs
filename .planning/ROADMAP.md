@@ -229,6 +229,19 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Plans**: 6 plans (5 spine-first vertical slices D-14→D-17 + 1 gap-closure)
 
+**Deferral (06-06 Task 2b — decision: typed-reject):** `regression_l1 + bagging` is
+TYPED-REJECTED in Phase 6 (`BoostingError::UnsupportedConfig`) and DEFERRED to a
+later phase. The L1 sign-gradient split-gain is a knife-edge over the bagged subset
+that diverges from the C++ reference in leaf STRUCTURE (e.g. a 2-vs-3-leaf split
+count; `rust:0.0` vs `cpp:11.0` at `regression_l1_bag1_es0_bfa0` tree 0). The
+faithful subset-path median-residual `RenewTreeOutput` IS implemented and retained
+(commit 8330cee) and full-corpus `regression_l1` stays bit-exact, but no leaf-VALUE
+renewal can fix a divergent leaf STRUCTURE — so the combination is rejected with an
+honest typed error rather than shipping wrong-but-similar leaves. A related
+pre-existing `binary + bagging + boost_from_average` per-tree split-count knife-edge
+(`binary_bag1_es0_bfa1`) is logged in `06.../deferred-items.md` (DEF-06-01) for the
+same future fix.
+
 **Wave 1** *(Wave-0 foundation — scaffolds + extensions + failing end-to-end test)*
 
   - [x] 06-01-PLAN.md — Scaffold the 4 new crates (lgbm-objective/metric/boosting/lgbm) + error boundaries; Tree shrinkage/add_bias; learner add_prediction_to_score/renew_tree_output hook; failing boosting_parity scaffold + capture stub
@@ -251,7 +264,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 6** *(gap closure — verification gaps_found 3/5 SC; closes CR-01/WR-01/WR-03/CR-02 + reg_sqrt verification gap)*
 
-  - [ ] 06-06-PLAN.md — Tighten D-07 matrix assertions (no swallowed Results, WR-01); subset-path median-residual renewal for regression_l1+bagging (WR-03); Tree::as_constant(count) + byte-exact constant-tree model-text assertion (CR-01); decouple early-stop eval from metric_freq + metric_freq>1+ES golden (CR-02); real-binary reg_sqrt=1 golden (GAP E)
+  - [x] 06-06-PLAN.md — Tighten D-07 matrix assertions (no swallowed Results, WR-01); subset-path median-residual renewal for regression_l1+bagging (WR-03; retained but regression_l1+bagging TYPED-REJECTED per Task 2b decision — see Deferral above); Tree::as_constant(count) + byte-exact constant-tree model-text assertion (CR-01); decouple early-stop eval from metric_freq + metric_freq>1+ES golden (CR-02); real-binary reg_sqrt=1 golden + .reg_sqrt(bool) setter (GAP E)
 
 ### Phase 7: Parity-Completing Variants
 
