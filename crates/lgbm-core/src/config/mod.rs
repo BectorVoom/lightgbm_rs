@@ -131,6 +131,10 @@ pub struct Config {
     pub max_cat_to_onehot: i32,
     /// `int top_k`. config.h default: 20.
     pub top_k: i32,
+    /// `std::vector<int8_t> monotone_constraints`. config.h default: [] (empty).
+    /// Per-feature `+1` (non-decreasing) / `-1` (non-increasing) / `0` (no
+    /// constraint), length == num_features when non-empty (ADV-01).
+    pub monotone_constraints: Vec<i32>,
     /// `std::string monotone_constraints_method`. config.h default: "basic".
     pub monotone_constraints_method: String,
     /// `double monotone_penalty`. config.h default: 0.0.
@@ -143,6 +147,12 @@ pub struct Config {
     pub cegb_tradeoff: f64,
     /// `double cegb_penalty_split`. config.h default: 0.0.
     pub cegb_penalty_split: f64,
+    /// `std::vector<double> cegb_penalty_feature_lazy`. config.h default: []
+    /// (empty). Per-feature on-demand cost penalty (ADV-05).
+    pub cegb_penalty_feature_lazy: Vec<f64>,
+    /// `std::vector<double> cegb_penalty_feature_coupled`. config.h default: []
+    /// (empty). Per-feature coupled cost penalty (ADV-05).
+    pub cegb_penalty_feature_coupled: Vec<f64>,
     /// `double path_smooth`. config.h default: 0.
     pub path_smooth: f64,
     /// `std::string interaction_constraints`. config.h default: "".
@@ -340,12 +350,15 @@ impl Default for Config {
             cat_smooth: 10.0,
             max_cat_to_onehot: 4,
             top_k: 20,
+            monotone_constraints: Vec::new(),
             monotone_constraints_method: "basic".to_string(),
             monotone_penalty: 0.0,
             forcedsplits_filename: String::new(),
             refit_decay_rate: 0.9,
             cegb_tradeoff: 1.0,
             cegb_penalty_split: 0.0,
+            cegb_penalty_feature_lazy: Vec::new(),
+            cegb_penalty_feature_coupled: Vec::new(),
             path_smooth: 0.0,
             interaction_constraints: String::new(),
             verbosity: 1,

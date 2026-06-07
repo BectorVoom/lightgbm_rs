@@ -224,7 +224,29 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
     get_int(&resolved, "top_k", &mut cfg.top_k)?;
     check_gt("top_k", cfg.top_k, 0)?;
 
+    get_int_vec(&resolved, "monotone_constraints", &mut cfg.monotone_constraints)?;
+    // C++ Config::CheckParamConflict validates each entry is in {-1,0,1}.
+    for &m in &cfg.monotone_constraints {
+        if !(-1..=1).contains(&m) {
+            return Err(ConfigError::OutOfRange {
+                param: "monotone_constraints".to_string(),
+                value: m.to_string(),
+                bound: "-1, 0, or 1".to_string(),
+            });
+        }
+    }
+
     get_string(&resolved, "monotone_constraints_method", &mut cfg.monotone_constraints_method);
+    // C++ accepts {basic, intermediate, advanced}.
+    match cfg.monotone_constraints_method.as_str() {
+        "basic" | "intermediate" | "advanced" => {}
+        other => {
+            return Err(ConfigError::UnknownValue {
+                param: "monotone_constraints_method".to_string(),
+                value: other.to_string(),
+            });
+        }
+    }
 
     get_double(&resolved, "monotone_penalty", &mut cfg.monotone_penalty)?;
     check_ge_f("monotone_penalty", cfg.monotone_penalty, 0.0)?;
@@ -240,6 +262,9 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
 
     get_double(&resolved, "cegb_penalty_split", &mut cfg.cegb_penalty_split)?;
     check_ge_f("cegb_penalty_split", cfg.cegb_penalty_split, 0.0)?;
+
+    get_double_vec(&resolved, "cegb_penalty_feature_lazy", &mut cfg.cegb_penalty_feature_lazy)?;
+    get_double_vec(&resolved, "cegb_penalty_feature_coupled", &mut cfg.cegb_penalty_feature_coupled)?;
 
     get_double(&resolved, "path_smooth", &mut cfg.path_smooth)?;
     check_ge_f("path_smooth", cfg.path_smooth, 0.0)?;

@@ -67,6 +67,58 @@ fn named_invalid_cases_return_typed_errors() {
         Config::from_params(&params(&[("boosting", "nonsense")])),
         Err(ConfigError::UnknownValue { .. })
     ));
+    // ADV-01: monotone_constraints entry outside {-1,0,1} → OutOfRange.
+    assert!(matches!(
+        Config::from_params(&params(&[("monotone_constraints", "1,2,0")])),
+        Err(ConfigError::OutOfRange { .. })
+    ));
+    // ADV-01: monotone_constraints_method nonsense → UnknownValue.
+    assert!(matches!(
+        Config::from_params(&params(&[("monotone_constraints_method", "nonsense")])),
+        Err(ConfigError::UnknownValue { .. })
+    ));
+    // ADV-05: cegb_tradeoff negative → OutOfRange.
+    assert!(matches!(
+        Config::from_params(&params(&[("cegb_tradeoff", "-1")])),
+        Err(ConfigError::OutOfRange { .. })
+    ));
+}
+
+#[test]
+fn adv_constraint_params_parse_with_aliases() {
+    // ADV-01 monotone_constraints vector + alias `mc`.
+    let c = Config::from_params(&params(&[("mc", "1,-1,0")])).unwrap();
+    assert_eq!(c.monotone_constraints, vec![1, -1, 0]);
+    // method enum + penalty.
+    let c = Config::from_params(&params(&[
+        ("monotone_constraints_method", "intermediate"),
+        ("monotone_penalty", "5.0"),
+    ]))
+    .unwrap();
+    assert_eq!(c.monotone_constraints_method, "intermediate");
+    assert_eq!(c.monotone_penalty, 5.0);
+    // ADV-02 interaction_constraints (stored as the raw string spec).
+    let c = Config::from_params(&params(&[("interaction_constraints", "[0,1],[2]")])).unwrap();
+    assert_eq!(c.interaction_constraints, "[0,1],[2]");
+    // ADV-03 forced_splits_filename alias `fs` resolves to forcedsplits_filename.
+    let c = Config::from_params(&params(&[("forced_splits", "fs.json")])).unwrap();
+    assert_eq!(c.forcedsplits_filename, "fs.json");
+    // ADV-04 extra_trees + extra_seed.
+    let c = Config::from_params(&params(&[("extra_trees", "true"), ("extra_seed", "9")])).unwrap();
+    assert!(c.extra_trees);
+    assert_eq!(c.extra_seed, 9);
+    // ADV-05 cegb params incl. feature-penalty vectors.
+    let c = Config::from_params(&params(&[
+        ("cegb_tradeoff", "0.5"),
+        ("cegb_penalty_split", "0.1"),
+        ("cegb_penalty_feature_coupled", "1.0,2.0"),
+        ("cegb_penalty_feature_lazy", "0.5,0.5"),
+    ]))
+    .unwrap();
+    assert_eq!(c.cegb_tradeoff, 0.5);
+    assert_eq!(c.cegb_penalty_split, 0.1);
+    assert_eq!(c.cegb_penalty_feature_coupled, vec![1.0, 2.0]);
+    assert_eq!(c.cegb_penalty_feature_lazy, vec![0.5, 0.5]);
 }
 
 #[test]

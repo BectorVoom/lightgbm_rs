@@ -98,6 +98,29 @@ pub fn get_split_gains(
         + get_leaf_gain(use_l1, sum_right_gradients, sum_right_hessians, l1, l2)
 }
 
+/// `GetLeafGainGivenOutput<USE_L1>` (feature_histogram.hpp:817-829): the leaf
+/// gain for a leaf whose output is FIXED (already monotone-clamped) rather than
+/// the unconstrained `-g/(h+l2)`. Used by the monotone (`USE_MC`) split-gain path
+/// where `left_output`/`right_output` are clamped to the leaf `[min,max]`
+/// constraint before the gain is computed. A plain host `fn` (the monotone gate
+/// runs on the deterministic CPU anchor only — not a `#[cube]` kernel).
+#[must_use]
+pub fn get_leaf_gain_given_output(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    output: f64,
+) -> f64 {
+    if use_l1 {
+        let sg_l1 = threshold_l1(sum_gradients, l1);
+        -(2.0 * sg_l1 * output + (sum_hessians + l2) * output * output)
+    } else {
+        -(2.0 * sum_gradients * output + (sum_hessians + l2) * output * output)
+    }
+}
+
 /// `CalculateSplittedLeafOutput<USE_L1, false, false>`
 /// (feature_histogram.hpp:716-738, the `!USE_MAX_OUTPUT && !USE_SMOOTHING`
 /// path):

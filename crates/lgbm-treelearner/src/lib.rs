@@ -23,25 +23,31 @@
 //! Plan 03 against these contracts.
 
 pub mod col_sampler;
+pub mod cost_effective_gradient_boosting;
 pub mod data_partition;
 pub mod error;
 pub mod feature_histogram_categorical;
 pub mod fix_histogram;
+pub mod forced_splits;
 pub mod histogram_pool;
 pub mod leaf_splits;
 pub mod learner;
+pub mod monotone_constraints;
 pub mod split_info;
 
 pub use col_sampler::ColSampler;
+pub use cost_effective_gradient_boosting::CegbModel;
 pub use data_partition::DataPartition;
 pub use error::TreeLearnerError;
 pub use feature_histogram_categorical::{
     construct_bitset, find_best_threshold_categorical, CategoricalSplit,
 };
 pub use fix_histogram::fix_histogram;
+pub use forced_splits::{parse_forced_splits, ForcedSplitError, ForcedSplitNode};
 pub use histogram_pool::HistogramPool;
 pub use leaf_splits::LeafSplits;
 pub use learner::{BuildStrategy, FeatureColumn, SerialTreeLearner};
+pub use monotone_constraints::{BasicConstraint, MonotoneConstraints};
 pub use split_info::{split_gt, SplitInfo};
 
 /// THE single authoritative threshold-offset rule (`meta_->offset`), shared by
