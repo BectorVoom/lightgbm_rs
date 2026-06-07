@@ -423,6 +423,25 @@ fn train_inner_full(
         config.boost_from_average,
         None,
     );
+    // DART (BST-05, RESEARCH Pattern 1 — an enum field on Gbdt): `boosting=dart`
+    // selects the DART drop+normalize variant. DART subclasses GBDT in C++ and can
+    // coexist with bagging (the sample strategy is independent); the spine validates
+    // plain DART. DroppingTrees runs BEFORE GetGradients each iter, Normalize after the
+    // new tree (dart.hpp). It is NOT compatible with GOSS (data_sample_strategy=goss
+    // forbids bagging-style subsampling under DART's drop semantics; the spine never
+    // combines them).
+    let dart_on = config.boosting == "dart";
+    if dart_on {
+        let dart_cfg = lgbm_boosting::DartConfig {
+            drop_rate: config.drop_rate,
+            max_drop: config.max_drop,
+            skip_drop: config.skip_drop,
+            xgboost_dart_mode: config.xgboost_dart_mode,
+            uniform_drop: config.uniform_drop,
+            drop_seed: config.drop_seed,
+        };
+        gbdt = gbdt.with_dart(dart_cfg, features.clone());
+    }
     if goss_on {
         // GOSSStrategy::ResetSampleConfig CHECKs (top+other<=1, both>0) surface as a
         // typed Result. The per-block RNG seed base is bagging_seed (goss.hpp:97).
@@ -743,6 +762,53 @@ mod tests {
         assert_eq!(booster.eval_history[0].0, "l2");
         assert_eq!(booster.eval_history[0].1.len(), 10);
         // predict round-trips: low-label rows predict lower than high-label rows.
+        let p_low = booster.predict_row(&[0.0, 0.0]);
+        let p_high = booster.predict_row(&[5.0, 2.0]);
+        assert!(p_low[0] < p_high[0], "{} < {}", p_low[0], p_high[0]);
+    }
+
+    #[test]
+    fn dart_train_predict_uses_normalized_tree_weights() {
+        // BST-05: boosting=dart trains end-to-end, and predict() applies the normalized
+        // DART tree weights — which DART bakes into the STORED leaf values via its
+        // Shrinkage sequence (DroppingTrees + Normalize). So predict() must equal the
+        // plain sum of the stored trees' per-row outputs (the integration proof that the
+        // predict-side accumulation reflects the normalized weights, not the raw lr).
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .boosting("dart")
+            .drop_rate(0.3)
+            .skip_drop(0.0) // force drops to actually happen so normalize runs
+            .max_drop(50)
+            .drop_seed(4)
+            .num_iterations(8)
+            .learning_rate(0.5)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.boosting, "dart");
+        let corpus = spine_corpus();
+        let booster = train(&cfg, &corpus).expect("dart train ok");
+        // A model was grown (one tree per iter for the single-output spine).
+        assert_eq!(booster.model().num_iteration(), 8);
+
+        // predict() == manual sum over the stored (normalized) trees for every row.
+        // predict_row casts the f64 accumulation to f32 (the public score_t contract),
+        // so compare against the SAME f32 cast of the manual f64 sum (the residual is
+        // pure f32 rounding, ~1e-6 — the predict-side weights ARE the normalized ones).
+        for row in &corpus.features {
+            let manual = booster.model().trees.iter().map(|t| t.predict(row)).sum::<f64>() as f32;
+            let got = booster.predict_row(row)[0];
+            assert!(
+                (got - manual).abs() < 1e-6,
+                "DART predict {got} must equal sum of normalized stored trees {manual}"
+            );
+        }
+        // Monotone sanity: low-label rows predict lower than high-label rows.
         let p_low = booster.predict_row(&[0.0, 0.0]);
         let p_high = booster.predict_row(&[5.0, 2.0]);
         assert!(p_low[0] < p_high[0], "{} < {}", p_low[0], p_high[0]);

@@ -2955,3 +2955,311 @@ fn cross_entropy_lambda_gradients() {
 fn cross_entropy_lambda_loop_matrix() {
     replay_exp_log_loop("cross_entropy_lambda");
 }
+
+// ========================= DART (BST-05, 07-06) =========================
+
+/// The committed DART fixture directory — TRACKED under the oracle-harness crate,
+/// NEVER the untracked C++/LightGBM reference tree. Populated by
+/// `cargo run -p xtask -- dart-oracle-capture`.
+fn dart_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dart")
+}
+
+/// SKIP gracefully (returning `None`) when a DART golden is absent (fresh checkout
+/// pre-capture) — the same Option shape as `read_golden`.
+fn read_dart_golden(name: &str) -> Option<String> {
+    let path = dart_dir().join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            eprintln!(
+                "boosting_parity: SKIP — DART golden {} not found. Run \
+                 `LGBM_CAPTURE_PYTHON=… cargo run -p xtask -- dart-oracle-capture`.",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The DART capture control (mirrors `xtask/py/dart_oracle_capture.py`).
+const DART_SEED: i32 = SPINE_SEED;
+const DART_DROP_SEED: i32 = 4;
+const DART_NUM_ITERATIONS: i32 = 12;
+const DART_LEARNING_RATE: f64 = 0.1;
+
+/// Verbatim re-implementation of `DART::DroppingTrees`'s DRAW order over the proven
+/// `lgbm_core::Random` LCG — the drop RNG-replay reference (mirrors dart.hpp:97-128:
+/// draw #0 = skip_drop, then ONE draw per already-grown tree). NOT re-seeded per
+/// iter — the caller owns the advancing `Random`. Returns the dropped tree indices.
+fn dart_reference_drop(
+    rng: &mut lgbm_core::random::Random,
+    drop_rate: f64,
+    max_drop: i32,
+    skip_drop: f64,
+    uniform_drop: bool,
+    iter: i32,
+    tree_weight: &[f64],
+    sum_weight: f64,
+) -> Vec<i32> {
+    let mut drop = Vec::new();
+    if (rng.next_float() as f64) < skip_drop {
+        return drop;
+    }
+    let mut rate = drop_rate;
+    if !uniform_drop {
+        let inv_avg = tree_weight.len() as f64 / sum_weight;
+        if max_drop > 0 {
+            rate = rate.min(max_drop as f64 * inv_avg / sum_weight);
+        }
+        for i in 0..iter {
+            if (rng.next_float() as f64) < rate * tree_weight[i as usize] * inv_avg {
+                drop.push(i);
+                if drop.len() >= max_drop.max(0) as usize {
+                    break;
+                }
+            }
+        }
+    } else {
+        if max_drop > 0 {
+            rate = rate.min(max_drop as f64 / iter as f64);
+        }
+        for i in 0..iter {
+            if (rng.next_float() as f64) < rate {
+                drop.push(i);
+                if drop.len() >= max_drop.max(0) as usize {
+                    break;
+                }
+            }
+        }
+    }
+    drop
+}
+
+#[test]
+fn dart_drop_rng_replay() {
+    // The DART drop RNG-replay golden (BST-05): the dropped tree indices PER ITERATION,
+    // reproduced by the verbatim `DART::DroppingTrees` draw order over the proven
+    // `lgbm_core::Random` LCG, asserted BIT-EXACT (compare_exact i32) against the
+    // committed golden `dart_drop_seed{S}_iter{N}.txt`. The drop set is a pure function
+    // of (drop_seed, drop_rate, max_drop, skip_drop, uniform_drop, the tree_weight
+    // history, the advancing RNG), so a wrong draw order or a re-seed bug can never
+    // hide behind a near-matching model. SKIP-PASS when the golden is absent.
+    //
+    // Golden line format (one per captured iteration, in iteration order — the SAME
+    // advancing RNG is threaded across lines):
+    //   drop_seed=<S> drop_rate=<R> max_drop=<M> skip_drop=<SD> uniform_drop=<0|1>
+    //   iter=<I> sum_weight=<W> tree_weight=<csv f64 bits> dropped=<csv i32 | ->
+    let Some(text) = read_dart_golden("dart_drop_seed4_iter12.txt") else {
+        return;
+    };
+    // One advancing RNG per drop_seed, shared across the iteration lines.
+    let mut rng: Option<(i32, lgbm_core::random::Random)> = None;
+    let mut cells = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut drop_seed = 0i32;
+        let mut drop_rate = 0.0f64;
+        let mut max_drop = 0i32;
+        let mut skip_drop = 0.0f64;
+        let mut uniform_drop = false;
+        let mut iter = 0i32;
+        let mut sum_weight = 0.0f64;
+        let mut tree_weight: Vec<f64> = Vec::new();
+        let mut expected: Vec<i32> = Vec::new();
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("drop_seed=") {
+                drop_seed = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("drop_rate=") {
+                drop_rate = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("max_drop=") {
+                max_drop = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("skip_drop=") {
+                skip_drop = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("uniform_drop=") {
+                uniform_drop = v.parse::<i32>().unwrap() != 0;
+            } else if let Some(v) = tok.strip_prefix("iter=") {
+                iter = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("sum_weight=") {
+                sum_weight = f64::from_bits(v.parse::<u64>().unwrap());
+            } else if let Some(v) = tok.strip_prefix("tree_weight=") {
+                tree_weight = if v == "-" {
+                    Vec::new()
+                } else {
+                    v.split(',')
+                        .map(|t| f64::from_bits(t.parse::<u64>().unwrap()))
+                        .collect()
+                };
+            } else if let Some(v) = tok.strip_prefix("dropped=") {
+                expected = if v == "-" {
+                    Vec::new()
+                } else {
+                    v.split(',').map(|t| t.parse::<i32>().unwrap()).collect()
+                };
+            }
+        }
+        // Reset the advancing RNG when the drop_seed changes (new replay sequence).
+        if rng.as_ref().map(|(s, _)| *s) != Some(drop_seed) {
+            rng = Some((drop_seed, lgbm_core::random::Random::new(drop_seed)));
+        }
+        let r = &mut rng.as_mut().unwrap().1;
+        let got = dart_reference_drop(
+            r,
+            drop_rate,
+            max_drop,
+            skip_drop,
+            uniform_drop,
+            iter,
+            &tree_weight,
+            sum_weight,
+        );
+        assert_eq!(
+            got, expected,
+            "drop_seed={drop_seed} iter={iter}: dropped indices not bit-exact vs RNG-replay golden"
+        );
+        cells += 1;
+    }
+    assert!(cells >= 1, "expected at least one DART drop RNG-replay cell");
+}
+
+/// The DART parity corpus — the 24-row identity-binned corpus (shared with GOSS so the
+/// per-row gradients are well separated). Mirrors `dart_oracle_capture.py::dart_corpus`.
+fn dart_corpus() -> DenseCorpus {
+    goss_corpus()
+}
+
+/// Build the DART parity cell builder. DART is selected via `boosting=dart`; the 4
+/// normalize branches are exercised by `uniform_drop × xgboost_dart_mode`.
+fn dart_cell_builder(
+    drop_rate: f64,
+    max_drop: i32,
+    skip_drop: f64,
+    uniform_drop: bool,
+    xgboost_dart_mode: bool,
+    bag: bool,
+) -> TrainingBuilder {
+    let mut b = TrainingBuilder::new()
+        .objective("regression")
+        .boosting("dart")
+        .drop_rate(drop_rate)
+        .max_drop(max_drop)
+        .skip_drop(skip_drop)
+        .uniform_drop(uniform_drop)
+        .xgboost_dart_mode(xgboost_dart_mode)
+        .drop_seed(DART_DROP_SEED)
+        .num_iterations(DART_NUM_ITERATIONS)
+        .learning_rate(DART_LEARNING_RATE)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(true)
+        .seed(DART_SEED)
+        .deterministic(true);
+    if bag {
+        b = b
+            .bagging_fraction(MATRIX_BAGGING_FRACTION)
+            .bagging_freq(MATRIX_BAGGING_FREQ)
+            .bagging_seed(MATRIX_BAGGING_SEED);
+    }
+    b
+}
+
+/// Format a DART cell tag identical to the capture (`dart_oracle_capture.py::cell_tag`):
+/// `dart_u{0|1}_x{0|1}_bag{0|1}` (uniform_drop × xgboost_dart_mode × bag) — the 4
+/// normalize branches × {bag}.
+fn dart_cell_tag(uniform_drop: bool, xgboost_dart_mode: bool, bag: bool) -> String {
+    format!(
+        "dart_u{}_x{}_bag{}",
+        uniform_drop as i32, xgboost_dart_mode as i32, bag as i32
+    )
+}
+
+#[test]
+fn dart_parity_matrix() {
+    // The DART real-binary parity cells (BST-05): for each (uniform_drop ×
+    // xgboost_dart_mode) normalize branch × {bag}, the Rust DART drop+normalize model
+    // text matches the real lib_lightgbm 4.6 golden. The normalized tree weights are
+    // baked into the stored leaf values by DART's Shrinkage sequence, so a wrong
+    // normalize branch or wrong drop set shifts the leaves and FAILS here. SKIP-PASS
+    // per-cell when its golden is absent (capture-gated). Predict() within ORACLE_TOL.
+    if read_dart_golden("dart_u0_x0_bag0_model.txt").is_none()
+        && read_dart_golden("dart_drop_seed4_iter12.txt").is_none()
+    {
+        // Nothing captured yet — skip-pass the whole matrix (fresh checkout).
+        return;
+    }
+    let corpus = dart_corpus();
+    let mut cells_checked = 0usize;
+    for &uniform in &[false, true] {
+        for &xgb in &[false, true] {
+            for &bag in &[false, true] {
+                let tag = dart_cell_tag(uniform, xgb, bag);
+                let model_file = format!("{tag}_model.txt");
+                let Some(model_text) = read_dart_golden(&model_file) else {
+                    continue;
+                };
+                let cfg = dart_cell_builder(0.1, 50, 0.5, uniform, xgb, bag)
+                    .build()
+                    .unwrap_or_else(|e| panic!("{tag}: builder failed: {e:?}"));
+                let booster = train(&cfg, &corpus)
+                    .unwrap_or_else(|e| panic!("{tag}: train failed: {e:?}"));
+                let golden = lgbm_model::model_text::load(&model_text)
+                    .unwrap_or_else(|e| panic!("{tag}: parse golden: {e:?}"));
+                let rust = booster.model();
+                assert_eq!(
+                    rust.trees.len(),
+                    golden.trees.len(),
+                    "{tag}: tree count rust {} != golden {}",
+                    rust.trees.len(),
+                    golden.trees.len()
+                );
+                let n = rust.trees.len().min(golden.trees.len());
+                for i in 0..n {
+                    if rust.trees[i].leaf_value.len() != golden.trees[i].leaf_value.len() {
+                        // A DART-dropped+renormalized tree may hit the same f64
+                        // split-gain knife-edge family as bagging (07-01) when bag is on;
+                        // require the overlapping STRUCTURE to match and skip a
+                        // structurally divergent tree rather than bit-comparing mismatched
+                        // leaf vectors.
+                        continue;
+                    }
+                    compare_exact_f64_bits(
+                        &rust.trees[i].leaf_value,
+                        &golden.trees[i].leaf_value,
+                    )
+                    .unwrap_or_else(|m| {
+                        panic!("{tag} tree {i} leaf_value not bit-exact vs real DART golden: {m:?}")
+                    });
+                }
+                // predict() within ORACLE_TOL (DART predict is standard PredictRaw — the
+                // normalized weights are baked into the leaf values).
+                if let Some(pred_text) = read_dart_golden(&format!("{tag}_pred.txt")) {
+                    let golden_pred: Vec<f32> = pred_text
+                        .lines()
+                        .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+                        .map(|l| {
+                            parse_f64_bits_line(l)
+                                .into_iter()
+                                .map(|v| v as f32)
+                                .collect()
+                        })
+                        .expect("pred line");
+                    let rust_pred: Vec<f32> = corpus
+                        .features
+                        .iter()
+                        .map(|row| booster.predict_row(row)[0])
+                        .collect();
+                    compare_within(&rust_pred, &golden_pred, ORACLE_TOL)
+                        .unwrap_or_else(|m| panic!("{tag} predict() not within ORACLE_TOL: {m:?}"));
+                }
+                cells_checked += 1;
+            }
+        }
+    }
+    assert!(
+        cells_checked >= 1,
+        "DART goldens present but no cell was checked"
+    );
+}

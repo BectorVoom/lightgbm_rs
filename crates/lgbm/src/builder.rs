@@ -244,6 +244,54 @@ impl TrainingBuilder {
         self.boosting("goss").top_rate(top_rate).other_rate(other_rate)
     }
 
+    /// `drop_rate` (DART — the per-tree drop probability scale; config.h default 0.1,
+    /// CHECK `[0,1]`; BST-05). Routes into `lgbm-core::Config.drop_rate` via
+    /// `Config::from_params` (set.rs:187-189).
+    pub fn drop_rate(mut self, v: f64) -> Self {
+        self.params.insert("drop_rate".into(), v.to_string());
+        self
+    }
+
+    /// `max_drop` (DART — the cap on dropped trees per iteration; config.h default 50;
+    /// `<= 0` disables the cap; BST-05). Routes into `lgbm-core::Config.max_drop`
+    /// (set.rs:191).
+    pub fn max_drop(mut self, n: i32) -> Self {
+        self.params.insert("max_drop".into(), n.to_string());
+        self
+    }
+
+    /// `skip_drop` (DART — the probability of skipping all drops this iteration;
+    /// config.h default 0.5, CHECK `[0,1]`; BST-05). Routes into
+    /// `lgbm-core::Config.skip_drop` (set.rs:193-195).
+    pub fn skip_drop(mut self, v: f64) -> Self {
+        self.params.insert("skip_drop".into(), v.to_string());
+        self
+    }
+
+    /// `uniform_drop` (DART — drop each tree with a uniform `drop_rate` instead of a
+    /// weight-scaled probability, and disable `tree_weight_` bookkeeping; config.h
+    /// default false; BST-05). Routes into `lgbm-core::Config.uniform_drop`
+    /// (set.rs:198).
+    pub fn uniform_drop(mut self, on: bool) -> Self {
+        self.params.insert("uniform_drop".into(), on.to_string());
+        self
+    }
+
+    /// `xgboost_dart_mode` (DART — select the xgboost normalize branch; config.h
+    /// default false; BST-05). Routes into `lgbm-core::Config.xgboost_dart_mode`
+    /// (set.rs:197).
+    pub fn xgboost_dart_mode(mut self, on: bool) -> Self {
+        self.params.insert("xgboost_dart_mode".into(), on.to_string());
+        self
+    }
+
+    /// `drop_seed` (DART — the seed for the single advancing drop RNG; config.h
+    /// default 4; BST-05). Routes into `lgbm-core::Config.drop_seed` (set.rs:199).
+    pub fn drop_seed(mut self, seed: i32) -> Self {
+        self.params.insert("drop_seed".into(), seed.to_string());
+        self
+    }
+
     /// `early_stopping_round` (stop after this many non-improving rounds; `0`
     /// disables early stopping; BST-07).
     pub fn early_stopping_round(mut self, n: i32) -> Self {
@@ -333,6 +381,32 @@ mod tests {
         assert_eq!(cfg.data_sample_strategy, "goss");
         assert!((cfg.top_rate - 0.2).abs() < 1e-12);
         assert!((cfg.other_rate - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dart_setters_route_into_config() {
+        // BST-05: drop_rate/max_drop/skip_drop/uniform_drop/xgboost_dart_mode/drop_seed
+        // + boosting=dart must round-trip into Config.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .boosting("dart")
+            .drop_rate(0.3)
+            .max_drop(2)
+            .skip_drop(0.25)
+            .uniform_drop(true)
+            .xgboost_dart_mode(true)
+            .drop_seed(17)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.boosting, "dart", "boosting=dart must round-trip");
+        assert!((cfg.drop_rate - 0.3).abs() < 1e-12);
+        assert_eq!(cfg.max_drop, 2);
+        assert!((cfg.skip_drop - 0.25).abs() < 1e-12);
+        assert!(cfg.uniform_drop);
+        assert!(cfg.xgboost_dart_mode);
+        assert_eq!(cfg.drop_seed, 17);
     }
 
     #[test]

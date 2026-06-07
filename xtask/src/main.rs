@@ -136,6 +136,22 @@ pub const GOSS_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
 /// goss.hpp:97). Pinned so the RNG-replay golden is reproducible.
 pub const GOSS_BAGGING_SEED: i32 = 3;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W5 DART
+/// (BST-05) oracle (plan 07-06). Reuses the SAME prebuilt-wheel binary;
+/// `dart-oracle-capture` asserts the installed version matches BEFORE training so a
+/// wrong version can never silently emit divergent DART goldens (threat T-07-06-SC).
+pub const DART_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W5 DART oracle (plan 07-06). The SAME
+/// seed the boosting matrix uses ([`BOOSTING_ORACLE_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the DART goldens
+/// byte-idempotent. Recorded in REFERENCE_MANIFEST.md.
+pub const DART_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
+
+/// The single advancing drop-RNG seed for DART (C++ `config_->drop_seed`,
+/// config.h:463, dart.hpp:45). Pinned so the drop RNG-replay golden is reproducible.
+pub const DART_DROP_SEED: i32 = 4;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -148,12 +164,13 @@ fn main() -> Result<()> {
         Some("boosting-oracle-capture") => boosting_oracle_capture(),
         Some("subset-determinism-capture") => subset_determinism_capture(),
         Some("goss-oracle-capture") => goss_oracle_capture(),
+        Some("dart-oracle-capture") => dart_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
-                 subset-determinism-capture | goss-oracle-capture)"
+                 subset-determinism-capture | goss-oracle-capture | dart-oracle-capture)"
             );
         }
         None => {
@@ -161,7 +178,7 @@ fn main() -> Result<()> {
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
-                 subset-determinism-capture | goss-oracle-capture>"
+                 subset-determinism-capture | goss-oracle-capture | dart-oracle-capture>"
             );
             Ok(())
         }
@@ -1192,6 +1209,83 @@ fn goss_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- goss-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/goss/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `dart-oracle-capture` — Phase-7 W5 DART (BST-05) golden capture (plan 07-06).
+///
+/// Shells out to `xtask/py/dart_oracle_capture.py` (the real prebuilt `lib_lightgbm`
+/// 4.6 wheel) to dump (1) the DART model-parity cells over `uniform_drop ×
+/// xgboost_dart_mode × {bag}` (the 4 normalize branches × bagging) + per-row preds and
+/// (2) the drop RNG-replay golden (`dart_drop_seed4_iter12.txt` — the dropped tree
+/// indices per iteration over the bit-exact C++ LCG). Asserts the installed lightgbm
+/// version BEFORE training (threat T-07-06-SC). Goldens land under the TRACKED
+/// oracle-harness fixtures dir — NEVER `LightGBM/`.
+fn dart_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/dart_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Goldens live under the TRACKED oracle-harness crate dir — NEVER LightGBM/.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/dart");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask dart-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        DART_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = DART_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask dart-oracle-capture: training the DART uniform_drop×xgboost_dart_mode×{{bag}} \
+         cells on real lib_lightgbm and dumping the model + drop RNG-replay goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(DART_ORACLE_SEED.to_string())
+            .arg(DART_DROP_SEED.to_string())
+            .arg(DART_ORACLE_LIGHTGBM_VERSION),
+        "dart_oracle_capture.py",
+    )?;
+
+    // The drop RNG-replay golden is always written; at least the canonical cell model.
+    for name in ["dart_drop_seed4_iter12.txt", "dart_u0_x0_bag0_model.txt"] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask dart-oracle-capture: done. Wrote DART goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- dart-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/dart/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())
