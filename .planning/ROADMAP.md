@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists) (completed 2026-06-05)
 - [x] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [x] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity *(9/9 plans; 05-09 closed the final mfb>0 leaf-0 2-ULP BIT-EXACT via a real lib_lightgbm 4.6 FP execution trace — the serial learner is bit-exact to the real binary on BOTH committed corpora)*
-- [ ] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API *(5/5 plans executed; verification gaps_found 3/5 SC — see 06-VERIFICATION.md: CR-01 constant-tree leaf_count model-text divergence, WR-01/WR-03 swallowed matrix assertions + empty l1+bagging renew, CR-02 metric_freq-gated early stop. Run `/gsd-plan-phase 6 --gaps`.)*
+- [x] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API *(6/6 plans executed; gap-closure 06-06 closed all five verification gaps A–E: CR-01 constant-tree leaf_count model-text now byte-exact, WR-01 every matrix cell asserts (no swallowed Results), CR-02 early-stop decoupled from metric_freq, GAP E reg_sqrt builder setter + golden, WR-03 subset renewal landed. Task 2b decision: regression_l1 + bagging TYPED-REJECTED (BoostingError::UnsupportedConfig) and deferred — L1 sign-gradient split-gain knife-edge over the bagged subset diverges from the C++ leaf STRUCTURE (rust:0.0 vs cpp:11.0); the related binary+bagging+bfa knife-edge is tracked as DEF-06-01. cargo test --workspace GREEN.)* (completed 2026-06-07)
 - [ ] **Phase 7: Parity-Completing Variants** - GOSS/DART/RF, categorical/EFB splits, remaining objectives/metrics, ranking, SHAP, monotone, refit, importance
 - [ ] **Phase 8: Python Bindings** - PyO3 + numpy bindings mirroring the official `lightgbm` Booster/Dataset/sklearn API
 
@@ -310,6 +310,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
-| 6. GBDT Spine + Core Objectives/Metrics | 5/5 | Complete (D-07 matrix vs real lib_lightgbm 4.6; regression L2 bit-exact all axes) | 2026-06-07 |
+| 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete   | 2026-06-07 |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |
