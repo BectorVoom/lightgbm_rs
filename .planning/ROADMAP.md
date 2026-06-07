@@ -280,7 +280,21 @@ same future fix.
   4. SHAP/feature contributions (`predict_contrib` over full node/cover structure) and prediction early stopping (`pred_early_stop`/`_freq`/`_margin`) produce C++-matching outputs.
   5. Monotone constraints (basic/intermediate/advanced + `monotone_penalty`), interaction constraints, forced splits/bins, extra trees, CEGB, refit/continue training (`Booster.refit()`), and feature importance reporting each reproduce the C++ behavior.
 
-**Plans**: TBD
+**Plans**: 12 plans (one phase, dependency-ordered sequential waves per D-01; Wave 0 = the D-05 bagged-subset determinism diagnostic, authored first; one end-of-phase verification gate)
+
+Plans:
+- [ ] 07-01-PLAN.md — Wave 0 (D-05): bagged-subset split-gain determinism diagnostic + branch decision (un-defer regression_l1+bagging or bounded-cap)
+- [ ] 07-02-PLAN.md — Objectives breadth A (OBJ-04): huber/fair/quantile/mape
+- [ ] 07-03-PLAN.md — Objectives breadth B (OBJ-04/05): poisson/gamma/tweedie + cross_entropy/cross_entropy_lambda
+- [ ] 07-04-PLAN.md — Extended metrics (MET-03): regression/xentropy/multiclass metrics
+- [ ] 07-05-PLAN.md — GOSS (BST-04): sample strategy + amplification + RNG-replay
+- [ ] 07-06-PLAN.md — DART (BST-05): drop+normalize (4 branches) + drop RNG-replay
+- [ ] 07-07-PLAN.md — Random Forest (BST-06): averaged trees + mandatory bagging
+- [ ] 07-08-PLAN.md — Categorical splits (TRL-06, D-06/D-07): additive learner re-open + numeric-spine no-regression gate
+- [ ] 07-09-PLAN.md — Ranking stack (OBJ-06/MET-04/bagging_by_query): lambdarank/rank_xendcg + ndcg/map + DCGCalculator + query bagging
+- [ ] 07-10-PLAN.md — Prediction modes (PRD-04/05): TreeSHAP predict_contrib + pred early stop
+- [ ] 07-11-PLAN.md — Advanced learner constraints (ADV-01..05): monotone/interaction/forced/extra-trees/CEGB
+- [ ] 07-12-PLAN.md — Advanced model ops (ADV-06/07): refit/continue + feature importance
 
 ### Phase 8: Python Bindings
 
@@ -311,5 +325,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 0/TBD | Not started | - |
+| 7. Parity-Completing Variants | 0/12 | Planned | - |
 | 8. Python Bindings | 0/TBD | Not started | - |
