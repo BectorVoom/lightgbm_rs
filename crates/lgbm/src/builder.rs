@@ -254,6 +254,95 @@ impl TrainingBuilder {
         self
     }
 
+    /// `monotone_constraints` (ADV-01) — per-feature `+1`/`-1`/`0` constraint
+    /// vector (config.h `[]`; comma-separated, each in `{-1,0,1}`).
+    pub fn monotone_constraints(mut self, constraints: &[i32]) -> Self {
+        let csv = constraints
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.params.insert("monotone_constraints".into(), csv);
+        self
+    }
+
+    /// `monotone_constraints_method` (ADV-01) — `basic`/`intermediate`/`advanced`
+    /// (config.h default `basic`).
+    pub fn monotone_constraints_method(mut self, method: &str) -> Self {
+        self.params
+            .insert("monotone_constraints_method".into(), method.to_string());
+        self
+    }
+
+    /// `monotone_penalty` (ADV-01) — the monotone-split gain penalty (config.h
+    /// default 0.0, `>= 0`).
+    pub fn monotone_penalty(mut self, v: f64) -> Self {
+        self.params.insert("monotone_penalty".into(), v.to_string());
+        self
+    }
+
+    /// `interaction_constraints` (ADV-02) — the allowed co-occurring-feature
+    /// groups spec (config.h default `""`, e.g. `"[0,1],[2]"`).
+    pub fn interaction_constraints(mut self, spec: &str) -> Self {
+        self.params
+            .insert("interaction_constraints".into(), spec.to_string());
+        self
+    }
+
+    /// `forced_splits_filename` (ADV-03) — the forced-splits JSON file
+    /// (config.h default `""`; aliases `fs`/`forced_splits`).
+    pub fn forced_splits_filename(mut self, path: &str) -> Self {
+        self.params
+            .insert("forcedsplits_filename".into(), path.to_string());
+        self
+    }
+
+    /// `extra_trees` (ADV-04) — randomized-threshold split selection
+    /// (config.h default false).
+    pub fn extra_trees(mut self, on: bool) -> Self {
+        self.params.insert("extra_trees".into(), on.to_string());
+        self
+    }
+
+    /// `extra_seed` (ADV-04) — the extra-trees per-feature RNG seed
+    /// (config.h default 6).
+    pub fn extra_seed(mut self, seed: i32) -> Self {
+        self.params.insert("extra_seed".into(), seed.to_string());
+        self
+    }
+
+    /// `cegb_tradeoff` (ADV-05) — the CEGB cost/gain tradeoff (config.h default
+    /// 1.0, `>= 0`).
+    pub fn cegb_tradeoff(mut self, v: f64) -> Self {
+        self.params.insert("cegb_tradeoff".into(), v.to_string());
+        self
+    }
+
+    /// `cegb_penalty_split` (ADV-05) — the per-split cost (config.h default 0.0,
+    /// `>= 0`).
+    pub fn cegb_penalty_split(mut self, v: f64) -> Self {
+        self.params
+            .insert("cegb_penalty_split".into(), v.to_string());
+        self
+    }
+
+    /// `cegb_penalty_feature_lazy` (ADV-05) — per-feature on-demand cost vector
+    /// (config.h default `[]`).
+    pub fn cegb_penalty_feature_lazy(mut self, v: &[f64]) -> Self {
+        let csv = v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+        self.params.insert("cegb_penalty_feature_lazy".into(), csv);
+        self
+    }
+
+    /// `cegb_penalty_feature_coupled` (ADV-05) — per-feature coupled cost vector
+    /// (config.h default `[]`).
+    pub fn cegb_penalty_feature_coupled(mut self, v: &[f64]) -> Self {
+        let csv = v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+        self.params
+            .insert("cegb_penalty_feature_coupled".into(), csv);
+        self
+    }
+
     /// `bagging_fraction` (row subsampling rate, `(0, 1]`; BST-03). Paired with
     /// [`bagging_freq`](Self::bagging_freq) and [`bagging_seed`](Self::bagging_seed).
     pub fn bagging_fraction(mut self, v: f64) -> Self {
@@ -760,6 +849,39 @@ mod tests {
             .build()
             .unwrap();
         assert!(cfg.bagging_by_query, "bagging_by_query=true must round-trip");
+    }
+
+    #[test]
+    fn adv_constraint_setters_route_into_config() {
+        // W10 ADV-01..05 builder setters all round-trip into Config.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .monotone_constraints(&[1, -1, 0])
+            .monotone_constraints_method("intermediate")
+            .monotone_penalty(5.0)
+            .interaction_constraints("[0,1],[2]")
+            .forced_splits_filename("forced.json")
+            .extra_trees(true)
+            .extra_seed(9)
+            .cegb_tradeoff(0.5)
+            .cegb_penalty_split(0.1)
+            .cegb_penalty_feature_coupled(&[1.0, 2.0, 3.0])
+            .cegb_penalty_feature_lazy(&[0.5, 0.5, 0.5])
+            .build()
+            .unwrap();
+        assert_eq!(cfg.monotone_constraints, vec![1, -1, 0]);
+        assert_eq!(cfg.monotone_constraints_method, "intermediate");
+        assert_eq!(cfg.monotone_penalty, 5.0);
+        assert_eq!(cfg.interaction_constraints, "[0,1],[2]");
+        assert_eq!(cfg.forcedsplits_filename, "forced.json");
+        assert!(cfg.extra_trees);
+        assert_eq!(cfg.extra_seed, 9);
+        assert_eq!(cfg.cegb_tradeoff, 0.5);
+        assert_eq!(cfg.cegb_penalty_split, 0.1);
+        assert_eq!(cfg.cegb_penalty_feature_coupled, vec![1.0, 2.0, 3.0]);
+        assert_eq!(cfg.cegb_penalty_feature_lazy, vec![0.5, 0.5, 0.5]);
     }
 
     #[test]

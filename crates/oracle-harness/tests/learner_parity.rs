@@ -1568,3 +1568,347 @@ fn learner_parity_categorical_no_regression_numeric_spine() {
         assert_real_tree_parity("no_regression:mfb_pos_real", &tree, &golden, 0.1);
     }
 }
+
+// ===========================================================================
+// W10 ADVANCED-CONSTRAINTS REPLAY (plan 07-11, ADV-01..05): per-axis cells that
+// grow the Rust constrained tree and assert it bit-exact against the real
+// lib_lightgbm 4.6 golden under `tests/fixtures/constraints/`. Each cell
+// SKIP-passes when its golden is absent (the wheel-gated capture, Task 4).
+//
+// The sidecar pins the per-feature bins + bin_upper_bound + per-row grad + the
+// constraint axis the Rust learner must consume, so the comparison can ONLY
+// falsify the constraint GATE, never the (Phase-2) numeric binning.
+// ===========================================================================
+
+fn constraints_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/constraints")
+}
+
+/// One feature's pinned bin layout from the constraints sidecar.
+struct ConFeature {
+    bins: Vec<u32>,
+    bin_upper_bound: Vec<f64>,
+    num_bin: u32,
+    most_freq_bin: u32,
+}
+
+/// The constraints sidecar: per-feature bin layout + per-row grad + the
+/// constraint axis (parsed from the C++-emitted nested JSON via a focused hand
+/// parser — no serde dep in the harness).
+struct ConSidecar {
+    features: Vec<ConFeature>,
+    grad: Vec<f32>,
+    num_leaves: i32,
+    shrinkage: f64,
+    // The constraint axis (only the fields a given cell needs are populated).
+    monotone_constraints: Vec<i32>,
+    monotone_constraints_method: String,
+    monotone_penalty: f64,
+    interaction_constraints: Vec<Vec<i32>>,
+    extra_trees: bool,
+    extra_seed: i32,
+    cegb_tradeoff: f64,
+    cegb_penalty_split: f64,
+    cegb_penalty_feature_coupled: Vec<f64>,
+}
+
+/// Parse a flat `"key": value` scalar (number) from a JSON slice.
+fn json_scalar(text: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{key}\"");
+    let i = text.find(&pat)?;
+    let after = &text[i + pat.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let end = rest
+        .find([',', '\n', '}', ']'])
+        .unwrap_or(rest.len());
+    rest[..end].trim().parse::<f64>().ok()
+}
+
+/// Parse a flat number array `"key": [..]` from the FIRST occurrence after `from`.
+fn json_num_array_at(text: &str, from: usize) -> (Vec<f64>, usize) {
+    let lb = text[from..].find('[').map(|x| from + x).unwrap();
+    let rb = text[lb..].find(']').map(|x| lb + x).unwrap();
+    let v = text[lb + 1..rb]
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<f64>().expect("array element not a number"))
+        .collect();
+    (v, rb)
+}
+
+/// Load + parse the constraints sidecar; `None` (SKIP) when absent.
+fn load_con_sidecar(name: &str) -> Option<ConSidecar> {
+    let path = constraints_dir().join(format!("{name}.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "learner_parity: SKIP — constraints sidecar {} not found. Run \
+             `LGBM_CAPTURE_PYTHON=<py-with-lightgbm-4.6> cargo run -p xtask -- \
+             constraints-oracle-capture` and commit the goldens.",
+            path.display()
+        );
+        return None;
+    };
+    // Parse the `features` array: each object has bins/bin_upper_bound/num_bin/
+    // most_freq_bin. We scan sequentially for the per-feature arrays.
+    let mut features = Vec::new();
+    let feats_start = text.find("\"features\"").expect("sidecar missing features");
+    let mut cursor = feats_start;
+    // Each feature object contains "bins" then "bin_upper_bound".
+    while let Some(bins_rel) = text[cursor..].find("\"bins\"") {
+        let bins_at = cursor + bins_rel;
+        // Stop if we've passed into the top-level grad array (after features).
+        if text.find("\"grad\"").is_some_and(|grad_at| bins_at > grad_at) {
+            break;
+        }
+        let (bins_f, after_bins) = json_num_array_at(&text, bins_at);
+        let bub_at = text[after_bins..]
+            .find("\"bin_upper_bound\"")
+            .map(|x| after_bins + x)
+            .expect("feature missing bin_upper_bound");
+        let (bub, after_bub) = json_num_array_at(&text, bub_at);
+        // num_bin / most_freq_bin scalars within this feature object.
+        let nb = json_scalar(&text[bins_at..], "num_bin").expect("feature num_bin") as u32;
+        let mfb = json_scalar(&text[bins_at..], "most_freq_bin").expect("feature most_freq_bin") as u32;
+        features.push(ConFeature {
+            bins: bins_f.into_iter().map(|x| x as u32).collect(),
+            bin_upper_bound: bub,
+            num_bin: nb,
+            most_freq_bin: mfb,
+        });
+        cursor = after_bub;
+    }
+    // grad (top-level, after features).
+    let grad_at = text.find("\"grad\"").expect("sidecar missing grad");
+    let (grad, _) = json_num_array_at(&text, grad_at);
+
+    // axis fields (best-effort; absent => default/empty).
+    let axis_at = text.find("\"axis\"").unwrap_or(0);
+    let axis = &text[axis_at..];
+    let monotone_constraints = if axis.contains("monotone_constraints\"") {
+        let mc_at = axis.find("\"monotone_constraints\"").unwrap();
+        json_num_array_at(axis, mc_at).0.into_iter().map(|x| x as i32).collect()
+    } else {
+        Vec::new()
+    };
+    let method = if let Some(i) = axis.find("\"monotone_constraints_method\"") {
+        let after = &axis[i..];
+        let q1 = after[after.find(':').unwrap()..].find('"').unwrap() + after.find(':').unwrap();
+        let s = &after[q1 + 1..];
+        let q2 = s.find('"').unwrap();
+        s[..q2].to_string()
+    } else {
+        "basic".to_string()
+    };
+    let interaction_constraints = parse_interaction_groups(axis);
+    Some(ConSidecar {
+        features,
+        grad: grad.into_iter().map(|x| x as f32).collect(),
+        num_leaves: json_scalar(&text, "num_leaves").unwrap_or(4.0) as i32,
+        shrinkage: json_scalar(&text, "shrinkage").unwrap_or(0.1),
+        monotone_constraints,
+        monotone_constraints_method: method,
+        monotone_penalty: json_scalar(axis, "monotone_penalty").unwrap_or(0.0),
+        interaction_constraints,
+        extra_trees: axis.contains("\"extra_trees\": true") || axis.contains("\"extra_trees\":true"),
+        extra_seed: json_scalar(axis, "extra_seed").unwrap_or(6.0) as i32,
+        cegb_tradeoff: json_scalar(axis, "cegb_tradeoff").unwrap_or(1.0),
+        cegb_penalty_split: json_scalar(axis, "cegb_penalty_split").unwrap_or(0.0),
+        cegb_penalty_feature_coupled: if axis.contains("cegb_penalty_feature_coupled") {
+            let at = axis.find("\"cegb_penalty_feature_coupled\"").unwrap();
+            json_num_array_at(axis, at).0
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// Parse `interaction_constraints` as nested groups `[[0],[1]]` from the axis JSON.
+fn parse_interaction_groups(axis: &str) -> Vec<Vec<i32>> {
+    let Some(i) = axis.find("\"interaction_constraints\"") else {
+        return Vec::new();
+    };
+    let after = &axis[i..];
+    let Some(open) = after.find('[') else {
+        return Vec::new();
+    };
+    // Find the matching close of the OUTER bracket.
+    let bytes = after.as_bytes();
+    let mut depth = 0i32;
+    let mut end = open;
+    for (k, &b) in bytes.iter().enumerate().skip(open) {
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth -= 1;
+            if depth == 0 {
+                end = k;
+                break;
+            }
+        }
+    }
+    let inner = &after[open + 1..end];
+    let mut groups = Vec::new();
+    let mut gstart = None;
+    for (k, c) in inner.char_indices() {
+        match c {
+            '[' => gstart = Some(k + 1),
+            ']' => {
+                if let Some(s) = gstart.take() {
+                    let g: Vec<i32> = inner[s..k]
+                        .split(',')
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.parse::<f64>().expect("group elem") as i32)
+                        .collect();
+                    groups.push(g);
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+/// Build the constraint corpus (feature columns + cfg) from a sidecar.
+fn con_corpus(s: &ConSidecar) -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32) {
+    let hess = vec![1.0f32; s.grad.len()];
+    let features = s
+        .features
+        .iter()
+        .enumerate()
+        .map(|(fi, f)| FeatureColumn {
+            bins: f.bins.clone(),
+            num_bin: f.num_bin,
+            offset: lgbm_treelearner::offset_for_most_freq_bin(f.most_freq_bin),
+            min_bin: 0,
+            max_bin: f.num_bin - 1,
+            default_bin: f.num_bin,
+            most_freq_bin: f.most_freq_bin,
+            missing_type: MissingType::None,
+            bin_upper_bound: f.bin_upper_bound.clone(),
+            real_feature_index: fi as i32,
+            ..Default::default()
+        })
+        .collect();
+    let mut cfg = GainConfig::default();
+    cfg.min_data_in_leaf = 1;
+    cfg.min_sum_hessian_in_leaf = 1e-3;
+    cfg.lambda_l2 = 0.0;
+    (features, s.grad.clone(), hess, cfg, s.num_leaves)
+}
+
+/// Drive one constraints cell: grow the Rust constrained tree, assert bit-exact
+/// against the real golden. SKIP-passes when the golden/sidecar is absent.
+fn run_constraints_cell(name: &str) {
+    let Some(sidecar) = load_con_sidecar(name) else {
+        return;
+    };
+    let Some(golden) = load_real_tree(&constraints_dir().join(format!("{name}.txt"))) else {
+        return;
+    };
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, nl) = con_corpus(&sidecar);
+
+    // Forced splits: parse the per-cell forced JSON if present.
+    let forced = std::fs::read_to_string(constraints_dir().join(format!("{name}.forced.json")))
+        .ok()
+        .and_then(|src| {
+            lgbm_treelearner::parse_forced_splits(&src, features.len() as i32)
+                .expect("forced JSON parses")
+        });
+
+    let constraints = lgbm_treelearner::learner::LearnerConstraints {
+        monotone_constraints: sidecar.monotone_constraints.clone(),
+        monotone_penalty: sidecar.monotone_penalty,
+        interaction_constraints: sidecar.interaction_constraints.clone(),
+        extra_trees: sidecar.extra_trees,
+        extra_seed: sidecar.extra_seed,
+        cegb_tradeoff: sidecar.cegb_tradeoff,
+        cegb_penalty_split: sidecar.cegb_penalty_split,
+        cegb_penalty_feature_coupled: sidecar.cegb_penalty_feature_coupled.clone(),
+        cegb_penalty_feature_lazy: Vec::new(),
+        forced_splits: forced,
+    };
+    let _ = &sidecar.monotone_constraints_method; // method axis recorded; basic ported
+
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, nl, -1)
+        .with_features(features)
+        .with_constraints(constraints);
+    let tree = learner.train(&g, &h, true).expect("constraints train ok");
+    assert_real_tree_parity(name, &tree, &golden, sidecar.shrinkage);
+}
+
+#[test]
+fn learner_parity_monotone_basic() {
+    run_constraints_cell("mono_basic_p0");
+}
+
+#[test]
+fn learner_parity_monotone_basic_penalty() {
+    run_constraints_cell("mono_basic_p5");
+}
+
+#[test]
+fn learner_parity_monotone_intermediate() {
+    run_constraints_cell("mono_intermediate_p0");
+}
+
+#[test]
+fn learner_parity_monotone_advanced() {
+    run_constraints_cell("mono_advanced_p0");
+}
+
+#[test]
+fn learner_parity_monotone_mixed() {
+    run_constraints_cell("mono_mixed");
+}
+
+#[test]
+fn learner_parity_interaction_one_group() {
+    run_constraints_cell("interaction_one");
+}
+
+#[test]
+fn learner_parity_interaction_two_groups() {
+    run_constraints_cell("interaction_two");
+}
+
+#[test]
+fn learner_parity_forced_single() {
+    run_constraints_cell("forced_single");
+}
+
+#[test]
+fn learner_parity_forced_nested() {
+    run_constraints_cell("forced_nested");
+}
+
+/// ADV-04 extra-trees RNG-replay: the SAME extra_seed must reproduce the real
+/// binary's randomized-threshold tree bit-exact (the RNG-replay candidate).
+#[test]
+fn learner_parity_extra_trees_seed6() {
+    run_constraints_cell("extra_trees_seed6");
+}
+
+#[test]
+fn learner_parity_extra_trees_seed9() {
+    run_constraints_cell("extra_trees_seed9");
+}
+
+#[test]
+fn learner_parity_cegb_tradeoff() {
+    run_constraints_cell("cegb_t1_psplit");
+}
+
+#[test]
+fn learner_parity_cegb_tradeoff_half() {
+    run_constraints_cell("cegb_t0.5_psplit");
+}
+
+#[test]
+fn learner_parity_cegb_coupled() {
+    run_constraints_cell("cegb_coupled");
+}
