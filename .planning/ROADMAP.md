@@ -346,7 +346,7 @@ Plans:
 **Plans**: 8 plans (dependency-ordered sequential waves; MVP vertical slices over the validated Rust facade)Plans:
 **Wave 1**
 
-- [ ] 08-01-PLAN.md — Rust facade slice: D-02 raw→bin→train bridge + new Booster methods (batch predict / feature_importance / refit / model text I/O), oracle-tested
+- [x] 08-01-PLAN.md — Rust facade slice: D-02 raw→bin→train bridge + new Booster methods (batch predict / feature_importance / refit / model text I/O) + custom-metric (feval) eval-history hook, oracle-tested (3/3 tasks; 41 lgbm + 2 oracle tests green)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 

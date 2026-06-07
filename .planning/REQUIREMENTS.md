@@ -211,10 +211,10 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | ADV-05 | Phase 7 | Complete |
 | ADV-06 | Phase 7 | Complete |
 | ADV-07 | Phase 7 | Complete |
-| PYB-01 | Phase 8 | Pending |
+| PYB-01 | Phase 8 | In Progress (08-01: Rust facade enabling slice — raw→bin→train + Booster methods; Python binding pending 08-02+) |
 | PYB-02 | Phase 8 | Pending |
 | PYB-03 | Phase 8 | Pending |
-| PYB-04 | Phase 8 | Pending |
+| PYB-04 | Phase 8 | In Progress (08-01: custom-metric feval eval-history hook + refit facade method; Python callbacks pending 08-06) |
 
 **Coverage:**
 

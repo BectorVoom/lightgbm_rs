@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 8 context gathered
-last_updated: "2026-06-07T12:54:45.021Z"
-last_activity: 2026-06-07 -- Phase 08 planning complete
+stopped_at: Completed 08-01-PLAN.md
+last_updated: "2026-06-07T21:10:00.000Z"
+last_activity: 2026-06-07 -- Completed 08-01 (D-02 raw→bin→train + Booster methods + feval hook)
 progress:
   total_phases: 8
-  completed_phases: 7
-  total_plans: 45
-  completed_plans: 45
-  percent: 88
+  completed_phases: 6
+  total_plans: 54
+  completed_plans: 46
+  percent: 76
 ---
 
 # Project State
@@ -21,14 +21,27 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 07 — parity-completing-variants
+**Current focus:** Phase 08 — python-bindings
 
 ## Current Position
 
-Phase: 8
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-06-07 -- Phase 08 planning complete
+Phase: 08 (python-bindings) — EXECUTING
+Plan: 2 of 8
+Status: Executing Phase 08 (08-01 complete)
+Last activity: 2026-06-07 -- Completed 08-01 (D-02 raw→bin→train + Booster methods + feval hook)
+
+### Plan 08-01 result (PYB-01 facade gap + PYB-04 enabling — COMPLETE)
+
+Plan 08-01 closed the Rust-side enabling slice for Phase 8 — the D-02 raw→bin→train wiring + the missing Booster delegation methods + the custom-metric (feval) eval-history hook that 08-06's Python feval marshalling consumes.
+
+- **D-02 raw→bin→train bridge:** `RawCorpus` + `build_feature_columns_from_raw` (Route A: per-column `BinMapper::find_bin_from_column`/`find_bin_categorical` + `value_to_bin`, mirroring the identity `FeatureColumn` shape, reusing `offset_for_most_freq_bin`) + `train_raw`. The identity path (`build_feature_columns`) is preserved byte-for-byte; `train_inner_full` was refactored into a shared column-based driver (`train_inner_columns_full`). Validated bit-exact to the identity path on the trivial case (`raw_bin_train_matches_identity_bin`, `compare_exact_f64_bits` + one-ULP teeth).
+- **Booster facade methods:** `predict` (batch), `predict_raw_batch`, `feature_importance_split`, `feature_importance_gain`, `refit`, `model_to_string`, `save_model`, `model_from_string` — all thin delegations to `GbdtModel`/`model_text`. Model-text round-trip predicts bit-exact; garbage text → `LgbmError::Model`.
+- **custom-metric (feval) hook (PYB-04 upstream half):** `EvalMetric::Custom(Box<dyn Fn(&[f64],&[f32]) -> (String,f64,bool)>)` feeds the EXISTING eval-history loop with ZERO loop changes; `train_custom_with_metric(.., Option<feval>)` (chosen route — the plan's preferred one), `train_custom` delegates with `None`. Proven: custom feval bit-matches the built-in `Metric::L2` value-for-value; non-finite feval → `LgbmError::CustomMetric`.
+- **Deviations:** Rule-3 (tests pin `min_data_in_bin=1` so each distinct integer gets its own bin — the identity-binning precondition); Rule-2 (facade-owned `LgbmError::Io` + `LgbmError::CustomMetric` for the new boundaries).
+- **DEF-08-OOS-01 (pre-existing, OUT OF SCOPE):** `goss_parity_matrix` fails at tree 11 (deep f64 split-gain knife-edge, DEF-07-02 class). Verified PRE-EXISTING by reverting the three edited files to `c13d380` and reproducing the identical failure; originates in prior-session learner.rs/boosting_parity.rs commits, not 08-01. Logged to phase-08 `deferred-items.md`.
+- **gate:** `cargo test -p lgbm` 41/41; `cargo test -p oracle-harness --test raw_bin_train_parity` 2/2; clippy clean on edited code; `LightGBM/` never git-added. Commits: 7a2fa3a (T1), 896b4bc (T2), c2c5e47 (T3).
+
+Next: `/gsd-execute-phase 8 --wave 2` runs 08-02 (the PyO3 extension crate scaffold — pyo3/maturin/rust-numpy, the package-legitimacy gate applies there).
 
 ### Plan 07-07 result (BST-06 — Random Forest BoostingVariant::Rf, COMPLETE)
 
