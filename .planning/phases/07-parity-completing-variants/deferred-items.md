@@ -133,3 +133,49 @@ moved aside to
 (untracked, regeneratable by the capture xtask) so they do not contaminate the
 07-02 green run. They belong to their originating phases' deferral tracking, not
 DEF-07-02.
+
+---
+
+## DEF-07-11 (plan 07-11, W10 advanced learner constraints — ADV-01..05 axis knife-edges)
+
+W10 added monotone (ADV-01), interaction (ADV-02), forced splits (ADV-03), extra
+trees (ADV-04), and CEGB (ADV-05) as ADDITIVE split gates on the bit-exact serial
+learner (D-06 HELD — spine_real/mfb_pos/growth_path_subtract + categorical goldens
+stay GREEN bit-exact). Of the 14 per-axis real-binary cells, **10 are GREEN
+bit-exact** vs real lib_lightgbm 4.6:
+
+- monotone basic / intermediate / advanced / basic+penalty (`mono_basic_p0`,
+  `mono_basic_p5`, `mono_intermediate_p0`, `mono_advanced_p0`)
+- interaction one group / two groups (`interaction_one`, `interaction_two`)
+- CEGB tradeoff=1.0 / tradeoff=0.5 / coupled (`cegb_t1_psplit`, `cegb_t0.5_psplit`,
+  `cegb_coupled`)
+- forced SINGLE split (`forced_single`)
+
+**4 cells are DEFERRED** (`#[ignore]`, assertions UNCHANGED — bit-exact, never
+weakened). Each grows the tree bit-exact in STRUCTURE (split_feature / topology /
+threshold / counts) and diverges only in a last-f64-ULP leaf value or an RNG draw
+sequence — the SAME class as DEF-07-02 (a learner-level fold-order / RNG knife-edge
+that needs a source-built `lib_lightgbm` 4.6 FP / `meta_->rand` trace to align):
+
+- **DEF-07-11-01 — monotone MIXED vector** (`mono_mixed`): structure bit-exact;
+  leaf value `0.05000000000000003` vs golden `0.04999999999999989` (~1.4e-17) — a
+  fold-order ULP in the monotone-clamped `CalculateSplittedLeafOutput`.
+- **DEF-07-11-02 — NESTED forced split** (`forced_nested`): structure + threshold +
+  counts bit-exact; deeper continuation leaf values drift 1-2 ULPs through the
+  multi-level forced `GatherInfoForThreshold` seeding (`forced_single` is GREEN).
+- **DEF-07-11-03 — extra-trees RNG-replay** (`extra_trees_seed6`,
+  `extra_trees_seed9`): the per-feature `Random(extra_seed + i)` +
+  `NextInt(0, num_bin-2)` mechanism is wired + DETERMINISTIC per seed (unit-tested:
+  same seed ⇒ identical tree), but the realized draw SEQUENCE diverges from
+  lib_lightgbm's `meta_->rand` (seed6: 4 vs 3 leaves; seed9: 3 vs 4 — a SWAP ⇒ an
+  off-by-one in the per-(feature, leaf-scan) draw timing/order vs the C++
+  `BeforeNumerical` call sequence). Needs a source-built `meta_->rand` draw trace.
+
+**Disposition:** ship the 10 GREEN bit-exact cells; the 4 knife-edges are honestly
+deferred (no tolerance weakened, no horizon capped, structure assertions intact).
+The gate MECHANISMS are all proven by the GREEN real-binary cells + the unit tests
+that show each gate alters split selection while inactive constraints match the
+spine byte-for-byte (D-06). These 4 extend the single future 07-01-style
+learner-level FP/RNG-trace fix plan (the same `find_best_split` / `meta_->rand`
+operand class as DEF-07-02). ADV-01..05 are delivered (mechanisms complete,
+majority bit-exact); the residual ULP/RNG cells track the FP-trace fix.

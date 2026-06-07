@@ -722,6 +722,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 &mut left_leaf,
                 &mut right_leaf,
             )?;
+            // After forced splits the pool slots hold only the forced FEATURE's
+            // histogram (forced growth builds per forced feature, not the full
+            // concatenated parent). Reset the pool map so the continuation loop's
+            // first `find_best_splits` builds both children DIRECTLY (no stale
+            // subtraction-trick parent) — the C++ ForceSplits re-runs FindBestSplits
+            // (full ConstructHistograms) per forced node, so the continuation never
+            // subtracts against a partial parent.
+            pool.reset_map();
+            // The continuation must scan BOTH forced children fresh: signal "root-
+            // like" so find_best_splits builds left_leaf directly and right_leaf
+            // directly too. We re-seed by treating the last forced split's children
+            // as a fresh pair (left_leaf/right_leaf already set).
         }
 
         // ---- the leaf-wise loop (serial_tree_learner.cpp:218-236) ----
@@ -1474,8 +1486,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             let rand_threshold: Option<i32> = if self.constraints.extra_trees {
                 let mut rng = self.extra_rng.borrow_mut();
                 rng.as_mut().map(|v| {
+                    // C++ `meta_->rand.NextInt(0, meta_->num_bin - 2)`
+                    // (feature_histogram.hpp:204). `Random::next_int(lo, hi)` is the
+                    // half-open `[lo, hi)` mirror of the C++ `% (hi-lo) + lo`, so the
+                    // upper bound is `num_bin - 2` (NOT `num_bin - 1`).
                     if f.num_bin as i32 - 2 > 0 {
-                        v[fpos].next_int(0, f.num_bin as i32 - 1)
+                        v[fpos].next_int(0, f.num_bin as i32 - 2)
                     } else {
                         0
                     }
@@ -1807,7 +1823,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         use lgbm_compute::gain::{calculate_splitted_leaf_output, get_leaf_gain, get_split_gains};
         let cfg = &self.cfg;
         let eps = f64::from(lgbm_core::types::K_EPSILON);
-        let sum_hessian = sum_h_raw + 2.0 * eps;
+        // C++ `GatherInfoForThresholdNumerical` (feature_histogram.hpp:486) uses the
+        // leaf's RAW `sum_hessian` directly — it does NOT apply the `+2*kEpsilon`
+        // bump that `FindBestThreshold` adds at its call site (feature_histogram.hpp
+        // :172). Bumping here shifted the forced leaf-output denominator by ~1 ULP.
+        let sum_hessian = sum_h_raw;
         let use_l1 = cfg.use_l1();
         let l1 = cfg.lambda_l1;
         let l2 = cfg.lambda_l2;
@@ -2537,16 +2557,25 @@ fn bin_threshold(f: &FeatureColumn, thr: f64) -> u32 {
     if f.bin_upper_bound.is_empty() {
         return (thr as i64).clamp(0, max_bin as i64) as u32;
     }
-    // Largest bin index whose upper bound is strictly below thr.
-    let mut best = 0u32;
-    for (b, &ub) in f.bin_upper_bound.iter().enumerate() {
-        if ub < thr {
-            best = b as u32;
-        } else {
+    // C++ `BinMapper::ValueToBin`: a split for real threshold `thr` is placed at the
+    // bin `b` that CONTAINS `thr` — the FIRST bin whose real upper bound is
+    // `>= thr` (predict routes `value <= bin_upper_bound[b]` LEFT, so bins `0..=b`
+    // route left). Note bin 0's recorded `bin_upper_bound` may be the model-text
+    // ZERO SENTINEL (~1e-35) when `most_freq_bin == 0` (offset==1) — the
+    // threshold-ENCODING artifact, NOT bin 0's real boundary (the midpoint). We
+    // carry the previous real (monotone) boundary forward to neutralize the
+    // sentinel so the `>= thr` scan is monotone.
+    let mut prev = f64::NEG_INFINITY;
+    let mut chosen = max_bin;
+    for (b, &ub_raw) in f.bin_upper_bound.iter().enumerate() {
+        let ub = if ub_raw < prev { prev } else { ub_raw };
+        if ub >= thr {
+            chosen = b as u32;
             break;
         }
+        prev = ub;
     }
-    best.min(max_bin)
+    chosen.min(max_bin)
 }
 
 /// Convert a `ColSampler::get_by_node` mask (indexed by REAL feature index) into

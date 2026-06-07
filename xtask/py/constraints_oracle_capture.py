@@ -30,12 +30,26 @@ Usage:
 """
 
 import json
+import math
 import os
+import struct
 import sys
 
 import numpy as np
 
 import lightgbm as lgb
+
+
+def next_up(x):
+    """The next f64 after x toward +inf (LightGBM `GetDoubleUpperBound` nudges the
+    bin midpoint up by one ULP)."""
+    bits = struct.unpack("<Q", struct.pack("<d", x))[0]
+    return struct.unpack("<d", struct.pack("<Q", bits + 1))[0]
+
+
+# LightGBM bin-0 zero sentinel when most_freq_bin == 0 (offset==1): the threshold
+# stored for a split at bin 0 is `(float)1e-35` widened to f64.
+ZERO_SENTINEL = float(np.float64(np.float32(1e-35)))
 
 
 def dataset_params():
@@ -85,18 +99,25 @@ def feature_sidecar(X, booster):
         rank = {v: i for i, v in enumerate(distinct)}
         bins = [rank[float(v)] for v in col]
         num_bin = len(distinct)
-        # bin_upper_bound: midpoints (lib_lightgbm convention). For the gate the
-        # Rust side reads bin_upper_bound only to record the tree threshold; the
-        # split bin is what matters. Use midpoints between consecutive distinct
-        # values, last bin = +inf-ish (use last value + 0.5 for finiteness).
-        ub = []
-        for i in range(num_bin):
-            if i + 1 < num_bin:
-                ub.append((distinct[i] + distinct[i + 1]) / 2.0)
-            else:
-                ub.append(distinct[i] + 0.5)
         counts = np.bincount(np.asarray(bins, dtype=np.int64), minlength=num_bin)
         most_freq_bin = int(np.argmax(counts))
+        # bin_upper_bound matching LightGBM `GetDoubleUpperBound` EXACTLY: the
+        # midpoint to the next bin nudged up one ULP. When most_freq_bin == 0 the
+        # offset==1 path stores the zero-sentinel for bin 0 (the Rust learner reads
+        # bin_upper_bound[threshold]). For the corpus's consecutive integer values
+        # the midpoint is `b + 0.5`.
+        ub = []
+        for i in range(num_bin):
+            if i == 0 and most_freq_bin == 0:
+                ub.append(ZERO_SENTINEL)
+            elif i + 1 < num_bin:
+                ub.append(next_up((distinct[i] + distinct[i + 1]) / 2.0))
+            else:
+                # last bin upper bound = +inf in LightGBM; Rust never records it as
+                # a threshold (a split AT the last bin is invalid), so a finite
+                # placeholder is fine. Use next_up(value + 0.5) for determinism.
+                ub.append(next_up(distinct[i] + 0.5))
+        _ = math
         feats.append(
             dict(
                 bins=bins,
@@ -123,12 +144,21 @@ def train_and_dump(out_dir, name, X, y, axis, seed):
     model_path = os.path.join(out_dir, name + ".txt")
     sidecar_path = os.path.join(out_dir, name + ".json")
     booster.save_model(model_path)
+    # Record the axis in the sidecar WITHOUT machine-absolute paths: the Rust test
+    # reads the forced JSON from `<name>.forced.json` (relative to the fixtures
+    # dir), so store only the basename — keeping the committed sidecar portable +
+    # byte-idempotent across machines.
+    axis_recorded = dict(axis)
+    if "forcedsplits_filename" in axis_recorded:
+        axis_recorded["forcedsplits_filename"] = os.path.basename(
+            axis_recorded["forcedsplits_filename"]
+        )
     sidecar = dict(
         name=name,
         features=feats,
         grad=[float(-v) for v in y],  # grad = -label (iter-1, score 0)
         num_leaves=int(params.get("num_leaves", 4)),
-        axis=axis,
+        axis=axis_recorded,
         shrinkage=float(params.get("learning_rate", 0.1)),
     )
     with open(sidecar_path, "w") as fh:
