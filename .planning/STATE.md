@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 08 (python-bindings) — EXECUTING
-Plan: 5 of 8
-Status: Ready to execute
-Last activity: 2026-06-08 -- Completed 08-03 (PYB-02 input widening: f32/f64 dense dtype dispatch + scipy CSR/CSC sparse, single widen site; A/B parity over all four input kinds vs real lightgbm 4.6 at atol=1e-6, 9 new pytest green)
+Plan: 6 of 8
+Status: Executing (08-01..05 complete; Wave 4 plan 08-06 next)
+Last activity: 2026-06-08 -- Completed 08-04 (PYB-02 polars DataFrame input via Arrow + dtype→categorical routing; categorical A/B vs real lightgbm 4.6 at atol=1e-6; full pytest suite 30 green) and 08-05 (full params-dict pipeline D-06/07/08)
 
 ### Plan 08-03 result (PYB-02 input widening — COMPLETE)
 

@@ -358,7 +358,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 08-04-PLAN.md — polars zero-copy via Arrow + dtype→categorical routing (PYB-02/D-03/D-04)
+- [x] 08-04-PLAN.md — polars zero-copy via Arrow + dtype→categorical routing (PYB-02/D-03/D-04)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -392,4 +392,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
 | 7. Parity-Completing Variants | 12/12 | Complete    | 2026-06-07 |
-| 8. Python Bindings | 4/8 | In Progress|  |
+| 8. Python Bindings | 5/8 | In Progress|  |
