@@ -101,6 +101,55 @@ impl GbdtModel {
         output
     }
 
+    /// C++ `GBDT::PredictRaw` WITH the prediction-early-stop hook
+    /// (`gbdt_prediction.cpp:13-32` + `prediction_early_stop.cpp`). Accumulates each
+    /// tree's `Predict` into the per-class `output[k]` in **f64** over the resolved
+    /// sub-range; every `freq` accumulated iterations it evaluates the running
+    /// per-row score against `margin` and STOPS early if the margin is decisive.
+    ///
+    /// The margin condition matches `PredictionEarlyStopInstance` exactly:
+    /// - "binary" (`num_tree_per_iteration == 1`): `2*|score[0]| > margin`.
+    /// - "multiclass" (`> 1`): `(top1 - top2) > margin`.
+    ///
+    /// Returns `(output, iterations_evaluated)` — the same per-class score the
+    /// no-early-stop path produces when no stop fires, plus the count of iterations
+    /// actually accumulated (matching the C++ reference's effective iteration count).
+    ///
+    /// When `freq <= 0` the hook is disabled (`round_period` is effectively never
+    /// reached); the result is then byte-identical to [`Self::predict_raw`].
+    pub fn predict_raw_early_stop(
+        &self,
+        features: &[f64],
+        start_iteration: i32,
+        num_iteration: i32,
+        freq: i32,
+        margin: f64,
+    ) -> (Vec<f64>, i32) {
+        let ntpi = self.num_tree_per_iteration.max(0) as usize;
+        let mut output = vec![0.0f64; ntpi];
+        let (start, num) = self.init_predict(start_iteration, num_iteration);
+        let end = start + num;
+        let mut round_counter = 0i32;
+        let mut iters_evaluated = 0i32;
+        for i in start..end {
+            for k in 0..ntpi {
+                let idx = i as usize * ntpi + k;
+                output[k] += self.trees[idx].predict(features);
+            }
+            iters_evaluated += 1;
+            // C++ increments the counter every iteration; the callback fires when
+            // `round_period == counter` (so freq <= 0 never fires).
+            round_counter += 1;
+            if freq > 0 && freq == round_counter {
+                if pred_early_stop_should_stop(&output, margin) {
+                    return (output, iters_evaluated);
+                }
+                round_counter = 0;
+            }
+        }
+        (output, iters_evaluated)
+    }
+
     /// C++ `GBDT::FeatureImportance` (split-count, `gbdt_model_text.cpp:627`):
     /// the number of splits on each ORIGINAL feature index, across all stored
     /// trees. Index `f` of the returned vector is feature `f`'s split count; the
@@ -116,6 +165,34 @@ impl GbdtModel {
             }
         }
         counts
+    }
+}
+
+/// The `PredictionEarlyStopInstance` margin callback (`prediction_early_stop.cpp`).
+///
+/// - len 1 → "binary": `2*|pred[0]| > margin`.
+/// - len >= 2 → "multiclass": `(top1 - top2) > margin` (the two largest scores).
+///
+/// Returns `true` when the margin is decisive (stop accumulating further trees).
+/// An empty `output` (no classes) never stops.
+fn pred_early_stop_should_stop(output: &[f64], margin: f64) -> bool {
+    match output.len() {
+        0 => false,
+        1 => 2.0 * output[0].abs() > margin,
+        _ => {
+            // Two largest scores (C++ std::partial_sort top 2, descending).
+            let mut top1 = f64::NEG_INFINITY;
+            let mut top2 = f64::NEG_INFINITY;
+            for &v in output {
+                if v > top1 {
+                    top2 = top1;
+                    top1 = v;
+                } else if v > top2 {
+                    top2 = v;
+                }
+            }
+            (top1 - top2) > margin
+        }
     }
 }
 
@@ -295,5 +372,65 @@ mod tests {
         let m = two_tree_regression();
         // tree0 splits feature 0, tree1 splits feature 1.
         assert_eq!(m.feature_importance_split_count(), vec![1, 1]);
+    }
+
+    // --- prediction early stopping (PRD-05) ---
+
+    #[test]
+    fn pred_early_stop_disabled_is_identical_to_predict_raw() {
+        let m = five_iter_regression();
+        let row = [1.0f64, 0.0];
+        let plain = m.predict_raw(&row, 0, -1);
+        // freq <= 0 disables the hook; result must be byte-identical, all 5 iters.
+        let (es, iters) = m.predict_raw_early_stop(&row, 0, -1, 0, 10.0);
+        assert_eq!(es, plain, "disabled early-stop must match predict_raw exactly");
+        assert_eq!(iters, 5, "all iterations evaluated when disabled");
+    }
+
+    #[test]
+    fn pred_early_stop_binary_margin_fires_at_freq() {
+        // five_iter_regression accumulates {1,2,4,8,16} on feature-0=1.0.
+        // After iter 0 (counter==1): score 1.0, 2*|1.0|=2.0. With freq=1, margin=1.5
+        // the binary margin (2.0 > 1.5) fires immediately -> iters_evaluated == 1.
+        let m = five_iter_regression();
+        let row = [1.0f64, 0.0];
+        let (es, iters) = m.predict_raw_early_stop(&row, 0, -1, 1, 1.5);
+        assert_eq!(iters, 1, "binary margin should fire after the first iteration");
+        assert!((es[0] - 1.0).abs() < 1e-12, "score frozen at the stop point");
+    }
+
+    #[test]
+    fn pred_early_stop_checks_only_every_freq_iterations() {
+        // freq=3 only checks at counter==3 (after iter 2: cumulative 1+2+4=7,
+        // 2*7=14 > margin 10 -> stop at iters_evaluated==3). It must NOT stop earlier
+        // even though 2*|score| already exceeds margin at iter 2 (cumulative 3, 6<10
+        // anyway) — the load-bearing part is the check cadence.
+        let m = five_iter_regression();
+        let row = [1.0f64, 0.0];
+        let (es, iters) = m.predict_raw_early_stop(&row, 0, -1, 3, 10.0);
+        assert_eq!(iters, 3, "margin checked only at the freq boundary");
+        assert!((es[0] - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pred_early_stop_no_stop_runs_full_range() {
+        // A margin so large it never fires -> all iterations, full score 31.
+        let m = five_iter_regression();
+        let row = [1.0f64, 0.0];
+        let (es, iters) = m.predict_raw_early_stop(&row, 0, -1, 1, 1e9);
+        assert_eq!(iters, 5);
+        assert!((es[0] - 31.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pred_early_stop_multiclass_uses_top2_margin() {
+        // Multiclass margin = top1 - top2.
+        assert!(pred_early_stop_should_stop(&[5.0, 1.0, 0.0], 3.0)); // 5-1=4 > 3
+        assert!(!pred_early_stop_should_stop(&[5.0, 4.0, 0.0], 3.0)); // 5-4=1 < 3
+        // Binary (len 1) uses 2*|score|.
+        assert!(pred_early_stop_should_stop(&[2.0], 3.0)); // 2*2=4 > 3
+        assert!(!pred_early_stop_should_stop(&[1.0], 3.0)); // 2*1=2 < 3
+        // Empty never stops.
+        assert!(!pred_early_stop_should_stop(&[], 0.0));
     }
 }

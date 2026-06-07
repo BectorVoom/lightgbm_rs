@@ -101,6 +101,25 @@ fn numeric_spread_defaults_match_cpp() {
 }
 
 #[test]
+fn pred_early_stop_defaults_and_resolution() {
+    // config.h defaults: pred_early_stop=false, _freq=10, _margin=10.0.
+    let c = Config::default();
+    assert!(!c.pred_early_stop);
+    assert_eq!(c.pred_early_stop_freq, 10);
+    assert_eq!(c.pred_early_stop_margin, 10.0);
+
+    // And they resolve from raw params (PRD-05 builder/CLI drivability).
+    let mut params = std::collections::HashMap::new();
+    params.insert("pred_early_stop".to_string(), "true".to_string());
+    params.insert("pred_early_stop_freq".to_string(), "1".to_string());
+    params.insert("pred_early_stop_margin".to_string(), "2.0".to_string());
+    let c = Config::from_params(&params).expect("resolve pred_early_stop params");
+    assert!(c.pred_early_stop);
+    assert_eq!(c.pred_early_stop_freq, 1);
+    assert_eq!(c.pred_early_stop_margin, 2.0);
+}
+
+#[test]
 fn derived_seed_config_h_defaults() {
     // config_auto.cpp / config.h member defaults BEFORE seed derivation.
     let c = Config::default();
