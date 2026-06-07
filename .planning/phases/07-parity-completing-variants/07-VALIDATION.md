@@ -1,8 +1,8 @@
 ---
 phase: 7
 slug: parity-completing-variants
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-06-07
 ---
@@ -78,11 +78,11 @@ created: 2026-06-07
 
 ## Validation Sign-Off
 
-- [ ] All tasks have an `<automated>` verify or a Wave 0 dependency
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references (diagnostic harness, new parity files, RNG-replay goldens, capture pipeline)
-- [ ] No watch-mode flags
-- [ ] Numeric-spine no-regression goldens enforced at the W7 wave merge
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have an `<automated>` verify or a Wave 0 dependency
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (diagnostic harness, new parity files, RNG-replay goldens, capture pipeline)
+- [x] No watch-mode flags
+- [x] Numeric-spine no-regression goldens enforced at the W7 wave merge
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-06-07 (plan-checker VERIFICATION PASSED; plans satisfy the Dimension-8 contract). `wave_0_complete` flips when 07-01 executes.

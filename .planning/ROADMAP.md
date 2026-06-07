@@ -281,19 +281,53 @@ same future fix.
   5. Monotone constraints (basic/intermediate/advanced + `monotone_penalty`), interaction constraints, forced splits/bins, extra trees, CEGB, refit/continue training (`Booster.refit()`), and feature importance reporting each reproduce the C++ behavior.
 
 **Plans**: 12 plans (one phase, dependency-ordered sequential waves per D-01; Wave 0 = the D-05 bagged-subset determinism diagnostic, authored first; one end-of-phase verification gate)
-
 Plans:
+**Wave 1**
+
 - [ ] 07-01-PLAN.md — Wave 0 (D-05): bagged-subset split-gain determinism diagnostic + branch decision (un-defer regression_l1+bagging or bounded-cap)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 07-02-PLAN.md — Objectives breadth A (OBJ-04): huber/fair/quantile/mape
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 07-03-PLAN.md — Objectives breadth B (OBJ-04/05): poisson/gamma/tweedie + cross_entropy/cross_entropy_lambda
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 07-04-PLAN.md — Extended metrics (MET-03): regression/xentropy/multiclass metrics
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 07-05-PLAN.md — GOSS (BST-04): sample strategy + amplification + RNG-replay
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 07-06-PLAN.md — DART (BST-05): drop+normalize (4 branches) + drop RNG-replay
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 07-07-PLAN.md — Random Forest (BST-06): averaged trees + mandatory bagging
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
 - [ ] 07-08-PLAN.md — Categorical splits (TRL-06, D-06/D-07): additive learner re-open + numeric-spine no-regression gate
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
 - [ ] 07-09-PLAN.md — Ranking stack (OBJ-06/MET-04/bagging_by_query): lambdarank/rank_xendcg + ndcg/map + DCGCalculator + query bagging
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
 - [ ] 07-10-PLAN.md — Prediction modes (PRD-04/05): TreeSHAP predict_contrib + pred early stop
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
 - [ ] 07-11-PLAN.md — Advanced learner constraints (ADV-01..05): monotone/interaction/forced/extra-trees/CEGB
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
 - [ ] 07-12-PLAN.md — Advanced model ops (ADV-06/07): refit/continue + feature importance
 
 ### Phase 8: Python Bindings

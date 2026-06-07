@@ -520,9 +520,11 @@ W11 Advanced model ops: ADV-06 refit/continue, ADV-07 importance
 | A4 | `lambdarank_truncation_level`/`lambdarank_norm`/`label_gain`/`sigmoid` defaults are as in `rank_objective.hpp` usage | Config table | Verify against config.h at W8 plan time (I cited usage sites, not the config.h default lines) |
 | A5 | The 6 Phase-6 reg_sqrt/mf2es goldens + all Phase-7 goldens require a `lightgbm==4.6.0` wheel that is NOT installed here | Environment | Capture steps must be human-gated checkpoints; tests skip-pass until captured (matches Phase-5/6 pattern) |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Which D-05 branch fires?**
+> Q1 → resolved at runtime by the 07-01 W0 diagnostic plan, which plans BOTH outcome branches. Q2 → CPU-bit-exact only for Phase 7 (carried Phase-6 deferral). Q3 → implemented as two slices in 07-12 (refit). None block planning.
+
+1. **Which D-05 branch fires?** _(RESOLVED — delegated to 07-01 W0 diagnostic; both branches planned.)_
    - Known: the divergence is a single-tree leaf-structure flip on bagged subsets with non-constant gradient (binary+bfa, L1).
    - Unclear: fold-order/init-timing (fixable) vs genuine f32 histogram accumulation (cap it).
    - Recommendation: W0 is a dedicated FP-trace diagnostic plan (Phase-5 real-binary-trace technique); it MUST conclude with a branch decision recorded before W4/W6 start.
