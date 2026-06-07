@@ -158,51 +158,49 @@ impl DataPartition {
         Ok((left_count, right_count))
     }
 
-    /// `DataPartition::Split` for a CATEGORICAL split — a host transcription of
-    /// `DenseBin::SplitCategoricalInner<USE_MIN_BIN=false>`
-    /// (`dense_bin.hpp:451-504`, the single-feature-group overload that hard-codes
-    /// `min_bin = 1`). Routes `leaf`'s rows by the INNER bin bitset into
-    /// `left_leaf` (kept as `leaf`, the `lte`/in-bitset side) and `right_leaf`
-    /// (the `gt`/default side).
+    /// `DataPartition::Split` for a CATEGORICAL split — routes `leaf`'s rows by the
+    /// REAL category bitset into `left_leaf` (kept as `leaf`, the in-bitset side)
+    /// and `right_leaf` (the default/out-of-bitset side).
     ///
-    /// `threshold_inner` is the inner-bin bitset (`Common::ConstructBitset` over
-    /// the winning REAL BINS). `most_freq_bin` drives the default direction:
-    /// `offset = most_freq_bin == 0 ? 1 : 0`; a `bin == 0` row goes to the default
-    /// (right) side unless `most_freq_bin > 0` AND `most_freq_bin` is in the bitset
-    /// (then default → left). The in-bitset test is
-    /// `FindInBitset(threshold, bin - 1 + offset)` (min_bin == 1).
+    /// This is the row-partition analog of the predict-side `Tree::CategoricalDecision`
+    /// (`tree.h:374-390`): a row whose feature BIN maps to a CATEGORY VALUE that is
+    /// in the real bitset routes LEFT; everything else (incl. the NaN dummy bin 0,
+    /// whose category is `-1` / negative) routes RIGHT. Routing on the category
+    /// value through `bin_to_category` is provably equivalent to the C++
+    /// `DenseBin::SplitCategoricalInner` inner-bin-bitset routing (which is just a
+    /// performance encoding of the same decision) and is GUARANTEED consistent with
+    /// the model's serialized real bitset + the predict path — sidestepping the
+    /// bin↔offset bookkeeping entirely.
+    ///
+    /// `cat_bitset_real` is `Common::ConstructBitset` over the winning CATEGORY
+    /// VALUES (the same bitset the tree serializes as `cat_threshold`).
+    /// `bin_to_category` maps a feature bin to its category value (`bin_2_categorical_`).
     ///
     /// Returns `(left_count, right_count)`.
-    #[allow(clippy::too_many_arguments)]
     pub fn split_categorical(
         &mut self,
         leaf: i32,
         right_leaf: i32,
         feature_bins: &[u32],
-        threshold_inner: &[u32],
-        most_freq_bin: u32,
+        cat_bitset_real: &[u32],
+        bin_to_category: &[i32],
     ) -> (i32, i32) {
         let leaf_u = leaf as usize;
         let begin = self.leaf_begin[leaf_u] as usize;
         let count = self.leaf_count[leaf_u] as usize;
         let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
 
-        let offset: u32 = if most_freq_bin == 0 { 1 } else { 0 };
-        // Default side: gt (right) unless most_freq_bin > 0 and in the bitset.
-        let default_left = most_freq_bin > 0 && find_in_bitset(threshold_inner, most_freq_bin);
-
         let mut lte: Vec<u32> = Vec::with_capacity(count); // left / in-bitset
         let mut gt: Vec<u32> = Vec::with_capacity(count); // right / default
         for &row in &leaf_rows {
             let bin = feature_bins[row as usize];
-            // USE_MIN_BIN == false: a `bin == 0` row goes to the default side.
-            if bin == 0 {
-                if default_left {
-                    lte.push(row);
-                } else {
-                    gt.push(row);
-                }
-            } else if find_in_bitset(threshold_inner, bin - 1 + offset) {
+            let cat = bin_to_category
+                .get(bin as usize)
+                .copied()
+                .unwrap_or(bin as i32);
+            // Negative category (the NaN dummy at bin 0) always routes RIGHT, exactly
+            // as CategoricalDecision routes `int_fval < 0` / NaN to the right child.
+            if cat >= 0 && find_in_bitset(cat_bitset_real, cat as u32) {
                 lte.push(row);
             } else {
                 gt.push(row);

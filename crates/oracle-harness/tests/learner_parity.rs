@@ -1401,7 +1401,21 @@ fn load_cat_sidecar(name: &str) -> Option<CatSidecar> {
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<i64>().expect("array element not an int"))
+            // ints may be serialized as floats (e.g. `1.0`); truncate to int.
+            .map(|s| s.parse::<f64>().expect("array element not a number") as i64)
+            .collect()
+    };
+    let float_array = |key: &str| -> Vec<f64> {
+        let pat = format!("\"{key}\"");
+        let i = text.find(&pat).unwrap_or_else(|| panic!("sidecar missing array {key}"));
+        let after = &text[i + pat.len()..];
+        let lb = after.find('[').expect("array key without '['");
+        let rb = after.find(']').expect("array key without ']'");
+        after[lb + 1..rb]
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<f64>().expect("array element not a number"))
             .collect()
     };
     Some(CatSidecar {
@@ -1412,7 +1426,7 @@ fn load_cat_sidecar(name: &str) -> Option<CatSidecar> {
             .collect(),
         num_bin: scalar("num_bin") as u32,
         most_freq_bin: scalar("most_freq_bin") as u32,
-        grad: int_array("grad").into_iter().map(|x| x as f32).collect(),
+        grad: float_array("grad").into_iter().map(|x| x as f32).collect(),
         num_leaves: scalar("num_leaves") as i32,
         cat_l2: scalar("cat_l2"),
         cat_smooth: scalar("cat_smooth"),

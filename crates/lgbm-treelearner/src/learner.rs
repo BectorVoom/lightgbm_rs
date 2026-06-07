@@ -1523,13 +1523,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     ) -> Result<(i32, i32), TreeLearnerError> {
         use crate::feature_histogram_categorical::construct_bitset;
 
-        // Inner (bin) bitset for the data-partition routing.
-        let cat_bitset_inner = construct_bitset(cat_threshold_bins);
-        // Real (category-value) bitset for the model-text (the C++ RealThreshold of
-        // each winning bin, then ConstructBitset). For categorical, RealThreshold ==
-        // bin_2_categorical_[bin] (BinToValue). Negative category values cannot
-        // appear in a winning split (bin 0 is the NaN dummy and is never selected by
-        // the finder, which scans bin_start = 1 - offset).
+        // Real (category-value) bitset = ConstructBitset over the RealThreshold of
+        // each winning bin (`bin_2_categorical_[bin]`, the C++ RealThreshold /
+        // BinToValue). This is BOTH the serialized model bitset AND the partition
+        // routing key (routing by category value is equivalent to the C++ inner-bin
+        // bitset routing and is consistent with the predict path). Negative category
+        // values cannot appear in a winning split: bin 0 is the NaN dummy and the
+        // finder scans bin_start = 1 - offset, never selecting it.
         let cat_values: Vec<u32> = cat_threshold_bins
             .iter()
             .map(|&bin| {
@@ -1543,13 +1543,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             .collect();
         let cat_bitset_real = construct_bitset(&cat_values);
 
-        // Partition by the inner bitset (left = in-bitset, right = default).
+        // Partition by the REAL category bitset (left = in-bitset, right = default).
         data_partition.split_categorical(
             best_leaf,
             new_right,
             &f.bins,
-            &cat_bitset_inner,
-            f.most_freq_bin,
+            &cat_bitset_real,
+            &f.bin_to_category,
         );
 
         let missing_type_code = match f.missing_type {
@@ -2258,3 +2258,4 @@ fn root_tree(root_output: f64, num_data: i32) -> Tree {
         threshold_in_bin: Vec::new(),
     }
 }
+
