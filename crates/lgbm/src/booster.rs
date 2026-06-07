@@ -31,6 +31,13 @@ use crate::error::LgbmError;
 /// One configured eval metric — either a regression metric (raw-score) or a
 /// binary metric (prob-space / AUC). Unifies the per-round eval-history loop
 /// across objectives.
+/// A user-supplied custom-metric (feval) closure: `(raw_scores, labels) ->
+/// (name, value, is_higher_better)`, mirroring the C++ `_EvalFunctionWrapper`
+/// contract the Python `feval` marshals into (08-06). The closure is called once
+/// per eval cadence with the SAME `(scores, labels)` the built-in metrics see,
+/// so it feeds the SAME eval-history loop.
+pub type CustomMetricClosure = Box<dyn Fn(&[f64], &[f32]) -> (String, f64, bool)>;
+
 enum EvalMetric {
     /// A regression metric (`l1`/`l2`/`rmse`) over the raw score.
     Reg(Metric),
@@ -38,6 +45,9 @@ enum EvalMetric {
     Bin(BinaryMetric),
     /// The `multi_logloss` metric over the class-major score buffer.
     Multi(MultiLogloss),
+    /// A user custom-metric (feval) closure (PYB-04). Its `name()` and value come
+    /// from the closure; it feeds the SAME eval-history loop as the built-ins.
+    Custom(CustomMetricClosure),
 }
 
 impl EvalMetric {
@@ -46,6 +56,13 @@ impl EvalMetric {
             EvalMetric::Reg(m) => m.name().to_string(),
             EvalMetric::Bin(m) => m.name().to_string(),
             EvalMetric::Multi(m) => m.name().to_string(),
+            // The custom-metric name is dynamic; resolve it by calling the closure
+            // with empty inputs is NOT valid, so we record the name lazily during
+            // eval. For the history-key setup we expose a stable placeholder that
+            // the first eval overwrites. To keep the name stable we instead cache
+            // it on first construction is not possible (closure is opaque), so the
+            // caller (train path) uses the closure-returned name from eval.
+            EvalMetric::Custom(_) => "custom".to_string(),
         }
     }
 
@@ -54,6 +71,27 @@ impl EvalMetric {
             EvalMetric::Reg(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
             EvalMetric::Bin(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
             EvalMetric::Multi(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
+            EvalMetric::Custom(f) => {
+                let (_name, value, _higher) = f(scores, labels);
+                // A NaN / non-finite custom value is surfaced as a typed error
+                // (T-08-01-04), never silently recorded.
+                if !value.is_finite() {
+                    return Err(LgbmError::CustomMetric {
+                        detail: "custom metric (feval) returned a non-finite value".into(),
+                    });
+                }
+                Ok(value)
+            }
+        }
+    }
+
+    /// The closure-supplied metric name (for `Custom`) or the built-in name. For
+    /// `Custom` this calls the closure with the actual eval inputs so the recorded
+    /// history key matches the user's name.
+    fn resolved_name(&self, scores: &[f64], labels: &[f32]) -> String {
+        match self {
+            EvalMetric::Custom(f) => f(scores, labels).0,
+            other => other.name(),
         }
     }
 
@@ -65,6 +103,9 @@ impl EvalMetric {
             EvalMetric::Bin(m) => m.factor_to_bigger_better(),
             // multi_logloss is a loss: lower is better.
             EvalMetric::Multi(_) => -1.0,
+            // The custom metric's direction is dynamic; default to "lower is
+            // better" for the ES factor (the value-recording path is unaffected).
+            EvalMetric::Custom(_) => -1.0,
         }
     }
 }
@@ -444,6 +485,104 @@ impl Booster {
     pub fn predict_row_raw(&self, features: &[f64], num_iteration: i32) -> Vec<f64> {
         self.model.predict_raw(features, 0, num_iteration)
     }
+
+    /// Batch transformed prediction: one transformed score vector per row, equal
+    /// to calling [`predict_row`](Self::predict_row) per row. Thin delegation —
+    /// no new algorithm.
+    pub fn predict(&self, rows: &[Vec<f64>]) -> Vec<Vec<f32>> {
+        rows.iter().map(|r| self.predict_row(r)).collect()
+    }
+
+    /// Batch RAW (untransformed) prediction over the first `num_iteration` trees
+    /// (`<= 0` = all), one raw score vector per row. Delegates to
+    /// [`GbdtModel::predict_raw`].
+    pub fn predict_raw_batch(
+        &self,
+        rows: &[Vec<f64>],
+        start_iteration: i32,
+        num_iteration: i32,
+    ) -> Vec<Vec<f64>> {
+        rows.iter()
+            .map(|r| self.model.predict_raw(r, start_iteration, num_iteration))
+            .collect()
+    }
+
+    /// Per-feature split-count importance (ADV-07). Delegates to
+    /// [`GbdtModel::feature_importance_split_count`].
+    pub fn feature_importance_split(&self) -> Vec<u64> {
+        self.model.feature_importance_split_count()
+    }
+
+    /// Per-feature gain-sum importance (ADV-07). Delegates to
+    /// [`GbdtModel::feature_importance_gain`].
+    pub fn feature_importance_gain(&self) -> Vec<f64> {
+        self.model.feature_importance_gain()
+    }
+
+    /// Refit one tree's leaf values to new data/gradients (PYB-04 enabling,
+    /// ADV-06). Delegates to [`GbdtModel::refit_one_tree`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn refit(
+        &mut self,
+        tree_index: usize,
+        rows: &[Vec<f64>],
+        gradients: &[f32],
+        hessians: &[f32],
+        decay: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) {
+        self.model.refit_one_tree(
+            tree_index, rows, gradients, hessians, decay, use_l1, l1, l2,
+        );
+    }
+
+    /// Serialize the model to LightGBM-compatible v4 model text (Phase-3
+    /// byte-stable `%.17g`/`%g` formatter). Delegates to
+    /// [`lgbm_model::model_text::save`].
+    pub fn model_to_string(&self) -> String {
+        lgbm_model::model_text::save(&self.model)
+    }
+
+    /// Write the model text to `path`. An I/O failure is mapped to a typed
+    /// [`LgbmError::Io`] so the caller never panics.
+    ///
+    /// # Errors
+    /// [`LgbmError::Io`] wrapping the I/O failure detail.
+    pub fn save_model(&self, path: &std::path::Path) -> Result<(), LgbmError> {
+        let text = self.model_to_string();
+        std::fs::write(path, text).map_err(|e| LgbmError::Io {
+            detail: format!("failed to write model to {}: {e}", path.display()),
+        })
+    }
+
+    /// Reconstruct a [`Booster`] from LightGBM model text (Phase-3
+    /// [`lgbm_model::model_text::load`]). Carries the loaded model's objective so
+    /// `predict` applies the same transform. The eval history / iter snapshots are
+    /// empty (a loaded model carries no training trace).
+    ///
+    /// # Errors
+    /// [`LgbmError::Model`] when the text fails to parse (untrusted-text boundary,
+    /// T-08-01-03) — never a panic.
+    pub fn model_from_string(text: &str) -> Result<Booster, LgbmError> {
+        let model = lgbm_model::model_text::load(text).map_err(LgbmError::Model)?;
+        let objective_string = model
+            .objective_string
+            .clone()
+            .unwrap_or_else(|| "regression".to_string());
+        let objective_kind = ObjectiveKind::parse(&objective_string)
+            .unwrap_or(ObjectiveKind::Regression { sqrt: false });
+        let best_iteration = model.num_iteration();
+        Ok(Booster {
+            model,
+            objective_kind,
+            best_iteration,
+            eval_history: Vec::new(),
+            iter_scores: Vec::new(),
+            iter_grad_hess: Vec::new(),
+        })
+    }
 }
 
 /// Train a regression spine [`Booster`] from a [`Config`] + a dense identity-binned
@@ -547,9 +686,43 @@ pub fn train_custom<'a, F>(
 where
     F: Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a,
 {
+    train_custom_with_metric(config, corpus, closure, None)
+}
+
+/// Train with a user-supplied `custom` objective closure (OBJ-02 / D-04) AND an
+/// OPTIONAL custom-metric (feval) closure (PYB-04 custom-metric half). The feval
+/// closure maps `(raw_scores, labels) -> (name, value, is_higher_better)`
+/// (mirroring C++ `_EvalFunctionWrapper`); when supplied it REPLACES the built-in
+/// `l2` eval metric and feeds the SAME eval-history loop, recording the
+/// closure-supplied name. When `feval` is `None` this behaves identically to
+/// [`train_custom`] (the built-in `l2` over the raw score).
+///
+/// This is the upstream hook the 08-06 Python `feval` marshalling consumes: the
+/// Python layer wraps the user's `feval` into a [`CustomMetricClosure`] and calls
+/// this entry, so a user metric is wired into eval history without disturbing the
+/// built-in path.
+///
+/// # Errors
+/// [`LgbmError`] for an invalid corpus or a loop/learner failure; a wrong-length
+/// objective-closure return surfaces as `LgbmError::Objective`, a non-finite
+/// feval value as `LgbmError::CustomMetric` (T-08-01-04), never a panic.
+pub fn train_custom_with_metric<'a, F>(
+    config: &Config,
+    corpus: &DenseCorpus,
+    closure: F,
+    feval: Option<CustomMetricClosure>,
+) -> Result<Booster, LgbmError>
+where
+    F: Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a,
+{
     let custom = CustomObjective::new(closure);
-    // The custom run's eval metric mirrors the capture (l2 over the raw score).
-    let metrics = vec![EvalMetric::Reg(Metric::L2)];
+    // When a feval is supplied, the custom-metric closure REPLACES the built-in
+    // metric list ([l2]) and feeds the SAME eval-history loop; otherwise the
+    // custom run's eval metric mirrors the capture (l2 over the raw score).
+    let metrics = match feval {
+        Some(f) => vec![EvalMetric::Custom(f)],
+        None => vec![EvalMetric::Reg(Metric::L2)],
+    };
     train_inner(
         config,
         corpus,
@@ -899,6 +1072,15 @@ fn train_inner_columns_full(
         if do_eval && provide_train {
             for (mi, m) in metrics.iter().enumerate() {
                 let v = m.eval(&snap.score, corpus_labels)?;
+                // A custom-metric (feval) key is resolved lazily from the closure
+                // (the placeholder "custom" set at history-setup is overwritten on
+                // the first eval with the user-supplied name) so the recorded
+                // history key matches the user's metric name (PYB-04).
+                if matches!(m, EvalMetric::Custom(_)) {
+                    let name = m.resolved_name(&snap.score, corpus_labels);
+                    legacy_eval_history[mi].0 = name.clone();
+                    train_eval_history[mi].0 = format!("training {name}");
+                }
                 train_eval_history[mi].1.push(v);
                 legacy_eval_history[mi].1.push(v);
             }
@@ -1600,5 +1782,187 @@ mod tests {
             build_feature_columns_from_raw(&bad_cat),
             Err(LgbmError::InvalidCorpus { .. })
         ));
+    }
+
+    // ---- Task 2 (Booster facade methods + custom-metric feval hook) ----
+
+    fn trained_spine() -> Booster {
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(10)
+            .learning_rate(0.1)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .metric("l2,rmse")
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        train(&cfg, &spine_corpus()).expect("train ok")
+    }
+
+    #[test]
+    fn booster_facade_batch_predict_equals_per_row() {
+        let booster = trained_spine();
+        let corpus = spine_corpus();
+        let batch = booster.predict(&corpus.features);
+        assert_eq!(batch.len(), corpus.features.len());
+        for (i, row) in corpus.features.iter().enumerate() {
+            let per_row = booster.predict_row(row);
+            assert_eq!(batch[i].len(), per_row.len());
+            for (a, b) in batch[i].iter().zip(per_row.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "row {i} batch != per-row");
+            }
+        }
+    }
+
+    #[test]
+    fn booster_facade_importance_delegates() {
+        let booster = trained_spine();
+        assert_eq!(
+            booster.feature_importance_split(),
+            booster.model().feature_importance_split_count()
+        );
+        assert_eq!(
+            booster.feature_importance_gain(),
+            booster.model().feature_importance_gain()
+        );
+    }
+
+    #[test]
+    fn booster_facade_model_text_round_trips() {
+        let booster = trained_spine();
+        let text = booster.model_to_string();
+        let reloaded = Booster::model_from_string(&text).expect("reload ok");
+        let corpus = spine_corpus();
+        for row in &corpus.features {
+            let a = booster.predict_row(row);
+            let b = reloaded.predict_row(row);
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "round-trip predict must be bit-exact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn booster_facade_refit_changes_leaves() {
+        let mut booster = trained_spine();
+        let corpus = spine_corpus();
+        let before: Vec<f64> = booster.model().trees[0].leaf_value.clone();
+        // Refit tree 0 with synthetic gradients (decay=0.0 fully replaces leaves).
+        let grads = vec![5.0f32; corpus.features.len()];
+        let hess = vec![1.0f32; corpus.features.len()];
+        booster.refit(0, &corpus.features, &grads, &hess, 0.0, false, 0.0, 0.0);
+        let after: Vec<f64> = booster.model().trees[0].leaf_value.clone();
+        assert_ne!(before, after, "refit must change leaf values");
+    }
+
+    #[test]
+    fn model_from_string_rejects_garbage() {
+        let err = Booster::model_from_string("not a valid model").unwrap_err();
+        assert!(matches!(err, LgbmError::Model(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn custom_metric_feval_matches_builtin_l2() {
+        // The custom-metric (feval) hook records a user-supplied metric in eval
+        // history under the closure name, and its per-iteration values bit-match
+        // the built-in Metric::L2 over the same scores/labels — proving the hook
+        // feeds the SAME eval-history loop, not a parallel one (PYB-04).
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(8)
+            .learning_rate(0.1)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(false) // custom forces bfa OFF
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        let corpus = spine_corpus();
+        // Custom objective: L2 gradient/hessian (grad = score - label, hess = 1).
+        let labels = corpus.labels.clone();
+        let obj = move |scores: &[f64]| -> (Vec<f32>, Vec<f32>) {
+            let g: Vec<f32> = scores
+                .iter()
+                .zip(labels.iter())
+                .map(|(s, l)| (*s as f32) - *l)
+                .collect();
+            let h: Vec<f32> = vec![1.0f32; scores.len()];
+            (g, h)
+        };
+
+        // Baseline: custom objective, built-in l2 metric.
+        let baseline = train_custom_with_metric(&cfg, &corpus, obj.clone(), None)
+            .expect("baseline custom train");
+        let (_, baseline_l2) = baseline
+            .eval_history
+            .iter()
+            .find(|(n, _)| n == "l2")
+            .expect("built-in l2 recorded");
+
+        // Custom metric: an in-closure L2 (mean (pred-label)^2), is_higher_better=false.
+        let feval: CustomMetricClosure = Box::new(|scores: &[f64], labels: &[f32]| {
+            let n = scores.len().max(1) as f64;
+            let sse: f64 = scores
+                .iter()
+                .zip(labels.iter())
+                .map(|(s, l)| {
+                    let d = s - *l as f64;
+                    d * d
+                })
+                .sum();
+            ("my_l2".to_string(), sse / n, false)
+        });
+        let custom = train_custom_with_metric(&cfg, &corpus, obj, Some(feval))
+            .expect("custom-metric train");
+        let (_, custom_vals) = custom
+            .eval_history
+            .iter()
+            .find(|(n, _)| n == "my_l2")
+            .expect("custom metric recorded under closure name");
+
+        assert_eq!(
+            baseline_l2.len(),
+            custom_vals.len(),
+            "same number of recorded rounds"
+        );
+        for (i, (b, c)) in baseline_l2.iter().zip(custom_vals.iter()).enumerate() {
+            assert_eq!(
+                b.to_bits(),
+                c.to_bits(),
+                "iter {i}: custom feval {c} must bit-match built-in l2 {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_metric_nan_is_typed_error() {
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(3)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(false)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        let corpus = spine_corpus();
+        let obj = |scores: &[f64]| -> (Vec<f32>, Vec<f32>) {
+            (vec![0.0f32; scores.len()], vec![1.0f32; scores.len()])
+        };
+        let feval: CustomMetricClosure =
+            Box::new(|_s: &[f64], _l: &[f32]| ("bad".to_string(), f64::NAN, false));
+        let err = train_custom_with_metric(&cfg, &corpus, obj, Some(feval))
+            .expect_err("NaN feval must error");
+        assert!(matches!(err, LgbmError::CustomMetric { .. }), "got {err:?}");
     }
 }

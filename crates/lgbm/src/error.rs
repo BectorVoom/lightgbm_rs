@@ -54,6 +54,27 @@ pub enum LgbmError {
         detail: String,
     },
 
+    /// An I/O failure at the facade boundary (e.g. writing a model file via
+    /// [`Booster::save_model`](crate::Booster::save_model)). Facade-owned so the
+    /// caller never panics on a filesystem error.
+    #[error("io error: {detail}")]
+    Io {
+        /// Human-readable description of the I/O failure.
+        detail: String,
+    },
+
+    /// A user-supplied custom-metric (feval) closure returned an invalid value
+    /// (non-finite) on the custom-train path (T-08-01-04). Facade-owned — the
+    /// closure boundary is a facade concern (the closure is supplied by the Rust
+    /// caller / the eventual Python `feval` marshalling in 08-06). Surfaced as a
+    /// typed error so a NaN/inf metric value never silently corrupts the
+    /// eval-history / early-stopping decision.
+    #[error("custom metric error: {detail}")]
+    CustomMetric {
+        /// Human-readable description of the custom-metric defect.
+        detail: String,
+    },
+
     /// A per-feature constraint/penalty vector (`monotone_constraints`,
     /// `cegb_penalty_feature_coupled`, or `cegb_penalty_feature_lazy`) was
     /// non-empty but its length did not equal `num_features` (T-07-11-02).
