@@ -1642,6 +1642,55 @@ mod tests {
         assert_eq!(tree.leaf_value, before, "IsRenewTreeOutput()==false leaves the tree unchanged");
     }
 
+    #[test]
+    fn renew_tree_output_overwrites_each_leaf_via_closure() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        // Build a real 2-leaf partition over a splittable feature so each leaf has
+        // a concrete (non-empty) row set the closure can see.
+        let (f, _g, _h) = splittable_feature();
+        let mut part = DataPartition::new(8, 2);
+        let (lc, rc) = part
+            .split(
+                &backend, &client, 0, 1, &f.bins, f.num_bin, f.min_bin, f.max_bin, 1,
+                f.most_freq_bin,
+            )
+            .expect("partition split ok");
+        assert!(lc > 0 && rc > 0);
+
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 2, -1);
+        let mut tree = two_leaf_tree();
+        // The renew closure returns a per-leaf constant (here: 100 + leaf index *
+        // 10), proving each leaf's output is overwritten with the closure's value
+        // (the l1 median-residual body uses the same seam — leaf -> median(rows)).
+        learner.renew_tree_output(
+            &mut tree,
+            &part,
+            Some(|leaf: i32, rows: &[u32]| {
+                assert!(!rows.is_empty(), "each leaf has rows");
+                100.0 + leaf as f64 * 10.0
+            }),
+        );
+        assert_eq!(tree.leaf_value, vec![100.0, 110.0], "each leaf overwritten by closure");
+    }
+
+    #[test]
+    fn renew_tree_output_single_leaf_is_noop() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 1, -1);
+        let part = DataPartition::new(4, 1);
+        let mut tree = two_leaf_tree();
+        tree.num_leaves = 1;
+        let before = tree.leaf_value.clone();
+        learner.renew_tree_output(
+            &mut tree,
+            &part,
+            Some(|_leaf: i32, _rows: &[u32]| -42.0),
+        );
+        assert_eq!(tree.leaf_value, before, "num_leaves<=1 renew is a no-op (T-06-03-02)");
+    }
+
     /// `leaf_wise_caps`: a depth-1 cap yields exactly 2 leaves on a splittable
     /// input; a non-positive-gain synthetic yields a single-leaf tree; and the
     /// `num_leaves` cap bounds the loop.

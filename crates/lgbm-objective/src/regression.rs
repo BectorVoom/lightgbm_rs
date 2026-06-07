@@ -24,6 +24,7 @@
 use lgbm_core::types::K_EPSILON;
 
 use crate::error::ObjectiveError;
+use crate::percentile::percentile_fun;
 
 /// C++ `Common::Sign` (`common.h:873`): `(x > 0) - (x < 0)` → `-1 | 0 | 1`.
 #[inline]
@@ -45,6 +46,12 @@ pub enum Objective {
         /// The `sqrt` token was present on the objective spec.
         sqrt: bool,
     },
+    /// `regression_l1` (`RegressionL1loss`, `regression_objective.hpp:207-288`):
+    /// `grad = (score_t)Sign(score - label)`, `hess = 1.0f`; `BoostFromScore` is
+    /// the label MEDIAN (`PercentileFun` at alpha = 0.5, NOT the mean); and
+    /// `IsRenewTreeOutput() == true` — after each tree, every leaf's output is
+    /// overwritten with the median RESIDUAL of its rows (Pitfall 2/3).
+    RegressionL1,
 }
 
 impl Objective {
@@ -70,6 +77,9 @@ impl Objective {
             "regression" | "regression_l2" | "mean_squared_error" | "mse" | "l2" => {
                 Ok(Objective::Regression { sqrt })
             }
+            // C++ aliases for RegressionL1loss (objective_function.cpp / config
+            // alias table): `regression_l1`, `l1`, `mean_absolute_error`, `mae`.
+            "regression_l1" | "l1" | "mean_absolute_error" | "mae" => Ok(Objective::RegressionL1),
             other => Err(ObjectiveError::Unsupported {
                 name: other.to_string(),
             }),
@@ -91,7 +101,9 @@ impl Objective {
     /// so the hessian is the constant `1.0`.
     pub fn is_constant_hessian(&self) -> bool {
         match self {
-            Objective::Regression { .. } => true,
+            // L1 hess is the constant 1.0 too (unweighted) — RegressionL1loss
+            // inherits IsConstantHessian from RegressionL2loss.
+            Objective::Regression { .. } | Objective::RegressionL1 => true,
         }
     }
 
@@ -101,6 +113,8 @@ impl Objective {
     pub fn is_renew_tree_output(&self) -> bool {
         match self {
             Objective::Regression { .. } => false,
+            // RegressionL1loss::IsRenewTreeOutput() == true.
+            Objective::RegressionL1 => true,
         }
     }
 
@@ -123,6 +137,8 @@ impl Objective {
                     labels.to_vec()
                 }
             }
+            // L1 has no Init label transform (no sqrt option).
+            Objective::RegressionL1 => labels.to_vec(),
         }
     }
 
@@ -174,6 +190,18 @@ impl Objective {
                     hessians[i] = 1.0f32;
                 }
             }
+            Objective::RegressionL1 => {
+                // RegressionL1loss::GetGradients (no-weights,
+                // regression_objective.hpp:217-225):
+                //   diff = score[i] - label_[i]  (f64; label promoted)
+                //   grad[i] = (score_t)Common::Sign(diff)
+                //   hess[i] = 1.0f
+                for i in 0..n {
+                    let diff = score[i] - label[i] as f64;
+                    gradients[i] = sign(diff) as f32;
+                    hessians[i] = 1.0f32;
+                }
+            }
         }
         Ok(())
     }
@@ -197,7 +225,31 @@ impl Objective {
                 let sumw = label.len() as f64;
                 suml / sumw
             }
+            // RegressionL1loss::BoostFromScore (regression_objective.hpp:236-249):
+            // the unweighted percentile at alpha = 0.5 — the label MEDIAN via
+            // PercentileFun (NOT the mean). The macro reads `label_[i]` as
+            // `label_t` (f32); we promote each to f64 (the percentile arithmetic is
+            // the same; PercentileFun's casts are width-preserving for the median).
+            Objective::RegressionL1 => {
+                let data: Vec<f64> = label.iter().map(|&l| l as f64).collect();
+                percentile_fun(&data, 0.5)
+            }
         }
+    }
+
+    /// `RegressionL1loss::RenewTreeOutput` per-leaf body
+    /// (`regression_objective.hpp:253-283`): the weighted/unweighted median of a
+    /// leaf's RESIDUALS. `residuals` are the per-row `label[row] - score[row]`
+    /// values for the rows in one leaf (the C++ `residual_getter`), in the data
+    /// partition's row order. Returns the new leaf output (the median residual at
+    /// alpha = 0.5). The boosting layer gathers the residuals for each leaf and
+    /// calls this; for `IsRenewTreeOutput() == false` objectives the loop never
+    /// invokes it.
+    ///
+    /// Only the unweighted path is exercised by the in-scope corpora; the weighted
+    /// variant lives in [`crate::percentile::weighted_percentile_fun`].
+    pub fn renew_leaf_output(&self, residuals: &[f64]) -> f64 {
+        percentile_fun(residuals, 0.5)
     }
 
     /// Whether `|init|` exceeds the `kEpsilon` gate the GBDT loop uses to decide
@@ -303,5 +355,59 @@ mod tests {
         assert!(!obj.is_renew_tree_output());
         assert!(Objective::init_score_is_significant(1.0));
         assert!(!Objective::init_score_is_significant(0.0));
+    }
+
+    #[test]
+    fn parse_regression_l1_family() {
+        assert_eq!(Objective::parse("regression_l1").unwrap(), Objective::RegressionL1);
+        assert_eq!(Objective::parse("l1").unwrap(), Objective::RegressionL1);
+        assert_eq!(Objective::parse("mae").unwrap(), Objective::RegressionL1);
+        assert_eq!(
+            Objective::parse("mean_absolute_error").unwrap(),
+            Objective::RegressionL1
+        );
+    }
+
+    #[test]
+    fn gradients_l1_sign_and_unit_hessian() {
+        // grad[i] = Sign(score - label); hess = 1.0.
+        let obj = Objective::RegressionL1;
+        let score = [3.0f64, -2.5, 0.0, 100.25, 7.0];
+        let label = [1.0f32, 0.5, 0.0, 100.0, 7.0];
+        let mut grad = [0.0f32; 5];
+        let mut hess = [0.0f32; 5];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        // 3-1>0 -> +1; -2.5-0.5<0 -> -1; 0-0==0 -> 0; 100.25-100>0 -> +1; 7-7==0 -> 0.
+        assert_eq!(grad, [1.0f32, -1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(hess, [1.0f32; 5]);
+    }
+
+    #[test]
+    fn gradients_l1_flags() {
+        let obj = Objective::RegressionL1;
+        assert!(obj.is_constant_hessian());
+        assert!(obj.is_renew_tree_output());
+    }
+
+    #[test]
+    fn boost_from_score_l1_is_median_not_mean() {
+        let obj = Objective::RegressionL1;
+        // Odd count median: [1,2,3,4,100] -> mean = 22, median (PercentileFun) = 3.
+        let label = [1.0f32, 2.0, 3.0, 4.0, 100.0];
+        let init = obj.boost_from_score(&label);
+        assert_eq!(init, 3.0, "L1 BoostFromScore must be the median, not the mean");
+        // Sanity: the L2 mean of the same labels is 22.0 — proving the divergence.
+        let l2 = Objective::Regression { sqrt: false }.boost_from_score(&label);
+        assert!((l2 - 22.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn renew_leaf_output_is_median_residual() {
+        let obj = Objective::RegressionL1;
+        // residuals (label - score) for a leaf's rows.
+        let residuals = [10.0f64, 8.0, 2.0, 0.0]; // even count, median(PercentileFun) = 5.
+        assert_eq!(obj.renew_leaf_output(&residuals), 5.0);
+        let odd = [1.0f64, 2.0, 3.0];
+        assert_eq!(obj.renew_leaf_output(&odd), 2.0);
     }
 }

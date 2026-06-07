@@ -20,6 +20,7 @@
 //! 06-02 (L2 spine) and 06-03+ (regression_l1 / binary / multiclass / custom).
 
 pub mod error;
+pub mod percentile;
 pub mod regression;
 
 pub use error::ObjectiveError;

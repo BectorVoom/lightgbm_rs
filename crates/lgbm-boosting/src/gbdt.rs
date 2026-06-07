@@ -172,6 +172,13 @@ impl Gbdt {
 
         // ---- (3) bagging: DEFERRED to 06-05 (no subsetting on the spine) ----
 
+        // The training score BEFORE any of this iteration's trees are added — the
+        // C++ `GetTrainingScore()` the `residual_getter` closes over (gbdt.cpp:409:
+        // `label[i] - score_ptr[i]`). RenewTreeOutput runs BEFORE UpdateScore, so
+        // it must see the pre-update score; snapshot it once (it is unchanged across
+        // the K=1 single-output loop here).
+        let train_score_pre = self.score_updater.scores().to_vec();
+
         // ---- (4) per-class tree loop ----
         for cur_tree_id in 0..self.num_class.max(1) {
             let offset = (cur_tree_id as usize) * nd;
@@ -185,15 +192,29 @@ impl Gbdt {
                 learner.train_returning_partition(grad, hess, is_first_tree)?;
 
             if tree.num_leaves > 1 {
-                // RenewTreeOutput: no-op for L2 (IsRenewTreeOutput()==false). The
-                // l1 median-residual closure lands with regression_l1 in 06-03.
+                // RenewTreeOutput: no-op for L2 (IsRenewTreeOutput()==false), active
+                // for regression_l1 — overwrite each leaf's output with the median
+                // RESIDUAL (`label[row] - train_score[offset+row]`) of its rows
+                // (Pitfall 2/3; gbdt.cpp:409-411 + serial_tree_learner.cpp:920-940).
                 if self.objective.is_renew_tree_output() {
-                    // The renewal closure is objective-specific (06-03); for the
-                    // 06-02 spine objective this branch is never taken.
+                    let obj = &self.objective;
+                    let labels_ref = labels;
+                    let score_ref = &train_score_pre;
                     learner.renew_tree_output(
                         &mut tree,
                         &partition,
-                        None::<fn(i32, &[u32]) -> f64>,
+                        Some(|_leaf: i32, rows: &[u32]| {
+                            // residual_getter over the leaf's rows, then the median
+                            // (PercentileFun alpha=0.5) — the new leaf output.
+                            let residuals: Vec<f64> = rows
+                                .iter()
+                                .map(|&row| {
+                                    let r = row as usize;
+                                    labels_ref[r] as f64 - score_ref[offset + r]
+                                })
+                                .collect();
+                            obj.renew_leaf_output(&residuals)
+                        }),
                     );
                 }
                 // Shrinkage BEFORE UpdateScore.
