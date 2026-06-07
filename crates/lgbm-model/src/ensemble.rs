@@ -166,6 +166,103 @@ impl GbdtModel {
         }
         counts
     }
+
+    /// C++ `GBDT::FeatureImportance(num_iteration, importance_type=1)` — GAIN-based
+    /// (`gbdt_model_text.cpp:646-655`): the SUM of `split_gain` over each ORIGINAL
+    /// feature's splits, across all stored trees, counting ONLY splits with
+    /// `split_gain > 0` (the CR-02 guard, mirrored exactly from C++ which applies the
+    /// `> 0` filter for BOTH split=0 and gain=1). Index `f` is feature `f`'s total
+    /// split gain; the vector length is `max_feature_idx + 1`.
+    ///
+    /// Accumulated in f64 (the gains are stored f32; the C++ vector is `double`).
+    pub fn feature_importance_gain(&self) -> Vec<f64> {
+        let n = (self.max_feature_idx + 1).max(0) as usize;
+        let mut gains = vec![0.0f64; n];
+        for tree in &self.trees {
+            // split_gain / split_feature have length num_leaves - 1.
+            for (idx, &sf) in tree.split_feature.iter().enumerate() {
+                let g = tree.split_gain.get(idx).copied().unwrap_or(0.0);
+                if g > 0.0 && sf >= 0 && (sf as usize) < n {
+                    gains[sf as usize] += g as f64;
+                }
+            }
+        }
+        gains
+    }
+
+    /// C++ `GBDT::FeatureImportance(num_iteration, importance_type=0)` — SPLIT-count
+    /// WITH the `split_gain > 0` guard (`gbdt_model_text.cpp:636-642`). This is the
+    /// CR-02-faithful sibling of [`Self::feature_importance_split_count`]: C++ counts
+    /// a split toward its feature ONLY when `split_gain(split_idx) > 0`. The legacy
+    /// [`Self::feature_importance_split_count`] omits the guard (it counts every
+    /// stored split) and is retained for callers that want the raw structural count;
+    /// the model-text emit + parity path use THIS guarded variant.
+    pub fn feature_importance_split_count_guarded(&self) -> Vec<u64> {
+        let n = (self.max_feature_idx + 1).max(0) as usize;
+        let mut counts = vec![0u64; n];
+        for tree in &self.trees {
+            for (idx, &sf) in tree.split_feature.iter().enumerate() {
+                let g = tree.split_gain.get(idx).copied().unwrap_or(0.0);
+                if g > 0.0 && sf >= 0 && (sf as usize) < n {
+                    counts[sf as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// Leaf-refit ONE tree (`SerialTreeLearner::FitByExistingTree`,
+    /// serial_tree_learner.cpp:247-285, called from `GBDT::RefitTree`): route every
+    /// training row to its leaf in `trees[tree_index]` (over the tree's existing
+    /// STRUCTURE — never re-split), accumulate per-leaf `(sum_grad, sum_hess)`, then
+    /// blend each leaf via [`Tree::refit_leaf`] (`new = decay*old +
+    /// (1-decay)*shrunk_newton`).
+    ///
+    /// `rows` are the per-row RAW feature buffers (width `max_feature_idx + 1`) used
+    /// by `Tree::get_leaf` (the C++ `data_partition_` row→leaf map, here re-derived
+    /// by routing each row through the existing tree). `gradients` / `hessians` are
+    /// the per-row grad/hess for THIS tree's class (the C++ `gradients_pointer_ +
+    /// offset`). `decay` is `refit_decay_rate`; `use_l1`/`l1`/`l2` mirror the
+    /// leaf-output config. A constant (`num_leaves <= 1`) tree has no routed leaves
+    /// to refit and is left unchanged (C++ `FitByExistingTree` still iterates its one
+    /// leaf, but a constant tree has no rows partition beyond the whole corpus — the
+    /// decay blend on a single leaf is well-defined, so we refit it too).
+    #[allow(clippy::too_many_arguments)]
+    pub fn refit_one_tree(
+        &mut self,
+        tree_index: usize,
+        rows: &[Vec<f64>],
+        gradients: &[f32],
+        hessians: &[f32],
+        decay: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) {
+        let num_leaves = self.trees[tree_index].num_leaves.max(1) as usize;
+        let mut sum_grad = vec![0.0f64; num_leaves];
+        let mut sum_hess = vec![0.0f64; num_leaves];
+        for (r, row) in rows.iter().enumerate() {
+            let leaf = if self.trees[tree_index].num_leaves > 1 {
+                self.trees[tree_index].get_leaf(row) as usize
+            } else {
+                0
+            };
+            sum_grad[leaf] += gradients[r] as f64;
+            sum_hess[leaf] += hessians[r] as f64;
+        }
+        for leaf in 0..num_leaves {
+            self.trees[tree_index].refit_leaf(
+                leaf,
+                sum_grad[leaf],
+                sum_hess[leaf],
+                decay,
+                use_l1,
+                l1,
+                l2,
+            );
+        }
+    }
 }
 
 /// The `PredictionEarlyStopInstance` margin callback (`prediction_early_stop.cpp`).
@@ -372,6 +469,76 @@ mod tests {
         let m = two_tree_regression();
         // tree0 splits feature 0, tree1 splits feature 1.
         assert_eq!(m.feature_importance_split_count(), vec![1, 1]);
+    }
+
+    /// A stump with a chosen split_gain (for the gain-importance tests).
+    fn gain_stump(feat: i32, gain: f32) -> Tree {
+        let mut t = stump(1.0, 2.0, feat, 0.5);
+        t.split_gain = vec![gain];
+        t
+    }
+
+    #[test]
+    fn feature_importance_gain_sums_split_gain() {
+        // ADV-07: gain importance = sum of split_gain per feature, split_gain>0 only.
+        let m = GbdtModel {
+            trees: vec![gain_stump(0, 3.0), gain_stump(0, 2.0), gain_stump(1, 5.0)],
+            ..two_tree_regression()
+        };
+        let g = m.feature_importance_gain();
+        assert!((g[0] - 5.0).abs() < 1e-9, "feature 0 = 3+2 = 5, got {}", g[0]);
+        assert!((g[1] - 5.0).abs() < 1e-9, "feature 1 = 5, got {}", g[1]);
+    }
+
+    #[test]
+    fn feature_importance_gain_guards_nonpositive() {
+        // CR-02 guard: a split with gain <= 0 contributes 0 to gain AND to the
+        // guarded split count.
+        let m = GbdtModel {
+            trees: vec![gain_stump(0, 0.0), gain_stump(0, -1.0), gain_stump(1, 4.0)],
+            ..two_tree_regression()
+        };
+        let g = m.feature_importance_gain();
+        assert_eq!(g[0], 0.0, "all of feature 0's splits have gain <= 0");
+        assert!((g[1] - 4.0).abs() < 1e-9);
+        // The guarded split-count drops the gain<=0 splits too.
+        assert_eq!(m.feature_importance_split_count_guarded(), vec![0, 1]);
+        // The legacy unguarded count still tallies every stored split.
+        assert_eq!(m.feature_importance_split_count(), vec![2, 1]);
+    }
+
+    #[test]
+    fn refit_one_tree_decay_corners() {
+        // ADV-06 leaf-refit: route rows to leaves of a stump on feature 0 @ 0.5,
+        // accumulate per-leaf grad/hess, blend by decay.
+        // stump(1.0, 2.0, 0, 0.5): leaf 0 = value 1.0 (feature<=0.5), leaf 1 = 2.0.
+        let mut m = GbdtModel {
+            trees: vec![stump(1.0, 2.0, 0, 0.5)],
+            ..two_tree_regression()
+        };
+        // rows: two route to leaf 0 (feat0 = 0.0), two to leaf 1 (feat0 = 1.0).
+        let rows = vec![
+            vec![0.0, 0.0],
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 0.0],
+        ];
+        let grad = [1.0f32, 1.0, 3.0, 3.0]; // leaf0 sum=2, leaf1 sum=6
+        let hess = [1.0f32, 1.0, 1.0, 1.0]; // leaf0 sum=2, leaf1 sum=2
+
+        // decay = 1.0 => unchanged.
+        m.refit_one_tree(0, &rows, &grad, &hess, 1.0, false, 0.0, 0.0);
+        assert_eq!(m.trees[0].leaf_value, vec![1.0, 2.0]);
+
+        // decay = 0.0 => all-new: leaf0 = -2/(2+kEps), leaf1 = -6/(2+kEps).
+        let mut m = GbdtModel {
+            trees: vec![stump(1.0, 2.0, 0, 0.5)],
+            ..two_tree_regression()
+        };
+        m.refit_one_tree(0, &rows, &grad, &hess, 0.0, false, 0.0, 0.0);
+        let e = lgbm_core::types::K_EPSILON as f64;
+        assert!((m.trees[0].leaf_value[0] - (-2.0 / (2.0 + e))).abs() < 1e-9);
+        assert!((m.trees[0].leaf_value[1] - (-6.0 / (2.0 + e))).abs() < 1e-9);
     }
 
     // --- prediction early stopping (PRD-05) ---

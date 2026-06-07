@@ -214,6 +214,21 @@ fn find_parameters_tail(s: &str) -> Option<String> {
 /// from each serialized tree's byte length (including its trailing `\n`), the
 /// recomputed `feature_importances:` block, and the verbatim `parameters:` tail.
 pub fn save(model: &GbdtModel) -> String {
+    // C++ `SaveModelToString(..., feature_importance_type, ...)` defaults the
+    // importance type to split (0) at the public save entry points; the
+    // `saved_feature_importance_type` selector (ADV-07) routes through
+    // [`save_with_importance`].
+    save_with_importance(model, 0)
+}
+
+/// C++ `GBDT::SaveModelToString(start, num, feature_importance_type)`
+/// (`gbdt_model_text.cpp:311-409`) — serialize the ensemble, emitting the
+/// `feature_importances:` block per `importance_type` (`0 = split`, `1 = gain`),
+/// the `saved_feature_importance_type` selector (config.h:615). Both branches apply
+/// the C++ `split_gain > 0` guard (the CR-02 Phase-3 follow-up); gain values are
+/// truncated to `size_t` (`static_cast<size_t>`) and only feature entries `> 0` are
+/// written, stable-sorted descending by the truncated value — byte-faithful to C++.
+pub fn save_with_importance(model: &GbdtModel, importance_type: i32) -> String {
     let mut s = String::new();
     s.push_str(SUB_MODEL_NAME);
     s.push('\n');
@@ -261,11 +276,25 @@ pub fn save(model: &GbdtModel) -> String {
     }
     s.push_str("end of trees\n");
 
-    // feature_importances: recomputed split-count, descending stable-sort, >0.
-    let counts = model.feature_importance_split_count();
+    // feature_importances: recomputed per `importance_type`, descending stable-sort,
+    // keeping only entries whose `static_cast<size_t>` value is > 0. C++ applies the
+    // `split_gain > 0` guard for BOTH split (0) and gain (1)
+    // (gbdt_model_text.cpp:636-655). Gain values are truncated to integer via the
+    // `static_cast<size_t>` the C++ emit performs (gbdt_model_text.cpp:378).
+    let importances: Vec<u64> = if importance_type == 1 {
+        // Gain: truncate the f64 gain-sum to integer (C++ static_cast<size_t>).
+        model
+            .feature_importance_gain()
+            .iter()
+            .map(|&g| if g > 0.0 { g as u64 } else { 0 })
+            .collect()
+    } else {
+        // Split: the CR-02-guarded split count (split_gain > 0).
+        model.feature_importance_split_count_guarded()
+    };
     let feature_names: Vec<&str> = model.feature_names.split(' ').collect();
     // pair (count, original_index) keeping only >0; stable-sort by count desc.
-    let mut pairs: Vec<(u64, usize)> = counts
+    let mut pairs: Vec<(u64, usize)> = importances
         .iter()
         .enumerate()
         .filter(|&(_, &c)| c > 0)
@@ -373,6 +402,60 @@ mod tests {
         let m = load(&text).expect("load");
         let reemit = save(&m);
         assert_eq!(reemit, text, "save(load(text)) must be byte-identical");
+    }
+
+    #[test]
+    fn save_with_importance_selects_split_vs_gain() {
+        // ADV-07: saved_feature_importance_type selects which importance the
+        // feature_importances: block emits. The minimal model's single tree splits
+        // feature 0 with split_gain = 1.5.
+        let m = load(&minimal_model_text()).expect("load");
+
+        // type 0 (split) — Column_0 split count = 1 (guarded, gain 1.5 > 0).
+        let split_text = save_with_importance(&m, 0);
+        assert!(
+            split_text.contains("\nfeature_importances:\nColumn_0=1\n"),
+            "split importance must emit Column_0=1, got:\n{split_text}"
+        );
+
+        // type 1 (gain) — Column_0 gain-sum = 1.5 truncated to 1 (static_cast<size_t>).
+        let gain_text = save_with_importance(&m, 1);
+        assert!(
+            gain_text.contains("\nfeature_importances:\nColumn_0=1\n"),
+            "gain importance (1.5 -> 1) must emit Column_0=1, got:\n{gain_text}"
+        );
+
+        // The default `save` matches type 0 (split).
+        assert_eq!(save(&m), split_text);
+    }
+
+    #[test]
+    fn save_with_gain_truncates_and_guards() {
+        // A model whose split gains accumulate to a value > 1 emits the truncated
+        // integer; a gain <= 0 split is dropped from BOTH split and gain blocks.
+        let mut m = load(&minimal_model_text()).expect("load");
+        // Bump max_feature_idx so feature 1 has a slot; add a second tree splitting
+        // feature 0 with a large gain and a third with gain 0 (must be guarded out).
+        let mut t_big = m.trees[0].clone();
+        t_big.split_gain = vec![3.7]; // feature 0, gain 3.7
+        let mut t_zero = m.trees[0].clone();
+        t_zero.split_gain = vec![0.0]; // guarded out
+        m.trees.push(t_big);
+        m.trees.push(t_zero);
+
+        // gain: feature 0 = 1.5 + 3.7 = 5.2 -> trunc 5; the gain-0 split contributes 0.
+        let gain_text = save_with_importance(&m, 1);
+        assert!(
+            gain_text.contains("\nfeature_importances:\nColumn_0=5\n"),
+            "gain 5.2 -> 5, got:\n{gain_text}"
+        );
+        // split (guarded): feature 0 has 2 splits with gain>0 (1.5, 3.7); the gain-0
+        // split is excluded.
+        let split_text = save_with_importance(&m, 0);
+        assert!(
+            split_text.contains("\nfeature_importances:\nColumn_0=2\n"),
+            "guarded split count = 2, got:\n{split_text}"
+        );
     }
 
     #[test]
