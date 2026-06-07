@@ -1268,6 +1268,18 @@ impl<'a> Gbdt<'a> {
         if !is_skip {
             let mut drop_rate = cfg.drop_rate;
             if !cfg.uniform_drop {
+                // WR-04: DELIBERATE 0/0 = NaN, byte-for-byte with C++ dart.hpp:104
+                // (`static_cast<double>(tree_weight_.size()) / sum_weight_`). On the
+                // first drop-eligible iteration `sum_weight == 0`, so both this and
+                // the `max_drop` cap term below are NaN. This is SAFE only because on
+                // iter 0 (the sole iteration with `sum_weight == 0` under fresh
+                // training, `num_init_iteration_ == 0`) the `for i in 0..iter` drop
+                // loop is EMPTY, so the NaN is never reached by a `draw < ...`
+                // comparison. WARNING: if DART continue-training is ever wired
+                // (`with_loaded_model` + DART, `num_init_iteration_ > 0`), a non-empty
+                // drop loop could reach this NaN, where `NaN < x` is always false
+                // (no trees dropped) — guard `sum_weight == 0` there before relying on
+                // it. Do NOT "fix" the 0/0 here: it must stay bit-exact to C++.
                 let inv_average_weight = dart.tree_weight.len() as f64 / dart.sum_weight;
                 if cfg.max_drop > 0 {
                     drop_rate =
