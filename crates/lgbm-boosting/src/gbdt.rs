@@ -1022,7 +1022,22 @@ impl<'a> Gbdt<'a> {
                     .train_on_subset_returning_partition(&in_bag, grad, hess, is_first_tree)?;
                 tree = grown;
                 if tree.num_leaves > 1 {
-                    Self::rf_renew_subset(learner, &mut tree, &subset_partition, &in_bag, labels, init);
+                    // RenewTreeOutput is GATED on obj->IsRenewTreeOutput()
+                    // (serial_tree_learner.cpp:922) — a NO-OP for L2 (the leaf value is
+                    // the learner's gradient-fit Newton output -sum_grad/sum_hess over
+                    // the bagged subset, derived from the constant init buffer), ACTIVE
+                    // for regression_l1 etc. (mean RESIDUAL `label - init`). RF renews
+                    // with `pred = init_scores_[k]` (a CONSTANT, rf.hpp:149-150).
+                    if self.objective.is_renew_tree_output() {
+                        self.rf_renew_subset(
+                            learner,
+                            &mut tree,
+                            &subset_partition,
+                            &in_bag,
+                            labels,
+                            init,
+                        );
+                    }
                     // NO shrinkage (rf.hpp shrinkage_rate_ = 1.0).
                     if Objective::init_score_is_significant(init) {
                         tree.add_bias(init);
@@ -1047,7 +1062,10 @@ impl<'a> Gbdt<'a> {
             let (grown, partition) = learner.train_returning_partition(grad, hess, is_first_tree)?;
             tree = grown;
             if tree.num_leaves > 1 {
-                self.rf_renew_full(&mut tree, &partition, learner, labels, init);
+                // RenewTreeOutput gated on obj->IsRenewTreeOutput() (no-op for L2).
+                if self.objective.is_renew_tree_output() {
+                    self.rf_renew_full(&mut tree, &partition, learner, labels, init);
+                }
                 if Objective::init_score_is_significant(init) {
                     tree.add_bias(init);
                 }
@@ -1104,10 +1122,13 @@ impl<'a> Gbdt<'a> {
     }
 
     /// RF leaf renewal on the FULL-corpus path (`rf.hpp:150-152`,
-    /// serial_tree_learner.cpp RenewTreeOutput): overwrite each leaf's output with
-    /// the mean residual `label - init_score` over its rows (the C++ residual_getter
-    /// `label[i] - pred` with `pred = init_scores_[cur_tree_id]`, a CONSTANT). RF
-    /// renews UNCONDITIONALLY (unlike the GBDT spine which only renews regression_l1).
+    /// serial_tree_learner.cpp:920-958 RenewTreeOutput, GATED on
+    /// `obj->IsRenewTreeOutput()`): overwrite each leaf's output with the objective's
+    /// renewal of the residuals `label - init_score` (the C++ residual_getter
+    /// `label[i] - pred` with `pred = init_scores_[cur_tree_id]`, a CONSTANT). The
+    /// renewal is the objective's percentile (median for regression_l1, weighted for
+    /// mape) — NOT a plain mean — dispatched via `renew_leaf_output`. A NO-OP for L2
+    /// (the caller only invokes this when `is_renew_tree_output()` is true).
     fn rf_renew_full<B: Backend>(
         &self,
         tree: &mut Tree,
@@ -1116,31 +1137,32 @@ impl<'a> Gbdt<'a> {
         labels: &[f32],
         init: f64,
     ) {
+        let obj = &self.objective;
         learner.renew_tree_output(
             tree,
             partition,
             Some(|_leaf: i32, rows: &[u32]| {
-                // Mean residual `label - init` over the leaf's rows (rf.hpp uses the
-                // mean — RenewTreeOutput with the residual_getter over a regression
-                // objective averages the residuals; PercentileFun is L1-only and RF's
-                // built-in objectives here are L2-family, so the renew is the mean).
                 if rows.is_empty() {
                     return 0.0;
                 }
-                let sum: f64 = rows
+                let residuals: Vec<f64> = rows
                     .iter()
                     .map(|&r| labels[r as usize] as f64 - init)
-                    .sum();
-                sum / rows.len() as f64
+                    .collect();
+                let leaf_labels: Vec<f32> =
+                    rows.iter().map(|&r| labels[r as usize]).collect();
+                obj.renew_leaf_output(&residuals, &leaf_labels)
             }),
         );
     }
 
     /// RF leaf renewal on the BAGGED-SUBSET path (`rf.hpp:150-152` with the subset
-    /// index mapping). Mirrors [`Self::rf_renew_full`] but maps each leaf's
-    /// subset-row index through `in_bag[sr]` to the full-corpus row before forming the
-    /// residual `label[fr] - init`.
+    /// index mapping, GATED on `obj->IsRenewTreeOutput()`). Mirrors
+    /// [`Self::rf_renew_full`] but maps each leaf's subset-row index through
+    /// `in_bag[sr]` to the full-corpus row before forming the residual `label[fr] -
+    /// init`. The renewal is the objective's percentile (`renew_leaf_output`).
     fn rf_renew_subset<B: Backend>(
+        &self,
         learner: &SerialTreeLearner<'_, B>,
         tree: &mut Tree,
         subset_partition: &lgbm_treelearner::DataPartition,
@@ -1148,8 +1170,7 @@ impl<'a> Gbdt<'a> {
         labels: &[f32],
         init: f64,
     ) {
-        // The partition's per-leaf rows are SUBSET indices; map each through
-        // `in_bag[sr]` to the full-corpus row before forming the residual.
+        let obj = &self.objective;
         learner.renew_tree_output(
             tree,
             subset_partition,
@@ -1157,14 +1178,15 @@ impl<'a> Gbdt<'a> {
                 if subset_rows.is_empty() {
                     return 0.0;
                 }
-                let sum: f64 = subset_rows
+                let full_rows: Vec<usize> = subset_rows
                     .iter()
-                    .map(|&sr| {
-                        let fr = in_bag[sr as usize] as usize;
-                        labels[fr] as f64 - init
-                    })
-                    .sum();
-                sum / subset_rows.len() as f64
+                    .map(|&sr| in_bag[sr as usize] as usize)
+                    .collect();
+                let residuals: Vec<f64> =
+                    full_rows.iter().map(|&fr| labels[fr] as f64 - init).collect();
+                let leaf_labels: Vec<f32> =
+                    full_rows.iter().map(|&fr| labels[fr]).collect();
+                obj.renew_leaf_output(&residuals, &leaf_labels)
             }),
         );
     }
