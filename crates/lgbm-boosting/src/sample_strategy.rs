@@ -24,18 +24,17 @@
 //!   — after the draw, `std::reverse(buf + left, buf + cnt)` reverses the OOB tail,
 //!   so `bag_data_indices = [in-bag asc] ++ [OOB desc]` (Pitfall 4).
 //!
-//! ## `bagging_by_query` — explicit, decision-backed Phase-7 deferral (BST-03)
+//! ## `bagging_by_query` — query-grouped bagging (BST-03, un-deferred in 07-09)
 //!
-//! Per the 2026-06-07 user decision (06-CONTEXT.md BST-03 scope note + Deferred
-//! Ideas), the query-grouped draw (`num_sampled_queries`/`sampled_query_indices`,
-//! the `bagging.hpp` query branch + `gbdt.cpp:227`) is DEFERRED to Phase 7 and
-//! ships there alongside the Phase-7 ranking objectives (OBJ-04/05/06) — the ONLY
-//! objectives it affects, none of which exist in Phase 6. Phase 6 ships pos/neg
-//! ROW bagging only. This is NOT a silent reduction: [`BaggingConfig::new`]
-//! REJECTS `bagging_by_query == true` with a typed [`BoostingError`], rather than
-//! silently falling through to row bagging (so a wrong-but-similar bag can never
-//! hide the missing query path). `bagging_by_query` is not dropped — it is
-//! scheduled for Phase 7.
+//! When `bagging_by_query == true` the draw's minimal unit is a whole QUERY, not a
+//! row (`bagging.hpp:52-104`): the per-block RNG draws over `num_queries_` against
+//! `bagging_fraction`, the in-bag queries are expanded to their `[query_boundaries[q],
+//! query_boundaries[q+1])` row ranges, and `sampled_query_boundaries_` is the
+//! prefix-sum of in-bag query sizes. This shipped DEFERRED in Phase 6 (the now-
+//! removed `BoostingError::BaggingByQueryDeferred`) pending the Phase-7 ranking
+//! objectives; 07-09 un-defers it alongside lambdarank/rank_xendcg (D-02 step 5,
+//! D-03). The query path reuses the SAME build-once `bagging_rands_` block-1024 RNG
+//! discipline as row bagging (the 07-01 bit-exact bagging carries over).
 
 use lgbm_core::random::Random;
 
@@ -60,18 +59,22 @@ pub struct BaggingConfig {
     pub bagging_freq: i32,
     /// `bagging_seed` (per-block RNG seed base; C++ default 3).
     pub bagging_seed: i32,
+    /// `bagging_by_query` — when true, the draw's minimal unit is a whole QUERY
+    /// (un-deferred in 07-09; see the module doc). Requires the caller to provide
+    /// `query_boundaries` to [`BaggingSampleStrategy::reset_sample_config`].
+    pub bagging_by_query: bool,
 }
 
 impl BaggingConfig {
-    /// Construct a [`BaggingConfig`], rejecting `bagging_by_query == true` as an
-    /// explicit Phase-7 deferral (BST-03 — see the module doc + 06-CONTEXT.md scope
-    /// note). This is the decision-backed guard: a caller that sets
-    /// `bagging_by_query = true` gets a typed error, NEVER a silent fall-through to
-    /// row bagging.
+    /// Construct a [`BaggingConfig`]. `bagging_by_query` is now a supported field
+    /// (07-09 un-deferred the query-grouped draw alongside the ranking objectives);
+    /// the `Result` return is retained for API stability with the Phase-6 callers,
+    /// and currently never errs.
     ///
     /// # Errors
-    /// [`BoostingError::BaggingByQueryDeferred`] when `bagging_by_query` is true
-    /// (the query-grouped draw ships with the Phase-7 ranking objectives).
+    /// None at present — the signature returns `Result` so callers established in
+    /// Phase 6 (which `?`-propagate this) keep compiling unchanged.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn new(
         bagging_fraction: f64,
         pos_bagging_fraction: f64,
@@ -80,15 +83,13 @@ impl BaggingConfig {
         bagging_seed: i32,
         bagging_by_query: bool,
     ) -> Result<Self, BoostingError> {
-        if bagging_by_query {
-            return Err(BoostingError::BaggingByQueryDeferred);
-        }
         Ok(Self {
             bagging_fraction,
             pos_bagging_fraction,
             neg_bagging_fraction,
             bagging_freq,
             bagging_seed,
+            bagging_by_query,
         })
     }
 }
@@ -116,6 +117,20 @@ pub struct BaggingSampleStrategy {
     /// from the continuing RNG stream — recreating them per draw would re-draw the
     /// SAME bag every iteration, diverging from the reference).
     bagging_rands: Vec<Random>,
+    /// `query_boundaries_` (prefix-sum, len num_queries+1) — present only when
+    /// `bagging_by_query` is active; empty otherwise. Captured at
+    /// `reset_sample_config` from the dataset metadata.
+    query_boundaries: Vec<i32>,
+    /// `bag_query_indices_` — `[in-bag query asc] ++ [OOB query desc]` after a query
+    /// draw (the query analog of `bag_data_indices_`). Empty in row mode.
+    bag_query_indices: Vec<i32>,
+    /// `num_sampled_queries_` — the in-bag query count (split point of
+    /// `bag_query_indices`).
+    num_sampled_queries: i32,
+    /// `sampled_query_boundaries_` — the prefix-sum of in-bag query sizes
+    /// (`len num_sampled_queries + 1`), so the kept rows of sampled query `s` are
+    /// `bag_data_indices[sampled_query_boundaries[s]..sampled_query_boundaries[s+1]]`.
+    sampled_query_boundaries: Vec<i32>,
 }
 
 impl BaggingSampleStrategy {
@@ -153,6 +168,49 @@ impl BaggingSampleStrategy {
             bag_data_indices: Vec::new(),
             need_re_bagging: true,
             bagging_rands,
+            query_boundaries: Vec::new(),
+            bag_query_indices: Vec::new(),
+            num_sampled_queries: 0,
+            sampled_query_boundaries: Vec::new(),
+        }
+    }
+
+    /// C++ `ResetSampleConfig` with `bagging_by_query == true` (bagging.hpp:171-176):
+    /// the query-grouped variant. The draw's minimal unit is a whole QUERY; the
+    /// per-block `bagging_rands_` are STILL sized by `num_data` (bagging.hpp:178-181,
+    /// the seeding loop uses `num_data_`, NOT `num_queries_`), so the RNG stream is
+    /// identical to row bagging up to which positions are consumed.
+    ///
+    /// `query_boundaries` is the prefix-sum group array (`[0, …, num_data]`,
+    /// `num_queries + 1` entries). The balanced (pos/neg) path is NOT used in the
+    /// query branch (C++ always calls the plain `BaggingHelper` there, bagging.hpp:58).
+    pub fn reset_sample_config_with_queries(
+        config: BaggingConfig,
+        num_data: i32,
+        query_boundaries: &[i32],
+    ) -> Self {
+        let nd = num_data.max(0);
+        let num_queries = (query_boundaries.len() as i32 - 1).max(0);
+        // bag_data_cnt_ = trunc(bagging_fraction * num_data) initially (bagging.hpp:161);
+        // overwritten to the realized sampled row count after the first draw.
+        let bag_data_cnt = (config.bagging_fraction * nd as f64) as i32;
+        // Per-block RNG sized by num_data (bagging.hpp:178-181), built ONCE.
+        let n_blocks = ((nd + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK).max(0);
+        let bagging_rands: Vec<Random> = (0..n_blocks)
+            .map(|i| Random::new(config.bagging_seed + i))
+            .collect();
+        Self {
+            config,
+            num_data: nd,
+            balanced: false,
+            bag_data_cnt,
+            bag_data_indices: Vec::new(),
+            need_re_bagging: true,
+            bagging_rands,
+            query_boundaries: query_boundaries.to_vec(),
+            bag_query_indices: vec![0i32; nd as usize],
+            num_sampled_queries: 0,
+            sampled_query_boundaries: vec![0i32; (num_queries + 1) as usize],
         }
     }
 
@@ -223,8 +281,98 @@ impl BaggingSampleStrategy {
         true
     }
 
+    /// C++ `BaggingSampleStrategy::Bagging` with `bagging_by_query == true`
+    /// (bagging.hpp:52-104), ported 1:1. Draws QUERIES (not rows) via the per-block
+    /// `bagging_rands_` against `bagging_fraction` over `num_queries_`, then expands
+    /// each in-bag query to its `[query_boundaries[q], query_boundaries[q+1])` row
+    /// range, building `sampled_query_boundaries_` (the prefix-sum of in-bag query
+    /// sizes) and `bag_data_indices_` (the expanded kept rows in query order).
+    /// Returns `true` when a (re)bag happened.
+    ///
+    /// The query draw does NOT do the one-buffer reverse (the C++ query branch's
+    /// single bagging-runner block has no OOB tail to reverse); `bag_query_indices`
+    /// holds `[in-bag query asc] ++ [OOB query desc-filled]` and only the in-bag
+    /// prefix `[0, num_sampled_queries)` is expanded.
+    pub fn bagging_by_query(&mut self, iter: i32) -> bool {
+        if !self.should_bag(iter) {
+            return false;
+        }
+        self.need_re_bagging = false;
+        let num_queries = (self.query_boundaries.len() as i32 - 1).max(0);
+        // BaggingHelper over num_queries: draw each query index IN ORDER against
+        // bagging_fraction (bagging.hpp:230-246), the per-block RNG keyed by the
+        // QUERY index / 1024 (cur_idx / bagging_rand_block_). cur_left filled left,
+        // OOB filled from the right.
+        let rands = &mut self.bagging_rands;
+        let mut cur_left = 0usize;
+        let mut cur_right = num_queries as usize;
+        for q in 0..num_queries {
+            let block = (q / BAGGING_RAND_BLOCK) as usize;
+            let draw = rands[block].next_float() as f64;
+            if draw < self.config.bagging_fraction {
+                self.bag_query_indices[cur_left] = q;
+                cur_left += 1;
+            } else {
+                cur_right -= 1;
+                self.bag_query_indices[cur_right] = q;
+            }
+        }
+        self.num_sampled_queries = cur_left as i32;
+
+        // Build sampled_query_boundaries_ as the prefix-sum of in-bag query sizes
+        // (bagging.hpp:62-91). sampled_query_boundaries_[0] = 0.
+        self.sampled_query_boundaries.clear();
+        self.sampled_query_boundaries.push(0);
+        for s in 0..cur_left {
+            let q = self.bag_query_indices[s] as usize;
+            let q_size = self.query_boundaries[q + 1] - self.query_boundaries[q];
+            let prev = *self.sampled_query_boundaries.last().unwrap();
+            self.sampled_query_boundaries.push(prev + q_size);
+        }
+        let total_rows = *self.sampled_query_boundaries.last().unwrap();
+        self.bag_data_cnt = total_rows;
+
+        // Expand the in-bag queries to their row ranges (bagging.hpp:93-103).
+        let mut bag_data_indices = vec![0i32; total_rows as usize];
+        for s in 0..cur_left {
+            let q = self.bag_query_indices[s] as usize;
+            let data_start = self.query_boundaries[q];
+            let data_end = self.query_boundaries[q + 1];
+            let sampled_start = self.sampled_query_boundaries[s];
+            for (off, i) in (data_start..data_end).enumerate() {
+                bag_data_indices[(sampled_start + off as i32) as usize] = i;
+            }
+        }
+        self.bag_data_indices = bag_data_indices;
+        true
+    }
+
+    /// `bag_query_indices_` — `[in-bag query asc] ++ [OOB query desc]` (the query
+    /// analog of [`Self::bag_data_indices`]; the RNG-replay golden asserts the in-bag
+    /// prefix bit-exact).
+    pub fn bag_query_indices(&self) -> &[i32] {
+        &self.bag_query_indices
+    }
+
+    /// `num_sampled_queries_` — the realized in-bag query count.
+    pub fn num_sampled_queries(&self) -> i32 {
+        self.num_sampled_queries
+    }
+
+    /// The in-bag (sampled) query indices (`bag_query_indices_[..num_sampled_queries]`).
+    pub fn sampled_query_indices(&self) -> &[i32] {
+        &self.bag_query_indices[..self.num_sampled_queries.max(0) as usize]
+    }
+
+    /// `sampled_query_boundaries_` — the prefix-sum of in-bag query sizes
+    /// (`len num_sampled_queries + 1`).
+    pub fn sampled_query_boundaries(&self) -> &[i32] {
+        &self.sampled_query_boundaries
+    }
+
     /// `bag_data_indices_` — `[in-bag asc] ++ [OOB desc]` (the full ordered array
-    /// the D-13 RNG-replay golden asserts).
+    /// the D-13 RNG-replay golden asserts). In query mode this is the expanded kept
+    /// rows in query order (length `bag_data_cnt`).
     pub fn bag_data_indices(&self) -> &[i32] {
         &self.bag_data_indices
     }
@@ -647,13 +795,117 @@ mod tests {
     }
 
     #[test]
-    fn bagging_by_query_true_is_typed_error() {
-        // EXPLICIT SCOPE BOUNDARY (BST-03): bagging_by_query=true is REJECTED, not
-        // silently treated as row bagging.
-        let err = BaggingConfig::new(0.7, 1.0, 1.0, 1, 3, true).unwrap_err();
-        assert!(matches!(err, BoostingError::BaggingByQueryDeferred));
-        // bagging_by_query=false (the default) takes the row-bagging path.
-        assert!(BaggingConfig::new(0.7, 1.0, 1.0, 1, 3, false).is_ok());
+    fn bagging_by_query_config_is_accepted() {
+        // 07-09 un-deferred bagging_by_query: it is now a supported config field, not
+        // a typed error. Both true and false construct cleanly.
+        let cfg = BaggingConfig::new(0.7, 1.0, 1.0, 1, 3, true).unwrap();
+        assert!(cfg.bagging_by_query);
+        let cfg = BaggingConfig::new(0.7, 1.0, 1.0, 1, 3, false).unwrap();
+        assert!(!cfg.bagging_by_query);
+    }
+
+    /// Verbatim re-implementation of the C++ query-grouped draw + expansion
+    /// (bagging.hpp:52-104) over the proven `lgbm_core::Random` — the bagging_by_query
+    /// RNG-replay reference. Returns (sampled_query_indices, sampled_query_boundaries,
+    /// expanded_bag_data_indices).
+    fn reference_bag_by_query(
+        seed: i32,
+        fraction: f64,
+        num_data: i32,
+        query_boundaries: &[i32],
+    ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+        let num_queries = query_boundaries.len() as i32 - 1;
+        // bagging_rands sized by num_data (bagging.hpp:178-181).
+        let n_blocks = (num_data + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK;
+        let mut rands: Vec<Random> = (0..n_blocks).map(|i| Random::new(seed + i)).collect();
+        let mut buf = vec![0i32; num_data as usize];
+        let mut left = 0usize;
+        let mut right = num_queries as usize;
+        for q in 0..num_queries {
+            let block = (q / BAGGING_RAND_BLOCK) as usize;
+            if (rands[block].next_float() as f64) < fraction {
+                buf[left] = q;
+                left += 1;
+            } else {
+                right -= 1;
+                buf[right] = q;
+            }
+        }
+        let sampled: Vec<i32> = buf[..left].to_vec();
+        let mut sqb = vec![0i32];
+        for &q in &sampled {
+            let sz = query_boundaries[q as usize + 1] - query_boundaries[q as usize];
+            let prev = *sqb.last().unwrap();
+            sqb.push(prev + sz);
+        }
+        let total = *sqb.last().unwrap();
+        let mut expanded = vec![0i32; total as usize];
+        for (s, &q) in sampled.iter().enumerate() {
+            let ds = query_boundaries[q as usize];
+            let de = query_boundaries[q as usize + 1];
+            let ss = sqb[s];
+            for (off, i) in (ds..de).enumerate() {
+                expanded[(ss + off as i32) as usize] = i;
+            }
+        }
+        (sampled, sqb, expanded)
+    }
+
+    #[test]
+    fn bagging_by_query_matches_rng_replay_golden() {
+        // The sampled query indices + sampled_query_boundaries + expanded row indices
+        // match the verbatim query-grouped RNG-replay reference bit-exact.
+        // 6 queries of varying sizes summing to 20 rows.
+        let qb = vec![0i32, 3, 5, 9, 12, 18, 20];
+        let num_data = 20;
+        for (seed, frac) in [(3i32, 0.7f64), (3, 0.5), (7, 0.6), (3, 0.4)] {
+            let cfg = BaggingConfig::new(frac, 1.0, 1.0, 1, seed, true).unwrap();
+            let mut s =
+                BaggingSampleStrategy::reset_sample_config_with_queries(cfg, num_data, &qb);
+            assert!(s.bagging_by_query(0), "iter 0 must bag (need_re_bagging)");
+            let (exp_sampled, exp_sqb, exp_rows) =
+                reference_bag_by_query(seed, frac, num_data, &qb);
+            assert_eq!(
+                s.sampled_query_indices(),
+                exp_sampled.as_slice(),
+                "seed={seed} frac={frac}: sampled query indices must match RNG-replay"
+            );
+            assert_eq!(
+                s.sampled_query_boundaries(),
+                exp_sqb.as_slice(),
+                "seed={seed} frac={frac}: sampled_query_boundaries must match"
+            );
+            assert_eq!(
+                s.bag_data_indices(),
+                exp_rows.as_slice(),
+                "seed={seed} frac={frac}: expanded row indices must match"
+            );
+            assert_eq!(s.num_sampled_queries(), exp_sampled.len() as i32);
+            assert_eq!(s.bag_data_cnt(), exp_rows.len() as i32);
+        }
+    }
+
+    #[test]
+    fn bagging_by_query_expands_whole_queries() {
+        // Every kept row must belong to an in-bag query (whole-query granularity:
+        // no partial queries).
+        let qb = vec![0i32, 4, 7, 10];
+        let cfg = BaggingConfig::new(0.6, 1.0, 1.0, 1, 3, true).unwrap();
+        let mut s = BaggingSampleStrategy::reset_sample_config_with_queries(cfg, 10, &qb);
+        s.bagging_by_query(0);
+        let sampled: std::collections::BTreeSet<i32> =
+            s.sampled_query_indices().iter().copied().collect();
+        // Each kept row's query must be in the sampled set.
+        for &row in s.bag_data_indices() {
+            let q = qb.windows(2).position(|w| row >= w[0] && row < w[1]).unwrap() as i32;
+            assert!(sampled.contains(&q), "row {row} (query {q}) must be in-bag");
+        }
+        // And all rows of an in-bag query are present.
+        for &q in s.sampled_query_indices() {
+            for r in qb[q as usize]..qb[q as usize + 1] {
+                assert!(s.bag_data_indices().contains(&r), "row {r} of in-bag query {q} missing");
+            }
+        }
     }
 
     #[test]

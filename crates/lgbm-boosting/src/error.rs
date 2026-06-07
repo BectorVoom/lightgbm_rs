@@ -52,18 +52,6 @@ pub enum BoostingError {
     #[error("metric error: {0}")]
     Metric(#[from] MetricError),
 
-    /// `bagging_by_query = true` was requested in Phase 6 (BST-03, threat
-    /// T-06-05-04). The query-grouped draw is an EXPLICIT, decision-backed Phase-7
-    /// deferral (06-CONTEXT.md BST-03 scope note) — it ships with the Phase-7
-    /// ranking objectives (OBJ-04/05/06), the only objectives it affects. Phase 6
-    /// rejects it with this typed error rather than silently falling through to
-    /// pos/neg row bagging (which would produce a wrong-but-similar bag).
-    #[error(
-        "bagging_by_query is deferred to Phase 7 (ships with the ranking objectives); \
-         Phase 6 supports pos/neg row bagging only (BST-03 scope note)"
-    )]
-    BaggingByQueryDeferred,
-
     /// Early stopping was requested (`early_stopping_round > 0`) but no validation
     /// set was supplied (threat T-06-05-02). The stop decision reads
     /// `score.last()` of each valid set's metric history; with no valid set there is
