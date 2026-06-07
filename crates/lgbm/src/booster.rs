@@ -17,7 +17,7 @@ use lgbm_compute::gain::GainConfig;
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
 use lgbm_core::Config;
-use lgbm_dataset::bin_mapper::MissingType;
+use lgbm_dataset::bin_mapper::{BinMapper, MissingType};
 use lgbm_metric::{BinaryMetric, Metric, MultiLogloss};
 use lgbm_model::{GbdtModel, ObjectiveKind};
 use lgbm_objective::{
@@ -188,6 +188,199 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
         });
     }
     Ok(columns)
+}
+
+/// A dense training corpus of RAW (arbitrary real-valued) features — the D-02
+/// raw→bin→train input. Unlike [`DenseCorpus`] (which requires identity-binnable
+/// integer columns), `RawCorpus` carries arbitrary continuous (or categorical)
+/// values that are binned internally by the bit-exact [`BinMapper`]
+/// (`find_bin_from_column` / `find_bin_categorical`, Phase-2) before training.
+///
+/// This is the slice the Python wrapper depends on: a Python user passes a numpy
+/// matrix of real values, which marshals into a `RawCorpus`; the facade bins it
+/// via the same `BinMapper` the parity harness proves bit-exact, so the
+/// raw→bin→train path reproduces the identity-bin / C++ golden output.
+#[derive(Debug, Clone)]
+pub struct RawCorpus {
+    /// Row-major RAW feature values, `num_data` rows × `num_features` columns.
+    pub features: Vec<Vec<f64>>,
+    /// Per-row labels (length `num_data`).
+    pub labels: Vec<f32>,
+    /// Real-feature indices (columns) to bin as CATEGORICAL via
+    /// [`BinMapper::find_bin_categorical`] (D-04). Empty ⇒ all numeric.
+    pub categorical_features: Vec<usize>,
+    /// The binning + training [`Config`] (`max_bin`, `min_data_in_bin`,
+    /// `bin_construct_sample_cnt`, `data_random_seed`, `use_missing`,
+    /// `zero_as_missing`, `min_data_in_leaf`). Defaults to [`Config::default`].
+    pub config: Config,
+}
+
+impl RawCorpus {
+    /// Construct a `RawCorpus` of all-numeric features with the default binning
+    /// [`Config`]. Use the struct literal directly to set `categorical_features`
+    /// or a custom `config`.
+    pub fn new(features: Vec<Vec<f64>>, labels: Vec<f32>) -> Self {
+        Self {
+            features,
+            labels,
+            categorical_features: Vec::new(),
+            config: Config::default(),
+        }
+    }
+}
+
+/// Build [`FeatureColumn`]s from a RAW corpus by binning each column with the
+/// bit-exact [`BinMapper`] (D-02). This is the raw→bin→train bridge: it mirrors
+/// the EXACT `FeatureColumn { .. }` construction shape of [`build_feature_columns`]
+/// but drives every bin-layout field from a per-column `BinMapper` instead of the
+/// identity-binning assumption. The authoritative
+/// [`offset_for_most_freq_bin`](lgbm_treelearner::offset_for_most_freq_bin) helper
+/// is REUSED unchanged (the single offset source, D-09).
+///
+/// Route A (RESEARCH Open-Q 2): the per-column mapper is built via
+/// [`BinMapper::find_bin_from_column`] (numeric) or
+/// [`BinMapper::find_bin_categorical`] (categorical), then each row's raw value is
+/// mapped with [`BinMapper::value_to_bin`].
+///
+/// # Errors
+/// [`LgbmError::InvalidCorpus`] for an empty corpus, a labels/num_data mismatch,
+/// a ragged row, or a non-finite categorical index — validated BEFORE any binning
+/// (Security V5, T-08-01-01).
+pub fn build_feature_columns_from_raw(
+    corpus: &RawCorpus,
+) -> Result<Vec<FeatureColumn>, LgbmError> {
+    // ---- shape validation BEFORE any binning / indexing (T-08-01-01) ----
+    let num_data = corpus.features.len();
+    if num_data == 0 {
+        return Err(LgbmError::InvalidCorpus {
+            detail: "empty corpus (no rows)".into(),
+        });
+    }
+    let num_features = corpus.features[0].len();
+    if num_features == 0 {
+        return Err(LgbmError::InvalidCorpus {
+            detail: "corpus row 0 has no features".into(),
+        });
+    }
+    if corpus.labels.len() != num_data {
+        return Err(LgbmError::InvalidCorpus {
+            detail: format!(
+                "labels length {} != num_data {num_data}",
+                corpus.labels.len()
+            ),
+        });
+    }
+    for (i, row) in corpus.features.iter().enumerate() {
+        if row.len() != num_features {
+            return Err(LgbmError::InvalidCorpus {
+                detail: format!("row {i} has {} cols, expected {num_features}", row.len()),
+            });
+        }
+    }
+    for &c in &corpus.categorical_features {
+        if c >= num_features {
+            return Err(LgbmError::InvalidCorpus {
+                detail: format!(
+                    "categorical feature index {c} out of range (num_features {num_features})"
+                ),
+            });
+        }
+    }
+
+    let cfg = &corpus.config;
+    // The pre-filter threshold is OFF by default (no min_data_in_leaf filtering of
+    // bins) for the facade — matching the in-memory sample path. The BinMapper
+    // builders take care of scaling internally.
+    let pre_filter = false;
+    let mut columns = Vec::with_capacity(num_features);
+    for j in 0..num_features {
+        // Gather the raw column (f64).
+        let column: Vec<f64> = corpus.features.iter().map(|row| row[j]).collect();
+
+        // Build the per-column BinMapper (Route A).
+        let mapper: BinMapper = if corpus.categorical_features.contains(&j) {
+            BinMapper::find_bin_categorical(
+                column.clone(),
+                cfg.max_bin,
+                cfg.min_data_in_bin,
+                cfg.min_data_in_leaf,
+                pre_filter,
+                cfg.use_missing,
+                cfg.zero_as_missing,
+                column.len(),
+            )
+        } else {
+            BinMapper::find_bin_from_column(
+                &column,
+                cfg.max_bin,
+                cfg.min_data_in_bin,
+                cfg.min_data_in_leaf,
+                pre_filter,
+                cfg.use_missing,
+                cfg.zero_as_missing,
+                cfg.bin_construct_sample_cnt,
+                cfg.data_random_seed,
+                &[],
+            )
+        };
+
+        // Per-row raw→bin via the mapper (bin_mapper.rs:148).
+        let bins: Vec<u32> = column.iter().map(|&v| mapper.value_to_bin(v)).collect();
+
+        let num_bin = mapper.num_bin_ as u32;
+        let most_freq_bin = mapper.most_freq_bin_;
+        let bin_type = mapper.bin_type_;
+        // bin_2_categorical_ maps bin → original category value (BinToValue);
+        // carried so a categorical split can rebuild its cat_threshold bitset.
+        let bin_to_category = mapper.bin_2_categorical_.clone();
+
+        columns.push(FeatureColumn {
+            bins,
+            num_bin,
+            offset: offset_for_most_freq_bin(most_freq_bin),
+            // Single-feature group: the feature owns bins [0, num_bin-1].
+            min_bin: 0,
+            max_bin: num_bin.saturating_sub(1),
+            default_bin: mapper.default_bin_,
+            most_freq_bin,
+            missing_type: mapper.missing_type_,
+            bin_upper_bound: mapper.bin_upper_bound_.clone(),
+            real_feature_index: j as i32,
+            bin_type,
+            bin_to_category,
+        });
+    }
+    Ok(columns)
+}
+
+/// Train a [`Booster`] from a RAW corpus (the D-02 raw→bin→train entry point).
+/// Bins each feature with the bit-exact [`BinMapper`] via
+/// [`build_feature_columns_from_raw`], then drives the SAME `train_inner_full`
+/// consumer used by [`train`]. The objective/metric resolution mirrors `train`.
+///
+/// # Errors
+/// [`LgbmError`] for an invalid corpus, an unsupported objective/metric, or a
+/// loop/learner failure — never a panic (Security V5).
+pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmError> {
+    let first = config.objective.split_whitespace().next().unwrap_or("");
+    // Resolve the objective over a thin DenseCorpus view (labels only are used by
+    // resolve_objective's label guards; the features are not re-binned there).
+    let label_view = DenseCorpus {
+        features: corpus.features.clone(),
+        labels: corpus.labels.clone(),
+    };
+    let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
+    let metrics = eval_metrics_for(first, config);
+    let features = build_feature_columns_from_raw(corpus)?;
+    train_inner_columns(
+        config,
+        &corpus.features,
+        &corpus.labels,
+        features,
+        boost_obj,
+        transformed_labels,
+        metrics,
+    )
 }
 
 /// The trained ensemble + eval history (D-05). Mirrors the Python `Booster`'s
@@ -394,15 +587,71 @@ fn train_inner_full(
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
 ) -> Result<Booster, LgbmError> {
+    // The identity path builds its feature columns from the integer-binnable
+    // corpus, then delegates to the shared column-based driver. The raw→bin→train
+    // path (train_raw) supplies pre-binned columns to `train_inner_columns` directly.
+    let features = build_feature_columns(corpus)?;
+    train_inner_columns_full(
+        config,
+        &corpus.features,
+        &corpus.labels,
+        valid,
+        features,
+        boost_obj,
+        labels,
+        metrics,
+    )
+}
+
+/// The column-based training driver used by the raw→bin→train path (no validation
+/// set; early stopping / bagging still honored from config when `valid` is `None`).
+/// Pre-binned [`FeatureColumn`]s are supplied directly (already built via the
+/// bit-exact `BinMapper`), so this NEVER re-bins.
+#[allow(clippy::too_many_arguments)]
+fn train_inner_columns(
+    config: &Config,
+    feature_rows: &[Vec<f64>],
+    corpus_labels: &[f32],
+    features: Vec<FeatureColumn>,
+    boost_obj: BoostObjective<'_>,
+    labels: Vec<f32>,
+    metrics: Vec<EvalMetric>,
+) -> Result<Booster, LgbmError> {
+    train_inner_columns_full(
+        config,
+        feature_rows,
+        corpus_labels,
+        None,
+        features,
+        boost_obj,
+        labels,
+        metrics,
+    )
+}
+
+/// The full column-based training driver: takes the raw feature rows (for the
+/// valid-score predict + feature_infos), the corpus labels (for metric eval), and
+/// the PRE-BUILT feature columns (identity-binned OR `BinMapper`-binned). All
+/// binning happens BEFORE this is called.
+#[allow(clippy::too_many_arguments)]
+fn train_inner_columns_full(
+    config: &Config,
+    feature_rows: &[Vec<f64>],
+    corpus_labels: &[f32],
+    valid: Option<&DenseCorpus>,
+    features: Vec<FeatureColumn>,
+    boost_obj: BoostObjective<'_>,
+    labels: Vec<f32>,
+    metrics: Vec<EvalMetric>,
+) -> Result<Booster, LgbmError> {
     use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};
 
     let objective_string = canonical_objective_string(config);
     let objective_kind = ObjectiveKind::parse(&objective_string)
         .unwrap_or(ObjectiveKind::Regression { sqrt: false });
 
-    // ---- identity-binned feature columns ----
-    let features = build_feature_columns(corpus)?;
-    let num_data = corpus.features.len() as i32;
+    // ---- feature columns (pre-built by the caller) ----
+    let num_data = feature_rows.len() as i32;
     let num_class = config.num_class.max(1);
     let num_features = features.len();
     let max_feature_idx = features
@@ -649,7 +898,7 @@ fn train_inner_full(
         // Training metrics: history is metric_freq-gated (MET-02 unchanged).
         if do_eval && provide_train {
             for (mi, m) in metrics.iter().enumerate() {
-                let v = m.eval(&snap.score, &corpus.labels)?;
+                let v = m.eval(&snap.score, corpus_labels)?;
                 train_eval_history[mi].1.push(v);
                 legacy_eval_history[mi].1.push(v);
             }
@@ -701,7 +950,7 @@ fn train_inner_full(
         objective_string,
         max_feature_idx,
         feature_names(num_features),
-        feature_infos(corpus, num_features),
+        feature_infos_from_rows(feature_rows, num_features),
     );
 
     Ok(Booster {
@@ -782,21 +1031,34 @@ fn feature_names(num_features: usize) -> String {
         .join(" ")
 }
 
-/// `feature_infos=` for the model text: `[min:max]` per feature (identity bins
-/// `0..num_bin-1`), matching the capture's `[0:5] [0:2]`.
-fn feature_infos(corpus: &DenseCorpus, num_features: usize) -> String {
+/// `feature_infos=` for the model text: `[min:max]` per feature. For the identity
+/// path the raw values are the integer bins `0..num_bin-1`, so integral min/max
+/// print without a decimal point (matching the capture's `[0:5] [0:2]`); the
+/// raw→bin→train path's continuous values print with their real value.
+fn feature_infos_from_rows(feature_rows: &[Vec<f64>], num_features: usize) -> String {
     (0..num_features)
         .map(|j| {
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
-            for row in &corpus.features {
+            for row in feature_rows {
                 min = min.min(row[j]);
                 max = max.max(row[j]);
             }
-            format!("[{}:{}]", min as i64, max as i64)
+            format!("[{}:{}]", fmt_bound(min), fmt_bound(max))
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Format a feature-info bound: integral values print as an integer (`5` not
+/// `5.0`, preserving the identity-path capture bytes); non-integral values print
+/// their real value.
+fn fmt_bound(v: f64) -> String {
+    if v.is_finite() && v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
 }
 
 #[cfg(test)]
@@ -1187,5 +1449,156 @@ mod tests {
             labels: vec![1.0, 2.0],
         };
         assert!(build_feature_columns(&corpus).is_err());
+    }
+
+    // ---- Task 1 (D-02 raw→bin→train bridge) ----
+
+    /// A deterministic binning config: single-thread, fixed seed, large sample
+    /// count so every row is sampled (so `find_bin_from_column` sees the full
+    /// column) — the REFERENCE_MANIFEST shape for parity-stable binning.
+    fn det_config(objective: &str) -> Config {
+        let mut cfg = TrainingBuilder::new()
+            .objective(objective)
+            .num_iterations(10)
+            .learning_rate(0.1)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .metric("l2,rmse")
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        // min_data_in_bin=1 so each distinct integer value gets its OWN bin (the
+        // identity-binning precondition the trivial-case equivalence relies on —
+        // the default min_data_in_bin=3 would MERGE adjacent integer bins).
+        cfg.min_data_in_bin = 1;
+        cfg
+    }
+
+    #[test]
+    fn raw_bin_equals_identity_bin_on_trivial_case() {
+        // When the raw values ARE the consecutive integers 0..K-1, the BinMapper
+        // collapses to identity binning, so build_feature_columns_from_raw must
+        // produce the SAME bin indices + num_bin as build_feature_columns.
+        let corpus = spine_corpus();
+        let identity = build_feature_columns(&corpus).expect("identity ok");
+        let raw = RawCorpus {
+            features: corpus.features.clone(),
+            labels: corpus.labels.clone(),
+            categorical_features: Vec::new(),
+            config: det_config("regression"),
+        };
+        let bridged = build_feature_columns_from_raw(&raw).expect("raw ok");
+        assert_eq!(identity.len(), bridged.len());
+        for (i, (idc, brc)) in identity.iter().zip(bridged.iter()).enumerate() {
+            assert_eq!(idc.bins, brc.bins, "feature {i} bins must match identity");
+            assert_eq!(idc.num_bin, brc.num_bin, "feature {i} num_bin");
+            assert_eq!(
+                idc.most_freq_bin, brc.most_freq_bin,
+                "feature {i} most_freq_bin"
+            );
+            assert_eq!(idc.offset, brc.offset, "feature {i} offset");
+        }
+    }
+
+    #[test]
+    fn raw_bin_train_equals_identity_bin_train_on_trivial_case() {
+        // Training the SAME integer-valued corpus via the raw path and the identity
+        // path must produce bit-identical model text (the raw bridge collapses to
+        // the identity path when values are already 0..K-1).
+        let cfg = det_config("regression");
+        let corpus = spine_corpus();
+        let id_booster = train(&cfg, &corpus).expect("identity train");
+        let raw = RawCorpus {
+            features: corpus.features.clone(),
+            labels: corpus.labels.clone(),
+            categorical_features: Vec::new(),
+            config: cfg.clone(),
+        };
+        let raw_booster = train_raw(&cfg, &raw).expect("raw train");
+        // Leaf values bit-exact across all trees.
+        assert_eq!(
+            id_booster.model().trees.len(),
+            raw_booster.model().trees.len()
+        );
+        for (ti, (idt, rwt)) in id_booster
+            .model()
+            .trees
+            .iter()
+            .zip(raw_booster.model().trees.iter())
+            .enumerate()
+        {
+            for (li, (iv, rv)) in idt
+                .leaf_value
+                .iter()
+                .zip(rwt.leaf_value.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    iv.to_bits(),
+                    rv.to_bits(),
+                    "tree {ti} leaf {li}: identity {iv} != raw {rv} (bit-exact)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_bin_train_real_values_trains_and_orders() {
+        // A corpus of REAL continuous values trains via the raw path (binned by the
+        // BinMapper) and predicts monotonically (low-label rows < high-label rows).
+        let cfg = det_config("regression");
+        let f0 = [0.1f64, 0.15, 1.2, 1.25, 2.7, 2.75, 3.9, 3.95, 5.1, 5.15, 6.6, 6.65];
+        let f1 = [0.0f64, 1.1, 2.2, 0.05, 1.15, 2.25, 0.1, 1.2, 2.3, 0.0, 1.1, 2.2];
+        let features: Vec<Vec<f64>> = (0..12).map(|i| vec![f0[i], f1[i]]).collect();
+        let labels = vec![
+            2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
+        ];
+        let raw = RawCorpus {
+            features: features.clone(),
+            labels,
+            categorical_features: Vec::new(),
+            config: cfg.clone(),
+        };
+        let booster = train_raw(&cfg, &raw).expect("raw real train");
+        assert_eq!(booster.model().num_iteration(), 10);
+        let p_low = booster.predict_row(&[0.1, 0.0]);
+        let p_high = booster.predict_row(&[6.6, 2.2]);
+        assert!(p_low[0] < p_high[0], "{} < {}", p_low[0], p_high[0]);
+    }
+
+    #[test]
+    fn raw_bin_train_validates_shape() {
+        let cfg = det_config("regression");
+        // empty corpus
+        let empty = RawCorpus::new(Vec::new(), Vec::new());
+        assert!(matches!(
+            build_feature_columns_from_raw(&empty),
+            Err(LgbmError::InvalidCorpus { .. })
+        ));
+        // labels/num_data mismatch
+        let mismatch = RawCorpus::new(vec![vec![0.0], vec![1.0]], vec![1.0]);
+        assert!(matches!(
+            build_feature_columns_from_raw(&mismatch),
+            Err(LgbmError::InvalidCorpus { .. })
+        ));
+        // ragged row
+        let ragged = RawCorpus::new(vec![vec![0.0, 1.0], vec![1.0]], vec![1.0, 2.0]);
+        assert!(matches!(
+            build_feature_columns_from_raw(&ragged),
+            Err(LgbmError::InvalidCorpus { .. })
+        ));
+        // out-of-range categorical index
+        let bad_cat = RawCorpus {
+            features: vec![vec![0.0], vec![1.0]],
+            labels: vec![1.0, 2.0],
+            categorical_features: vec![5],
+            config: cfg,
+        };
+        assert!(matches!(
+            build_feature_columns_from_raw(&bad_cat),
+            Err(LgbmError::InvalidCorpus { .. })
+        ));
     }
 }
