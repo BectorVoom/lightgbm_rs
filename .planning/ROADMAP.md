@@ -366,7 +366,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 08-06-PLAN.md — custom obj/metric callbacks + Booster.refit() (PYB-04)
+- [x] 08-06-PLAN.md — custom obj/metric callbacks + Booster.refit() (PYB-04)
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
@@ -392,4 +392,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
 | 7. Parity-Completing Variants | 12/12 | Complete    | 2026-06-07 |
-| 8. Python Bindings | 5/8 | In Progress|  |
+| 8. Python Bindings | 6/8 | In Progress|  |

@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-06-07T22:38:29.022Z"
-last_activity: "2026-06-08 -- Completed 08-03 (PYB-02 input widening: f32/f64 dense dtype dispatch + scipy CSR/CSC sparse, single widen site; A/B parity over all four input kinds vs real lightgbm 4.6 at atol=1e-6, 9 new pytest green)"
+last_updated: "2026-06-07T23:34:20.667Z"
+last_activity: 2026-06-08 -- Completed 08-04 (PYB-02 polars DataFrame input via Arrow + dtype→categorical routing; categorical A/B vs real lightgbm 4.6 at atol=1e-6; full pytest suite 30 green) and 08-05 (full params-dict pipeline D-06/07/08)
 progress:
   total_phases: 8
   completed_phases: 6
   total_plans: 54
-  completed_plans: 49
+  completed_plans: 51
   percent: 75
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 08 (python-bindings) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: Executing (08-01..05 complete; Wave 4 plan 08-06 next)
 Last activity: 2026-06-08 -- Completed 08-04 (PYB-02 polars DataFrame input via Arrow + dtype→categorical routing; categorical A/B vs real lightgbm 4.6 at atol=1e-6; full pytest suite 30 green) and 08-05 (full params-dict pipeline D-06/07/08)
 
@@ -396,6 +396,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 07 P11 | 150 | 4 tasks | 14 files |
 | Phase 07 P12 | 19 | 4 tasks | 16 files |
 | Phase 08 P08-05 | 10 min | 2 tasks | 5 files |
+| Phase 08 P08-06 | 35min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -492,6 +493,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T22:38:29.013Z
+Last session: 2026-06-07T23:34:20.657Z
 Stopped at: Completed 08-05-PLAN.md
 Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md

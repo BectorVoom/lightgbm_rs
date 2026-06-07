@@ -111,7 +111,7 @@
 - [x] **PYB-01**: Python bindings (PyO3 + maturin) mirroring the official `lightgbm` `Booster`/`Dataset` API
 - [x] **PYB-02**: NumPy interop (rust-numpy) for dense/sparse input and array outputs
 - [ ] **PYB-03**: Python sklearn-style wrapper API (`LGBMClassifier`/`LGBMRegressor`/`LGBMRanker`) parity
-- [ ] **PYB-04**: Python `custom` objective/metric callbacks and `Booster.refit()` support
+- [x] **PYB-04**: Python `custom` objective/metric callbacks and `Booster.refit()` support
 
 ## v2 Requirements
 
