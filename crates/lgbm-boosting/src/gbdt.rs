@@ -1277,7 +1277,13 @@ impl<'a> Gbdt<'a> {
                     let draw = dart.random_for_drop.next_float() as f64;
                     if draw < drop_rate * dart.tree_weight[i as usize] * inv_average_weight {
                         dart.drop_index.push(i); // num_init_iteration_ = 0
-                        if dart.drop_index.len() >= cfg.max_drop.max(0) as usize {
+                        // C++ `static_cast<size_t>(config_->max_drop)` (dart.hpp:111):
+                        // a negative `max_drop` casts to a huge size_t so the cap
+                        // never fires (unbounded drops); `max_drop == 0` casts to 0
+                        // so it breaks after the first push. `i32 as usize` sign-
+                        // extends to 64-bit identically — do NOT clamp with `.max(0)`,
+                        // which would cap a negative `max_drop` at 1 drop (WR-01).
+                        if dart.drop_index.len() >= cfg.max_drop as usize {
                             break;
                         }
                     }
@@ -1290,7 +1296,10 @@ impl<'a> Gbdt<'a> {
                     let draw = dart.random_for_drop.next_float() as f64;
                     if draw < drop_rate {
                         dart.drop_index.push(i);
-                        if dart.drop_index.len() >= cfg.max_drop.max(0) as usize {
+                        // See the non-uniform branch above (WR-01): `i32 as usize`
+                        // reproduces C++ `static_cast<size_t>(config_->max_drop)`
+                        // exactly — negative => unbounded, 0 => break after first.
+                        if dart.drop_index.len() >= cfg.max_drop as usize {
                             break;
                         }
                     }
@@ -2102,7 +2111,9 @@ mod tests {
             for i in 0..iter {
                 if (rng.next_float() as f64) < drop_rate * tree_weight[i as usize] * inv_avg {
                     drop.push(i);
-                    if drop.len() >= cfg.max_drop.max(0) as usize {
+                    // WR-01: mirror C++ `static_cast<size_t>(config_->max_drop)` —
+                    // `i32 as usize` (no `.max(0)` clamp).
+                    if drop.len() >= cfg.max_drop as usize {
                         break;
                     }
                 }
@@ -2114,7 +2125,8 @@ mod tests {
             for i in 0..iter {
                 if (rng.next_float() as f64) < drop_rate {
                     drop.push(i);
-                    if drop.len() >= cfg.max_drop.max(0) as usize {
+                    // WR-01: mirror C++ `static_cast<size_t>(config_->max_drop)`.
+                    if drop.len() >= cfg.max_drop as usize {
                         break;
                     }
                 }
