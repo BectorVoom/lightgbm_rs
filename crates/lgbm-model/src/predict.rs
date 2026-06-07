@@ -523,6 +523,124 @@ fn leaf_width(model: &GbdtModel) -> usize {
     ntpi * num_iter
 }
 
+// ---------------------------------------------------------------------------
+// TreeSHAP feature-contribution prediction (PRD-04, predict_contrib).
+//
+// Mirrors C++ `GBDT::PredictContrib` (`gbdt.cpp:640-651`): for each class `k`,
+// the per-row output sub-block `[k*(num_features+1) .. (k+1)*(num_features+1))`
+// holds per-feature contributions `[0..num_features]` plus the expected-value
+// base `[num_features]`, accumulated across the resolved iteration sub-range.
+//
+// INVARIANT (PRD-04): for class `k`, the sum of that sub-block equals the raw
+// margin `predict_raw(row)[k]` (each tree contributes its own per-feature SHAP
+// values + its ExpectedValue base; the sum telescopes to the tree's predict).
+// ---------------------------------------------------------------------------
+
+/// Per-row contribution output width = `num_tree_per_iteration * (num_features+1)`
+/// (`NumPredictOneRow` for contrib, `gbdt.h`).
+#[inline]
+fn contrib_width(model: &GbdtModel) -> usize {
+    let ntpi = model.num_tree_per_iteration.max(0) as usize;
+    let nf = row_width(model);
+    ntpi * (nf + 1)
+}
+
+/// Run TreeSHAP for one materialized row over the full ensemble, appending the
+/// `num_tree_per_iteration * (num_features + 1)` f64 contributions to `out`.
+/// `num_features = max_feature_idx + 1` (the SHAP feature axis is the model's
+/// feature width, NOT the caller's `num_cols`).
+#[inline]
+fn predict_row_contrib(model: &GbdtModel, row: &[f64], out: &mut Vec<f64>) {
+    let ntpi = model.num_tree_per_iteration.max(0) as usize;
+    let nf = row_width(model);
+    let block = nf + 1;
+    let base = out.len();
+    // Zero the per-row slab, then accumulate each tree into its class sub-block.
+    out.resize(base + ntpi * block, 0.0);
+    let num_iter = model.num_iteration().max(0) as usize;
+    for i in 0..num_iter {
+        for k in 0..ntpi {
+            let idx = i * ntpi + k;
+            let off = base + k * block;
+            model.trees[idx].predict_contrib(row, nf, &mut out[off..off + block]);
+        }
+    }
+}
+
+/// TreeSHAP dense feature-contribution prediction (PRD-04). Output is row-major;
+/// each row contributes `num_tree_per_iteration * (max_feature_idx + 2)` f64
+/// values: per class `k`, `[per-feature contributions; expected-value base]`.
+///
+/// INVARIANT: for each row and class, the sum of that class's sub-block equals
+/// the raw margin (`predict_raw_mat`). Callers (and the parity gate) assert it.
+pub fn predict_contrib_mat(
+    model: &GbdtModel,
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<f64>, ModelError> {
+    validate_dense_shape(model, data, num_rows, num_cols)?;
+    let width = row_width(model);
+    let per_row = contrib_width(model);
+    let ncols = num_cols as usize;
+    let mut out = Vec::with_capacity(num_rows as usize * per_row);
+    let mut row = vec![0.0f64; width];
+    for r in 0..num_rows as usize {
+        let base = r * ncols;
+        for (c, slot) in row.iter_mut().enumerate() {
+            *slot = data[base + c] as f64;
+        }
+        predict_row_contrib(model, &row, &mut out);
+    }
+    Ok(out)
+}
+
+/// TreeSHAP CSR feature-contribution prediction (PRD-04).
+pub fn predict_contrib_csr(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<f64>, ModelError> {
+    validate_csr_shape(model, indptr, indices, values, num_rows, num_cols)?;
+    let width = row_width(model);
+    let per_row = contrib_width(model);
+    let mut out = Vec::with_capacity(num_rows as usize * per_row);
+    let mut row = vec![0.0f64; width];
+    for r in 0..num_rows as usize {
+        for slot in row.iter_mut() {
+            *slot = 0.0;
+        }
+        scatter_csr_row(indptr, indices, values, r, num_cols, width, &mut row)?;
+        predict_row_contrib(model, &row, &mut out);
+    }
+    Ok(out)
+}
+
+/// TreeSHAP CSC feature-contribution prediction (PRD-04).
+pub fn predict_contrib_csc(
+    model: &GbdtModel,
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+) -> Result<Vec<f64>, ModelError> {
+    validate_csc_shape(model, indptr, indices, values, num_rows, num_cols)?;
+    let width = row_width(model);
+    let nrows = num_rows as usize;
+    let per_row = contrib_width(model);
+    let dense = scatter_csc_dense(indptr, indices, values, num_rows, num_cols, width)?;
+    let mut out = Vec::with_capacity(nrows * per_row);
+    for r in 0..nrows {
+        let row = &dense[r * width..(r + 1) * width];
+        predict_row_contrib(model, row, &mut out);
+    }
+    Ok(out)
+}
+
 // --- shared shape validators + materializers (extracted so raw/transformed/leaf
 //     entry points apply the SAME boundary checks) ---
 
@@ -884,6 +1002,69 @@ mod tests {
         let m = model();
         let data = vec![1.0f32];
         let err = predict_mat(&m, &data, 1, 1).unwrap_err();
+        assert!(matches!(err, ModelError::ShapeMismatch { .. }));
+    }
+
+    // --- predict_contrib (PRD-04) ---
+
+    #[test]
+    fn contrib_sum_plus_base_equals_raw_dense() {
+        // Two 2-leaf stumps over features 0 and 1; the per-class contrib sub-block
+        // (per-feature + base) must sum to the raw margin for every row.
+        let m = model(); // ntpi=1, nf=2 -> block width 3
+        let data = vec![1.0f32, 0.0, 0.0, 1.0];
+        let raw = predict_raw_mat(&m, &data, 2, 2).unwrap();
+        let contrib = predict_contrib_mat(&m, &data, 2, 2).unwrap();
+        let block = 3; // num_features+1
+        assert_eq!(contrib.len(), 2 * block);
+        for r in 0..2 {
+            let sum: f64 = contrib[r * block..(r + 1) * block].iter().sum();
+            assert!(
+                (sum - raw[r] as f64).abs() < 1e-6,
+                "row {r}: sum(contrib)+base {sum} != raw {}",
+                raw[r]
+            );
+        }
+    }
+
+    #[test]
+    fn contrib_multiclass_per_class_block_sums_to_raw() {
+        let m = multiclass_model(); // ntpi=2, nf=2 -> 2 blocks of width 3
+        let data = vec![1.0f32, 0.0];
+        let raw = predict_raw_mat(&m, &data, 1, 2).unwrap(); // 2 raw class margins
+        let contrib = predict_contrib_mat(&m, &data, 1, 2).unwrap();
+        let block = 3;
+        assert_eq!(contrib.len(), 2 * block);
+        for k in 0..2 {
+            let sum: f64 = contrib[k * block..(k + 1) * block].iter().sum();
+            assert!(
+                (sum - raw[k] as f64).abs() < 1e-6,
+                "class {k}: block sum {sum} != raw {}",
+                raw[k]
+            );
+        }
+    }
+
+    #[test]
+    fn contrib_csr_csc_match_dense() {
+        let m = model();
+        let data = vec![1.0f32, 0.0, 0.0, 1.0];
+        let dense = predict_contrib_mat(&m, &data, 2, 2).unwrap();
+
+        let (ip, ix, v) = (vec![0i64, 1, 2], vec![0i32, 1], vec![1.0f32, 1.0]);
+        let csr = predict_contrib_csr(&m, &ip, &ix, &v, 2, 2).unwrap();
+        assert_eq!(dense, csr);
+
+        let (cip, cix, cv) = (vec![0i64, 1, 2], vec![0i32, 1], vec![1.0f32, 1.0]);
+        let csc = predict_contrib_csc(&m, &cip, &cix, &cv, 2, 2).unwrap();
+        assert_eq!(dense, csc);
+    }
+
+    #[test]
+    fn contrib_too_few_cols_is_shape_mismatch() {
+        let m = model();
+        let data = vec![1.0f32];
+        let err = predict_contrib_mat(&m, &data, 1, 1).unwrap_err();
         assert!(matches!(err, ModelError::ShapeMismatch { .. }));
     }
 }

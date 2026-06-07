@@ -55,6 +55,17 @@ const MISSING_NAN: i8 = 2;
 /// C++ `Tree(const char*, size_t*)` reads at most 22 `key=value` header lines.
 const MAX_HEADER_LINES: usize = 22;
 
+/// C++ `Tree::PathElement` (`tree.h:443-454`) — one element of the unique feature
+/// path used by the TreeSHAP recursion. `pweight` is the permutation weight (paths
+/// with `i-1` ones) and is tracked separately from the fractions.
+#[derive(Debug, Clone, Copy, Default)]
+struct PathElement {
+    feature_index: i32,
+    zero_fraction: f64,
+    one_fraction: f64,
+    pweight: f64,
+}
+
 /// A single decision tree — faithful parallel-array mirror of C++ `Tree`
 /// (`tree.h`). Field names keep the C++ correspondence explicit.
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +253,263 @@ impl Tree {
             self.get_leaf(feature_values)
         } else {
             0
+        }
+    }
+
+    /// C++ `Tree::LeafOutput` (`tree.h:91`): `leaf_value_[leaf]`.
+    #[inline]
+    fn leaf_output(&self, leaf: usize) -> f64 {
+        self.leaf_value[leaf]
+    }
+
+    /// C++ `Tree::data_count` (`tree.h:181`): the cover (row count) at `node`.
+    /// `node >= 0` is an internal node (`internal_count_[node]`); `node < 0` is the
+    /// leaf `~node` (`leaf_count_[~node]`).
+    #[inline]
+    fn data_count(&self, node: i32) -> f64 {
+        if node >= 0 {
+            self.internal_count[node as usize] as f64
+        } else {
+            self.leaf_count[(!node) as usize] as f64
+        }
+    }
+
+    /// C++ `Tree::ExpectedValue` (`tree.cpp:1031-1039`): the cover-weighted average
+    /// of the leaf outputs — the SHAP base / bias term. For a single-leaf tree this
+    /// is the leaf output. Otherwise `total_count = internal_count_[0]` (the root
+    /// cover) and `exp_value = Σ (leaf_count_[i] / total_count) * leaf_value_[i]`.
+    pub fn expected_value(&self) -> f64 {
+        if self.num_leaves == 1 {
+            return self.leaf_output(0);
+        }
+        let total_count = self.internal_count[0] as f64;
+        let mut exp_value = 0.0f64;
+        for i in 0..self.num_leaves as usize {
+            exp_value += (self.leaf_count[i] as f64 / total_count) * self.leaf_output(i);
+        }
+        exp_value
+    }
+
+    /// The maximum leaf depth of the grown tree (C++ `Tree::RecomputeMaxDepth`,
+    /// `tree.cpp:1041-1053`). A single-leaf tree has depth 0. A parsed model carries
+    /// no serialized `leaf_depth_`, so the depth is recomputed from the node
+    /// structure by descending from the root.
+    fn max_depth(&self) -> i32 {
+        if self.num_leaves <= 1 {
+            return 0;
+        }
+        let mut depths = vec![0i32; self.num_leaves as usize];
+        self.recompute_leaf_depths(0, 0, &mut depths);
+        depths.iter().copied().max().unwrap_or(0)
+    }
+
+    /// C++ `Tree::RecomputeLeafDepths` (`tree.h:691-699`): fill `depths[~node]` for
+    /// every leaf by descending from `node` at `depth`.
+    fn recompute_leaf_depths(&self, node: i32, depth: i32, depths: &mut [i32]) {
+        if node < 0 {
+            depths[(!node) as usize] = depth;
+        } else {
+            let n = node as usize;
+            self.recompute_leaf_depths(self.left_child[n], depth + 1, depths);
+            self.recompute_leaf_depths(self.right_child[n], depth + 1, depths);
+        }
+    }
+
+    /// C++ `Tree::PredictContrib` (`tree.h:668-677`): accumulate this tree's
+    /// per-feature SHAP contributions into `output[0..num_features]` and the
+    /// expected-value base into `output[num_features]` (TreeSHAP, arXiv:1706.06060).
+    ///
+    /// `output` MUST have length `num_features + 1`; the caller owns zeroing /
+    /// striding it across classes + accumulating across the ensemble. The
+    /// INVARIANT (asserted in tests + the parity gate): for one tree,
+    /// `Σ output[0..num_features] + output[num_features] == tree.predict(row)`.
+    ///
+    /// Works over numeric AND categorical decision nodes (the recursion calls
+    /// [`Self::decision`], which dispatches on the categorical mask exactly as
+    /// `GetLeaf` does, so `find_in_bitset` routing is honored).
+    pub fn predict_contrib(&self, feature_values: &[f64], num_features: usize, output: &mut [f64]) {
+        output[num_features] += self.expected_value();
+        if self.num_leaves > 1 {
+            let max_path_len = (self.max_depth() + 1) as usize;
+            // C++ allocates max_path_len*(max_path_len+1)/2 PathElements.
+            let mut unique_path_data =
+                vec![PathElement::default(); max_path_len * (max_path_len + 1) / 2];
+            self.tree_shap(feature_values, output, 0, 0, &mut unique_path_data, 1.0, 1.0, -1);
+        }
+    }
+
+    /// C++ `Tree::ExtendPath` (`tree.cpp:868-880`). `unique_path` is the slice
+    /// starting at the current frame's base (the caller passes `&mut path[base..]`).
+    fn extend_path(
+        unique_path: &mut [PathElement],
+        unique_depth: usize,
+        zero_fraction: f64,
+        one_fraction: f64,
+        feature_index: i32,
+    ) {
+        unique_path[unique_depth].feature_index = feature_index;
+        unique_path[unique_depth].zero_fraction = zero_fraction;
+        unique_path[unique_depth].one_fraction = one_fraction;
+        unique_path[unique_depth].pweight = if unique_depth == 0 { 1.0 } else { 0.0 };
+        let ud = unique_depth as f64;
+        for i in (0..unique_depth).rev() {
+            let prev = unique_path[i].pweight;
+            unique_path[i + 1].pweight +=
+                one_fraction * prev * (i as f64 + 1.0) / (ud + 1.0);
+            unique_path[i].pweight =
+                zero_fraction * prev * (ud - i as f64) / (ud + 1.0);
+        }
+    }
+
+    /// C++ `Tree::UnwindPath` (`tree.cpp:882-905`).
+    fn unwind_path(unique_path: &mut [PathElement], unique_depth: usize, path_index: usize) {
+        let one_fraction = unique_path[path_index].one_fraction;
+        let zero_fraction = unique_path[path_index].zero_fraction;
+        let mut next_one_portion = unique_path[unique_depth].pweight;
+        let ud = unique_depth as f64;
+
+        for i in (0..unique_depth).rev() {
+            if one_fraction != 0.0 {
+                let tmp = unique_path[i].pweight;
+                unique_path[i].pweight =
+                    next_one_portion * (ud + 1.0) / ((i as f64 + 1.0) * one_fraction);
+                next_one_portion =
+                    tmp - unique_path[i].pweight * zero_fraction * (ud - i as f64) / (ud + 1.0);
+            } else {
+                unique_path[i].pweight =
+                    (unique_path[i].pweight * (ud + 1.0)) / (zero_fraction * (ud - i as f64));
+            }
+        }
+
+        for i in path_index..unique_depth {
+            unique_path[i].feature_index = unique_path[i + 1].feature_index;
+            unique_path[i].zero_fraction = unique_path[i + 1].zero_fraction;
+            unique_path[i].one_fraction = unique_path[i + 1].one_fraction;
+        }
+    }
+
+    /// C++ `Tree::UnwoundPathSum` (`tree.cpp:907-925`).
+    fn unwound_path_sum(unique_path: &[PathElement], unique_depth: usize, path_index: usize) -> f64 {
+        let one_fraction = unique_path[path_index].one_fraction;
+        let zero_fraction = unique_path[path_index].zero_fraction;
+        let mut next_one_portion = unique_path[unique_depth].pweight;
+        let mut total = 0.0f64;
+        let ud = unique_depth as f64;
+        for i in (0..unique_depth).rev() {
+            if one_fraction != 0.0 {
+                let tmp = next_one_portion * (ud + 1.0) / ((i as f64 + 1.0) * one_fraction);
+                total += tmp;
+                next_one_portion =
+                    unique_path[i].pweight - tmp * zero_fraction * ((ud - i as f64) / (ud + 1.0));
+            } else {
+                total +=
+                    (unique_path[i].pweight / zero_fraction) / ((ud - i as f64) / (ud + 1.0));
+            }
+        }
+        total
+    }
+
+    /// C++ `Tree::TreeSHAP` (`tree.cpp:927-977`) — the recursive polynomial-time
+    /// SHAP value computation. `path` is the full preallocated buffer; the current
+    /// frame's unique-path slice starts at offset `unique_depth` (mirroring the C++
+    /// `parent_unique_path + unique_depth` pointer arithmetic over one flat array).
+    #[allow(clippy::too_many_arguments)]
+    fn tree_shap(
+        &self,
+        feature_values: &[f64],
+        phi: &mut [f64],
+        node: i32,
+        unique_depth: usize,
+        path: &mut [PathElement],
+        parent_zero_fraction: f64,
+        parent_one_fraction: f64,
+        parent_feature_index: i32,
+    ) {
+        // Copy the parent's [0, unique_depth) frame forward to this frame's base,
+        // then operate on the slice starting at `unique_depth` (the C++
+        // `unique_path = parent_unique_path + unique_depth` + std::copy).
+        if unique_depth > 0 {
+            path.copy_within(0..unique_depth, unique_depth);
+        }
+        let (_, frame) = path.split_at_mut(unique_depth);
+
+        Self::extend_path(
+            frame,
+            unique_depth,
+            parent_zero_fraction,
+            parent_one_fraction,
+            parent_feature_index,
+        );
+
+        if node < 0 {
+            // Leaf node: distribute the leaf output across the path features.
+            let leaf_value = self.leaf_value[(!node) as usize];
+            for i in 1..=unique_depth {
+                let w = Self::unwound_path_sum(frame, unique_depth, i);
+                let el = &frame[i];
+                phi[el.feature_index as usize] +=
+                    w * (el.one_fraction - el.zero_fraction) * leaf_value;
+            }
+        } else {
+            let n = node as usize;
+            let split_feat = self.split_feature[n];
+            let hot_index = self.decision(feature_values[split_feat as usize], n);
+            let cold_index = if hot_index == self.left_child[n] {
+                self.right_child[n]
+            } else {
+                self.left_child[n]
+            };
+            let w = self.data_count(node);
+            let hot_zero_fraction = self.data_count(hot_index) / w;
+            let cold_zero_fraction = self.data_count(cold_index) / w;
+            let mut incoming_zero_fraction = 1.0f64;
+            let mut incoming_one_fraction = 1.0f64;
+
+            // If we have already split on this feature, undo that split so we can
+            // redo it for this node.
+            let mut path_index = 0usize;
+            while path_index <= unique_depth {
+                if frame[path_index].feature_index == split_feat {
+                    break;
+                }
+                path_index += 1;
+            }
+            let mut next_unique_depth = unique_depth;
+            if path_index != unique_depth + 1 {
+                incoming_zero_fraction = frame[path_index].zero_fraction;
+                incoming_one_fraction = frame[path_index].one_fraction;
+                Self::unwind_path(frame, unique_depth, path_index);
+                next_unique_depth -= 1;
+            }
+
+            // Recurse on the hot then cold child. The child operates on `path`
+            // starting at the SAME base as this frame (the C++ recursion passes
+            // `unique_path`, which is `path + unique_depth`). We pass the same
+            // `path` slice but the child's base offset is `next_unique_depth + 1`
+            // RELATIVE to the parent's base — which here is `unique_depth`. So the
+            // child's absolute base into the parent's `path` is
+            // `unique_depth + next_unique_depth + 1`; replicate by passing the
+            // sub-slice `&mut path[unique_depth..]` with depth `next_unique_depth + 1`.
+            self.tree_shap(
+                feature_values,
+                phi,
+                hot_index,
+                next_unique_depth + 1,
+                frame,
+                hot_zero_fraction * incoming_zero_fraction,
+                incoming_one_fraction,
+                split_feat,
+            );
+            self.tree_shap(
+                feature_values,
+                phi,
+                cold_index,
+                next_unique_depth + 1,
+                frame,
+                cold_zero_fraction * incoming_zero_fraction,
+                0.0,
+                split_feat,
+            );
         }
     }
 
@@ -1390,6 +1658,139 @@ mod tests {
         }
         assert_eq!(t.internal_value[0], 0.0);
         assert!(t.internal_value[0].is_sign_positive());
+    }
+
+    // --- TreeSHAP / predict_contrib (PRD-04) ---
+
+    /// A 3-leaf numeric tree over 2 features:
+    /// node 0 splits feature 0 at 1.5 (cover 100): left -> node 1, right -> leaf 2 (val 30).
+    /// node 1 splits feature 1 at 0.5 (cover 60): left -> leaf 0 (val 10), right -> leaf 1 (val 20).
+    fn two_feature_tree() -> Tree {
+        Tree {
+            num_leaves: 3,
+            num_cat: 0,
+            left_child: vec![1, -1],   // node0 left=node1; node1 left=~0=leaf0
+            right_child: vec![-3, -2], // node0 right=~2=leaf2; node1 right=~1=leaf1
+            split_feature: vec![0, 1],
+            threshold: vec![1.5, 0.5],
+            decision_type: vec![2, 2],
+            split_gain: vec![0.0, 0.0],
+            leaf_value: vec![10.0, 20.0, 30.0],
+            leaf_weight: vec![1.0, 1.0, 1.0],
+            leaf_count: vec![25, 35, 40],
+            internal_value: vec![0.0, 0.0],
+            internal_weight: vec![0.0, 0.0],
+            internal_count: vec![100, 60], // root cover 100, node1 cover 60
+            cat_boundaries: vec![],
+            cat_threshold: vec![],
+            shrinkage: 1.0,
+            is_linear: false,
+            leaf_depth: vec![0, 0, 0],
+            leaf_parent: vec![-1, -1, -1],
+            split_feature_inner: vec![-1, -1],
+            threshold_in_bin: vec![0, 0],
+        }
+    }
+
+    #[test]
+    fn expected_value_is_cover_weighted_leaf_average() {
+        let t = two_feature_tree();
+        // (25/100)*10 + (35/100)*20 + (40/100)*30 = 2.5 + 7.0 + 12.0 = 21.5
+        assert!((t.expected_value() - 21.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn expected_value_single_leaf_is_leaf_output() {
+        let t = Tree::as_constant(0.7, 12);
+        assert_eq!(t.expected_value(), 0.7);
+    }
+
+    #[test]
+    fn shap_invariant_sum_plus_base_equals_raw_numeric() {
+        let t = two_feature_tree();
+        let nf = 2usize;
+        for row in [
+            vec![0.0, 0.0], // f0<=1.5, f1<=0.5 -> leaf0 = 10
+            vec![1.0, 1.0], // f0<=1.5, f1>0.5  -> leaf1 = 20
+            vec![5.0, 0.0], // f0>1.5           -> leaf2 = 30
+            vec![5.0, 9.0], // f0>1.5           -> leaf2 = 30
+        ] {
+            let mut out = vec![0.0f64; nf + 1];
+            t.predict_contrib(&row, nf, &mut out);
+            let sum: f64 = out.iter().sum();
+            let raw = t.predict(&row);
+            assert!(
+                (sum - raw).abs() < 1e-9,
+                "SHAP invariant: sum(contrib)+base {sum} != raw {raw} for row {row:?}, out={out:?}"
+            );
+            // base term is the expected value.
+            assert!((out[nf] - t.expected_value()).abs() < 1e-12);
+        }
+    }
+
+    /// A categorical tree: node 0 splits categorical feature 0 (cat_idx 0); the
+    /// bitset {1,3} (0b1010) routes those categories LEFT (leaf 0 = -5), the rest
+    /// RIGHT (leaf 1 = 7). The SHAP invariant must hold through `find_in_bitset`.
+    fn categorical_tree() -> Tree {
+        let mut t = Tree {
+            num_leaves: 1,
+            num_cat: 0,
+            left_child: vec![],
+            right_child: vec![],
+            split_feature: vec![],
+            threshold: vec![],
+            decision_type: vec![],
+            split_gain: vec![],
+            leaf_value: vec![0.0],
+            leaf_weight: vec![0.0],
+            leaf_count: vec![100],
+            internal_value: vec![],
+            internal_weight: vec![],
+            internal_count: vec![],
+            cat_boundaries: vec![],
+            cat_threshold: vec![],
+            shrinkage: 1.0,
+            is_linear: false,
+            leaf_depth: vec![0],
+            leaf_parent: vec![-1],
+            split_feature_inner: vec![],
+            threshold_in_bin: vec![],
+        };
+        // Grow a categorical split on feature 0; categories {1,3} go LEFT.
+        t.split_categorical(0, 0, 0, &[0b1010u32], -5.0, 7.0, 40, 60, 1.0, 1.0, 0.0, 0);
+        // internal_count[0] is set to left+right by split_categorical (100).
+        t
+    }
+
+    #[test]
+    fn shap_invariant_holds_on_categorical_tree() {
+        let t = categorical_tree();
+        let nf = 1usize;
+        for cat in [0.0, 1.0, 2.0, 3.0, 4.0] {
+            let row = vec![cat];
+            let mut out = vec![0.0f64; nf + 1];
+            t.predict_contrib(&row, nf, &mut out);
+            let sum: f64 = out.iter().sum();
+            let raw = t.predict(&row);
+            assert!(
+                (sum - raw).abs() < 1e-9,
+                "cat SHAP invariant: sum {sum} != raw {raw} for cat {cat}, out={out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn predict_contrib_accumulates_into_existing_output() {
+        // The driver accumulates across trees: calling predict_contrib twice doubles
+        // both the contributions and the base (each tree adds its own).
+        let t = two_feature_tree();
+        let nf = 2usize;
+        let row = vec![1.0, 1.0];
+        let mut out = vec![0.0f64; nf + 1];
+        t.predict_contrib(&row, nf, &mut out);
+        t.predict_contrib(&row, nf, &mut out);
+        let sum: f64 = out.iter().sum();
+        assert!((sum - 2.0 * t.predict(&row)).abs() < 1e-9);
     }
 
     #[test]
