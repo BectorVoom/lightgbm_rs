@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 07-03-PLAN.md (OBJ-04 exp/log + OBJ-05 xentropy)
-last_updated: "2026-06-07T07:02:10.001Z"
+stopped_at: Completed 07-04-PLAN.md
+last_updated: "2026-06-07T07:18:00.415Z"
 last_activity: "2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02"
 progress:
   total_phases: 8
   completed_phases: 6
   total_plans: 45
-  completed_plans: 38
+  completed_plans: 39
   percent: 75
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 07 (parity-completing-variants) — EXECUTING
-Plan: 6 of 12 (07-01, 07-02 complete)
+Plan: 7 of 12 (07-01, 07-02 complete)
 Status: Ready to execute
 Last activity: 2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02
 
@@ -347,6 +347,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 07 P05 | 16min | 3 tasks | 26 files |
 | Phase 07 P03 | 20min | 3 tasks | 119 files |
 | Phase 07 P06 | 35min | 3 tasks | 26 files |
+| Phase 07 P04 | 11min | 3 tasks | 48 files |
 
 ## Accumulated Context
 
@@ -405,6 +406,8 @@ Recent decisions affecting current work:
 - [Phase 07]: BST-04 GOSS ships 1:1 from goss.hpp: build-once bagging_rands_ block-1024 RNG, ArgMaxAtK top-k threshold (not a sort), grad+hess amplification by (cnt-top_k)/other_k; selected on data_sample_strategy=goss inside train_one_iter (IsHessianChange), reusing the bagging subset-train + dropped-row scoring path. Real-binary parity bit-exact + RNG-replay golden.
 - [Phase ?]: 07-03: OBJ-05 (cross_entropy/cross_entropy_lambda) + poisson + tweedie-spine ship faithful real-binary parity (capped 5-iter exp-libm horizon)
 - [Phase ?]: 07-03: gamma (all) + tweedie bfa-off/axis deferred DEF-07-02 (extended) — non-constant-hessian learner f64 split-gain knife-edge; g/h faithful into tree
+- [Phase ?]: 07-04: average_precision is a binary-task metric (binary_metric.hpp); placed in BinaryMetric per C++ metric.cpp, not multiclass
+- [Phase ?]: 07-04: poisson/gamma/tweedie regression metrics apply exp ConvertOutput; quantile/huber/fair/mape use identity ConvertOutput (raw score)
 
 ### Pending Todos
 
@@ -434,6 +437,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T07:02:04.909Z
-Stopped at: Completed 07-03-PLAN.md (OBJ-04 exp/log + OBJ-05 xentropy)
+Last session: 2026-06-07T07:17:50.677Z
+Stopped at: Completed 07-04-PLAN.md
 Resume file: None
