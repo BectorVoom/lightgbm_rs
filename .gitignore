@@ -1,2 +1,5 @@
 /target
 __pycache__/
+
+# Python virtual environment (Phase 8 toolchain)
+/.venv/
