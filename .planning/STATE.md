@@ -26,9 +26,17 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 08 (python-bindings) — EXECUTING
-Plan: 3 of 8
-Status: Executing Phase 08 (08-01, 08-02 complete; Wave 3 next)
-Last activity: 2026-06-08 -- Completed 08-02 (PyO3 lgbm-python crate: numpy train/predict, GIL release, A/B parity vs real lightgbm 4.6 green within 1e-6)
+Plan: 4 of 8
+Status: Executing Phase 08 (08-01, 08-02, 08-03 complete; Wave 4 next)
+Last activity: 2026-06-08 -- Completed 08-03 (PYB-02 input widening: f32/f64 dense dtype dispatch + scipy CSR/CSC sparse, single widen site; A/B parity over all four input kinds vs real lightgbm 4.6 at atol=1e-6, 9 new pytest green)
+
+### Plan 08-03 result (PYB-02 input widening — COMPLETE)
+
+Plan 08-03 widened the Python input surface to the full PYB-02 spectrum. A user can now build a `lightgbm_rs.Dataset` from an **f32 OR f64 dense numpy matrix** (runtime dtype dispatch via `Bound::cast`, both widths routed through ONE `f32->f64` widen site mirrored from `ingest.rs::widen` → identical bins/models) and from a **scipy CSR/CSC sparse matrix** (`Dataset::from_csr`/`from_csc` staticmethods + `lightgbm_rs.dataset_from_csr/from_csc` dtype-coercing wrappers). Sparse **densifies to the same `RawCorpus` rows the dense path bins** (the identical gather-with-zeros `ingest::from_csr/from_csc` do internally) — preserving CSR/CSC↔dense equivalence and running the same `validate_indptr` + per-index bounds at the boundary, surfaced as `ValueError` before any indexing (Security V5, T-08-03-01). The A/B suite (`test_numpy_sparse_parity.py`, 9 tests) matches **real lightgbm 4.6** within `atol=1e-6` for all four input kinds (tests RUN, not skipped), plus f32/f64 + CSR/CSC self-consistency and malformed/dtype rejection. Full pytest suite **15 passed**.
+
+**Deviation (resolved inline):** sparse routes via densify-to-`RawCorpus` instead of the plan-suggested Route B `FinishedDataset → Vec<FeatureColumn>` extractor — the implemented train consumer is `train_raw(&RawCorpus)` (Route A binning) with no train-from-`FinishedDataset` seam, so Route B would be a new architectural addition (Rule 4). Densify is faithful to the ingest's internal gather, keeps all must-haves, and adds no `lgbm`-crate change. Commits: 1bdef62 (T1+T2 — same files, shared widen site), c8a8347 (T3).
+
+Next: `/gsd-execute-phase 8 --wave 4` runs 08-04 (polars zero-copy via Arrow + dtype→categorical routing).
 
 ### Plan 08-02 result (PYB-01/PYB-02 PyO3 thinnest slice — COMPLETE)
 
