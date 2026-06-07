@@ -343,7 +343,16 @@ Plans:
   3. The sklearn-style wrapper API (`LGBMClassifier`/`LGBMRegressor`/`LGBMRanker`) matches the official wrappers' semantics.
   4. Python `custom` objective/metric callbacks and `Booster.refit()` work and reproduce reference outputs.
 
-**Plans**: TBD
+**Plans**: 8 plans (dependency-ordered sequential waves; MVP vertical slices over the validated Rust facade)
+Plans:
+- [ ] 08-01-PLAN.md — Rust facade slice: D-02 raw→bin→train bridge + new Booster methods (batch predict / feature_importance / refit / model text I/O), oracle-tested
+- [ ] 08-02-PLAN.md — Crate scaffold (pinned pyo3 0.27 / numpy 0.27.1 / pyo3-polars 0.26.0) + minimal PyO3 numpy-dense train→predict with GIL release + A/B parity (PYB-01)
+- [ ] 08-03-PLAN.md — Widen input: f32/f64 dense + scipy CSR/CSC sparse (PYB-02)
+- [ ] 08-04-PLAN.md — polars zero-copy via Arrow + dtype→categorical routing (PYB-02/D-03/D-04)
+- [ ] 08-05-PLAN.md — params dict coercion + recognized-but-unimplemented rejection (D-06/07/08)
+- [ ] 08-06-PLAN.md — custom obj/metric callbacks + Booster.refit() (PYB-04)
+- [ ] 08-07-PLAN.md — sklearn wrappers + callbacks list + lgb.cv + plotting (PYB-03/D-09)
+- [ ] 08-08-PLAN.md — persistence: C++-compatible text I/O + pickle (D-10)
 **UI hint**: no
 
 ## Progress
@@ -360,4 +369,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
 | 7. Parity-Completing Variants | 12/12 | Complete    | 2026-06-07 |
-| 8. Python Bindings | 0/TBD | Not started | - |
+| 8. Python Bindings | 0/8 | Planned | - |
