@@ -235,6 +235,20 @@ pub const PREDICT_MODE_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// goldens byte-idempotent. Recorded in REFERENCE_MANIFEST.md.
 pub const PREDICT_MODE_ORACLE_SEED: i32 = MODEL_TRAIN_SEED;
 
+/// The pinned pip-`lightgbm` version for the Phase-7 W11 advanced model-ops
+/// (ADV-06 refit / ADV-07 importance) oracle (plan 07-12). Reuses the SAME
+/// prebuilt-wheel binary; `advanced-oracle-capture` asserts the installed version
+/// BEFORE training so a wrong version can never silently emit divergent refit /
+/// importance goldens (threat T-07-12-SC).
+pub const ADVANCED_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W11 advanced model-ops oracle (plan
+/// 07-12). The SAME seed the learner oracle uses; combined with `deterministic=true
+/// force_row_wise=true num_threads=1` (and no subsampling) it makes the refit /
+/// importance goldens byte-idempotent (empty `git diff` on a re-capture). Recorded
+/// in REFERENCE_MANIFEST.md.
+pub const ADVANCED_ORACLE_SEED: i32 = LEARNER_ORACLE_SEED;
+
 /// The per-block RNG seed base for ranking's query-grouped bagging (C++
 /// `config_->bagging_seed`, bagging.hpp). Pinned so the bagging_by_query RNG-replay
 /// golden is reproducible.
@@ -264,6 +278,7 @@ fn main() -> Result<()> {
         Some("constraints-oracle-capture") => constraints_oracle_capture(),
         Some("predict-mode-oracle-capture") => predict_mode_oracle_capture(),
         Some("rank-oracle-capture") => rank_oracle_capture(),
+        Some("advanced-oracle-capture") => advanced_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
@@ -272,7 +287,8 @@ fn main() -> Result<()> {
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
                  rf-oracle-capture | metric-oracle-capture | categorical-oracle-capture | \
                  constraints-oracle-capture | \
-                 predict-mode-oracle-capture | rank-oracle-capture)"
+                 predict-mode-oracle-capture | rank-oracle-capture | \
+                 advanced-oracle-capture)"
             );
         }
         None => {
@@ -1736,6 +1752,94 @@ fn rank_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- rank-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/rank/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `advanced-oracle-capture` (plan 07-12, ADV-06 refit / ADV-07 importance) — REAL
+/// lib_lightgbm 4.6 advanced-model-ops capture. Trains a small deterministic
+/// multi-tree regression model on a shared numeric corpus, then dumps under
+/// `crates/oracle-harness/tests/fixtures/advanced/`:
+/// - `base_model.txt` — the authoritative v4 base model text (loaded by the Rust
+///   refit test as the starting ensemble),
+/// - `refit_decay09.txt` / `refit_decay00.txt` — the C++ `Booster.refit(X, y,
+///   decay_rate=0.9|0.0)` model text (the leaf-refit goldens, ADV-06),
+/// - `continue_model.txt` — the model after continuing training from the base via
+///   `init_model` (the input_model continue golden, ADV-06),
+/// - `importance.json` — the per-feature `feature_importance('split')` /
+///   `('gain')` vectors (ADV-07),
+/// - `advanced.json` — the shared sidecar: per-feature bins + bin_upper_bound +
+///   per-row label so the Rust replay routes rows + recomputes grad/hess identically.
+///
+/// The pip `lightgbm` is a CAPTURE-time tool only (version-asserted, never a crate
+/// dep, never read at `cargo test` time). NEVER `git add` the `LightGBM/` tree.
+fn advanced_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/advanced_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/advanced");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask advanced-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        ADVANCED_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = ADVANCED_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python (e.g. a venv) with \
+         `pip install lightgbm==4.6.0`. `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask advanced-oracle-capture: training the base model, refit (decay 0.9/0.0), \
+         continue-training, and split/gain importance on real lib_lightgbm ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(ADVANCED_ORACLE_SEED.to_string())
+            .arg(ADVANCED_ORACLE_LIGHTGBM_VERSION),
+        "advanced_oracle_capture.py",
+    )?;
+
+    for name in [
+        "base_model.txt",
+        "refit_decay09.txt",
+        "refit_decay00.txt",
+        "continue_model.txt",
+        "importance.json",
+        "advanced.json",
+    ] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask advanced-oracle-capture: done. Wrote refit + importance goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- advanced-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/advanced/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())

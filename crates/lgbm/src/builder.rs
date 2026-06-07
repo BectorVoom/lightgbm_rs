@@ -551,6 +551,34 @@ impl TrainingBuilder {
         self
     }
 
+    /// `refit_decay_rate` (ADV-06 — the leaf-refit decay blend `leaf = decay*old +
+    /// (1-decay)*new`; config.h default 0.9, CHECK `[0,1]`). Routes into
+    /// `lgbm-core::Config.refit_decay_rate` (set.rs:256-258).
+    pub fn refit_decay_rate(mut self, v: f64) -> Self {
+        self.params.insert("refit_decay_rate".into(), v.to_string());
+        self
+    }
+
+    /// `input_model` (ADV-06 — the path/name of a previously-trained model to
+    /// CONTINUE training from; config.h default empty; aliases `model_input` /
+    /// `model_in`). Routes into `lgbm-core::Config.input_model` (set.rs:275). The
+    /// continue-training itself is driven by `Gbdt::with_loaded_model` once the model
+    /// text is loaded; this setter only records the source path on the resolved
+    /// [`Config`].
+    pub fn input_model(mut self, path: &str) -> Self {
+        self.params.insert("input_model".into(), path.to_string());
+        self
+    }
+
+    /// `saved_feature_importance_type` (ADV-07 — `0 = split`, `1 = gain`; the
+    /// selector for the `feature_importances:` model-text block; config.h:615 default
+    /// 0). Routes into `lgbm-core::Config.saved_feature_importance_type` (set.rs:277).
+    pub fn saved_feature_importance_type(mut self, kind: i32) -> Self {
+        self.params
+            .insert("saved_feature_importance_type".into(), kind.to_string());
+        self
+    }
+
     /// Resolve the accumulated params (or the `from_config` preset) into a
     /// validated [`Config`] (D-02 — routed through `Config::from_params`'s alias
     /// table + CHECK validation).
@@ -882,6 +910,34 @@ mod tests {
         assert_eq!(cfg.cegb_penalty_split, 0.1);
         assert_eq!(cfg.cegb_penalty_feature_coupled, vec![1.0, 2.0, 3.0]);
         assert_eq!(cfg.cegb_penalty_feature_lazy, vec![0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn refit_importance_setters_route_into_config() {
+        // ADV-06 / ADV-07: refit_decay_rate / input_model / saved_feature_importance_type
+        // builder setters must round-trip into Config.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .refit_decay_rate(0.0)
+            .input_model("base.txt")
+            .saved_feature_importance_type(1)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.refit_decay_rate, 0.0);
+        assert_eq!(cfg.input_model, "base.txt");
+        assert_eq!(cfg.saved_feature_importance_type, 1);
+    }
+
+    #[test]
+    fn refit_decay_rate_out_of_range_rejected() {
+        // ADV-06: refit_decay_rate > 1 fails the config.h [0,1] CHECK — typed error.
+        let err = TrainingBuilder::new()
+            .objective("regression")
+            .refit_decay_rate(1.5)
+            .build();
+        assert!(err.is_err(), "refit_decay_rate=1.5 must be rejected");
     }
 
     #[test]

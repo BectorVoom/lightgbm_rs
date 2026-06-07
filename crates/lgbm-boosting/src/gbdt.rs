@@ -1386,6 +1386,119 @@ impl<'a> Gbdt<'a> {
         &self.trees
     }
 
+    /// ADV-06 leaf-refit (`GBDT::RefitTree`, gbdt.cpp:258-294 + the Python
+    /// `Booster.refit`). Re-fits the LEAF OUTPUTS of the already-loaded ensemble on
+    /// new `(features, labels)` WITHOUT changing tree STRUCTURE, blending each leaf by
+    /// `refit_decay_rate` (`new = decay*old + (1-decay)*shrunk_newton`).
+    ///
+    /// Mirrors the C++ loop exactly: for each stored iteration, `Boosting()` recomputes
+    /// per-row grad/hess on the CURRENT refit score (which starts at the constructor's
+    /// init — 0 with `boost_from_average=false`), then each tree in that iteration is
+    /// leaf-refit (rows routed through the tree's existing structure, per-leaf grad/hess
+    /// accumulated, decay-blended) and its new predictions are added to the refit score
+    /// (the C++ `train_score_updater_->AddScore(new_tree)`). The refit is in-place:
+    /// `self.trees` ends with the re-fit leaf values.
+    ///
+    /// `use_l1` / `l1` / `l2` mirror the leaf-output config (`lambda_l1`/`lambda_l2`).
+    /// The caller pre-loads the trees + the loaded score via [`Self::with_loaded_model`]
+    /// — but refit RESETS the score to a clean accumulation (the C++ `RefitTree`
+    /// re-scores from the refit trees themselves), so this method zeroes the score
+    /// buffer first.
+    ///
+    /// # Errors
+    /// Objective errors propagate via `#[from]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refit(
+        &mut self,
+        labels: &[f32],
+        refit_decay_rate: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) -> Result<(), BoostingError> {
+        let nd = self.num_data as usize;
+        if labels.len() != nd {
+            return Err(BoostingError::LengthMismatch {
+                expected: nd,
+                actual: labels.len(),
+            });
+        }
+        let k = self.objective.num_model_per_iteration().max(1);
+        let total = nd * k as usize;
+        let num_iterations = self.trees.len() / k.max(1) as usize;
+
+        // Snapshot the per-row feature vectors once (the C++ data_partition_ row→leaf
+        // map, here re-derived by routing each row through each tree's structure).
+        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        let decay = refit_decay_rate;
+
+        // C++ RefitTree re-scores from the refit trees; reset the accumulation.
+        for cur_tree_id in 0..k {
+            self.score_updater.multiply_score(0.0, cur_tree_id);
+        }
+
+        let mut gradients = vec![0.0f32; total];
+        let mut hessians = vec![0.0f32; total];
+        for iter in 0..num_iterations {
+            // Boosting(): grad/hess on the CURRENT refit score.
+            self.objective.get_gradients(
+                self.score_updater.scores(),
+                labels,
+                &mut gradients,
+                &mut hessians,
+            )?;
+            for cur_tree_id in 0..k {
+                let model_index = iter * k as usize + cur_tree_id as usize;
+                let offset = (cur_tree_id as usize) * nd;
+                let grad = &gradients[offset..offset + nd];
+                let hess = &hessians[offset..offset + nd];
+                // FitByExistingTree on the existing structure (in-place leaf refit).
+                // We refit a single tree (`model_index`) — feed only this tree's
+                // class-slice grad/hess (the C++ gradients_pointer_ + offset).
+                self.refit_one_tree_inplace(model_index, &rows, grad, hess, decay, use_l1, l1, l2);
+                // AddScore(new_tree) to the refit score (predict-side, full corpus).
+                let tree = self.trees[model_index].clone();
+                self.score_updater
+                    .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Leaf-refit one stored tree in place (the [`GbdtModel::refit_one_tree`] mirror
+    /// at the boosting layer, operating on `self.trees`). Routes every row to its leaf
+    /// in `self.trees[tree_index]`, accumulates per-leaf grad/hess, decay-blends.
+    #[allow(clippy::too_many_arguments)]
+    fn refit_one_tree_inplace(
+        &mut self,
+        tree_index: usize,
+        rows: &[Vec<f64>],
+        gradients: &[f32],
+        hessians: &[f32],
+        decay: f64,
+        use_l1: bool,
+        l1: f64,
+        l2: f64,
+    ) {
+        let num_leaves = self.trees[tree_index].num_leaves.max(1) as usize;
+        let mut sum_grad = vec![0.0f64; num_leaves];
+        let mut sum_hess = vec![0.0f64; num_leaves];
+        for (r, row) in rows.iter().enumerate() {
+            let leaf = if self.trees[tree_index].num_leaves > 1 {
+                self.trees[tree_index].get_leaf(row) as usize
+            } else {
+                0
+            };
+            sum_grad[leaf] += gradients[r] as f64;
+            sum_hess[leaf] += hessians[r] as f64;
+        }
+        for leaf in 0..num_leaves {
+            self.trees[tree_index].refit_leaf(
+                leaf, sum_grad[leaf], sum_hess[leaf], decay, use_l1, l1, l2,
+            );
+        }
+    }
+
     /// ADV-06 continue-training (`input_model`): seed this driver with the trees of
     /// a previously-trained ensemble so subsequent [`Self::train_one_iter`] calls
     /// APPEND new trees on top (C++ `GBDT::InitTrain` with `num_init_iteration_ =
@@ -2368,6 +2481,85 @@ mod tests {
             (avg_pred - score_row0).abs() < 1e-9,
             "RF predict average {avg_pred} must match the running-average score {score_row0}"
         );
+    }
+
+    #[test]
+    fn refit_decay_one_leaves_model_unchanged() {
+        // ADV-06: refit with decay=1.0 must leave every leaf value unchanged
+        // (all-old), regardless of the new data's gradients.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let mut base = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        );
+        base.train(&mut learner, &labels, features.len(), 3).expect("base train");
+        let base_trees = base.trees().to_vec();
+        let base_leaves: Vec<Vec<f64>> = base_trees.iter().map(|t| t.leaf_value.clone()).collect();
+
+        let mut refit = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_loaded_model(base_trees, features.clone());
+        refit.refit(&labels, 1.0, false, 0.0, 0.0).expect("refit decay=1");
+        for (t, old) in refit.trees().iter().zip(&base_leaves) {
+            assert_eq!(&t.leaf_value, old, "decay=1 must leave leaves unchanged");
+        }
+    }
+
+    #[test]
+    fn refit_decay_zero_changes_leaves() {
+        // ADV-06: refit with decay=0.0 replaces leaves with the fresh shrunk Newton
+        // output on the (same) data — the values must change from the base.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let mut base = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        );
+        base.train(&mut learner, &labels, features.len(), 2).expect("base train");
+        let base_trees = base.trees().to_vec();
+        let base_first_leaves = base_trees[0].leaf_value.clone();
+
+        let mut refit = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_loaded_model(base_trees, features.clone());
+        refit.refit(&labels, 0.0, false, 0.0, 0.0).expect("refit decay=0");
+        // The structure (num_leaves) is preserved; the values differ.
+        assert_eq!(refit.trees()[0].num_leaves, 2);
+        assert_ne!(
+            refit.trees()[0].leaf_value, base_first_leaves,
+            "decay=0 must change the leaf outputs"
+        );
+        // Tree count unchanged (refit never adds/removes trees).
+        assert_eq!(refit.num_trees(), 2);
     }
 
     #[test]
