@@ -804,6 +804,34 @@ fn multiclassova_metrics() {
 
 /// The matrix training control (mirrors `boosting_oracle_capture.py` MATRIX_*).
 const MATRIX_NUM_ITERATIONS: i32 = 12;
+
+/// Tolerance for the *documented-residual* D-07 matrix cells (the cells whose leaf
+/// values are NOT bit-exact vs C++ for a known, decision-backed numerical reason).
+///
+/// Cause of the residual (why these cells are not bit-exact):
+/// - **regression_l1 with `boost_from_average` OFF** (`uniform_grad_residual`): the
+///   iter-0 gradients are UNIFORM (`sign(0 - label) == -1` for every row), so the
+///   degenerate first split has a split-gain at the f64-noise level (~1e-15). C++
+///   accepts that knife-edge split; the Rust f64-fold gain rounds to `<= 0` and
+///   rejects it, shifting one tree. The OVERLAPPING trees still agree to within
+///   this bound.
+/// - **multiclass / multiclassova with early stopping** (`*num_class > 1 && es`):
+///   the early-stop DECISION reads the valid `multi_logloss`, computed through the
+///   softmax `exp` (Rust system libm vs the C++ wheel `std::exp` differ at ~1 ULP,
+///   the 06-04 exp-libm residual), which can flip which round is "best". The
+///   overlapping trees agree to within this bound.
+///
+/// regression_l1 + bagging is NOT in this residual family any more: Task 2 (06-06)
+/// applies the median-residual `RenewTreeOutput` on the subset path so those four
+/// cells assert bit-exact / within `ORACLE_TOL` like the full-corpus cells.
+///
+/// CAPPED at `<= 1e-4` so a too-loose tolerance can never mask a real regression;
+/// the value is the smallest power-of-ten bound the correctly-renewed cells
+/// actually satisfy (determined empirically — see 06-06-SUMMARY). The test ALSO
+/// asserts the max observed leaf-value diff across the whole matrix is `<= this`,
+/// so the bound is enforced by the code, not narrated in the SUMMARY.
+const MATRIX_RESIDUAL_TOL: f32 = 1e-4;
+
 const MATRIX_BAGGING_FRACTION: f64 = 0.7;
 const MATRIX_BAGGING_FREQ: i32 = 1;
 const MATRIX_BAGGING_SEED: i32 = 3;
@@ -900,6 +928,19 @@ fn run_d07_matrix() {
         ("multiclassova", "multiclassova", &mc, 3),
     ];
 
+    // Largest leaf-value abs-diff observed across EVERY asserting comparison in the
+    // matrix (residual cells included). Asserted `<= MATRIX_RESIDUAL_TOL` at the end
+    // so the chosen bound is enforced in-code, not merely narrated in the SUMMARY.
+    let mut max_diff: f32 = 0.0;
+    let mut note_diff = |rl: &[f32], gl: &[f32]| {
+        for (r, g) in rl.iter().zip(gl.iter()) {
+            let d = (r - g).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+    };
+
     let mut cells_checked = 0usize;
     let mut es_fired = 0usize;
     for (objective, prefix, corpus, num_class) in &objectives {
@@ -934,55 +975,51 @@ fn run_d07_matrix() {
                         .unwrap_or_else(|e| panic!("{cell}: parse golden: {e:?}"));
                     let rust = booster.model();
 
-                    // KNOWN RESIDUAL CELLS (documented, NOT silently dropped — see
-                    // REFERENCE_MANIFEST.md "D-07 matrix residuals"): cells whose
-                    // iter-0 gradients are UNIFORM (regression_l1 with bfa OFF: grad =
-                    // sign(0 - label) = -1 for every row) produce a split GAIN at the
-                    // f64-noise level (C++ split_gain ~1.78e-15 > 0 accepted; the Rust
-                    // f64-fold gain rounds to <= 0 and rejects the degenerate split).
-                    // This is the same "bit-exact where the algorithm permits"
-                    // knife-edge family as the 06-04 softmax exp-libm residual: a
-                    // sub-ULP gain difference flips a degenerate split. These cells are
-                    // VALIDATED within ORACLE_TOL on the OVERLAPPING trees rather than
-                    // dropped.
+                    // COVERAGE CONTRACT (06-06): EVERY matrix cell now asserts
+                    // numerically — no `compare_within` Result is discarded. A cell is
+                    // either bit-exact (`compare_exact_f64_bits`), within `ORACLE_TOL`,
+                    // or within the capped `MATRIX_RESIDUAL_TOL` (<= 1e-4); a wrong leaf
+                    // value of ANY magnitude makes this test FAIL. (Pre-06-06 the
+                    // residual cells called `compare_within(...).ok()`, discarding the
+                    // Result — the WR-01 defect; that is fixed below.)
                     //
-                    // regression_l1 + bagging is ALSO a documented residual: the
-                    // median-residual RenewTreeOutput over the IN-BAG leaves on the
-                    // subset path is deferred (the subset partition's residual_getter
-                    // needs threading through train_on_subset) — so the l1 bagging
-                    // cells' leaf values are the learner Newton output, not the median
-                    // residual. Validated within ORACLE_TOL; documented in the manifest.
+                    // Bit-exact cells: single-output (`num_class == 1`) regression /
+                    // regression_l1 / binary, both full-corpus AND bagging — incl. the
+                    // four regression_l1 + bagging cells which Task 2 (06-06) makes
+                    // correct via the subset-path median-residual RenewTreeOutput.
                     //
-                    // BAGGING-PATH residual (objectives with NON-CONSTANT hessian or a
-                    // post-growth renewal): regression(L2) bagging is BIT-EXACT (its
-                    // hessian is constant 1 and there is no renew, so the subset
-                    // histogram + predict-side OOB scoring reproduce the C++ tmp_subset_
-                    // result bit-for-bit). For binary (per-row sigmoid hessian),
-                    // regression_l1 (median renew), and the multiclass objectives, the
-                    // subset path's interaction with the non-constant hessian / renewal
-                    // is NOT yet bit-exact (the C++ tmp_subset_ Dataset + in-bag
-                    // train-path scatter vs the Rust subset-retrain + predict-side
-                    // scoring diverge in the split structure). These cells are
-                    // VALIDATED within ORACLE_TOL on overlapping trees and DOCUMENTED in
-                    // the manifest as a follow-up — never silently dropped.
-                    let uniform_grad_residual = *objective == "regression_l1" && !bfa;
-                    let nonl2_bagging_residual = bag && *objective != "regression";
-                    let uniform_grad_residual = uniform_grad_residual || nonl2_bagging_residual;
+                    // MATRIX_RESIDUAL_TOL cells (documented knife-edge residuals, see
+                    // the constant's doc comment):
+                    //   - `uniform_grad_residual`: regression_l1 with bfa OFF — the
+                    //     uniform iter-0 gradient produces an f64-noise (~1e-15) split
+                    //     gain that C++ accepts and the Rust f64-fold rejects, shifting
+                    //     one tree. Asserted on the OVERLAPPING trees.
+                    //   - `*num_class > 1 && es`: multiclass/ova early-stop — the
+                    //     softmax exp-libm ~1-ULP residual can flip best_iteration.
+                    //     Asserted on the OVERLAPPING trees.
+                    // Non-es multiclass cells assert within ORACLE_TOL (below).
+                    let uniform_grad_residual =
+                        *objective == "regression_l1" && !bfa;
 
                     if uniform_grad_residual {
-                        // Validate the trees that DO overlap within ORACLE_TOL; the
-                        // tree-count may differ by the rejected degenerate first tree.
+                        // Assert the trees that DO overlap within MATRIX_RESIDUAL_TOL;
+                        // the tree-count may differ by the rejected degenerate first
+                        // tree. NO Result is discarded (WR-01 fix): a wrong leaf value
+                        // panics.
                         let n = rust.trees.len().min(golden.trees.len());
                         for i in 0..n {
-                            let rl = &rust.trees[i].leaf_value;
-                            let gl = &golden.trees[i].leaf_value;
+                            let rl: Vec<f32> =
+                                rust.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
+                            let gl: Vec<f32> =
+                                golden.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
                             if rl.len() == gl.len() {
-                                compare_within(
-                                    &rl.iter().map(|&v| v as f32).collect::<Vec<_>>(),
-                                    &gl.iter().map(|&v| v as f32).collect::<Vec<_>>(),
-                                    ORACLE_TOL,
-                                )
-                                .ok();
+                                note_diff(&rl, &gl);
+                                compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+                                    panic!(
+                                        "{cell} tree {i} leaf_value not within \
+                                         MATRIX_RESIDUAL_TOL: {m:?}"
+                                    )
+                                });
                             }
                         }
                         cells_checked += 1;
@@ -999,15 +1036,18 @@ fn run_d07_matrix() {
                     if *num_class > 1 && es {
                         let n = rust.trees.len().min(golden.trees.len());
                         for i in 0..n {
-                            let rl = &rust.trees[i].leaf_value;
-                            let gl = &golden.trees[i].leaf_value;
+                            let rl: Vec<f32> =
+                                rust.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
+                            let gl: Vec<f32> =
+                                golden.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
                             if rl.len() == gl.len() {
-                                compare_within(
-                                    &rl.iter().map(|&v| v as f32).collect::<Vec<_>>(),
-                                    &gl.iter().map(|&v| v as f32).collect::<Vec<_>>(),
-                                    ORACLE_TOL,
-                                )
-                                .ok();
+                                note_diff(&rl, &gl);
+                                compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+                                    panic!(
+                                        "{cell} tree {i} leaf_value not within \
+                                         MATRIX_RESIDUAL_TOL: {m:?}"
+                                    )
+                                });
                             }
                         }
                         cells_checked += 1;
@@ -1064,4 +1104,17 @@ fn run_d07_matrix() {
     }
     assert!(cells_checked >= 30, "expected >= 30 matrix cells, got {cells_checked}");
     assert!(es_fired >= 1, "at least one es cell must genuinely fire");
+
+    // Enforce the residual-tolerance contract IN-CODE (not just in the SUMMARY):
+    // the chosen bound is capped at 1e-4, and the largest leaf-value diff observed
+    // across the whole matrix must sit inside it.
+    assert!(
+        MATRIX_RESIDUAL_TOL <= 1e-4,
+        "MATRIX_RESIDUAL_TOL {MATRIX_RESIDUAL_TOL:e} must be <= 1e-4 so it cannot mask a regression"
+    );
+    assert!(
+        max_diff <= MATRIX_RESIDUAL_TOL,
+        "max observed matrix leaf-value diff {max_diff:e} exceeds MATRIX_RESIDUAL_TOL {MATRIX_RESIDUAL_TOL:e}"
+    );
 }
+
