@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 08-01-PLAN.md
-last_updated: "2026-06-07T21:10:00.000Z"
-last_activity: 2026-06-07 -- Completed 08-01 (D-02 raw→bin→train + Booster methods + feval hook)
+stopped_at: Completed 08-05-PLAN.md
+last_updated: "2026-06-07T22:38:29.022Z"
+last_activity: "2026-06-08 -- Completed 08-03 (PYB-02 input widening: f32/f64 dense dtype dispatch + scipy CSR/CSC sparse, single widen site; A/B parity over all four input kinds vs real lightgbm 4.6 at atol=1e-6, 9 new pytest green)"
 progress:
   total_phases: 8
   completed_phases: 6
   total_plans: 54
-  completed_plans: 46
-  percent: 76
+  completed_plans: 49
+  percent: 75
 ---
 
 # Project State
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 08 (python-bindings) — EXECUTING
-Plan: 4 of 8
-Status: Executing Phase 08 (08-01, 08-02, 08-03 complete; Wave 4 next)
+Plan: 5 of 8
+Status: Ready to execute
 Last activity: 2026-06-08 -- Completed 08-03 (PYB-02 input widening: f32/f64 dense dtype dispatch + scipy CSR/CSC sparse, single widen site; A/B parity over all four input kinds vs real lightgbm 4.6 at atol=1e-6, 9 new pytest green)
 
 ### Plan 08-03 result (PYB-02 input widening — COMPLETE)
@@ -395,6 +395,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 07 P07-10 | 12min | 4 tasks | 20 files |
 | Phase 07 P11 | 150 | 4 tasks | 14 files |
 | Phase 07 P12 | 19 | 4 tasks | 16 files |
+| Phase 08 P08-05 | 10 min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -460,6 +461,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-11: ADV-01..05 advanced learner constraints as additive split gates (D-06 held); 10/14 real-binary cells bit-exact, 4 residual ULP/RNG knife-edges deferred as DEF-07-11
 - [Phase ?]: 07-12: refit leaf-output formula inlined in lgbm-model (no kernel-layer dep edge)
 - [Phase ?]: 07-12: model-text split-count emit uses the CR-02 split_gain>0 guard (C++ guards both split and gain)
+- [Phase 08]: 08-05: extension-module is maturin-only; cargo test uses pyo3/auto-initialize + rlib so Rust coercion units link libpython
+- [Phase 08]: 08-05: params.rs build_config is the single Python params->Config seam (D-06/07/08); D-07 gate references lgbm_core OUT_OF_SCOPE_PARAMS
 
 ### Pending Todos
 
@@ -489,6 +492,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T12:13:18.458Z
-Stopped at: Phase 8 context gathered
+Last session: 2026-06-07T22:38:29.013Z
+Stopped at: Completed 08-05-PLAN.md
 Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md
