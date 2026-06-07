@@ -9,8 +9,6 @@
 //! and routes facade errors through [`crate::error`]; no panic crosses the FFI
 //! boundary (CLAUDE.md, T-08-02-03).
 
-use std::collections::HashMap;
-
 use lgbm::{Booster as FacadeBooster, Config, RawCorpus};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -20,6 +18,7 @@ use pyo3::types::PyDict;
 use crate::dataset::Dataset;
 use crate::error::LgbmErrorWrap;
 use crate::marshal::numpy_dense_to_rows;
+use crate::params::build_config_with_overrides;
 
 /// A trained LightGBM-rs model (mirrors `lightgbm.Booster`). Holds the owned
 /// facade [`lgbm::Booster`]; every method is a thin GIL-aware delegation.
@@ -75,43 +74,21 @@ impl Booster {
     }
 }
 
-/// Coerce a single Python parameter value into the canonical string form the
-/// facade `Config::from_params` consumes. BASIC coercion only (08-02 thinnest
-/// slice — the full typed-value layer is D-08 in 08-05):
-/// - `bool` -> `"true"` / `"false"` (lowercase, as the C++ config parser expects)
-/// - `str`  -> verbatim
-/// - everything else (int / float / ...) -> its Python `str()`
-fn python_value_to_string(v: &Bound<'_, PyAny>) -> PyResult<String> {
-    // `bool` MUST be tried before `int` — a Python bool is an `int` subclass, but
-    // `extract::<bool>()` only matches genuine bool objects, so ordering is safe.
-    if let Ok(b) = v.extract::<bool>() {
-        return Ok(if b { "true".to_string() } else { "false".to_string() });
-    }
-    if let Ok(s) = v.extract::<String>() {
-        return Ok(s);
-    }
-    v.str()?.extract::<String>()
-}
-
-/// Coerce a Python `params` dict into the `HashMap<String, String>` the facade
-/// alias/extraction pipeline (`Config::from_params`) consumes.
-fn params_dict_to_map(params: &Bound<'_, PyDict>) -> PyResult<HashMap<String, String>> {
-    let mut map = HashMap::with_capacity(params.len());
-    for (k, v) in params.iter() {
-        let key: String = k.extract()?;
-        map.insert(key, python_value_to_string(&v)?);
-    }
-    Ok(map)
-}
-
 /// Train a [`Booster`] from a `params` dict and a [`Dataset`] (mirrors
 /// `lightgbm.train(params, train_set, num_boost_round)`).
 ///
+/// The `params` dict is coerced + validated through the full D-06/07/08 pipeline
+/// ([`crate::params::build_config_with_overrides`]): typed values are coerced to
+/// C++-matching strings (D-08), recognized-but-unimplemented params raise a clear
+/// `ValueError` (D-07), and the result routes through `Config::from_params`
+/// (alias resolution + CHECK validation; unknown typos warn, D-06).
+///
 /// `num_boost_round` takes precedence over any iteration count in `params`
-/// (matching the official package), and is injected as the canonical
-/// `num_iterations` before alias resolution. The corpus is already marshalled
-/// (it lives in the owned `Dataset`), so training runs entirely with the GIL
-/// RELEASED (`Python::detach`, D-13/SC#1).
+/// (matching the official package), injected as the canonical `num_iterations`
+/// override AFTER coercion + the D-07 gate but BEFORE `from_params` (a directly-
+/// set canonical always beats an alias). The corpus is already marshalled (it
+/// lives in the owned `Dataset`), so training runs entirely with the GIL RELEASED
+/// (`Python::detach`, D-13/SC#1).
 ///
 /// # Errors
 /// `ValueError` for invalid params / corpus (caller-input defects);
@@ -124,13 +101,12 @@ pub fn train(
     train_set: &Dataset,
     num_boost_round: i32,
 ) -> PyResult<Booster> {
-    let mut map = params_dict_to_map(params)?;
-    // num_boost_round wins over any params iteration alias (official-package
-    // precedence). Setting the CANONICAL key makes `from_params`' alias pass keep
-    // it (a directly-set canonical always beats an alias).
-    map.insert("num_iterations".to_string(), num_boost_round.to_string());
-
-    let cfg: Config = Config::from_params(&map).map_err(|e| LgbmErrorWrap(e.into()))?;
+    // Full D-06/07/08 coercion + validation; num_boost_round wins over any params
+    // iteration alias (official-package precedence) via the canonical override.
+    let cfg: Config = build_config_with_overrides(
+        params,
+        [("num_iterations", num_boost_round.to_string())],
+    )?;
     let corpus: &RawCorpus = &train_set.corpus;
 
     // GIL RELEASED around the CPU-bound training (D-13/SC#1).
