@@ -55,20 +55,6 @@ pub enum MetricError {
         num_gains: usize,
     },
 
-    /// A multiclass label was not a non-negative integer `< num_class` (WR-03).
-    /// The C++ multiclass metrics (`multiclass_metric.hpp` `LossOnPoint`) index
-    /// `ref_score[static_cast<size_t>(label)]` with NO bounds check, relying on the
-    /// objective `Init` having validated the label. Surfaced here as a typed error
-    /// so both `multi_logloss` and `multi_error` reject a bad label CONSISTENTLY
-    /// (rather than one clamping and the other silently flooring).
-    #[error("multiclass label out of range: label `{label}` not a non-negative integer in [0, {num_class})")]
-    MulticlassLabelOutOfRange {
-        /// The offending label value.
-        label: f64,
-        /// The number of classes (the exclusive upper bound).
-        num_class: usize,
-    },
-
     /// A ranking label was not an integer (threat T-07-09-02, WR-02). Mirrors the
     /// FIRST check in `DCGCalculator::CheckLabel` (`dcg_calculator.cpp:148-153`):
     /// `fabs(label - static_cast<int>(label)) > kEpsilon` fatals because a

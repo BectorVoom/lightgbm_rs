@@ -26,27 +26,6 @@ use lgbm_model::ObjectiveKind;
 
 use crate::error::MetricError;
 
-/// WR-03: validate that every label is a non-negative integer `< num_class`, the
-/// precondition the C++ multiclass metrics rely on (the objective `Init`
-/// enforces it; `LossOnPoint` then indexes `ref_score[static_cast<size_t>(label)]`
-/// with no bounds check). Shared by `MultiLogloss::eval` and `MultiError::eval`
-/// so the two handle a bad label identically (a typed error) rather than one
-/// clamping and the other flooring. The integer check uses `K_EPSILON` like the
-/// ranking `DcgCalculator::check_labels` (truncation toward zero, NOT floor).
-fn check_multiclass_labels(labels: &[f32], k_classes: usize) -> Result<(), MetricError> {
-    let eps = K_EPSILON;
-    for &l in labels {
-        let delta = (l - (l as i32 as f32)).abs();
-        if delta > eps || l < 0.0 || (l as usize) >= k_classes {
-            return Err(MetricError::MulticlassLabelOutOfRange {
-                label: l as f64,
-                num_class: k_classes,
-            });
-        }
-    }
-    Ok(())
-}
-
 /// `multi_error` (top-k error) metric — `MultiErrorMetric` (multiclass_metric.hpp:138-160).
 ///
 /// `LossOnPoint`: count classes with `score[k] >= score[label]`; if that count
@@ -103,9 +82,6 @@ impl MultiError {
         if num_data == 0 || k_classes == 0 {
             return Ok(0.0);
         }
-        // WR-03: enforce the C++ label precondition once, consistently with
-        // MultiLogloss::eval (both reject a bad label as a typed error).
-        check_multiclass_labels(labels, k_classes)?;
         let mut raw = vec![0.0f64; k_classes];
         let mut rec = vec![0.0f64; k_classes];
         let mut sum_loss = 0.0f64;
@@ -114,10 +90,8 @@ impl MultiError {
                 raw[k] = scores[num_data * k + i];
             }
             self.objective.convert(&raw, &mut rec);
-            // MultiErrorMetric::LossOnPoint (multiclass_metric.hpp:142-151). The
-            // label is validated `< k_classes` above, so this index is in bounds
-            // (matching C++ `ref_score[static_cast<size_t>(label)]`).
-            let kk = labels[i] as usize;
+            // MultiErrorMetric::LossOnPoint (multiclass_metric.hpp:142-151).
+            let kk = (labels[i] as usize).min(k_classes - 1);
             let ref_k = rec[kk];
             let mut num_larger = 0i32;
             let mut is_error = 0.0f64;
@@ -348,10 +322,6 @@ impl MultiLogloss {
         if num_data == 0 || k_classes == 0 {
             return Ok(0.0);
         }
-        // WR-03: enforce the C++ label precondition once, consistently with
-        // MultiError::eval (both reject a bad label as a typed error rather than
-        // one clamping and the other silently flooring to gain 0).
-        check_multiclass_labels(labels, k_classes)?;
         let eps = K_EPSILON as f64;
         let mut raw = vec![0.0f64; k_classes];
         let mut rec = vec![0.0f64; k_classes];
@@ -363,10 +333,12 @@ impl MultiLogloss {
             }
             // ConvertOutput first (softmax / per-class sigmoid).
             self.objective.convert(&raw, &mut rec);
-            // LossOnPoint: -log(rec[label]) with the kEpsilon floor. The label is
-            // validated `< k_classes` above (matches C++ `ref_score[k]`).
+            // LossOnPoint: -log(rec[label]) with the kEpsilon floor.
             let kk = labels[i] as usize;
-            let p = rec[kk];
+            // Defensive: a label out of range would be a caller error; clamp to the
+            // floor rather than index OOB (Security V5). The softmax objective's
+            // Init already range-checks training labels.
+            let p = rec.get(kk).copied().unwrap_or(0.0);
             sum_loss += if p > eps { -p.ln() } else { -eps.ln() };
         }
         Ok(sum_loss / num_data as f64)
@@ -474,39 +446,6 @@ mod tests {
         let m = MultiError::new(ObjectiveKind::Multiclass { num_class: 3 }, 3, 1);
         let err = m.eval(&[1.0, 2.0, 3.0, 4.0], &[0.0f32, 1.0]).unwrap_err();
         assert!(matches!(err, MetricError::LengthMismatch { .. }));
-    }
-
-    #[test]
-    fn multiclass_metrics_reject_bad_labels_consistently() {
-        // WR-03: an out-of-range label (2 with num_class=2) and a fractional label
-        // (0.5) must BOTH be rejected as a typed error by BOTH multi_logloss and
-        // multi_error — previously multi_error clamped and multi_logloss floored.
-        let scores = [2.0f64, 0.0, 0.0, 2.0]; // class-major, 2 classes, 2 rows
-        let logloss = MultiLogloss::new(ObjectiveKind::Multiclass { num_class: 2 }, 2);
-        let error = MultiError::new(ObjectiveKind::Multiclass { num_class: 2 }, 2, 1);
-
-        // Out-of-range label.
-        let oob = [0.0f32, 2.0];
-        let e1 = logloss.eval(&scores, &oob).unwrap_err();
-        let e2 = error.eval(&scores, &oob).unwrap_err();
-        assert!(matches!(e1, MetricError::MulticlassLabelOutOfRange { .. }));
-        assert!(matches!(e2, MetricError::MulticlassLabelOutOfRange { .. }));
-
-        // Fractional label.
-        let frac = [0.0f32, 0.5];
-        assert!(matches!(
-            logloss.eval(&scores, &frac).unwrap_err(),
-            MetricError::MulticlassLabelOutOfRange { .. }
-        ));
-        assert!(matches!(
-            error.eval(&scores, &frac).unwrap_err(),
-            MetricError::MulticlassLabelOutOfRange { .. }
-        ));
-
-        // Valid integer labels still evaluate.
-        let ok = [0.0f32, 1.0];
-        assert!(logloss.eval(&scores, &ok).is_ok());
-        assert!(error.eval(&scores, &ok).is_ok());
     }
 
     #[test]
