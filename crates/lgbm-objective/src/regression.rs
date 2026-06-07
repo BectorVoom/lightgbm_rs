@@ -401,12 +401,18 @@ impl Objective {
                 let sumw = label.len() as f64;
                 suml / sumw
             }
-            // RegressionQuantileloss::BoostFromScore (regression_objective.hpp:531):
-            // the unweighted label percentile at `alpha` (PercentileFun over the
-            // labels, NOT the mean). label_t (f32) promoted to f64.
+            // RegressionQuantileloss::BoostFromScore (regression_objective.hpp:524):
+            // the unweighted label percentile via `PercentileFun(label_t, ...)`. Two
+            // f32-fidelity details vs the f64 renew path: (1) `alpha_` is `score_t`
+            // (f32), promoted to double inside the macro — so round alpha through f32;
+            // (2) the macro instantiates T = `label_t` (f32): `ref_data` is f32 and the
+            // result is `static_cast<label_t>(v1 - (v1 - v2) * bias)`, so the final
+            // value is f32-narrowed. The labels are already f32; cast the percentile
+            // result to f32 (then back to f64 for the score) to match C++.
             Objective::Quantile { alpha } => {
                 let data: Vec<f64> = label.iter().map(|&l| l as f64).collect();
-                percentile_fun(&data, *alpha)
+                let a = (*alpha as f32) as f64;
+                percentile_fun(&data, a) as f32 as f64
             }
             // RegressionMAPELOSS::BoostFromScore (regression_objective.hpp:635): the
             // WEIGHTED label median (alpha = 0.5) with per-row label_weight =
@@ -450,7 +456,13 @@ impl Objective {
     pub fn renew_leaf_output(&self, residuals: &[f64], labels: &[f32]) -> f64 {
         match self {
             Objective::RegressionL1 => percentile_fun(residuals, 0.5),
-            Objective::Quantile { alpha } => percentile_fun(residuals, *alpha),
+            // C++ `RegressionQuantileloss::RenewTreeOutput` calls
+            // `PercentileFun(double, ..., alpha_)` where `alpha_` is a `score_t`
+            // (f32). Inside the macro `float_pos = (cnt-1) * (1.0 - alpha)` promotes
+            // that f32 to double, so the effective alpha is the f32-rounded value
+            // (e.g. `(double)0.9f = 0.8999999761581421`, NOT the exact f64 0.9).
+            // Round through f32 to reproduce the C++ `pos`/`bias` selection bit-for-bit.
+            Objective::Quantile { alpha } => percentile_fun(residuals, (*alpha as f32) as f64),
             Objective::Mape => {
                 let weights: Vec<f64> =
                     labels.iter().map(|&l| mape_label_weight(l) as f64).collect();
@@ -728,20 +740,35 @@ mod tests {
     #[test]
     fn quantile_boost_from_score_is_label_percentile() {
         let obj = Objective::Quantile { alpha: 0.9 };
-        // PercentileFun([1..10], 0.9): float_pos=(10-1)*(1-0.9)=0.9, pos=1,
-        //   bias=0.9, desc=[10,9,...,1], v1=desc[0]=10, v2=desc[1]=9 ->
-        //   10 - (10-9)*0.9 = 9.1.
+        // PercentileFun([1..10], alpha): float_pos=(10-1)*(1-alpha), pos=1,
+        //   bias=float_pos, desc=[10,9,...,1], v1=desc[0]=10, v2=desc[1]=9 ->
+        //   10 - (10-9)*bias. C++ `alpha_` is `score_t` (f32) and BoostFromScore
+        //   instantiates `PercentileFun(label_t)` (f32 result), so the EXACT value is
+        //   the f32-rounded `10 - bias32` where bias32 derives from `(double)0.9f`,
+        //   NOT the exact-f64 9.1. Assert against that faithful value.
         let label: Vec<f32> = (1..=10).map(|i| i as f32).collect();
-        assert!((obj.boost_from_score(&label) - 9.1).abs() < 1e-9);
+        let a = (0.9f32) as f64;
+        let bias = 9.0 * (1.0 - a); // pos-1 == 0
+        let expected = (10.0 - (10.0 - 9.0) * bias) as f32 as f64;
+        let got = obj.boost_from_score(&label);
+        assert!((got - expected).abs() < 1e-12, "got {got} expected {expected}");
+        // It is still ~9.1 (the f32-alpha shift is ~2.4e-7), guarding against a gross error.
+        assert!((got - 9.1).abs() < 1e-6, "got {got}");
     }
 
     #[test]
     fn quantile_renew_uses_alpha() {
         let obj = Objective::Quantile { alpha: 0.9 };
         let residuals: Vec<f64> = (1..=10).map(|i| i as f64).collect();
-        // Same as the percentile above -> 9.1. labels ignored for quantile.
+        // RenewTreeOutput instantiates `PercentileFun(double)` but `alpha_` is still
+        // f32, so the effective alpha is `(double)0.9f`. The result is f64 (no final
+        // f32 cast). labels ignored for quantile.
+        let a = (0.9f32) as f64;
+        let bias = 9.0 * (1.0 - a);
+        let expected = 10.0 - (10.0 - 9.0) * bias;
         let got = obj.renew_leaf_output(&residuals, &[0.0f32; 10]);
-        assert!((got - 9.1).abs() < 1e-9, "got {got}");
+        assert!((got - expected).abs() < 1e-12, "got {got} expected {expected}");
+        assert!((got - 9.1).abs() < 1e-6, "got {got}");
     }
 
     #[test]
