@@ -302,7 +302,13 @@ fn train_inner(
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
 ) -> Result<Booster, LgbmError> {
-    let objective_kind = ObjectiveKind::parse(&config.objective)
+    // Build the canonical `objective=` model line. LightGBM appends `num_class:` /
+    // `sigmoid:` tokens for the multiclass objectives (e.g.
+    // `multiclass num_class:3`, `multiclassova num_class:3 sigmoid:1`); the
+    // single-output objectives use the bare name. This is BOTH the predict-side
+    // ConvertOutput source AND the serialized model objective line (round-trip).
+    let objective_string = canonical_objective_string(config);
+    let objective_kind = ObjectiveKind::parse(&objective_string)
         // Custom objective (`objective = "custom"`/"none") has no predict-side
         // transform: fall back to identity (regression) for predict_row_raw.
         .unwrap_or(ObjectiveKind::Regression { sqrt: false });
@@ -363,7 +369,7 @@ fn train_inner(
 
     let best_iteration = gbdt.num_iteration();
     let model = gbdt.into_model(
-        config.objective.clone(),
+        objective_string,
         max_feature_idx,
         feature_names(num_features),
         feature_infos(corpus, num_features),
@@ -377,6 +383,36 @@ fn train_inner(
         iter_scores,
         iter_grad_hess,
     })
+}
+
+/// Build the canonical LightGBM `objective=` model line from the config. The
+/// multiclass objectives append the `num_class:`/`sigmoid:` tokens exactly as the
+/// C++ `MulticlassSoftmax::ToString` / `MulticlassOVA::ToString` do (so the model
+/// text round-trips and `ObjectiveKind::parse` recovers num_class); the
+/// single-output objectives use the bare `config.objective` name.
+fn canonical_objective_string(config: &Config) -> String {
+    let first = config.objective.split_whitespace().next().unwrap_or("");
+    match first {
+        "multiclass" | "softmax" => format!("multiclass num_class:{}", config.num_class),
+        "multiclassova" | "multiclass_ova" | "ova" | "ovr" => format!(
+            "multiclassova num_class:{} sigmoid:{}",
+            config.num_class,
+            // C++ ToString emits the sigmoid as the default-formatted double; the
+            // spine uses 1 → "1" matches the golden `sigmoid:1`.
+            format_sigmoid(config.sigmoid),
+        ),
+        _ => config.objective.clone(),
+    }
+}
+
+/// Format `sigmoid` for the objective line: an integral value prints without a
+/// decimal point (`1` not `1.0`), matching the C++ ostream default the golden uses.
+fn format_sigmoid(sigmoid: f64) -> String {
+    if sigmoid.fract() == 0.0 {
+        format!("{}", sigmoid as i64)
+    } else {
+        format!("{sigmoid}")
+    }
 }
 
 /// The per-objective default eval metrics (matching the capture's `metric=` list):

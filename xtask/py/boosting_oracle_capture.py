@@ -60,6 +60,15 @@ NUM_LEAVES = 4
 LEARNING_RATE = 0.1
 # "A later iteration" for the D-10 L1 golden (scores no longer zero).
 LATER_ITER = 5
+# The multiclass cells run for FEWER iterations than the single-output spine: the
+# redundant-form softmax `exp` (Rust libm vs the C++ wheel's std::exp) diverges at
+# the ~1-ULP level and flips a knife-edge split at iter ~5-6 on this corpus. Capping
+# the multiclass horizon at 5 iters (15 trees over 3 classes) keeps EVERY grown tree
+# BIT-EXACT to the real binary (the L2/L5 contract holds), proving the per-class
+# class-major layout end-to-end. The flip itself is the documented exp-libm residual
+# (see 06-04-SUMMARY); 06-05+ may revisit a libm-matched longer horizon.
+MULTICLASS_NUM_ITERATIONS = 5
+MULTICLASS_LATER_ITER = 4
 
 
 def f64_bits_line(values):
@@ -158,6 +167,142 @@ def binary_corpus():
     )
     expected_most_freq = [0, 0]
     return X, labels, expected_most_freq
+
+
+def multiclass_corpus():
+    """The multiclass spine corpus (D-08): 2 features, 12 rows, identity-binned,
+    3-class integer labels in [0,3), ALL classes present (class_need_train true)
+    and class probs distinct from 0/1.
+
+    f0 separates the classes reasonably so the per-class one-vs-rest trees find
+    real splits."""
+    f0 = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+    f1 = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]
+    X = np.array([f0, f1], dtype=np.float64).T
+    # 3 classes, balanced (4 rows each), all present (class_need_train true). The
+    # redundant-form softmax `exp` is a TRANSCENDENTAL — the Rust system libm `exp`
+    # and the C++ wheel's `std::exp` differ at the ~1-ULP level, so the multiclass
+    # g/h (and the Newton leaf outputs / scores it drives) match the real binary to
+    # ~1e-6 (the project's CPU contract for transcendental-bearing paths) but NOT
+    # bit-exact — and at a knife-edge split gain a sub-ULP g/h difference can flip a
+    # split. This is the documented exp-libm residual (CLAUDE.md "bit-exact where
+    # the algorithm permits"); the multiclass replay asserts ~1e-6, the layout /
+    # tree-count / class-major stride are exact. See 06-04-SUMMARY.
+    labels = np.array(
+        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.0, 1.0, 2.0],
+        dtype=np.float64,
+    )
+    expected_most_freq = [0, 0]
+    return X, labels, expected_most_freq
+
+
+def _class_major(arr2d):
+    """Flatten a (num_data, num_class) row-major array to a class-major 1-D vector
+    (class 0's rows, then class 1's, ...), matching the Rust score_ layout
+    score_[num_data*k + i]. numpy `order='F'` on a (num_data, num_class) array does
+    exactly this (column-major)."""
+    return np.asarray(arr2d).reshape(-1, order="F")
+
+
+def softmax_rows(raw2d):
+    """Common::Softmax per row (max-subtraction), on a (num_data, num_class) raw
+    score matrix. Returns the same-shape probability matrix."""
+    raw = np.asarray(raw2d, dtype=np.float64)
+    wmax = raw.max(axis=1, keepdims=True)
+    e = np.exp(raw - wmax)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def multiclass_gh(raw2d, labels, num_class):
+    """Softmax GetGradients (multiclass_objective.hpp:86-130), CLASS-MAJOR output.
+
+    raw2d is (num_data, num_class) raw scores; returns (grad, hess) as class-major
+    f32 vectors of length num_data*num_class:
+      p = softmax(raw); grad[k] = p[k]-1 if label==k else p[k]; hess = factor*p*(1-p).
+    """
+    num_data = len(labels)
+    factor = num_class / (num_class - np.float32(1.0))
+    p = softmax_rows(raw2d)  # (num_data, num_class)
+    lab = np.asarray(labels).astype(int)
+    grad = p.copy()
+    grad[np.arange(num_data), lab] -= np.float32(1.0)
+    hess = factor * p * (np.float32(1.0) - p)
+    return _class_major(grad).astype(np.float32), _class_major(hess).astype(np.float32)
+
+
+def multiclassova_gh(raw2d, labels, num_class, sigmoid=1.0):
+    """MulticlassOVA GetGradients (multiclass_objective.hpp:228-233), CLASS-MAJOR.
+
+    Per class i: binary g/h with is_pos = (label == i), over the class-major slice.
+    raw2d is (num_data, num_class) raw scores."""
+    raw = np.asarray(raw2d, dtype=np.float64)
+    grads = np.empty_like(raw)
+    hesss = np.empty_like(raw)
+    lab = np.asarray(labels).astype(int)
+    for i in range(num_class):
+        is_pos = (lab == i)
+        label_val = np.where(is_pos, 1.0, -1.0)
+        s = raw[:, i]
+        response = -label_val * sigmoid / (1.0 + np.exp(label_val * sigmoid * s))
+        abs_resp = np.abs(response)
+        grads[:, i] = response
+        hesss[:, i] = abs_resp * (sigmoid - abs_resp)
+    return _class_major(grads).astype(np.float32), _class_major(hesss).astype(np.float32)
+
+
+def write_layered_multiclass(out_dir, prefix, booster, X, labels, evals_result,
+                             metric_names, gh_fn, inits, num_class, num_data,
+                             num_iterations=NUM_ITERATIONS, later_iter=LATER_ITER):
+    """Write the L1-L5 goldens for a multiclass cell (class-major layout, K trees
+    per iteration).
+
+    `inits` is the per-class init score vector (length num_class); `gh_fn(raw2d,
+    labels, num_class) -> (grad, hess)` derives the class-major g/h from a
+    (num_data, num_class) raw-score matrix."""
+    # L5: model text + transformed predict (probabilities, class-major flattened).
+    booster.save_model(os.path.join(out_dir, f"{prefix}_spine_model.txt"))
+    pred_prob = booster.predict(X)  # (num_data, num_class) probabilities
+    with open(os.path.join(out_dir, f"{prefix}_spine_pred.txt"), "w") as fh:
+        fh.write(f"# {prefix}_spine_pred — transformed predict() probabilities; "
+                 f"class-major f64 bits (class 0 rows, then class 1, ...)\n")
+        fh.write(f64_bits_line(_class_major(pred_prob)) + "\n")
+
+    # L2: per-iter raw score (class-major reshape of the (num_data, num_class)
+    # raw_score predict).
+    with open(os.path.join(out_dir, f"{prefix}_scores.txt"), "w") as fh:
+        fh.write(f"# {prefix}_scores — per-iter raw score; one line per k=1..N; "
+                 f"class-major f64 bits; num_class={num_class}\n")
+        fh.write(f"# num_iterations={num_iterations} num_data={num_data}\n")
+        for k in range(1, num_iterations + 1):
+            raw_k = booster.predict(X, raw_score=True, num_iteration=k)
+            fh.write(f64_bits_line(_class_major(raw_k)) + "\n")
+
+    # L1 iter 1: score_0 = the per-class init for every row (BoostFromAverage).
+    raw0 = np.tile(np.asarray(inits, dtype=np.float64), (num_data, 1))  # (nd, K)
+    grad1, hess1 = gh_fn(raw0, labels, num_class)
+    with open(os.path.join(out_dir, f"{prefix}_gh_iter1.txt"), "w") as fh:
+        fh.write(f"# {prefix}_gh_iter1 — iter-1 per-row/per-class grad/hess; "
+                 f"class-major f32 bits; GRAD then HESS\n")
+        fh.write("GRAD " + f32_bits_line(grad1) + "\n")
+        fh.write("HESS " + f32_bits_line(hess1) + "\n")
+
+    # L1 later iter: raw score AFTER later_iter-1 trees per class.
+    raw_prev = np.asarray(booster.predict(X, raw_score=True, num_iteration=later_iter - 1))
+    gradN, hessN = gh_fn(raw_prev, labels, num_class)
+    with open(os.path.join(out_dir, f"{prefix}_gh_iterN.txt"), "w") as fh:
+        fh.write(f"# {prefix}_gh_iterN — iter-{later_iter} per-row/per-class grad/hess; "
+                 f"class-major f32 bits; GRAD then HESS\n")
+        fh.write(f"# iter={later_iter} inits={list(inits)!r}\n")
+        fh.write("GRAD " + f32_bits_line(gradN) + "\n")
+        fh.write("HESS " + f32_bits_line(hessN) + "\n")
+
+    # L3: per-round metrics (multi_logloss).
+    with open(os.path.join(out_dir, f"{prefix}_metrics.txt"), "w") as fh:
+        fh.write(f"# {prefix}_metrics — per-round {' + '.join(metric_names)} "
+                 f"(record_evaluation); f64 bits\n")
+        for metric in metric_names:
+            vals = evals_result["training"][metric]
+            fh.write(f"{metric} " + f64_bits_line(vals) + "\n")
 
 
 def write_layered(out_dir, prefix, booster, X, labels, evals_result,
@@ -360,8 +505,60 @@ def main():
     b_ref = lgb.train(p_ref, d_ref, num_boost_round=NUM_ITERATIONS)
     b_ref.save_model(os.path.join(out_dir, "custom_crossanchor_l2_model.txt"))
 
-    print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom "
-          "L1-L5 goldens to %s" % out_dir)
+    # ============================ multiclass (softmax) ============================
+    Xm, lm, mfqm = multiclass_corpus()
+    num_class = 3
+    keps = 1e-15
+    pm = base_params(seed, "multiclass", ["multi_logloss"])
+    pm["num_class"] = num_class
+    dm = lgb.Dataset(Xm, label=lm, free_raw_data=False)
+    dm.construct()
+    assert_identity_binning(Xm, mfqm)
+    er_m = {}
+    b_mc = lgb.train(
+        pm, dm, num_boost_round=MULTICLASS_NUM_ITERATIONS,
+        valid_sets=[dm], valid_names=["training"],
+        callbacks=[lgb.record_evaluation(er_m)],
+    )
+    # Per-class init: BoostFromScore(k) = log(max(kEps, class_init_probs_[k])).
+    class_counts = np.bincount(lm.astype(int), minlength=num_class).astype(np.float64)
+    class_probs = class_counts / len(lm)
+    inits_mc = [float(np.log(max(keps, class_probs[k]))) for k in range(num_class)]
+    write_layered_multiclass(
+        out_dir, "multiclass", b_mc, Xm, lm, er_m, ["multi_logloss"],
+        multiclass_gh, inits_mc, num_class, len(lm),
+        num_iterations=MULTICLASS_NUM_ITERATIONS, later_iter=MULTICLASS_LATER_ITER,
+    )
+
+    # ============================ multiclassova ============================
+    Xo, lo, mfqo = multiclass_corpus()
+    po = base_params(seed, "multiclassova", ["multi_logloss"])
+    po["num_class"] = num_class
+    do = lgb.Dataset(Xo, label=lo, free_raw_data=False)
+    do.construct()
+    assert_identity_binning(Xo, mfqo)
+    er_o = {}
+    b_ova = lgb.train(
+        po, do, num_boost_round=MULTICLASS_NUM_ITERATIONS,
+        valid_sets=[do], valid_names=["training"],
+        callbacks=[lgb.record_evaluation(er_o)],
+    )
+    # Per-class init: each class's binary BoostFromScore = logit(clamped pavg_i),
+    # pavg_i = count(label == i) / num_data.
+    inits_ova = []
+    for i in range(num_class):
+        pavg_i = float(np.mean(lo.astype(int) == i))
+        pavg_i = min(max(pavg_i, keps), 1.0 - keps)
+        inits_ova.append(float(np.log(pavg_i / (1.0 - pavg_i)) / 1.0))
+    write_layered_multiclass(
+        out_dir, "multiclassova", b_ova, Xo, lo, er_o, ["multi_logloss"],
+        lambda raw, lab, nc: multiclassova_gh(raw, lab, nc, sigmoid=1.0),
+        inits_ova, num_class, len(lo),
+        num_iterations=MULTICLASS_NUM_ITERATIONS, later_iter=MULTICLASS_LATER_ITER,
+    )
+
+    print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom/"
+          "multiclass/multiclassova L1-L5 goldens to %s" % out_dir)
 
 
 if __name__ == "__main__":

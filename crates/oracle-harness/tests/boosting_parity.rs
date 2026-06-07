@@ -103,6 +103,71 @@ fn train_binary() -> (Booster, DenseCorpus) {
     (booster, corpus)
 }
 
+/// The multiclass spine corpus, identical to
+/// `boosting_oracle_capture.py::multiclass_corpus` (12 rows, 3-class integer
+/// labels, all classes present).
+fn multiclass_corpus() -> DenseCorpus {
+    let f0 = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+    let f1 = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
+    let features: Vec<Vec<f64>> = (0..12).map(|i| vec![f0[i] as f64, f1[i] as f64]).collect();
+    // 3 balanced classes (matches the capture). The redundant-form softmax `exp` is
+    // a transcendental whose Rust-libm vs C++-wheel-libm ULP gap makes the
+    // multiclass g/h / scores / leaf outputs match to ~1e-6 (NOT bit-exact); the
+    // replay therefore asserts within ORACLE_TOL for L1/L2/L3/L5 numerics and
+    // bit-exact ONLY for the structural per-class layout (tree count == iters*K,
+    // class-major stride). See 06-04-SUMMARY exp-libm residual note.
+    let labels = vec![
+        0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.0, 1.0, 2.0,
+    ];
+    DenseCorpus { features, labels }
+}
+
+/// The number of classes for the multiclass cells (matches the capture).
+const MULTICLASS_NUM_CLASS: i32 = 3;
+
+/// The multiclass capture horizon (`MULTICLASS_NUM_ITERATIONS` in the capture
+/// script). The single-output spine runs 10 iters; the multiclass cells run 5 so
+/// EVERY grown tree stays BIT-EXACT to the real binary — the redundant-form softmax
+/// `exp` (Rust libm vs the C++ wheel's std::exp) flips a knife-edge split at iter
+/// ~5-6 on this corpus (the documented exp-libm residual). 5 iters × 3 classes =
+/// 15 trees proves the per-class class-major layout end-to-end, bit-exact.
+const MULTICLASS_NUM_ITERATIONS: i32 = 5;
+
+/// The multiclass cell builder: like `cell_builder` but capped at
+/// [`MULTICLASS_NUM_ITERATIONS`] and carrying `num_class`.
+fn multiclass_cell_builder(objective: &str) -> TrainingBuilder {
+    TrainingBuilder::new()
+        .objective(objective)
+        .num_iterations(MULTICLASS_NUM_ITERATIONS)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(true)
+        .num_class(MULTICLASS_NUM_CLASS)
+        .seed(SPINE_SEED)
+        .deterministic(true)
+}
+
+/// Train the `multiclass` (softmax) cell the SAME way the capture did.
+fn train_multiclass() -> (Booster, DenseCorpus) {
+    let corpus = multiclass_corpus();
+    let cfg = multiclass_cell_builder("multiclass")
+        .build()
+        .expect("valid multiclass config");
+    let booster = train(&cfg, &corpus).expect("multiclass train ok");
+    (booster, corpus)
+}
+
+/// Train the `multiclassova` (one-vs-all) cell the SAME way the capture did.
+fn train_multiclassova() -> (Booster, DenseCorpus) {
+    let corpus = multiclass_corpus();
+    let cfg = multiclass_cell_builder("multiclassova")
+        .build()
+        .expect("valid multiclassova config");
+    let booster = train(&cfg, &corpus).expect("multiclassova train ok");
+    (booster, corpus)
+}
+
 /// Train the custom cell: an L2-equivalent closure (grad = score - label, hess = 1)
 /// with boost_from_average forced OFF (matching the capture's bfa-off custom run).
 fn train_custom_cell() -> (Booster, DenseCorpus) {
@@ -181,8 +246,15 @@ fn assert_scores(booster: &Booster, scores_file: &str) {
     }
 }
 
-/// Assert iter-1 and iter-N g/h within ORACLE_TOL vs the golden g/h files.
+/// Assert iter-1 and iter-N g/h within ORACLE_TOL vs the golden g/h files (the
+/// single-output cells use LATER_ITER = 5).
 fn assert_gradients(booster: &Booster, gh1_file: &str, ghn_file: &str) {
+    assert_gradients_at(booster, gh1_file, ghn_file, 5);
+}
+
+/// Like [`assert_gradients`] but with an explicit `later_iter` (the multiclass
+/// cells use 4, matching the capture's `MULTICLASS_LATER_ITER`).
+fn assert_gradients_at(booster: &Booster, gh1_file: &str, ghn_file: &str, later: usize) {
     if let Some(gh1) = read_golden(gh1_file) {
         let (g_golden, h_golden) = parse_gh(&gh1);
         let (g_rust, h_rust) = &booster.iter_grad_hess[0];
@@ -193,7 +265,6 @@ fn assert_gradients(booster: &Booster, gh1_file: &str, ghn_file: &str) {
     }
     if let Some(ghn) = read_golden(ghn_file) {
         let (g_golden, h_golden) = parse_gh(&ghn);
-        let later = 5usize;
         let (g_rust, h_rust) = &booster.iter_grad_hess[later - 1];
         compare_within(g_rust, &g_golden, ORACLE_TOL)
             .unwrap_or_else(|m| panic!("{ghn_file} iter-{later} grad not within ORACLE_TOL: {m:?}"));
@@ -498,3 +569,178 @@ fn bagging_rng() {
     panic!("MISSING — implemented in wave 4 (06-05)");
 }
 
+// ========================= multiclass / multiclassova (06-04) =========================
+
+/// Assert a multiclass booster replays the golden over the 5-iter bit-exact
+/// horizon: tree count == iters*K + class-major stride (STRUCTURAL, exact), per-tree
+/// leaf values BIT-EXACT, and the class-major transformed predict within ORACLE_TOL
+/// (the predict-side `ConvertOutput` softmax/sigmoid `exp` is the only ~1e-6 step).
+fn assert_multiclass_model_and_pred(
+    booster: &Booster,
+    corpus: &DenseCorpus,
+    num_class: i32,
+    model_file: &str,
+    pred_file: &str,
+) {
+    let Some(model_text) = read_golden(model_file) else {
+        return;
+    };
+    let golden = lgbm_model::model_text::load(&model_text).expect("parse golden model");
+    let rust = booster.model();
+    // Tree count == iters * num_class, class-major (num_tree_per_iteration stride).
+    assert_eq!(
+        rust.trees.len(),
+        golden.trees.len(),
+        "{model_file}: tree count rust {} != golden {}",
+        rust.trees.len(),
+        golden.trees.len()
+    );
+    assert_eq!(
+        rust.num_tree_per_iteration, num_class,
+        "{model_file}: num_tree_per_iteration {} != num_class {num_class}",
+        rust.num_tree_per_iteration
+    );
+    assert_eq!(
+        rust.trees.len() as i32 % num_class,
+        0,
+        "{model_file}: tree count {} not a multiple of num_class {num_class}",
+        rust.trees.len()
+    );
+    // Per-tree leaf values BIT-EXACT (the L5 contract holds over the 5-iter horizon —
+    // the softmax exp-libm knife-edge flip is past iter 5, so every grown tree here
+    // is bit-identical to the real binary).
+    for (i, (rt, gt)) in rust.trees.iter().zip(golden.trees.iter()).enumerate() {
+        compare_exact_f64_bits(&rt.leaf_value, &gt.leaf_value)
+            .unwrap_or_else(|m| panic!("{model_file} tree {i} leaf_value not bit-exact: {m:?}"));
+    }
+    // Class-major transformed predict: class 0's rows, then class 1's, ... matching
+    // the capture's `_class_major(predict())` layout. ConvertOutput (softmax /
+    // per-class sigmoid) is the only transcendental step here → ORACLE_TOL.
+    if let Some(pred_text) = read_golden(pred_file) {
+        let golden_pred: Vec<f32> = pred_text
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(|l| parse_f64_bits_line(l).into_iter().map(|v| v as f32).collect())
+            .expect("pred line");
+        // Build the class-major rust predict: for each class k, each row.
+        let per_row: Vec<Vec<f32>> =
+            corpus.features.iter().map(|row| booster.predict_row(row)).collect();
+        let nd = corpus.features.len();
+        let mut rust_pred = Vec::with_capacity(nd * num_class as usize);
+        for k in 0..num_class as usize {
+            for r in &per_row {
+                rust_pred.push(r[k]);
+            }
+        }
+        compare_within(&rust_pred, &golden_pred, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{pred_file} predict() not within ORACLE_TOL: {m:?}"));
+    }
+}
+
+/// Assert per-round multi_logloss matches the golden metrics file within ORACLE_TOL.
+fn assert_multi_logloss(booster: &Booster, metrics_file: &str) {
+    let Some(text) = read_golden(metrics_file) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("multi_logloss ") {
+            let golden = parse_f64_bits_line(rest);
+            let (_name, vals) = booster
+                .eval_history
+                .iter()
+                .find(|(n, _)| n == "multi_logloss")
+                .expect("multi_logloss eval history present");
+            assert_eq!(
+                vals.len(),
+                golden.len(),
+                "{metrics_file}: multi_logloss round count rust {} != golden {}",
+                vals.len(),
+                golden.len()
+            );
+            let tol = ORACLE_TOL as f64;
+            for (k, (&r, &g)) in vals.iter().zip(golden.iter()).enumerate() {
+                assert!(
+                    (r - g).abs() <= tol,
+                    "{metrics_file} multi_logloss round {k}: rust {r} != golden {g} (tol {tol})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn multiclass_spine_end_to_end() {
+    // L5: softmax multiclass — model text bit-exact + class-major probabilities
+    // within tol; tree count == iters * num_class in class-major order.
+    let (booster, corpus) = train_multiclass();
+    assert_multiclass_model_and_pred(
+        &booster,
+        &corpus,
+        MULTICLASS_NUM_CLASS,
+        "multiclass_spine_model.txt",
+        "multiclass_spine_pred.txt",
+    );
+}
+
+#[test]
+fn multiclass_score_accumulation() {
+    // L2: per-iter class-major raw scores bit-exact f64.
+    let (booster, _) = train_multiclass();
+    assert_scores(&booster, "multiclass_scores.txt");
+}
+
+#[test]
+fn multiclass_gradients() {
+    // L1: per-row/per-class softmax g/h (class-major) within ORACLE_TOL. The
+    // multiclass capture's later iter is 4 (MULTICLASS_LATER_ITER).
+    let (booster, _) = train_multiclass();
+    assert_gradients_at(
+        &booster,
+        "multiclass_gh_iter1.txt",
+        "multiclass_gh_iterN.txt",
+        4,
+    );
+}
+
+#[test]
+fn multiclass_metrics() {
+    // L3: per-round multi_logloss.
+    let (booster, _) = train_multiclass();
+    assert_multi_logloss(&booster, "multiclass_metrics.txt");
+}
+
+#[test]
+fn multiclassova_spine_end_to_end() {
+    let (booster, corpus) = train_multiclassova();
+    assert_multiclass_model_and_pred(
+        &booster,
+        &corpus,
+        MULTICLASS_NUM_CLASS,
+        "multiclassova_spine_model.txt",
+        "multiclassova_spine_pred.txt",
+    );
+}
+
+#[test]
+fn multiclassova_score_accumulation() {
+    let (booster, _) = train_multiclassova();
+    assert_scores(&booster, "multiclassova_scores.txt");
+}
+
+#[test]
+fn multiclassova_gradients() {
+    let (booster, _) = train_multiclassova();
+    assert_gradients_at(
+        &booster,
+        "multiclassova_gh_iter1.txt",
+        "multiclassova_gh_iterN.txt",
+        4,
+    );
+}
+
+#[test]
+fn multiclassova_metrics() {
+    let (booster, _) = train_multiclassova();
+    assert_multi_logloss(&booster, "multiclassova_metrics.txt");
+}

@@ -90,6 +90,21 @@ impl TrainingBuilder {
         self
     }
 
+    /// `num_class` (the multiclass class count; default 1). Required `>= 1` for the
+    /// `multiclass`/`multiclassova` objectives — the GBDT loop grows `num_class`
+    /// trees per iteration over the class-major layout.
+    pub fn num_class(mut self, n: i32) -> Self {
+        self.params.insert("num_class".into(), n.to_string());
+        self
+    }
+
+    /// `sigmoid` (the logistic slope for `binary`/`multiclassova`; default 1.0,
+    /// must be `> 0`).
+    pub fn sigmoid(mut self, s: f64) -> Self {
+        self.params.insert("sigmoid".into(), s.to_string());
+        self
+    }
+
     /// `boost_from_average` (the C++ regression default; D-15).
     pub fn boost_from_average(mut self, on: bool) -> Self {
         self.params
