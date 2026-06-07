@@ -1,229 +1,278 @@
 ---
 phase: 07-parity-completing-variants
-reviewed: 2026-06-07T10:09:55Z
+reviewed: 2026-06-07T10:40:20Z
 depth: standard
-files_reviewed: 31
+files_reviewed: 56
 files_reviewed_list:
+  - crates/lgbm-boosting/src/error.rs
   - crates/lgbm-boosting/src/gbdt.rs
-  - crates/lgbm-boosting/src/sample_strategy.rs
+  - crates/lgbm-boosting/src/lib.rs
   - crates/lgbm-boosting/src/objective.rs
+  - crates/lgbm-boosting/src/sample_strategy.rs
+  - crates/lgbm-boosting/src/score_updater.rs
   - crates/lgbm-compute/src/gain.rs
   - crates/lgbm-compute/src/kernels/split.rs
+  - crates/lgbm-core/src/config/mod.rs
+  - crates/lgbm-core/src/config/set.rs
+  - crates/lgbm-core/tests/config_defaults.rs
+  - crates/lgbm-core/tests/config_validation.rs
+  - crates/lgbm-metric/src/binary.rs
   - crates/lgbm-metric/src/dcg_calculator.rs
+  - crates/lgbm-metric/src/error.rs
+  - crates/lgbm-metric/src/lib.rs
+  - crates/lgbm-metric/src/multiclass.rs
   - crates/lgbm-metric/src/rank.rs
   - crates/lgbm-metric/src/regression.rs
   - crates/lgbm-metric/src/xentropy.rs
-  - crates/lgbm-metric/src/multiclass.rs
-  - crates/lgbm-metric/src/binary.rs
-  - crates/lgbm-model/src/tree.rs
-  - crates/lgbm-model/src/predict.rs
   - crates/lgbm-model/src/ensemble.rs
   - crates/lgbm-model/src/model_text.rs
   - crates/lgbm-model/src/objective.rs
+  - crates/lgbm-model/src/predict.rs
+  - crates/lgbm-model/src/tree.rs
+  - crates/lgbm-objective/Cargo.toml
+  - crates/lgbm-objective/src/error.rs
+  - crates/lgbm-objective/src/lib.rs
+  - crates/lgbm-objective/src/rank.rs
   - crates/lgbm-objective/src/regression.rs
   - crates/lgbm-objective/src/xentropy.rs
-  - crates/lgbm-objective/src/rank.rs
-  - crates/lgbm-treelearner/src/learner.rs
-  - crates/lgbm-treelearner/src/feature_histogram_categorical.rs
-  - crates/lgbm-treelearner/src/monotone_constraints.rs
   - crates/lgbm-treelearner/src/cost_effective_gradient_boosting.rs
-  - crates/lgbm-treelearner/src/forced_splits.rs
   - crates/lgbm-treelearner/src/data_partition.rs
-  - crates/lgbm-treelearner/src/leaf_splits.rs
-  - crates/lgbm-core/src/config/set.rs
-  - crates/lgbm-core/src/config/mod.rs
-  - crates/lgbm/src/builder.rs
+  - crates/lgbm-treelearner/src/feature_histogram_categorical.rs
+  - crates/lgbm-treelearner/src/forced_splits.rs
+  - crates/lgbm-treelearner/src/learner.rs
+  - crates/lgbm-treelearner/src/lib.rs
+  - crates/lgbm-treelearner/src/monotone_constraints.rs
   - crates/lgbm/src/booster.rs
+  - crates/lgbm/src/builder.rs
+  - crates/oracle-harness/tests/advanced_parity.rs
+  - crates/oracle-harness/tests/boosting_parity.rs
+  - crates/oracle-harness/tests/learner_parity.rs
+  - crates/oracle-harness/tests/metric_parity.rs
+  - crates/oracle-harness/tests/predict_parity.rs
+  - crates/oracle-harness/tests/rank_parity.rs
+  - xtask/cpp/kernel_capture.cpp
+  - xtask/py/advanced_oracle_capture.py
+  - xtask/py/boosting_oracle_capture.py
+  - xtask/py/categorical_oracle_capture.py
+  - xtask/py/constraints_oracle_capture.py
+  - xtask/py/dart_oracle_capture.py
+  - xtask/py/goss_oracle_capture.py
+  - xtask/py/metric_oracle_capture.py
+  - xtask/py/predict_mode_oracle_capture.py
+  - xtask/py/rank_oracle_capture.py
+  - xtask/py/rf_oracle_capture.py
+  - xtask/py/subset_determinism_capture.py
   - xtask/src/main.rs
 findings:
-  critical: 0
+  critical: 1
   warning: 4
-  info: 4
+  info: 3
   total: 8
 status: issues_found
 ---
 
-# Phase 7: Code Review Report
+# Phase 07: Code Review Report
 
-**Reviewed:** 2026-06-07T10:09:55Z
+**Reviewed:** 2026-06-07T10:40:20Z
 **Depth:** standard
-**Files Reviewed:** 31
+**Files Reviewed:** 56
 **Status:** issues_found
 
 ## Summary
 
-Reviewed the Phase-7 "parity-completing variants" surface: DART/RF/GOSS boosting
-variants, the extended objective/metric families (huber/fair/quantile/mape/
-poisson/gamma/tweedie, ranking, cross-entropy, multiclass AUC/error), categorical
-splits, monotone constraints, CEGB, forced-splits JSON parsing, TreeSHAP, leaf
-refit, and the config/facade wiring.
+Phase 07 completes the boosting variants (DART, GOSS, Random Forest), the
+objective family (huber/fair/quantile/mape/poisson/gamma/tweedie/xentropy/
+lambdarank/rank_xendcg), the metric family (binary/multiclass/rank/extended
+regression), the categorical/monotone/forced-split/CEGB tree-learner additives,
+and the model-ops (refit, importance, predict modes). The numerical transcription
+is generally very faithful — gradient/hessian math, the gain primitives, the
+GOSS/bagging/DART RNG draw orders, the percentile/median renewal paths, and the
+f32-vs-f64 cast boundaries were cross-checked against the in-tree C++ reference
+and match line-for-line in nearly every case. RNG-replay goldens freeze the
+load-bearing draw orders.
 
-This is a numerically-faithful 1:1 port of C++ LightGBM 4.6. I verified the
-load-bearing math against the in-tree C++ reference under `LightGBM/src/` directly
-(rank_objective.hpp, xentropy_objective.hpp, dart.hpp, dcg_calculator.cpp,
-binary_metric.hpp, feature_histogram.hpp). The core gain math, RNG draw order
-(bagging/GOSS/rank_xendcg verbatim quickselect + per-block LCG), histogram
-subtraction trick, smaller-child selection, kEpsilon provenance, leaf-renew
-ordering, lambdarank pairwise accumulation, cross-entropy stable form,
-average_precision/AUC accumulation, softmax max-subtraction, and TreeSHAP
-recursion all match the reference faithfully. Input-boundary handling
-(model-text parse, forced_splits JSON, predict shape checks, config CHECK_*) is
-defensive and typed — no panicking paths found on hostile input.
+One genuine **correctness divergence from the C++ reference** was found: the
+standalone transformed batch-predict API in `lgbm-model` does not apply the
+Random Forest `average_output` division by `num_iteration`, so a model loaded and
+predicted through `predict_mat`/`predict_csr`/`predict_csc` returns the SUM of
+trees instead of the AVERAGE for RF models — diverging from C++ `GBDT::Predict`
+and from the in-crate `Booster::predict_row` (which DOES divide). Several
+lower-severity divergences and quality issues are also recorded.
 
-No BLOCKER-tier correctness or security defects were found. The findings below are
-narrow algorithmic-edge divergences (config corners outside the validated matrix),
-a UTF-8 handling bug in the forced-splits string parser, and a few maintainability
-items. Per the review charter, the accepted deferrals DEF-07-02 and DEF-07-11
-(objective/constraint knife-edges) are NOT reported.
+## Critical Issues
+
+### CR-01: RF `average_output` division missing from transformed batch-predict API
+
+**File:** `crates/lgbm-model/src/predict.rs:328-342` (callers `predict_mat`
+`:365`, `predict_csr` `:392`, `predict_csc` `:420`; contrib helper `:621-636`).
+
+**Issue:** C++ `GBDT::Predict` (`gbdt_prediction.cpp:55-66`) applies
+`output[k] /= num_iteration_for_pred_` when `average_output_ == true` (the Random
+Forest flag) BEFORE `ConvertOutput`. The Rust `predict_row_transformed` calls
+`model.predict_raw(...)` then `kind.convert(...)` with NO averaging step.
+`GbdtModel::predict_raw` (`ensemble.rs:90-102`) is the raw SUM and never divides
+(correct — C++ `PredictRaw` also doesn't). For a model with `average_output =
+true` (set by `Gbdt::into_model` when `variant == Rf`, `gbdt.rs:1573`), the
+transformed predict therefore returns `num_iteration ×` the correct
+probability/score. The in-crate `Booster::predict_row` (`booster.rs:227-240`) DOES
+apply the division, so the bug is specifically in the standalone `lgbm-model`
+predict API that the C-API / FFI / model-file consumers use — a real
+numerical-fidelity break for any RF model run through that surface, and an
+internal inconsistency with the `Booster` path.
+
+**Fix:** Apply the average division in the transformed/contrib paths (NOT the raw
+path) when `model.average_output`, mirroring C++ order (divide before convert):
+```rust
+fn predict_row_transformed(
+    model: &GbdtModel, kind: &ObjectiveKind, row: &[f64],
+    raw_buf: &mut Vec<f64>, conv_buf: &mut [f64], out: &mut Vec<f32>,
+) {
+    raw_buf.clear();
+    raw_buf.extend(model.predict_raw(row, 0, -1));
+    if model.average_output {
+        let (_s, num) = model.init_predict(0, -1);
+        if num > 0 {
+            for v in raw_buf.iter_mut() { *v /= num as f64; }
+        }
+    }
+    kind.convert(raw_buf, conv_buf);
+    for &v in conv_buf.iter() { out.push(v as f32); }
+}
+```
+Add an RF round-trip test in `predict.rs` (`average_output = true`, 2+ trees)
+asserting the transformed output equals `Booster::predict_row` and is the per-tree
+average, not the sum. Confirm whether `predict_contrib` for RF also needs the
+`/ num_iteration` scaling (C++ scales the SHAP base/contribs for averaged output).
 
 ## Warnings
 
-### WR-01: DART `max_drop < 0` caps drops at 1 instead of "no cap" (C++ divergence)
+### WR-01: DART `max_drop <= 0` early-break diverges from C++ unbounded cap
 
-**File:** `crates/lgbm-boosting/src/gbdt.rs:1280` and `:1293`
-**Issue:** The drop cap is written `dart.drop_index.len() >= cfg.max_drop.max(0) as usize`.
-C++ writes `drop_index_.size() >= static_cast<size_t>(config_->max_drop)`
-(dart.hpp:109-110, 124-125). For a NEGATIVE `max_drop` (e.g. `-1`), C++
-`static_cast<size_t>(-1) == SIZE_MAX`, so the break NEVER fires → unlimited drops.
-The Rust `.max(0)` collapses any negative `max_drop` to `0`, so `len() >= 0` is
-always true → the loop breaks after the FIRST pushed drop index, capping at 1
-drop. `max_drop == 0` matches C++ (both cap at 1), but `max_drop < 0` diverges.
-`config/set.rs:191` applies NO `>= 0` range check on `max_drop`, so a user can
-reach this. The `DartConfig.max_drop` doc comment ("`<= 0` ⇒ no cap") is also
-inconsistent with the actual `== 0` behavior.
-**Fix:** Mirror the C++ unsigned-wrap semantics explicitly:
+**File:** `crates/lgbm-boosting/src/gbdt.rs:1280`, `:1293` (test mirror
+`reference_drop` at `:2105`, `:2117`).
+
+**Issue:** The drop loop breaks when
+`dart.drop_index.len() >= cfg.max_drop.max(0) as usize`. C++ (`dart.hpp:111,123`)
+breaks on `drop_index_.size() >= static_cast<size_t>(config_->max_drop)`. For
+`max_drop < 0`, `static_cast<size_t>(-1)` is a huge value so C++ never breaks
+(unbounded drops), whereas the Rust `(-1).max(0) = 0` makes the break fire after
+the FIRST drop. For `max_drop == 0` both break after the first push (consistent).
+The default `max_drop = 50`, and there is no `CHECK` on `max_drop` in `config.h`,
+so a user-set negative `max_drop` silently caps drops at 1 in Rust vs unbounded in
+C++.
+
+**Fix:** Only apply the cap when `max_drop > 0`, matching the C++ unsigned cast:
 ```rust
-// C++ static_cast<size_t>(config_->max_drop): a negative max_drop wraps to a
-// huge bound (no effective cap); 0 caps at 1; positive caps at that value.
-let cap = if cfg.max_drop < 0 { usize::MAX } else { cfg.max_drop as usize };
-// ... inside the loop:
-if dart.drop_index.len() >= cap { break; }
+if cfg.max_drop > 0 && dart.drop_index.len() >= cfg.max_drop as usize {
+    break;
+}
 ```
-Apply to both the `!uniform_drop` (`:1280`) and `uniform_drop` (`:1293`) branches.
+Apply in both the non-uniform and uniform branches and in `reference_drop`.
 
-### WR-02: Forced-splits JSON string parser mangles non-ASCII bytes (`c as char`)
+### WR-02: rank labels truncated as gain-table index without an integer-ness check
 
-**File:** `crates/lgbm-treelearner/src/forced_splits.rs:223-224`
-**Issue:** `parse_string` builds the result with `s.push(c as char)` where `c: u8`.
-For any byte `>= 0x80` (the continuation/lead bytes of a multi-byte UTF-8
-sequence) this reinterprets each raw byte as a Unicode scalar value, corrupting
-non-ASCII content (e.g. a UTF-8 key or value is silently mojibake'd rather than
-decoded). `forced_splits_filename` is explicitly called out as the untrusted
-input boundary in this module's threat header (T-07-11-01); a hostile or merely
-non-ASCII document is silently mis-parsed instead of rejected or correctly
-decoded. It does not crash (the schema only reads numeric `feature`/`threshold`),
-but it is a latent correctness/robustness defect at a security boundary and the
-"hand-rolled JSON reader" comment implies RFC-ish fidelity it does not have.
-**Fix:** Accumulate raw bytes into a `Vec<u8>` and decode once with
-`String::from_utf8(...)`, returning `ForcedSplitError::Syntax` on invalid UTF-8;
-or restrict the parser to ASCII and reject bytes `>= 0x80` explicitly. Example:
+**File:** `crates/lgbm-metric/src/dcg_calculator.rs:118-124`, `:137`, `:161`;
+`crates/lgbm-objective/src/rank.rs:319`, `:324`.
+
+**Issue:** Rank labels index the gain table via `l as usize` (a C-style truncation
+toward zero). The C++ `DCGCalculator::CheckLabel` (`dcg_calculator.cpp:147-162`)
+additionally fatals when the label is NOT an integer (`label !=
+static_cast<int>(label)`). The Rust `check_labels` validates range (`>= 0`,
+`< label_gain.len()`) but NOT integer-ness, so a fractional label like `2.7`
+silently truncates to gain index 2 here whereas C++ aborts. The range check
+prevents OOB (no panic), so this is a parity/robustness gap rather than a crash,
+but a non-integer rank label yields a silently different DCG vs C++.
+
+**Fix:** Add the integer-ness check to `check_labels`:
 ```rust
-Some(c) => { buf.push(c); self.pos += 1; }
-// on close quote:
-String::from_utf8(buf).map_err(|_| ForcedSplitError::Syntax("invalid utf-8 in string".into()))
+if l.fract() != 0.0 {
+    return Err(MetricError::LabelOutOfRange { label: l as i64, num_gains: n_gains });
+}
 ```
+(or a dedicated `NonIntegerLabel` variant). Mirror in the lambdarank ctor's
+`dcg.check_labels` call.
 
-### WR-03: DART drop loop uses `self.iter` instead of `num_init_iteration_ + iter` (continue-training divergence)
+### WR-03: `multi_logloss` vs `multi_error` handle out-of-range labels inconsistently
 
-**File:** `crates/lgbm-boosting/src/gbdt.rs:1276`, `:1289`, `:1305-1315`
-**Issue:** `dropping_trees` iterates `for i in 0..iter` (`iter = self.iter`) and
-indexes `self.trees[(i * k + cur_tree_id)]`. C++ `DroppingTrees` iterates
-`for (int i = 0; i < iter_; ++i)` and pushes `num_init_iteration_ + i`
-(dart.hpp:107-108, 116-117), then indexes `models_[(num_init_iteration_ + i) * ntpi + cur_tree_id]`.
-The Rust port hard-codes the `num_init_iteration_ = 0` assumption (acknowledged in
-the inline comment). For a FRESH train this is correct, but if DART is combined
-with `with_loaded_model` (continue-training, ADV-06), `self.iter` after seeding
-equals the loaded iteration count and the drop indices/tree lookups would no
-longer match the C++ `(num_init_iteration_ + i)` indexing — DART would consider
-dropping the pre-loaded trees and the `tree_weight_`/`drop_index_` bookkeeping
-(which only covers freshly-grown iterations) would index incorrectly.
-**Fix:** If DART + continue-training is out of scope, add a guard in
-`with_loaded_model`/`with_dart` that rejects the combination with a typed error
-(so it can never silently mis-index). If in scope, thread `num_init_iteration`
-through `dropping_trees`/`normalize` and offset the tree index + `tree_weight_`
-access by it, mirroring `(num_init_iteration_ + i)`.
+**File:** `crates/lgbm-metric/src/multiclass.rs:337-341` (logloss) vs `:94`
+(multi_error).
 
-### WR-04: `model_text::load` rejects a zero-feature model (`"".split(' ').count() == 1`)
+**Issue:** `MultiLogloss::eval` does `let kk = labels[i] as usize; rec.get(kk)...`
+— a negative label (`-1.0f32 as usize` saturates) or a wrap does not panic (the
+`.get` returns `None → 0.0 → floor`), but a label that truncates into
+`[0, num_class)` silently scores the wrong class. `MultiError::eval` instead clamps
+with `.min(k_classes - 1)`. Neither validates that the label is a non-negative
+integer `< num_class`, which the C++ `MulticlassMetric` relies on the objective
+`Init` having enforced — and the two metrics handle the bad-label case
+differently.
 
-**File:** `crates/lgbm-model/src/model_text.rs:112-123`
-**Issue:** The feature-count validation does
-`feature_names.split(' ').count() != expected_cols`. For a degenerate model with
-`max_feature_idx = -1` (zero features), `expected_cols = (−1 + 1) = 0`, but an
-empty `feature_names=` value yields `"".split(' ').count() == 1`, so a valid
-zero-feature model would be rejected as malformed. Likewise `feature_infos`.
-Real LightGBM models always have `>= 1` feature so this is unlikely to surface,
-but it is an off-by-one in the boundary check that would mis-classify a valid
-edge-case model as malformed.
-**Fix:** Special-case the empty string before counting:
-```rust
-let fn_count = if feature_names.is_empty() { 0 } else { feature_names.split(' ').count() };
-```
-(and the same for `feature_infos`).
+**Fix:** Validate `labels[i]` is a non-negative integer `< num_class` once (return
+`MetricError::LabelOutOfRange`) in both `MultiLogloss::eval` and
+`MultiError::eval`, or document the precondition and keep the defensive handling
+consistent between them.
+
+### WR-04: DART `inv_average_weight` 0/0 NaN is faithful-but-fragile
+
+**File:** `crates/lgbm-boosting/src/gbdt.rs:1271,1274`.
+
+**Issue:** `inv_average_weight = tree_weight.len() as f64 / sum_weight`. On the
+first drop-eligible iteration `sum_weight == 0`, so this is `0.0/0.0 = NaN`, and
+the `max_drop` cap term at `:1274` is also NaN. This matches C++ (same `0/0`), and
+on iter 0 the per-tree drop loop `for i in 0..iter` is empty so the NaN is never
+compared — byte-equal to C++. The risk is a future refactor or a continue-training
+path (`num_init_iteration_ > 0`, `with_loaded_model` + DART) reaching the NaN
+comparison with a non-empty drop loop, where `NaN < x` is always false (no trees
+dropped) — a silent divergence waiting to surface.
+
+**Fix:** No change required for current parity. Add a comment documenting the
+deliberate `0/0` (mirroring C++) and guard the NaN if continue-training with DART
+is ever wired so it cannot leak into a non-empty drop loop.
 
 ## Info
 
-### IN-01: `average_precision` declares `accum_prec` without initializer (dead C++ init dropped)
+### IN-01: `safe_log` magic-number `1e-35` duplicated instead of reusing the constant
 
-**File:** `crates/lgbm-metric/src/binary.rs:132`
-**Issue:** `let mut accum_prec;` is declared uninitialized; C++ initializes it to
-`1.0f` (binary_metric.hpp:319). The C++ `1.0f` init is dead (it is overwritten on
-every threshold change before being read), so the Rust behavior is equivalent —
-but a future edit that reads `accum_prec` before the first threshold transition
-would fail to compile (Rust) where C++ would silently read `1.0`. Cosmetic
-fidelity gap; no behavior change.
-**Fix:** Initialize `let mut accum_prec = 1.0f64;` to mirror the C++ source 1:1.
+**File:** `crates/lgbm-metric/src/regression.rs:54`.
 
-### IN-02: `feature_importance_split_count` (unguarded) is a near-duplicate of the guarded variant
+**Issue:** `const K_ZERO_THRESHOLD: f64 = 1e-35;` is hard-coded locally, while the
+project convention (stated in `dcg_calculator.rs` / `gain.rs` / `tree.rs`) is to
+reuse `lgbm_core::types::K_ZERO_THRESHOLD` and "never redefine 1e-35 / 1e-15
+locally." The value matches C++ `kZeroThreshold`, so no numeric defect, but the
+duplicated literal can drift from the canonical constant.
 
-**File:** `crates/lgbm-model/src/ensemble.rs:157-168` vs `:200-212`
-**Issue:** `feature_importance_split_count` (no `split_gain > 0` guard) and
-`feature_importance_split_count_guarded` differ only by the gain filter. The
-unguarded one is retained "for callers that want the raw structural count" but
-the model-text emit + parity use the guarded one. Two methods with subtly
-different semantics invite a wrong-method bug at a call site.
-**Fix:** If no live caller needs the unguarded count, remove it; otherwise rename
-to make the distinction unmissable (e.g. `..._raw` / `..._cpp_faithful`) and
-document which one matches C++ `FeatureImportance`.
+**Fix:** Replace with `f64::from(lgbm_core::types::K_ZERO_THRESHOLD)` (and drop
+the local const), matching the binary/multiclass/objective crates' pattern.
 
-### IN-03: `renew_tree_output` recomputes every leaf incl. empty leaves (works, but relies on `percentile_fun([])==0.0`)
+### IN-02: `model_text::load` silently ignores `version=` and unknown header keys
 
-**File:** `crates/lgbm-treelearner/src/learner.rs:2486-2489`
-**Issue:** The loop calls `renew(leaf, rows)` for every leaf unconditionally. C++
-`RenewTreeOutput` (serial_tree_learner.cpp:935-942) special-cases `cnt_leaf_data == 0`
-by setting `SetLeafOutput(i, 0.0)` (single-machine). The Rust closures
-(gbdt.rs:699-717, :787-802) feed an empty `residuals`/`labels` slice into
-`obj.renew_leaf_output`, which routes to `percentile_fun(&[], 0.5) == 0.0` —
-coincidentally matching the C++ `0.0`. The behavior is correct ONLY because the
-empty-input percentile returns `0.0`; it is not guarded explicitly. Leaf-wise
-growth with `min_data_in_leaf >= 1` never produces empty leaves on the in-scope
-corpora, so this is latent. The MAPE weighted path (`weighted_percentile_fun(&[],&[],0.5)`)
-should be confirmed to also return `0.0`/not panic on empty input.
-**Fix:** Add an explicit `if rows.is_empty() { tree.leaf_value[leaf]=0.0; continue; }`
-guard in `renew_tree_output` to make the C++ correspondence explicit and robust
-(the RF path `rf_renew_full` already does this; the GBDT-spine closures do not).
+**File:** `crates/lgbm-model/src/model_text.rs:96`.
 
-### IN-04: `find_in_bitset` / `categorical_decision` slice indexing assumes valid `cat_boundaries` on a parsed model
+**Issue:** The header parse `ignore`s any unrecognized key
+(`_ => { /* tree / version=v4 / other header keys: ignored */ }`), including
+`version`. A non-`v4` or corrupted-header model loads without warning. C++
+`LoadModelFromString` checks the version. Low risk (committed fixtures are v4;
+feature counts are still validated against `max_feature_idx`), but a
+forward-incompatible model is accepted silently.
 
-**File:** `crates/lgbm-model/src/tree.rs:201-204`
-**Issue:** `categorical_decision` indexes `self.cat_boundaries[cat_idx]` and
-`[cat_idx + 1]` then slices `self.cat_threshold[lo..hi]` with `cat_idx` derived
-from `self.threshold[node] as i32`. `Tree::parse` validates `cat_boundaries`
-length (`num_cat + 1`) and `cat_threshold` length (`== cat_boundaries.back()`),
-but does NOT validate that each numeric `threshold` value used as a categorical
-`cat_idx` is `< num_cat`, nor that `cat_boundaries` is monotone non-decreasing
-(so `lo <= hi`). A crafted model with an out-of-range categorical threshold or a
-non-monotone `cat_boundaries` could panic on slice indexing at predict time
-(`lo > hi` or `cat_idx + 1` OOB). This is a defense-in-depth gap at the model
-parse boundary (the module's own header promises "never a panic" on malformed
-files); numeric splits are fully bounds-checked but the categorical-threshold ↔
-`cat_boundaries` linkage is not.
-**Fix:** In `Tree::parse`, for each categorical-decision node validate
-`(threshold as usize) + 1 < cat_boundaries.len()` and that `cat_boundaries` is
-monotone non-decreasing, returning `ModelError::MalformedModel` otherwise — so
-predict-time slicing can never panic on a hostile model.
+**Fix:** Capture `version` and reject (or warn on) a version other than
+`MODEL_VERSION` ("v4") as a `ModelError::MalformedModel`.
+
+### IN-03: lazy-CEGB `feature_used_in_data` allocation uses an unchecked usize product
+
+**File:** `crates/lgbm-treelearner/src/cost_effective_gradient_boosting.rs:73`.
+
+**Issue:** `vec![false; (num_features as usize) * (num_data as usize)]` allocates
+the full (feature × row) seen-set when any `cegb_penalty_feature_lazy` is set. The
+multiply is an unchecked `as usize` product; on a 32-bit target or a pathological
+`num_features * num_data` it could over-allocate or wrap. Inputs come from
+config/dataset (not adversarial network input) and in-scope corpora are small, so
+this is a robustness note (performance is out of v1 scope).
+
+**Fix:** Use `checked_mul` on the `usize` product and surface a typed error if it
+overflows, or gate the allocation behind a sanity bound.
 
 ---
 
-_Reviewed: 2026-06-07T10:09:55Z_
+_Reviewed: 2026-06-07T10:40:20Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
