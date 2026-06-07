@@ -655,7 +655,15 @@ impl Tree {
     /// case). `num_cat = 0`, all split/internal arrays empty, one leaf at depth 0
     /// with parent -1 — exactly the C++ `Tree(2,…)` default reduced to a single
     /// leaf.
-    pub fn as_constant(constant_value: f64) -> Tree {
+    ///
+    /// `count` is `leaf_count_[0]` — the row count of the single leaf. C++ passes
+    /// `num_data_` at BOTH constant-tree call sites (gbdt.cpp:430 for the init case
+    /// and gbdt.cpp:433 for the extend-with-zeros case), so the caller MUST thread
+    /// `num_data` here (the CR-01 fix; was hardcoded `0`). `Tree::to_string` ALWAYS
+    /// emits `leaf_count=` (tree.cpp:363 — no single-leaf write-side early return),
+    /// so a constant tree's serialized model text reads `leaf_count=<num_data>`,
+    /// byte-matching the C++ golden (e.g. `leaf_count=12`).
+    pub fn as_constant(constant_value: f64, count: i32) -> Tree {
         Tree {
             num_leaves: 1,
             num_cat: 0,
@@ -670,7 +678,7 @@ impl Tree {
             // the constant tree's single leaf.
             leaf_value: vec![constant_value],
             leaf_weight: vec![0.0],
-            leaf_count: vec![0],
+            leaf_count: vec![count],
             internal_value: Vec::new(),
             internal_weight: Vec::new(),
             internal_count: Vec::new(),
@@ -993,18 +1001,20 @@ mod tests {
 
     #[test]
     fn as_constant_builds_one_leaf_tree() {
-        // C++ AsConstantTree: num_leaves=1, shrinkage=1.0, leaf_value[0]=val.
-        let t = Tree::as_constant(0.7);
+        // C++ AsConstantTree: num_leaves=1, shrinkage=1.0, leaf_value[0]=val,
+        // leaf_count_[0]=count (gbdt.cpp passes num_data_).
+        let t = Tree::as_constant(0.7, 12);
         assert_eq!(t.num_leaves, 1);
         assert_eq!(t.shrinkage, 1.0);
         assert_eq!(t.leaf_value, vec![0.7]);
+        assert_eq!(t.leaf_count, vec![12]);
         assert_eq!(t.num_cat, 0);
         assert!(t.split_feature.is_empty());
         // A 1-leaf tree predicts its constant for any input.
         assert_eq!(t.predict(&[1.0, 2.0, 3.0]), 0.7);
         assert_eq!(t.predict(&[]), 0.7);
         // Zero constant (the extend-with-zeros case).
-        assert_eq!(Tree::as_constant(0.0).predict(&[0.0]), 0.0);
+        assert_eq!(Tree::as_constant(0.0, 12).predict(&[0.0]), 0.0);
     }
 
     #[test]

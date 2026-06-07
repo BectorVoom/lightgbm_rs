@@ -287,7 +287,7 @@ impl<'a> Gbdt<'a> {
                 let is_first_iter =
                     self.trees.len() < k as usize;
                 let const_val = if is_first_iter { init } else { 0.0 };
-                self.trees.push(Tree::as_constant(const_val));
+                self.trees.push(Tree::as_constant(const_val, self.num_data));
                 continue;
             }
 
@@ -385,7 +385,7 @@ impl<'a> Gbdt<'a> {
                     let init = init_scores[cur_tree_id as usize];
                     let is_first_iter = self.trees.len() < k as usize;
                     let const_val = if is_first_iter { init } else { 0.0 };
-                    self.trees.push(Tree::as_constant(const_val));
+                    self.trees.push(Tree::as_constant(const_val, self.num_data));
                 }
                 continue;
             }
@@ -443,7 +443,7 @@ impl<'a> Gbdt<'a> {
                 let init = init_scores[cur_tree_id as usize];
                 let is_first_iter = self.trees.len() < k as usize;
                 let const_val = if is_first_iter { init } else { 0.0 };
-                self.trees.push(Tree::as_constant(const_val));
+                self.trees.push(Tree::as_constant(const_val, self.num_data));
             }
         }
 

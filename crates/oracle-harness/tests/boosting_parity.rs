@@ -424,6 +424,103 @@ fn parse_gh(text: &str) -> (Vec<f32>, Vec<f32>) {
     (grad, hess)
 }
 
+/// CR-01 (06-06): the constant (`num_leaves==1`) tree's SERIALIZED model text must
+/// carry `leaf_count=<num_data>` (C++ `AsConstantTree(val, num_data_)`,
+/// gbdt.cpp:430/433 + tree.h:239), NOT the pre-06-06 hardcoded `leaf_count=0`.
+/// `Tree::to_string` ALWAYS emits `leaf_count=` (tree.cpp:363 — no single-leaf
+/// write-side early return), so this is the byte-exact serialization contract for
+/// SC#1.
+///
+/// The only committed golden containing a constant tree is
+/// `regression_l1_bag1_es0_bfa0` (its `Tree=0` is a constant with `leaf_count=12`
+/// and `leaf_value=11`, the renewed median residual). This test reconstructs that
+/// exact constant tree via `Tree::as_constant(value, num_data)` and byte-compares
+/// its serialized block against the golden's `Tree=0` block, LINE BY LINE.
+///
+/// SCOPE RESTRICTION (documented): one line is excluded from the byte-compare,
+/// `leaf_weight=` — the real binary emits it EMPTY for a constant tree while the
+/// Rust serializer emits `leaf_weight=0` (a pre-existing serialization divergence
+/// unrelated to CR-01, NOT in the 06-VERIFICATION gap set). The `leaf_count=` line
+/// IS in scope (the CR-01 contract); a revert to `vec![0]` fails this test at the
+/// `leaf_count=` line. `leaf_value` matches here because `as_constant` is fed the
+/// golden's renewed value directly (this test isolates the SERIALIZATION of
+/// leaf_count, independent of the Task 2b leaf-VALUE renewal question).
+#[test]
+fn constant_tree_model_text_byte_exact() {
+    let Some(model_text) = read_golden("regression_l1_bag1_es0_bfa0_model.txt") else {
+        return;
+    };
+    // Extract the golden `Tree=0` block (from the `Tree=0` line to the next blank
+    // line), then drop the `Tree=0` header to get the bare ToString() body.
+    let tree0_block: Vec<&str> = {
+        let mut lines = Vec::new();
+        let mut in_block = false;
+        for line in model_text.lines() {
+            if line == "Tree=0" {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if line.trim().is_empty() {
+                    break;
+                }
+                lines.push(line);
+            }
+        }
+        lines
+    };
+    assert!(
+        !tree0_block.is_empty(),
+        "golden has no Tree=0 block to byte-compare"
+    );
+
+    // Reconstruct the exact constant tree the golden encodes: value 11.0 (the
+    // renewed median), count = num_data = 12 (the spine corpus row count).
+    let constant = lgbm_model::Tree::as_constant(11.0, 12);
+    // `to_string()` ends with a trailing blank line (tree.cpp:406); drop the trailing
+    // empty entry so the bare-body line set matches the golden block extraction.
+    let rust_block: Vec<String> = constant
+        .to_string()
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Line-by-line byte compare (excluding the documented `leaf_weight=` divergence).
+    // The golden block and the rust block must agree line-for-line on every other
+    // key, INCLUDING `leaf_count=12` (the CR-01 contract). A length divergence (an
+    // extra/missing serialized line) also fails.
+    assert_eq!(
+        tree0_block.len(),
+        rust_block.len(),
+        "constant tree serialized line count: golden {} != rust {}\n golden={tree0_block:?}\n rust={rust_block:?}",
+        tree0_block.len(),
+        rust_block.len()
+    );
+    let mut saw_leaf_count = false;
+    for (golden_line, rust_line) in tree0_block.iter().zip(rust_block.iter()) {
+        if golden_line.starts_with("leaf_weight=") {
+            // documented pre-existing divergence (empty vs `0`) — out of CR-01 scope.
+            continue;
+        }
+        if golden_line.starts_with("leaf_count=") {
+            saw_leaf_count = true;
+            assert_eq!(
+                *golden_line, "leaf_count=12",
+                "golden constant tree must carry leaf_count=12"
+            );
+        }
+        assert_eq!(
+            golden_line, rust_line,
+            "constant tree model-text line diverges: golden {golden_line:?} != rust {rust_line:?}"
+        );
+    }
+    assert!(
+        saw_leaf_count,
+        "the constant tree block must contain a leaf_count= line (CR-01)"
+    );
+}
+
 #[test]
 fn early_stopping() {
     // L3/BST-07: the full D-07 cross-product matrix (5 objectives × {bagging on/off}
