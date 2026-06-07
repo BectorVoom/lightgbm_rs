@@ -227,7 +227,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Core metrics (`l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`) plus multi-metric infrastructure (`metric_freq`, training-metric eval) match the reference, and early stopping (`early_stopping_round`, `first_metric_only`, `early_stopping_min_delta`) fires identically.
   5. Bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) selects the same rows via RNG-matching sequence and call order.
 
-**Plans**: 5 plans (spine-first vertical slices, D-14→D-17)
+**Plans**: 6 plans (5 spine-first vertical slices D-14→D-17 + 1 gap-closure)
 
 **Wave 1** *(Wave-0 foundation — scaffolds + extensions + failing end-to-end test)*
 
@@ -248,6 +248,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Wave 5** *(blocked on 06-04 — bagging + early-stop axes + full matrix, D-17 steps 3+4)*
 
   - [x] 06-05-PLAN.md — BaggingSampleStrategy (RNG-replay D-13 golden, bit-exact) + OOB score update + early stopping (BST-07) + metric infra (MET-02); full ~40-cell D-07 cross-product replay (regression L2 bit-exact across all axes incl. bagging; documented residuals for non-L2 bagging / l1 bfa-off / multiclass es)
+
+**Wave 6** *(gap closure — verification gaps_found 3/5 SC; closes CR-01/WR-01/WR-03/CR-02 + reg_sqrt verification gap)*
+
+  - [ ] 06-06-PLAN.md — Tighten D-07 matrix assertions (no swallowed Results, WR-01); subset-path median-residual renewal for regression_l1+bagging (WR-03); Tree::as_constant(count) + byte-exact constant-tree model-text assertion (CR-01); decouple early-stop eval from metric_freq + metric_freq>1+ES golden (CR-02); real-binary reg_sqrt=1 golden (GAP E)
 
 ### Phase 7: Parity-Completing Variants
 
