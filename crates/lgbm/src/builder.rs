@@ -123,6 +123,41 @@ impl TrainingBuilder {
         self
     }
 
+    /// `predict_contrib` (PRD-04): when `true`, prediction emits TreeSHAP per-feature
+    /// contributions (+ the expected-value base) instead of plain scores. Routes into
+    /// `lgbm-core::Config.predict_contrib` via `Config::from_params` (set.rs:290 /
+    /// scope.rs:137).
+    pub fn predict_contrib(mut self, on: bool) -> Self {
+        self.params.insert("predict_contrib".into(), on.to_string());
+        self
+    }
+
+    /// `pred_early_stop` (PRD-05): enable the per-N-iterations prediction-early-stop
+    /// margin hook. Routes into `lgbm-core::Config.pred_early_stop` (set.rs:292 /
+    /// scope.rs:139). config.h default false.
+    pub fn pred_early_stop(mut self, on: bool) -> Self {
+        self.params.insert("pred_early_stop".into(), on.to_string());
+        self
+    }
+
+    /// `pred_early_stop_freq` (PRD-05): how many accumulated iterations between margin
+    /// checks (config.h default 10). Routes into `Config.pred_early_stop_freq`
+    /// (set.rs:293 / scope.rs:140).
+    pub fn pred_early_stop_freq(mut self, v: i32) -> Self {
+        self.params
+            .insert("pred_early_stop_freq".into(), v.to_string());
+        self
+    }
+
+    /// `pred_early_stop_margin` (PRD-05): the decisive-margin threshold (config.h
+    /// default 10.0). Routes into `Config.pred_early_stop_margin` (set.rs:294 /
+    /// scope.rs:141).
+    pub fn pred_early_stop_margin(mut self, v: f64) -> Self {
+        self.params
+            .insert("pred_early_stop_margin".into(), v.to_string());
+        self
+    }
+
     /// `alpha` (OBJ-04): the shared Huber δ AND quantile percentile level (config.h
     /// default 0.9, CHECK `> 0`; quantile additionally requires `< 1`). Routes into
     /// `lgbm-core::Config.alpha` via `Config::from_params` (set.rs:316 /
@@ -601,6 +636,38 @@ mod tests {
             .build()
             .unwrap();
         assert!(!cfg0.reg_sqrt, "reg_sqrt defaults to false");
+    }
+
+    #[test]
+    fn predict_mode_setters_route_into_config() {
+        // PRD-04 / PRD-05: predict_contrib + pred_early_stop/_freq/_margin must be
+        // drivable end-to-end through the builder.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .predict_contrib(true)
+            .pred_early_stop(true)
+            .pred_early_stop_freq(3)
+            .pred_early_stop_margin(2.5)
+            .build()
+            .unwrap();
+        assert!(cfg.predict_contrib, "predict_contrib(true) must round-trip");
+        assert!(cfg.pred_early_stop, "pred_early_stop(true) must round-trip");
+        assert_eq!(cfg.pred_early_stop_freq, 3);
+        assert!((cfg.pred_early_stop_margin - 2.5).abs() < 1e-12);
+
+        // defaults stay config.h values.
+        let cfg0 = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .build()
+            .unwrap();
+        assert!(!cfg0.predict_contrib);
+        assert!(!cfg0.pred_early_stop);
+        assert_eq!(cfg0.pred_early_stop_freq, 10);
+        assert!((cfg0.pred_early_stop_margin - 10.0).abs() < 1e-12);
     }
 
     #[test]

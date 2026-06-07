@@ -209,6 +209,19 @@ pub const RANK_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// REFERENCE_MANIFEST.md.
 pub const RANK_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W9
+/// predict-mode (PRD-04 TreeSHAP + PRD-05 prediction-early-stop) oracle (plan
+/// 07-10). Reuses the SAME prebuilt-wheel binary; `predict-mode-oracle-capture`
+/// asserts the installed version matches BEFORE capture so a wrong version can
+/// never silently emit divergent predict-mode goldens (threat T-07-10-SC).
+pub const PREDICT_MODE_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W9 predict-mode oracle (plan 07-10).
+/// The SAME seed the model oracle uses ([`MODEL_TRAIN_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the predict-mode
+/// goldens byte-idempotent. Recorded in REFERENCE_MANIFEST.md.
+pub const PREDICT_MODE_ORACLE_SEED: i32 = MODEL_TRAIN_SEED;
+
 /// The per-block RNG seed base for ranking's query-grouped bagging (C++
 /// `config_->bagging_seed`, bagging.hpp). Pinned so the bagging_by_query RNG-replay
 /// golden is reproducible.
@@ -235,6 +248,7 @@ fn main() -> Result<()> {
         Some("rf-oracle-capture") => rf_oracle_capture(),
         Some("metric-oracle-capture") => metric_oracle_capture(),
         Some("categorical-oracle-capture") => categorical_oracle_capture(),
+        Some("predict-mode-oracle-capture") => predict_mode_oracle_capture(),
         Some("rank-oracle-capture") => rank_oracle_capture(),
         Some(other) => {
             bail!(
@@ -242,7 +256,8 @@ fn main() -> Result<()> {
                  (try: regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
-                 rf-oracle-capture | metric-oracle-capture | categorical-oracle-capture)"
+                 rf-oracle-capture | metric-oracle-capture | categorical-oracle-capture | \
+                 predict-mode-oracle-capture | rank-oracle-capture)"
             );
         }
         None => {
@@ -1026,6 +1041,95 @@ fn categorical_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- categorical-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/categorical/` \
+         is empty (byte-idempotent real-binary dump)."
+    );
+    Ok(())
+}
+
+/// `predict-mode-oracle-capture` — Phase-7 W9 (plan 07-10, PRD-04 + PRD-05) real
+/// `lib_lightgbm` 4.6 predict-mode golden capture.
+///
+/// Trains small deterministic models (numeric regression, categorical regression,
+/// multiclass) on real `lib_lightgbm`, then dumps under
+/// `crates/oracle-harness/tests/fixtures/predict_modes/<name>/`:
+/// - `model.txt` — the authoritative v4 model text (loaded by the Rust test),
+/// - `X.txt` — the predict input matrix (rows of f64 bit patterns),
+/// - `contrib.txt` — `booster.predict(X, pred_contrib=True)` (per-row per-class
+///   `[per-feature; base]`, f64 bit patterns) for the PRD-04 sum+base==raw gate,
+/// - `early_stop.txt` — for the freq×margin axis, the raw score + iterations-used
+///   the reference reports (PRD-05).
+///
+/// Version-asserted ([`PREDICT_MODE_ORACLE_LIGHTGBM_VERSION`]); byte-idempotent;
+/// LightGBM/ is NEVER git-added.
+fn predict_mode_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/predict_mode_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/predict_modes");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask predict-mode-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        PREDICT_MODE_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = PREDICT_MODE_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python (e.g. a venv) with \
+         `pip install lightgbm==4.6.0`. `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask predict-mode-oracle-capture: training predict-mode corpora on real \
+         lib_lightgbm and dumping TreeSHAP contrib + pred-early-stop goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(PREDICT_MODE_ORACLE_SEED.to_string())
+            .arg(PREDICT_MODE_ORACLE_LIGHTGBM_VERSION),
+        "predict_mode_oracle_capture.py",
+    )?;
+
+    for name in ["numeric", "categorical", "multiclass"] {
+        for f in ["model.txt", "X.txt", "contrib.txt"] {
+            let p = out_dir.join(name).join(f);
+            if !p.is_file() {
+                bail!("capture completed but {} was not written", p.display());
+            }
+        }
+    }
+    // early_stop goldens are emitted for the binary + multiclass corpora.
+    for name in ["numeric", "multiclass"] {
+        let p = out_dir.join(name).join("early_stop.txt");
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask predict-mode-oracle-capture: done. Wrote numeric/categorical/multiclass \
+         predict-mode goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- predict-mode-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/predict_modes/` \
          is empty (byte-idempotent real-binary dump)."
     );
     Ok(())
