@@ -168,7 +168,6 @@ fn run_early_stop_cell(corpus: &str) {
     };
 
     let ntpi = model.num_tree_per_iteration.max(0) as usize;
-    let width = (model.max_feature_idx + 1).max(0) as usize;
 
     // Parse the CELL blocks: `CELL freq=<f> margin=<g> rows=<n> width=<w>` then rows.
     let mut lines = golden_text.lines().peekable();
@@ -200,19 +199,13 @@ fn run_early_stop_cell(corpus: &str) {
             }
         }
 
-        // Replay each row through predict_raw_early_stop.
-        let mut rust = Vec::with_capacity(rows * ntpi);
-        let mut row_buf = vec![0.0f64; width];
-        for r in 0..rows {
-            for (c, slot) in row_buf.iter_mut().enumerate() {
-                *slot = x[r * cols + c] as f64;
-            }
-            let (scores, _iters) =
-                model.predict_raw_early_stop(&row_buf, 0, -1, freq, margin);
-            rust.extend(scores);
-        }
-
-        let rust_f32: Vec<f32> = rust.iter().map(|&v| v as f32).collect();
+        // Replay through the model-aware early-stop driver (applies the C++
+        // `!NeedAccuratePrediction()` gate: regression returns the full score,
+        // binary/multiclass freeze at the margin).
+        let (rust_f32, _iters) = lgbm_model::predict::predict_raw_early_stop_mat(
+            &model, &x, rows as i32, cols as i32, freq, margin,
+        )
+        .expect("predict_raw_early_stop_mat");
         let golden_f32: Vec<f32> = golden.iter().map(|&v| v as f32).collect();
         compare_within(&rust_f32, &golden_f32, ORACLE_TOL).unwrap_or_else(|m| {
             panic!(

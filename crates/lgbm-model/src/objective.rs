@@ -88,6 +88,31 @@ pub enum ObjectiveKind {
 }
 
 impl ObjectiveKind {
+    /// C++ `ObjectiveFunction::NeedAccuratePrediction` (`objective_function.h:76`)
+    /// plus the per-objective overrides. Returns `false` ONLY for objectives whose
+    /// raw margin is a decisive classification score — `binary`
+    /// (`binary_objective.hpp:188`), `multiclass` / `multiclassova`
+    /// (`multiclass_objective.hpp:153,259`), and ranking (not represented here).
+    /// Every regression-like objective (regression, poisson/gamma/tweedie,
+    /// cross_entropy / cross_entropy_lambda) inherits the base `true`.
+    ///
+    /// This is the GATE that decides whether prediction early stopping is allowed:
+    /// `Predictor` installs the active early-stop instance only when
+    /// `!NeedAccuratePrediction()` (`predictor.hpp:46`). For an
+    /// accurate-prediction objective the early-stop request is silently ignored and
+    /// the full ensemble is always evaluated.
+    pub fn need_accurate_prediction(&self) -> bool {
+        match self {
+            ObjectiveKind::Binary { .. }
+            | ObjectiveKind::Multiclass { .. }
+            | ObjectiveKind::MulticlassOva { .. } => false,
+            ObjectiveKind::Regression { .. }
+            | ObjectiveKind::Poisson
+            | ObjectiveKind::CrossEntropy
+            | ObjectiveKind::CrossEntropyLambda => true,
+        }
+    }
+
     /// Parse the model's `objective=` line value (e.g. `binary sigmoid:1`,
     /// `multiclass num_class:3`, `regression sqrt`, `regression`) into a kind +
     /// params. Mirrors the C++ string-ctors: the first whitespace token is the
@@ -309,6 +334,27 @@ pub fn convert_multiclassova(input: &[f64], output: &mut [f64], sigmoid: f64) {
 mod tests {
     use super::*;
     use crate::tree::Tree;
+
+    #[test]
+    fn need_accurate_prediction_gates_early_stop() {
+        // Only binary / multiclass / multiclassova return false (early-stop allowed).
+        assert!(!ObjectiveKind::parse("binary").unwrap().need_accurate_prediction());
+        assert!(!ObjectiveKind::parse("multiclass num_class:3")
+            .unwrap()
+            .need_accurate_prediction());
+        assert!(!ObjectiveKind::parse("multiclassova num_class:3")
+            .unwrap()
+            .need_accurate_prediction());
+        // Regression-like objectives inherit the base `true` (early-stop ignored).
+        assert!(ObjectiveKind::parse("regression").unwrap().need_accurate_prediction());
+        assert!(ObjectiveKind::parse("poisson").unwrap().need_accurate_prediction());
+        assert!(ObjectiveKind::parse("cross_entropy")
+            .unwrap()
+            .need_accurate_prediction());
+        assert!(ObjectiveKind::parse("cross_entropy_lambda")
+            .unwrap()
+            .need_accurate_prediction());
+    }
 
     // --- Test 1 + 2: regression identity / sqrt ---
 

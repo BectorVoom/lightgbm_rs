@@ -524,6 +524,74 @@ fn leaf_width(model: &GbdtModel) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Prediction early stopping (PRD-05) — model-aware driver.
+//
+// Mirrors C++ `Predictor` (`predictor.hpp:41-59`): the early-stop margin hook is
+// installed ONLY when `early_stop && !boosting->NeedAccuratePrediction()`. For an
+// accurate-prediction objective (regression / poisson / cross-entropy / …) the
+// request is silently ignored and the FULL ensemble is evaluated — so the result
+// is byte-identical to `predict_raw`. The hook is active only for binary /
+// multiclass margins (`GbdtModel::predict_raw_early_stop`).
+// ---------------------------------------------------------------------------
+
+/// Dense early-stop raw prediction (PRD-05). Returns row-major raw scores of width
+/// `num_tree_per_iteration` plus a per-row `iterations_evaluated` count.
+///
+/// `freq` / `margin` come from `Config.pred_early_stop_freq` /
+/// `pred_early_stop_margin`. When the model's objective `need_accurate_prediction()`
+/// (regression-like), the hook is disabled and every row evaluates the full
+/// ensemble (`iterations_evaluated == num_iteration()`), matching C++.
+pub fn predict_raw_early_stop_mat(
+    model: &GbdtModel,
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    freq: i32,
+    margin: f64,
+) -> Result<(Vec<f32>, Vec<i32>), ModelError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    let expected = (num_rows as i64) * (num_cols as i64);
+    if data.len() as i64 != expected {
+        return Err(ModelError::ShapeMismatch {
+            detail: format!(
+                "data.len()={} must equal num_rows*num_cols={expected}",
+                data.len()
+            ),
+        });
+    }
+    check_cols(model, num_cols)?;
+
+    // GATE: early stop is only honored for objectives that do NOT need accurate
+    // prediction (binary / multiclass). Otherwise force freq=0 (disabled).
+    let kind = resolve_objective(model)?;
+    let effective_freq = if kind.need_accurate_prediction() { 0 } else { freq };
+
+    let width = row_width(model);
+    let ntpi = model.num_tree_per_iteration.max(0) as usize;
+    let ncols = num_cols as usize;
+    let mut out = Vec::with_capacity(num_rows as usize * ntpi);
+    let mut iters = Vec::with_capacity(num_rows as usize);
+    let mut row = vec![0.0f64; width];
+    for r in 0..num_rows as usize {
+        let base = r * ncols;
+        for (c, slot) in row.iter_mut().enumerate() {
+            *slot = data[base + c] as f64;
+        }
+        let (scores, n) =
+            model.predict_raw_early_stop(&row, 0, -1, effective_freq, margin);
+        for s in scores {
+            out.push(s as f32);
+        }
+        iters.push(n);
+    }
+    Ok((out, iters))
+}
+
+// ---------------------------------------------------------------------------
 // TreeSHAP feature-contribution prediction (PRD-04, predict_contrib).
 //
 // Mirrors C++ `GBDT::PredictContrib` (`gbdt.cpp:640-651`): for each class `k`,
@@ -1066,5 +1134,33 @@ mod tests {
         let data = vec![1.0f32];
         let err = predict_contrib_mat(&m, &data, 1, 1).unwrap_err();
         assert!(matches!(err, ModelError::ShapeMismatch { .. }));
+    }
+
+    // --- early-stop driver gating (PRD-05) ---
+
+    #[test]
+    fn early_stop_driver_disabled_for_regression() {
+        // regression need_accurate_prediction()==true -> the hook is ignored even
+        // with an aggressive freq/margin; result == full raw predict, all iters.
+        let m = model(); // objective=regression, ntpi=1, 2 iters
+        let data = vec![1.0f32, 0.0, 0.0, 1.0];
+        let raw = predict_raw_mat(&m, &data, 2, 2).unwrap();
+        let (es, iters) =
+            predict_raw_early_stop_mat(&m, &data, 2, 2, 1, 0.0).unwrap();
+        assert_eq!(es, raw, "regression must ignore early stop (full predict)");
+        assert_eq!(iters, vec![2, 2], "all iterations evaluated for regression");
+    }
+
+    #[test]
+    fn early_stop_driver_active_for_binary() {
+        // A binary model: ntpi=1, objective=binary. With a tiny margin the binary
+        // 2*|score| check fires after the first iteration.
+        let mut m = model();
+        m.objective_string = Some("binary sigmoid:1".to_string());
+        let data = vec![1.0f32, 0.0]; // f0=1.0->tree0 leaf1=2.0
+        let (_es, iters) =
+            predict_raw_early_stop_mat(&m, &data, 1, 2, 1, 1.0).unwrap();
+        // tree0 contributes 2.0; 2*|2.0|=4.0 > 1.0 -> stop after 1 iteration.
+        assert_eq!(iters, vec![1], "binary early stop fires after first iter");
     }
 }
