@@ -1991,3 +1991,338 @@ fn subset_determinism_diagnostic() {
         );
     }
 }
+
+// ===================== OBJ-04 family A: huber/fair/quantile/mape (07-02) =====================
+//
+// Each objective is a vertical slice on the spine corpus (labels 2..20, all
+// |label| >= 1 so MAPE is stable, quantile/huber find real splits). The capture
+// (`boosting_oracle_capture.py::capture_family_a`) emits, per objective:
+//   - the layered L1-L5 DEFAULT-param spine cell (bag off / es off / bfa on):
+//     `<obj>_spine_model.txt` / `_spine_pred.txt` / `_scores.txt` / `_gh_iter1.txt`
+//     / `_gh_iterN.txt` / `_metrics.txt`.
+//   - the 7 remaining {bag×es×bfa} loop cells: `<obj>_bag<B>_es<E>_bfa<F>_model.txt`
+//     (+ `_pred.txt`).
+//   - the objective param-axis ALT cell on the spine (bag off / es off / bfa on):
+//     `<obj>_<param><value>_model.txt` (e.g. `huber_alpha0p5_model.txt`).
+//
+// Every cell skip-passes cleanly when its golden is absent (fresh checkout
+// pre-capture). The capture is the human-gated Task 3 of 07-02.
+//
+// D-05 POSTURE (quantile/mape bagged cells): quantile and mape are
+// `is_renew_tree_output == true`; their BAGGED loop cells (`*_bag1_*`) exercise the
+// renew-on-bagged-subset path. 07-01 settled D-05 as the FAITHFUL-FIX branch
+// (07-D05-DECISION.md): the bagged-subset split-gain `min_gain_shift` operand bug
+// was fixed in lgbm-compute `find_best_split`, the subset-path RenewTreeOutput is
+// faithful to C++ (gbdt.rs:395-415), and regression_l1 + bagging was un-deferred and
+// now asserts bit-exact parity. Under that settled posture the quantile/mape bagged
+// cells ASSERT real-binary leaf-value parity (bit-exact where the algorithm permits,
+// within ORACLE_TOL where the percentile/weighted-percentile renewal applies),
+// falling through to the SAME assertion path as the non-bagged cells — they are NOT
+// special-cased nor skipped. A growing divergence on a bagged renew cell therefore
+// fails this test as a regression (the D-05 contract).
+
+/// The family-A default param for each objective (matches the capture's
+/// `FAMILY_A_PARAM_AXIS[*][1][0]`). Used to drive the spine + loop cells.
+fn family_a_default_param(objective: &str) -> Option<(&'static str, f64)> {
+    match objective {
+        "huber" => Some(("alpha", 0.9)),
+        "fair" => Some(("fair_c", 1.0)),
+        "quantile" => Some(("alpha", 0.9)),
+        "mape" => None,
+        other => panic!("not a family-A objective: {other}"),
+    }
+}
+
+/// The family-A metric list per objective (matches the capture's FAMILY_A_METRIC).
+fn family_a_metric(objective: &str) -> &'static str {
+    match objective {
+        "huber" => "huber,l2",
+        "fair" => "fair,l2",
+        "quantile" => "quantile,l2",
+        "mape" => "mape,l2",
+        other => panic!("not a family-A objective: {other}"),
+    }
+}
+
+/// Apply a single objective param to a builder (alpha / fair_c).
+fn apply_param(b: TrainingBuilder, param: Option<(&str, f64)>) -> TrainingBuilder {
+    match param {
+        Some(("alpha", v)) => b.alpha(v),
+        Some(("fair_c", v)) => b.fair_c(v),
+        Some((other, _)) => panic!("unexpected family-A param {other}"),
+        None => b,
+    }
+}
+
+/// The family-A layered spine builder: 10 iters (NUM_ITERATIONS) / lr 0.1 /
+/// num_leaves 4 / bfa on / default param — mirrors `cell_builder` + the capture's
+/// layered default-spine cell.
+fn family_a_spine_builder(objective: &str) -> TrainingBuilder {
+    let b = cell_builder(objective, true).metric(family_a_metric(objective));
+    apply_param(b, family_a_default_param(objective))
+}
+
+/// Train a family-A objective's layered spine cell (bag off / es off / bfa on,
+/// default param) the SAME way the capture did.
+fn train_family_a_spine(objective: &str) -> (Booster, DenseCorpus) {
+    let corpus = spine_corpus();
+    let cfg = family_a_spine_builder(objective)
+        .build()
+        .unwrap_or_else(|e| panic!("{objective} spine builder failed: {e:?}"));
+    let booster =
+        train(&cfg, &corpus).unwrap_or_else(|e| panic!("{objective} spine train failed: {e:?}"));
+    (booster, corpus)
+}
+
+/// The family-A loop-cell builder for `(objective, bag, es, bfa)` at the DEFAULT
+/// param: 12 iters (MATRIX_NUM_ITERATIONS) — matches the capture's
+/// `capture_family_a_cell`.
+fn family_a_loop_builder(objective: &str, bag: bool, es: bool, bfa: bool) -> TrainingBuilder {
+    let mut b = TrainingBuilder::new()
+        .objective(objective)
+        .metric(family_a_metric(objective))
+        .num_iterations(MATRIX_NUM_ITERATIONS)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(bfa)
+        .seed(SPINE_SEED)
+        .deterministic(true);
+    b = apply_param(b, family_a_default_param(objective));
+    if bag {
+        b = b
+            .bagging_fraction(MATRIX_BAGGING_FRACTION)
+            .bagging_freq(MATRIX_BAGGING_FREQ)
+            .bagging_seed(MATRIX_BAGGING_SEED);
+    }
+    if es {
+        b = b.early_stopping_round(MATRIX_EARLY_STOPPING_ROUND);
+    }
+    b
+}
+
+/// Replay one family-A loop cell against `<obj>_bag<B>_es<E>_bfa<F>_model.txt`,
+/// skip-passing if the golden is absent. Asserts leaf-value parity within
+/// `MATRIX_RESIDUAL_TOL` (bit-exact where the algorithm permits; the renew cells use
+/// the percentile/weighted-percentile horizon). The es cells trim to best_iteration,
+/// so only the OVERLAPPING trees are compared.
+fn replay_family_a_loop_cell(objective: &str, bag: bool, es: bool, bfa: bool) {
+    let tag = format!("bag{}_es{}_bfa{}", bag as i32, es as i32, bfa as i32);
+    let cell = format!("{objective}_{tag}");
+    let model_file = format!("{cell}_model.txt");
+    let Some(model_text) = read_golden(&model_file) else {
+        return; // skip-pass absent the capture
+    };
+    let corpus = spine_corpus();
+    let cfg = family_a_loop_builder(objective, bag, es, bfa)
+        .build()
+        .unwrap_or_else(|e| panic!("{cell}: builder failed: {e:?}"));
+    let booster = if es {
+        let valid = matrix_valid_corpus(&corpus);
+        train_with_valid(&cfg, &corpus, &valid)
+            .unwrap_or_else(|e| panic!("{cell}: train_with_valid failed: {e:?}"))
+    } else {
+        train(&cfg, &corpus).unwrap_or_else(|e| panic!("{cell}: train failed: {e:?}"))
+    };
+    let golden = lgbm_model::model_text::load(&model_text)
+        .unwrap_or_else(|e| panic!("{cell}: parse golden: {e:?}"));
+    let rust = booster.model();
+    // Overlapping trees (es trims to best_iteration; the trailing-tree pop can make
+    // the counts differ by the trimmed tail). EVERY overlapping tree's leaves are
+    // asserted within MATRIX_RESIDUAL_TOL — no Result discarded (the WR-01 contract).
+    let n = rust.trees.len().min(golden.trees.len());
+    for i in 0..n {
+        let rl: Vec<f32> = rust.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
+        let gl: Vec<f32> = golden.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
+        compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+            panic!("{cell} tree {i} leaf_value not within MATRIX_RESIDUAL_TOL: {m:?}")
+        });
+    }
+}
+
+/// Replay one family-A param-axis ALT cell (`<obj>_<param><value>_model.txt`),
+/// skip-passing if absent. The capture writes these on the spine cell (bag off /
+/// es off / bfa on) with the non-default param value.
+fn replay_family_a_param_cell(objective: &str, param: &str, value: f64) {
+    let alt_tag = format!("{param}{value}").replace('.', "p");
+    let cell = format!("{objective}_{alt_tag}");
+    let model_file = format!("{cell}_model.txt");
+    let Some(model_text) = read_golden(&model_file) else {
+        return; // skip-pass absent the capture
+    };
+    let corpus = spine_corpus();
+    let b = cell_builder(objective, true).metric(family_a_metric(objective));
+    let cfg = apply_param(b, Some((param, value)))
+        .build()
+        .unwrap_or_else(|e| panic!("{cell}: builder failed: {e:?}"));
+    let booster = train(&cfg, &corpus).unwrap_or_else(|e| panic!("{cell}: train failed: {e:?}"));
+    let golden = lgbm_model::model_text::load(&model_text)
+        .unwrap_or_else(|e| panic!("{cell}: parse golden: {e:?}"));
+    let rust = booster.model();
+    assert_eq!(
+        rust.trees.len(),
+        golden.trees.len(),
+        "{cell}: tree count rust {} != golden {}",
+        rust.trees.len(),
+        golden.trees.len()
+    );
+    for (i, (rt, gt)) in rust.trees.iter().zip(golden.trees.iter()).enumerate() {
+        let rl: Vec<f32> = rt.leaf_value.iter().map(|&v| v as f32).collect();
+        let gl: Vec<f32> = gt.leaf_value.iter().map(|&v| v as f32).collect();
+        compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+            panic!("{cell} tree {i} leaf_value not within MATRIX_RESIDUAL_TOL: {m:?}")
+        });
+    }
+}
+
+/// Run the full {bag×es×bfa} loop for one family-A objective (skip the referenced
+/// default-spine collapse cell, which is the layered `*_spine_model` golden).
+fn replay_family_a_loop(objective: &str) {
+    for bag in [false, true] {
+        for es in [false, true] {
+            for bfa in [false, true] {
+                if !bag && !es && bfa {
+                    continue; // the layered spine cell, asserted by the *_spine tests
+                }
+                replay_family_a_loop_cell(objective, bag, es, bfa);
+            }
+        }
+    }
+}
+
+// ---- huber ----
+
+#[test]
+fn huber_spine_end_to_end() {
+    let (booster, corpus) = train_family_a_spine("huber");
+    assert_model_and_pred(&booster, &corpus, "huber_spine_model.txt", "huber_spine_pred.txt");
+}
+
+#[test]
+fn huber_score_accumulation() {
+    let (booster, _) = train_family_a_spine("huber");
+    assert_scores(&booster, "huber_scores.txt");
+}
+
+#[test]
+fn huber_gradients() {
+    // grad clamped to ±alpha (the clip is the load-bearing huber behavior).
+    let (booster, _) = train_family_a_spine("huber");
+    assert_gradients(&booster, "huber_gh_iter1.txt", "huber_gh_iterN.txt");
+}
+
+#[test]
+fn huber_loop_matrix() {
+    replay_family_a_loop("huber");
+}
+
+#[test]
+fn huber_alpha_axis() {
+    // alpha ∈ {0.9 default (spine), 0.5 alt}; the alt clip threshold changes the grad.
+    replay_family_a_param_cell("huber", "alpha", 0.5);
+}
+
+// ---- fair ----
+
+#[test]
+fn fair_spine_end_to_end() {
+    let (booster, corpus) = train_family_a_spine("fair");
+    assert_model_and_pred(&booster, &corpus, "fair_spine_model.txt", "fair_spine_pred.txt");
+}
+
+#[test]
+fn fair_score_accumulation() {
+    let (booster, _) = train_family_a_spine("fair");
+    assert_scores(&booster, "fair_scores.txt");
+}
+
+#[test]
+fn fair_gradients() {
+    // fair is the only family-A objective with a NON-constant hessian (c²/(|x|+c)²).
+    let (booster, _) = train_family_a_spine("fair");
+    assert_gradients(&booster, "fair_gh_iter1.txt", "fair_gh_iterN.txt");
+}
+
+#[test]
+fn fair_loop_matrix() {
+    replay_family_a_loop("fair");
+}
+
+#[test]
+fn fair_c_axis() {
+    // fair_c ∈ {1.0 default (spine), 2.0 alt}.
+    replay_family_a_param_cell("fair", "fair_c", 2.0);
+}
+
+// ---- quantile (is_renew_tree_output == true; bag cells exercise D-05 renew+bag) ----
+
+#[test]
+fn quantile_spine_end_to_end() {
+    // The quantile leaf values ARE the residual percentile at alpha (RenewTreeOutput),
+    // NOT the learner Newton output — the committed model text carries them.
+    let (booster, corpus) = train_family_a_spine("quantile");
+    assert_model_and_pred(
+        &booster,
+        &corpus,
+        "quantile_spine_model.txt",
+        "quantile_spine_pred.txt",
+    );
+}
+
+#[test]
+fn quantile_score_accumulation() {
+    let (booster, _) = train_family_a_spine("quantile");
+    assert_scores(&booster, "quantile_scores.txt");
+}
+
+#[test]
+fn quantile_gradients() {
+    let (booster, _) = train_family_a_spine("quantile");
+    assert_gradients(&booster, "quantile_gh_iter1.txt", "quantile_gh_iterN.txt");
+}
+
+#[test]
+fn quantile_loop_matrix() {
+    // The {bag×es×bfa} loop incl. the BAGGED renew cells (`quantile_bag1_*`): under
+    // the 07-01 D-05 faithful-fix posture the bagged-subset RenewTreeOutput is
+    // faithful to C++, so these cells ASSERT real-binary parity (within
+    // MATRIX_RESIDUAL_TOL for the percentile renewal) — NOT skipped. See the D-05
+    // POSTURE note above.
+    replay_family_a_loop("quantile");
+}
+
+#[test]
+fn quantile_alpha_axis() {
+    // alpha ∈ {0.9 default (spine), 0.1 alt}; the pinball asymmetry flips.
+    replay_family_a_param_cell("quantile", "alpha", 0.1);
+}
+
+// ---- mape (subclasses L1; is_renew_tree_output == true; bag cells exercise D-05) ----
+
+#[test]
+fn mape_spine_end_to_end() {
+    // MAPE leaf values are the WEIGHTED residual median (label_weight = 1/max(1,|label|)).
+    let (booster, corpus) = train_family_a_spine("mape");
+    assert_model_and_pred(&booster, &corpus, "mape_spine_model.txt", "mape_spine_pred.txt");
+}
+
+#[test]
+fn mape_score_accumulation() {
+    let (booster, _) = train_family_a_spine("mape");
+    assert_scores(&booster, "mape_scores.txt");
+}
+
+#[test]
+fn mape_gradients() {
+    let (booster, _) = train_family_a_spine("mape");
+    assert_gradients(&booster, "mape_gh_iter1.txt", "mape_gh_iterN.txt");
+}
+
+#[test]
+fn mape_loop_matrix() {
+    // The {bag×es×bfa} loop incl. the BAGGED renew cells (`mape_bag1_*`): same D-05
+    // faithful-fix posture as quantile — the bagged-subset weighted-median renew is
+    // faithful to C++ and these cells ASSERT real-binary parity (within
+    // MATRIX_RESIDUAL_TOL), NOT skipped. See the D-05 POSTURE note above.
+    replay_family_a_loop("mape");
+}

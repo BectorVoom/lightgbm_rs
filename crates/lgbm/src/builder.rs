@@ -123,6 +123,23 @@ impl TrainingBuilder {
         self
     }
 
+    /// `alpha` (OBJ-04): the shared Huber δ AND quantile percentile level (config.h
+    /// default 0.9, CHECK `> 0`; quantile additionally requires `< 1`). Routes into
+    /// `lgbm-core::Config.alpha` via `Config::from_params` (set.rs:316 /
+    /// scope.rs:154).
+    pub fn alpha(mut self, v: f64) -> Self {
+        self.params.insert("alpha".into(), v.to_string());
+        self
+    }
+
+    /// `fair_c` (OBJ-04): the Fair-loss `c` parameter (config.h default 1.0, CHECK
+    /// `> 0`). Routes into `lgbm-core::Config.fair_c` via `Config::from_params`
+    /// (set.rs:319 / scope.rs:155).
+    pub fn fair_c(mut self, v: f64) -> Self {
+        self.params.insert("fair_c".into(), v.to_string());
+        self
+    }
+
     /// `seed` (the master seed; derives the sub-seeds via `Config::from_params`).
     pub fn seed(mut self, seed: i32) -> Self {
         self.params.insert("seed".into(), seed.to_string());

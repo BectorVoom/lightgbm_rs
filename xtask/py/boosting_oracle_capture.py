@@ -374,6 +374,80 @@ def binary_gh(score_prev, labels, sigmoid=1.0):
     return grad, hess
 
 
+# ---- OBJ-04 family A gradient/hessian (huber/fair/quantile/mape) ----
+def huber_gh(alpha):
+    """RegressionHuberLoss::GetGradients (regression_objective.hpp:312): grad clamped
+    to ±alpha in f64 then cast f32; hess = 1."""
+    def gh(score_prev, labels):
+        diff = np.asarray(score_prev, dtype=np.float64) - np.asarray(labels, dtype=np.float64)
+        clamped = np.where(np.abs(diff) <= alpha, diff, np.sign(diff) * alpha)
+        return clamped.astype(np.float32), np.ones(len(labels), dtype=np.float32)
+    return gh
+
+
+def fair_gh(c):
+    """RegressionFairLoss::GetGradients (regression_objective.hpp:364): grad =
+    c*x/(|x|+c); hess = c²/(|x|+c)²."""
+    def gh(score_prev, labels):
+        x = np.asarray(score_prev, dtype=np.float64) - np.asarray(labels, dtype=np.float64)
+        denom = np.abs(x) + c
+        grad = (c * x / denom).astype(np.float32)
+        hess = (c * c / (denom * denom)).astype(np.float32)
+        return grad, hess
+    return gh
+
+
+def quantile_gh(alpha):
+    """RegressionQuantileloss::GetGradients (regression_objective.hpp:494): alpha is a
+    score_t (f32); delta is the f32-cast residual; grad = (1-alpha) if delta>=0 else
+    -alpha; hess = 1."""
+    a32 = np.float32(alpha)
+    def gh(score_prev, labels):
+        delta = (np.asarray(score_prev, dtype=np.float64)
+                 - np.asarray(labels, dtype=np.float64)).astype(np.float32)
+        grad = np.where(delta >= np.float32(0.0), np.float32(1.0) - a32, -a32).astype(np.float32)
+        return grad, np.ones(len(labels), dtype=np.float32)
+    return gh
+
+
+def mape_label_weight(labels):
+    """RegressionMAPELOSS label_weight = 1/max(1,|label|), computed in f32."""
+    lab = np.asarray(labels, dtype=np.float32)
+    return (np.float32(1.0) / np.maximum(np.float32(1.0), np.abs(lab))).astype(np.float32)
+
+
+def mape_gh(score_prev, labels):
+    """RegressionMAPELOSS::GetGradients (regression_objective.hpp:619): grad =
+    Sign(score-label) * label_weight; hess = 1."""
+    diff = np.asarray(score_prev, dtype=np.float64) - np.asarray(labels, dtype=np.float64)
+    lw = mape_label_weight(labels)
+    grad = (np.sign(diff) * lw.astype(np.float64)).astype(np.float32)
+    return grad, np.ones(len(labels), dtype=np.float32)
+
+
+def weighted_median_percentile(values, weights, alpha=0.5):
+    """Reproduce the C++ WeightedPercentileFun (regression_objective.hpp:50-88), used
+    by the mape BoostFromScore (weighted label median) and quantile/mape renew."""
+    cnt = len(values)
+    if cnt <= 1:
+        return float(values[0]) if cnt == 1 else 0.0
+    v = np.asarray(values, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    order = np.argsort(v, kind="stable")
+    cdf = np.cumsum(w[order])
+    threshold = cdf[-1] * alpha
+    # upper_bound: first index with cdf > threshold.
+    pos = int(np.searchsorted(cdf, threshold, side="right"))
+    pos = min(pos, cnt - 1)
+    if pos == 0 or pos == cnt - 1:
+        return float(v[order[pos]])
+    v1 = v[order[pos - 1]]
+    v2 = v[order[pos]]
+    if cdf[pos + 1] - cdf[pos] >= 1.0:
+        return float((threshold - cdf[pos]) / (cdf[pos + 1] - cdf[pos]) * (v2 - v1) + v1)
+    return float(v2)
+
+
 def median_percentile(values, alpha=0.5):
     """Reproduce the C++ PercentileFun median (the BoostFromScore L1 init)."""
     cnt = len(values)
@@ -515,6 +589,153 @@ def capture_matrix(out_dir, seed):
                         bag, es, bfa,
                     )
                     best_iters[f"{prefix}_{cell_tag(bag, es, bfa)}"] = bi
+    return best_iters
+
+
+# ====================== OBJ-04 family A (huber/fair/quantile/mape) ======================
+# Each objective is a vertical slice on the proven spine corpus. Per RESEARCH
+# §"Per-Subsystem Oracle Axis Matrix → Objectives" (07-RESEARCH.md:319-328):
+#   huber    : 8 loop cells (bag×es×bfa) × alpha ∈ {0.9 default, 0.5}
+#   fair     : 8 × fair_c ∈ {1.0, 2.0}
+#   quantile : 8 × alpha ∈ {0.9, 0.1}  (RenewTreeOutput percentile; bag cells gate D-05)
+#   mape     : 8                       (subclasses L1; bag cells gate D-05)
+# The DEFAULT-param spine cell (bag off / es off / bfa on) is captured as the
+# layered L1-L5 golden (write_layered). The remaining 7 loop cells + the
+# non-default param-axis cells are captured as model+predict goldens via
+# capture_matrix_cell, tagged with the objective-param suffix where it deviates from
+# the default. The spine corpus labels are 2..20 (all |label| >= 1) so MAPE is stable
+# (no <1 rounding warning) and quantile/huber find real splits.
+FAMILY_A_PARAM_AXIS = {
+    # objective -> (param_name, [default_value, alt_value])
+    "huber": ("alpha", [0.9, 0.5]),
+    "fair": ("fair_c", [1.0, 2.0]),
+    "quantile": ("alpha", [0.9, 0.1]),
+    "mape": (None, [None]),
+}
+
+FAMILY_A_METRIC = {
+    "huber": ["huber", "l2"],
+    "fair": ["fair", "l2"],
+    "quantile": ["quantile", "l2"],
+    "mape": ["mape", "l2"],
+}
+
+
+def family_a_gh(objective, param_value):
+    if objective == "huber":
+        return huber_gh(param_value)
+    if objective == "fair":
+        return fair_gh(param_value)
+    if objective == "quantile":
+        return quantile_gh(param_value)
+    if objective == "mape":
+        return mape_gh
+    raise ValueError(objective)
+
+
+def family_a_init(objective, labels, param_value):
+    """The objective's BoostFromScore on the spine labels."""
+    if objective in ("huber", "fair"):
+        return float(np.mean(labels))               # inherit L2 mean
+    if objective == "quantile":
+        return median_percentile(labels, param_value)  # PercentileFun at alpha
+    if objective == "mape":
+        return weighted_median_percentile(labels, mape_label_weight(labels), 0.5)
+    raise ValueError(objective)
+
+
+def capture_family_a_cell(out_dir, objective, prefix, X, labels, seed,
+                          param_name, param_value, bag, es, bfa):
+    """Capture ONE family-A loop cell (model + predict) for the given param value and
+    the (bag, es, bfa) axis. Returns the realized best_iteration."""
+    p = base_params(seed, objective, FAMILY_A_METRIC[objective])
+    p["boost_from_average"] = bool(bfa)
+    if param_name is not None:
+        p[param_name] = param_value
+    if bag:
+        p["bagging_fraction"] = MATRIX_BAGGING_FRACTION
+        p["bagging_freq"] = MATRIX_BAGGING_FREQ
+        p["bagging_seed"] = 3
+    dtrain = lgb.Dataset(X, label=labels, params=p, free_raw_data=False)
+    dtrain.construct()
+    valid_sets = [dtrain]
+    valid_names = ["training"]
+    callbacks = []
+    if es:
+        Xv, lv = matrix_valid_corpus(X)
+        dvalid = lgb.Dataset(Xv, label=lv, reference=dtrain, free_raw_data=False)
+        dvalid.construct()
+        valid_sets = [dtrain, dvalid]
+        valid_names = ["training", "valid_0"]
+        callbacks.append(lgb.early_stopping(MATRIX_EARLY_STOPPING_ROUND, verbose=False))
+    booster = lgb.train(
+        p, dtrain, num_boost_round=MATRIX_NUM_ITERATIONS,
+        valid_sets=valid_sets, valid_names=valid_names, callbacks=callbacks,
+    )
+    booster.save_model(os.path.join(out_dir, f"{prefix}_model.txt"))
+    pred = booster.predict(X, raw_score=True)
+    with open(os.path.join(out_dir, f"{prefix}_pred.txt"), "w") as fh:
+        fh.write(f"# {prefix}_pred — predict() raw score; f64 bits\n")
+        fh.write(f"# best_iteration={booster.best_iteration}\n")
+        fh.write(f64_bits_line(np.asarray(pred)) + "\n")
+    return booster.best_iteration
+
+
+def capture_family_a(out_dir, seed):
+    """Capture all huber/fair/quantile/mape goldens: the layered L1-L5 default-spine
+    cell + the {bag×es×bfa} loop cells + the objective param-axis cells. Returns the
+    realized best_iteration map for the loop cells (es cells included)."""
+    X, labels, mfq = spine_corpus()
+    best_iters = {}
+    for objective in ("huber", "fair", "quantile", "mape"):
+        param_name, values = FAMILY_A_PARAM_AXIS[objective]
+        default_value = values[0]
+        metric = FAMILY_A_METRIC[objective]
+
+        # --- layered L1-L5 default-spine cell (bag off / es off / bfa on) ---
+        p = base_params(seed, objective, metric)
+        p["boost_from_average"] = True
+        if param_name is not None:
+            p[param_name] = default_value
+        d = lgb.Dataset(X, label=labels, params=p, free_raw_data=False)
+        d.construct()
+        assert_identity_binning(X, mfq)
+        er = {}
+        booster = lgb.train(
+            p, d, num_boost_round=NUM_ITERATIONS,
+            valid_sets=[d], valid_names=["training"],
+            callbacks=[lgb.record_evaluation(er)],
+        )
+        init = family_a_init(objective, labels, default_value)
+        gh = family_a_gh(objective, default_value)
+        write_layered(out_dir, objective, booster, X, labels, er,
+                      metric, gh, init, booster.predict(X, raw_score=True))
+
+        # --- the 7 remaining {bag×es×bfa} loop cells at the DEFAULT param ---
+        for bag in (False, True):
+            for es in (False, True):
+                for bfa in (False, True):
+                    if (not bag) and (not es) and bfa:
+                        continue  # the layered spine cell, referenced not re-captured
+                    tag = cell_tag(bag, es, bfa)
+                    prefix = f"{objective}_{tag}"
+                    bi = capture_family_a_cell(
+                        out_dir, objective, prefix, X, labels, seed,
+                        param_name, default_value, bag, es, bfa,
+                    )
+                    best_iters[prefix] = bi
+
+        # --- the objective param-axis: the ALT param value on the spine cell ---
+        # (bag off / es off / bfa on), tagged `<objective>_<param><value>`.
+        if param_name is not None and len(values) > 1:
+            alt = values[1]
+            alt_tag = f"{param_name}{alt}".replace(".", "p")
+            prefix = f"{objective}_{alt_tag}"
+            bi = capture_family_a_cell(
+                out_dir, objective, prefix, X, labels, seed,
+                param_name, alt, False, False, True,
+            )
+            best_iters[prefix] = bi
     return best_iters
 
 
@@ -755,10 +976,19 @@ def main():
         for cell in sorted(best_iters):
             fh.write("%s best_iteration=%d\n" % (cell, best_iters[cell]))
 
+    # ===================== OBJ-04 family A (huber/fair/quantile/mape) =====================
+    fa_best_iters = capture_family_a(out_dir, seed)
+    with open(os.path.join(out_dir, "family_a_best_iterations.txt"), "w") as fh:
+        fh.write("# OBJ-04 family A (07-02): realized best_iteration per loop cell "
+                 "(<objective>_bag<B>_es<E>_bfa<F> best_iteration=<n>). "
+                 "es cells with best_iteration < %d FIRED.\n" % MATRIX_NUM_ITERATIONS)
+        for cell in sorted(fa_best_iters):
+            fh.write("%s best_iteration=%d\n" % (cell, fa_best_iters[cell]))
+
     print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom/"
           "multiclass/multiclassova L1-L5 goldens + regression_sqrt (reg_sqrt=1) + "
-          "regression_mf2es (metric_freq=2 + early_stopping) + the D-07 matrix "
-          "to %s" % out_dir)
+          "regression_mf2es (metric_freq=2 + early_stopping) + the D-07 matrix + "
+          "the OBJ-04 family-A (huber/fair/quantile/mape) goldens to %s" % out_dir)
 
 
 if __name__ == "__main__":
