@@ -22,8 +22,10 @@ pub mod binary;
 pub mod error;
 pub mod multiclass;
 pub mod regression;
+pub mod xentropy;
 
 pub use binary::BinaryMetric;
 pub use error::MetricError;
-pub use multiclass::MultiLogloss;
-pub use regression::Metric;
+pub use multiclass::{AucMu, MultiError, MultiLogloss};
+pub use regression::{Metric, RegressionMetricParams};
+pub use xentropy::XentropyMetric;

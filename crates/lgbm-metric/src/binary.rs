@@ -44,6 +44,11 @@ pub enum BinaryMetric {
     },
     /// `auc` — area under the ROC curve (sort-based; no prob transform needed).
     Auc,
+    /// `average_precision` — average precision (PR-AUC); sort-based, no transform
+    /// (`AveragePrecisionMetric`, binary_metric.hpp:270-372). MET-03 places this
+    /// in the binary family (it is `AveragePrecisionMetric`, a binary-task metric),
+    /// matching the C++ `metric.cpp` factory.
+    AveragePrecision,
 }
 
 impl BinaryMetric {
@@ -53,14 +58,16 @@ impl BinaryMetric {
             BinaryMetric::BinaryLogloss { .. } => "binary_logloss",
             BinaryMetric::BinaryError { .. } => "binary_error",
             BinaryMetric::Auc => "auc",
+            BinaryMetric::AveragePrecision => "average_precision",
         }
     }
 
-    /// C++ `factor_to_bigger_better`: `-1` for the losses, `+1` for AUC.
+    /// C++ `factor_to_bigger_better`: `-1` for the losses, `+1` for AUC /
+    /// average_precision (bigger is better).
     pub fn factor_to_bigger_better(&self) -> f64 {
         match self {
             BinaryMetric::BinaryLogloss { .. } | BinaryMetric::BinaryError { .. } => -1.0,
-            BinaryMetric::Auc => 1.0,
+            BinaryMetric::Auc | BinaryMetric::AveragePrecision => 1.0,
         }
     }
 
@@ -101,7 +108,55 @@ impl BinaryMetric {
                 Ok(sum_loss / n as f64)
             }
             BinaryMetric::Auc => Ok(auc(scores, labels)),
+            BinaryMetric::AveragePrecision => Ok(average_precision(scores, labels)),
         }
+    }
+}
+
+/// C++ `AveragePrecisionMetric::Eval` (binary_metric.hpp:305-372), unweighted.
+///
+/// Descending-by-score sort, then accumulate precision over the PR curve. The
+/// sort is descending by raw score (no transform). `sum_weights_ == num_data`.
+fn average_precision(scores: &[f64], labels: &[f32]) -> f64 {
+    let n = scores.len();
+    if n == 0 {
+        return 1.0;
+    }
+    let mut sorted_idx: Vec<usize> = (0..n).collect();
+    // Descending by score (C++ `score[a] > score[b]`).
+    sorted_idx.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+
+    let mut cur_actual_pos = 0.0f64;
+    let mut sum_actual_pos = 0.0f64;
+    let mut sum_pred_pos = 0.0f64;
+    let mut accum_prec; // recomputed at each threshold change
+    let mut accum = 0.0f64;
+    let mut cur_neg = 0.0f64;
+    let mut threshold = scores[sorted_idx[0]];
+    let sum_weights = n as f64;
+    for &idx in &sorted_idx {
+        let cur_label = labels[idx];
+        let cur_score = scores[idx];
+        if cur_score != threshold {
+            threshold = cur_score;
+            sum_actual_pos += cur_actual_pos;
+            sum_pred_pos += cur_actual_pos + cur_neg;
+            accum_prec = sum_actual_pos / sum_pred_pos;
+            accum += cur_actual_pos * accum_prec;
+            cur_neg = 0.0;
+            cur_actual_pos = 0.0;
+        }
+        cur_neg += (cur_label <= 0.0) as i32 as f64;
+        cur_actual_pos += (cur_label > 0.0) as i32 as f64;
+    }
+    sum_actual_pos += cur_actual_pos;
+    sum_pred_pos += cur_actual_pos + cur_neg;
+    accum_prec = sum_actual_pos / sum_pred_pos;
+    accum += cur_actual_pos * accum_prec;
+    if sum_actual_pos > 0.0 && sum_actual_pos != sum_weights {
+        accum / sum_actual_pos
+    } else {
+        1.0
     }
 }
 
@@ -239,5 +294,32 @@ mod tests {
     fn binary_metric_length_mismatch_is_typed_error() {
         let err = BinaryMetric::Auc.eval(&[1.0, 2.0], &[1.0]).unwrap_err();
         assert!(matches!(err, MetricError::LengthMismatch { .. }));
+    }
+
+    #[test]
+    fn average_precision_perfect_separation_is_one() {
+        // all positives rank above all negatives -> AP = 1.
+        let scores = [3.0f64, 2.5, 1.0, 0.5];
+        let labels = [1.0f32, 1.0, 0.0, 0.0];
+        let ap = BinaryMetric::AveragePrecision.eval(&scores, &labels).unwrap();
+        assert!((ap - 1.0).abs() < TOL, "AP perfect should be 1, got {ap}");
+        assert_eq!(BinaryMetric::AveragePrecision.factor_to_bigger_better(), 1.0);
+        assert_eq!(BinaryMetric::AveragePrecision.name(), "average_precision");
+    }
+
+    #[test]
+    fn average_precision_matches_hand_computed() {
+        // scores descending: ranks = [p, n, p, n]. labels by rank: 1,0,1,0.
+        // distinct thresholds (all distinct scores), so each row is its own group.
+        // After rank1 (pos): sum_pos=1, pred=1, prec=1, accum += 1*1 = 1.
+        // After rank2 (neg): sum_pos=1, pred=2, prec=0.5, accum += 0 (cur_pos=0).
+        // After rank3 (pos): sum_pos=2, pred=3, prec=2/3, accum += 1*(2/3).
+        // After rank4 (neg): sum_pos=2, pred=4, prec=0.5, accum += 0.
+        // AP = accum / sum_pos = (1 + 2/3) / 2 = 5/6.
+        let scores = [4.0f64, 3.0, 2.0, 1.0];
+        let labels = [1.0f32, 0.0, 1.0, 0.0];
+        let ap = BinaryMetric::AveragePrecision.eval(&scores, &labels).unwrap();
+        let expect = (1.0 + 2.0 / 3.0) / 2.0;
+        assert!((ap - expect).abs() < TOL, "AP {ap} != {expect}");
     }
 }
