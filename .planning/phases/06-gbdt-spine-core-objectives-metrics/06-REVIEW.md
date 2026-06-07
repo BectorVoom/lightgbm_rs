@@ -33,10 +33,10 @@ files_reviewed_list:
   - xtask/py/boosting_oracle_capture.py
   - xtask/src/main.rs
 findings:
-  critical: 2
-  warning: 5
-  info: 3
-  total: 10
+  critical: 0
+  warning: 6
+  info: 5
+  total: 11
 status: issues_found
 ---
 
@@ -49,112 +49,205 @@ status: issues_found
 
 ## Summary
 
-Phase 6 wires the proven Phase-5 serial tree learner into the GBDT boosting loop plus the five core objectives, seven metrics, bagging RNG, and early stopping. The bulk of the net-new numerical code (objective grad/hess, metric reductions, percentile, softmax gather, bagging draw) is a faithful, well-cited 1:1 port and reads correct against the C++ reference — the documented deviations (custom-objective f64 preds, multiclass 5-iter exp-libm horizon, RNG-instance reuse) all match what the summaries claim, and were NOT re-reported here.
+Reviewed the Phase-6 GBDT spine: the boosting loop (`gbdt.rs`), score accumulator,
+bagging RNG, early stopping, six objectives, seven metrics, the public facade
+(`booster.rs` / `builder.rs`), the `Tree` model, and the capture/replay harness.
 
-Two correctness defects vs the C++ reference survive and are not exercised by the committed goldens (so the green test suite does not catch them):
+The faithful-mirror discipline is strong and the C++ citations are precise. I
+traced the BoostFromAverage → GetGradients → Bagging → per-class tree →
+RenewTreeOutput → Shrinkage → UpdateScore → AddBias ordering against
+`gbdt.cpp:383-452` and it matches; the early-stop `iter - best_iter >= round`
+arithmetic and the `(total_iters - best_iteration) * num_class` trailing-tree pop
+reconcile with the C++ `EvalAndCheckEarlyStopping` fixed pop without an off-by-one.
+The percentile interpolation and `upper_bound`/`partition_point` mapping are
+correct against `regression_objective.hpp:50-88`.
 
-1. **Constant-tree `leaf_count` is hardcoded to 0** instead of `num_data`, diverging from C++ `AsConstantTree(init, num_data_)` model-text output for the `class_need_train==false` / no-split path.
-2. **Early-stopping decision is gated by `metric_freq`** — C++ evaluates the valid metric + stop check EVERY iteration when early stopping is on, regardless of `metric_freq`. With `metric_freq > 1` the Rust port skips stop checks on off-cadence rounds, changing `best_iteration` and the trailing-tree trim.
-
-Both are latent because the matrix/goldens run at `metric_freq=1` and never byte-compare a serialized constant tree's `leaf_count`. The remaining findings are robustness/quality issues, with one notable test-integrity gap (residual matrix cells swallow their comparison result via `.ok()`).
-
-## Critical Issues
-
-### CR-01: Constant tree serializes `leaf_count=0` instead of `num_data` (model-text divergence vs C++)
-
-**File:** `crates/lgbm-model/src/tree.rs:658-687` (and call sites `crates/lgbm-boosting/src/gbdt.rs:290, 362, 420`)
-**Issue:** C++ `GBDT::TrainOneIter` pushes a degenerate class via `new_tree->AsConstantTree(init_scores[cur_tree_id], num_data_)` (`gbdt.cpp:430`) — the second arg sets `leaf_count_[0] = num_data` (`tree.h:232-240`). The Rust `Tree::as_constant(constant_value)` always sets `leaf_count: vec![0]` and takes no count parameter. C++ `Tree::ToString` always emits `leaf_count=` (no single-leaf write-side early return — `src/io/tree.cpp:363`), so a constant tree serializes `leaf_count=<num_data>` in C++ but `leaf_count=0` in Rust. Any model that contains a constant tree (absent multiclass class, single-class binary, or a first iteration with no positive-gain split) will NOT be byte-exact against the C++ model text — violating the bit-exact model-text contract. This is currently latent: the D-07 matrix replay compares `leaf_value` arrays only (boosting_parity.rs:1026-1041), not the full serialized text, and the absent-class path is only Rust-unit-tested (gbdt.rs:801-828), never against the real binary.
-**Fix:** Give `as_constant` the count argument and thread it from the loop:
-```rust
-// tree.rs
-pub fn as_constant(constant_value: f64, count: i32) -> Tree {
-    Tree { /* ... */ leaf_count: vec![count], /* ... */ }
-}
-// gbdt.rs — match gbdt.cpp:430 (init iter) / :433 (later iters, count=num_data, val=0)
-self.trees.push(Tree::as_constant(const_val, self.num_data));
-```
-Note C++ passes `num_data_` in BOTH the init-iter (`:430`) and the extend-with-zeros (`:433`) branches, so use `self.num_data` for all three call sites.
-
-### CR-02: Early-stopping stop check is gated by `metric_freq`, diverging from C++ (every-iteration check)
-
-**File:** `crates/lgbm/src/booster.rs:516-540`
-**Issue:** The Rust loop computes valid metrics and calls `early.update(...)` only inside `if do_eval`, where `do_eval = (it + 1) % metric_freq == 0 || it + 1 == total_iters` (line 516). In C++ `OutputMetric` (`gbdt.cpp:551-608`), `need_output = (iter % metric_freq) == 0` gates only the *training* metric output/logging; the validation-metric eval AND the early-stop decision run under `if (need_output || early_stopping_round_ > 0)` (`gbdt.cpp:574`) — i.e. **every iteration when early stopping is enabled**, independent of `metric_freq`. With `metric_freq > 1` and early stopping on, the Rust port skips the stop check on off-cadence rounds, so `iter - best_iter >= round` triggers on a different round (or not at all within the horizon), changing `best_iteration` and the count of trailing trees popped. Latent only because the committed matrix cells and unit tests use the default `metric_freq = 1`.
-**Fix:** Decouple the early-stop eval from the `metric_freq` output cadence — when early stopping is enabled, evaluate the valid set and run `early.update` every iteration; keep `metric_freq` gating the training-metric history push only:
-```rust
-let do_train_eval = (it + 1) % metric_freq == 0 || it + 1 == total_iters;
-let do_valid_eval = valid_nd > 0 && (do_train_eval || es_enabled);
-if provide_train && do_train_eval { /* push training metrics */ }
-if do_valid_eval {
-    let mut row = Vec::with_capacity(metrics.len());
-    for m in &metrics { row.push(m.eval(&valid_score, &valid_labels)?); }
-    // record valid history only on the output cadence to match C++ logging;
-    // but always run the stop decision when es is enabled:
-    if es_enabled && early.update(it, &EvalSnapshot { values: vec![row] }) { break; }
-}
-```
-Mirror C++ `gbdt.cpp:574` exactly: valid eval + stop runs on `need_output || early_stopping_round_ > 0`.
+No blockers found. The findings below are correctness-edge and maintainability
+concerns. The most material is **WR-01**: a real divergence from the C++
+`OutputMetric` cadence (`booster.rs` adds an "always eval on the last iter" clause
+the reference does not have), which silently changes the recorded eval-history
+length whenever `num_iterations` is not a multiple of `metric_freq` — a case the
+committed tests do not exercise.
 
 ## Warnings
 
-### WR-01: Matrix residual cells discard their comparison via `.ok()` (test asserts nothing)
+### WR-01: Eval-history cadence diverges from C++ when `num_iterations % metric_freq != 0`
 
-**File:** `crates/oracle-harness/tests/boosting_parity.rs:980-986, 1004-1011`
-**Issue:** The `uniform_grad_residual` and multiclass-es residual branches call `compare_within(...).ok()`, discarding the `Result`. The surrounding comments and the SUMMARY claim these cells are "VALIDATED within ORACLE_TOL on overlapping trees," but `.ok()` means a mismatch of any magnitude — including a gross regression far beyond ORACLE_TOL — passes silently. These cells are effectively unasserted; only `cells_checked += 1` records that they ran. The numerical-fidelity claim for the residual cells is therefore not enforced.
-**Fix:** Assert the result (or collect into a max-diff and assert the max is within a documented residual bound). At minimum:
+**File:** `crates/lgbm/src/booster.rs:527`
+**Issue:** The recorded-history gate is
+`let do_eval = (it + 1) % metric_freq == 0 || it + 1 == total_iters;`. The C++
+reference (`gbdt.cpp:552`, `OutputMetric`) gates output purely on
+`need_output = (iter % config_->metric_freq) == 0` with **no** last-iteration
+special case. So for, e.g., `num_iterations = 10`, `metric_freq = 3`, C++ records
+on iters 3, 6, 9 (3 values) while this port records on 3, 6, 9, **and 10** (4
+values). The committed `metric_freq_thins_eval_history` test only uses 9 iters (a
+multiple of 3), so the divergence is untested. This changes
+`booster.eval_history` length and the per-round value vector vs the C++
+`record_evaluation` golden for any non-multiple horizon.
+**Fix:** Drop the last-iter clause to mirror C++ exactly:
 ```rust
-compare_within(&rl_f32, &gl_f32, ORACLE_TOL)
-    .unwrap_or_else(|m| panic!("{cell} tree {i} residual exceeds ORACLE_TOL: {m:?}"));
+let do_eval = (it + 1) % metric_freq == 0;
 ```
-If overlapping trees genuinely cannot meet ORACLE_TOL, use an explicit, documented residual tolerance and assert against THAT — never `.ok()`.
+If a final-iteration value is desired for ergonomics, gate it behind an explicit,
+documented facade choice that is NOT applied to the C++-parity eval-history keys.
 
-### WR-02: D-07 matrix replay uses one valid set; C++ capture monitors `[training, valid_0]`
+### WR-02: `MulticlassSoftmax::new(1, ..)` produces `factor = +inf` (NaN hessians) instead of a typed reject
 
-**File:** `crates/lgbm/src/booster.rs:290-319, 461-468` vs `xtask/py/boosting_oracle_capture.py:454-466`
-**Issue:** The capture passes `valid_sets=[dtrain, dvalid]` with `valid_names=["training", "valid_0"]` and the `lgb.early_stopping` callback (default monitors ALL valid sets). C++ thus tracks `best_score_`/`best_iter_` for BOTH the training set and valid_0 and stops on whichever plateaus first. The Rust `train_with_valid` constructs `EarlyStopping::new(..., num_valid_sets = 1, ...)` (booster.rs:466) — only valid_0. The two agree only because the training metric typically keeps improving (so valid_0 drives the stop). This is a fragile equivalence: a corpus/objective where the training metric plateaus first would diverge in `best_iteration`, and the test (boosting_parity.rs:1047) asserts the trimmed tree count against the C++ `best_iteration`.
-**Fix:** Either (a) make the Rust early-stop path accept multiple valid sets and have the matrix replay register the training set as a monitored valid set too (matching the capture), or (b) change the capture to monitor only `valid_0` (`callbacks=[lgb.early_stopping(..., first_metric_only=...)]` with `valid_sets=[dvalid]` only) so the oracle and the implementation track the same set. Document the choice in REFERENCE_MANIFEST.md.
-
-### WR-03: regression_l1 RenewTreeOutput silently skipped on the bagging-subset path
-
-**File:** `crates/lgbm-boosting/src/gbdt.rs:314-322`
-**Issue:** In the `use_subset` branch, when `is_renew_tree_output()` is true the code enters an empty `if` block containing only a comment — the median-residual leaf renewal is NOT applied. So `regression_l1 + bagging` leaves carry the learner's Newton output, not the median residual the objective requires (`RegressionL1loss::IsRenewTreeOutput()==true`). The SUMMARY documents this as a known deferral, but in code it is a silent no-op inside a `true` branch rather than an explicit guard/error, so a future reader can mistake it for "handled." It produces numerically wrong leaf values for any l1-with-bagging run.
-**Fix:** Make the gap explicit and loud rather than a silent empty block — e.g. thread the subset partition's `residual_getter` through `train_on_subset` and apply the renewal (the real fix), or, until then, return a typed `BoostingError` for `regression_l1 + bagging` so a caller cannot silently get wrong leaves:
+**File:** `crates/lgbm-objective/src/multiclass.rs:84`
+**Issue:** `new` validates only `num_class >= 1`, then computes
+`factor = num_class / (num_class - 1.0)`. For `num_class == 1` this is `1.0 / 0.0
+= +inf`, so every hessian `factor * p * (1 - p)` becomes `inf`/`NaN` and silently
+corrupts the whole tree-growth path rather than failing at the boundary (Security
+V5 / typed-reject discipline this crate otherwise follows). C++ upstream config
+validation forbids `num_class < 2` for multiclass, but this constructor is a
+public boundary and does not.
+**Fix:** Reject `num_class < 2` for softmax explicitly:
 ```rust
-if self.objective.is_renew_tree_output() {
-    return Err(BoostingError::Unsupported(/* l1 + bagging renewal pending */));
+if num_class < 2 {
+    return Err(ObjectiveError::Unsupported {
+        name: format!("multiclass num_class {num_class} must be >= 2 (redundant-form factor divides by num_class-1)"),
+    });
 }
 ```
 
-### WR-04: `feature_row` closure recomputes the feature-vector width per row inside the OOB scoring loop
+### WR-03: `MulticlassOva` does not validate the per-row integer label range (silent class drop)
 
-**File:** `crates/lgbm-boosting/src/gbdt.rs:332-344`
-**Issue:** The `feature_row` closure recomputes `width = features.iter().map(...).max()...` on every invocation, and it is called once per scored row (in_bag + OOB) per tree. Beyond the O(rows×features) waste (out of scope), the `max().map(|m| (m+1)).unwrap_or(0)` produces a zero-width vector when `features` is empty, and `v[f.real_feature_index]` would then panic on a non-empty `features` with an out-of-range index — though in practice `features` is non-empty on this path. The bigger correctness risk is that the row vector is indexed by `real_feature_index`, which must be dense `0..width`; a sparse/non-contiguous `real_feature_index` set would leave gaps as `0.0` that `Tree::predict` then traverses, silently mis-routing OOB rows.
-**Fix:** Hoist the width computation out of the closure and assert the feature index space is dense, or build the row vector by gathering only the features the tree actually splits on. At minimum compute `width` once before the loop and document the dense-index precondition.
+**File:** `crates/lgbm-objective/src/multiclass.rs:226-239`
+**Issue:** `MulticlassOva::new` truncates `label as i32` with no range check (the
+doc-comment frames this as "mirror C++"). A label `>= num_class` or `< 0` then
+maps to no positive class in any `class_labels(i)` (`class_id` never equals it),
+so that row is treated as negative for **every** one-vs-all binary — it is
+silently dropped from all positive sets with no error. Unlike `MulticlassSoftmax`
+(which raises `LabelOutOfRange`), this can hide a caller mistake as a quietly
+mis-trained model. The C++ `MulticlassOVA` indeed skips the range fatal, but the
+project's stated stance (typed-reject over wrong-but-similar) argues for at least
+a guard against negative labels, which are never valid.
+**Fix:** Reject negative labels (always invalid) and consider warning/erroring on
+`label >= num_class`:
+```rust
+for &l in labels {
+    let li = l as i32;
+    if li < 0 {
+        return Err(ObjectiveError::LabelOutOfRange { label: li, num_class });
+    }
+}
+```
 
-### WR-05: `MulticlassOva` does not range-check labels; relies on `f32 as i32`/`as usize` saturation
+### WR-04: `MultiLogloss::eval` clamps an out-of-range label to the floor, masking a caller error
 
-**File:** `crates/lgbm-objective/src/multiclass.rs:226-239` and `crates/lgbm-metric/src/multiclass.rs:96-101`
-**Issue:** `MulticlassOva::new` intentionally skips the label range check (mirroring C++ `MulticlassOVA`, which only maps `is_pos = (int)label == i`). That is faithful for grad/hess. But the `multi_logloss` metric indexes `rec` by `labels[i] as usize` (multiclass.rs:96). A negative label casts to `0usize` under Rust saturating `f32 as usize` and a too-large label is caught by `rec.get(kk)`, so there is no panic — but a negative or out-of-range OVA label silently scores against class 0 / the floor instead of being rejected, which can diverge from C++ where `(size_t)label` of a negative is a huge index (different behavior). This is a latent fidelity gap for malformed multiclassova labels.
-**Fix:** Decide and document the contract: either range-check OVA labels at `MulticlassOva::new` (typed `LabelOutOfRange`, as softmax does) or explicitly mirror the exact C++ `(size_t)label` behavior in the metric. Do not leave it to Rust cast-saturation, which matches neither cleanly.
+**File:** `crates/lgbm-metric/src/multiclass.rs:96-101`
+**Issue:** `let kk = labels[i] as usize;` then `rec.get(kk).copied().unwrap_or(0.0)`
+clamps a label outside `[0, num_class)` to probability `0.0` → the `-log(eps)`
+floor, silently inflating the loss instead of surfacing the malformed input as a
+typed `MetricError`. The comment calls this "defensive (Security V5)", but
+swallowing a programmer error as a plausible-looking metric value is exactly the
+soft-failure the adversarial stance warns against — it cannot be distinguished
+from a genuinely bad prediction. (Also note `labels[i] as usize` on a negative
+f32 wraps to a huge `usize`, which `.get()` then misses — correct against panic,
+but the value is meaningless.)
+**Fix:** Return `MetricError` (or a new `LabelOutOfRange`-style variant) when
+`kk >= k_classes`, rather than clamping:
+```rust
+if kk >= k_classes {
+    return Err(MetricError::LengthMismatch { expected: k_classes, actual: kk });
+}
+```
+
+### WR-05: Bagging-subset path scores in-bag rows via per-row `predict`, not the bit-exact partition scatter
+
+**File:** `crates/lgbm-boosting/src/gbdt.rs:407-418`
+**Issue:** On the `use_subset` branch BOTH in-bag and OOB rows are scored with
+`add_tree_predict_path` (a per-row `Tree::predict` over the bin-index-as-real-value
+feature vector). The C++ path scores **in-bag** rows via the data-partition leaf
+scatter (`UpdateScore` → `AddPredictionToScore`) and only **OOB** rows via
+predict (`gbdt.cpp:491-509`). The doc comment asserts these are bit-identical "on
+the identity-binned corpus" because `bin index == raw value` and thresholds are
+the bin upper bounds — which is true for the current Phase-6 corpora — but it is a
+load-bearing assumption that will silently diverge the moment a non-identity
+binning is introduced (real `bin_upper_bound` midpoints vs raw values), and the
+predict path can route a row to a different leaf than the partition scatter when a
+feature value sits on a threshold boundary. Correct for Phase-6 scope, but it is a
+fidelity boundary, not a permanent equivalence.
+**Fix:** When the in-bag partition is available (`subset_partition`), score in-bag
+rows through the train-path scatter (`add_tree_train_path`) as C++ does, reserving
+the predict path for OOB rows only. At minimum add a debug-assert that the
+predict-path leaf equals the partition leaf for in-bag rows so a future
+non-identity corpus fails loudly.
+
+### WR-06: `as i32` label truncation can wrap large/NaN f32 labels into a valid-looking class index
+
+**File:** `crates/lgbm-objective/src/multiclass.rs:90` (and `:233`)
+**Issue:** Class labels are derived via `l as i32`. In Rust, `f32 as i32`
+saturates (NaN → 0, +large → i32::MAX, -large → i32::MIN). For softmax the
+subsequent range check catches `i32::MAX`/`i32::MIN`, but `NaN as i32 == 0` slips
+through as a spurious class-0 label with no error. For OVA there is no range check
+at all (see WR-03). This is an unlikely input on the deterministic anchor but is a
+genuine silent mis-classification of NaN labels.
+**Fix:** Reject non-finite labels before truncation:
+```rust
+if !l.is_finite() {
+    return Err(ObjectiveError::LabelOutOfRange { label: i32::MIN, num_class });
+}
+let li = l as i32;
+```
 
 ## Info
 
-### IN-01: `train_inner_full` carries dead `train_eval_history` plumbing
+### IN-01: `feature_row` closure recomputes the feature width on every row
 
-**File:** `crates/lgbm/src/booster.rs:473-476, 519-525, 561`
-**Issue:** `train_eval_history` is populated (line 523) but then explicitly discarded with `let _ = train_eval_history;` (line 561) — the training metrics are routed through `legacy_eval_history` instead. The vector and its per-round pushes are dead work and confuse the data flow.
-**Fix:** Remove `train_eval_history` and push training metrics directly to the legacy/keyed history, or actually surface `training <metric>` keys in the public `eval_history` if that was the intent.
+**File:** `crates/lgbm-boosting/src/gbdt.rs:394-406`
+**Issue:** The `feature_row` closure recomputes `width` (a `max` scan over all
+feature columns) on every invocation, i.e. once per scored row per tree. This is a
+maintainability/readability smell (the width is loop-invariant). Performance is
+out of v1 scope, but hoisting it also makes the intent clearer.
+**Fix:** Compute `width` once before the closure and capture it.
 
-### IN-02: `BoostObjective::renew_leaf_output` returns `0.0` for non-renew variants instead of being unreachable
+### IN-02: `train`/`train_with_valid` duplicate the objective-dispatch `match` block verbatim
+
+**File:** `crates/lgbm/src/booster.rs:252-275` and `:296-316`
+**Issue:** The five-arm objective-resolution match (binary / multiclass /
+multiclassova / regression) is copy-pasted between `train` and `train_with_valid`.
+Divergence risk if one is edited and the other is not (e.g. a future objective
+added to one path only).
+**Fix:** Extract a `resolve_boost_objective(config, corpus) -> (BoostObjective, Vec<f32>)`
+helper and call it from both entry points.
+
+### IN-03: `weighted_percentile_fun` is dead code in Phase 6
+
+**File:** `crates/lgbm-objective/src/percentile.rs:90-125`
+**Issue:** The weighted percentile path is only reachable via weighted
+`regression_l1`, and `regression_l1 + bagging` is typed-rejected while the
+unweighted full-corpus path uses `percentile_fun`. The function is unexercised in
+Phase 6 (only its uniform-weight unit test runs). It is faithful and documented as
+kept-for-completeness; flagging so it is tracked as intentionally-fallow rather
+than silently rotting.
+**Fix:** No change required for scope; ensure a real weighted-L1 parity test lands
+when the weighted path is activated.
+
+### IN-04: `BoostObjective::renew_leaf_output` returns `0.0` for non-renew variants
 
 **File:** `crates/lgbm-boosting/src/objective.rs:129-139`
-**Issue:** For Binary/Custom/Multiclass/MulticlassOva the method returns `0.0` "defensively." It is only ever called when `is_renew_tree_output()` is true (regression_l1), so the `0.0` arms are dead; a stray future caller would get a silently-wrong leaf value of 0 rather than a loud failure.
-**Fix:** `unreachable!("renew_leaf_output called for a non-renew objective")` (or `debug_assert!`) makes the invariant explicit and turns a future misuse into a loud panic in tests rather than a silent 0.
+**Issue:** For Binary/Custom/Multiclass/MulticlassOva the renewal returns a silent
+`0.0`. It is guarded by `is_renew_tree_output()` at every call site, so it is
+unreachable, but a future caller that forgets the guard would get a silent zero
+leaf rather than a loud failure.
+**Fix:** Consider `unreachable!()` (or a debug_assert) in the non-renew arms to
+convert a future mis-wire into a loud panic in debug builds rather than a silent
+wrong leaf.
 
-### IN-03: `Booster.best_iteration` doc/field comments still describe 06-02 stub behavior
+### IN-05: `has_init_score()` is hard-wired to `false` with no plumbing seam
 
-**File:** `crates/lgbm/src/booster.rs:196-203`
-**Issue:** The doc comments on `best_iteration` / `eval_history` still say "06-02: the last trained iteration (no early stopping yet)" even though 06-05 wired early stopping and the field is now populated from `EarlyStopping::best_iteration()`. Stale comments mislead readers about the field's current semantics.
-**Fix:** Update the field docs to describe the 06-05 behavior (best_iteration from the early-stop decision, or `num_iteration()` when early stopping is off).
+**File:** `crates/lgbm-boosting/src/gbdt.rs:164-169`
+**Issue:** `has_init_score` always returns `false`; init-score `Dataset` metadata
+is never threaded from the facade (`ScoreUpdater::new` accepts it, but `train_*`
+always pass `None`). This is documented as a later-wave seam, but means a corpus
+carrying `init_score` would silently get a re-run BoostFromAverage instead of
+honoring the supplied init (C++ `gbdt.cpp:422` gates on
+`!train_score_updater_->has_init_score()`). No defect in current scope (no init
+metadata path exists), but the gap is a latent correctness divergence once
+init_score is plumbed.
+**Fix:** When init_score plumbing lands, wire the flag through `with_objective` so
+`boost_from_average` is correctly suppressed; until then keep the doc note.
 
 ---
 
