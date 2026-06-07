@@ -89,3 +89,53 @@ SUBSET_HIST feature=<j> bin=<b> sum_gradient=<repr-f64> sum_hessian=<repr-f64>
 CNT_FACTOR feature=<j> value=<repr-f64>
 SPLIT feature=<j> threshold=<t> current_gain=<repr-f64> min_gain_shift=<repr-f64>
 ```
+
+---
+
+# Phase 7 W4 — GOSS (BST-04) Oracle Fixtures (plan 07-05)
+
+GOSS gradient-based one-side sampling goldens, captured on the real prebuilt
+`lib_lightgbm` 4.6 pip wheel. Normal `cargo test` reads the committed fixtures and
+needs none of this.
+
+## Pinned Reference
+
+- **pip `lightgbm` version:** `4.6.0` (`GOSS_ORACLE_LIGHTGBM_VERSION`)
+- **Train seed:** `0x60057000` (`GOSS_ORACLE_SEED`, == `BOOSTING_ORACLE_SEED`)
+- **Bagging (RNG) seed:** `3` (`GOSS_BAGGING_SEED`, the per-block `Random(bagging_seed+i)`
+  base, goss.hpp:97)
+
+## Deterministic Capture Flags
+
+- `boosting=goss` (alias-expands to `gbdt` + `data_sample_strategy=goss`)
+- `top_rate ∈ {0.2, 0.1}` × `other_rate ∈ {0.1, 0.05}` (top+other ≤ 0.5 ⇒ subset path)
+- `deterministic=true force_row_wise=true num_threads=1`
+- identity binning (as above); GOSS forbids bagging (no bag axis)
+
+## Exact Capture Command
+
+```bash
+LGBM_CAPTURE_PYTHON=<python-with-lightgbm-4.6.0> \
+  cargo run -p xtask -- goss-oracle-capture
+```
+
+which runs `xtask/py/goss_oracle_capture.py <out_dir> 0x60057000 3 4.6.0` and writes,
+under `crates/oracle-harness/tests/fixtures/goss/`:
+
+| Fixture | Kind | Contents |
+|---------|------|----------|
+| `goss_t{T}_o{O}_es{E}_bfa{B}_model.txt` (16 cells) | L5 model parity | real lib_lightgbm 4.6 `%.17g` model text for the top×other×{es}×{bfa} cell; GOSS sampling + grad/hess amplification reflected in the trees |
+| `goss_rng_replay.txt` | RNG-replay | kept/dropped row indices the `goss.hpp` Helper produces for a fixed grad/hess input, derived over the bit-exact C++ `Random` LCG (`random.h`) + `ArgMaxAtK` (`array_args.h`); carries the input grad/hess as f32 bits |
+
+The RNG-replay golden freezes the algorithm spec over the bit-exact LCG (the wheel
+cannot expose internal bag indices — identical posture to the bagging `bag_indices_*`
+golden). The capture is byte-idempotent (empty `git diff` on a re-run). NEVER
+`git add` the `LightGBM/` tree.
+
+## Replay
+
+- `boosting_parity.rs::goss_rng_replay` — reproduces `GossSampleStrategy::bagging`
+  over the recorded grad/hess and asserts the kept/dropped indices BIT-EXACT.
+- `boosting_parity.rs::goss_parity_matrix` — trains each cell via `boosting=goss`
+  and asserts the per-tree leaf values BIT-EXACT against the real-binary golden on
+  the overlapping trees. Both skip-pass until the fixtures are captured.
