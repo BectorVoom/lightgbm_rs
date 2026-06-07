@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
+status: executing
 stopped_at: Phase 7 context gathered
-last_updated: "2026-06-07T04:22:15.036Z"
-last_activity: 2026-06-07 -- Phase 07 planning complete
+last_updated: "2026-06-07T05:20:00.000Z"
+last_activity: 2026-06-07 -- Phase 07 Plan 01 complete (D-05 faithful-fix)
 progress:
   total_phases: 8
   completed_phases: 6
-  total_plans: 33
-  completed_plans: 33
-  percent: 75
+  total_plans: 45
+  completed_plans: 34
+  percent: 76
 ---
 
 # Project State
@@ -21,16 +21,32 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-05)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 06 — gbdt-spine-core-objectives-metrics
+**Current focus:** Phase 07 — parity-completing-variants
 
 ## Current Position
 
-Phase: 7
-Plan: Not started
-Status: Phase 6 plans complete — ready to re-verify (`/gsd-verify-phase 06`)
-Last activity: 2026-06-07 -- Phase 07 planning complete
+Phase: 07 (parity-completing-variants) — EXECUTING
+Plan: 2 of 12
+Status: Executing Phase 07 (07-01 Wave 0 / D-05 COMPLETE)
+Last activity: 2026-06-07 -- Phase 07 Plan 01 complete (D-05 faithful-fix)
+
+### Plan 07-01 result (Wave 0 / D-05 — bagged-subset split-gain determinism FAITHFUL-FIX)
+
+Plan 07-01 SETTLED D-05 (the bagged-subset split-gain knife-edge) BEFORE any bagging-dependent wave (GOSS W4, RF W6) — branch = FAITHFUL-FIX, proven by a source-built `lib_lightgbm` 4.6 FP execution trace.
+
+- **ROOT CAUSE (source-built FP trace):** the Rust `min_gain_shift` was computed from the RAW leaf `sum_hessian`, while C++ uses the `2*kEpsilon`-BUMPED value (C++ bumps at the `FindBestThreshold` call site, `feature_histogram.hpp:174`, so `BeforeNumerical` divides by the bumped sum_hessian). The raw value made the Rust `min_gain_shift` ~7 ULPs too high, rejecting bagged-subset deeper splits whose `current_gain` exceeds the C++ `min_gain_shift` by a SINGLE f64 ULP (e.g. node-1 `current_gain` 0x4013fffff4924920 > C++ `min_gain_shift` 0x4013fffff492491f; Rust raw shift 0x4013fffff4924925 rejected it). NOT an irreducible f32 / near-zero artifact — a deterministic OPERAND bug.
+- **FAITHFUL FIX:** `find_best_split_cpu` (f64) + `find_best_split_raw_f32_on` (f32 hip) + the `per_bin_gains` diagnostic now compute `min_gain_shift` from the bumped `sum_hessian`; the `kernel_capture.cpp` golden-capture transcription had the same bug (fixed; `split.txt` regenerated, byte-idempotent; `kernel_parity` 4/4 bit-exact).
+- **DEF-06-01 CLOSED:** `binary_bag1_es0_bfa1` tree-0 now grows 4 leaves bit-exact matching C++; the matrix binary+bagging cell takes the STRICT bit-exact path; `subset_determinism_diagnostic` HARD-asserts the tree-0 leaf-count parity. Cleared in `deferred-items.md`.
+- **regression_l1 + bagging UN-DEFERRED:** removed the `BoostingError::UnsupportedConfig` reject; added `GBDT::no_split_constant_value` (C++ `ObtainAutomaticInitialScore` fallback, `gbdt.cpp:418-429`) so the bfa-off `regression_l1` no-split constant tree-0 carries the label median (11.0), not 0.0. The 4 `regression_l1_bag1_*` cells assert real-binary parity.
+- **BOUNDED known-divergence (documented, capped):** the non-bagged `regression_l1` bfa-off cells retain a cross-feature L1 gain tie on degenerate 2-row nodes (two features separate the node perfectly with gains equal to ~1 f64 ULP; Rust vs C++ order them oppositely). Topology matches C++ EXACTLY; |leaf diff| < 0.1; count hard-capped. Pre-fix this cell grew degenerate single-leaf STUBS that the old skip-guard hid — the fix is a strict improvement. No assertion weakened.
+- **DECISION RECORD:** `07-D05-DECISION.md` (source-build FP-trace evidence + the confirmed fold-order/operand root cause + the faithful fix + the bounded residual).
+- **gate:** `cargo test --workspace` GREEN (50 binaries, 0 failed; boosting_parity 26/26, kernel_parity 4/4, learner_parity 12/12 incl. spine_real/mfb_pos); `LightGBM/` never git-added; the /tmp instrumented build + C++ instrumentation reverted.
+
+Next: `/gsd-execute-phase 7 --wave 1` — the wave-1 plans now build on a SETTLED D-05 (bagging variants inherit the faithful answer).
 
 ### Plan 06-06 result (gap-closure A–E + Task 2b — regression_l1 + bagging TYPED-REJECTED)
+
+> **NOTE (superseded by 07-01):** the Task 2b typed-reject for regression_l1 + bagging and DEF-06-01 below were both reversed/closed by the D-05 faithful-fix in Plan 07-01 (a source-built FP trace proved the divergence was a min_gain_shift operand bug, not an irreducible leaf-structure flip). Kept for history.
 
 Plan 06-06 closed all five Phase-6 verification gaps and resolved Task 2b by typed-rejecting regression_l1 + bagging.
 

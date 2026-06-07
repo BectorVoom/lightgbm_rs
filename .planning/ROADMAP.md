@@ -284,7 +284,7 @@ same future fix.
 Plans:
 **Wave 1**
 
-- [ ] 07-01-PLAN.md — Wave 0 (D-05): bagged-subset split-gain determinism diagnostic + branch decision (un-defer regression_l1+bagging or bounded-cap)
+- [x] 07-01-PLAN.md — Wave 0 (D-05): bagged-subset split-gain determinism — branch = **FAITHFUL-FIX**. A source-built lib_lightgbm 4.6 FP execution trace proved the knife-edge was a `min_gain_shift` OPERAND bug (Rust used the RAW leaf sum_hessian; C++ uses the 2*kEpsilon-BUMPED value → Rust shift ~7 ULPs too high, rejecting bagged-subset splits whose current_gain exceeds C++'s shift by 1 ULP). Fixed `find_best_split` (f64+f32) + per_bin_gains + kernel_capture transcription (split.txt regenerated bit-idempotent). **DEF-06-01 CLOSED** (binary_bag1_es0_bfa1 tree-0 = 4 leaves bit-exact); **regression_l1+bagging UN-DEFERRED** (typed-reject removed + no-split ObtainAutomaticInitialScore fallback → constant tree-0 = label median 11.0); the 4 regression_l1_bag1_* cells assert real-binary parity. Bounded, hard-capped L1 cross-feature gain-tie residual documented (07-D05-DECISION.md). cargo test --workspace GREEN (boosting_parity 26/26, kernel_parity 4/4, learner_parity 12/12). (completed 2026-06-07)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 

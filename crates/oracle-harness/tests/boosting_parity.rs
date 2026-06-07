@@ -1945,26 +1945,39 @@ fn subset_determinism_diagnostic() {
                     .expect("binary cell builder");
                 let booster = train(&cfg, corpus).expect("binary_bag1_es0_bfa1 train");
                 let rust_tree0_leaves = booster.model().trees[0].leaf_value.len() as i32;
-                // Diagnostic, not a hard parity gate (the flip is the open D-05
-                // question): localize whether tree-0 still diverges. The hard cap
-                // lives in the matrix's `struct_divergent <= 1`; here we only REPORT.
+                // D-05 faithful-fix CLOSED DEF-06-01: tree-0 leaf count MUST now match
+                // C++ (the min_gain_shift bumped-sum_hessian fix). This is a HARD gate —
+                // a regression that reopens the flip fails here.
+                assert_eq!(
+                    rust_tree0_leaves, cpp_leaf_count,
+                    "{trace_file}: tree-0 leaf count rust={rust_tree0_leaves} \
+                     cpp={cpp_leaf_count} — DEF-06-01 reopened (the bagged-subset \
+                     split-gain knife-edge regressed; see 07-D05-DECISION.md)"
+                );
                 eprintln!(
                     "subset_determinism_diagnostic[{trace_file}]: tree-0 leaf count \
                      rust={rust_tree0_leaves} cpp={cpp_leaf_count} \
-                     ({})",
-                    if rust_tree0_leaves == cpp_leaf_count {
-                        "MATCH — DEF-06-01 closed for this cell"
-                    } else {
-                        "DIVERGENT — DEF-06-01 still open (see 07-D05-DECISION.md)"
-                    }
+                     (MATCH — DEF-06-01 closed bit-exact)"
                 );
             } else {
-                // regression_l1 + bagging is typed-rejected (06-06 Task 2b); the trace
-                // documents the C++ target leaf count for the un-defer decision.
+                // regression_l1 + bagging — UN-DEFERRED (D-05 faithful-fix). It now
+                // trains; assert its tree-0 leaf count matches C++ (the constant
+                // no-split tree, leaf_count=1 carrying the label-median leaf value).
+                let cfg = matrix_cell_builder("regression_l1", 1, true, false, false)
+                    .build()
+                    .expect("regression_l1 bag1 cell builder");
+                let booster = train(&cfg, corpus).expect("regression_l1_bag1 train");
+                let rust_tree0_leaves = booster.model().trees[0].leaf_value.len() as i32;
+                assert_eq!(
+                    rust_tree0_leaves, cpp_leaf_count,
+                    "{trace_file}: regression_l1 + bagging tree-0 leaf count \
+                     rust={rust_tree0_leaves} cpp={cpp_leaf_count} — the un-defer \
+                     target regressed (see 07-D05-DECISION.md)"
+                );
                 eprintln!(
                     "subset_determinism_diagnostic[{trace_file}]: regression_l1 + bagging \
-                     is typed-rejected today; C++ tree-0 leaf count = {cpp_leaf_count} \
-                     (the un-defer target, see 07-D05-DECISION.md)"
+                     UN-DEFERRED; tree-0 leaf count rust={rust_tree0_leaves} \
+                     cpp={cpp_leaf_count} (MATCH)"
                 );
             }
         }
