@@ -243,7 +243,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 4** *(blocked on 06-03 — per-class structural axis, D-16)*
 
-  - [ ] 06-04-PLAN.md — multiclass(softmax) + multiclassova + multi_logloss; loop generalized to num_class trees/iter (class-major layout + class_need_train); multiclass/ova L1–L5 goldens
+  - [x] 06-04-PLAN.md — multiclass(softmax) + multiclassova + multi_logloss; loop generalized to num_class trees/iter (class-major layout + class_need_train); multiclass/ova L1–L5 goldens (bit-exact L2/L5 over 5-iter horizon, documented softmax exp-libm residual)
 
 **Wave 5** *(blocked on 06-04 — bagging + early-stop axes + full matrix, D-17 steps 3+4)*
 
