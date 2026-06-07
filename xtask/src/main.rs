@@ -152,6 +152,19 @@ pub const DART_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
 /// config.h:463, dart.hpp:45). Pinned so the drop RNG-replay golden is reproducible.
 pub const DART_DROP_SEED: i32 = 4;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W3 extended
+/// metric (MET-03) oracle (plan 07-04). Reuses the SAME prebuilt-wheel binary as
+/// [`MODEL_LIGHTGBM_VERSION`]; `metric-oracle-capture` asserts the installed version
+/// matches BEFORE training so a wrong version can never silently emit divergent
+/// metric goldens (threat T-07-04-SC).
+pub const METRIC_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W3 extended-metric oracle (plan 07-04).
+/// The SAME seed the boosting matrix uses ([`BOOSTING_ORACLE_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the metric goldens
+/// byte-idempotent (empty `git diff` on a re-capture). Recorded in REFERENCE_MANIFEST.md.
+pub const METRIC_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -165,12 +178,14 @@ fn main() -> Result<()> {
         Some("subset-determinism-capture") => subset_determinism_capture(),
         Some("goss-oracle-capture") => goss_oracle_capture(),
         Some("dart-oracle-capture") => dart_oracle_capture(),
+        Some("metric-oracle-capture") => metric_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
-                 subset-determinism-capture | goss-oracle-capture | dart-oracle-capture)"
+                 subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
+                 metric-oracle-capture)"
             );
         }
         None => {
@@ -178,7 +193,8 @@ fn main() -> Result<()> {
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
-                 subset-determinism-capture | goss-oracle-capture | dart-oracle-capture>"
+                 subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
+                 metric-oracle-capture>"
             );
             Ok(())
         }
@@ -1028,6 +1044,106 @@ fn boosting_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- boosting-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/boosting/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `metric-oracle-capture` — Phase-7 W3 (MET-03) extended-metric oracle capture
+/// (plan 07-04).
+///
+/// Trains a tiny model per metric family on the real prebuilt `lib_lightgbm` 4.6
+/// pip wheel with a COMPATIBLE objective, then dumps each metric's final-round raw
+/// score, labels, and the authoritative real-binary metric value. The Rust parity
+/// test replays `Metric::eval` (and the xentropy/multiclass/binary variants) over
+/// the captured (scores, labels) and asserts they match the captured value within
+/// ORACLE_TOL — proving the ported metric math against the real binary.
+///
+/// The version is asserted FIRST (mirror [`boosting_oracle_capture`] — threat
+/// T-07-04-SC): a wrong wheel version must never silently emit divergent metric
+/// goldens. The pip `lightgbm` is a CAPTURE-time tool only — never a crate
+/// dependency and never read at `cargo test` time (the goldens are committed).
+fn metric_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/metric_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Goldens live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/metric");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask metric-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        METRIC_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = METRIC_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask metric-oracle-capture: training the quantile / huber / fair / mape / \
+         poisson / gamma / gamma_deviance / tweedie / cross_entropy / \
+         cross_entropy_lambda / kullback_leibler / average_precision / multi_error / \
+         auc_mu cells on real lib_lightgbm and dumping (scores, labels, value) goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(METRIC_ORACLE_SEED.to_string())
+            .arg(METRIC_ORACLE_LIGHTGBM_VERSION),
+        "metric_oracle_capture.py",
+    )?;
+
+    for metric in [
+        "quantile",
+        "huber",
+        "fair",
+        "mape",
+        "poisson",
+        "gamma",
+        "gamma_deviance",
+        "tweedie",
+        "cross_entropy",
+        "cross_entropy_lambda",
+        "kullback_leibler",
+        "average_precision",
+        "multi_error",
+        "auc_mu",
+    ] {
+        for suffix in ["scores", "labels", "value"] {
+            let p = out_dir.join(format!("{metric}_{suffix}.txt"));
+            if !p.is_file() {
+                bail!("capture completed but {} was not written", p.display());
+            }
+        }
+    }
+
+    eprintln!(
+        "xtask metric-oracle-capture: done. Wrote metric goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- metric-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/metric/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())
