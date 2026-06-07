@@ -316,7 +316,7 @@ Plans:
 
 **Wave 9** *(blocked on Wave 8 completion)*
 
-- [ ] 07-09-PLAN.md — Ranking stack (OBJ-06/MET-04/bagging_by_query): lambdarank/rank_xendcg + ndcg/map + DCGCalculator + query bagging
+- [x] 07-09-PLAN.md — Ranking stack (OBJ-06/MET-04/bagging_by_query): lambdarank/rank_xendcg + ndcg/map + DCGCalculator + query bagging
 
 **Wave 10** *(blocked on Wave 9 completion)*
 
@@ -359,5 +359,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 8/12 | In Progress|  |
+| 7. Parity-Completing Variants | 9/12 | In Progress|  |
 | 8. Python Bindings | 0/TBD | Not started | - |

@@ -62,14 +62,14 @@
 - [x] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`
 - [x] **OBJ-05**: Cross-entropy objectives — `cross_entropy`, `cross_entropy_lambda`
-- [ ] **OBJ-06**: Ranking objectives — `lambdarank`, `rank_xendcg` (query boundaries, DCGCalculator, `objective_seed`)
+- [x] **OBJ-06**: Ranking objectives — `lambdarank`, `rank_xendcg` (query boundaries, DCGCalculator, `objective_seed`)
 
 ### Metrics
 
 - [x] **MET-01**: Core metrics — `l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`
 - [x] **MET-02**: Metric infrastructure — multi-metric lists, `metric_freq`, `is_provide_training_metric`, training-metric eval *(06-05: wired through builder→Config→Booster; metric_freq cadence + multi-metric + is_provide_training_metric + valid-metric eval history, matching the reference)*
 - [x] **MET-03**: Extended regression/xentropy metrics — `quantile`, `huber`, `fair`, `poisson`, `mape`, `gamma`, `gamma_deviance`, `tweedie`, `multi_error`, `cross_entropy`, `cross_entropy_lambda`, `kullback_leibler`, `average_precision`, `auc_mu`
-- [ ] **MET-04**: Ranking metrics — `ndcg`, `map` (DCGCalculator static tables, `eval_at`/`ndcg_eval_at`, per-query)
+- [x] **MET-04**: Ranking metrics — `ndcg`, `map` (DCGCalculator static tables, `eval_at`/`ndcg_eval_at`, per-query)
 
 ### Prediction
 
@@ -199,9 +199,9 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | TRL-06 | Phase 7 | Complete |
 | OBJ-04 | Phase 7 | Pending |
 | OBJ-05 | Phase 7 | Complete |
-| OBJ-06 | Phase 7 | Pending |
+| OBJ-06 | Phase 7 | Complete |
 | MET-03 | Phase 7 | Complete |
-| MET-04 | Phase 7 | Pending |
+| MET-04 | Phase 7 | Complete |
 | PRD-04 | Phase 7 | Pending |
 | PRD-05 | Phase 7 | Pending |
 | ADV-01 | Phase 7 | Pending |
