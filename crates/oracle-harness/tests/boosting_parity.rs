@@ -2589,3 +2589,344 @@ fn mape_loop_matrix() {
     // MATRIX_RESIDUAL_TOL), NOT skipped. See the D-05 POSTURE note above.
     replay_family_a_loop("mape");
 }
+
+// ============== OBJ-04/05 exp/log family: poisson/gamma/tweedie/cross_entropy(_lambda) ==============
+//
+// The OBJ-04 exp/log objectives (poisson/gamma/tweedie) + OBJ-05 cross_entropy /
+// cross_entropy_lambda. Every grad/hess + BoostFromScore + ConvertOutput uses a
+// TRANSCENDENTAL (exp / log / log1p / expm1), so they carry the carried Pitfall-5
+// multiclass exp-libm horizon caveat: the Rust system libm vs the C++ wheel's
+// std::{exp,log} differ at ~1 ULP and can flip a knife-edge split at a deep iter.
+//
+// HORIZON CAP (NOT a tolerance weakening): the capture trains these cells for
+// EXP_LOG_NUM_ITERATIONS (5) so EVERY grown tree stays BIT-EXACT to the real binary
+// (model leaf values via compare_exact_f64_bits; per-iter scores bit-exact). The ONLY
+// ORACLE_TOL surface is the predict-side ConvertOutput (one exp/sigmoid/log1p per
+// row). This mirrors the Phase-6 multiclass 5-iter precedent (06-04-SUMMARY) —
+// capping the horizon rather than weakening the assertion. Each cell skip-passes
+// cleanly when its golden is absent (fresh checkout pre-capture).
+//
+// Corpora: poisson/gamma/tweedie use the spine corpus (labels 2..20, all >= 0,
+// Σ != 0 — passes the C++ Init `>= 0` / non-zero-sum guard); cross_entropy /
+// cross_entropy_lambda use the binary corpus (labels 0/1 ∈ [0, 1] — passes the C++
+// `[0, 1]` interval guard).
+
+/// The exp/log family capture horizon (`EXP_LOG_NUM_ITERATIONS` in the capture
+/// script). Capped at 5 iters so every grown tree stays bit-exact under the carried
+/// Pitfall-5 exp-libm caveat (the predict-side ConvertOutput is the only ORACLE_TOL
+/// surface). Mirrors [`MULTICLASS_NUM_ITERATIONS`].
+const EXP_LOG_NUM_ITERATIONS: i32 = 5;
+
+/// The corpus for an exp/log objective: spine (>= 0 labels) for poisson/gamma/
+/// tweedie, binary (0/1 labels ∈ [0, 1]) for cross_entropy/cross_entropy_lambda.
+fn exp_log_corpus(objective: &str) -> DenseCorpus {
+    match objective {
+        "cross_entropy" | "cross_entropy_lambda" => binary_corpus(),
+        _ => spine_corpus(),
+    }
+}
+
+/// The exp/log family default objective param (matches the capture's
+/// `EXP_LOG_PARAM_AXIS[*][1][0]`). `None` for gamma/cross_entropy(_lambda).
+fn exp_log_default_param(objective: &str) -> Option<(&'static str, f64)> {
+    match objective {
+        "poisson" => Some(("poisson_max_delta_step", 0.7)),
+        "tweedie" => Some(("tweedie_variance_power", 1.5)),
+        "gamma" | "cross_entropy" | "cross_entropy_lambda" => None,
+        other => panic!("not an exp/log objective: {other}"),
+    }
+}
+
+/// Apply an exp/log objective param to a builder.
+fn apply_exp_log_param(b: TrainingBuilder, param: Option<(&str, f64)>) -> TrainingBuilder {
+    match param {
+        Some(("poisson_max_delta_step", v)) => b.poisson_max_delta_step(v),
+        Some(("tweedie_variance_power", v)) => b.tweedie_variance_power(v),
+        Some((other, _)) => panic!("unexpected exp/log param {other}"),
+        None => b,
+    }
+}
+
+/// The exp/log family capped-horizon builder for `(objective, bag, es, bfa)` at the
+/// DEFAULT param. Mirrors the capture's `capture_exp_log` / `capture_exp_log_cell`
+/// (EXP_LOG_NUM_ITERATIONS rounds).
+fn exp_log_builder(objective: &str, bag: bool, es: bool, bfa: bool) -> TrainingBuilder {
+    let mut b = TrainingBuilder::new()
+        .objective(objective)
+        .num_iterations(EXP_LOG_NUM_ITERATIONS)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(bfa)
+        .seed(SPINE_SEED)
+        .deterministic(true);
+    b = apply_exp_log_param(b, exp_log_default_param(objective));
+    if bag {
+        b = b
+            .bagging_fraction(MATRIX_BAGGING_FRACTION)
+            .bagging_freq(MATRIX_BAGGING_FREQ)
+            .bagging_seed(MATRIX_BAGGING_SEED);
+    }
+    if es {
+        b = b.early_stopping_round(MATRIX_EARLY_STOPPING_ROUND);
+    }
+    b
+}
+
+/// Train an exp/log objective's layered spine cell (bag off / es off / bfa on,
+/// default param) the SAME way the capture did.
+fn train_exp_log_spine(objective: &str) -> (Booster, DenseCorpus) {
+    let corpus = exp_log_corpus(objective);
+    let cfg = exp_log_builder(objective, false, false, true)
+        .build()
+        .unwrap_or_else(|e| panic!("{objective} exp/log spine builder failed: {e:?}"));
+    let booster = train(&cfg, &corpus)
+        .unwrap_or_else(|e| panic!("{objective} exp/log spine train failed: {e:?}"));
+    (booster, corpus)
+}
+
+/// Replay one exp/log loop cell against `<obj>_bag<B>_es<E>_bfa<F>_model.txt`,
+/// skip-passing if the golden is absent. Asserts leaf-value parity within
+/// `MATRIX_RESIDUAL_TOL` (bit-exact where the algorithm permits at the capped
+/// horizon). The es cells trim to best_iteration, so only the OVERLAPPING trees are
+/// compared.
+fn replay_exp_log_loop_cell(objective: &str, bag: bool, es: bool, bfa: bool) {
+    let tag = format!("bag{}_es{}_bfa{}", bag as i32, es as i32, bfa as i32);
+    let cell = format!("{objective}_{tag}");
+    let model_file = format!("{cell}_model.txt");
+    let Some(model_text) = read_golden(&model_file) else {
+        return; // skip-pass absent the capture
+    };
+    let corpus = exp_log_corpus(objective);
+    let cfg = exp_log_builder(objective, bag, es, bfa)
+        .build()
+        .unwrap_or_else(|e| panic!("{cell}: builder failed: {e:?}"));
+    let booster = if es {
+        let valid = matrix_valid_corpus(&corpus);
+        train_with_valid(&cfg, &corpus, &valid)
+            .unwrap_or_else(|e| panic!("{cell}: train_with_valid failed: {e:?}"))
+    } else {
+        train(&cfg, &corpus).unwrap_or_else(|e| panic!("{cell}: train failed: {e:?}"))
+    };
+    let golden = lgbm_model::model_text::load(&model_text)
+        .unwrap_or_else(|e| panic!("{cell}: parse golden: {e:?}"));
+    let rust = booster.model();
+    let n = rust.trees.len().min(golden.trees.len());
+    for i in 0..n {
+        let rl: Vec<f32> = rust.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
+        let gl: Vec<f32> = golden.trees[i].leaf_value.iter().map(|&v| v as f32).collect();
+        compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+            panic!("{cell} tree {i} leaf_value not within MATRIX_RESIDUAL_TOL: {m:?}")
+        });
+    }
+}
+
+/// Replay one exp/log param-axis ALT cell (`<obj>_<param><value>_model.txt`),
+/// skip-passing if absent. The capture writes these on the spine cell (bag off / es
+/// off / bfa on) with the non-default param value, at the capped horizon.
+fn replay_exp_log_param_cell(objective: &str, param: &str, value: f64) {
+    let alt_tag = format!("{param}{value}").replace('.', "p");
+    let cell = format!("{objective}_{alt_tag}");
+    let model_file = format!("{cell}_model.txt");
+    let Some(model_text) = read_golden(&model_file) else {
+        return; // skip-pass absent the capture
+    };
+    let corpus = exp_log_corpus(objective);
+    let b = exp_log_builder(objective, false, false, true);
+    // Override the default param with the ALT value.
+    let b = apply_exp_log_param(b, Some((param, value)));
+    let cfg = b
+        .build()
+        .unwrap_or_else(|e| panic!("{cell}: builder failed: {e:?}"));
+    let booster = train(&cfg, &corpus).unwrap_or_else(|e| panic!("{cell}: train failed: {e:?}"));
+    let golden = lgbm_model::model_text::load(&model_text)
+        .unwrap_or_else(|e| panic!("{cell}: parse golden: {e:?}"));
+    let rust = booster.model();
+    assert_eq!(
+        rust.trees.len(),
+        golden.trees.len(),
+        "{cell}: tree count rust {} != golden {}",
+        rust.trees.len(),
+        golden.trees.len()
+    );
+    for (i, (rt, gt)) in rust.trees.iter().zip(golden.trees.iter()).enumerate() {
+        let rl: Vec<f32> = rt.leaf_value.iter().map(|&v| v as f32).collect();
+        let gl: Vec<f32> = gt.leaf_value.iter().map(|&v| v as f32).collect();
+        compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+            panic!("{cell} tree {i} leaf_value not within MATRIX_RESIDUAL_TOL: {m:?}")
+        });
+    }
+}
+
+/// Run the full {bag×es×bfa} loop for one exp/log objective (skip the referenced
+/// default-spine collapse cell, which is the layered `*_spine_model` golden).
+fn replay_exp_log_loop(objective: &str) {
+    for bag in [false, true] {
+        for es in [false, true] {
+            for bfa in [false, true] {
+                if !bag && !es && bfa {
+                    continue; // the layered spine cell, asserted by the *_spine tests
+                }
+                replay_exp_log_loop_cell(objective, bag, es, bfa);
+            }
+        }
+    }
+}
+
+// ---- poisson (exp grad/hess; SafeLog BoostFromScore; exp ConvertOutput) ----
+
+#[test]
+fn poisson_spine_end_to_end() {
+    // Capped horizon (EXP_LOG_NUM_ITERATIONS): the grown ensemble's model leaf values
+    // replay BIT-EXACT and predict() (exp ConvertOutput) within ORACLE_TOL vs the real
+    // lib_lightgbm 4.6 golden. The horizon cap (5 iters) keeps every tree bit-exact
+    // under the carried Pitfall-5 exp-libm caveat — no tolerance weakened.
+    let (booster, corpus) = train_exp_log_spine("poisson");
+    assert_model_and_pred(&booster, &corpus, "poisson_spine_model.txt", "poisson_spine_pred.txt");
+}
+
+#[test]
+fn poisson_score_accumulation() {
+    let (booster, _) = train_exp_log_spine("poisson");
+    assert_scores(&booster, "poisson_scores.txt");
+}
+
+#[test]
+fn poisson_gradients() {
+    // grad = exp(score)-label; hess = exp(score)*exp(max_delta_step) (the exp-libm path).
+    let (booster, _) = train_exp_log_spine("poisson");
+    assert_gradients_at(&booster, "poisson_gh_iter1.txt", "poisson_gh_iterN.txt", 4);
+}
+
+#[test]
+fn poisson_loop_matrix() {
+    replay_exp_log_loop("poisson");
+}
+
+#[test]
+fn poisson_max_delta_step_axis() {
+    // poisson_max_delta_step ∈ {0.7 default (spine), 0.1 alt}; the alt scales the hessian.
+    replay_exp_log_param_cell("poisson", "poisson_max_delta_step", 0.1);
+}
+
+// ---- gamma (subclasses poisson; exp(-score) grad/hess) ----
+
+#[test]
+fn gamma_spine_end_to_end() {
+    let (booster, corpus) = train_exp_log_spine("gamma");
+    assert_model_and_pred(&booster, &corpus, "gamma_spine_model.txt", "gamma_spine_pred.txt");
+}
+
+#[test]
+fn gamma_score_accumulation() {
+    let (booster, _) = train_exp_log_spine("gamma");
+    assert_scores(&booster, "gamma_scores.txt");
+}
+
+#[test]
+fn gamma_gradients() {
+    let (booster, _) = train_exp_log_spine("gamma");
+    assert_gradients_at(&booster, "gamma_gh_iter1.txt", "gamma_gh_iterN.txt", 4);
+}
+
+#[test]
+fn gamma_loop_matrix() {
+    replay_exp_log_loop("gamma");
+}
+
+// ---- tweedie (subclasses poisson; rho-parameterized exp grad/hess) ----
+
+#[test]
+fn tweedie_spine_end_to_end() {
+    let (booster, corpus) = train_exp_log_spine("tweedie");
+    assert_model_and_pred(&booster, &corpus, "tweedie_spine_model.txt", "tweedie_spine_pred.txt");
+}
+
+#[test]
+fn tweedie_score_accumulation() {
+    let (booster, _) = train_exp_log_spine("tweedie");
+    assert_scores(&booster, "tweedie_scores.txt");
+}
+
+#[test]
+fn tweedie_gradients() {
+    let (booster, _) = train_exp_log_spine("tweedie");
+    assert_gradients_at(&booster, "tweedie_gh_iter1.txt", "tweedie_gh_iterN.txt", 4);
+}
+
+#[test]
+fn tweedie_loop_matrix() {
+    replay_exp_log_loop("tweedie");
+}
+
+#[test]
+fn tweedie_variance_power_axis() {
+    // tweedie_variance_power ∈ {1.5 default (spine), 1.1, 1.9 alts}.
+    replay_exp_log_param_cell("tweedie", "tweedie_variance_power", 1.1);
+    replay_exp_log_param_cell("tweedie", "tweedie_variance_power", 1.9);
+}
+
+// ---- cross_entropy (OBJ-05; labels in [0,1]; sigmoid ConvertOutput) ----
+
+#[test]
+fn cross_entropy_spine_end_to_end() {
+    let (booster, corpus) = train_exp_log_spine("cross_entropy");
+    assert_model_and_pred(
+        &booster,
+        &corpus,
+        "cross_entropy_spine_model.txt",
+        "cross_entropy_spine_pred.txt",
+    );
+}
+
+#[test]
+fn cross_entropy_score_accumulation() {
+    let (booster, _) = train_exp_log_spine("cross_entropy");
+    assert_scores(&booster, "cross_entropy_scores.txt");
+}
+
+#[test]
+fn cross_entropy_gradients() {
+    let (booster, _) = train_exp_log_spine("cross_entropy");
+    assert_gradients_at(&booster, "cross_entropy_gh_iter1.txt", "cross_entropy_gh_iterN.txt", 4);
+}
+
+#[test]
+fn cross_entropy_loop_matrix() {
+    replay_exp_log_loop("cross_entropy");
+}
+
+// ---- cross_entropy_lambda (OBJ-05; labels in [0,1]; log1p(exp) ConvertOutput) ----
+
+#[test]
+fn cross_entropy_lambda_spine_end_to_end() {
+    let (booster, corpus) = train_exp_log_spine("cross_entropy_lambda");
+    assert_model_and_pred(
+        &booster,
+        &corpus,
+        "cross_entropy_lambda_spine_model.txt",
+        "cross_entropy_lambda_spine_pred.txt",
+    );
+}
+
+#[test]
+fn cross_entropy_lambda_score_accumulation() {
+    let (booster, _) = train_exp_log_spine("cross_entropy_lambda");
+    assert_scores(&booster, "cross_entropy_lambda_scores.txt");
+}
+
+#[test]
+fn cross_entropy_lambda_gradients() {
+    let (booster, _) = train_exp_log_spine("cross_entropy_lambda");
+    assert_gradients_at(
+        &booster,
+        "cross_entropy_lambda_gh_iter1.txt",
+        "cross_entropy_lambda_gh_iterN.txt",
+        4,
+    );
+}
+
+#[test]
+fn cross_entropy_lambda_loop_matrix() {
+    replay_exp_log_loop("cross_entropy_lambda");
+}

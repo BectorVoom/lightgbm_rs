@@ -915,8 +915,9 @@ fn boosting_oracle_capture() -> Result<()> {
 
     eprintln!(
         "xtask boosting-oracle-capture: training the regression / regression_l1 / \
-         binary / custom / huber / fair / quantile / mape cells on real lib_lightgbm \
-         and dumping L1/L2/L3/L5 goldens ..."
+         binary / custom / huber / fair / quantile / mape / poisson / gamma / tweedie / \
+         cross_entropy / cross_entropy_lambda cells on real lib_lightgbm and dumping \
+         L1/L2/L3/L5 goldens ..."
     );
     run(
         Command::new(&python)
@@ -980,6 +981,16 @@ fn boosting_oracle_capture() -> Result<()> {
         "quantile_spine_model.txt",
         "mape_spine_model.txt",
         "family_a_best_iterations.txt",
+        // OBJ-04/05 exp/log family (07-03): poisson/gamma/tweedie/cross_entropy/
+        // cross_entropy_lambda layered spine goldens + the capped-horizon loop-cell
+        // best-iteration index. The {bag×es×bfa} loop + param-axis cells are written
+        // too (enumerated by the parity test, not re-listed here).
+        "poisson_spine_model.txt",
+        "gamma_spine_model.txt",
+        "tweedie_spine_model.txt",
+        "cross_entropy_spine_model.txt",
+        "cross_entropy_lambda_spine_model.txt",
+        "exp_log_best_iterations.txt",
         // a representative matrix cell per objective (the full set is enumerated in
         // boosting_parity::early_stopping + the REFERENCE_MANIFEST.md).
         "regression_bag1_es0_bfa1_model.txt",

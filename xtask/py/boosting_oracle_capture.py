@@ -70,6 +70,19 @@ LATER_ITER = 5
 MULTICLASS_NUM_ITERATIONS = 5
 MULTICLASS_LATER_ITER = 4
 
+# OBJ-04/05 exp/log family (poisson/gamma/tweedie/cross_entropy/cross_entropy_lambda):
+# every grad/hess + BoostFromScore + ConvertOutput uses a TRANSCENDENTAL (exp / log /
+# log1p / expm1). The Rust system libm and the C++ wheel's std::{exp,log} differ at the
+# ~1-ULP level (Pitfall 5, carried from the multiclass exp-libm horizon, 06-04). At a
+# knife-edge split gain a sub-ULP g/h difference can flip a split at a deep iteration.
+# We CAP the iteration horizon at EXP_LOG_NUM_ITERATIONS so EVERY grown tree stays
+# BIT-EXACT to the real binary (the leaf-value parity contract holds end-to-end),
+# rather than weakening the assertion. The only ORACLE_TOL surface is the predict-side
+# ConvertOutput (one exp/sigmoid/log1p per row). Mirrors the multiclass 5-iter
+# precedent.
+EXP_LOG_NUM_ITERATIONS = 5
+EXP_LOG_LATER_ITER = 4
+
 
 def f64_bits_line(values):
     """Serialize a list of f64 as space-separated u64 bit patterns (exact)."""
@@ -466,6 +479,72 @@ def median_percentile(values, alpha=0.5):
     return float(v1 - (v1 - v2) * bias)
 
 
+# ---- OBJ-04/05 exp/log family gradient/hessian (poisson/gamma/tweedie/xentropy) ----
+def poisson_gh(max_delta_step):
+    """RegressionPoissonLoss::GetGradients (regression_objective.hpp:439): grad =
+    exp(score)-label; hess = exp(score)*exp(max_delta_step)."""
+    emds = float(np.exp(max_delta_step))
+    def gh(score_prev, labels):
+        es = np.exp(np.asarray(score_prev, dtype=np.float64))
+        grad = (es - np.asarray(labels, dtype=np.float64)).astype(np.float32)
+        hess = (es * emds).astype(np.float32)
+        return grad, hess
+    return gh
+
+
+def gamma_gh(score_prev, labels):
+    """RegressionGammaLoss::GetGradients (regression_objective.hpp:694): exp_score =
+    exp(-score); grad = 1 - label*exp_score; hess = label*exp_score."""
+    es = np.exp(-np.asarray(score_prev, dtype=np.float64))
+    lab = np.asarray(labels, dtype=np.float64)
+    grad = (1.0 - lab * es).astype(np.float32)
+    hess = (lab * es).astype(np.float32)
+    return grad, hess
+
+
+def tweedie_gh(rho):
+    """RegressionTweedieLoss::GetGradients (regression_objective.hpp:729): exp_1 =
+    exp((1-rho)*score); exp_2 = exp((2-rho)*score); grad = -label*exp_1 + exp_2;
+    hess = -label*(1-rho)*exp_1 + (2-rho)*exp_2."""
+    def gh(score_prev, labels):
+        s = np.asarray(score_prev, dtype=np.float64)
+        lab = np.asarray(labels, dtype=np.float64)
+        e1 = np.exp((1.0 - rho) * s)
+        e2 = np.exp((2.0 - rho) * s)
+        grad = (-lab * e1 + e2).astype(np.float32)
+        hess = (-lab * (1.0 - rho) * e1 + (2.0 - rho) * e2).astype(np.float32)
+        return grad, hess
+    return gh
+
+
+def cross_entropy_gh(score_prev, labels):
+    """CrossEntropy::GetGradients (xentropy_objective.hpp:98), stable log1pexp form."""
+    s = np.asarray(score_prev, dtype=np.float64)
+    lab = np.asarray(labels, dtype=np.float64)
+    grad = np.empty_like(s)
+    hess = np.empty_like(s)
+    hi = s > -37.0
+    et = np.exp(-s[hi])
+    grad[hi] = ((1.0 - lab[hi]) - lab[hi] * et) / (1.0 + et)
+    hess[hi] = et / ((1.0 + et) * (1.0 + et))
+    lo = ~hi
+    el = np.exp(s[lo])
+    grad[lo] = el - lab[lo]
+    hess[lo] = el
+    return grad.astype(np.float32), hess.astype(np.float32)
+
+
+def cross_entropy_lambda_gh(score_prev, labels):
+    """CrossEntropyLambda::GetGradients (xentropy_objective.hpp:215): z = 1/(1+exp(-s));
+    grad = z-label; hess = z*(1-z)."""
+    s = np.asarray(score_prev, dtype=np.float64)
+    lab = np.asarray(labels, dtype=np.float64)
+    z = 1.0 / (1.0 + np.exp(-s))
+    grad = (z - lab).astype(np.float32)
+    hess = (z * (1.0 - z)).astype(np.float32)
+    return grad, hess
+
+
 # ============================ D-07 cross-product matrix ============================
 # The full ~40-cell matrix: 5 core objectives × {bagging on/off} × {early_stop
 # on/off} × {boost_from_average on/off} = 8 cells/objective. The spine cell
@@ -739,6 +818,207 @@ def capture_family_a(out_dir, seed):
     return best_iters
 
 
+# ================= OBJ-04/05 exp/log family (poisson/gamma/tweedie/xentropy) =================
+# Per RESEARCH §"Per-Subsystem Oracle Axis Matrix → Objectives" (07-RESEARCH.md:319-332):
+#   poisson              : 8 loop cells (bag×es×bfa) × poisson_max_delta_step ∈ {0.7, 0.1}
+#   gamma                : 8
+#   tweedie              : 8 × tweedie_variance_power ∈ {1.5, 1.1, 1.9}
+#   cross_entropy        : 8 (label in [0,1])
+#   cross_entropy_lambda : 8
+# Every grad/hess + BoostFromScore + ConvertOutput uses a transcendental (exp/log),
+# so the horizon is CAPPED at EXP_LOG_NUM_ITERATIONS (Pitfall 5) so every grown tree
+# stays bit-exact; the predict-side ConvertOutput is the only ORACLE_TOL surface.
+# poisson/gamma/tweedie use the spine corpus (labels 2..20, all >= 0, Σ != 0);
+# cross_entropy/cross_entropy_lambda use the binary corpus (labels 0/1 ∈ [0,1]).
+EXP_LOG_PARAM_AXIS = {
+    # objective -> (param_name, [default_value, *alt_values])
+    "poisson": ("poisson_max_delta_step", [0.7, 0.1]),
+    "gamma": (None, [None]),
+    "tweedie": ("tweedie_variance_power", [1.5, 1.1, 1.9]),
+    "cross_entropy": (None, [None]),
+    "cross_entropy_lambda": (None, [None]),
+}
+
+
+def exp_log_corpus(objective):
+    """The corpus for an exp/log objective: spine (>=0 labels) for poisson/gamma/
+    tweedie, binary (0/1 labels in [0,1]) for cross_entropy/cross_entropy_lambda."""
+    if objective in ("cross_entropy", "cross_entropy_lambda"):
+        return binary_corpus()
+    return spine_corpus()
+
+
+def exp_log_gh(objective, param_value):
+    if objective == "poisson":
+        return poisson_gh(param_value)
+    if objective == "gamma":
+        return gamma_gh
+    if objective == "tweedie":
+        return tweedie_gh(param_value)
+    if objective == "cross_entropy":
+        return cross_entropy_gh
+    if objective == "cross_entropy_lambda":
+        return cross_entropy_lambda_gh
+    raise ValueError(objective)
+
+
+def exp_log_init(objective, labels, param_value):
+    """The objective's BoostFromScore on the corpus labels."""
+    keps = 1e-15
+    if objective in ("poisson", "gamma", "tweedie"):
+        # SafeLog(L2 mean): log of the label mean (the log-mean score space).
+        return float(np.log(np.mean(labels)))
+    if objective == "cross_entropy":
+        pavg = float(np.mean(labels))
+        pavg = min(max(pavg, keps), 1.0 - keps)
+        return float(np.log(pavg / (1.0 - pavg)))
+    if objective == "cross_entropy_lambda":
+        havg = float(np.mean(labels))
+        return float(np.log(np.expm1(havg)))
+    raise ValueError(objective)
+
+
+def write_layered_capped(out_dir, prefix, booster, X, labels, evals_result,
+                         metric_names, gh_fn, init, pred_transformed,
+                         num_iterations, later_iter):
+    """write_layered with an explicit (capped) horizon — the exp/log family caps the
+    L2 per-iter score horizon at num_iterations (EXP_LOG_NUM_ITERATIONS, Pitfall 5)."""
+    booster.save_model(os.path.join(out_dir, f"{prefix}_spine_model.txt"))
+    with open(os.path.join(out_dir, f"{prefix}_spine_pred.txt"), "w") as fh:
+        fh.write(f"# {prefix}_spine_pred — transformed predict() f64 bits "
+                 f"(ConvertOutput; ORACLE_TOL surface)\n")
+        fh.write(f64_bits_line(pred_transformed) + "\n")
+    with open(os.path.join(out_dir, f"{prefix}_scores.txt"), "w") as fh:
+        fh.write(f"# {prefix}_scores — per-iter raw score; one line per k=1..N; f64 "
+                 f"bits; horizon CAPPED at {num_iterations} (Pitfall 5 exp-libm)\n")
+        fh.write(f"# num_iterations={num_iterations} num_data={len(labels)}\n")
+        for k in range(1, num_iterations + 1):
+            raw_k = booster.predict(X, raw_score=True, num_iteration=k)
+            fh.write(f64_bits_line(raw_k) + "\n")
+    score0 = np.full(len(labels), init, dtype=np.float64)
+    grad1, hess1 = gh_fn(score0, labels)
+    with open(os.path.join(out_dir, f"{prefix}_gh_iter1.txt"), "w") as fh:
+        fh.write(f"# {prefix}_gh_iter1 — iter-1 per-row grad/hess; f32 bits; GRAD then HESS\n")
+        fh.write("GRAD " + f32_bits_line(grad1) + "\n")
+        fh.write("HESS " + f32_bits_line(hess1) + "\n")
+    score_prev = np.asarray(booster.predict(X, raw_score=True, num_iteration=later_iter - 1))
+    gradN, hessN = gh_fn(score_prev, labels)
+    with open(os.path.join(out_dir, f"{prefix}_gh_iterN.txt"), "w") as fh:
+        fh.write(f"# {prefix}_gh_iterN — iter-{later_iter} per-row grad/hess; f32 bits; "
+                 f"GRAD then HESS\n")
+        fh.write(f"# iter={later_iter} init={init!r}\n")
+        fh.write("GRAD " + f32_bits_line(gradN) + "\n")
+        fh.write("HESS " + f32_bits_line(hessN) + "\n")
+    with open(os.path.join(out_dir, f"{prefix}_metrics.txt"), "w") as fh:
+        fh.write(f"# {prefix}_metrics — per-round {' + '.join(metric_names)} "
+                 f"(record_evaluation); f64 bits\n")
+        for metric in metric_names:
+            vals = evals_result["training"][metric]
+            fh.write(f"{metric} " + f64_bits_line(vals) + "\n")
+
+
+def capture_exp_log_cell(out_dir, objective, prefix, X, labels, seed,
+                         param_name, param_value, bag, es, bfa):
+    """Capture ONE exp/log loop cell (model + predict) at the CAPPED horizon."""
+    # The metric crate has no poisson/gamma/tweedie/xentropy metric; the parity replay
+    # compares model leaf values + scores (not eval history), so capture with the
+    # objective's NATIVE LightGBM metric only for record-keeping in the model header.
+    p = base_params(seed, objective, [objective])
+    p["boost_from_average"] = bool(bfa)
+    if param_name is not None:
+        p[param_name] = param_value
+    if bag:
+        p["bagging_fraction"] = MATRIX_BAGGING_FRACTION
+        p["bagging_freq"] = MATRIX_BAGGING_FREQ
+        p["bagging_seed"] = 3
+    dtrain = lgb.Dataset(X, label=labels, params=p, free_raw_data=False)
+    dtrain.construct()
+    valid_sets = [dtrain]
+    valid_names = ["training"]
+    callbacks = []
+    if es:
+        Xv, lv = matrix_valid_corpus(X)
+        # For xentropy, the plateau valid labels must be in [0,1]; clamp the constant.
+        if objective in ("cross_entropy", "cross_entropy_lambda"):
+            lv = np.clip(lv, 0.0, 1.0)
+            lv[:] = 1.0
+        dvalid = lgb.Dataset(Xv, label=lv, reference=dtrain, free_raw_data=False)
+        dvalid.construct()
+        valid_sets = [dtrain, dvalid]
+        valid_names = ["training", "valid_0"]
+        callbacks.append(lgb.early_stopping(MATRIX_EARLY_STOPPING_ROUND, verbose=False))
+    booster = lgb.train(
+        p, dtrain, num_boost_round=EXP_LOG_NUM_ITERATIONS,
+        valid_sets=valid_sets, valid_names=valid_names, callbacks=callbacks,
+    )
+    booster.save_model(os.path.join(out_dir, f"{prefix}_model.txt"))
+    pred = booster.predict(X, raw_score=True)
+    with open(os.path.join(out_dir, f"{prefix}_pred.txt"), "w") as fh:
+        fh.write(f"# {prefix}_pred — predict() raw score; f64 bits\n")
+        fh.write(f"# best_iteration={booster.best_iteration}\n")
+        fh.write(f64_bits_line(np.asarray(pred)) + "\n")
+    return booster.best_iteration
+
+
+def capture_exp_log(out_dir, seed):
+    """Capture all poisson/gamma/tweedie/cross_entropy/cross_entropy_lambda goldens:
+    the layered L1-L5 default-spine cell (capped horizon) + the {bag×es×bfa} loop
+    cells + the objective param-axis cells. Returns the loop best_iteration map."""
+    best_iters = {}
+    for objective in ("poisson", "gamma", "tweedie",
+                      "cross_entropy", "cross_entropy_lambda"):
+        X, labels, mfq = exp_log_corpus(objective)
+        param_name, values = EXP_LOG_PARAM_AXIS[objective]
+        default_value = values[0]
+
+        # --- layered L1-L5 default-spine cell (bag off / es off / bfa on) ---
+        p = base_params(seed, objective, [objective])
+        p["boost_from_average"] = True
+        if param_name is not None:
+            p[param_name] = default_value
+        d = lgb.Dataset(X, label=labels, params=p, free_raw_data=False)
+        d.construct()
+        assert_identity_binning(X, mfq)
+        er = {}
+        booster = lgb.train(
+            p, d, num_boost_round=EXP_LOG_NUM_ITERATIONS,
+            valid_sets=[d], valid_names=["training"],
+            callbacks=[lgb.record_evaluation(er)],
+        )
+        init = exp_log_init(objective, labels, default_value)
+        gh = exp_log_gh(objective, default_value)
+        write_layered_capped(out_dir, objective, booster, X, labels, er,
+                             [objective], gh, init,
+                             booster.predict(X), EXP_LOG_NUM_ITERATIONS,
+                             EXP_LOG_LATER_ITER)
+
+        # --- the 7 remaining {bag×es×bfa} loop cells at the DEFAULT param ---
+        for bag in (False, True):
+            for es in (False, True):
+                for bfa in (False, True):
+                    if (not bag) and (not es) and bfa:
+                        continue  # the layered spine cell, referenced not re-captured
+                    tag = cell_tag(bag, es, bfa)
+                    prefix = f"{objective}_{tag}"
+                    bi = capture_exp_log_cell(
+                        out_dir, objective, prefix, X, labels, seed,
+                        param_name, default_value, bag, es, bfa,
+                    )
+                    best_iters[prefix] = bi
+
+        # --- the objective param-axis: each ALT param value on the spine cell ---
+        if param_name is not None and len(values) > 1:
+            for alt in values[1:]:
+                alt_tag = f"{param_name}{alt}".replace(".", "p")
+                prefix = f"{objective}_{alt_tag}"
+                bi = capture_exp_log_cell(
+                    out_dir, objective, prefix, X, labels, seed,
+                    param_name, alt, False, False, True,
+                )
+                best_iters[prefix] = bi
+    return best_iters
+
+
 def main():
     out_dir = sys.argv[1]
     seed = int(sys.argv[2])
@@ -985,10 +1265,21 @@ def main():
         for cell in sorted(fa_best_iters):
             fh.write("%s best_iteration=%d\n" % (cell, fa_best_iters[cell]))
 
+    # ============= OBJ-04/05 exp/log family (poisson/gamma/tweedie/xentropy) =============
+    el_best_iters = capture_exp_log(out_dir, seed)
+    with open(os.path.join(out_dir, "exp_log_best_iterations.txt"), "w") as fh:
+        fh.write("# OBJ-04/05 exp/log family (07-03): realized best_iteration per loop "
+                 "cell (<objective>_bag<B>_es<E>_bfa<F> best_iteration=<n>). Horizon "
+                 "CAPPED at %d (Pitfall 5 exp-libm).\n" % EXP_LOG_NUM_ITERATIONS)
+        for cell in sorted(el_best_iters):
+            fh.write("%s best_iteration=%d\n" % (cell, el_best_iters[cell]))
+
     print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom/"
           "multiclass/multiclassova L1-L5 goldens + regression_sqrt (reg_sqrt=1) + "
           "regression_mf2es (metric_freq=2 + early_stopping) + the D-07 matrix + "
-          "the OBJ-04 family-A (huber/fair/quantile/mape) goldens to %s" % out_dir)
+          "the OBJ-04 family-A (huber/fair/quantile/mape) goldens + the OBJ-04/05 "
+          "exp/log family (poisson/gamma/tweedie/cross_entropy/cross_entropy_lambda) "
+          "goldens to %s" % out_dir)
 
 
 if __name__ == "__main__":

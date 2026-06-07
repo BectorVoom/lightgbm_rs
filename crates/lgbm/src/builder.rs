@@ -140,6 +140,26 @@ impl TrainingBuilder {
         self
     }
 
+    /// `poisson_max_delta_step` (OBJ-04): the Poisson hessian safeguard
+    /// `exp(max_delta_step)` scale (config.h default 0.7, CHECK `> 0`). Routes into
+    /// `lgbm-core::Config.poisson_max_delta_step` via `Config::from_params`
+    /// (set.rs:322 / scope.rs:156).
+    pub fn poisson_max_delta_step(mut self, v: f64) -> Self {
+        self.params
+            .insert("poisson_max_delta_step".into(), v.to_string());
+        self
+    }
+
+    /// `tweedie_variance_power` (OBJ-04): the Tweedie `rho` parameter (config.h
+    /// default 1.5, CHECK in `[1, 2)`). Routes into
+    /// `lgbm-core::Config.tweedie_variance_power` via `Config::from_params`
+    /// (set.rs:325 / scope.rs:157).
+    pub fn tweedie_variance_power(mut self, v: f64) -> Self {
+        self.params
+            .insert("tweedie_variance_power".into(), v.to_string());
+        self
+    }
+
     /// `seed` (the master seed; derives the sub-seeds via `Config::from_params`).
     pub fn seed(mut self, seed: i32) -> Self {
         self.params.insert("seed".into(), seed.to_string());
@@ -364,6 +384,41 @@ mod tests {
             .build()
             .unwrap();
         assert!(!cfg0.reg_sqrt, "reg_sqrt defaults to false");
+    }
+
+    #[test]
+    fn exp_log_param_setters_round_trip_into_config() {
+        // OBJ-04 (07-03): poisson_max_delta_step / tweedie_variance_power must be
+        // drivable end-to-end through the builder (the D-03 full-param-surface
+        // contract). The setters insert the raw params which route into Config via
+        // Config::from_params.
+        let cfg = TrainingBuilder::new()
+            .objective("poisson")
+            .num_iterations(5)
+            .num_leaves(4)
+            .poisson_max_delta_step(0.1)
+            .build()
+            .unwrap();
+        assert!((cfg.poisson_max_delta_step - 0.1).abs() < 1e-12);
+
+        let cfg_t = TrainingBuilder::new()
+            .objective("tweedie")
+            .num_iterations(5)
+            .num_leaves(4)
+            .tweedie_variance_power(1.9)
+            .build()
+            .unwrap();
+        assert!((cfg_t.tweedie_variance_power - 1.9).abs() < 1e-12);
+
+        // defaults stay at the config.h values.
+        let cfg0 = TrainingBuilder::new()
+            .objective("poisson")
+            .num_iterations(5)
+            .num_leaves(4)
+            .build()
+            .unwrap();
+        assert!((cfg0.poisson_max_delta_step - 0.7).abs() < 1e-12);
+        assert!((cfg0.tweedie_variance_power - 1.5).abs() < 1e-12);
     }
 
     #[test]
