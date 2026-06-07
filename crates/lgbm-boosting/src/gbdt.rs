@@ -195,6 +195,45 @@ impl<'a> Gbdt<'a> {
         init
     }
 
+    /// C++ `GBDT::ObtainAutomaticInitialScore` fallback in the NO-SPLIT branch
+    /// (gbdt.cpp:418-429). When the learner returns a 1-leaf (no-split) tree on the
+    /// FIRST iteration AND `boost_from_average == false` AND the objective is
+    /// non-null AND there is no init-score metadata, C++ still computes the
+    /// automatic initial score (`obj->BoostFromScore(cur_tree_id)` — the label
+    /// median for regression_l1), ADDS it to the train score once, and uses it as
+    /// the constant tree's leaf value. This is the `regression_l1` constant-tree
+    /// leaf-value (e.g. the bagged regression_l1 tree-0 = the label median 11.0,
+    /// NOT 0.0). Returns the constant value to push (0.0 when the fallback does not
+    /// apply — the BoostFromAverage init was already injected on iter 0 by
+    /// [`boost_from_average`](Self::boost_from_average)).
+    fn no_split_constant_value(
+        &mut self,
+        cur_tree_id: i32,
+        labels: &[f32],
+        init_score: f64,
+    ) -> f64 {
+        let is_first_iter = (self.trees.len() as i32) < self.objective.num_model_per_iteration().max(1);
+        if !is_first_iter {
+            // Subsequent iterations extend with a zero constant (C++ AsConstantTree(0)).
+            return 0.0;
+        }
+        // C++ no-split fallback: !boost_from_average && obj != null && !has_init_score
+        // → ObtainAutomaticInitialScore + AddScore, then AsConstantTree(that score).
+        if !self.boost_from_average
+            && self.objective.boost_from_average_enabled()
+            && !self.has_init_score()
+        {
+            let auto_init = self.objective.boost_from_score(cur_tree_id, labels);
+            if Objective::init_score_is_significant(auto_init) {
+                self.score_updater.add_constant(auto_init, cur_tree_id);
+            }
+            return auto_init;
+        }
+        // Otherwise the BoostFromAverage init (already in score_ from iter 0) is the
+        // constant value (C++ AsConstantTree(init_scores[cur_tree_id])).
+        init_score
+    }
+
     /// C++ `GBDT::TrainOneIter` (gbdt.cpp:344-452) for the single-output spine.
     ///
     /// Grows one tree per class (K = 1 here), accumulating it into `score_` via the
@@ -220,28 +259,20 @@ impl<'a> Gbdt<'a> {
                 actual: labels.len(),
             });
         }
-        // TYPED-REJECT (06-06 Task 2b — decision: typed-reject): regression_l1 +
-        // bagging is DEFERRED past Phase 6. The faithful subset-path median-residual
-        // renewal below IS retained (8330cee) and full-corpus regression_l1 stays
-        // bit-exact, but regression_l1 over a bagged SUBSET diverges from C++ in leaf
-        // STRUCTURE (the L1 sign-gradient split-gain is a knife-edge over the bagged
-        // subset — e.g. rust:0.0 vs cpp:11.0 at regression_l1_bag1_es0_bfa0 tree 0).
-        // No leaf-VALUE renewal can fix a divergent leaf STRUCTURE, so we reject the
-        // combination here — BEFORE any tree is grown — rather than ship wrong-but-
-        // similar leaves. `is_renew_tree_output()` is true ONLY for regression_l1.
-        let l1_bagging = self.objective.is_renew_tree_output()
-            && self
-                .bagging
-                .as_ref()
-                .is_some_and(|bag| bag.is_bagging_active());
-        if l1_bagging {
-            return Err(BoostingError::UnsupportedConfig {
-                what: "regression_l1 + bagging (L1 sign-gradient split-gain \
-                       knife-edge over the bagged subset diverges from the C++ \
-                       leaf structure; deferred past Phase 6)"
-                    .to_string(),
-            });
-        }
+        // UN-DEFERRED in Phase-7 07-01 (D-05 faithful-fix): regression_l1 + bagging
+        // is no longer typed-rejected. The Phase-6 06-06 rejection assumed the L1
+        // sign-gradient split-gain over the bagged subset diverged from C++ in leaf
+        // STRUCTURE (rust:0.0 vs cpp:11.0 at regression_l1_bag1_es0_bfa0 tree 0). A
+        // source-built lib_lightgbm 4.6 FP execution trace (07-D05-DECISION.md)
+        // showed the divergence was a SPLIT-GAIN OPERAND bug, not an irreducible
+        // structure flip: the Rust `min_gain_shift` used the RAW leaf `sum_hessian`
+        // where C++ uses the `2*kEpsilon`-BUMPED value (feature_histogram.hpp:174),
+        // making the Rust gain-shift ULPs too high and rejecting the borderline
+        // bagged-subset splits C++ accepts. With that fixed (lgbm-compute
+        // `find_best_split`) plus the retained subset-path median-residual
+        // `RenewTreeOutput` (8330cee), regression_l1 + bagging now reproduces the
+        // real-binary tree structure (the `regression_l1_bag1_*` matrix cells assert
+        // real-binary parity, not the typed error). DEF-06-01 family cleared.
 
         // K = num_model_per_iteration (num_class for multiclass/ova, 1 otherwise).
         // The objective is authoritative — it MUST agree with self.num_class for the
@@ -422,9 +453,12 @@ impl<'a> Gbdt<'a> {
                     }
                     self.trees.push(tree);
                 } else {
+                    // No-split tree on the bagged subset. C++ applies the
+                    // ObtainAutomaticInitialScore fallback (gbdt.cpp:418-429): for
+                    // regression_l1 bfa-off the constant value is the label median
+                    // (e.g. tree-0 = 11.0), not 0.0. See `no_split_constant_value`.
                     let init = init_scores[cur_tree_id as usize];
-                    let is_first_iter = self.trees.len() < k as usize;
-                    let const_val = if is_first_iter { init } else { 0.0 };
+                    let const_val = self.no_split_constant_value(cur_tree_id, labels, init);
                     self.trees.push(Tree::as_constant(const_val, self.num_data));
                 }
                 continue;
@@ -475,14 +509,15 @@ impl<'a> Gbdt<'a> {
                 self.trees.push(tree);
             } else {
                 // No positive-gain split (gbdt.cpp:419-434): the learner returned a
-                // 1-leaf tree. C++ discards it and pushes AsConstantTree(init) on the
-                // first iteration (extend-with-zeros afterward). The init already
-                // entered score_ once via BoostFromAverage→AddScore (iter 0), so
-                // there is NO further score change. Pushing the constant keeps
-                // models_.len() == iter * K (Pitfall 6).
+                // 1-leaf tree. C++ discards it and pushes AsConstantTree on the first
+                // iteration (extend-with-zeros afterward). On the first iteration with
+                // boost_from_average=false it applies the ObtainAutomaticInitialScore
+                // fallback (the label median for regression_l1) and AddScores it once;
+                // otherwise the BoostFromAverage init (already in score_ from iter 0)
+                // is the constant. Pushing the constant keeps models_.len() == iter * K
+                // (Pitfall 6). See `no_split_constant_value`.
                 let init = init_scores[cur_tree_id as usize];
-                let is_first_iter = self.trees.len() < k as usize;
-                let const_val = if is_first_iter { init } else { 0.0 };
+                let const_val = self.no_split_constant_value(cur_tree_id, labels, init);
                 self.trees.push(Tree::as_constant(const_val, self.num_data));
             }
         }

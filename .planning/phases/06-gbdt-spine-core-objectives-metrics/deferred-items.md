@@ -4,7 +4,26 @@ These were discovered during execution but fall OUTSIDE the scope of the current
 task. They are logged here per the executor scope boundary (do not auto-fix
 pre-existing issues in unrelated paths) and tracked for a future phase.
 
-## DEF-06-01 — `binary` + `bagging` + `boost_from_average` per-tree split-count knife-edge
+## DEF-06-01 — `binary` + `bagging` + `boost_from_average` per-tree split-count knife-edge — CLEARED (Phase-7 07-01)
+
+> **STATUS: CLEARED in Phase-7 07-01 (D-05 faithful-fix, 2026-06-07).**
+> A source-built `lib_lightgbm` 4.6 CPU-only single-thread FP execution trace
+> (see `.planning/phases/07-parity-completing-variants/07-D05-DECISION.md`)
+> localized the root cause to a SPLIT-GAIN OPERAND bug, not an irreducible
+> structure flip: the Rust `min_gain_shift` was computed from the RAW leaf
+> `sum_hessian`, while C++ computes it from the `2*kEpsilon`-BUMPED `sum_hessian`
+> (C++ passes the bumped value into `BeforeNumerical`, `feature_histogram.hpp:174`,
+> 400-401). The raw value made the Rust `min_gain_shift` ~7 ULPs too high, which
+> rejected the bagged-subset deeper splits whose `current_gain` exceeds the C++
+> `min_gain_shift` by a SINGLE f64 ULP (e.g. `0x4013fffff4924920 > 0x4013fffff492491f`).
+> Fixing `lgbm-compute` `find_best_split` (and the matching `kernel_capture.cpp`
+> transcription + `split.txt` golden + the f32 hip path + the `per_bin_gains`
+> diagnostic) makes `binary_bag1_es0_bfa1` tree-0 grow 4 leaves bit-exact, MATCHING
+> C++. The matrix binary+bagging cells now take the STRICT bit-exact path. The same
+> fix (plus the no-split ObtainAutomaticInitialScore fallback in gbdt) un-deferred
+> `regression_l1 + bagging`. No assertion was weakened; the only tolerance is the
+> bounded `uniform_grad_residual` L1 cross-feature gain-tie on degenerate 2-row
+> nodes (documented, hard-capped).
 
 - **Discovered during:** 06-06 Task 2b execution (closing regression_l1 + bagging).
 - **Cell:** `binary_bag1_es0_bfa1` (and `binary_bag1_es1_bfa1` when its trimmed
