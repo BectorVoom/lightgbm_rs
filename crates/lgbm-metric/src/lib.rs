@@ -18,8 +18,10 @@
 //! string-keyed `CreateMetric`) and the per-metric formulas (L1/L2/RMSE/
 //! binary_logloss/binary_error/AUC/multi_logloss) land in 06-04+.
 
+pub mod binary;
 pub mod error;
 pub mod regression;
 
+pub use binary::BinaryMetric;
 pub use error::MetricError;
 pub use regression::Metric;

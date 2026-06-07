@@ -29,6 +29,7 @@ use lgbm_objective::Objective;
 use lgbm_treelearner::SerialTreeLearner;
 
 use crate::error::BoostingError;
+use crate::objective::BoostObjective;
 use crate::score_updater::ScoreUpdater;
 
 /// The GBDT ensemble driver — the f64 score accumulator + the grown model.
@@ -37,11 +38,12 @@ use crate::score_updater::ScoreUpdater;
 /// deterministic core, bagging OFF, early-stopping OFF, `boost_from_average`
 /// honored (the C++ regression default). Per-class generalization (multiclass),
 /// bagging, and early stopping land in 06-04/06-05.
-pub struct Gbdt {
+pub struct Gbdt<'a> {
     /// The f64 score accumulator (`score_`).
     score_updater: ScoreUpdater,
-    /// The training-side objective (grad/hess + `BoostFromScore`).
-    objective: Objective,
+    /// The training-side objective (grad/hess + `BoostFromScore`), dispatching
+    /// over regression / regression_l1 / binary / custom (`objective_function_`).
+    objective: BoostObjective<'a>,
     /// `learning_rate` (`config_->learning_rate`) — the per-tree `Shrinkage`.
     learning_rate: f64,
     /// `num_class` (1 for the regression/binary spine).
@@ -70,12 +72,33 @@ pub struct IterSnapshot {
     pub score: Vec<f64>,
 }
 
-impl Gbdt {
-    /// Construct the boosting driver. `init_score` is the optional `Dataset`
-    /// `init_score` metadata (class-major `num_data * num_class`); `None` zeroes
-    /// the score buffer.
+impl<'a> Gbdt<'a> {
+    /// Construct the boosting driver from a built-in regression objective (the
+    /// 06-02 spine constructor — kept for the existing callers/tests).
     pub fn new(
         objective: Objective,
+        learning_rate: f64,
+        num_class: i32,
+        num_data: i32,
+        boost_from_average: bool,
+        init_score: Option<&[f64]>,
+    ) -> Self {
+        Self::with_objective(
+            BoostObjective::Builtin(objective),
+            learning_rate,
+            num_class,
+            num_data,
+            boost_from_average,
+            init_score,
+        )
+    }
+
+    /// Construct the boosting driver from any [`BoostObjective`] (regression /
+    /// regression_l1 / binary / custom). `init_score` is the optional `Dataset`
+    /// `init_score` metadata (class-major `num_data * num_class`); `None` zeroes
+    /// the score buffer.
+    pub fn with_objective(
+        objective: BoostObjective<'a>,
         learning_rate: f64,
         num_class: i32,
         num_data: i32,
@@ -111,6 +134,11 @@ impl Gbdt {
     /// score updater. Returns `init` (0 if the gate is closed).
     fn boost_from_average(&mut self, cur_tree_id: i32, labels: &[f32], num_features: usize) -> f64 {
         if !self.trees.is_empty() || self.has_init_score() {
+            return 0.0;
+        }
+        // C++ skips BoostFromAverage entirely when objective_function_ == nullptr
+        // (the custom path) — gbdt.cpp:355-372.
+        if !self.objective.boost_from_average_enabled() {
             return 0.0;
         }
         if !(self.boost_from_average || num_features == 0) {

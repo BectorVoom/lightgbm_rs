@@ -22,8 +22,10 @@
 
 pub mod error;
 pub mod gbdt;
+pub mod objective;
 pub mod score_updater;
 
 pub use error::BoostingError;
 pub use gbdt::{Gbdt, IterSnapshot};
+pub use objective::BoostObjective;
 pub use score_updater::ScoreUpdater;

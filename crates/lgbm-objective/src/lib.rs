@@ -19,10 +19,14 @@
 //! C++ string-keyed `CreateObjectiveFunction`) and the per-objective math land in
 //! 06-02 (L2 spine) and 06-03+ (regression_l1 / binary / multiclass / custom).
 
+pub mod binary;
+pub mod custom;
 pub mod error;
 pub mod percentile;
 pub mod regression;
 
+pub use binary::Binary;
+pub use custom::CustomObjective;
 pub use error::ObjectiveError;
 pub use regression::Objective;
 
