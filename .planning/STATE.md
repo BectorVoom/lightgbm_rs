@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06-05-PLAN.md (bagging + early stopping + metric infra + D-07 matrix)
-last_updated: "2026-06-07T01:25:00.000Z"
-last_activity: 2026-06-07 -- Phase 06 plan 05 (bagging/early-stopping/metric-infra + D-07 matrix) complete — PHASE 6 DONE
+stopped_at: Phase 06 executed (5/5 plans) — verification gaps_found (3/5 SC); awaiting /gsd-plan-phase 6 --gaps
+last_updated: "2026-06-07T02:10:00.000Z"
+last_activity: 2026-06-07 -- Phase 06 all 5 plans executed; phase-goal verification returned gaps_found (3/5) — phase NOT complete
 progress:
   total_phases: 8
-  completed_phases: 6
+  completed_phases: 5
   total_plans: 32
   completed_plans: 32
-  percent: 100
+  percent: 95
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 06 (gbdt-spine-core-objectives-metrics) — COMPLETE
-Plan: 5 of 5 — DONE
-Status: 06-05 complete — Phase 6 finished (all 10 requirement IDs satisfied; all 5 ROADMAP SC demonstrated)
-Last activity: 2026-06-07 -- Phase 06 plan 05 (bagging/early-stopping/metric-infra + D-07 matrix) complete
+Phase: 06 (gbdt-spine-core-objectives-metrics) — GAPS FOUND (5/5 plans executed, verification 3/5 SC)
+Plan: 5 of 5 executed — phase verification returned gaps_found
+Status: Phase 6 NOT complete — 06-VERIFICATION.md gaps_found (3/5). Open: CR-01 (constant-tree leaf_count model-text divergence vs C++), WR-01/WR-03 (22 D-07 matrix cells swallow assertions via `.ok()` + empty regression_l1+bagging renew block), CR-02 (early stop gated by metric_freq vs C++ every-iter). Next: `/gsd-plan-phase 6 --gaps`.
+Last activity: 2026-06-07 -- Phase 06 verification returned gaps_found (3/5 SC)
 
 ### Plan 06-05 result (BST-03/BST-07/MET-02 — bagging + early stopping + metric infra + D-07 matrix)
 
