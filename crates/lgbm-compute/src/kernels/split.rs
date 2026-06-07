@@ -598,24 +598,40 @@ pub fn find_best_split_cpu(
         });
     }
 
+    // FindBestThreshold entry bump: sum_hessian + 2 * kEpsilon (:172). The 2 and
+    // kEpsilon widen to f64 exactly as C++ does. C++ applies this bump at the
+    // `FindBestThreshold` call site — `find_best_threshold_fun_(sum_gradient,
+    // sum_hessian + 2 * kEpsilon, ...)` (feature_histogram.hpp:174) — so EVERY
+    // downstream consumer (both `BeforeNumerical`/`min_gain_shift` AND `cnt_factor`
+    // and the per-bin scan) sees the BUMPED `sum_hessian`. Compute the bump FIRST
+    // and thread the bumped value into `min_gain_shift` below.
+    let two_eps = 2.0 * f64::from(K_EPSILON);
+    let sum_hessian_bumped = sum_hessian + two_eps;
+
     // BeforeNumerical (feature_histogram.hpp:198-207): the whole-leaf gain, then
     // min_gain_shift = gain_shift + min_gain_to_split. Computed on the host with
     // the SAME f64 gain primitive the kernel uses (so it is bit-identical).
+    //
+    // PARITY FIX (Phase-7 D-05, faithful-fix branch): `gain_shift` MUST use the
+    // `2*kEpsilon`-BUMPED `sum_hessian`, not the raw value. In C++ the lambda
+    // receives the already-bumped `sum_hessian` and passes it straight into
+    // `BeforeNumerical(... sum_hessian ...)` (feature_histogram.hpp:400-401,
+    // 411-413, 424-425), so `GetLeafGain`'s denominator is `sum_hessian + 2*kEpsilon
+    // + lambda_l2`. Using the raw `sum_hessian` here made the Rust `min_gain_shift`
+    // ~7 ULPs HIGHER than C++, which rejected the bagged-subset deeper splits whose
+    // `current_gain` exceeds the C++ `min_gain_shift` by a single f64 ULP — the
+    // DEF-06-01 / regression_l1+bagging knife-edge (binary_bag1_es0_bfa1 tree-0:
+    // rust 2 vs cpp 4 leaves). Source-built lib_lightgbm 4.6 FP trace confirmed:
+    // `min_gain_shift` from the bumped sum_hessian is bit-exact to the real binary.
     let use_l1 = cfg.use_l1();
-    // gain_shift is GetLeafGain over the (un-bumped) leaf totals.
     let gain_shift = crate::gain::get_leaf_gain(
         use_l1,
         sum_gradient,
-        sum_hessian,
+        sum_hessian_bumped,
         cfg.lambda_l1,
         cfg.lambda_l2,
     );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
-
-    // FindBestThreshold entry bump: sum_hessian + 2 * kEpsilon (:172). The 2 and
-    // kEpsilon widen to f64 exactly as C++ does.
-    let two_eps = 2.0 * f64::from(K_EPSILON);
-    let sum_hessian_bumped = sum_hessian + two_eps;
 
     // Host-computed iteration counts (the loops are bounded RANGE loops on the
     // device; computing the bound on the host keeps the kernel control flow
@@ -787,19 +803,23 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
         });
     }
 
-    // BeforeNumerical (host, f32): gain_shift over the un-bumped leaf totals.
+    // FindBestThreshold entry bump (f32): sum_hessian + 2*kEpsilon (:172,174).
+    let two_eps = 2.0f32 * f32::from(K_EPSILON);
+    let sum_hessian_bumped = sum_hessian + two_eps;
+
+    // BeforeNumerical (host, f32): gain_shift over the BUMPED leaf totals. Phase-7
+    // D-05 faithful-fix (mirrors the f64 `find_best_split_cpu` fix): C++ passes the
+    // `2*kEpsilon`-bumped `sum_hessian` into `BeforeNumerical`, so `min_gain_shift`
+    // must divide by `sum_hessian_bumped`, not the raw `sum_hessian`.
     let use_l1 = cfg.use_l1();
     let gain_shift = crate::gain::get_leaf_gain_f32(
         use_l1,
         sum_gradient,
-        sum_hessian,
+        sum_hessian_bumped,
         cfg.lambda_l1 as f32,
         cfg.lambda_l2 as f32,
     );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split as f32;
-
-    let two_eps = 2.0f32 * f32::from(K_EPSILON);
-    let sum_hessian_bumped = sum_hessian + two_eps;
 
     let num_bin_i = num_bin as i32;
     let rev_count = (num_bin_i - 1).max(0);

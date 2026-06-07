@@ -758,13 +758,19 @@ struct SCaseSpec {
 
 void EmitSCase(std::ofstream& out, const SCaseSpec& cs) {
   const bool use_l1 = cs.cfg.lambda_l1 > 0.0;
-  // BeforeNumerical (feature_histogram.hpp:198-207): gain_shift over UN-bumped
+  // FindBestThreshold entry bump (:172): sum_hessian + 2*kEpsilon. C++ applies
+  // this AT the FindBestThreshold call site (feature_histogram.hpp:174), so the
+  // BUMPED sum_hessian is what `BeforeNumerical` (and therefore `min_gain_shift`)
+  // sees — NOT the raw value. (Phase-7 D-05: the prior transcription used the raw
+  // sum_hessian here, which made `min_gain_shift` ~ULPs higher than the real
+  // lib_lightgbm 4.6 binary; a source-built FP trace proved the bumped value is
+  // bit-exact to the reference. Fixed to match real C++.)
+  const double sum_hessian_bumped = cs.sum_hessian + 2.0 * static_cast<double>(kEpsilonF);
+  // BeforeNumerical (feature_histogram.hpp:198-207): gain_shift over the BUMPED
   // totals; min_gain_shift = gain_shift + min_gain_to_split.
   const double gain_shift =
-      GetLeafGain(use_l1, cs.sum_gradient, cs.sum_hessian, cs.cfg.lambda_l1, cs.cfg.lambda_l2);
+      GetLeafGain(use_l1, cs.sum_gradient, sum_hessian_bumped, cs.cfg.lambda_l1, cs.cfg.lambda_l2);
   const double min_gain_shift = gain_shift + cs.cfg.min_gain_to_split;
-  // FindBestThreshold entry bump (:172): sum_hessian + 2*kEpsilon.
-  const double sum_hessian_bumped = cs.sum_hessian + 2.0 * static_cast<double>(kEpsilonF);
 
   std::vector<double> cand_rev, cand_fwd;
   WinSplit w = FindBestThreshold(cs.hist, cs.cfg, use_l1, cs.sum_gradient,

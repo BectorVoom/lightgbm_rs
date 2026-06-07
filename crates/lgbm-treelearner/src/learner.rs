@@ -1084,11 +1084,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let default_bin = f.default_bin as i32;
         let qnan = f64::NAN;
 
-        // BeforeNumerical min_gain_shift (host, same as find_best_split).
-        let gain_shift = lgbm_compute::gain::get_leaf_gain(use_l1, sum_gradient, sum_hessian, l1, l2);
-        let min_gain_shift = gain_shift + cfg.min_gain_to_split;
+        // BeforeNumerical min_gain_shift (host, same as find_best_split). Phase-7
+        // D-05 faithful-fix: `gain_shift` uses the 2*kEpsilon-BUMPED `sum_hessian`
+        // (C++ passes the bumped value into `BeforeNumerical`, feature_histogram.hpp
+        // :174,400-401) — mirrors the `find_best_split_cpu` fix so this diagnostic
+        // re-scan stays bit-identical to the live kernel path.
         let eps = f64::from(lgbm_core::types::K_EPSILON);
         let sum_hessian_bumped = sum_hessian + 2.0 * eps;
+        let gain_shift =
+            lgbm_compute::gain::get_leaf_gain(use_l1, sum_gradient, sum_hessian_bumped, l1, l2);
+        let min_gain_shift = gain_shift + cfg.min_gain_to_split;
         let cnt_factor = f64::from(num_data) / sum_hessian_bumped;
         let round_int = |x: f64| -> i32 { (x + f64::from(0.5f32)) as i32 };
         let get_grad = |t: i32| hist[(t as usize) << 1];
