@@ -9,4 +9,48 @@ in-scope APIs.
 
 from ._core import Booster, Dataset, LightGBMError, train
 
-__all__ = ["Booster", "Dataset", "LightGBMError", "train"]
+
+def dataset_from_csr(csr, label):
+    """Build a :class:`Dataset` from a scipy CSR matrix (D-05).
+
+    Coerces the three scipy arrays to the widths the bit-exact ingest expects
+    (``indptr`` -> int64, ``indices`` -> int32, ``data`` -> float32; RESEARCH A5)
+    and delegates to :meth:`Dataset.from_csr`, which densifies into the SAME f64
+    rows the dense path bins. ``csr`` is any scipy ``csr_matrix``/``csr_array``.
+    """
+    import numpy as np
+
+    return Dataset.from_csr(
+        np.ascontiguousarray(csr.indptr, dtype=np.int64),
+        np.ascontiguousarray(csr.indices, dtype=np.int32),
+        np.ascontiguousarray(csr.data, dtype=np.float32),
+        (int(csr.shape[0]), int(csr.shape[1])),
+        np.asarray(label, dtype=np.float64),
+    )
+
+
+def dataset_from_csc(csc, label):
+    """Build a :class:`Dataset` from a scipy CSC matrix (D-05).
+
+    Column-oriented mirror of :func:`dataset_from_csr`; same dtype coercion and
+    dense-equivalence guarantee.
+    """
+    import numpy as np
+
+    return Dataset.from_csc(
+        np.ascontiguousarray(csc.indptr, dtype=np.int64),
+        np.ascontiguousarray(csc.indices, dtype=np.int32),
+        np.ascontiguousarray(csc.data, dtype=np.float32),
+        (int(csc.shape[0]), int(csc.shape[1])),
+        np.asarray(label, dtype=np.float64),
+    )
+
+
+__all__ = [
+    "Booster",
+    "Dataset",
+    "LightGBMError",
+    "train",
+    "dataset_from_csr",
+    "dataset_from_csc",
+]
