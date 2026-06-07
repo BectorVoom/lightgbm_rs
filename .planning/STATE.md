@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 07-10-PLAN.md
-last_updated: "2026-06-07T09:40:54.893Z"
+status: verifying
+stopped_at: Completed 07-12-PLAN.md
+last_updated: "2026-06-07T10:03:44.850Z"
 last_activity: "2026-06-07 -- 07-07 complete: Random Forest (BST-06) BoostingVariant::Rf — averaged trees + mandatory bagging + no shrinkage; real-binary parity, BST-06 complete"
 progress:
   total_phases: 8
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 45
-  completed_plans: 44
-  percent: 75
+  completed_plans: 45
+  percent: 88
 ---
 
 # Project State
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 Phase: 07 (parity-completing-variants) — EXECUTING
 Plan: 12 of 12 (07-01..07-07 complete)
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-07 -- 07-07 complete: Random Forest (BST-06) BoostingVariant::Rf — averaged trees + mandatory bagging + no shrinkage; real-binary parity, BST-06 complete
 
 ### Plan 07-07 result (BST-06 — Random Forest BoostingVariant::Rf, COMPLETE)
@@ -366,6 +366,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 07 P09 | 22min | 4 tasks | 30 files |
 | Phase 07 P07-10 | 12min | 4 tasks | 20 files |
 | Phase 07 P11 | 150 | 4 tasks | 14 files |
+| Phase 07 P12 | 19 | 4 tasks | 16 files |
 
 ## Accumulated Context
 
@@ -429,6 +430,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 07-07: RF (BST-06) ships as BoostingVariant::Rf — averaged trees (MultiplyScore running-average, shrinkage 1.0), grad/hess derived once from a constant init buffer, RenewTreeOutput gated on IsRenewTreeOutput (capture-revealed L2 bug fix), 2 typed CHECKs; real-binary parity (single bit-exact, multiclass structure+predict within ORACLE_TOL); BST-06 complete.
 - [Phase ?]: 07-10: prediction early stop gated on ObjectiveKind::need_accurate_prediction (only binary/multiclass/ova activate; regression-like are no-ops, matching C++ Predictor)
 - [Phase ?]: 07-11: ADV-01..05 advanced learner constraints as additive split gates (D-06 held); 10/14 real-binary cells bit-exact, 4 residual ULP/RNG knife-edges deferred as DEF-07-11
+- [Phase ?]: 07-12: refit leaf-output formula inlined in lgbm-model (no kernel-layer dep edge)
+- [Phase ?]: 07-12: model-text split-count emit uses the CR-02 split_gain>0 guard (C++ guards both split and gain)
 
 ### Pending Todos
 
@@ -458,6 +461,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T09:40:49.774Z
-Stopped at: Completed 07-10-PLAN.md
+Last session: 2026-06-07T10:03:35.075Z
+Stopped at: Completed 07-12-PLAN.md
 Resume file: None
