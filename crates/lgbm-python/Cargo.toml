@@ -1,0 +1,22 @@
+[package]
+name = "lgbm-python"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm = { path = "../lgbm" }
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+lgbm-model = { path = "../lgbm-model" }
+# The PyO3 / numpy / pyo3-polars version triangle (08-RESEARCH Pitfall 1, BLOCKING):
+# pyo3 0.27 is the floor required by pyo3-polars 0.26; numpy 0.27 is the
+# pyo3-0.27-compatible rust-numpy release. Mixing numpy 0.28 (needs pyo3 0.28)
+# with pyo3-polars 0.26 will NOT compile — these three must move together.
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
+numpy = "0.27"
+pyo3-polars = "0.26"
+
+[lib]
+# The compiled extension module (`lightgbm_rs._core`, D-11/D-12).
+crate-type = ["cdylib"]

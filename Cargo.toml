@@ -10,6 +10,7 @@ members = [
     "crates/lgbm-metric",
     "crates/lgbm-boosting",
     "crates/lgbm",
+    "crates/lgbm-python",
     "crates/oracle-harness",
     "xtask",
 ]
