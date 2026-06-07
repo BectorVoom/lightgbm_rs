@@ -48,11 +48,11 @@
 
 - [x] **BST-01**: GBDT training loop (`TrainOneIter`, `UpdateScore`, per-class trees, shrinkage, `boost_from_average`)
 - [x] **BST-02**: Score updater accumulation with deterministic reduction ordering
-- [ ] **BST-03**: Bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) with RNG-matching sequence
+- [x] **BST-03**: Bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) with RNG-matching sequence *(06-05: BaggingSampleStrategy over FND-01 Random — D-13 RNG-replay golden bit-exact; regression L2 bagging bit-exact vs real binary; `bagging_by_query=true` is an explicit, decision-backed Phase-7 deferral — typed reject, not silent)*
 - [ ] **BST-04**: GOSS sample strategy (`top_rate`/`other_rate`) with matching gradient-magnitude sort and amplification factor
 - [ ] **BST-05**: DART boosting (`drop_rate`, `max_drop`, `skip_drop`, `uniform_drop`, `xgboost_dart_mode`, `drop_seed`)
 - [ ] **BST-06**: Random Forest boosting (averaged trees, mandatory bagging, no shrinkage accumulation)
-- [ ] **BST-07**: Early stopping (`early_stopping_round`, `first_metric_only`, `early_stopping_min_delta`)
+- [x] **BST-07**: Early stopping (`early_stopping_round`, `first_metric_only`, `early_stopping_min_delta`) *(06-05: EarlyStopping verbatim decision — kMinScore init, factor*score vs best + min_delta, first_metric_only, trailing-tree pop; best_iteration recorded; fires identically on the D-07 matrix)*
 
 ### Objective Functions
 
@@ -66,7 +66,7 @@
 ### Metrics
 
 - [x] **MET-01**: Core metrics — `l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`
-- [ ] **MET-02**: Metric infrastructure — multi-metric lists, `metric_freq`, `is_provide_training_metric`, training-metric eval
+- [x] **MET-02**: Metric infrastructure — multi-metric lists, `metric_freq`, `is_provide_training_metric`, training-metric eval *(06-05: wired through builder→Config→Booster; metric_freq cadence + multi-metric + is_provide_training_metric + valid-metric eval history, matching the reference)*
 - [ ] **MET-03**: Extended regression/xentropy metrics — `quantile`, `huber`, `fair`, `poisson`, `mape`, `gamma`, `gamma_deviance`, `tweedie`, `multi_error`, `cross_entropy`, `cross_entropy_lambda`, `kullback_leibler`, `average_precision`, `auc_mu`
 - [ ] **MET-04**: Ranking metrics — `ndcg`, `map` (DCGCalculator static tables, `eval_at`/`ndcg_eval_at`, per-query)
 
@@ -184,13 +184,13 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | TRL-09 | Phase 5 | Complete (05-04) |
 | BST-01 | Phase 6 | Complete |
 | BST-02 | Phase 6 | Complete |
-| BST-03 | Phase 6 | Pending |
-| BST-07 | Phase 6 | Pending |
+| BST-03 | Phase 6 | Complete |
+| BST-07 | Phase 6 | Complete |
 | OBJ-01 | Phase 6 | Complete |
 | OBJ-02 | Phase 6 | Complete |
 | OBJ-03 | Phase 6 | Complete |
 | MET-01 | Phase 6 | Complete |
-| MET-02 | Phase 6 | Pending |
+| MET-02 | Phase 6 | Complete |
 | API-01 | Phase 6 | Complete |
 | BST-04 | Phase 7 | Pending |
 | BST-05 | Phase 7 | Pending |

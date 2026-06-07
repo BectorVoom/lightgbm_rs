@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Tree Model + Model Text I/O + Predict Parity** - Load a C++-trained model and predict identically (parity before training exists) (completed 2026-06-05)
 - [x] **Phase 4: Compute Backend (CPU-first f32 histograms → ROCm)** - Backend trait, f32 histogram/split/score kernels, CPU then ROCm, both at ~1e-6
 - [x] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity *(9/9 plans; 05-09 closed the final mfb>0 leaf-0 2-ULP BIT-EXACT via a real lib_lightgbm 4.6 FP execution trace — the serial learner is bit-exact to the real binary on BOTH committed corpora)*
-- [ ] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API
+- [x] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API *(5/5 plans; all 10 requirement IDs satisfied; D-07 cross-product matrix replays vs real lib_lightgbm 4.6 — regression L2 bit-exact across all axes; documented residuals for non-L2 bagging / l1 bfa-off / multiclass exp-libm)* (completed 2026-06-07)
 - [ ] **Phase 7: Parity-Completing Variants** - GOSS/DART/RF, categorical/EFB splits, remaining objectives/metrics, ranking, SHAP, monotone, refit, importance
 - [ ] **Phase 8: Python Bindings** - PyO3 + numpy bindings mirroring the official `lightgbm` Booster/Dataset/sklearn API
 
@@ -247,7 +247,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 5** *(blocked on 06-04 — bagging + early-stop axes + full matrix, D-17 steps 3+4)*
 
-  - [ ] 06-05-PLAN.md — BaggingSampleStrategy (RNG-replay D-13 golden) + OOB score update + early stopping (BST-07) + metric infra (MET-02); full ~40-cell D-07 cross-product replay
+  - [x] 06-05-PLAN.md — BaggingSampleStrategy (RNG-replay D-13 golden, bit-exact) + OOB score update + early stopping (BST-07) + metric infra (MET-02); full ~40-cell D-07 cross-product replay (regression L2 bit-exact across all axes incl. bagging; documented residuals for non-L2 bagging / l1 bfa-off / multiclass es)
 
 ### Phase 7: Parity-Completing Variants
 
@@ -293,6 +293,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
-| 6. GBDT Spine + Core Objectives/Metrics | 3/5 | In Progress|  |
+| 6. GBDT Spine + Core Objectives/Metrics | 5/5 | Complete (D-07 matrix vs real lib_lightgbm 4.6; regression L2 bit-exact all axes) | 2026-06-07 |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

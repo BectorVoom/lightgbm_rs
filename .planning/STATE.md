@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06-04-PLAN.md (multiclass/multiclassova + multi_logloss)
-last_updated: "2026-06-07T01:40:00.000Z"
-last_activity: 2026-06-07 -- Phase 06 plan 04 (multiclass) complete
+stopped_at: Completed 06-05-PLAN.md (bagging + early stopping + metric infra + D-07 matrix)
+last_updated: "2026-06-07T01:25:00.000Z"
+last_activity: 2026-06-07 -- Phase 06 plan 05 (bagging/early-stopping/metric-infra + D-07 matrix) complete — PHASE 6 DONE
 progress:
   total_phases: 8
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 32
-  completed_plans: 31
-  percent: 97
+  completed_plans: 32
+  percent: 100
 ---
 
 # Project State
@@ -25,10 +25,20 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 06 (gbdt-spine-core-objectives-metrics) — EXECUTING
-Plan: 5 of 5
-Status: 06-04 complete — ready to execute 06-05 (bagging + early stopping)
-Last activity: 2026-06-07 -- Phase 06 plan 04 (multiclass/multiclassova + multi_logloss) complete
+Phase: 06 (gbdt-spine-core-objectives-metrics) — COMPLETE
+Plan: 5 of 5 — DONE
+Status: 06-05 complete — Phase 6 finished (all 10 requirement IDs satisfied; all 5 ROADMAP SC demonstrated)
+Last activity: 2026-06-07 -- Phase 06 plan 05 (bagging/early-stopping/metric-infra + D-07 matrix) complete
+
+### Plan 06-05 result (BST-03/BST-07/MET-02 — bagging + early stopping + metric infra + D-07 matrix)
+
+Plan 06-05 added the final two axes of the maximal-fidelity matrix and closed Phase 6.
+
+- **bagging (BST-03 / D-13):** `BaggingSampleStrategy` mirrors bagging.hpp/threading.h verbatim over the FND-01-proven `lgbm_core::Random` (per-block `Random(bagging_seed+i)` block 1024, draw every row in order incl. OOB, in-bag left / OOB right + one-buffer reverse; balanced pos/neg). `bagging_by_query=true` rejected with a typed error (EXPLICIT Phase-7 deferral, never silent). The D-13 RNG-replay golden (`bag_indices_seed3_frac0.7.txt`) replays bit-exact (i32). OOB rows STILL scored (Pitfall 4). CRITICAL RNG-reuse fix: `bagging_rands_` built once + advanced across draws → regression(L2) bagging BIT-EXACT vs real lib_lightgbm 4.6.
+- **early stopping (BST-07):** `EarlyStopping` (kMinScore init, `factor*score vs best + min_delta`, first_metric_only, trailing-tree pop = round*num_class) + per-iter facade loop with valid-set accumulation; `best_iteration` recorded + the model trimmed to it. Empty-valid-set guarded (typed error).
+- **metric infra (MET-02):** metric_freq cadence, multi-metric list, is_provide_training_metric, valid-metric eval history — all wired through builder→Config→Booster.
+- **D-07 cross-product matrix:** captured + replayed all ~40 cells (5 objectives × {bag} × {es} × {bfa}) vs real lib_lightgbm 4.6. regression(L2) BIT-EXACT across all 8 cells incl. bagging; single-output es/bfa bit-exact; multiclass within ORACLE_TOL. Documented residuals (manifest, NOT silently dropped): regression_l1 bfa-off uniform-grad split-gain f64-noise; non-L2 bagging cells (non-constant hessian / median-residual renew on subset); multiclass es best_iteration (softmax exp-libm). Phase-7 follow-ups recorded.
+- **gate:** `cargo test --workspace` GREEN (boosting_parity 22 passed / 0 ignored — bagging_rng + early_stopping matrix now live; all 06-02..06-04 cells unregressed bit-exact). Capture byte-idempotent; LightGBM/ never git-added.
 
 ### Plan 06-04 result (OBJ-01/OBJ-03/MET-01/BST-01 — per-class structural axis complete)
 
@@ -325,6 +335,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T00:22:38.427Z
+Last session: 2026-06-07T01:25:00.000Z -- Completed 06-05-PLAN.md; resume file: None (Phase 6 complete)
 Stopped at: Phase 6 context gathered
 Resume file: .planning/phases/06-gbdt-spine-core-objectives-metrics/06-CONTEXT.md
