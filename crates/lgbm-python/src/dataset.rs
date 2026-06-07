@@ -7,10 +7,11 @@ use lgbm::RawCorpus;
 use numpy::{PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3_polars::PyDataFrame;
 
 use crate::marshal::{
-    numpy_dense_f32_to_rows, numpy_dense_to_rows, numpy_labels_to_f32, scipy_csc_to_rows,
-    scipy_csr_to_rows,
+    numpy_dense_f32_to_rows, numpy_dense_to_rows, numpy_labels_to_f32, polars_df_to_corpus,
+    scipy_csc_to_rows, scipy_csr_to_rows,
 };
 
 /// Marshal a dense numpy matrix of EITHER `f32` or `f64` dtype into owned f64
@@ -105,6 +106,30 @@ impl Dataset {
         Self::from_rows(rows, labels)
     }
 
+    /// Build a `Dataset` from a **polars DataFrame** (D-03/D-04). Columns are
+    /// consumed Arrow-side in Rust (no numpy round-trip, which would erase the
+    /// Categorical/Enum dtype). With `categorical_feature = None` (the default
+    /// `'auto'`), `Categorical`/`Enum`/`String` columns route to LightGBM
+    /// categorical features and numeric columns to numeric; a `Some(names)` list
+    /// FULLY decides routing (official-package precedence). The frame is densified
+    /// into the SAME owned f64 rows the numpy/sparse paths use (categorical columns
+    /// carry their integer category codes), so a DataFrame and its numeric-array
+    /// equivalent train to the same model.
+    ///
+    /// `categorical_feature` must contain column NAMES; the thin `lightgbm_rs`
+    /// wrapper resolves integer indices to names before calling.
+    #[staticmethod]
+    #[pyo3(signature = (df, label, categorical_feature = None))]
+    fn from_polars(
+        df: PyDataFrame,
+        label: PyReadonlyArray1<'_, f64>,
+        categorical_feature: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let (rows, _names, cat_indices) = polars_df_to_corpus(df, categorical_feature)?;
+        let labels = numpy_labels_to_f32(&label)?;
+        Self::from_rows_with_categorical(rows, labels, cat_indices)
+    }
+
     /// Number of rows in the dataset (mirrors `Dataset.num_data()`).
     fn num_data(&self) -> usize {
         self.corpus.features.len()
@@ -133,5 +158,26 @@ impl Dataset {
         Ok(Dataset {
             corpus: RawCorpus::new(rows, labels),
         })
+    }
+
+    /// Constructor tail for the polars path: same boundary validation as
+    /// [`Dataset::from_rows`], then set `categorical_features` so
+    /// `build_feature_columns_from_raw` routes those columns through
+    /// `find_bin_categorical` (D-04).
+    fn from_rows_with_categorical(
+        rows: Vec<Vec<f64>>,
+        labels: Vec<f32>,
+        categorical_indices: Vec<usize>,
+    ) -> PyResult<Self> {
+        if labels.len() != rows.len() {
+            return Err(PyValueError::new_err(format!(
+                "label length {} != number of data rows {}",
+                labels.len(),
+                rows.len()
+            )));
+        }
+        let mut corpus = RawCorpus::new(rows, labels);
+        corpus.categorical_features = categorical_indices;
+        Ok(Dataset { corpus })
     }
 }

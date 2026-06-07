@@ -23,7 +23,24 @@ lgbm-model = { path = "../lgbm-model" }
 # proper extension module.
 pyo3 = { version = "0.27", features = ["abi3-py39"] }
 numpy = "0.27"
-pyo3-polars = "0.26"
+# `dtype-categorical` makes the polars `DataType::Categorical`/`Enum` variants
+# available so the Arrow-stream ingest can faithfully route Categorical/Enum
+# columns to LightGBM categorical features (D-04). It propagates `polars/dtype-
+# categorical` to the same polars 0.53 core pyo3-polars already pulls (one tree).
+pyo3-polars = { version = "0.26", features = ["dtype-categorical"] }
+# Direct `polars` dep for `DataType` / `Column` introspection in marshalling.
+# Pinned to the SAME 0.53 core pyo3-polars resolves so the Arrow C-stream
+# `PyDataFrame -> polars::DataFrame` types are identical (no version-bridge gap).
+# `dtype-u8`/`dtype-u16` are REQUIRED alongside `dtype-categorical`: polars 0.53
+# picks the narrowest physical code width for a categorical (u8 for <=256 cats),
+# and `to_physical_repr()` panics with `unimplemented!()` if that width's Series
+# impl is feature-gated off. Enabling both makes category codes of ANY cardinality
+# materializable to the f64 codes the facade `find_bin_categorical` path consumes.
+polars = { version = "0.53", default-features = false, features = [
+    "dtype-categorical",
+    "dtype-u8",
+    "dtype-u16",
+] }
 
 [dev-dependencies]
 # `auto-initialize` boots a CPython interpreter for `cargo test` so the Rust

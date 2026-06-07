@@ -11,9 +11,13 @@
 //! see `ingest.rs`'s identical `widen` contract). Every conversion flows through
 //! exactly ONE place per path: [`widen`]. Do NOT scatter `as f64` casts (T-08-03-03).
 
+use std::collections::HashSet;
+
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+use polars::prelude::{Categories, DataType, Series};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3_polars::PyDataFrame;
 
 /// The SINGLE f32 -> f64 widen site for caller dense/sparse feature data crossing
 /// from numpy/scipy into the f64 rows the facade bins. Mirrors `ingest.rs::widen`
@@ -244,4 +248,150 @@ pub fn scipy_csc_to_rows(
         }
     }
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// polars DataFrame ingest (08-04, D-03/D-04)
+// ---------------------------------------------------------------------------
+
+/// Extract a polars [`Series`] as an owned `Vec<f64>`, null -> `NaN` (the facade
+/// `BinMapper` treats `NaN` as missing). Numeric columns are cast to f64; for a
+/// categorical/enum series this receives its already-physical-code repr.
+fn series_to_f64_vec(s: &Series, name: &str) -> PyResult<Vec<f64>> {
+    let casted = s.cast(&DataType::Float64).map_err(|e| {
+        PyValueError::new_err(format!(
+            "column '{name}': cannot convert dtype {:?} to numeric f64: {e}",
+            s.dtype()
+        ))
+    })?;
+    let ca = casted
+        .f64()
+        .map_err(|e| PyValueError::new_err(format!("column '{name}': {e}")))?;
+    Ok(ca.into_iter().map(|opt| opt.unwrap_or(f64::NAN)).collect())
+}
+
+/// Extract one DataFrame column's raw f64 feature values.
+///
+/// When `as_categorical` the values are the category CODES the facade
+/// `find_bin_categorical` path consumes (D-04):
+/// - `Categorical`/`Enum` -> the physical integer codes (`to_physical_repr`),
+///   widened to f64 (handles any physical width: u8/u16/u32/u64).
+/// - `String` -> cast to a global `Categorical` first, then its physical codes.
+/// - numeric (an explicit override of a numeric column) -> the values ARE the
+///   codes; taken verbatim as f64.
+///
+/// Otherwise the column is a numeric feature cast straight to f64.
+fn column_feature_values(s: &Series, name: &str, as_categorical: bool) -> PyResult<Vec<f64>> {
+    if !as_categorical {
+        return series_to_f64_vec(s, name);
+    }
+    match s.dtype() {
+        DataType::Categorical(_, _) | DataType::Enum(_, _) => {
+            let phys = s.to_physical_repr().into_owned();
+            series_to_f64_vec(&phys, name)
+        }
+        DataType::String => {
+            let cat = s
+                .cast(&DataType::from_categories(Categories::global()))
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "column '{name}': cannot cast string to categorical: {e}"
+                    ))
+                })?;
+            let phys = cat.to_physical_repr().into_owned();
+            series_to_f64_vec(&phys, name)
+        }
+        // A numeric column explicitly overridden to categorical: its integer-valued
+        // entries are the category codes already.
+        _ => series_to_f64_vec(s, name),
+    }
+}
+
+/// The owned parts a polars DataFrame marshals into: row-major f64 feature rows,
+/// the column (feature) names, and the indices routed to categorical features.
+pub type CorpusParts = (Vec<Vec<f64>>, Vec<String>, Vec<usize>);
+
+/// Marshal a polars DataFrame (consumed Arrow-side in Rust via pyo3-polars — NO
+/// numpy round-trip, which would erase the Categorical/Enum dtype) into the owned
+/// f64 rows + feature names + categorical-feature index set that build a
+/// [`lgbm::RawCorpus`] (D-03/D-04).
+///
+/// Routing (D-04): with `categorical_override = None` (the default `'auto'`),
+/// `Categorical`/`Enum`/`String` columns are categorical and numeric columns are
+/// numeric. When `categorical_override` is `Some(names)`, that list FULLY decides
+/// routing (official-package precedence over dtype) — only the named columns are
+/// categorical, everything else numeric.
+///
+/// # Errors
+/// `PyValueError` for an empty frame, an unknown override name, or a column that
+/// cannot be coerced — never panics.
+pub fn polars_df_to_corpus(
+    pydf: PyDataFrame,
+    categorical_override: Option<Vec<String>>,
+) -> PyResult<CorpusParts> {
+    let df = pydf.0;
+    let columns = df.columns();
+    let ncols = columns.len();
+    if ncols == 0 {
+        return Err(PyValueError::new_err("DataFrame has no columns"));
+    }
+    let nrows = df.height();
+    if nrows == 0 {
+        return Err(PyValueError::new_err("DataFrame has no rows"));
+    }
+
+    let names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
+
+    // Validate override names against the actual columns BEFORE routing.
+    let override_set: Option<HashSet<String>> = match categorical_override {
+        Some(list) => {
+            let known: HashSet<&str> = names.iter().map(String::as_str).collect();
+            for n in &list {
+                if !known.contains(n.as_str()) {
+                    return Err(PyValueError::new_err(format!(
+                        "categorical_feature '{n}' is not a column of the DataFrame"
+                    )));
+                }
+            }
+            Some(list.into_iter().collect())
+        }
+        None => None,
+    };
+
+    let mut col_data: Vec<Vec<f64>> = Vec::with_capacity(ncols);
+    let mut cat_indices: Vec<usize> = Vec::new();
+
+    for (j, col) in columns.iter().enumerate() {
+        let s = col.as_materialized_series();
+        let name = &names[j];
+        let is_cat = match &override_set {
+            // Override fully decides routing (D-04 precedence).
+            Some(set) => set.contains(name),
+            // Default 'auto' = dtype routing.
+            None => matches!(
+                s.dtype(),
+                DataType::Categorical(_, _) | DataType::Enum(_, _) | DataType::String
+            ),
+        };
+        if is_cat {
+            cat_indices.push(j);
+        }
+        let values = column_feature_values(s, name, is_cat)?;
+        if values.len() != nrows {
+            return Err(PyValueError::new_err(format!(
+                "column '{name}' length {} != frame height {nrows}",
+                values.len()
+            )));
+        }
+        col_data.push(values);
+    }
+
+    // Transpose column-major -> the row-major rows the facade consumes.
+    let mut rows: Vec<Vec<f64>> = vec![Vec::with_capacity(ncols); nrows];
+    for col in &col_data {
+        for (i, &v) in col.iter().enumerate() {
+            rows[i].push(v);
+        }
+    }
+    Ok((rows, names, cat_indices))
 }
