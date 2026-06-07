@@ -292,7 +292,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 07-03-PLAN.md — Objectives breadth B (OBJ-04/05): poisson/gamma/tweedie + cross_entropy/cross_entropy_lambda
+- [x] 07-03-PLAN.md — Objectives breadth B (OBJ-04/05): poisson/gamma/tweedie + cross_entropy/cross_entropy_lambda
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -359,5 +359,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 3/12 | In Progress|  |
+| 7. Parity-Completing Variants | 4/12 | In Progress|  |
 | 8. Python Bindings | 0/TBD | Not started | - |

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 07-05-PLAN.md (GOSS BST-04)
-last_updated: "2026-06-07T06:16:46.702Z"
+stopped_at: Completed 07-03-PLAN.md (OBJ-04 exp/log + OBJ-05 xentropy)
+last_updated: "2026-06-07T06:42:38.174Z"
 last_activity: "2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02"
 progress:
   total_phases: 8
   completed_phases: 6
   total_plans: 45
-  completed_plans: 36
+  completed_plans: 37
   percent: 75
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 07 (parity-completing-variants) — EXECUTING
-Plan: 4 of 12 (07-01, 07-02 complete)
+Plan: 5 of 12 (07-01, 07-02 complete)
 Status: Ready to execute
 Last activity: 2026-06-07 -- 07-02 complete: huber/mape/quantile-spine GREEN committed; fair + quantile-bagged/iterated #[ignore]'d under DEF-07-02
 
@@ -345,6 +345,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 06 P03 | ~50min | 3 tasks | 37 files |
 | Phase 06 P06 | 60 | 6 tasks | 8 files |
 | Phase 07 P05 | 16min | 3 tasks | 26 files |
+| Phase 07 P03 | 20min | 3 tasks | 119 files |
 
 ## Accumulated Context
 
@@ -401,6 +402,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 06-03: regression_l1 leaf values are the median RESIDUAL (RenewTreeOutput) — bit-exact vs real binary + distinct from L2 Newton leaves (Pitfall 2/3)
 - [Phase ?]: Task 2b: regression_l1 + bagging typed-rejected (BoostingError::UnsupportedConfig), deferred past Phase 6 — L1 sign-gradient split-gain knife-edge over the bagged subset diverges from the C++ leaf STRUCTURE (rust:0.0 vs cpp:11.0); faithful subset renewal (8330cee) retained
 - [Phase 07]: BST-04 GOSS ships 1:1 from goss.hpp: build-once bagging_rands_ block-1024 RNG, ArgMaxAtK top-k threshold (not a sort), grad+hess amplification by (cnt-top_k)/other_k; selected on data_sample_strategy=goss inside train_one_iter (IsHessianChange), reusing the bagging subset-train + dropped-row scoring path. Real-binary parity bit-exact + RNG-replay golden.
+- [Phase ?]: 07-03: OBJ-05 (cross_entropy/cross_entropy_lambda) + poisson + tweedie-spine ship faithful real-binary parity (capped 5-iter exp-libm horizon)
+- [Phase ?]: 07-03: gamma (all) + tweedie bfa-off/axis deferred DEF-07-02 (extended) — non-constant-hessian learner f64 split-gain knife-edge; g/h faithful into tree
 
 ### Pending Todos
 
@@ -430,6 +433,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-07T06:16:46.695Z
-Stopped at: Completed 07-05-PLAN.md (GOSS BST-04)
+Last session: 2026-06-07T06:42:28.042Z
+Stopped at: Completed 07-03-PLAN.md (OBJ-04 exp/log + OBJ-05 xentropy)
 Resume file: None

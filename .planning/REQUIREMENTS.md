@@ -61,7 +61,7 @@
 - [x] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
 - [x] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`
-- [ ] **OBJ-05**: Cross-entropy objectives — `cross_entropy`, `cross_entropy_lambda`
+- [x] **OBJ-05**: Cross-entropy objectives — `cross_entropy`, `cross_entropy_lambda`
 - [ ] **OBJ-06**: Ranking objectives — `lambdarank`, `rank_xendcg` (query boundaries, DCGCalculator, `objective_seed`)
 
 ### Metrics
@@ -198,7 +198,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | BST-06 | Phase 7 | Pending |
 | TRL-06 | Phase 7 | Pending |
 | OBJ-04 | Phase 7 | Pending |
-| OBJ-05 | Phase 7 | Pending |
+| OBJ-05 | Phase 7 | Complete |
 | OBJ-06 | Phase 7 | Pending |
 | MET-03 | Phase 7 | Pending |
 | MET-04 | Phase 7 | Pending |
