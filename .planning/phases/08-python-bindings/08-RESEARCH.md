@@ -439,22 +439,16 @@ features = ["pyo3/extension-module"]
 | A5 | scipy sparse `.indptr`/`.indices` coerce cleanly to i64/i32 expected by `ingest::from_csr` | Pattern 4 | scipy default indptr is int32 on 32-bit builds / int64 on 64-bit; explicit `.astype` needed (noted in pattern). |
 | A6 | Mirroring the name `LightGBMError` for the exception is desirable for drop-in parity | Pattern 6 | If users distinguish packages by exception type, a distinct name may be preferred; low risk (Claude's Discretion item). |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **`categorical_feature` override API shape (Claude's Discretion / D-04)**
-   - What we know: official accepts `categorical_feature='auto'|list[int|str]`; dtype auto-routing is the default (D-04).
-   - What's unclear: exact precedence (explicit list vs dtype) and index-vs-name forms to replicate.
-   - Recommendation: mirror official `Dataset.set_categorical_feature` / the `categorical_feature` train kwarg; default `'auto'` = dtype routing.
+1. **`categorical_feature` override API shape (Claude's Discretion / D-04)** — RESOLVED
+   - Resolution: mirror the official surface. The binding accepts `categorical_feature='auto' | list[int|str]`; default `'auto'` = dtype auto-routing (D-04), an explicit list (column indices or names) overrides dtype detection for exactly those columns. Index-and-name forms both supported, mirroring official `Dataset.set_categorical_feature` / the `categorical_feature` train kwarg. Precedence: explicit list wins over dtype auto-routing for the listed columns.
 
-2. **Route A vs Route B for the D-02 bridge**
-   - What we know: both reach `Vec<FeatureColumn>`; A is less new surface, B reuses full ingest incl. CSR/CSC.
-   - What's unclear: whether sparse (D-05) is cleaner through B (since `ingest::from_csr` already returns `FinishedDataset`).
-   - Recommendation: A for dense; for sparse, build the B extractor (since `from_csr`/`from_csc` already produce `FinishedDataset`). Plan one shared `FinishedDataset → Vec<FeatureColumn>` extractor and use it for both dense+sparse → unifies the path.
+2. **Route A vs Route B for the D-02 bridge** — RESOLVED
+   - Resolution: Route A (dense, column-direct) for the dense path — build per-column `BinMapper`s and construct `FeatureColumn`s directly (least new surface), planned in 08-01. Route B (sparse via the existing `ingest::from_csr`/`from_csc` → `FinishedDataset` → a shared `FinishedDataset → Vec<FeatureColumn>` extractor) for the sparse path (D-05), planned in 08-03. The sparse extractor is the shared seam that unifies dense+sparse onto the same `Vec<FeatureColumn>` consumer.
 
-3. **CPython floor + CI wheel matrix (Claude's Discretion / D-13)**
-   - What we know: abi3 → one wheel per platform; official supports 3.7–3.13.
-   - What's unclear: 3.8 vs 3.9 floor; which platforms (linux/macos/windows) the local-ROCm CI builds.
-   - Recommendation: `abi3-py39` (modern floor, drops EOL 3.8); linux + macos wheels at minimum; confirm with user.
+3. **CPython floor + CI wheel matrix (Claude's Discretion / D-13)** — RESOLVED
+   - Resolution: CPython floor = `abi3-py39` (one abi3 wheel per platform; drops EOL 3.8, supports 3.9–3.13). CI wheel matrix targets linux + macos at minimum (the local-ROCm CI host), built via maturin; windows is additive/deferred. Bindings target the CPU facade, so ROCm is orthogonal to the wheel matrix.
 
 ## Environment Availability
 
