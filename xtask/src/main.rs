@@ -103,6 +103,22 @@ pub const BOOSTING_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// a re-capture). Recorded in REFERENCE_MANIFEST.md.
 pub const BOOSTING_ORACLE_SEED: i32 = 0x6005_7000;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 Wave-0
+/// (D-05) bagged-subset determinism FP trace (plan 07-01). Reuses the SAME
+/// prebuilt-wheel binary as [`MODEL_LIGHTGBM_VERSION`]; `subset-determinism-capture`
+/// asserts the installed version matches BEFORE any training so a wrong version can
+/// never silently emit a divergent determinism trace (threat T-07-01-SC).
+pub const SUBSET_DETERMINISM_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 Wave-0 (D-05) bagged-subset determinism
+/// FP trace (plan 07-01). It is the SAME seed the matrix cells use
+/// ([`BOOSTING_ORACLE_SEED`]) so the captured `binary_bag1_es0_bfa1` /
+/// `regression_l1_bag1_es0_bfa0` tree-0 traces match the matrix's bagged subset
+/// EXACTLY. Combined with `deterministic=true force_row_wise=true num_threads=1
+/// bagging_fraction=0.7 bagging_freq=1 bagging_seed=3`, the trace is byte-idempotent
+/// (empty `git diff` on a re-capture). Recorded in REFERENCE_MANIFEST.md.
+pub const SUBSET_DETERMINISM_SEED: i32 = BOOSTING_ORACLE_SEED;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -113,18 +129,21 @@ fn main() -> Result<()> {
         Some("learner-capture") => learner_capture(),
         Some("learner-oracle-capture") => learner_oracle_capture(),
         Some("boosting-oracle-capture") => boosting_oracle_capture(),
+        Some("subset-determinism-capture") => subset_determinism_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
-                 learner-capture | learner-oracle-capture | boosting-oracle-capture)"
+                 learner-capture | learner-oracle-capture | boosting-oracle-capture | \
+                 subset-determinism-capture)"
             );
         }
         None => {
             eprintln!(
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
-                 learner-capture | learner-oracle-capture | boosting-oracle-capture>"
+                 learner-capture | learner-oracle-capture | boosting-oracle-capture | \
+                 subset-determinism-capture>"
             );
             Ok(())
         }
@@ -954,6 +973,103 @@ fn boosting_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- boosting-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/boosting/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `subset-determinism-capture` — Phase-7 Wave-0 (D-05) bagged-subset split-gain
+/// determinism FP-trace capture (plan 07-01).
+///
+/// Settles the bagged-subset split-gain knife-edge (DEF-06-01 + the typed-rejected
+/// `regression_l1 + bagging`, STATE.md 06-06) BEFORE any bagging-dependent wave
+/// (GOSS W4, RF W6) builds on it. It trains the TWO knife-edge cells
+/// (`binary_bag1_es0_bfa1`, `regression_l1_bag1_es0_bfa0`) on the real prebuilt
+/// `lib_lightgbm` 4.6 pip wheel with the pinned deterministic config (matching the
+/// matrix capture: `deterministic=true force_row_wise=true num_threads=1
+/// bagging_fraction=0.7 bagging_freq=1 bagging_seed=3 seed=SUBSET_DETERMINISM_SEED`)
+/// and dumps a tree-0 FP trace (per-bin subset histogram `sum_gradient`/`sum_hessian`,
+/// per-candidate-split `current_gain`/`min_gain_shift`, and the realized leaf count)
+/// into `crates/oracle-harness/tests/fixtures/determinism/`.
+///
+/// The version is asserted FIRST (mirror [`model_capture`] / [`learner_oracle_capture`]
+/// — threat T-07-01-SC): a wrong wheel version must never silently emit a divergent
+/// determinism trace. The pip `lightgbm` is a CAPTURE-time tool only — never a crate
+/// dependency and never read at `cargo test` time (the trace is committed).
+///
+/// The FINEST per-bin / per-candidate trace requires a SOURCE-built `lib_lightgbm`
+/// 4.6 (the Phase-5 05-09 FP-trace technique; point `$LGBM_TRACE_LIB` at it). The
+/// wheel surface alone records the realized tree-0 leaf count + model-dump per-split
+/// gain — already enough to localize fold-ORDER vs init-score-timing vs an f32-only
+/// divergence for the D-05 decision. NEVER `git add` the `LightGBM/` tree.
+fn subset_determinism_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/subset_determinism_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Fixtures live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/determinism");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    // Version-assert the wheel BEFORE training so a wrong version can never silently
+    // emit a divergent determinism trace (threat T-07-01-SC).
+    eprintln!(
+        "xtask subset-determinism-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        SUBSET_DETERMINISM_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = SUBSET_DETERMINISM_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask subset-determinism-capture: training the binary_bag1_es0_bfa1 + \
+         regression_l1_bag1_es0_bfa0 cells on real lib_lightgbm and dumping the \
+         tree-0 subset FP trace ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(SUBSET_DETERMINISM_SEED.to_string())
+            .arg(SUBSET_DETERMINISM_LIGHTGBM_VERSION),
+        "subset_determinism_capture.py",
+    )?;
+
+    for name in [
+        "binary_bag1_es0_bfa1_subset_trace.txt",
+        "regression_l1_bag1_es0_bfa0_subset_trace.txt",
+    ] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask subset-determinism-capture: done. Wrote the tree-0 subset FP trace under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- subset-determinism-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/determinism/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())
