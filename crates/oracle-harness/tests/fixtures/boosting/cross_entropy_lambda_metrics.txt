@@ -1,0 +1,2 @@
+# cross_entropy_lambda_metrics — per-round cross_entropy_lambda (record_evaluation); f64 bits
+cross_entropy_lambda 4603616449574131259 4603002305760487788 4602331740135223063 4601503825612919544 4600794028232866665
