@@ -262,6 +262,358 @@ impl BaggingSampleStrategy {
     }
 }
 
+/// C++ `ArrayArgs<score_t>::ArgMaxAtK` (`include/LightGBM/utils/array_args.h:131`)
+/// with its `Partition` helper (:101), ported VERBATIM. GOSS uses this (NOT a full
+/// sort) to find the top-k grad-magnitude threshold; the tie behavior of this
+/// quickselect-style partition differs from a stable sort, so it MUST be mirrored
+/// bit-for-bit (RESEARCH §"Re-sorting where C++ uses nth_element/ArgMaxAtK").
+///
+/// `k` is a 0-based index: `k = 0` selects the maximum. After the call, the element
+/// at position `k` is the one that would be there in fully-descending order, and
+/// `arr[k]` is the threshold GOSS reads (`tmp_gradients[top_k - 1]`).
+///
+/// Operates in place over `arr[start..end]`. `next_float`-equivalent comparisons use
+/// `>` exactly as C++ (`while (ref[++i] > v)`), so f32 NaN/tie handling matches.
+fn arg_max_at_k(arr: &mut [f32], start: i32, end: i32, k: i32) -> i32 {
+    if start >= end - 1 {
+        return start;
+    }
+    let (l, r) = partition(arr, start, end);
+    if (k > l && k < r) || (l == start - 1 && r == end - 1) {
+        k
+    } else if k <= l {
+        arg_max_at_k(arr, start, l + 1, k)
+    } else {
+        arg_max_at_k(arr, r, end, k)
+    }
+}
+
+/// C++ `ArrayArgs<score_t>::Partition` (`array_args.h:101-128`), ported verbatim —
+/// a descending three-way (Bentley–McIlroy) partition around the pivot `arr[end-1]`.
+/// Returns `(l, r)`: elements `> pivot` end up in `[start, l]`, elements `== pivot`
+/// in `(l, r)`, elements `< pivot` in `[r, end)`. Every index/swap detail is
+/// load-bearing for the ArgMaxAtK tie behavior.
+// The `!(a > v)` / `!(v > b)` forms are a VERBATIM port of the C++ `while (ref[++i] >
+// v)` / `while (v > ref[--j])` loop conditions (array_args.h:114-115). Rewriting them
+// as `<=`/`>=` would change the f32 NaN/tie semantics the partition relies on, so the
+// faithful negated form is retained.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn partition(arr: &mut [f32], start: i32, end: i32) -> (i32, i32) {
+    let mut i = start - 1;
+    let mut j = end - 1;
+    let mut p = i;
+    let mut q = j;
+    if start >= end - 1 {
+        return (start - 1, end);
+    }
+    let v = arr[(end - 1) as usize];
+    loop {
+        // while (ref[++i] > v) {}
+        loop {
+            i += 1;
+            if !(arr[i as usize] > v) {
+                break;
+            }
+        }
+        // while (v > ref[--j]) { if (j == start) break; }
+        loop {
+            j -= 1;
+            if !(v > arr[j as usize]) {
+                break;
+            }
+            if j == start {
+                break;
+            }
+        }
+        if i >= j {
+            break;
+        }
+        arr.swap(i as usize, j as usize);
+        if arr[i as usize] == v {
+            p += 1;
+            arr.swap(p as usize, i as usize);
+        }
+        if v == arr[j as usize] {
+            q -= 1;
+            arr.swap(j as usize, q as usize);
+        }
+    }
+    arr.swap(i as usize, (end - 1) as usize);
+    j = i - 1;
+    i += 1;
+    let mut kk = start;
+    while kk <= p {
+        arr.swap(kk as usize, j as usize);
+        kk += 1;
+        j -= 1;
+    }
+    let mut kk = end - 2;
+    while kk >= q {
+        arr.swap(i as usize, kk as usize);
+        i += 1;
+        kk -= 1;
+    }
+    (j, i)
+}
+
+/// C++ `GOSSStrategy` (`src/boosting/goss.hpp`) — Gradient-based One-Side Sampling.
+///
+/// GOSS is a [`SampleStrategy`] sibling of [`BaggingSampleStrategy`]: instead of a
+/// uniform row draw, it keeps the rows with the largest gradient magnitude (the
+/// "top" rows) plus a random sample of the rest, and **amplifies the grad/hess of
+/// the sampled rows in place** (`IsHessianChange() == true`, `goss.hpp:111-113`) so
+/// the subsample stays an unbiased estimator. It therefore runs INSIDE
+/// `train_one_iter` AFTER `get_gradients` and BEFORE the learner.
+///
+/// Faithful-mirror citations (read directly from the in-tree C++ source):
+/// - `goss.hpp:33`: skip subsampling for `iter < (int)(1.0 / learning_rate)` —
+///   returns the full set with grad/hess UNMODIFIED.
+/// - `goss.hpp:95-98`: the per-block `Random(bagging_seed + i)` block-1024 array,
+///   built ONCE in `ResetSampleConfig` and advanced across draws (the SAME RNG
+///   discipline as bagging — STATE.md 06-05 CRITICAL fix; re-seeding per draw would
+///   re-draw the same bag).
+/// - `goss.hpp:116-165` (`Helper`): `top_k = max(1, (data_size_t)(cnt * top_rate))`,
+///   `other_k = (data_size_t)(cnt * other_rate)`, `ArgMaxAtK(top_k - 1)` over
+///   `|grad * hess|` for the threshold (NOT a full sort), then per row IN ORDER: if
+///   `|g*h| >= threshold` keep (top); else if
+///   `bagging_rands[idx/1024].NextFloat() < prob` keep AND amplify grad AND hess by
+///   `multiply = (cnt - top_k) / other_k`; otherwise drop. `prob` is the running
+///   `rest_need / rest_all` (`goss.hpp:148-151`) — draw order is load-bearing.
+/// - `goss.hpp:85-86`: `CHECK_LE(top_rate + other_rate, 1)` and
+///   `CHECK(top_rate > 0 && other_rate > 0)` (surfaced as a typed `Result`).
+///
+/// Single-class only here (`num_tree_per_iteration == 1`); the C++ multi-class
+/// `|grad*hess|` is summed across the per-class stride (`goss.hpp:121-125,140-143`),
+/// which is wired via `num_tree_per_iteration` for forward-compatibility but the
+/// Phase-7 W4 spine validates `K = 1`.
+pub struct GossSampleStrategy {
+    /// `config_->top_rate`.
+    top_rate: f64,
+    /// `config_->other_rate`.
+    other_rate: f64,
+    /// `config_->learning_rate` — drives the `iter < 1/lr` skip window.
+    learning_rate: f64,
+    /// `num_data_`.
+    num_data: i32,
+    /// `num_tree_per_iteration_` (the per-class stride for `|grad*hess|`; 1 here).
+    num_tree_per_iteration: i32,
+    /// `bag_data_cnt_` — the realized kept-row count after a draw (== `num_data`
+    /// before the first real draw / inside the skip window).
+    bag_data_cnt: i32,
+    /// `bag_data_indices_` — `[kept rows] ++ [dropped rows]` (kept = top ++ sampled,
+    /// in row order; dropped filled from the right). Length `num_data`.
+    bag_data_indices: Vec<i32>,
+    /// `bagging_rands_` — per-block `Random(bagging_seed + i)`, built ONCE and
+    /// advanced across draws (the bagging RNG discipline).
+    bagging_rands: Vec<Random>,
+}
+
+impl std::fmt::Debug for GossSampleStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Random` is intentionally not `Debug` (it is the parity-critical LCG); show
+        // the config + realized counts instead of the per-block RNG state.
+        f.debug_struct("GossSampleStrategy")
+            .field("top_rate", &self.top_rate)
+            .field("other_rate", &self.other_rate)
+            .field("learning_rate", &self.learning_rate)
+            .field("num_data", &self.num_data)
+            .field("num_tree_per_iteration", &self.num_tree_per_iteration)
+            .field("bag_data_cnt", &self.bag_data_cnt)
+            .field("num_blocks", &self.bagging_rands.len())
+            .finish()
+    }
+}
+
+impl GossSampleStrategy {
+    /// C++ `GOSSStrategy::ResetSampleConfig` (`goss.hpp:76-109`): validate the rate
+    /// invariants, build the per-block RNG window ONCE, and initialize
+    /// `bag_data_cnt_ = num_data_` (the "do not bag the first iterations" flag).
+    ///
+    /// # Errors
+    /// [`BoostingError::GossConfig`] when `top_rate + other_rate > 1` or either rate
+    /// is `<= 0` (the `goss.hpp:85-86` CHECKs).
+    pub fn reset_sample_config(
+        top_rate: f64,
+        other_rate: f64,
+        learning_rate: f64,
+        num_data: i32,
+        num_tree_per_iteration: i32,
+        bagging_seed: i32,
+    ) -> Result<Self, BoostingError> {
+        // C++ CHECK_LE(top_rate + other_rate, 1.0f) (goss.hpp:85).
+        if top_rate + other_rate > 1.0 {
+            return Err(BoostingError::GossConfig {
+                what: format!(
+                    "top_rate + other_rate must be <= 1 (got {top_rate} + {other_rate} = {})",
+                    top_rate + other_rate
+                ),
+            });
+        }
+        // C++ CHECK(top_rate > 0 && other_rate > 0) (goss.hpp:86).
+        if !(top_rate > 0.0 && other_rate > 0.0) {
+            return Err(BoostingError::GossConfig {
+                what: format!(
+                    "top_rate and other_rate must both be > 0 (got top_rate={top_rate}, other_rate={other_rate})"
+                ),
+            });
+        }
+        let nd = num_data.max(0);
+        // Per-block RNG seeding — built ONCE (goss.hpp:94-98), advanced across draws.
+        let n_blocks = ((nd + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK).max(0);
+        let bagging_rands: Vec<Random> = (0..n_blocks)
+            .map(|i| Random::new(bagging_seed + i))
+            .collect();
+        Ok(Self {
+            top_rate,
+            other_rate,
+            learning_rate,
+            num_data: nd,
+            num_tree_per_iteration: num_tree_per_iteration.max(1),
+            bag_data_cnt: nd,
+            bag_data_indices: vec![0i32; nd as usize],
+            bagging_rands,
+        })
+    }
+
+    /// The first iteration at which GOSS actually subsamples — C++
+    /// `iter < static_cast<int>(1.0f / config_->learning_rate)` (`goss.hpp:33`).
+    /// The cast is to `int` (truncation toward zero) over an `f32` reciprocal, which
+    /// the port mirrors via `(1.0f32 / lr as f32) as i32`.
+    fn skip_iters(&self) -> i32 {
+        (1.0f32 / self.learning_rate as f32) as i32
+    }
+
+    /// C++ `GOSSStrategy::Bagging(iter, …)` (`goss.hpp:30-74`): when `iter` is past
+    /// the skip window, run [`Self::helper`] over the WHOLE corpus (the C++
+    /// `bagging_runner_.Run<true>` here is single-threaded with one block), which
+    /// fills `bag_data_indices_` and AMPLIFIES the sampled rows' grad/hess in place.
+    /// Returns whether subsampling happened this iteration.
+    ///
+    /// `gradients` / `hessians` are the class-major buffers (`num_data *
+    /// num_tree_per_iteration`); they are MUTATED in place for the sampled rows.
+    pub fn bagging(&mut self, iter: i32, gradients: &mut [f32], hessians: &mut [f32]) -> bool {
+        // C++ goss.hpp:31 — bag_data_cnt_ = num_data_ before deciding.
+        self.bag_data_cnt = self.num_data;
+        // C++ goss.hpp:33 — not subsample for first iterations.
+        if iter < self.skip_iters() {
+            return false;
+        }
+        let cnt = self.num_data;
+        let left_cnt = self.helper(0, cnt, gradients, hessians);
+        self.bag_data_cnt = left_cnt;
+        true
+    }
+
+    /// C++ `GOSSStrategy::Helper` (`goss.hpp:116-165`), ported 1:1.
+    ///
+    /// Computes per-row `|grad*hess|` (summed across the per-class stride), finds the
+    /// top-k threshold via [`arg_max_at_k`], then walks the rows IN ORDER filling
+    /// `bag_data_indices_` (`buffer`): top rows and randomly-sampled rest rows go to
+    /// the left (kept), dropped rows to the right; sampled rows have their grad AND
+    /// hess multiplied by `multiply = (cnt - top_k) / other_k`. Returns the kept-row
+    /// count (`cur_left_cnt`).
+    fn helper(
+        &mut self,
+        start: i32,
+        cnt: i32,
+        gradients: &mut [f32],
+        hessians: &mut [f32],
+    ) -> i32 {
+        if cnt <= 0 {
+            return 0;
+        }
+        let ntpi = self.num_tree_per_iteration as usize;
+        let nd = self.num_data as usize;
+        // tmp_gradients[i] = Σ_k |grad[k*nd + start + i] * hess[k*nd + start + i]|.
+        let mut tmp_gradients = vec![0.0f32; cnt as usize];
+        for (i, tmp) in tmp_gradients.iter_mut().enumerate() {
+            for cur_tree_id in 0..ntpi {
+                let idx = cur_tree_id * nd + start as usize + i;
+                *tmp += (gradients[idx] * hessians[idx]).abs();
+            }
+        }
+        // top_k = max(1, (data_size_t)(cnt * top_rate)); other_k = (data_size_t)(cnt * other_rate).
+        let mut top_k = (cnt as f64 * self.top_rate) as i32;
+        let other_k = (cnt as f64 * self.other_rate) as i32;
+        top_k = top_k.max(1);
+        // ArgMaxAtK(&tmp_gradients, 0, size, top_k - 1); threshold = tmp_gradients[top_k - 1].
+        let n = tmp_gradients.len() as i32;
+        arg_max_at_k(&mut tmp_gradients, 0, n, top_k - 1);
+        let threshold = tmp_gradients[(top_k - 1) as usize];
+
+        // multiply = (score_t)(cnt - top_k) / other_k  (f32 division — goss.hpp:133).
+        let multiply = (cnt - top_k) as f32 / other_k as f32;
+        let mut cur_left_cnt = 0i32;
+        let mut cur_right_pos = cnt;
+        let mut big_weight_cnt = 0i32;
+        let buffer = &mut self.bag_data_indices;
+        for i in 0..cnt {
+            let cur_idx = start + i;
+            // grad = Σ_k |grad[k*nd + cur_idx] * hess[k*nd + cur_idx]|.
+            let mut grad = 0.0f32;
+            for cur_tree_id in 0..ntpi {
+                let idx = cur_tree_id * nd + cur_idx as usize;
+                grad += (gradients[idx] * hessians[idx]).abs();
+            }
+            if grad >= threshold {
+                buffer[cur_left_cnt as usize] = cur_idx;
+                cur_left_cnt += 1;
+                big_weight_cnt += 1;
+            } else {
+                let sampled = cur_left_cnt - big_weight_cnt;
+                let rest_need = other_k - sampled;
+                let rest_all = (cnt - i) - (top_k - big_weight_cnt);
+                // prob = (rest_need) / (double)(rest_all)  (goss.hpp:151).
+                let prob = rest_need as f64 / rest_all as f64;
+                // C++ NextFloat() < prob: NextFloat is f32, prob is f64; C++ promotes
+                // the f32 to f64 for the comparison. Mirror exactly.
+                let block = (cur_idx / BAGGING_RAND_BLOCK) as usize;
+                if (self.bagging_rands[block].next_float() as f64) < prob {
+                    buffer[cur_left_cnt as usize] = cur_idx;
+                    cur_left_cnt += 1;
+                    for cur_tree_id in 0..ntpi {
+                        let idx = cur_tree_id * nd + cur_idx as usize;
+                        gradients[idx] *= multiply;
+                        hessians[idx] *= multiply;
+                    }
+                } else {
+                    cur_right_pos -= 1;
+                    buffer[cur_right_pos as usize] = cur_idx;
+                }
+            }
+        }
+        cur_left_cnt
+    }
+
+    /// `bag_data_cnt_` — the realized kept-row count (the split point of
+    /// [`Self::bag_data_indices`]).
+    pub fn bag_data_cnt(&self) -> i32 {
+        self.bag_data_cnt
+    }
+
+    /// `bag_data_indices_` — `[kept rows] ++ [dropped rows]` (the full ordered array
+    /// the GOSS RNG-replay golden asserts).
+    pub fn bag_data_indices(&self) -> &[i32] {
+        &self.bag_data_indices
+    }
+
+    /// The kept (in-bag) row indices (`bag_data_indices_[..bag_data_cnt]`).
+    pub fn in_bag(&self) -> &[i32] {
+        &self.bag_data_indices[..self.bag_data_cnt.max(0) as usize]
+    }
+
+    /// The dropped (out-of-bag) row indices (`bag_data_indices_[bag_data_cnt..]`).
+    pub fn out_of_bag(&self) -> &[i32] {
+        &self.bag_data_indices[self.bag_data_cnt.max(0) as usize..]
+    }
+
+    /// Whether this iteration actually subsampled (`bag_data_cnt < num_data`). False
+    /// inside the skip window (every row kept, grad/hess unmodified).
+    pub fn is_use_subset(&self) -> bool {
+        self.bag_data_cnt < self.num_data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +767,191 @@ mod tests {
         // All rows in-bag (draw < 1.0 always true).
         assert_eq!(s.bag_data_cnt(), 8);
         assert!(s.out_of_bag().is_empty());
+    }
+
+    // ===================== GOSS (BST-04) =====================
+
+    /// A verbatim re-implementation of the C++ `GOSSStrategy::Helper`
+    /// (`goss.hpp:116-165`) over the proven `lgbm_core::Random` — the GOSS RNG-replay
+    /// reference (mirrors `reference_bag`). Single-class (`num_tree_per_iteration=1`).
+    /// Returns `(bag_data_indices, bag_data_cnt, amplified_mask, multiply)`.
+    ///
+    /// `grad`/`hess` are the per-row buffers (NOT mutated — the reference reads the
+    /// pre-draw values, exactly as `helper` does internally for the keep decision and
+    /// applies `multiply` to the kept-sampled rows).
+    fn reference_goss(
+        seed: i32,
+        top_rate: f64,
+        other_rate: f64,
+        grad: &[f32],
+        hess: &[f32],
+    ) -> (Vec<i32>, i32, Vec<bool>, f32) {
+        let cnt = grad.len() as i32;
+        let n_blocks = (cnt + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK;
+        let mut rands: Vec<Random> = (0..n_blocks).map(|i| Random::new(seed + i)).collect();
+        let mut tmp: Vec<f32> = (0..cnt as usize)
+            .map(|i| (grad[i] * hess[i]).abs())
+            .collect();
+        let mut top_k = (cnt as f64 * top_rate) as i32;
+        let other_k = (cnt as f64 * other_rate) as i32;
+        top_k = top_k.max(1);
+        let n = tmp.len() as i32;
+        arg_max_at_k(&mut tmp, 0, n, top_k - 1);
+        let threshold = tmp[(top_k - 1) as usize];
+        let multiply = (cnt - top_k) as f32 / other_k as f32;
+        let mut buf = vec![0i32; cnt as usize];
+        let mut amplified = vec![false; cnt as usize];
+        let mut cur_left = 0i32;
+        let mut cur_right = cnt;
+        let mut big = 0i32;
+        for i in 0..cnt {
+            let g = (grad[i as usize] * hess[i as usize]).abs();
+            if g >= threshold {
+                buf[cur_left as usize] = i;
+                cur_left += 1;
+                big += 1;
+            } else {
+                let sampled = cur_left - big;
+                let rest_need = other_k - sampled;
+                let rest_all = (cnt - i) - (top_k - big);
+                let prob = rest_need as f64 / rest_all as f64;
+                let block = (i / BAGGING_RAND_BLOCK) as usize;
+                if (rands[block].next_float() as f64) < prob {
+                    buf[cur_left as usize] = i;
+                    amplified[i as usize] = true;
+                    cur_left += 1;
+                } else {
+                    cur_right -= 1;
+                    buf[cur_right as usize] = i;
+                }
+            }
+        }
+        (buf, cur_left, amplified, multiply)
+    }
+
+    #[test]
+    fn goss_config_check_top_plus_other_le_one() {
+        // CHECK_LE(top_rate + other_rate, 1.0) (goss.hpp:85).
+        let err =
+            GossSampleStrategy::reset_sample_config(0.7, 0.4, 0.1, 10, 1, 3).unwrap_err();
+        assert!(matches!(err, BoostingError::GossConfig { .. }));
+        // both > 0 (goss.hpp:86).
+        let err =
+            GossSampleStrategy::reset_sample_config(0.0, 0.1, 0.1, 10, 1, 3).unwrap_err();
+        assert!(matches!(err, BoostingError::GossConfig { .. }));
+        // valid: 0.2 + 0.1 <= 1.
+        assert!(GossSampleStrategy::reset_sample_config(0.2, 0.1, 0.1, 10, 1, 3).is_ok());
+    }
+
+    #[test]
+    fn goss_skips_subsampling_for_early_iters() {
+        // iter < (int)(1/lr): full set, grad/hess UNMODIFIED (goss.hpp:33).
+        // lr = 0.1 => skip iters 0..9, subsample from iter 10.
+        let n = 20;
+        let mut grad: Vec<f32> = (0..n).map(|i| (i as f32) - 10.0).collect();
+        let mut hess = vec![1.0f32; n as usize];
+        let grad_before = grad.clone();
+        let hess_before = hess.clone();
+        let mut s = GossSampleStrategy::reset_sample_config(0.2, 0.1, 0.1, n, 1, 3).unwrap();
+        // iter 5 (< 10): skipped.
+        let did = s.bagging(5, &mut grad, &mut hess);
+        assert!(!did, "iter 5 < 1/lr=10 must skip subsampling");
+        assert!(!s.is_use_subset(), "skip window => not a subset");
+        assert_eq!(s.bag_data_cnt(), n);
+        assert_eq!(grad, grad_before, "skip window must NOT modify gradients");
+        assert_eq!(hess, hess_before, "skip window must NOT modify hessians");
+        // iter 10 (>= 10): subsamples.
+        let did = s.bagging(10, &mut grad, &mut hess);
+        assert!(did, "iter 10 >= 1/lr=10 must subsample");
+        assert!(s.bag_data_cnt() < n, "GOSS keeps fewer rows: top_k + sampled");
+    }
+
+    #[test]
+    fn goss_amplifies_grad_and_hess_by_multiply() {
+        // Sampled (non-top, randomly-kept) rows have BOTH grad and hess multiplied by
+        // multiply = (cnt - top_k) / other_k.
+        let n = 20;
+        // Distinct |g*h| so the top-k threshold is well defined; hess=1 so |g*h|=|g|.
+        let mut grad: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let mut hess = vec![1.0f32; n as usize];
+        let grad_before = grad.clone();
+        let (exp_idx, exp_cnt, exp_amp, multiply) =
+            reference_goss(3, 0.2, 0.1, &grad_before, &hess);
+        let mut s = GossSampleStrategy::reset_sample_config(0.2, 0.1, 0.1, n, 1, 3).unwrap();
+        s.bagging(10, &mut grad, &mut hess);
+        assert_eq!(s.bag_data_cnt(), exp_cnt, "kept count must match reference");
+        assert_eq!(
+            s.bag_data_indices(),
+            exp_idx.as_slice(),
+            "bag indices must match GOSS RNG-replay reference"
+        );
+        // Every amplified row: grad *= multiply, hess (was 1) == multiply.
+        for i in 0..n as usize {
+            if exp_amp[i] {
+                let expect_g = grad_before[i] * multiply;
+                assert!(
+                    (grad[i] - expect_g).abs() < 1e-6,
+                    "row {i} grad must be amplified by multiply={multiply}"
+                );
+                assert!(
+                    (hess[i] - multiply).abs() < 1e-6,
+                    "row {i} hess must be amplified by multiply={multiply}"
+                );
+            } else {
+                // Top rows and dropped rows keep their original grad/hess.
+                assert!(
+                    (grad[i] - grad_before[i]).abs() < 1e-9,
+                    "non-amplified row {i} grad must be unchanged"
+                );
+                assert!((hess[i] - 1.0).abs() < 1e-9, "non-amplified row {i} hess unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn goss_uses_arg_max_at_k_not_full_sort() {
+        // ArgMaxAtK(k=0) returns the maximum element at index 0 (a full descending
+        // sort would too, but a TIE block is only partially ordered — assert the
+        // selected k-th element equals the descending-sort k-th, NOT a stable order).
+        let mut a = vec![3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+        let n = a.len() as i32;
+        // k = 2 (the 3rd largest). Descending sorted: 9,6,5,4,3,2,1,1 => index 2 == 5.
+        arg_max_at_k(&mut a, 0, n, 2);
+        assert_eq!(a[2], 5.0, "ArgMaxAtK(k=2) selects the 3rd-largest value");
+        // The partition guarantees a[0..2] are all >= a[2] and a[3..] are all <= a[2].
+        for i in 0..2 {
+            assert!(a[i] >= a[2], "left of k must be >= a[k]");
+        }
+        for i in 3..a.len() {
+            assert!(a[i] <= a[2], "right of k must be <= a[k]");
+        }
+    }
+
+    #[test]
+    fn goss_bag_indices_match_rng_replay_golden() {
+        // The full bag_data_indices (kept ++ dropped) + amplified mask match the
+        // verbatim GOSS RNG-replay reference bit-exact (compare_exact). Several
+        // seed/rate combos to exercise the draw loop.
+        let n = 50;
+        let grad: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32) - 6.0).collect();
+        let hess = vec![1.0f32; n as usize];
+        for (seed, top, other) in [(3i32, 0.2f64, 0.1f64), (3, 0.1, 0.05), (7, 0.2, 0.1)] {
+            let mut g = grad.clone();
+            let mut h = hess.clone();
+            let (exp_idx, exp_cnt, _amp, _m) = reference_goss(seed, top, other, &grad, &hess);
+            let mut s =
+                GossSampleStrategy::reset_sample_config(top, other, 0.1, n, 1, seed).unwrap();
+            s.bagging(10, &mut g, &mut h);
+            assert_eq!(
+                s.bag_data_cnt(),
+                exp_cnt,
+                "seed={seed} top={top} other={other}: kept count != reference"
+            );
+            assert_eq!(
+                s.bag_data_indices(),
+                exp_idx.as_slice(),
+                "seed={seed} top={top} other={other}: GOSS indices not bit-exact vs RNG-replay"
+            );
+        }
     }
 }

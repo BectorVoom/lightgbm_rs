@@ -72,6 +72,17 @@ pub enum BoostingError {
     #[error("early_stopping_round > 0 requires at least one validation set")]
     EarlyStoppingWithoutValidSet,
 
+    /// A GOSS config check failed (BST-04, threat T-07-05-01). Mirrors the C++
+    /// `GOSSStrategy::ResetSampleConfig` invariants (`goss.hpp:85-86`):
+    /// `CHECK_LE(top_rate + other_rate, 1.0)` and
+    /// `CHECK(top_rate > 0 && other_rate > 0)`. Surfaced as a typed `Result` so a
+    /// caller never silently samples against an out-of-range rate.
+    #[error("invalid GOSS config: {what}")]
+    GossConfig {
+        /// Human-readable description of the violated GOSS invariant.
+        what: String,
+    },
+
     /// A config combination that is in scope for the C++ reference but DEFERRED in
     /// this phase is rejected here with an honest, decision-backed typed error
     /// rather than silently producing wrong-but-similar output.

@@ -31,5 +31,7 @@ pub use early_stopping::{EarlyStopping, EvalSnapshot, MetricSpec};
 pub use error::BoostingError;
 pub use gbdt::{Gbdt, IterSnapshot};
 pub use objective::BoostObjective;
-pub use sample_strategy::{BaggingConfig, BaggingSampleStrategy, BAGGING_RAND_BLOCK};
+pub use sample_strategy::{
+    BaggingConfig, BaggingSampleStrategy, GossSampleStrategy, BAGGING_RAND_BLOCK,
+};
 pub use score_updater::ScoreUpdater;

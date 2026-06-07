@@ -30,7 +30,7 @@ use lgbm_treelearner::{FeatureColumn, SerialTreeLearner};
 
 use crate::error::BoostingError;
 use crate::objective::BoostObjective;
-use crate::sample_strategy::BaggingSampleStrategy;
+use crate::sample_strategy::{BaggingSampleStrategy, GossSampleStrategy};
 use crate::score_updater::ScoreUpdater;
 
 /// The GBDT ensemble driver — the f64 score accumulator + the grown model.
@@ -71,6 +71,14 @@ pub struct Gbdt<'a> {
     /// rejects `bagging_by_query = true` with a typed error (06-CONTEXT.md BST-03
     /// scope note), so the loop NEVER silently row-bags a query request.
     bagging: Option<BaggingSampleStrategy>,
+    /// Optional GOSS sample strategy (BST-04). Mutually exclusive with [`Self::bagging`]
+    /// (GOSS forbids bagging — `goss.hpp:87-89`; the facade enforces this). `Some` ⇒
+    /// each iter past the `1/learning_rate` skip window AMPLIFIES the sampled rows'
+    /// grad/hess in place (`IsHessianChange`), trains on the kept (top ++ sampled)
+    /// subset, and scores kept + dropped rows predict-side (Pitfall 4 — dropped rows
+    /// STILL get the tree prediction added, exactly like bagging OOB). Inside the skip
+    /// window GOSS keeps every row with grad/hess unmodified (the full-corpus path).
+    goss: Option<GossSampleStrategy>,
     /// The full-corpus feature columns (real bin layout) — needed by the bagging
     /// path to (a) subset-train via the learner and (b) score OOB rows predict-side
     /// (`Tree::predict` over each row's real feature values). Empty when bagging is
@@ -135,6 +143,7 @@ impl<'a> Gbdt<'a> {
             trees: Vec::new(),
             iter: 0,
             bagging: None,
+            goss: None,
             features: Vec::new(),
         }
     }
@@ -154,6 +163,23 @@ impl<'a> Gbdt<'a> {
         features: Vec<FeatureColumn>,
     ) -> Self {
         self.bagging = Some(bagging);
+        self.features = features;
+        self
+    }
+
+    /// Enable GOSS / gradient-based one-side sampling (BST-04). `goss` is the
+    /// [`GossSampleStrategy`] (already `reset_sample_config`'d over the corpus);
+    /// `features` is the full-corpus feature columns (for subset training + dropped-row
+    /// predict-side scoring). Mutually exclusive with [`with_bagging`](Self::with_bagging)
+    /// — GOSS forbids bagging (`goss.hpp:87-89`); the facade rejects the combination.
+    ///
+    /// GOSS modifies grad/hess in place (`IsHessianChange`), so it runs INSIDE
+    /// [`train_one_iter`](Self::train_one_iter) after `get_gradients` and before the
+    /// learner; inside the `1/learning_rate` skip window every row is kept with
+    /// grad/hess unmodified.
+    #[must_use]
+    pub fn with_goss(mut self, goss: GossSampleStrategy, features: Vec<FeatureColumn>) -> Self {
+        self.goss = Some(goss);
         self.features = features;
         self
     }
@@ -304,17 +330,36 @@ impl<'a> Gbdt<'a> {
             &mut hessians,
         )?;
 
-        // ---- (3) bagging (BST-03): draw the bag over the RNG (D-13) ----
-        // C++ `Bagging(iter_, …)` BEFORE the per-class tree loop. The draw consumes
-        // the per-block Random sequence verbatim (Pitfall 4). When the strategy
-        // actually subsets (`is_use_subset`), the per-class trees train on the in-bag
-        // rows and BOTH in-bag and OOB rows are scored predict-side below.
-        let use_subset = if let Some(bag) = self.bagging.as_mut() {
+        // ---- (3) sampling (BST-03 bagging / BST-04 GOSS): draw the bag over the RNG ----
+        // C++ `sample_strategy_->Bagging(iter_, …)` BEFORE the per-class tree loop.
+        // The draw consumes the per-block Random sequence verbatim (Pitfall 4). When the
+        // strategy actually subsets (`is_use_subset`), the per-class trees train on the
+        // kept (in-bag) rows and BOTH kept and dropped rows are scored predict-side below.
+        //
+        // GOSS (BST-04) additionally AMPLIFIES the sampled rows' grad/hess IN PLACE
+        // (`IsHessianChange`) here, BEFORE the tree learner sees them (goss.hpp:30-74).
+        // It is mutually exclusive with bagging (GOSS forbids bagging, goss.hpp:87-89).
+        // The kept/dropped index arrays come from whichever strategy is active.
+        let (use_subset, sample_in_bag, sample_oob) = if let Some(bag) = self.bagging.as_mut() {
             // labels drive ONLY the balanced (pos/neg) draw; plain bagging ignores it.
             bag.bagging(self.iter, labels);
-            bag.is_use_subset()
+            if bag.is_use_subset() {
+                (true, bag.in_bag().to_vec(), bag.out_of_bag().to_vec())
+            } else {
+                (false, Vec::new(), Vec::new())
+            }
+        } else if let Some(goss) = self.goss.as_mut() {
+            // GOSS mutates grad/hess in place for the sampled rows (amplification) and
+            // fills its kept/dropped index arrays. Inside the 1/learning_rate skip
+            // window it keeps every row with grad/hess untouched (is_use_subset false).
+            goss.bagging(self.iter, &mut gradients, &mut hessians);
+            if goss.is_use_subset() {
+                (true, goss.in_bag().to_vec(), goss.out_of_bag().to_vec())
+            } else {
+                (false, Vec::new(), Vec::new())
+            }
         } else {
-            false
+            (false, Vec::new(), Vec::new())
         };
 
         // The training score BEFORE any of this iteration's trees are added — the
@@ -357,12 +402,8 @@ impl<'a> Gbdt<'a> {
             // OOB rows STILL get the tree prediction added). The full-corpus path
             // (no bagging / fraction==1) uses the bit-exact partition scatter.
             if use_subset {
-                let bag = self
-                    .bagging
-                    .as_ref()
-                    .expect("use_subset implies a bagging strategy");
-                let in_bag: Vec<i32> = bag.in_bag().to_vec();
-                let oob: Vec<i32> = bag.out_of_bag().to_vec();
+                let in_bag: Vec<i32> = sample_in_bag.clone();
+                let oob: Vec<i32> = sample_oob.clone();
                 let (mut tree, subset_partition) = learner.train_on_subset_returning_partition(
                     &in_bag,
                     grad,
@@ -917,6 +958,122 @@ mod tests {
         );
         // The grown tree was pushed (a real split on this separable corpus).
         assert_eq!(gbdt.trees.len(), 1);
+    }
+
+    // ===================== 07-05: GOSS sample strategy (BST-04) =====================
+
+    use crate::sample_strategy::GossSampleStrategy;
+
+    #[test]
+    fn goss_selected_amplifies_and_scores_all_rows() {
+        // GOSS runs INSIDE train_one_iter after get_gradients: it amplifies the
+        // sampled rows' grad/hess in place, trains on the kept subset, and scores
+        // BOTH kept and dropped rows predict-side (Pitfall 4 — dropped rows still
+        // get the tree prediction). With a 12-row corpus, top_rate+other_rate=0.3
+        // (subset path) and lr small enough that iter 0 is past the skip window, the
+        // first iter must subsample and still move every row's score from init.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, _l, cfg) = corpus();
+        // 12 distinct-gradient rows so GOSS has a non-degenerate top-k threshold.
+        let f0 = FeatureColumn {
+            bins: vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+            real_feature_index: 0,
+            ..features[0].clone()
+        };
+        let f1 = FeatureColumn {
+            bins: vec![0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+            real_feature_index: 1,
+            ..features[1].clone()
+        };
+        let feats = vec![f0, f1];
+        let labels = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 4, 1).with_features(feats.clone());
+        // lr = 1.0 => skip window is iter < 1, so iter 0 IS skipped; lr = 2.0 =>
+        // 1/lr = 0.5 -> (int) 0, so iter 0 subsamples.
+        // top_rate=0.3, other_rate=0.2 (sum 0.5, subset path): top_k = 3, other_k = 2,
+        // so ~5 rows kept — enough to split the separable corpus.
+        let goss = GossSampleStrategy::reset_sample_config(0.3, 0.2, 2.0, num_data, 1, 3).unwrap();
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            1.0, // shrinkage 1.0 for a visible score move
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_goss(goss, feats.clone());
+        let snap = gbdt
+            .train_one_iter(&mut learner, &labels, feats.len())
+            .expect("goss iter");
+        // A tree was grown (separable corpus) and exactly one tree pushed.
+        assert_eq!(gbdt.trees.len(), 1);
+        assert!(
+            gbdt.trees[0].num_leaves > 1,
+            "GOSS kept subset must grow a real split on the separable corpus"
+        );
+        // init = label mean. Every row (kept + dropped) must be scored predict-side
+        // (Pitfall 4: dropped rows STILL get the tree prediction), so every row's
+        // post-iter score differs from the constant init.
+        let init = labels.iter().map(|&l| l as f64).sum::<f64>() / num_data as f64;
+        let changed = snap
+            .score
+            .iter()
+            .filter(|&&s| (s - init).abs() > 1e-9)
+            .count();
+        assert_eq!(
+            changed, num_data as usize,
+            "every row (kept + dropped) must be scored under GOSS: {:?}",
+            snap.score
+        );
+    }
+
+    #[test]
+    fn goss_skip_window_keeps_full_corpus() {
+        // Inside the 1/learning_rate skip window GOSS keeps every row with grad/hess
+        // unmodified — identical to the no-sampling full-corpus path.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        let mut learner =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        // lr = 0.1 => skip iters 0..9; iter 0 keeps the full corpus.
+        let goss = GossSampleStrategy::reset_sample_config(0.2, 0.1, 0.1, num_data, 1, 3).unwrap();
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_goss(goss, features.clone());
+        // Reference: the SAME iter with no GOSS at all must produce the same score.
+        let mut learner_ref =
+            SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(features.clone());
+        let mut gbdt_ref = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            0.1,
+            1,
+            num_data,
+            true,
+            None,
+        );
+        let snap = gbdt
+            .train_one_iter(&mut learner, &labels, features.len())
+            .expect("goss skip iter");
+        let snap_ref = gbdt_ref
+            .train_one_iter(&mut learner_ref, &labels, features.len())
+            .expect("ref iter");
+        // Inside the skip window GOSS is a no-op: identical accumulated scores.
+        for (a, b) in snap.score.iter().zip(snap_ref.score.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "skip-window GOSS must match no-sampling bit-exact");
+        }
     }
 
     #[test]

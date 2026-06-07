@@ -1,0 +1,9 @@
+# GOSS (BST-04) oracle fixtures — Phase-7 plan 07-05.
+#
+# Populated by `cargo run -p xtask -- goss-oracle-capture` (real lib_lightgbm 4.6):
+#   - goss_sampled_seed{S}_top{T}_other{O}.txt  — the RNG-replay golden (kept/dropped
+#     indices + amplified rows, bit-exact via the per-block Random(bagging_seed+i) draw).
+#   - goss_{top}_{other}_es{E}_bfa{B}_model.txt  — layered parity cells over
+#     top_rate×other_rate × {es} × {bfa} (GOSS forbids bagging — no bag axis).
+#
+# NEVER `git add` the untracked LightGBM/ reference tree; goldens land only here.
