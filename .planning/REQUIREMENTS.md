@@ -39,7 +39,7 @@
 - [x] **TRL-03**: Leaf-wise (best-first) growth with `num_leaves` and `max_depth` caps
 - [x] **TRL-04**: Split-gain scan with exact gain formula and tie-breaking (`lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`)
 - [x] **TRL-05**: Numerical threshold splits with C++-matching missing/zero routing — _COMPLETE (05-09): spine + mfb corpora FULLY bit-exact vs real lib_lightgbm 4.6 (mfb>0 zero-sentinel default-bin split threshold 1.0000000180025095e-35, decision_type=2, AND node-2 leaf-0 value 0.59999999999999953 — the final 2-ULP closed via the real-binary FP trace)_
-- [ ] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
+- [x] **TRL-06**: Categorical splits (`SplitCategorical`/`FindBestThresholdCategorical`: `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`)
 - [x] **TRL-07**: Data partition (row→leaf routing) feeding histogram subtraction — _CR-03 CLOSED (05-08): leaf_count/topology bit-exact vs real lib_lightgbm 4.6 (spine + mfb>0, no 0-row leaf); routing self-consistency (CR-01) holds_
 - [x] **TRL-08**: Feature subsampling per-tree and per-node (`feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`)
 - [x] **TRL-09**: `force_row_wise` / `force_col_wise` histogram build strategies, both output-matching
@@ -196,7 +196,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | BST-04 | Phase 7 | Complete |
 | BST-05 | Phase 7 | Complete |
 | BST-06 | Phase 7 | Complete |
-| TRL-06 | Phase 7 | Pending |
+| TRL-06 | Phase 7 | Complete |
 | OBJ-04 | Phase 7 | Pending |
 | OBJ-05 | Phase 7 | Complete |
 | OBJ-06 | Phase 7 | Pending |
