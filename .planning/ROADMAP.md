@@ -239,7 +239,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Wave 3** *(blocked on 06-02 — objective/metric breadth, D-17 step 1)*
 
-  - [ ] 06-03-PLAN.md — regression_l1 (PercentileFun + RenewTreeOutput) + binary (sigmoid) + custom closure (OBJ-02) + binary_logloss/binary_error/auc; per-objective L1–L5 goldens
+  - [x] 06-03-PLAN.md — regression_l1 (PercentileFun + RenewTreeOutput) + binary (sigmoid) + custom closure (OBJ-02) + binary_logloss/binary_error/auc; per-objective L1–L5 goldens
 
 **Wave 4** *(blocked on 06-03 — per-class structural axis, D-16)*
 
@@ -293,6 +293,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 3. Tree Model + Model Text I/O + Predict Parity | 4/4 | Complete    | 2026-06-05 |
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
-| 6. GBDT Spine + Core Objectives/Metrics | 2/5 | In Progress|  |
+| 6. GBDT Spine + Core Objectives/Metrics | 3/5 | In Progress|  |
 | 7. Parity-Completing Variants | 0/TBD | Not started | - |
 | 8. Python Bindings | 0/TBD | Not started | - |

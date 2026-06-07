@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 6 context gathered
-last_updated: "2026-06-06T23:59:13.196Z"
+last_updated: "2026-06-07T00:22:44.788Z"
 last_activity: 2026-06-06 -- Phase 06 execution started
 progress:
   total_phases: 8
   completed_phases: 5
   total_plans: 32
-  completed_plans: 29
+  completed_plans: 30
   percent: 63
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 ## Current Position
 
 Phase: 06 (gbdt-spine-core-objectives-metrics) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Last activity: 2026-06-06 -- Phase 06 execution started
 
@@ -231,6 +231,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 5 P9 | checkpoint | 1 tasks | 2 files |
 | Phase 06 P01 | 6min | 3 tasks | 19 files |
 | Phase 06 P02 | 40min | 3 tasks | 26 files |
+| Phase 06 P03 | ~50min | 3 tasks | 37 files |
 
 ## Accumulated Context
 
@@ -283,6 +284,8 @@ Recent decisions affecting current work:
 - [Phase ?]: renew_tree_output seam uses Option<closure> not an objective trait (lgbm-treelearner stays free of lgbm-objective); add_prediction_to_score takes &DataPartition explicitly.
 - [Phase ?]: 06-02: L2 score golden is BIT-EXACT (predict(raw,k)==internal score_); phase-wide L2 contract recorded for 06-05
 - [Phase ?]: 06-02: ConvertOutput stays in lgbm-model (Open-Q1); lgbm-objective owns training side only, re-exports it
+- [Phase ?]: 06-03: custom-objective preds are f64 not f32 (RESEARCH D-04 deviation, LightGBM 4.6 passes f64); required for the bit-exact OBJ-02 cross-anchor
+- [Phase ?]: 06-03: regression_l1 leaf values are the median RESIDUAL (RenewTreeOutput) — bit-exact vs real binary + distinct from L2 Newton leaves (Pitfall 2/3)
 
 ### Pending Todos
 
@@ -309,6 +312,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-06T23:58:45.875Z
+Last session: 2026-06-07T00:22:38.427Z
 Stopped at: Phase 6 context gathered
 Resume file: .planning/phases/06-gbdt-spine-core-objectives-metrics/06-CONTEXT.md

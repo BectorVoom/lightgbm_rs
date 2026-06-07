@@ -57,7 +57,7 @@
 ### Objective Functions
 
 - [x] **OBJ-01**: Core objectives — `regression` (l2), `regression_l1`, `binary`, `multiclass` (softmax), `multiclassova`
-- [ ] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
+- [x] **OBJ-02**: `custom` objective (user-supplied grad/hess pass-through) for Python parity
 - [x] **OBJ-03**: Objective machinery — `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp), `BoostFromScore`, `reg_sqrt` — within ~1e-6 (f32)
 - [ ] **OBJ-04**: Remaining regression objectives — `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`
 - [ ] **OBJ-05**: Cross-entropy objectives — `cross_entropy`, `cross_entropy_lambda`
@@ -187,7 +187,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | BST-03 | Phase 6 | Pending |
 | BST-07 | Phase 6 | Pending |
 | OBJ-01 | Phase 6 | Complete |
-| OBJ-02 | Phase 6 | Pending |
+| OBJ-02 | Phase 6 | Complete |
 | OBJ-03 | Phase 6 | Complete |
 | MET-01 | Phase 6 | Complete |
 | MET-02 | Phase 6 | Pending |
