@@ -102,13 +102,23 @@ impl DcgCalculator {
     /// offending label as a typed error.
     ///
     /// # Errors
+    /// [`MetricError::NonIntegerLabel`] when a label is not an integer, then
     /// [`MetricError::LabelOutOfRange`] when a label is negative or
-    /// `>= label_gain.len()` (T-07-09-02). The C++ also fatals on non-int labels;
-    /// we mirror the range check (the gain-table index is `static_cast<int>(label)`,
-    /// which truncates, so the integer range is what matters for OOB safety).
+    /// `>= label_gain.len()` (T-07-09-02, WR-02). Mirrors the C++ check ORDER
+    /// (`dcg_calculator.cpp:148-161`): integer-ness first (`fabs(label -
+    /// static_cast<int>(label)) > kEpsilon`), then non-negative, then range. The
+    /// gain-table index is `static_cast<int>(label)`, which truncates toward zero,
+    /// so a fractional label must be rejected before it silently picks a wrong gain.
     pub fn check_labels(&self, labels: &[f32]) -> Result<(), MetricError> {
         let n_gains = self.label_gain.len();
+        // C++ `kEpsilon = 1e-15f` (score_t); the comparison is done in f32 with
+        // `static_cast<int>` truncation toward zero (NOT `floor`).
+        let eps = lgbm_core::types::K_EPSILON;
         for &l in labels {
+            let delta = (l - (l as i32 as f32)).abs();
+            if delta > eps {
+                return Err(MetricError::NonIntegerLabel { label: l as f64 });
+            }
             if l < 0.0 {
                 return Err(MetricError::LabelOutOfRange {
                     label: l as i64,
@@ -304,5 +314,21 @@ mod tests {
         // label 31 with a 31-entry gain table -> out of [0, 31).
         let err = dcg.check_labels(&[31.0]).unwrap_err();
         assert!(matches!(err, MetricError::LabelOutOfRange { label: 31, .. }));
+    }
+
+    #[test]
+    fn check_labels_rejects_non_integer() {
+        // WR-02: a fractional rank label (2.7) would silently truncate to gain
+        // index 2; C++ `DCGCalculator::CheckLabel` fatals on this. The integer
+        // check fires BEFORE the range check (C++ order).
+        let dcg = DcgCalculator::new(DcgCalculator::default_label_gain(&[]));
+        let err = dcg.check_labels(&[0.0, 2.7]).unwrap_err();
+        assert!(matches!(err, MetricError::NonIntegerLabel { .. }));
+        // Integer-valued floats pass.
+        assert!(dcg.check_labels(&[0.0, 1.0, 3.0]).is_ok());
+        // The integer check precedes the range check: a fractional out-of-range
+        // value still reports NonIntegerLabel first (matches C++ order).
+        let err = dcg.check_labels(&[31.5]).unwrap_err();
+        assert!(matches!(err, MetricError::NonIntegerLabel { .. }));
     }
 }

@@ -151,13 +151,23 @@ impl Lambdarank {
         check_rank_labels(labels, "lambdarank")?;
         let dcg = DcgCalculator::new(DcgCalculator::default_label_gain(label_gain));
         // DCGCalculator::CheckLabel — also bounds-check against the gain table.
-        dcg.check_labels(labels).map_err(|e| ObjectiveError::LabelRange {
-            label: match e {
-                lgbm_metric::error::MetricError::LabelOutOfRange { label, .. } => label as f64,
-                _ => f64::NAN,
-            },
-            objective: "lambdarank".to_string(),
-            reason: "ranking label exceeds the label_gain table size".to_string(),
+        dcg.check_labels(labels).map_err(|e| {
+            let (label, reason) = match e {
+                lgbm_metric::error::MetricError::LabelOutOfRange { label, .. } => {
+                    (label as f64, "ranking label exceeds the label_gain table size")
+                }
+                // WR-02: a fractional rank label would silently truncate to a wrong
+                // gain index (C++ `DCGCalculator::CheckLabel` fatals first on this).
+                lgbm_metric::error::MetricError::NonIntegerLabel { label } => {
+                    (label, "ranking label must be an integer")
+                }
+                _ => (f64::NAN, "ranking label failed DCG validation"),
+            };
+            ObjectiveError::LabelRange {
+                label,
+                objective: "lambdarank".to_string(),
+                reason: reason.to_string(),
+            }
         })?;
 
         // Per-query inverse max DCG at the truncation level (Init :165-175).

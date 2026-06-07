@@ -55,6 +55,17 @@ pub enum MetricError {
         num_gains: usize,
     },
 
+    /// A ranking label was not an integer (threat T-07-09-02, WR-02). Mirrors the
+    /// FIRST check in `DCGCalculator::CheckLabel` (`dcg_calculator.cpp:148-153`):
+    /// `fabs(label - static_cast<int>(label)) > kEpsilon` fatals because a
+    /// fractional rank label would silently truncate to a wrong gain-table index.
+    /// Surfaced as a typed error before any DCG indexing.
+    #[error("ranking label is not an integer: label `{label}` (gain table is indexed by truncation)")]
+    NonIntegerLabel {
+        /// The offending fractional label value.
+        label: f64,
+    },
+
     /// The supplied `query_boundaries` were malformed (threat T-07-09-01):
     /// non-monotonic, not starting at 0, or not ending at `num_data`. Validated
     /// before per-query iteration so a hostile boundary array can never index
