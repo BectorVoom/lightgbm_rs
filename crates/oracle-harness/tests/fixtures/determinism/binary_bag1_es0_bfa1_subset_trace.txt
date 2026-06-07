@@ -1,0 +1,8 @@
+# [GSD-META] subset-determinism FP trace (Phase-7 D-05)
+# cell=binary_bag1_es0_bfa1 objective=binary bfa=1 seed=1610969088
+# bagging_fraction=0.7 bagging_freq=1 bagging_seed=3 num_data=12
+# NOTE: per-bin SUBSET_HIST + per-candidate current_gain/min_gain_shift require a source-built lib_lightgbm 4.6 FP-trace ($LGBM_TRACE_LIB, Phase-5 05-09 technique). This wheel capture records the realized tree-0 leaf count + per-split model-dump gain; extend with the source trace.
+LEAF_COUNT 4
+SPLIT feature=0 threshold=4.500000000000001 split_gain=3.5999999046325684
+SPLIT feature=0 threshold=1.5000000000000002 split_gain=8.881779961836516e-16
+SPLIT feature=0 threshold=1.0000000180025095e-35 split_gain=4.440889980918258e-16
