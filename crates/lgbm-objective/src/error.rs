@@ -56,6 +56,25 @@ pub enum ObjectiveError {
         /// The unrecognized / out-of-scope objective name.
         name: String,
     },
+
+    /// An objective parameter fell outside its valid range.
+    ///
+    /// Security V5: mirrors a C++ `CHECK(...)` / `Log::Fatal` site surfaced as a
+    /// typed error rather than an abort. E.g. `RegressionQuantileloss` does
+    /// `CHECK(alpha_ > 0 && alpha_ < 1)` (`regression_objective.hpp:483`); the
+    /// generic Config `alpha > 0` check does not cover the `< 1` half, so the
+    /// quantile constructor returns this variant for an out-of-range `alpha`.
+    #[error("invalid `{param}` = `{value}` for objective `{objective}`: {reason}")]
+    InvalidParam {
+        /// The offending parameter name.
+        param: String,
+        /// The objective the parameter belongs to.
+        objective: String,
+        /// The supplied (invalid) value.
+        value: f64,
+        /// Why the value is rejected (the C++ CHECK predicate, in words).
+        reason: String,
+    },
 }
 
 #[cfg(test)]

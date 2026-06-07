@@ -401,15 +401,22 @@ impl<'a> Gbdt<'a> {
                             &mut tree,
                             &subset_partition,
                             Some(|_leaf: i32, subset_rows: &[u32]| {
-                                let residuals: Vec<f64> = subset_rows
+                                // The leaf rows' FULL-corpus indices, then their
+                                // residuals (label - pre-update score) and labels in
+                                // the SAME order (MAPE needs the labels for its
+                                // per-row label_weight).
+                                let full_rows: Vec<usize> = subset_rows
                                     .iter()
-                                    .map(|&sr| {
-                                        // bag_mapper[index_mapper[i]] = in_bag[subset_row]
-                                        let fr = in_bag_ref[sr as usize] as usize;
-                                        labels_ref[fr] as f64 - score_ref[offset + fr]
-                                    })
+                                    // bag_mapper[index_mapper[i]] = in_bag[subset_row]
+                                    .map(|&sr| in_bag_ref[sr as usize] as usize)
                                     .collect();
-                                obj.renew_leaf_output(&residuals)
+                                let residuals: Vec<f64> = full_rows
+                                    .iter()
+                                    .map(|&fr| labels_ref[fr] as f64 - score_ref[offset + fr])
+                                    .collect();
+                                let leaf_labels: Vec<f32> =
+                                    full_rows.iter().map(|&fr| labels_ref[fr]).collect();
+                                obj.renew_leaf_output(&residuals, &leaf_labels)
                             }),
                         );
                     }
@@ -482,8 +489,10 @@ impl<'a> Gbdt<'a> {
                         &mut tree,
                         &partition,
                         Some(|_leaf: i32, rows: &[u32]| {
-                            // residual_getter over the leaf's rows, then the median
-                            // (PercentileFun alpha=0.5) — the new leaf output.
+                            // residual_getter over the leaf's rows, then the
+                            // (weighted) percentile — the new leaf output. The leaf
+                            // labels are gathered in the SAME row order so MAPE can
+                            // form its per-row label_weight.
                             let residuals: Vec<f64> = rows
                                 .iter()
                                 .map(|&row| {
@@ -491,7 +500,9 @@ impl<'a> Gbdt<'a> {
                                     labels_ref[r] as f64 - score_ref[offset + r]
                                 })
                                 .collect();
-                            obj.renew_leaf_output(&residuals)
+                            let leaf_labels: Vec<f32> =
+                                rows.iter().map(|&row| labels_ref[row as usize]).collect();
+                            obj.renew_leaf_output(&residuals, &leaf_labels)
                         }),
                     );
                 }

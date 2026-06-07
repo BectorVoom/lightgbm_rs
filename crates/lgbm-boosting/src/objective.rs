@@ -124,11 +124,13 @@ impl<'a> BoostObjective<'a> {
         }
     }
 
-    /// The per-leaf renewal (`regression_l1` median residual). Only called when
+    /// The per-leaf renewal (regression_l1 / quantile / mape). `residuals` are the
+    /// leaf rows' `label - score`; `labels` are the SAME rows' (untransformed)
+    /// labels in the SAME order (needed for MAPE's `label_weight`). Only called when
     /// [`Self::is_renew_tree_output`] is true.
-    pub fn renew_leaf_output(&self, residuals: &[f64]) -> f64 {
+    pub fn renew_leaf_output(&self, residuals: &[f64], labels: &[f32]) -> f64 {
         match self {
-            BoostObjective::Builtin(o) => o.renew_leaf_output(residuals),
+            BoostObjective::Builtin(o) => o.renew_leaf_output(residuals, labels),
             // Unreachable in practice (guarded by is_renew_tree_output); return the
             // input-derived no-op rather than panic.
             BoostObjective::Binary(_)

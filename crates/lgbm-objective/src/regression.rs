@@ -24,7 +24,7 @@
 use lgbm_core::types::K_EPSILON;
 
 use crate::error::ObjectiveError;
-use crate::percentile::percentile_fun;
+use crate::percentile::{percentile_fun, weighted_percentile_fun};
 
 /// C++ `Common::Sign` (`common.h:873`): `(x > 0) - (x < 0)` → `-1 | 0 | 1`.
 #[inline]
@@ -52,6 +52,47 @@ pub enum Objective {
     /// `IsRenewTreeOutput() == true` — after each tree, every leaf's output is
     /// overwritten with the median RESIDUAL of its rows (Pitfall 2/3).
     RegressionL1,
+    /// `huber` (`RegressionHuberLoss`, `regression_objective.hpp:293`): a clipped
+    /// L2/L1 hybrid. `grad = clamp(score-label, -alpha, +alpha)` in f64 then cast
+    /// f32; `hess = 1.0` (constant). `alpha` is the Huber δ (config `alpha`, default
+    /// 0.9). Inherits L2's `BoostFromScore` (label mean); `IsRenewTreeOutput()`
+    /// false; `sqrt` is force-disabled in C++ (it warns and clears the flag).
+    Huber {
+        /// The Huber δ threshold (config `alpha`).
+        alpha: f64,
+    },
+    /// `fair` (`RegressionFairLoss`, `regression_objective.hpp:351`): a smooth
+    /// robust loss. `grad = c*x/(|x|+c)`, `hess = c²/(|x|+c)²` with `x = score-label`
+    /// (config `fair_c`, default 1.0). `IsConstantHessian()` false; inherits L2's
+    /// `BoostFromScore`; `IsRenewTreeOutput()` false.
+    Fair {
+        /// The Fair `c` parameter (config `fair_c`).
+        c: f64,
+    },
+    /// `quantile` (`RegressionQuantileloss`, `regression_objective.hpp:481`):
+    /// pinball loss. `grad = (1-alpha)` if `score-label >= 0` else `-alpha`;
+    /// `hess = 1.0`. `BoostFromScore` is the label percentile at `alpha`;
+    /// `IsRenewTreeOutput()` true (renew with the residual percentile at `alpha`).
+    /// C++ `CHECK(alpha > 0 && alpha < 1)`.
+    Quantile {
+        /// The quantile level (config `alpha`, default 0.9).
+        alpha: f64,
+    },
+    /// `mape` (`RegressionMAPELOSS`, `regression_objective.hpp:579`): subclasses
+    /// `RegressionL1loss` with a per-row `label_weight = 1/max(1, |label|)` (f32,
+    /// computed at Init). `grad = Sign(score-label) * label_weight`; `hess = 1.0`
+    /// (constant, unweighted). `BoostFromScore` is the weighted label median (alpha
+    /// 0.5) with `label_weight`; `IsRenewTreeOutput()` true (weighted residual
+    /// median at 0.5 with `label_weight`).
+    Mape,
+}
+
+/// C++ MAPE `label_weight_[i] = 1.0f / std::max(1.0f, std::fabs(label_[i]))`
+/// (`regression_objective.hpp:601`), computed in f32 at Init. Exposed as a free
+/// helper so both `get_gradients` and the renewal path share the SAME f32 op order.
+#[inline]
+fn mape_label_weight(label: f32) -> f32 {
+    1.0f32 / label.abs().max(1.0f32)
 }
 
 impl Objective {
@@ -80,6 +121,16 @@ impl Objective {
             // C++ aliases for RegressionL1loss (objective_function.cpp / config
             // alias table): `regression_l1`, `l1`, `mean_absolute_error`, `mae`.
             "regression_l1" | "l1" | "mean_absolute_error" | "mae" => Ok(Objective::RegressionL1),
+            // huber/fair/quantile carry params filled by `from_config`; parse seeds
+            // the config.h defaults (alpha 0.9, fair_c 1.0) so the bare-name parse is
+            // a valid variant. quantile's `< 1` CHECK is enforced in `from_config`
+            // (it sees the resolved Config value).
+            "huber" => Ok(Objective::Huber { alpha: 0.9 }),
+            "fair" => Ok(Objective::Fair { c: 1.0 }),
+            "quantile" => Ok(Objective::Quantile { alpha: 0.9 }),
+            // `mape` config aliases (config_auto.cpp valid-objective list):
+            // `mape`, `mean_absolute_percentage_error`.
+            "mape" | "mean_absolute_percentage_error" => Ok(Objective::Mape),
             other => Err(ObjectiveError::Unsupported {
                 name: other.to_string(),
             }),
@@ -106,7 +157,29 @@ impl Objective {
             Objective::Regression { sqrt } => Ok(Objective::Regression {
                 sqrt: sqrt || config.reg_sqrt,
             }),
-            // reg_sqrt only applies to the L2 regression family in C++; L1 ignores it.
+            // huber δ is config `alpha` (RegressionHuberLoss ctor:
+            // `alpha_ = config.alpha`). sqrt is force-disabled in C++ but that is a
+            // label-transform concern handled by `transform_labels` (huber returns
+            // labels unchanged regardless).
+            Objective::Huber { .. } => Ok(Objective::Huber { alpha: config.alpha }),
+            // fair c is config `fair_c` (RegressionFairLoss ctor: `c_ = config.fair_c`).
+            Objective::Fair { .. } => Ok(Objective::Fair { c: config.fair_c }),
+            // quantile alpha is config `alpha`; C++ `CHECK(alpha > 0 && alpha < 1)`
+            // (regression_objective.hpp:483). The generic Config check covers `> 0`;
+            // enforce the `< 1` half here as a typed reject (never a panic).
+            Objective::Quantile { .. } => {
+                if !(config.alpha > 0.0 && config.alpha < 1.0) {
+                    return Err(ObjectiveError::InvalidParam {
+                        param: "alpha".to_string(),
+                        objective: "quantile".to_string(),
+                        value: config.alpha,
+                        reason: "must satisfy 0 < alpha < 1".to_string(),
+                    });
+                }
+                Ok(Objective::Quantile { alpha: config.alpha })
+            }
+            // reg_sqrt only applies to the L2 regression family in C++; the rest
+            // (L1 / mape) ignore it.
             other => Ok(other),
         }
     }
@@ -117,7 +190,19 @@ impl Objective {
         match self {
             // L1 hess is the constant 1.0 too (unweighted) — RegressionL1loss
             // inherits IsConstantHessian from RegressionL2loss.
-            Objective::Regression { .. } | Objective::RegressionL1 => true,
+            // Huber hess = 1.0 (constant, inherits L2). Mape hess = 1.0 and overrides
+            // IsConstantHessian()==true (regression_objective.hpp:665).
+            Objective::Regression { .. }
+            | Objective::RegressionL1
+            | Objective::Huber { .. }
+            | Objective::Mape => true,
+            // Quantile hess = 1.0 (constant); RegressionQuantileloss does NOT
+            // override IsConstantHessian so it inherits L2's `true` — correct, the
+            // hessian is the constant 1.0.
+            Objective::Quantile { .. } => true,
+            // Fair hess = c²/(|x|+c)² is per-row; RegressionFairLoss overrides
+            // IsConstantHessian()==false (regression_objective.hpp:386).
+            Objective::Fair { .. } => false,
         }
     }
 
@@ -126,9 +211,13 @@ impl Objective {
     /// this in 06-03.
     pub fn is_renew_tree_output(&self) -> bool {
         match self {
-            Objective::Regression { .. } => false,
-            // RegressionL1loss::IsRenewTreeOutput() == true.
-            Objective::RegressionL1 => true,
+            // L2/huber/fair: the Newton output is the final leaf value (no renewal).
+            Objective::Regression { .. } | Objective::Huber { .. } | Objective::Fair { .. } => {
+                false
+            }
+            // RegressionL1loss / RegressionQuantileloss / RegressionMAPELOSS all
+            // override IsRenewTreeOutput() == true.
+            Objective::RegressionL1 | Objective::Quantile { .. } | Objective::Mape => true,
         }
     }
 
@@ -151,8 +240,15 @@ impl Objective {
                     labels.to_vec()
                 }
             }
-            // L1 has no Init label transform (no sqrt option).
-            Objective::RegressionL1 => labels.to_vec(),
+            // L1 has no Init label transform (no sqrt option). Huber/Fair/Quantile
+            // inherit RegressionL2loss but carry no `sqrt` flag (huber force-disables
+            // it in C++; fair/quantile never set it via the typed builder), so the
+            // labels pass through. Mape subclasses L1 — no transform.
+            Objective::RegressionL1
+            | Objective::Huber { .. }
+            | Objective::Fair { .. }
+            | Objective::Quantile { .. }
+            | Objective::Mape => labels.to_vec(),
         }
     }
 
@@ -216,6 +312,70 @@ impl Objective {
                     hessians[i] = 1.0f32;
                 }
             }
+            Objective::Huber { alpha } => {
+                // RegressionHuberLoss::GetGradients (no-weights,
+                // regression_objective.hpp:312-325):
+                //   diff = score[i] - label_[i]          (f64; label promoted)
+                //   if |diff| <= alpha: grad = (score_t)diff
+                //   else:               grad = (score_t)(Sign(diff) * alpha)
+                //   hess = 1.0f
+                for i in 0..n {
+                    let diff = score[i] - label[i] as f64;
+                    gradients[i] = if diff.abs() <= *alpha {
+                        diff as f32
+                    } else {
+                        (sign(diff) * *alpha) as f32
+                    };
+                    hessians[i] = 1.0f32;
+                }
+            }
+            Objective::Fair { c } => {
+                // RegressionFairLoss::GetGradients (no-weights,
+                // regression_objective.hpp:364-369):
+                //   x = score[i] - label_[i]                          (f64)
+                //   grad = (score_t)(c * x / (|x| + c))
+                //   hess = (score_t)(c * c / ((|x| + c) * (|x| + c)))
+                let c = *c;
+                for i in 0..n {
+                    let x = score[i] - label[i] as f64;
+                    let denom = x.abs() + c;
+                    gradients[i] = (c * x / denom) as f32;
+                    hessians[i] = (c * c / (denom * denom)) as f32;
+                }
+            }
+            Objective::Quantile { alpha } => {
+                // RegressionQuantileloss::GetGradients (no-weights,
+                // regression_objective.hpp:494-503): `alpha_` is a `score_t` (f32) in
+                // C++ and `delta` is the f32-cast residual; the branch + grad are all
+                // f32.
+                //   delta = (score_t)(score[i] - label_[i])
+                //   grad  = (delta >= 0) ? (1.0f - alpha) : -alpha
+                //   hess  = 1.0f
+                let alpha_f32 = *alpha as f32;
+                for i in 0..n {
+                    let delta = (score[i] - label[i] as f64) as f32;
+                    gradients[i] = if delta >= 0.0 {
+                        1.0f32 - alpha_f32
+                    } else {
+                        -alpha_f32
+                    };
+                    hessians[i] = 1.0f32;
+                }
+            }
+            Objective::Mape => {
+                // RegressionMAPELOSS::GetGradients (no-weights,
+                // regression_objective.hpp:619-625):
+                //   diff = score[i] - label_[i]                       (f64)
+                //   grad = (score_t)(Sign(diff) * label_weight_[i])
+                //   hess = 1.0f
+                // where label_weight_[i] = 1/max(1,|label|) computed in f32 at Init.
+                for i in 0..n {
+                    let diff = score[i] - label[i] as f64;
+                    let lw = mape_label_weight(label[i]);
+                    gradients[i] = (sign(diff) * lw as f64) as f32;
+                    hessians[i] = 1.0f32;
+                }
+            }
         }
         Ok(())
     }
@@ -228,7 +388,9 @@ impl Objective {
     /// f64 fold over the labels in row order — the bit-exact deterministic anchor.
     pub fn boost_from_score(&self, label: &[f32]) -> f64 {
         match self {
-            Objective::Regression { .. } => {
+            // L2 label mean. Huber/Fair inherit RegressionL2loss::BoostFromScore
+            // unchanged (no override), so they use the SAME ordered f64 fold.
+            Objective::Regression { .. } | Objective::Huber { .. } | Objective::Fair { .. } => {
                 if label.is_empty() {
                     return 0.0;
                 }
@@ -238,6 +400,22 @@ impl Objective {
                 }
                 let sumw = label.len() as f64;
                 suml / sumw
+            }
+            // RegressionQuantileloss::BoostFromScore (regression_objective.hpp:531):
+            // the unweighted label percentile at `alpha` (PercentileFun over the
+            // labels, NOT the mean). label_t (f32) promoted to f64.
+            Objective::Quantile { alpha } => {
+                let data: Vec<f64> = label.iter().map(|&l| l as f64).collect();
+                percentile_fun(&data, *alpha)
+            }
+            // RegressionMAPELOSS::BoostFromScore (regression_objective.hpp:635): the
+            // WEIGHTED label median (alpha = 0.5) with per-row label_weight =
+            // 1/max(1,|label|).
+            Objective::Mape => {
+                let data: Vec<f64> = label.iter().map(|&l| l as f64).collect();
+                let weights: Vec<f64> =
+                    label.iter().map(|&l| mape_label_weight(l) as f64).collect();
+                weighted_percentile_fun(&data, &weights, 0.5)
             }
             // RegressionL1loss::BoostFromScore (regression_objective.hpp:236-249):
             // the unweighted percentile at alpha = 0.5 — the label MEDIAN via
@@ -251,19 +429,39 @@ impl Objective {
         }
     }
 
-    /// `RegressionL1loss::RenewTreeOutput` per-leaf body
-    /// (`regression_objective.hpp:253-283`): the weighted/unweighted median of a
-    /// leaf's RESIDUALS. `residuals` are the per-row `label[row] - score[row]`
-    /// values for the rows in one leaf (the C++ `residual_getter`), in the data
-    /// partition's row order. Returns the new leaf output (the median residual at
-    /// alpha = 0.5). The boosting layer gathers the residuals for each leaf and
-    /// calls this; for `IsRenewTreeOutput() == false` objectives the loop never
-    /// invokes it.
+    /// `RenewTreeOutput` per-leaf body — the (weighted) percentile of a leaf's
+    /// RESIDUALS. `residuals` are the per-row `label[row] - score[row]` values for
+    /// the rows in one leaf (the C++ `residual_getter`), in the data partition's row
+    /// order; `labels` are the SAME rows' (untransformed) labels in the SAME order
+    /// (needed only for MAPE's `label_weight`). Returns the new leaf output. The
+    /// boosting layer gathers these for each leaf and calls this; for
+    /// `IsRenewTreeOutput() == false` objectives the loop never invokes it.
     ///
-    /// Only the unweighted path is exercised by the in-scope corpora; the weighted
-    /// variant lives in [`crate::percentile::weighted_percentile_fun`].
-    pub fn renew_leaf_output(&self, residuals: &[f64]) -> f64 {
-        percentile_fun(residuals, 0.5)
+    /// - `regression_l1` (`regression_objective.hpp:253-283`): unweighted residual
+    ///   median (`PercentileFun`, alpha = 0.5).
+    /// - `quantile` (`regression_objective.hpp:548-577`): unweighted residual
+    ///   percentile at the objective's `alpha`.
+    /// - `mape` (`regression_objective.hpp:642-660`): WEIGHTED residual median
+    ///   (alpha = 0.5) with per-row `label_weight = 1/max(1,|label|)`.
+    ///
+    /// Only the unweighted L1/quantile path and the MAPE weighted path on the
+    /// in-scope corpora are exercised; the weighted L1/quantile variants live in
+    /// [`crate::percentile::weighted_percentile_fun`].
+    pub fn renew_leaf_output(&self, residuals: &[f64], labels: &[f32]) -> f64 {
+        match self {
+            Objective::RegressionL1 => percentile_fun(residuals, 0.5),
+            Objective::Quantile { alpha } => percentile_fun(residuals, *alpha),
+            Objective::Mape => {
+                let weights: Vec<f64> =
+                    labels.iter().map(|&l| mape_label_weight(l) as f64).collect();
+                weighted_percentile_fun(residuals, &weights, 0.5)
+            }
+            // Non-renew objectives never reach here (guarded by is_renew_tree_output);
+            // fall back to the unweighted median rather than panic.
+            Objective::Regression { .. } | Objective::Huber { .. } | Objective::Fair { .. } => {
+                percentile_fun(residuals, 0.5)
+            }
+        }
     }
 
     /// Whether `|init|` exceeds the `kEpsilon` gate the GBDT loop uses to decide
@@ -418,10 +616,158 @@ mod tests {
     #[test]
     fn renew_leaf_output_is_median_residual() {
         let obj = Objective::RegressionL1;
-        // residuals (label - score) for a leaf's rows.
+        // residuals (label - score) for a leaf's rows. L1 ignores the labels arg.
         let residuals = [10.0f64, 8.0, 2.0, 0.0]; // even count, median(PercentileFun) = 5.
-        assert_eq!(obj.renew_leaf_output(&residuals), 5.0);
+        assert_eq!(obj.renew_leaf_output(&residuals, &[0.0f32; 4]), 5.0);
         let odd = [1.0f64, 2.0, 3.0];
-        assert_eq!(obj.renew_leaf_output(&odd), 2.0);
+        assert_eq!(obj.renew_leaf_output(&odd, &[0.0f32; 3]), 2.0);
+    }
+
+    // ---- huber/fair/quantile/mape (Plan 07-02, OBJ-04 family A) ----
+
+    fn cfg_with(objective: &str, alpha: f64, fair_c: f64) -> lgbm_core::Config {
+        let mut c = lgbm_core::Config::default();
+        c.objective = objective.to_string();
+        c.alpha = alpha;
+        c.fair_c = fair_c;
+        c
+    }
+
+    #[test]
+    fn parse_family_a_names() {
+        assert_eq!(Objective::parse("huber").unwrap(), Objective::Huber { alpha: 0.9 });
+        assert_eq!(Objective::parse("fair").unwrap(), Objective::Fair { c: 1.0 });
+        assert_eq!(
+            Objective::parse("quantile").unwrap(),
+            Objective::Quantile { alpha: 0.9 }
+        );
+        assert_eq!(Objective::parse("mape").unwrap(), Objective::Mape);
+        assert_eq!(
+            Objective::parse("mean_absolute_percentage_error").unwrap(),
+            Objective::Mape
+        );
+    }
+
+    #[test]
+    fn from_config_fills_params() {
+        let h = Objective::from_config(&cfg_with("huber", 0.5, 1.0)).unwrap();
+        assert_eq!(h, Objective::Huber { alpha: 0.5 });
+        let f = Objective::from_config(&cfg_with("fair", 0.9, 2.0)).unwrap();
+        assert_eq!(f, Objective::Fair { c: 2.0 });
+        let q = Objective::from_config(&cfg_with("quantile", 0.1, 1.0)).unwrap();
+        assert_eq!(q, Objective::Quantile { alpha: 0.1 });
+    }
+
+    #[test]
+    fn quantile_alpha_check_rejects_out_of_range() {
+        // alpha must satisfy 0 < alpha < 1 (C++ CHECK). alpha=1.0 is rejected.
+        let err = Objective::from_config(&cfg_with("quantile", 1.0, 1.0)).unwrap_err();
+        assert!(matches!(err, ObjectiveError::InvalidParam { .. }));
+        // alpha just under 1 is accepted.
+        assert!(Objective::from_config(&cfg_with("quantile", 0.999, 1.0)).is_ok());
+    }
+
+    #[test]
+    fn family_a_renew_and_hessian_flags() {
+        assert!(!Objective::Huber { alpha: 0.9 }.is_renew_tree_output());
+        assert!(!Objective::Fair { c: 1.0 }.is_renew_tree_output());
+        assert!(Objective::Quantile { alpha: 0.9 }.is_renew_tree_output());
+        assert!(Objective::Mape.is_renew_tree_output());
+        // Constant-hessian: huber/quantile/mape true; fair false.
+        assert!(Objective::Huber { alpha: 0.9 }.is_constant_hessian());
+        assert!(Objective::Quantile { alpha: 0.9 }.is_constant_hessian());
+        assert!(Objective::Mape.is_constant_hessian());
+        assert!(!Objective::Fair { c: 1.0 }.is_constant_hessian());
+    }
+
+    #[test]
+    fn huber_gradient_is_clamped_to_alpha() {
+        // residual far beyond alpha yields exactly ±alpha as f32; within yields diff.
+        let obj = Objective::Huber { alpha: 0.9 };
+        let score = [100.0f64, -100.0, 0.5, -0.5];
+        let label = [0.0f32, 0.0, 0.0, 0.0];
+        let mut grad = [0.0f32; 4];
+        let mut hess = [0.0f32; 4];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        assert_eq!(grad[0], 0.9f32); // +100 clamped to +alpha
+        assert_eq!(grad[1], -0.9f32); // -100 clamped to -alpha
+        assert_eq!(grad[2], 0.5f32); // within alpha -> diff
+        assert_eq!(grad[3], -0.5f32);
+        assert_eq!(hess, [1.0f32; 4]);
+    }
+
+    #[test]
+    fn fair_gradient_and_hessian() {
+        // grad = c*x/(|x|+c); hess = c²/(|x|+c)². Hand-computed for c=1, x=3.
+        let obj = Objective::Fair { c: 1.0 };
+        let score = [3.0f64];
+        let label = [0.0f32];
+        let mut grad = [0.0f32; 1];
+        let mut hess = [0.0f32; 1];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        // x=3: grad = 1*3/(3+1) = 0.75; hess = 1/(4*4) = 0.0625.
+        assert_eq!(grad[0], (1.0f64 * 3.0 / 4.0) as f32);
+        assert_eq!(hess[0], (1.0f64 / 16.0) as f32);
+    }
+
+    #[test]
+    fn quantile_gradient_sign_style() {
+        // grad = (1-alpha) if delta>=0 else -alpha; hess=1.
+        let obj = Objective::Quantile { alpha: 0.9 };
+        let score = [5.0f64, -5.0, 0.0];
+        let label = [0.0f32, 0.0, 0.0];
+        let mut grad = [0.0f32; 3];
+        let mut hess = [0.0f32; 3];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        assert_eq!(grad[0], 1.0f32 - 0.9f32); // delta>=0
+        assert_eq!(grad[1], -0.9f32); // delta<0
+        assert_eq!(grad[2], 1.0f32 - 0.9f32); // delta==0 -> >= branch
+        assert_eq!(hess, [1.0f32; 3]);
+    }
+
+    #[test]
+    fn quantile_boost_from_score_is_label_percentile() {
+        let obj = Objective::Quantile { alpha: 0.9 };
+        // PercentileFun([1..10], 0.9): float_pos=(10-1)*(1-0.9)=0.9, pos=1,
+        //   bias=0.9, desc=[10,9,...,1], v1=desc[0]=10, v2=desc[1]=9 ->
+        //   10 - (10-9)*0.9 = 9.1.
+        let label: Vec<f32> = (1..=10).map(|i| i as f32).collect();
+        assert!((obj.boost_from_score(&label) - 9.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quantile_renew_uses_alpha() {
+        let obj = Objective::Quantile { alpha: 0.9 };
+        let residuals: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        // Same as the percentile above -> 9.1. labels ignored for quantile.
+        let got = obj.renew_leaf_output(&residuals, &[0.0f32; 10]);
+        assert!((got - 9.1).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn mape_gradient_weights_by_inverse_label_magnitude() {
+        // grad = Sign(score-label) * 1/max(1,|label|); hess=1.
+        let obj = Objective::Mape;
+        let score = [10.0f64, 0.0, 2.0];
+        let label = [4.0f32, 5.0, 0.5];
+        let mut grad = [0.0f32; 3];
+        let mut hess = [0.0f32; 3];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        // row0: diff=6>0 -> +1 * 1/max(1,4)=1/4=0.25.
+        assert_eq!(grad[0], (1.0f64 * (1.0f32 / 4.0) as f64) as f32);
+        // row1: diff=-5<0 -> -1 * 1/max(1,5)=1/5=0.2.
+        assert_eq!(grad[1], (-1.0f64 * (1.0f32 / 5.0) as f64) as f32);
+        // row2: diff=1.5>0 -> +1 * 1/max(1,0.5)=1/1=1.0.
+        assert_eq!(grad[2], 1.0f32);
+        assert_eq!(hess, [1.0f32; 3]);
+    }
+
+    #[test]
+    fn huber_fair_boost_from_score_is_label_mean() {
+        let label = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        assert!((Objective::Huber { alpha: 0.9 }.boost_from_score(&label) - 3.0).abs()
+            < ORACLE_TOL as f64);
+        assert!((Objective::Fair { c: 1.0 }.boost_from_score(&label) - 3.0).abs()
+            < ORACLE_TOL as f64);
     }
 }
