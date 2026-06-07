@@ -17,8 +17,8 @@ pub mod error;
 
 // --- public training API (Phase 6) ---
 pub use booster::{
-    train, train_custom, train_custom_with_metric, train_raw, train_with_valid, Booster,
-    CustomMetricClosure, DenseCorpus, RawCorpus,
+    train, train_custom, train_custom_raw_with_metric, train_custom_with_metric, train_raw,
+    train_with_valid, Booster, CustomMetricClosure, DenseCorpus, RawCorpus,
 };
 pub use booster::build_feature_columns_from_raw;
 pub use builder::TrainingBuilder;

@@ -13,6 +13,7 @@
 use pyo3::prelude::*;
 
 pub mod booster;
+pub mod callbacks;
 pub mod dataset;
 pub mod error;
 pub mod marshal;

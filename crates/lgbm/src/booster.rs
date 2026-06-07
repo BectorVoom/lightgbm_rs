@@ -36,7 +36,7 @@ use crate::error::LgbmError;
 /// contract the Python `feval` marshals into (08-06). The closure is called once
 /// per eval cadence with the SAME `(scores, labels)` the built-in metrics see,
 /// so it feeds the SAME eval-history loop.
-pub type CustomMetricClosure = Box<dyn Fn(&[f64], &[f32]) -> (String, f64, bool)>;
+pub type CustomMetricClosure = Box<dyn Fn(&[f64], &[f32]) -> (String, f64, bool) + Send>;
 
 enum EvalMetric {
     /// A regression metric (`l1`/`l2`/`rmse`) over the raw score.
@@ -726,6 +726,51 @@ where
     train_inner(
         config,
         corpus,
+        BoostObjective::Custom(custom),
+        corpus.labels.clone(),
+        metrics,
+    )
+}
+
+/// Train with a user-supplied `custom` objective closure AND an OPTIONAL custom
+/// metric over a RAW (arbitrary-valued) corpus — the D-02 raw→bin→train bridge for
+/// the custom path (PYB-04). This is [`train_custom_with_metric`]'s sibling for
+/// raw input: it bins each feature with the bit-exact [`BinMapper`] via
+/// [`build_feature_columns_from_raw`] (exactly like [`train_raw`]) and then drives
+/// the SAME custom-objective + custom-metric eval-history loop the identity-binned
+/// `train_custom_with_metric` uses. `boost_from_average` is forced OFF for custom
+/// (mirroring C++ `obj == null`).
+///
+/// The Python binding consumes this entry: a user passes a numpy matrix (→
+/// `RawCorpus`) plus a Python `fobj` (→ `closure`) and optional `feval` (→
+/// `feval`); this bins the matrix and runs the custom path, so a Python custom
+/// objective trains on real-valued features without a separate identity-binning
+/// step.
+///
+/// # Errors
+/// [`LgbmError`] for an invalid corpus or a loop/learner failure; a wrong-length
+/// objective-closure return surfaces as `LgbmError::Objective`, a non-finite feval
+/// value as `LgbmError::CustomMetric`, never a panic.
+pub fn train_custom_raw_with_metric<'a, F>(
+    config: &Config,
+    corpus: &RawCorpus,
+    closure: F,
+    feval: Option<CustomMetricClosure>,
+) -> Result<Booster, LgbmError>
+where
+    F: Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a,
+{
+    let custom = CustomObjective::new(closure);
+    let metrics = match feval {
+        Some(f) => vec![EvalMetric::Custom(f)],
+        None => vec![EvalMetric::Reg(Metric::L2)],
+    };
+    let features = build_feature_columns_from_raw(corpus)?;
+    train_inner_columns(
+        config,
+        &corpus.features,
+        &corpus.labels,
+        features,
         BoostObjective::Custom(custom),
         corpus.labels.clone(),
         metrics,
