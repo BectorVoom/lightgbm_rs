@@ -184,6 +184,41 @@ impl TrainingBuilder {
         self
     }
 
+    /// `cat_l2` (TRL-06) — extra L2 added to `lambda_l2` ONLY in the per-category
+    /// split gain (config.h default 10.0). The deliberate categorical asymmetry.
+    pub fn cat_l2(mut self, v: f64) -> Self {
+        self.params.insert("cat_l2".into(), v.to_string());
+        self
+    }
+
+    /// `cat_smooth` (TRL-06) — categorical CTR smoothing + the
+    /// `RoundInt(hess*cnt_factor) >= cat_smooth` many-vs-many filter (default 10.0).
+    pub fn cat_smooth(mut self, v: f64) -> Self {
+        self.params.insert("cat_smooth".into(), v.to_string());
+        self
+    }
+
+    /// `min_data_per_group` (TRL-06) — categorical many-vs-many minimum rows per
+    /// accumulated category group (config.h default 100, `> 0`).
+    pub fn min_data_per_group(mut self, v: i32) -> Self {
+        self.params.insert("min_data_per_group".into(), v.to_string());
+        self
+    }
+
+    /// `max_cat_threshold` (TRL-06) — cap on categories on one side of a
+    /// many-vs-many split (config.h default 32, `> 0`).
+    pub fn max_cat_threshold(mut self, v: i32) -> Self {
+        self.params.insert("max_cat_threshold".into(), v.to_string());
+        self
+    }
+
+    /// `max_cat_to_onehot` (TRL-06) — categorical features with
+    /// `num_bin <= max_cat_to_onehot` use the one-hot path (config.h default 4, `> 0`).
+    pub fn max_cat_to_onehot(mut self, v: i32) -> Self {
+        self.params.insert("max_cat_to_onehot".into(), v.to_string());
+        self
+    }
+
     /// `bagging_fraction` (row subsampling rate, `(0, 1]`; BST-03). Paired with
     /// [`bagging_freq`](Self::bagging_freq) and [`bagging_seed`](Self::bagging_seed).
     pub fn bagging_fraction(mut self, v: f64) -> Self {
@@ -373,6 +408,28 @@ mod tests {
         assert!(cfg.boost_from_average);
         assert_eq!(cfg.seed, 7);
         assert!(cfg.deterministic);
+    }
+
+    #[test]
+    fn categorical_setters_route_into_config() {
+        // TRL-06: cat_l2/cat_smooth/min_data_per_group/max_cat_threshold/
+        // max_cat_to_onehot must round-trip into Config.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .cat_l2(7.5)
+            .cat_smooth(3.0)
+            .min_data_per_group(50)
+            .max_cat_threshold(16)
+            .max_cat_to_onehot(2)
+            .build()
+            .unwrap();
+        assert!((cfg.cat_l2 - 7.5).abs() < 1e-12);
+        assert!((cfg.cat_smooth - 3.0).abs() < 1e-12);
+        assert_eq!(cfg.min_data_per_group, 50);
+        assert_eq!(cfg.max_cat_threshold, 16);
+        assert_eq!(cfg.max_cat_to_onehot, 2);
     }
 
     #[test]

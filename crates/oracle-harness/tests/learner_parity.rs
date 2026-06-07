@@ -1326,3 +1326,231 @@ fn learner_parity_mfb_pos_real_binary() {
     assert_routing_self_consistent("mfb_pos_real", &features, &tree, g.len());
     assert_real_tree_parity("mfb_pos_real", &tree, &golden, 0.1);
 }
+
+// ===========================================================================
+// CATEGORICAL split parity (plan 07-08, TRL-06, D-06/D-07). Capture-gated against
+// the REAL `lib_lightgbm` 4.6 categorical goldens + JSON sidecars captured by
+// `cargo run -p xtask -- categorical-oracle-capture` under
+// `tests/fixtures/categorical/`. Each cell SKIP-passes when its golden is absent.
+//
+// The sidecar pins the per-row bins + `bin_2_categorical` map + cat axis the Rust
+// learner must consume so the bit-exact comparison can ONLY falsify the
+// categorical split/gain logic, never the (Phase-2) categorical binning.
+//
+// D-07 LAYERED DIAGNOSTICS asserted per cell:
+//   1. decision_type categorical bit (CATEGORICAL_MASK) set + num_cat
+//   2. the chosen cat_threshold bitset (REAL category bitset) bit-exact
+//   3. the full learner-authoritative tree fields bit-exact (assert_real_tree_parity)
+//   4. the model-text || round-trip (grow -> to_string -> parse -> to_string)
+// ===========================================================================
+
+fn categorical_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/categorical")
+}
+
+/// The minimal sidecar fields the categorical replay needs (parsed from the
+/// flat JSON the python capture emits — no serde dep in the harness).
+struct CatSidecar {
+    bins: Vec<u32>,
+    bin_2_categorical: Vec<i32>,
+    num_bin: u32,
+    most_freq_bin: u32,
+    grad: Vec<f32>,
+    num_leaves: i32,
+    cat_l2: f64,
+    cat_smooth: f64,
+    min_data_per_group: i32,
+    max_cat_threshold: i32,
+    max_cat_to_onehot: i32,
+}
+
+/// Tiny hand parser for the flat sidecar JSON (object with scalar + flat int/float
+/// array values; no nesting). Returns `None` (SKIP) when the file is absent.
+fn load_cat_sidecar(name: &str) -> Option<CatSidecar> {
+    let path = categorical_dir().join(format!("{name}.bins.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "learner_parity: SKIP — categorical sidecar {} not found. Run \
+             `LGBM_CAPTURE_PYTHON=<py-with-lightgbm-4.6> cargo run -p xtask -- \
+             categorical-oracle-capture` and commit the goldens.",
+            path.display()
+        );
+        return None;
+    };
+    let scalar = |key: &str| -> f64 {
+        // find `"key":` then read the number that follows (handles `key": 1.0`).
+        let pat = format!("\"{key}\"");
+        let i = text.find(&pat).unwrap_or_else(|| panic!("sidecar missing key {key}"));
+        let after = &text[i + pat.len()..];
+        let colon = after.find(':').expect("sidecar key without ':'");
+        let rest = after[colon + 1..].trim_start();
+        let end = rest
+            .find(|c: char| c == ',' || c == '\n' || c == '}')
+            .unwrap_or(rest.len());
+        rest[..end].trim().parse::<f64>().unwrap_or_else(|_| {
+            panic!("sidecar key {key} value not a number: {:?}", &rest[..end])
+        })
+    };
+    let int_array = |key: &str| -> Vec<i64> {
+        let pat = format!("\"{key}\"");
+        let i = text.find(&pat).unwrap_or_else(|| panic!("sidecar missing array {key}"));
+        let after = &text[i + pat.len()..];
+        let lb = after.find('[').expect("array key without '['");
+        let rb = after.find(']').expect("array key without ']'");
+        after[lb + 1..rb]
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<i64>().expect("array element not an int"))
+            .collect()
+    };
+    Some(CatSidecar {
+        bins: int_array("bins").into_iter().map(|x| x as u32).collect(),
+        bin_2_categorical: int_array("bin_2_categorical")
+            .into_iter()
+            .map(|x| x as i32)
+            .collect(),
+        num_bin: scalar("num_bin") as u32,
+        most_freq_bin: scalar("most_freq_bin") as u32,
+        grad: int_array("grad").into_iter().map(|x| x as f32).collect(),
+        num_leaves: scalar("num_leaves") as i32,
+        cat_l2: scalar("cat_l2"),
+        cat_smooth: scalar("cat_smooth"),
+        min_data_per_group: scalar("min_data_per_group") as i32,
+        max_cat_threshold: scalar("max_cat_threshold") as i32,
+        max_cat_to_onehot: scalar("max_cat_to_onehot") as i32,
+    })
+}
+
+/// Build the categorical `FeatureColumn` + `GainConfig` from a sidecar.
+fn cat_corpus(
+    s: &CatSidecar,
+) -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
+    let hess = vec![1.0f32; s.grad.len()];
+    let f0 = FeatureColumn {
+        bins: s.bins.clone(),
+        num_bin: s.num_bin,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(s.most_freq_bin),
+        min_bin: 0,
+        max_bin: s.num_bin - 1,
+        default_bin: s.num_bin,
+        most_freq_bin: s.most_freq_bin,
+        missing_type: MissingType::None,
+        bin_upper_bound: Vec::new(),
+        real_feature_index: 0,
+        bin_type: lgbm_dataset::bin_mapper::BinType::Categorical,
+        bin_to_category: s.bin_2_categorical.clone(),
+    };
+    let mut cfg = GainConfig::default();
+    cfg.min_data_in_leaf = 1;
+    cfg.min_sum_hessian_in_leaf = 1e-3;
+    cfg.lambda_l2 = 0.0;
+    cfg.cat_l2 = s.cat_l2;
+    cfg.cat_smooth = s.cat_smooth;
+    cfg.min_data_per_group = s.min_data_per_group;
+    cfg.max_cat_threshold = s.max_cat_threshold;
+    cfg.max_cat_to_onehot = s.max_cat_to_onehot;
+    (vec![f0], s.grad.clone(), hess, cfg, s.num_leaves, -1)
+}
+
+/// Drive one categorical cell: grow the Rust tree, assert the 4 layered
+/// diagnostics against the real golden + sidecar.
+fn run_categorical_cell(name: &str) {
+    let Some(sidecar) = load_cat_sidecar(name) else {
+        return;
+    };
+    let Some(golden) = load_real_tree(&categorical_dir().join(format!("{name}.txt"))) else {
+        return;
+    };
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, nl, md) = cat_corpus(&sidecar);
+    let mut learner = SerialTreeLearner::new(&backend, &client, cfg, nl, md)
+        .with_features(features.clone());
+    let tree = learner.train(&g, &h, true).expect("categorical train ok");
+
+    // (1) decision_type categorical bit + num_cat match the golden.
+    assert!(tree.num_cat >= 1, "{name}: a categorical split was grown");
+    assert_eq!(tree.num_cat, golden.num_cat, "{name}: num_cat != golden");
+    for (i, &dt) in tree.decision_type.iter().enumerate() {
+        assert_eq!(
+            dt & 1,
+            golden.decision_type[i] & 1,
+            "{name}: node {i} CATEGORICAL_MASK bit != golden"
+        );
+    }
+    // (2) the chosen cat_threshold bitset + cat_boundaries bit-exact.
+    assert_eq!(
+        tree.cat_boundaries, golden.cat_boundaries,
+        "{name}: cat_boundaries != golden"
+    );
+    assert_eq!(
+        tree.cat_threshold, golden.cat_threshold,
+        "{name}: cat_threshold (real category bitset) != golden"
+    );
+    // (3) the full learner-authoritative fields bit-exact (incl. shrinkage'd leaf).
+    assert_real_tree_parity(name, &tree, &golden, sidecar.shrinkage_or_default());
+    // (4) model-text round-trip byte-stable.
+    let txt = tree.to_string();
+    let reparsed = Tree::parse(&txt).expect("grown categorical tree round-trips");
+    assert_eq!(reparsed.to_string(), txt, "{name}: model-text round-trip");
+}
+
+impl CatSidecar {
+    fn shrinkage_or_default(&self) -> f64 {
+        0.1
+    }
+}
+
+#[test]
+fn learner_parity_categorical_onehot() {
+    run_categorical_cell("cat_onehot");
+}
+
+#[test]
+fn learner_parity_categorical_manyvsmany() {
+    run_categorical_cell("cat_manyvsmany");
+}
+
+/// D-06 NO-REGRESSION GATE (plan 07-08): an EXPLICIT assertion in this wave that
+/// the bit-exact numeric-spine goldens still replay bit-exact AFTER the additive
+/// categorical re-open. The categorical branch is purely additive and must not
+/// perturb the continuous split spine. This runs the three D-06 spine goldens and
+/// re-asserts each (each SKIP-passes only when its real-binary fixture is absent —
+/// the underlying `learner_parity_spine_real_binary` /
+/// `learner_parity_growth_path_subtract` / `learner_parity_mfb_pos_real_binary`
+/// cells are the authoritative gates; this cell makes the no-regression intent of
+/// 07-08 explicit and fails loudly if the categorical work ever drifts the spine).
+#[test]
+fn learner_parity_categorical_no_regression_numeric_spine() {
+    // spine_real (offset==1 path).
+    if let Some(golden) = load_real_tree(&spine_real_fixture()) {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let bins = vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+        let grad = vec![
+            -6.0f32, -6.0, -5.0, -5.0, -1.0, -1.0, 1.0, 1.0, 5.0, 5.0, 6.0, 6.0,
+        ];
+        let (features, g, h, cfg, nl, md) =
+            single_feature_corpus(bins, 6, 0, real_upper_bounds(6), grad);
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, nl, md)
+            .with_features(features.clone());
+        let tree = learner.train(&g, &h, true).expect("spine_real train ok");
+        assert_real_tree_parity("no_regression:spine_real", &tree, &golden, 0.1);
+    }
+    // mfb_pos (the sparse-collapse offset==1 anchor).
+    if let Some(golden) = load_real_tree(&mfb_pos_real_fixture()) {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let bins = vec![0u32, 1, 2, 2, 2, 2, 2, 2, 3, 3, 1, 0];
+        let grad = vec![
+            -6.0f32, -3.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 4.0, 5.0, -3.0, -6.0,
+        ];
+        let (features, g, h, cfg, nl, md) =
+            single_feature_corpus(bins, 4, 0, real_upper_bounds_mfb(4), grad);
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, nl, md)
+            .with_features(features.clone());
+        let tree = learner.train(&g, &h, true).expect("mfb_pos_real train ok");
+        assert_real_tree_parity("no_regression:mfb_pos_real", &tree, &golden, 0.1);
+    }
+}

@@ -182,6 +182,19 @@ pub const METRIC_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
 /// byte-idempotent (empty `git diff` on a re-capture). Recorded in REFERENCE_MANIFEST.md.
 pub const METRIC_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W7
+/// categorical-split (TRL-06) oracle (plan 07-08). Reuses the SAME prebuilt-wheel
+/// binary; `categorical-oracle-capture` asserts the installed version matches
+/// BEFORE training so a wrong version can never silently emit divergent
+/// categorical goldens (threat T-07-08-SC).
+pub const CATEGORICAL_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W7 categorical oracle (plan 07-08).
+/// The SAME seed the learner oracle uses ([`LEARNER_ORACLE_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the categorical
+/// goldens byte-idempotent. Recorded in REFERENCE_MANIFEST.md.
+pub const CATEGORICAL_ORACLE_SEED: i32 = LEARNER_ORACLE_SEED;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -197,13 +210,14 @@ fn main() -> Result<()> {
         Some("dart-oracle-capture") => dart_oracle_capture(),
         Some("rf-oracle-capture") => rf_oracle_capture(),
         Some("metric-oracle-capture") => metric_oracle_capture(),
+        Some("categorical-oracle-capture") => categorical_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
-                 rf-oracle-capture | metric-oracle-capture)"
+                 rf-oracle-capture | metric-oracle-capture | categorical-oracle-capture)"
             );
         }
         None => {
@@ -912,6 +926,81 @@ fn learner_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- learner-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/learner/` \
+         is empty (byte-idempotent real-binary dump)."
+    );
+    Ok(())
+}
+
+/// `categorical-oracle-capture` (plan 07-08, TRL-06) — REAL lib_lightgbm 4.6
+/// CATEGORICAL learner-oracle capture. Trains single-tree regression models on
+/// synthetic categorical corpora (one-hot + many-vs-many) on the real prebuilt
+/// `lib_lightgbm` and dumps each model's authoritative v4 model text PLUS a JSON
+/// sidecar (per-row bins + `bin_2_categorical` + cat axis) under
+/// `crates/oracle-harness/tests/fixtures/categorical/`. The pip `lightgbm` is a
+/// CAPTURE-time tool only (version-asserted, never a crate dep, never read at
+/// `cargo test` time). NEVER `git add` the `LightGBM/` tree.
+fn categorical_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/categorical_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/categorical");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask categorical-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        CATEGORICAL_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = CATEGORICAL_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python (e.g. a venv) with \
+         `pip install lightgbm==4.6.0`. `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask categorical-oracle-capture: training the one-hot + many-vs-many \
+         categorical corpora on real lib_lightgbm and dumping goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(CATEGORICAL_ORACLE_SEED.to_string())
+            .arg(CATEGORICAL_ORACLE_LIGHTGBM_VERSION),
+        "categorical_oracle_capture.py",
+    )?;
+
+    for name in ["cat_onehot", "cat_manyvsmany"] {
+        for ext in [".txt", ".bins.json"] {
+            let p = out_dir.join(format!("{name}{ext}"));
+            if !p.is_file() {
+                bail!("capture completed but {} was not written", p.display());
+            }
+        }
+    }
+
+    eprintln!(
+        "xtask categorical-oracle-capture: done. Wrote cat_onehot/cat_manyvsmany \
+         goldens + sidecars under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- categorical-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/categorical/` \
          is empty (byte-idempotent real-binary dump)."
     );
     Ok(())
