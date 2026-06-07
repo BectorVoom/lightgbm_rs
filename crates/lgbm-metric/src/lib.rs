@@ -20,8 +20,10 @@
 
 pub mod binary;
 pub mod error;
+pub mod multiclass;
 pub mod regression;
 
 pub use binary::BinaryMetric;
 pub use error::MetricError;
+pub use multiclass::MultiLogloss;
 pub use regression::Metric;

@@ -22,12 +22,14 @@
 pub mod binary;
 pub mod custom;
 pub mod error;
+pub mod multiclass;
 pub mod percentile;
 pub mod regression;
 
 pub use binary::Binary;
 pub use custom::CustomObjective;
 pub use error::ObjectiveError;
+pub use multiclass::{MulticlassOva, MulticlassSoftmax};
 pub use regression::Objective;
 
 // Re-export the predict-side transform so downstream callers (metric / boosting /
