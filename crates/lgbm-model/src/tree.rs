@@ -349,6 +349,105 @@ impl Tree {
         self.num_leaves += 1;
     }
 
+    /// C++ `Tree::SplitCategorical` (`tree.cpp:77-98`) — grow `leaf` into an
+    /// internal CATEGORICAL node with two child leaves.
+    ///
+    /// Mirrors [`split`](Self::split) structurally (the same `Tree::Split` core
+    /// rewiring/leaf bookkeeping) but:
+    /// - sets the `kCategoricalMask` bit in `decision_type` (numerical splits clear
+    ///   it); `default_left` is NOT encoded (the categorical decision routes NaN /
+    ///   negative categories RIGHT, the in-bitset categories LEFT);
+    /// - stores `threshold = num_cat` (as f64) and `threshold_in_bin = num_cat`
+    ///   (the index into `cat_boundaries`), then `++num_cat`;
+    /// - appends the REAL category bitset (`cat_threshold_real`) into
+    ///   `cat_threshold` and the running offset into `cat_boundaries`
+    ///   (`cat_boundaries.back() + num_threshold`); the INNER (bin) bitset is used
+    ///   only for the (already-completed) data-partition routing and is NOT
+    ///   serialized.
+    ///
+    /// `cat_boundaries` is lazily seeded to `[0]` on the FIRST categorical split
+    /// (C++ initializes `cat_boundaries_ = {0}` at construction). `missing_type` is
+    /// the numeric C++ `MissingType` (0=None, 1=Zero, 2=NaN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_categorical(
+        &mut self,
+        leaf: i32,
+        feature: i32,
+        real_feature: i32,
+        cat_threshold_real: &[u32],
+        left_value: f64,
+        right_value: f64,
+        left_count: i32,
+        right_count: i32,
+        left_weight: f64,
+        right_weight: f64,
+        gain: f32,
+        missing_type: i8,
+    ) {
+        let new_node_idx = (self.num_leaves - 1) as usize;
+        let leaf_u = leaf as usize;
+        let new_leaf = self.num_leaves;
+
+        // Rewire the parent's child pointer to the new internal node.
+        let parent = self.leaf_parent[leaf_u];
+        if parent >= 0 {
+            let p = parent as usize;
+            if self.right_child[p] == !leaf {
+                self.right_child[p] = new_node_idx as i32;
+            } else {
+                self.left_child[p] = new_node_idx as i32;
+            }
+        }
+
+        // Append the new internal node's split metadata. `threshold` /
+        // `threshold_in_bin` both store `num_cat` (the categorical-node index into
+        // `cat_boundaries`), per tree.cpp:85-86.
+        self.split_feature_inner.push(feature);
+        self.split_feature.push(real_feature);
+        self.split_gain.push(gain);
+        self.threshold_in_bin.push(self.num_cat as u32);
+        self.threshold.push(self.num_cat as f64);
+        self.internal_value.push(self.leaf_value[leaf_u]);
+        self.internal_weight.push(0.0);
+        self.internal_count.push(left_count + right_count);
+        self.left_child.push(!leaf);
+        self.right_child.push(!new_leaf);
+
+        // Pack decision_type: CATEGORICAL bit set, default_left NOT set, plus the
+        // missing_type bits (tree.cpp:82-84).
+        let mut dt: i8 = 0;
+        dt |= CATEGORICAL_MASK;
+        dt |= (missing_type & 3) << 2;
+        self.decision_type.push(dt);
+
+        // Seed cat_boundaries = {0} on the first categorical split (C++ ctor
+        // initializes cat_boundaries_ with a single 0).
+        if self.cat_boundaries.is_empty() {
+            self.cat_boundaries.push(0);
+        }
+        let new_boundary = self.cat_boundaries.last().copied().unwrap_or(0)
+            + cat_threshold_real.len() as i32;
+        self.cat_boundaries.push(new_boundary);
+        self.cat_threshold.extend_from_slice(cat_threshold_real);
+        self.num_cat += 1;
+
+        // Reassign the split leaf's output to the LEFT child; append the RIGHT child.
+        self.leaf_value[leaf_u] = left_value;
+        self.leaf_weight[leaf_u] = left_weight;
+        self.leaf_count[leaf_u] = left_count;
+        self.leaf_value.push(right_value);
+        self.leaf_weight.push(right_weight);
+        self.leaf_count.push(right_count);
+
+        // Depth + parent bookkeeping.
+        self.leaf_depth.push(self.leaf_depth[leaf_u] + 1);
+        self.leaf_depth[leaf_u] += 1;
+        self.leaf_parent[leaf_u] = new_node_idx as i32;
+        self.leaf_parent.push(new_node_idx as i32);
+
+        self.num_leaves += 1;
+    }
+
     /// C++ `Tree::ToString` (`tree.cpp:339-409`) — the byte-exact per-tree block.
     ///
     /// Section order + per-field formatter mode are load-bearing for DAT-09:
@@ -890,6 +989,68 @@ mod tests {
         assert_eq!(get_missing_type(0b0000_0010), 0); // None
         assert_eq!(get_missing_type(0b0000_0110), 1); // Zero
         assert_eq!(get_missing_type(0b0000_1010), 2); // NaN
+    }
+
+    /// A single-leaf root tree (mirrors the learner's `root_tree`) for growth tests.
+    fn root_tree_for_test(root_output: f64, num_data: i32) -> Tree {
+        Tree {
+            num_leaves: 1,
+            num_cat: 0,
+            left_child: Vec::new(),
+            right_child: Vec::new(),
+            split_feature: Vec::new(),
+            threshold: Vec::new(),
+            decision_type: Vec::new(),
+            split_gain: Vec::new(),
+            leaf_value: vec![root_output],
+            leaf_weight: vec![0.0],
+            leaf_count: vec![num_data],
+            internal_value: Vec::new(),
+            internal_weight: Vec::new(),
+            internal_count: Vec::new(),
+            cat_boundaries: Vec::new(),
+            cat_threshold: Vec::new(),
+            shrinkage: 1.0,
+            is_linear: false,
+            leaf_depth: vec![0],
+            leaf_parent: vec![-1],
+            split_feature_inner: Vec::new(),
+            threshold_in_bin: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn split_categorical_sets_mask_and_threshold_num_cat() {
+        let mut t = root_tree_for_test(0.0, 10);
+        // Grow a categorical node on leaf 0, feature 2 with the REAL bitset for
+        // categories {1, 3} (bits 1 and 3 set -> 0b1010). `Tree::split_categorical`
+        // stores the bitset verbatim (the learner constructs it from category vals).
+        let cat_bitset = vec![0b1010u32];
+        t.split_categorical(0, 2, 2, &cat_bitset, -1.0, 2.0, 6, 4, 3.0, 2.0, 5.0, 0);
+        assert_eq!(t.num_leaves, 2);
+        assert_eq!(t.num_cat, 1);
+        // CATEGORICAL_MASK bit set, threshold == num_cat (0 for the first cat node).
+        assert!(get_decision_type(t.decision_type[0], CATEGORICAL_MASK));
+        assert_eq!(t.threshold[0], 0.0, "threshold stores the cat index (0)");
+        // cat_boundaries seeded [0] then pushed 0 + bitset length (1 block).
+        assert_eq!(t.cat_boundaries, vec![0, 1]);
+        assert_eq!(t.cat_threshold, vec![0b1010]);
+    }
+
+    #[test]
+    fn grown_categorical_tree_round_trips() {
+        let mut t = root_tree_for_test(0.0, 20);
+        let cat_bitset = vec![0b100100u32]; // bits 2 and 5
+        t.split_categorical(0, 1, 1, &cat_bitset, 1.5, -0.5, 12, 8, 4.0, 3.0, 7.0, 0);
+        let s = t.to_string();
+        // The model-text emits the num_cat>0 cat lines.
+        assert!(s.contains("num_cat=1"), "model-text has num_cat=1:\n{s}");
+        assert!(s.contains("cat_boundaries="), "has cat_boundaries:\n{s}");
+        assert!(s.contains("cat_threshold="), "has cat_threshold:\n{s}");
+        let parsed = Tree::parse(&s).expect("grown categorical tree round-trips");
+        assert_eq!(parsed.to_string(), s, "byte-stable round-trip");
+        assert_eq!(parsed.num_cat, 1);
+        assert!(get_decision_type(parsed.decision_type[0], CATEGORICAL_MASK));
     }
 
     #[test]
