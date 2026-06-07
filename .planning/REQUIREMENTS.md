@@ -49,7 +49,7 @@
 - [x] **BST-01**: GBDT training loop (`TrainOneIter`, `UpdateScore`, per-class trees, shrinkage, `boost_from_average`)
 - [x] **BST-02**: Score updater accumulation with deterministic reduction ordering
 - [x] **BST-03**: Bagging / row subsampling (`bagging_fraction`/`bagging_freq`/`bagging_seed`, pos/neg, `bagging_by_query`) with RNG-matching sequence *(06-05: BaggingSampleStrategy over FND-01 Random — D-13 RNG-replay golden bit-exact; regression L2 bagging bit-exact vs real binary; `bagging_by_query=true` is an explicit, decision-backed Phase-7 deferral — typed reject, not silent)*
-- [ ] **BST-04**: GOSS sample strategy (`top_rate`/`other_rate`) with matching gradient-magnitude sort and amplification factor
+- [x] **BST-04**: GOSS sample strategy (`top_rate`/`other_rate`) with matching gradient-magnitude sort and amplification factor
 - [ ] **BST-05**: DART boosting (`drop_rate`, `max_drop`, `skip_drop`, `uniform_drop`, `xgboost_dart_mode`, `drop_seed`)
 - [ ] **BST-06**: Random Forest boosting (averaged trees, mandatory bagging, no shrinkage accumulation)
 - [x] **BST-07**: Early stopping (`early_stopping_round`, `first_metric_only`, `early_stopping_min_delta`) *(06-05: EarlyStopping verbatim decision — kMinScore init, factor*score vs best + min_delta, first_metric_only, trailing-tree pop; best_iteration recorded; fires identically on the D-07 matrix)*
@@ -193,7 +193,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | MET-01 | Phase 6 | Complete |
 | MET-02 | Phase 6 | Complete |
 | API-01 | Phase 6 | Complete |
-| BST-04 | Phase 7 | Pending |
+| BST-04 | Phase 7 | Complete |
 | BST-05 | Phase 7 | Pending |
 | BST-06 | Phase 7 | Pending |
 | TRL-06 | Phase 7 | Pending |
