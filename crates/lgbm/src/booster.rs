@@ -11,19 +11,46 @@
 //! corpus (the capture's exact binning). Per-objective / bagging / early-stopping
 //! widen in 06-03..06-05.
 
+use lgbm_boosting::objective::BoostObjective;
 use lgbm_boosting::{Gbdt, IterSnapshot};
 use lgbm_compute::gain::GainConfig;
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
 use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::MissingType;
-use lgbm_metric::Metric;
+use lgbm_metric::{BinaryMetric, Metric};
 use lgbm_model::{GbdtModel, ObjectiveKind};
-use lgbm_objective::Objective;
+use lgbm_objective::{Binary, CustomObjective, Objective};
 use lgbm_treelearner::learner::FeatureColumn;
 use lgbm_treelearner::{offset_for_most_freq_bin, SerialTreeLearner};
 
 use crate::error::LgbmError;
+
+/// One configured eval metric — either a regression metric (raw-score) or a
+/// binary metric (prob-space / AUC). Unifies the per-round eval-history loop
+/// across objectives.
+enum EvalMetric {
+    /// A regression metric (`l1`/`l2`/`rmse`) over the raw score.
+    Reg(Metric),
+    /// A binary metric (`binary_logloss`/`binary_error`/`auc`).
+    Bin(BinaryMetric),
+}
+
+impl EvalMetric {
+    fn name(&self) -> String {
+        match self {
+            EvalMetric::Reg(m) => m.name().to_string(),
+            EvalMetric::Bin(m) => m.name().to_string(),
+        }
+    }
+
+    fn eval(&self, scores: &[f64], labels: &[f32]) -> Result<f64, LgbmError> {
+        match self {
+            EvalMetric::Reg(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
+            EvalMetric::Bin(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
+        }
+    }
+}
 
 /// A dense, identity-binned training corpus: raw integer-valued features (one
 /// column per feature, bin index == raw value) + f32 labels.
@@ -204,9 +231,65 @@ impl Booster {
 /// [`LgbmError`] for an unsupported objective/metric, an invalid corpus, or a
 /// loop/learner failure — never a panic (Security V5).
 pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError> {
-    // ---- objective (training side) + predict-side transform ----
-    let objective = Objective::from_config(config).map_err(LgbmError::Objective)?;
-    let objective_kind = ObjectiveKind::parse(&config.objective).map_err(LgbmError::Model)?;
+    // Resolve the training-side objective from config.objective (regression /
+    // regression_l1 / binary). The custom-closure path is `train_custom`.
+    let first = config.objective.split_whitespace().next().unwrap_or("");
+    let (boost_obj, transformed_labels): (BoostObjective<'static>, Vec<f32>) = match first {
+        "binary" => {
+            let b = Binary::new(config.sigmoid).map_err(LgbmError::Objective)?;
+            (BoostObjective::Binary(b), corpus.labels.clone())
+        }
+        _ => {
+            // regression / regression_l1 (+ aliases) route through the enum factory.
+            let o = Objective::from_config(config).map_err(LgbmError::Objective)?;
+            let lbl = o.transform_labels(&corpus.labels);
+            (BoostObjective::Builtin(o), lbl)
+        }
+    };
+    let metrics = eval_metrics_for(first, config.sigmoid);
+    train_inner(config, corpus, boost_obj, transformed_labels, metrics)
+}
+
+/// Train with a user-supplied `custom` objective closure (OBJ-02 / D-04). The
+/// closure maps the current raw scores (f32) to `(grad, hess)`; `boost_from_average`
+/// is forced OFF for custom (mirroring the C++ `obj == null` path).
+///
+/// # Errors
+/// [`LgbmError`] for an invalid corpus or a loop/learner failure; a wrong-length
+/// closure return surfaces as `LgbmError::Objective` (T-06-03-01), never a panic.
+pub fn train_custom<'a, F>(
+    config: &Config,
+    corpus: &DenseCorpus,
+    closure: F,
+) -> Result<Booster, LgbmError>
+where
+    F: Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a,
+{
+    let custom = CustomObjective::new(closure);
+    // The custom run's eval metric mirrors the capture (l2 over the raw score).
+    let metrics = vec![EvalMetric::Reg(Metric::L2)];
+    train_inner(
+        config,
+        corpus,
+        BoostObjective::Custom(custom),
+        corpus.labels.clone(),
+        metrics,
+    )
+}
+
+/// The shared training driver: identity-binned columns → the [`Gbdt`] loop →
+/// per-round eval history → [`Booster`]. Generic over the [`BoostObjective`].
+fn train_inner(
+    config: &Config,
+    corpus: &DenseCorpus,
+    boost_obj: BoostObjective<'_>,
+    labels: Vec<f32>,
+    metrics: Vec<EvalMetric>,
+) -> Result<Booster, LgbmError> {
+    let objective_kind = ObjectiveKind::parse(&config.objective)
+        // Custom objective (`objective = "custom"`/"none") has no predict-side
+        // transform: fall back to identity (regression) for predict_row_raw.
+        .unwrap_or(ObjectiveKind::Regression { sqrt: false });
 
     // ---- identity-binned feature columns ----
     let features = build_feature_columns(corpus)?;
@@ -217,9 +300,6 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
         .map(|f| f.real_feature_index)
         .max()
         .unwrap_or(-1);
-
-    // ---- transform labels (sqrt Init no-op for plain regression) ----
-    let labels = objective.transform_labels(&corpus.labels);
 
     // ---- the learner (single-output spine; K = num_class = 1) ----
     let backend = CpuBackend;
@@ -235,8 +315,8 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
     .with_features(features);
 
     // ---- the GBDT loop ----
-    let mut gbdt = Gbdt::new(
-        objective,
+    let mut gbdt = Gbdt::with_objective(
+        boost_obj,
         config.learning_rate,
         config.num_class.max(1),
         num_data,
@@ -247,20 +327,14 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
         .train(&mut learner, &labels, num_features, config.num_iterations)
         .map_err(LgbmError::Boosting)?;
 
-    // ---- eval history (per-round l2/rmse on the training scores) ----
-    // Mirrors Python record_evaluation on the training set: evaluate the metrics
-    // against the per-iter accumulated score + the labels. Config has no in-scope
-    // `metric` field (it is an eval-only param), so the spine evaluates the
-    // regression default metrics (l2, rmse) — matching the capture's
-    // `metric=["l2","rmse"]` L3 golden.
-    let metrics = default_regression_metrics();
+    // ---- eval history (per-round metrics on the training scores) ----
     let mut eval_history: Vec<(String, Vec<f64>)> = metrics
         .iter()
-        .map(|m| (m.name().to_string(), Vec::with_capacity(snaps.len())))
+        .map(|m| (m.name(), Vec::with_capacity(snaps.len())))
         .collect();
     for snap in &snaps {
         for (mi, m) in metrics.iter().enumerate() {
-            let v = m.eval(&snap.score, &corpus.labels).map_err(LgbmError::Metric)?;
+            let v = m.eval(&snap.score, &corpus.labels)?;
             eval_history[mi].1.push(v);
         }
     }
@@ -289,11 +363,21 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
     })
 }
 
-/// The regression-spine default eval metrics (l2, rmse) — matching the capture's
-/// `metric=["l2","rmse"]` L3 golden. (When the facade plumbs an explicit
-/// eval-metric list later, route it here.)
-fn default_regression_metrics() -> Vec<Metric> {
-    vec![Metric::L2, Metric::Rmse]
+/// The per-objective default eval metrics (matching the capture's `metric=` list):
+/// `[l2, rmse]` for regression, `[l1, l2, rmse]` for regression_l1,
+/// `[binary_logloss, binary_error, auc]` for binary.
+fn eval_metrics_for(objective_first_token: &str, sigmoid: f64) -> Vec<EvalMetric> {
+    match objective_first_token {
+        "binary" => vec![
+            EvalMetric::Bin(BinaryMetric::BinaryLogloss { sigmoid }),
+            EvalMetric::Bin(BinaryMetric::BinaryError { sigmoid }),
+            EvalMetric::Bin(BinaryMetric::Auc),
+        ],
+        "regression_l1" | "l1" | "mean_absolute_error" | "mae" => {
+            vec![EvalMetric::Reg(Metric::L1), EvalMetric::Reg(Metric::L2), EvalMetric::Reg(Metric::Rmse)]
+        }
+        _ => vec![EvalMetric::Reg(Metric::L2), EvalMetric::Reg(Metric::Rmse)],
+    }
 }
 
 /// `feature_names=` for the model text: `Column_0 Column_1 ...` (the LightGBM

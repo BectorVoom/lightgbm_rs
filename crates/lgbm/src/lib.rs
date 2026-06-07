@@ -15,8 +15,8 @@ pub mod booster;
 pub mod builder;
 pub mod error;
 
-// --- public training API (Phase 6, 06-02 spine) ---
-pub use booster::{train, Booster, DenseCorpus};
+// --- public training API (Phase 6) ---
+pub use booster::{train, train_custom, Booster, DenseCorpus};
 pub use builder::TrainingBuilder;
 pub use error::LgbmError;
 

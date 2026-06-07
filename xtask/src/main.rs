@@ -877,8 +877,8 @@ fn boosting_oracle_capture() -> Result<()> {
     )?;
 
     eprintln!(
-        "xtask boosting-oracle-capture: training the regression spine on real \
-         lib_lightgbm and dumping L1/L2/L3/L5 goldens ..."
+        "xtask boosting-oracle-capture: training the regression / regression_l1 / \
+         binary / custom cells on real lib_lightgbm and dumping L1/L2/L3/L5 goldens ..."
     );
     run(
         Command::new(&python)
@@ -890,12 +890,35 @@ fn boosting_oracle_capture() -> Result<()> {
     )?;
 
     for name in [
+        // regression (L2) spine.
         "regression_gh_iter1.txt",
         "regression_gh_iterN.txt",
         "regression_scores.txt",
         "regression_metrics.txt",
         "regression_spine_model.txt",
         "regression_spine_pred.txt",
+        // regression_l1.
+        "regression_l1_gh_iter1.txt",
+        "regression_l1_gh_iterN.txt",
+        "regression_l1_scores.txt",
+        "regression_l1_metrics.txt",
+        "regression_l1_spine_model.txt",
+        "regression_l1_spine_pred.txt",
+        // binary.
+        "binary_gh_iter1.txt",
+        "binary_gh_iterN.txt",
+        "binary_scores.txt",
+        "binary_metrics.txt",
+        "binary_spine_model.txt",
+        "binary_spine_pred.txt",
+        // custom (OBJ-02) + cross-anchor reference.
+        "custom_gh_iter1.txt",
+        "custom_gh_iterN.txt",
+        "custom_scores.txt",
+        "custom_metrics.txt",
+        "custom_spine_model.txt",
+        "custom_spine_pred.txt",
+        "custom_crossanchor_l2_model.txt",
     ] {
         let p = out_dir.join(name);
         if !p.is_file() {

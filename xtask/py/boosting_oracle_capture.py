@@ -74,10 +74,12 @@ def f32_bits_line(values):
                     for v in values)
 
 
-def base_params(seed):
+def base_params(seed, objective="regression", metric=None):
+    if metric is None:
+        metric = ["l2", "rmse"]
     return {
-        "objective": "regression",        # L2
-        "metric": ["l2", "rmse"],
+        "objective": objective,
+        "metric": metric,
         "boost_from_average": True,        # the C++ regression DEFAULT (D-15)
         "deterministic": True,
         "force_row_wise": True,
@@ -143,6 +145,108 @@ def spine_corpus():
     return X, labels, expected_most_freq
 
 
+def binary_corpus():
+    """The binary spine corpus: 2 features, 12 rows, identity-binned, 0/1 labels
+    with BOTH classes present (so ClassNeedTrain == true and pavg != 0/1)."""
+    f0 = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+    f1 = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]
+    X = np.array([f0, f1], dtype=np.float64).T
+    # 5 positives of 12 -> pavg = 5/12 (|init| > kEps); separable-ish by f0.
+    labels = np.array(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0],
+        dtype=np.float64,
+    )
+    expected_most_freq = [0, 0]
+    return X, labels, expected_most_freq
+
+
+def write_layered(out_dir, prefix, booster, X, labels, evals_result,
+                  metric_names, gh_fn, init, pred_transformed):
+    """Write the L1-L5 goldens for one objective cell.
+
+    gh_fn(score_prev, labels) -> (grad f32, hess f32) is the objective's
+    score-derivation g/h (the RESEARCH L1 recommendation: derive g/h from the
+    captured per-iter score, no fobj override of a built-in objective)."""
+    # L5: model text + transformed predict.
+    booster.save_model(os.path.join(out_dir, f"{prefix}_spine_model.txt"))
+    with open(os.path.join(out_dir, f"{prefix}_spine_pred.txt"), "w") as fh:
+        fh.write(f"# {prefix}_spine_pred — transformed predict() f64 bits\n")
+        fh.write(f64_bits_line(pred_transformed) + "\n")
+
+    # L2: per-iter raw score.
+    with open(os.path.join(out_dir, f"{prefix}_scores.txt"), "w") as fh:
+        fh.write(f"# {prefix}_scores — per-iter raw score; one line per k=1..N; f64 bits\n")
+        fh.write(f"# num_iterations={NUM_ITERATIONS} num_data={len(labels)}\n")
+        for k in range(1, NUM_ITERATIONS + 1):
+            raw_k = booster.predict(X, raw_score=True, num_iteration=k)
+            fh.write(f64_bits_line(raw_k) + "\n")
+
+    # L1 iter 1: score_0 = init for every row (BoostFromAverage).
+    score0 = np.full(len(labels), init, dtype=np.float64)
+    grad1, hess1 = gh_fn(score0, labels)
+    with open(os.path.join(out_dir, f"{prefix}_gh_iter1.txt"), "w") as fh:
+        fh.write(f"# {prefix}_gh_iter1 — iter-1 per-row grad/hess; f32 bits; GRAD then HESS\n")
+        fh.write("GRAD " + f32_bits_line(grad1) + "\n")
+        fh.write("HESS " + f32_bits_line(hess1) + "\n")
+
+    # L1 later iter.
+    score_prev = np.asarray(booster.predict(X, raw_score=True, num_iteration=LATER_ITER - 1))
+    gradN, hessN = gh_fn(score_prev, labels)
+    with open(os.path.join(out_dir, f"{prefix}_gh_iterN.txt"), "w") as fh:
+        fh.write(f"# {prefix}_gh_iterN — iter-{LATER_ITER} per-row grad/hess; f32 bits; GRAD then HESS\n")
+        fh.write(f"# iter={LATER_ITER} init={init!r}\n")
+        fh.write("GRAD " + f32_bits_line(gradN) + "\n")
+        fh.write("HESS " + f32_bits_line(hessN) + "\n")
+
+    # L3: per-round metrics.
+    with open(os.path.join(out_dir, f"{prefix}_metrics.txt"), "w") as fh:
+        fh.write(f"# {prefix}_metrics — per-round {' + '.join(metric_names)} (record_evaluation); f64 bits\n")
+        for metric in metric_names:
+            vals = evals_result["training"][metric]
+            fh.write(f"{metric} " + f64_bits_line(vals) + "\n")
+
+
+def l2_gh(score_prev, labels):
+    grad = (np.asarray(score_prev) - labels).astype(np.float32)
+    hess = np.ones(len(labels), dtype=np.float32)
+    return grad, hess
+
+
+def l1_gh(score_prev, labels):
+    diff = np.asarray(score_prev) - labels
+    grad = np.sign(diff).astype(np.float32)
+    hess = np.ones(len(labels), dtype=np.float32)
+    return grad, hess
+
+
+def binary_gh(score_prev, labels, sigmoid=1.0):
+    s = np.asarray(score_prev, dtype=np.float64)
+    label_val = np.where(labels > 0, 1.0, -1.0)
+    response = -label_val * sigmoid / (1.0 + np.exp(label_val * sigmoid * s))
+    abs_resp = np.abs(response)
+    grad = response.astype(np.float32)
+    hess = (abs_resp * (sigmoid - abs_resp)).astype(np.float32)
+    return grad, hess
+
+
+def median_percentile(values, alpha=0.5):
+    """Reproduce the C++ PercentileFun median (the BoostFromScore L1 init)."""
+    cnt = len(values)
+    if cnt <= 1:
+        return float(values[0]) if cnt == 1 else 0.0
+    desc = np.sort(np.asarray(values, dtype=np.float64))[::-1]
+    float_pos = (cnt - 1) * (1.0 - alpha)
+    pos = int(float_pos) + 1
+    if pos < 1:
+        return float(desc[0])
+    if pos >= cnt:
+        return float(desc[cnt - 1])
+    bias = float_pos - (pos - 1)
+    v1 = desc[pos - 1]
+    v2 = desc[pos]
+    return float(v1 - (v1 - v2) * bias)
+
+
 def main():
     out_dir = sys.argv[1]
     seed = int(sys.argv[2])
@@ -153,72 +257,111 @@ def main():
     )
 
     os.makedirs(out_dir, exist_ok=True)
-    X, labels, expected_most_freq = spine_corpus()
 
-    p = base_params(seed)
+    # ============================ regression (L2) spine ============================
+    X, labels, expected_most_freq = spine_corpus()
+    p = base_params(seed, "regression", ["l2", "rmse"])
     dtrain = lgb.Dataset(X, label=labels, free_raw_data=False)
     dtrain.construct()
     assert_identity_binning(X, expected_most_freq)
-
     evals_result = {}
     booster = lgb.train(
-        p,
-        dtrain,
-        num_boost_round=NUM_ITERATIONS,
-        valid_sets=[dtrain],
-        valid_names=["training"],
+        p, dtrain, num_boost_round=NUM_ITERATIONS,
+        valid_sets=[dtrain], valid_names=["training"],
         callbacks=[lgb.record_evaluation(evals_result)],
     )
-
-    # ---- L5: model text + transformed predict ----
-    booster.save_model(os.path.join(out_dir, "regression_spine_model.txt"))
-    pred = booster.predict(X)  # transformed (identity for regression)
-    with open(os.path.join(out_dir, "regression_spine_pred.txt"), "w") as fh:
-        fh.write("# regression_spine_pred — transformed predict() f64 bits\n")
-        fh.write(f64_bits_line(pred) + "\n")
-
-    # ---- L2: per-iteration accumulated raw score ----
-    # predict(raw_score=True, num_iteration=k) == the internal score_ after k iters
-    # (RESEARCH Open-Q2/A4: this cell verifies score_ == predict(raw,k)).
-    with open(os.path.join(out_dir, "regression_scores.txt"), "w") as fh:
-        fh.write("# regression_scores — per-iter raw score; one line per k=1..N; f64 bits\n")
-        fh.write(f"# num_iterations={NUM_ITERATIONS} num_data={len(labels)}\n")
-        for k in range(1, NUM_ITERATIONS + 1):
-            raw_k = booster.predict(X, raw_score=True, num_iteration=k)
-            fh.write(f64_bits_line(raw_k) + "\n")
-
-    # ---- L1: per-row grad/hess (DERIVED from per-iter scores) ----
-    # regression-L2: grad_k[i] = score_{k-1}[i] - label[i], hess = 1.
-    # iter 1: score_0 = init (label mean, added by BoostFromAverage). With
-    # boost_from_average=true the iter-1 input score IS the init score for all rows.
     init = float(np.mean(labels))
-    score0 = np.full(len(labels), init, dtype=np.float64)
-    grad1 = (score0 - labels).astype(np.float32)
-    hess1 = np.ones(len(labels), dtype=np.float32)
-    with open(os.path.join(out_dir, "regression_gh_iter1.txt"), "w") as fh:
-        fh.write("# regression_gh_iter1 — iter-1 per-row grad/hess; f32 bits; "
-                 "GRAD then HESS\n")
-        fh.write("GRAD " + f32_bits_line(grad1) + "\n")
-        fh.write("HESS " + f32_bits_line(hess1) + "\n")
+    write_layered(out_dir, "regression", booster, X, labels, evals_result,
+                  ["l2", "rmse"], l2_gh, init, booster.predict(X))
 
-    score_prev = booster.predict(X, raw_score=True, num_iteration=LATER_ITER - 1)
-    gradN = (np.asarray(score_prev) - labels).astype(np.float32)
-    hessN = np.ones(len(labels), dtype=np.float32)
-    with open(os.path.join(out_dir, "regression_gh_iterN.txt"), "w") as fh:
-        fh.write(f"# regression_gh_iterN — iter-{LATER_ITER} per-row grad/hess; "
-                 "f32 bits; GRAD then HESS\n")
-        fh.write(f"# iter={LATER_ITER} init={init!r}\n")
-        fh.write("GRAD " + f32_bits_line(gradN) + "\n")
-        fh.write("HESS " + f32_bits_line(hessN) + "\n")
+    # ============================ regression_l1 ============================
+    Xl, ll, mfq = spine_corpus()  # continuous labels work for l1 too (D-08)
+    pl = base_params(seed, "regression_l1", ["l1", "l2", "rmse"])
+    dl = lgb.Dataset(Xl, label=ll, free_raw_data=False)
+    dl.construct()
+    er_l1 = {}
+    b_l1 = lgb.train(
+        pl, dl, num_boost_round=NUM_ITERATIONS,
+        valid_sets=[dl], valid_names=["training"],
+        callbacks=[lgb.record_evaluation(er_l1)],
+    )
+    init_l1 = median_percentile(ll, 0.5)  # L1 BoostFromScore = label median
+    write_layered(out_dir, "regression_l1", b_l1, Xl, ll, er_l1,
+                  ["l1", "l2", "rmse"], l1_gh, init_l1, b_l1.predict(Xl))
+    # Per-leaf renew golden (Pitfall 2/3): the l1 leaf values ARE the median
+    # residual, NOT the learner Newton output. The committed model text leaf values
+    # (in regression_l1_spine_model.txt) carry this; the dedicated assertion in
+    # boosting_parity replays them. No extra file needed — the model text IS the
+    # renew golden (its leaf values are the renewed medians).
 
-    # ---- L3: per-round metrics ----
-    with open(os.path.join(out_dir, "regression_metrics.txt"), "w") as fh:
-        fh.write("# regression_metrics — per-round l2 + rmse (record_evaluation); f64 bits\n")
-        for metric in ("l2", "rmse"):
-            vals = evals_result["training"][metric]
-            fh.write(f"{metric} " + f64_bits_line(vals) + "\n")
+    # ============================ binary ============================
+    Xb, lb, mfqb = binary_corpus()
+    pb = base_params(seed, "binary", ["binary_logloss", "binary_error", "auc"])
+    db = lgb.Dataset(Xb, label=lb, free_raw_data=False)
+    db.construct()
+    assert_identity_binning(Xb, mfqb)
+    er_b = {}
+    b_bin = lgb.train(
+        pb, db, num_boost_round=NUM_ITERATIONS,
+        valid_sets=[db], valid_names=["training"],
+        callbacks=[lgb.record_evaluation(er_b)],
+    )
+    # binary BoostFromScore: logit of clamped pavg.
+    pavg = float(np.mean(lb > 0))
+    keps = 1e-15
+    pavg = min(max(pavg, keps), 1.0 - keps)
+    init_b = float(np.log(pavg / (1.0 - pavg)) / 1.0)
+    write_layered(out_dir, "binary", b_bin, Xb, lb, er_b,
+                  ["binary_logloss", "binary_error", "auc"], binary_gh,
+                  init_b, b_bin.predict(Xb))
 
-    print("boosting_oracle_capture: wrote L1/L2/L3/L5 goldens to %s" % out_dir)
+    # ============================ custom (OBJ-02 cross-anchor) ============================
+    # The custom run uses a Python fobj that replicates the L2 objective's g/h
+    # (grad = score - label, hess = 1) — chosen DELIBERATELY so the custom run is
+    # cross-anchorable to the native regression(L2) cell. Because custom forces
+    # boost_from_average OFF (obj == null), we capture the L2 reference cell with
+    # boost_from_average=False so the two are genuinely comparable (same g/h, same
+    # init=0 => same trees => bit-identical model text). See REFERENCE_MANIFEST.md.
+    Xc, lc, mfqc = spine_corpus()
+
+    def fobj(preds, dataset):
+        # LightGBM 4.x custom objective (params["objective"] = callable):
+        # signature (y_pred, dataset) -> (grad, hess).
+        y = dataset.get_label()
+        grad = (preds - y).astype(np.float64)
+        hess = np.ones(len(y), dtype=np.float64)
+        return grad, hess
+
+    def feval(preds, dataset):
+        y = dataset.get_label()
+        return ("l2", float(np.mean((preds - y) ** 2)), False)
+
+    pc = base_params(seed, "regression", ["l2"])
+    pc["boost_from_average"] = False   # custom forces bfa OFF
+    pc["objective"] = fobj             # custom objective callable (4.x API)
+    dc = lgb.Dataset(Xc, label=lc, free_raw_data=False)
+    dc.construct()
+    er_c = {}
+    b_custom = lgb.train(
+        pc, dc, num_boost_round=NUM_ITERATIONS,
+        valid_sets=[dc], valid_names=["training"],
+        feval=feval,
+        callbacks=[lgb.record_evaluation(er_c)],
+    )
+    write_layered(out_dir, "custom", b_custom, Xc, lc, er_c, ["l2"],
+                  l2_gh, 0.0, b_custom.predict(Xc, raw_score=True))
+
+    # The cross-anchor L2 reference cell: native regression(L2) with bfa OFF (so the
+    # init is 0, matching custom) — its model text must bit-match custom's.
+    p_ref = base_params(seed, "regression", ["l2"])
+    p_ref["boost_from_average"] = False
+    d_ref = lgb.Dataset(Xc, label=lc, free_raw_data=False)
+    d_ref.construct()
+    b_ref = lgb.train(p_ref, d_ref, num_boost_round=NUM_ITERATIONS)
+    b_ref.save_model(os.path.join(out_dir, "custom_crossanchor_l2_model.txt"))
+
+    print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom "
+          "L1-L5 goldens to %s" % out_dir)
 
 
 if __name__ == "__main__":

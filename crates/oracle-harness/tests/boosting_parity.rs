@@ -25,7 +25,7 @@
 
 use std::path::PathBuf;
 
-use lgbm::{train, Booster, DenseCorpus, TrainingBuilder};
+use lgbm::{train, train_custom, Booster, DenseCorpus, TrainingBuilder};
 use oracle_harness::comparator::{
     compare_exact_f64_bits, compare_within, ORACLE_TOL,
 };
@@ -53,23 +53,153 @@ fn spine_corpus() -> DenseCorpus {
     DenseCorpus { features, labels }
 }
 
-/// Train the spine the SAME way the capture did (regression L2, 10 iters, lr 0.1,
-/// num_leaves 4, boost_from_average=true, deterministic, identity binning).
-fn train_spine() -> (Booster, DenseCorpus) {
-    let corpus = spine_corpus();
-    let cfg = TrainingBuilder::new()
-        .objective("regression")
+/// The binary spine corpus, identical to `boosting_oracle_capture.py::binary_corpus`
+/// (12 rows, 0/1 labels, both classes present).
+fn binary_corpus() -> DenseCorpus {
+    let f0 = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+    let f1 = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
+    let features: Vec<Vec<f64>> = (0..12).map(|i| vec![f0[i] as f64, f1[i] as f64]).collect();
+    let labels = vec![
+        0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+    ];
+    DenseCorpus { features, labels }
+}
+
+/// A builder shared across the cells: 10 iters, lr 0.1, num_leaves 4,
+/// deterministic, the recorded seed.
+fn cell_builder(objective: &str, bfa: bool) -> TrainingBuilder {
+    TrainingBuilder::new()
+        .objective(objective)
         .num_iterations(10)
         .learning_rate(0.1)
         .num_leaves(4)
         .min_data_in_leaf(1)
-        .boost_from_average(true)
+        .boost_from_average(bfa)
         .seed(SPINE_SEED)
         .deterministic(true)
-        .build()
-        .expect("valid spine config");
+}
+
+/// Train the regression(L2) spine the SAME way the capture did.
+fn train_spine() -> (Booster, DenseCorpus) {
+    let corpus = spine_corpus();
+    let cfg = cell_builder("regression", true).build().expect("valid spine config");
     let booster = train(&cfg, &corpus).expect("spine train ok");
     (booster, corpus)
+}
+
+/// Train the regression_l1 cell (Sign grad, median init, median-residual renew).
+fn train_regression_l1() -> (Booster, DenseCorpus) {
+    let corpus = spine_corpus(); // continuous labels (D-08)
+    let cfg = cell_builder("regression_l1", true).build().expect("valid l1 config");
+    let booster = train(&cfg, &corpus).expect("l1 train ok");
+    (booster, corpus)
+}
+
+/// Train the binary cell (sigmoid grad/hess, logit init).
+fn train_binary() -> (Booster, DenseCorpus) {
+    let corpus = binary_corpus();
+    let cfg = cell_builder("binary", true).build().expect("valid binary config");
+    let booster = train(&cfg, &corpus).expect("binary train ok");
+    (booster, corpus)
+}
+
+/// Train the custom cell: an L2-equivalent closure (grad = score - label, hess = 1)
+/// with boost_from_average forced OFF (matching the capture's bfa-off custom run).
+fn train_custom_cell() -> (Booster, DenseCorpus) {
+    let corpus = spine_corpus();
+    let cfg = cell_builder("regression", false).build().expect("valid custom config");
+    let labels = corpus.labels.clone();
+    let booster = train_custom(&cfg, &corpus, move |preds: &[f64]| {
+        // f64-subtract then f32-cast (the native L2 g/h op order — the cross-anchor).
+        let grad: Vec<f32> = preds
+            .iter()
+            .zip(labels.iter())
+            .map(|(&p, &l)| (p - l as f64) as f32)
+            .collect();
+        let hess = vec![1.0f32; preds.len()];
+        (grad, hess)
+    })
+    .expect("custom train ok");
+    (booster, corpus)
+}
+
+/// Assert a booster's per-tree leaf values bit-match a golden model text file, and
+/// (optionally) its predict() within ORACLE_TOL.
+fn assert_model_and_pred(booster: &Booster, corpus: &DenseCorpus, model_file: &str, pred_file: &str) {
+    let Some(model_text) = read_golden(model_file) else {
+        return;
+    };
+    let golden = lgbm_model::model_text::load(&model_text).expect("parse golden model");
+    let rust = booster.model();
+    assert_eq!(
+        rust.trees.len(),
+        golden.trees.len(),
+        "{model_file}: tree count rust {} != golden {}",
+        rust.trees.len(),
+        golden.trees.len()
+    );
+    for (i, (rt, gt)) in rust.trees.iter().zip(golden.trees.iter()).enumerate() {
+        compare_exact_f64_bits(&rt.leaf_value, &gt.leaf_value)
+            .unwrap_or_else(|m| panic!("{model_file} tree {i} leaf_value not bit-exact: {m:?}"));
+    }
+    if let Some(pred_text) = read_golden(pred_file) {
+        let golden_pred: Vec<f32> = pred_text
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(|l| parse_f64_bits_line(l).into_iter().map(|v| v as f32).collect())
+            .expect("pred line");
+        let rust_pred: Vec<f32> = corpus
+            .features
+            .iter()
+            .map(|row| booster.predict_row(row)[0])
+            .collect();
+        compare_within(&rust_pred, &golden_pred, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{pred_file} predict() not within ORACLE_TOL: {m:?}"));
+    }
+}
+
+/// Assert a booster's per-iter scores bit-match a golden scores file.
+fn assert_scores(booster: &Booster, scores_file: &str) {
+    let Some(scores_text) = read_golden(scores_file) else {
+        return;
+    };
+    let golden_lines: Vec<Vec<f64>> = scores_text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .map(parse_f64_bits_line)
+        .collect();
+    assert_eq!(
+        golden_lines.len(),
+        booster.iter_scores.len(),
+        "{scores_file}: iter count golden {} != rust {}",
+        golden_lines.len(),
+        booster.iter_scores.len()
+    );
+    for (k, (rust_k, golden_k)) in booster.iter_scores.iter().zip(golden_lines.iter()).enumerate() {
+        compare_exact_f64_bits(rust_k, golden_k)
+            .unwrap_or_else(|m| panic!("{scores_file} iter {} not bit-exact: {m:?}", k + 1));
+    }
+}
+
+/// Assert iter-1 and iter-N g/h within ORACLE_TOL vs the golden g/h files.
+fn assert_gradients(booster: &Booster, gh1_file: &str, ghn_file: &str) {
+    if let Some(gh1) = read_golden(gh1_file) {
+        let (g_golden, h_golden) = parse_gh(&gh1);
+        let (g_rust, h_rust) = &booster.iter_grad_hess[0];
+        compare_within(g_rust, &g_golden, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{gh1_file} iter-1 grad not within ORACLE_TOL: {m:?}"));
+        compare_within(h_rust, &h_golden, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{gh1_file} iter-1 hess not within ORACLE_TOL: {m:?}"));
+    }
+    if let Some(ghn) = read_golden(ghn_file) {
+        let (g_golden, h_golden) = parse_gh(&ghn);
+        let later = 5usize;
+        let (g_rust, h_rust) = &booster.iter_grad_hess[later - 1];
+        compare_within(g_rust, &g_golden, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{ghn_file} iter-{later} grad not within ORACLE_TOL: {m:?}"));
+        compare_within(h_rust, &h_golden, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{ghn_file} iter-{later} hess not within ORACLE_TOL: {m:?}"));
+    }
 }
 
 /// Parse a whitespace-separated line of u64 bit patterns into `Vec<f64>` (the L2
@@ -230,11 +360,134 @@ fn early_stopping() {
     panic!("MISSING — implemented in wave 4 (06-05)");
 }
 
+// ========================= regression_l1 (06-03) =========================
+
 #[test]
-#[ignore = "MISSING — implemented in wave 3 (06-03+): custom (D-04 closure) objective parity"]
+fn regression_l1_spine_end_to_end() {
+    // L5: the l1 leaf values ARE the median residual (RenewTreeOutput), NOT the
+    // learner Newton output (Pitfall 2/3). The committed model text carries the
+    // renewed medians; bit-matching it proves the renew body is correct.
+    let (booster, corpus) = train_regression_l1();
+    assert_model_and_pred(
+        &booster,
+        &corpus,
+        "regression_l1_spine_model.txt",
+        "regression_l1_spine_pred.txt",
+    );
+}
+
+#[test]
+fn regression_l1_score_accumulation() {
+    let (booster, _) = train_regression_l1();
+    assert_scores(&booster, "regression_l1_scores.txt");
+}
+
+#[test]
+fn regression_l1_gradients() {
+    let (booster, _) = train_regression_l1();
+    assert_gradients(
+        &booster,
+        "regression_l1_gh_iter1.txt",
+        "regression_l1_gh_iterN.txt",
+    );
+}
+
+#[test]
+fn regression_l1_renew_leaf_is_median_residual() {
+    // Dedicated Pitfall 2/3 assertion: the l1 leaf values bit-match the golden's
+    // (which are the median residuals the real binary's RenewTreeOutput produced),
+    // and are DISTINCT from what an L2 (Newton) tree on the same corpus would give
+    // — proving the median-residual renew is actually applied, not the learner
+    // output. (assert_model_and_pred already bit-checks the leaves; here we add the
+    // negative control: the l1 leaves differ from the L2 leaves.)
+    let Some(l1_text) = read_golden("regression_l1_spine_model.txt") else {
+        return;
+    };
+    let (booster, _) = train_regression_l1();
+    let golden = lgbm_model::model_text::load(&l1_text).expect("parse l1 golden");
+    // The Rust l1 leaves bit-match the golden (renew applied).
+    for (i, (rt, gt)) in booster.model().trees.iter().zip(golden.trees.iter()).enumerate() {
+        compare_exact_f64_bits(&rt.leaf_value, &gt.leaf_value)
+            .unwrap_or_else(|m| panic!("l1 tree {i} renewed leaf not bit-exact: {m:?}"));
+    }
+    // Negative control: train L2 on the same corpus; its tree-0 leaf values must
+    // DIFFER from the l1 renewed ones (else the renew would be a silent no-op).
+    let (l2_booster, _) = train_spine();
+    let l1_leaves = &booster.model().trees[1].leaf_value; // tree 1 (tree 0 folds bfa)
+    let l2_leaves = &l2_booster.model().trees[1].leaf_value;
+    assert!(
+        l1_leaves != l2_leaves,
+        "l1 renewed leaves must differ from L2 Newton leaves (renew is load-bearing)"
+    );
+}
+
+// ========================= binary (06-03) =========================
+
+#[test]
+fn binary_spine_end_to_end() {
+    let (booster, corpus) = train_binary();
+    assert_model_and_pred(
+        &booster,
+        &corpus,
+        "binary_spine_model.txt",
+        "binary_spine_pred.txt",
+    );
+}
+
+#[test]
+fn binary_score_accumulation() {
+    let (booster, _) = train_binary();
+    assert_scores(&booster, "binary_scores.txt");
+}
+
+#[test]
+fn binary_gradients() {
+    let (booster, _) = train_binary();
+    assert_gradients(&booster, "binary_gh_iter1.txt", "binary_gh_iterN.txt");
+}
+
+// ========================= custom (OBJ-02, 06-03) =========================
+
+#[test]
 fn custom_objective() {
-    // The D-04 custom-objective closure path produces the same g/h + tree.
-    panic!("MISSING — implemented in wave 3 (06-03)");
+    // The D-04 custom-objective closure (L2-equivalent g/h, bfa OFF) replays the
+    // captured custom golden (model text + scores + g/h) — the closure is invoked
+    // in place of GetGradients.
+    let (booster, corpus) = train_custom_cell();
+    assert_model_and_pred(
+        &booster,
+        &corpus,
+        "custom_spine_model.txt",
+        "custom_spine_pred.txt",
+    );
+    assert_scores(&booster, "custom_scores.txt");
+    assert_gradients(&booster, "custom_gh_iter1.txt", "custom_gh_iterN.txt");
+}
+
+#[test]
+fn custom_cross_anchored_to_native_regression_l2() {
+    // OBJ-02 cross-anchor: the custom run's end-to-end model text bit-matches the
+    // NATIVE regression(L2) cell captured with boost_from_average=OFF
+    // (`custom_crossanchor_l2_model.txt`) — same g/h ⇒ same trees ⇒ same model.
+    // This anchors the custom path to a real C++ objective (no distinct custom
+    // objective exists to diff). The comparison basis (bfa-off, init=0) is recorded
+    // in the REFERENCE_MANIFEST.
+    let Some(anchor_text) = read_golden("custom_crossanchor_l2_model.txt") else {
+        return;
+    };
+    let (booster, _) = train_custom_cell();
+    let anchor = lgbm_model::model_text::load(&anchor_text).expect("parse cross-anchor model");
+    let rust = booster.model();
+    assert_eq!(
+        rust.trees.len(),
+        anchor.trees.len(),
+        "cross-anchor tree count mismatch"
+    );
+    for (i, (rt, at)) in rust.trees.iter().zip(anchor.trees.iter()).enumerate() {
+        compare_exact_f64_bits(&rt.leaf_value, &at.leaf_value).unwrap_or_else(|m| {
+            panic!("custom tree {i} leaf_value != native regression(L2 bfa-off): {m:?}")
+        });
+    }
 }
 
 #[test]

@@ -8,14 +8,23 @@
 //!   nullptr`, `TrainOneIter(gradients, hessians)` is called with the
 //!   USER-SUPPLIED grad/hess and BoostFromAverage is skipped (`obj == null`).
 //! - Python `fobj(preds, train_data) -> (grad, hess)` — `preds` is the current
-//!   RAW accumulated margin (the f32-cast `score_`), shape `num_data * num_class`.
+//!   RAW accumulated margin (f64 `score_`), shape `num_data * num_class`.
 //!
 //! ## D-04 Rust mapping
 //! The closure is invoked by the GBDT loop at step (2) IN PLACE of
-//! `Objective::get_gradients`, passing the current `score_` cast to f32 (mirroring
-//! Python's f32 `preds`). Its returned `(grad, hess)` replace the built-in
-//! formula's output. `boost_from_average` is forced OFF for custom (mirroring the
-//! C++ `obj == null` BoostFromAverage skip).
+//! `Objective::get_gradients`, passing the current `score_` as `&[f64]` (the raw
+//! accumulated margin). Its returned `(grad, hess)` replace the built-in formula's
+//! output. `boost_from_average` is forced OFF for custom (mirroring the C++ `obj ==
+//! null` BoostFromAverage skip).
+//!
+//! **`preds` precision (DEVIATION from RESEARCH D-04):** RESEARCH said to pass the
+//! score "cast to f32 (mirror Python's f32 preds)". But LightGBM 4.6's Python
+//! wrapper actually passes the raw margin as **f64** to a custom objective
+//! (verified empirically — `preds.dtype == float64`). Casting to f32 first breaks
+//! bit-exact parity with the native cross-anchor (a custom L2-equivalent closure
+//! must reproduce the native regression(L2) g/h, which subtracts in f64). So this
+//! port passes `&[f64]` preds — the real-binary behavior is authoritative over the
+//! inferred default (06-03 Task 3, Rule 1).
 //!
 //! The D-04 contract names `Fn(preds: &[f32], dataset: &Dataset) -> (Vec<f32>,
 //! Vec<f32>)`. Here the closure closes over whatever dataset metadata it needs
@@ -35,21 +44,22 @@
 use crate::error::ObjectiveError;
 
 /// A user-supplied custom objective: a closure mapping the current raw scores
-/// (`preds`, f32) to per-row `(gradients, hessians)`.
+/// (`preds`, f64) to per-row `(gradients, hessians)`.
 ///
 /// Construct with [`CustomObjective::new`]; invoke via
 /// [`CustomObjective::get_gradients`], which validates the returned lengths.
 pub struct CustomObjective<'a> {
-    closure: Box<dyn Fn(&[f32]) -> (Vec<f32>, Vec<f32>) + 'a>,
+    closure: Box<dyn Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a>,
 }
 
 impl<'a> CustomObjective<'a> {
-    /// Wrap a `preds -> (grad, hess)` closure (the D-04 `fobj` mapping). The
-    /// closure closes over any dataset metadata (labels/weights) it needs, exactly
-    /// like Python's `fobj` closes over `train_data`.
+    /// Wrap a `preds -> (grad, hess)` closure (the D-04 `fobj` mapping). `preds` is
+    /// the raw accumulated margin (`&[f64]`, matching LightGBM 4.6's Python
+    /// wrapper). The closure closes over any dataset metadata (labels/weights) it
+    /// needs, exactly like Python's `fobj` closes over `train_data`.
     pub fn new<F>(closure: F) -> Self
     where
-        F: Fn(&[f32]) -> (Vec<f32>, Vec<f32>) + 'a,
+        F: Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a,
     {
         Self {
             closure: Box::new(closure),
@@ -60,9 +70,10 @@ impl<'a> CustomObjective<'a> {
     /// `(grad, hess)` into the caller's buffers (mirroring
     /// `Objective::get_gradients`'s in-place contract).
     ///
-    /// `score` is the f64 accumulated raw score; it is cast to f32 before the call
-    /// (mirroring Python's f32 `preds`). The closure's returned `(grad, hess)`
-    /// MUST each have length `score.len()` (== `num_data * num_class`).
+    /// `score` is the f64 accumulated raw score, passed to the closure verbatim as
+    /// `&[f64]` (LightGBM 4.6 hands a custom objective f64 preds). The closure's
+    /// returned `(grad, hess)` MUST each have length `score.len()` (== `num_data *
+    /// num_class`).
     ///
     /// # Errors
     /// [`ObjectiveError::LengthMismatch`] (V5, T-06-03-01) if the closure returns a
@@ -75,9 +86,7 @@ impl<'a> CustomObjective<'a> {
         hessians: &mut [f32],
     ) -> Result<(), ObjectiveError> {
         let n = score.len();
-        // Mirror Python's f32 preds: cast the raw f64 score to f32 before the call.
-        let preds: Vec<f32> = score.iter().map(|&s| s as f32).collect();
-        let (grad, hess) = (self.closure)(&preds);
+        let (grad, hess) = (self.closure)(score);
         if grad.len() != n {
             return Err(ObjectiveError::LengthMismatch {
                 expected: n,
@@ -111,8 +120,13 @@ mod tests {
         // A custom L2-equivalent fobj: grad = score - label, hess = 1 (the
         // DELIBERATE cross-anchor choice — same g/h as native regression(L2)).
         let labels = [1.0f32, 2.0, 3.0];
-        let obj = CustomObjective::new(|preds: &[f32]| {
-            let grad: Vec<f32> = preds.iter().zip(labels.iter()).map(|(&p, &l)| p - l).collect();
+        let obj = CustomObjective::new(|preds: &[f64]| {
+            // f64-subtract then f32-cast (mirroring the native L2 g/h op order).
+            let grad: Vec<f32> = preds
+                .iter()
+                .zip(labels.iter())
+                .map(|(&p, &l)| (p - l as f64) as f32)
+                .collect();
             let hess = vec![1.0f32; preds.len()];
             (grad, hess)
         });
@@ -128,7 +142,7 @@ mod tests {
     fn custom_wrong_length_grad_is_typed_error_not_panic() {
         // Returns a too-short grad vector — must be a typed error, never an OOB
         // index / panic (T-06-03-01, Security V5).
-        let obj = CustomObjective::new(|_preds: &[f32]| (vec![0.0f32; 1], vec![1.0f32; 3]));
+        let obj = CustomObjective::new(|_preds: &[f64]| (vec![0.0f32; 1], vec![1.0f32; 3]));
         let score = [1.0f64, 2.0, 3.0];
         let mut grad = [0.0f32; 3];
         let mut hess = [0.0f32; 3];
@@ -138,7 +152,7 @@ mod tests {
 
     #[test]
     fn custom_wrong_length_hess_is_typed_error() {
-        let obj = CustomObjective::new(|_preds: &[f32]| (vec![0.0f32; 3], vec![1.0f32; 2]));
+        let obj = CustomObjective::new(|_preds: &[f64]| (vec![0.0f32; 3], vec![1.0f32; 2]));
         let score = [1.0f64, 2.0, 3.0];
         let mut grad = [0.0f32; 3];
         let mut hess = [0.0f32; 3];
