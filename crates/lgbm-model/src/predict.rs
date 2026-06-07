@@ -335,6 +335,19 @@ fn predict_row_transformed(
 ) {
     raw_buf.clear();
     raw_buf.extend(model.predict_raw(row, 0, -1));
+    // RF (average_output) divides the per-tree SUM by num_iteration BEFORE the
+    // ConvertOutput, matching C++ `GBDT::Predict` (gbdt_prediction.cpp:57-61:
+    // the `average_output_` block runs after `PredictRaw` and before
+    // `ConvertOutput`). Mirrors `Booster::predict_row`. The raw path
+    // (`predict_raw`) must NOT divide — it matches C++ `PredictRaw`.
+    if model.average_output {
+        let (_start, num) = model.init_predict(0, -1);
+        if num > 0 {
+            for v in raw_buf.iter_mut() {
+                *v /= num as f64;
+            }
+        }
+    }
     kind.convert(raw_buf, conv_buf);
     for &v in conv_buf.iter() {
         out.push(v as f32);
@@ -981,6 +994,39 @@ mod tests {
         let raw = predict_raw_mat(&m, &data, 2, 2).unwrap();
         let tf = predict_mat(&m, &data, 2, 2).unwrap();
         assert_eq!(raw, tf, "regression transform must be identity");
+    }
+
+    #[test]
+    fn transformed_rf_average_output_divides_by_num_iteration() {
+        // CR-01: a Random Forest model (`average_output = true`, 2 trees =
+        // 2 iterations at ntpi=1) must return the per-tree AVERAGE through the
+        // transformed batch-predict API, mirroring C++ `GBDT::Predict`
+        // (gbdt_prediction.cpp:57-61) and the in-crate `Booster::predict_row`,
+        // NOT the raw SUM.
+        let mut m = model();
+        m.average_output = true;
+        let data = vec![1.0f32, 0.0, 0.0, 1.0];
+        // Raw SUM is unaffected by average_output (matches C++ PredictRaw).
+        let raw = predict_raw_mat(&m, &data, 2, 2).unwrap();
+        assert!((raw[0] - 2.1).abs() < 1e-6);
+        assert!((raw[1] - 1.2).abs() < 1e-6);
+        // Transformed output must be the SUM / num_iteration (=2), and the
+        // regression convert is the identity.
+        let tf = predict_mat(&m, &data, 2, 2).unwrap();
+        assert!(
+            (tf[0] - 2.1 / 2.0).abs() < 1e-6,
+            "RF transformed output must be per-tree average, got {}",
+            tf[0]
+        );
+        assert!((tf[1] - 1.2 / 2.0).abs() < 1e-6);
+        // CSR/CSC must agree with the dense transformed path.
+        let indptr = vec![0i64, 1, 2];
+        let indices = vec![0i32, 1];
+        let values = vec![1.0f32, 1.0];
+        let csr = predict_csr(&m, &indptr, &indices, &values, 2, 2).unwrap();
+        assert_eq!(csr, tf, "CSR RF transform must match dense");
+        let csc = predict_csc(&m, &indptr, &indices, &values, 2, 2).unwrap();
+        assert_eq!(csc, tf, "CSC RF transform must match dense");
     }
 
     /// A multiclass model: num_tree_per_iteration=2, one iteration. Tree for
