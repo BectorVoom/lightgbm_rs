@@ -16,6 +16,16 @@
 //!     iters evaluate; `is_provide_training_metric` adds the training set; the
 //!     multi-metric list is evaluated per round (MET-02).
 //!
+//! IMPORTANT (CR-02, 06-06): under early stopping the caller must eval the valid
+//! set EVERY iteration — `metric_freq` gates only the recorded eval-HISTORY, NOT the
+//! ES decision cadence. In C++ the valid-metric + ES block is
+//! `if (need_output || early_stopping_round_ > 0)` (gbdt.cpp:574); `need_output`
+//! (`iter % metric_freq == 0`) only guards the `Log::Info` line, so when ES is on
+//! the valid eval + stop check run on every iter regardless of `metric_freq`. The
+//! facade (booster.rs train loop) implements this: it computes the valid `row` and
+//! calls `EarlyStopping::update` whenever ES is enabled, and pushes to
+//! `valid_eval_history` only on the `metric_freq` cadence.
+//!
 //! This module owns the DECISION + cadence state machine; the actual metric values
 //! are computed by the caller (the facade, which holds the metric enums + the valid
 //! sets) and fed in via [`EvalSnapshot`]. Keeping the value computation in the

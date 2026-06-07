@@ -513,29 +513,46 @@ fn train_inner_full(
 
         // Metric eval cadence (metric_freq gate; MET-02). Always eval on the LAST
         // iter and on every freq multiple, matching the C++ OutputMetric cadence.
+        //
+        // CR-02 (06-06): `metric_freq` gates ONLY the recorded eval-HISTORY (the
+        // pushes into train/valid/legacy_eval_history and any future logging). The
+        // valid-score eval that FEEDS the early-stop DECISION + the `early.update`
+        // call run EVERY iteration when ES is on, INDEPENDENT of metric_freq —
+        // mirroring gbdt.cpp:574 where the valid-metric+ES block is
+        // `if (need_output || early_stopping_round_ > 0)` and `need_output`
+        // (= `iter % metric_freq == 0`) only guards the `Log::Info`. The pre-06-06
+        // port gated `early.update` behind `do_eval`, so a `metric_freq > 1` run
+        // skipped ES evaluation on the off-cadence iters and diverged from C++ on
+        // best_iteration / trailing-trim.
         let do_eval = (it + 1) % metric_freq == 0 || it + 1 == total_iters;
-        if do_eval {
-            // training metrics.
-            if provide_train {
-                for (mi, m) in metrics.iter().enumerate() {
-                    let v = m.eval(&snap.score, &corpus.labels)?;
-                    train_eval_history[mi].1.push(v);
-                    legacy_eval_history[mi].1.push(v);
-                }
+
+        // Training metrics: history is metric_freq-gated (MET-02 unchanged).
+        if do_eval && provide_train {
+            for (mi, m) in metrics.iter().enumerate() {
+                let v = m.eval(&snap.score, &corpus.labels)?;
+                train_eval_history[mi].1.push(v);
+                legacy_eval_history[mi].1.push(v);
             }
-            // valid metrics + early-stop decision.
-            if valid_nd > 0 {
-                let mut row = Vec::with_capacity(metrics.len());
-                for (mi, m) in metrics.iter().enumerate() {
-                    let v = m.eval(&valid_score, &valid_labels)?;
+        }
+
+        // Valid metrics: eval whenever we either record history (`do_eval`) OR need
+        // the ES decision this iter (`es_enabled`). Push to valid_eval_history ONLY
+        // on `do_eval` (so metric_freq still thins the RECORDED history per MET-02
+        // and the metric_freq_thins_eval_history test stays green); feed `row` to
+        // `early.update` whenever ES is on (EVERY iter — the CR-02 fix).
+        if valid_nd > 0 && (do_eval || es_enabled) {
+            let mut row = Vec::with_capacity(metrics.len());
+            for (mi, m) in metrics.iter().enumerate() {
+                let v = m.eval(&valid_score, &valid_labels)?;
+                if do_eval {
                     valid_eval_history[mi].1.push(v);
-                    row.push(v);
                 }
-                if es_enabled {
-                    let stop = early.update(it, &EvalSnapshot { values: vec![row] });
-                    if stop {
-                        break;
-                    }
+                row.push(v);
+            }
+            if es_enabled {
+                let stop = early.update(it, &EvalSnapshot { values: vec![row] });
+                if stop {
+                    break;
                 }
             }
         }
