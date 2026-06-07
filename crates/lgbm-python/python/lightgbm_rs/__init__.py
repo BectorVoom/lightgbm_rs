@@ -46,6 +46,36 @@ def dataset_from_csc(csc, label):
     )
 
 
+def dataset_from_polars(df, label, categorical_feature="auto"):
+    """Build a :class:`Dataset` from a polars ``DataFrame`` (D-03/D-04).
+
+    Columns are consumed zero-copy Arrow-side in Rust (no numpy round-trip, which
+    would erase the ``Categorical``/``Enum`` dtype). Routing follows the official
+    package's ``categorical_feature`` semantics:
+
+    - ``"auto"`` (default): dtype routing — ``Categorical``/``Enum``/``String``
+      columns become categorical features, numeric columns numeric.
+    - a list of column **names** and/or integer **indices**: that list fully
+      decides which columns are categorical (precedence over dtype).
+
+    ``label`` is any array-like coerced to float64.
+    """
+    import numpy as np
+
+    if categorical_feature == "auto":
+        names = None
+    else:
+        cols = list(df.columns)
+        names = []
+        for c in categorical_feature:
+            if isinstance(c, int):
+                names.append(cols[c])
+            else:
+                names.append(str(c))
+
+    return Dataset.from_polars(df, np.asarray(label, dtype=np.float64), names)
+
+
 __all__ = [
     "Booster",
     "Dataset",
@@ -53,4 +83,5 @@ __all__ = [
     "train",
     "dataset_from_csr",
     "dataset_from_csc",
+    "dataset_from_polars",
 ]
