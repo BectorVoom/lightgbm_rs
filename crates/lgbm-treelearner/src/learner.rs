@@ -2183,7 +2183,28 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // come from the SplitInfo.
         let part_left = data_partition.leaf_count(new_left);
         let part_right = data_partition.leaf_count(new_right);
-        if best.left_count < best.right_count {
+        // C++ OVERWRITES `best_split_info.left_count`/`right_count` with the
+        // data-partition leaf counts (serial_tree_learner.cpp:790-791,
+        // `update_cnt=true`) BEFORE the smaller/larger tie-break at :851
+        // (`best_split_info.left_count < best_split_info.right_count`). The
+        // smaller/larger HISTOGRAM-slot dance (BeforeFindBestSplit, learner.rs
+        // :1099-1109) ALSO keys off the partition counts. Both MUST use the SAME
+        // count source so the leaf that receives the directly-built / subtracted
+        // histogram is the same leaf that receives the matching seeded sums.
+        //
+        // Using the raw SplitInfo `round_int(hess·cnt_factor)` counts here
+        // (`best.left_count`/`best.right_count`) DESYNCS the two on the TIE / ±1
+        // case for fractional (non-constant) hessians: e.g. gamma tree-0 node
+        // {0,1}|{2,3} has SplitInfo counts (1,3) but partition counts (2,2). The
+        // histogram dance (partition 2,2 ⇒ tie ⇒ smaller=right={2,3}) then
+        // disagreed with this seeding (SplitInfo 1<3 ⇒ smaller=left={0,1}),
+        // attaching node{2,3}'s sums (sum_g=1.0) to node{0,1}'s histogram and
+        // flipping the next split's gain (bogus 1.0417 vs C++ 0.0333) → tree-0
+        // topology [1,8,2,1] vs golden [2,4,2,4]. Constant-hessian families round
+        // identically so this never tripped them. (DEF-07-02/03 root cause; proven
+        // by the source-built lib_lightgbm 4.6 FP trace,
+        // .planning/debug/split-gain-knife-edge-07-02.md.)
+        if part_left < part_right {
             // smaller = left
             smaller_leaf_splits.init_from_split(
                 part_left,
