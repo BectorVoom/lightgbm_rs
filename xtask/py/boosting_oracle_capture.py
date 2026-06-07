@@ -683,6 +683,69 @@ def main():
         num_iterations=MULTICLASS_NUM_ITERATIONS, later_iter=MULTICLASS_LATER_ITER,
     )
 
+    # ===================== metric_freq>1 + early_stopping (CR-02) =====================
+    # A regression cell with metric_freq=2 + early_stopping_round=2 on the plateau
+    # valid set (matrix_valid_corpus). C++ runs the valid-eval + ES decision EVERY
+    # iter when ES is on (gbdt.cpp:574) — metric_freq=2 only thins the recorded
+    # eval-history, NOT the ES cadence. This golden catches the CR-02 caller bug
+    # (gating early.update behind do_eval): the Rust best_iteration / trimmed
+    # tree-count must equal the captured value.
+    Xmf, lmf, mfq_mf = spine_corpus()
+    p_mf = base_params(seed, "regression", ["l2"])
+    p_mf["metric_freq"] = 2
+    d_mf = lgb.Dataset(Xmf, label=lmf, free_raw_data=False)
+    d_mf.construct()
+    Xv_mf, lv_mf = matrix_valid_corpus(Xmf)
+    dv_mf = lgb.Dataset(Xv_mf, label=lv_mf, reference=d_mf, free_raw_data=False)
+    dv_mf.construct()
+    b_mf = lgb.train(
+        p_mf, d_mf, num_boost_round=MATRIX_NUM_ITERATIONS,
+        valid_sets=[d_mf, dv_mf], valid_names=["training", "valid_0"],
+        callbacks=[lgb.early_stopping(MATRIX_EARLY_STOPPING_ROUND, verbose=False)],
+    )
+    b_mf.save_model(os.path.join(out_dir, "regression_mf2es_model.txt"))
+    with open(os.path.join(out_dir, "regression_mf2es_pred.txt"), "w") as fh:
+        fh.write("# regression_mf2es_pred — predict() raw score; f64 bits\n")
+        fh.write(f"# best_iteration={b_mf.best_iteration}\n")
+        fh.write(f64_bits_line(np.asarray(b_mf.predict(Xmf, raw_score=True))) + "\n")
+    with open(os.path.join(out_dir, "regression_mf2es_best_iteration.txt"), "w") as fh:
+        fh.write("# regression_mf2es — metric_freq=2 + early_stopping_round=2 "
+                 "(plateau valid); the ES decision runs every iter (gbdt.cpp:574)\n")
+        fh.write(f"best_iteration={b_mf.best_iteration}\n")
+
+    # ===================== regression reg_sqrt=1 (GAP E / OBJ-03) =====================
+    # reg_sqrt pre-transforms the label `Sign(label)*sqrt(|label|)`, fits L2 on the
+    # transformed target, and ConvertOutput inverts via `Sign(x)*x*x`. No committed
+    # golden previously exercised reg_sqrt=1 (all goldens [reg_sqrt: 0]). The gh_fn
+    # applies the SAME sqrt pre-transform before the L2 grad/hess; the predict golden
+    # carries the ConvertOutput inverse (booster.predict applies it).
+    Xsq, lsq, mfq_sq = spine_corpus()
+    p_sq = base_params(seed, "regression", ["l2"])
+    p_sq["reg_sqrt"] = True
+    d_sq = lgb.Dataset(Xsq, label=lsq, free_raw_data=False)
+    d_sq.construct()
+    er_sq = {}
+    b_sq = lgb.train(
+        p_sq, d_sq, num_boost_round=NUM_ITERATIONS,
+        valid_sets=[d_sq], valid_names=["training"],
+        callbacks=[lgb.record_evaluation(er_sq)],
+    )
+    # reg_sqrt L2 g/h: fit on the sqrt-transformed label.
+    def sqrt_transform(lab):
+        a = np.asarray(lab, dtype=np.float64)
+        return np.sign(a) * np.sqrt(np.abs(a))
+
+    def reg_sqrt_gh(score_prev, lab):
+        # L2 grad/hess against the TRANSFORMED label (the C++ reg_sqrt path).
+        tl = sqrt_transform(lab)
+        grad = (np.asarray(score_prev) - tl).astype(np.float32)
+        hess = np.ones(len(tl), dtype=np.float32)
+        return grad, hess
+    # BoostFromScore for reg_sqrt: mean of the TRANSFORMED labels.
+    init_sq = float(np.mean(sqrt_transform(lsq)))
+    write_layered(out_dir, "regression_sqrt", b_sq, Xsq, lsq, er_sq,
+                  ["l2"], reg_sqrt_gh, init_sq, b_sq.predict(Xsq))
+
     # ============================ D-07 cross-product matrix ============================
     best_iters = capture_matrix(out_dir, seed)
     with open(os.path.join(out_dir, "matrix_best_iterations.txt"), "w") as fh:
@@ -693,7 +756,9 @@ def main():
             fh.write("%s best_iteration=%d\n" % (cell, best_iters[cell]))
 
     print("boosting_oracle_capture: wrote regression/regression_l1/binary/custom/"
-          "multiclass/multiclassova L1-L5 goldens + the D-07 matrix to %s" % out_dir)
+          "multiclass/multiclassova L1-L5 goldens + regression_sqrt (reg_sqrt=1) + "
+          "regression_mf2es (metric_freq=2 + early_stopping) + the D-07 matrix "
+          "to %s" % out_dir)
 
 
 if __name__ == "__main__":

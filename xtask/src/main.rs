@@ -922,6 +922,16 @@ fn boosting_oracle_capture() -> Result<()> {
         // multiclass / multiclassova spine (06-04).
         "multiclass_spine_model.txt",
         "multiclassova_spine_model.txt",
+        // reg_sqrt=1 (GAP E / OBJ-03, 06-06): grad/hess on the sqrt-transformed
+        // label + model + ConvertOutput-inverted predict.
+        "regression_sqrt_gh_iter1.txt",
+        "regression_sqrt_spine_model.txt",
+        "regression_sqrt_spine_pred.txt",
+        // metric_freq=2 + early_stopping (CR-02, 06-06): the ES decision runs every
+        // iter independent of metric_freq (gbdt.cpp:574).
+        "regression_mf2es_model.txt",
+        "regression_mf2es_pred.txt",
+        "regression_mf2es_best_iteration.txt",
         // D-07 cross-product matrix index (06-05).
         "matrix_best_iterations.txt",
         // a representative matrix cell per objective (the full set is enumerated in

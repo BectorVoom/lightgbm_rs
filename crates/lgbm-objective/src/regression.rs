@@ -90,11 +90,25 @@ impl Objective {
     /// builder never forks the objective name; it routes the config's
     /// `objective` string through [`Self::parse`]).
     ///
+    /// reg_sqrt (GAP E, 06-06): in C++ `reg_sqrt` is a CONFIG flag the regression
+    /// objective reads (`RegressionL2loss::sqrt_`), independent of the objective
+    /// string. The 06-02 port keyed `sqrt` only off the `"regression sqrt"` string
+    /// token, so `config.reg_sqrt = true` (e.g. via `TrainingBuilder.reg_sqrt(true)`)
+    /// had no effect — `reg_sqrt=1` was not drivable end-to-end. Here we OR the config
+    /// flag into the parsed `sqrt` so EITHER route (the `"... sqrt"` token OR
+    /// `config.reg_sqrt`) activates the sqrt transform, matching C++.
+    ///
     /// # Errors
     /// [`ObjectiveError::Unsupported`] when `config.objective` is out of 06-02
     /// scope.
     pub fn from_config(config: &lgbm_core::Config) -> Result<Objective, ObjectiveError> {
-        Objective::parse(&config.objective)
+        match Objective::parse(&config.objective)? {
+            Objective::Regression { sqrt } => Ok(Objective::Regression {
+                sqrt: sqrt || config.reg_sqrt,
+            }),
+            // reg_sqrt only applies to the L2 regression family in C++; L1 ignores it.
+            other => Ok(other),
+        }
     }
 
     /// C++ `IsConstantHessian` (no weights → true). The spine path is unweighted,

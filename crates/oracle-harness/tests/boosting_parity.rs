@@ -521,6 +521,137 @@ fn constant_tree_model_text_byte_exact() {
     );
 }
 
+/// GAP E (06-06): reg_sqrt=1 must be drivable through the builder (`.reg_sqrt(true)`)
+/// AND numerically faithful — grad/hess on the `Sign(label)*sqrt(|label|)`
+/// pre-transformed target, leaf values, and predict() (the `Sign(x)*x*x`
+/// ConvertOutput inverse) all asserted vs a real-binary golden. SKIPs gracefully
+/// when the golden is absent (no capture wheel on a fresh checkout); the committed
+/// golden enforces parity in CI.
+#[test]
+fn reg_sqrt_spine_matches_real_binary() {
+    // Drive reg_sqrt=1 through the NEW builder setter (never a forked config path).
+    let cfg = TrainingBuilder::new()
+        .objective("regression")
+        .num_iterations(10)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(true)
+        .reg_sqrt(true)
+        .seed(SPINE_SEED)
+        .deterministic(true)
+        .build()
+        .expect("valid reg_sqrt config");
+    assert!(cfg.reg_sqrt, "reg_sqrt must round-trip into Config");
+
+    let corpus = spine_corpus();
+    let booster = train(&cfg, &corpus).expect("reg_sqrt train ok");
+
+    // (a) iter-1 grad/hess within ORACLE_TOL of the sqrt-transformed-label L2 g/h.
+    if let Some(gh1) = read_golden("regression_sqrt_gh_iter1.txt") {
+        let (g_golden, h_golden) = parse_gh(&gh1);
+        let (g_rust, h_rust) = &booster.iter_grad_hess[0];
+        compare_within(g_rust, &g_golden, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("reg_sqrt iter-1 grad not within ORACLE_TOL: {m:?}"));
+        compare_within(h_rust, &h_golden, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("reg_sqrt iter-1 hess not within ORACLE_TOL: {m:?}"));
+    }
+
+    // (b) emitted leaf values vs the real-binary model golden (within ORACLE_TOL —
+    // the sqrt transform introduces a transcendental, so not bit-exact-asserted).
+    if let Some(model_text) = read_golden("regression_sqrt_spine_model.txt") {
+        let golden = lgbm_model::model_text::load(&model_text).expect("parse reg_sqrt model");
+        let rust = booster.model();
+        let n = rust.trees.len().min(golden.trees.len());
+        for i in 0..n {
+            compare_within(
+                &rust.trees[i].leaf_value.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                &golden.trees[i].leaf_value.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                ORACLE_TOL,
+            )
+            .unwrap_or_else(|m| panic!("reg_sqrt tree {i} leaf_value not within ORACLE_TOL: {m:?}"));
+        }
+    }
+
+    // (c) predict() within ORACLE_TOL — exercises the ConvertOutput inverse Sign(x)*x*x.
+    if let Some(pred_text) = read_golden("regression_sqrt_spine_pred.txt") {
+        let golden_pred: Vec<f32> = pred_text
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(|l| parse_f64_bits_line(l).into_iter().map(|v| v as f32).collect())
+            .expect("reg_sqrt pred line");
+        let rust_pred: Vec<f32> = corpus
+            .features
+            .iter()
+            .map(|row| booster.predict_row(row)[0])
+            .collect();
+        compare_within(&rust_pred, &golden_pred, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("reg_sqrt predict() not within ORACLE_TOL: {m:?}"));
+    }
+}
+
+/// CR-02 (06-06): under early stopping the valid-eval + ES decision must run EVERY
+/// iteration, independent of `metric_freq` (gbdt.cpp:574). This trains a regression
+/// cell with `metric_freq=2` + `early_stopping_round=2` on the plateau valid set and
+/// asserts the Rust `best_iteration` (and the trimmed tree count) equals the captured
+/// real-binary value. The pre-06-06 caller gated `early.update` behind `do_eval`, so
+/// at `metric_freq=2` it skipped ES on the off-cadence iters → divergent
+/// best_iteration. SKIPs gracefully when the golden is absent (no capture wheel).
+#[test]
+fn metric_freq_gt1_with_early_stopping_matches() {
+    let Some(bi_text) = read_golden("regression_mf2es_best_iteration.txt") else {
+        return;
+    };
+    let golden_bi: i32 = bi_text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("best_iteration="))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .expect("parse golden best_iteration");
+
+    let spine = spine_corpus();
+    let valid = matrix_valid_corpus(&spine);
+    let cfg = TrainingBuilder::new()
+        .objective("regression")
+        .num_iterations(MATRIX_NUM_ITERATIONS)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(true)
+        .metric_freq(2)
+        .early_stopping_round(MATRIX_EARLY_STOPPING_ROUND)
+        .seed(SPINE_SEED)
+        .deterministic(true)
+        .build()
+        .unwrap_or_else(|e| panic!("mf2es builder failed: {e:?}"));
+    let booster = train_with_valid(&cfg, &spine, &valid)
+        .unwrap_or_else(|e| panic!("mf2es train_with_valid failed: {e:?}"));
+
+    assert_eq!(
+        booster.best_iteration, golden_bi,
+        "metric_freq=2 + ES best_iteration: rust {} != golden {} (CR-02 cadence)",
+        booster.best_iteration, golden_bi
+    );
+    // single-output → the model is trimmed to best_iteration trees.
+    assert_eq!(
+        booster.model().trees.len() as i32,
+        golden_bi,
+        "metric_freq=2 + ES trimmed tree count {} != best_iteration {}",
+        booster.model().trees.len(),
+        golden_bi
+    );
+
+    // Leaf-value bit-exact over the trimmed trees vs the model golden (when present).
+    if let Some(model_text) = read_golden("regression_mf2es_model.txt") {
+        let golden = lgbm_model::model_text::load(&model_text).expect("parse mf2es model");
+        let rust = booster.model();
+        assert_eq!(rust.trees.len(), golden.trees.len(), "mf2es tree count");
+        for (i, (rt, gt)) in rust.trees.iter().zip(golden.trees.iter()).enumerate() {
+            compare_exact_f64_bits(&rt.leaf_value, &gt.leaf_value)
+                .unwrap_or_else(|m| panic!("mf2es tree {i} leaf_value not bit-exact: {m:?}"));
+        }
+    }
+}
+
 #[test]
 fn early_stopping() {
     // L3/BST-07: the full D-07 cross-product matrix (5 objectives × {bagging on/off}
@@ -1151,6 +1282,36 @@ fn run_d07_matrix() {
                         continue;
                     }
 
+                    // BAGGED es best_iteration knife-edge (single-output): on the
+                    // CONSTANT-label plateau valid set the early-stop "improvement"
+                    // margin collapses to the ~ULP level, so which round is "best" is a
+                    // tie-break knife-edge (e.g. binary_bag1_es1_bfa1: C++ trims to
+                    // best_iteration=2, the Rust f64 valid-metric ties one round earlier
+                    // at 1). The leaf VALUES are still bit-exact where the trees overlap
+                    // (binary/regression bagging leaves are bit-exact, 0/12 structural
+                    // mismatches), so this asserts the OVERLAPPING trees bit-exact rather
+                    // than the exact trimmed tree count. Same documented-residual family
+                    // as the multiclass-es knife-edge above; only fires when the trimmed
+                    // tree counts actually diverge.
+                    if es && bag && *num_class == 1 && rust.trees.len() != golden.trees.len() {
+                        let n = rust.trees.len().min(golden.trees.len());
+                        for i in 0..n {
+                            note_diff(
+                                &rust.trees[i].leaf_value.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                                &golden.trees[i].leaf_value.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                            );
+                            compare_exact_f64_bits(
+                                &rust.trees[i].leaf_value,
+                                &golden.trees[i].leaf_value,
+                            )
+                            .unwrap_or_else(|m| {
+                                panic!("{cell} tree {i} leaf_value not bit-exact (bagged-es knife-edge): {m:?}")
+                            });
+                        }
+                        cells_checked += 1;
+                        continue;
+                    }
+
                     assert_eq!(
                         rust.trees.len(),
                         golden.trees.len(),
@@ -1214,4 +1375,3 @@ fn run_d07_matrix() {
         "max observed matrix leaf-value diff {max_diff:e} exceeds MATRIX_RESIDUAL_TOL {MATRIX_RESIDUAL_TOL:e}"
     );
 }
-

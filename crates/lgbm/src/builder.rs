@@ -112,6 +112,17 @@ impl TrainingBuilder {
         self
     }
 
+    /// `reg_sqrt` (GAP E / OBJ-03): when `true`, the regression objective fits L2 on
+    /// the `Sign(label)*sqrt(|label|)` pre-transformed target and inverts via
+    /// `ConvertOutput = Sign(x)*x*x`. Inserts the `reg_sqrt` raw param so it routes
+    /// into `lgbm-core::Config.reg_sqrt` via `Config::from_params` (set.rs:314 /
+    /// scope.rs:153) — mirrors the `boost_from_average` bool setter. Without this
+    /// setter `reg_sqrt=1` was not drivable end-to-end through the builder.
+    pub fn reg_sqrt(mut self, on: bool) -> Self {
+        self.params.insert("reg_sqrt".into(), on.to_string());
+        self
+    }
+
     /// `seed` (the master seed; derives the sub-seeds via `Config::from_params`).
     pub fn seed(mut self, seed: i32) -> Self {
         self.params.insert("seed".into(), seed.to_string());
@@ -227,6 +238,29 @@ mod tests {
         assert!(cfg.boost_from_average);
         assert_eq!(cfg.seed, 7);
         assert!(cfg.deterministic);
+    }
+
+    #[test]
+    fn reg_sqrt_setter_round_trips_into_config() {
+        // GAP E / OBJ-03: reg_sqrt=1 must be drivable end-to-end through the builder
+        // (the D-03 full-param-surface contract). The setter inserts the `reg_sqrt`
+        // raw param which routes into Config.reg_sqrt via Config::from_params.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .reg_sqrt(true)
+            .build()
+            .unwrap();
+        assert!(cfg.reg_sqrt, "reg_sqrt(true) must round-trip into Config.reg_sqrt");
+        // default stays false.
+        let cfg0 = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .build()
+            .unwrap();
+        assert!(!cfg0.reg_sqrt, "reg_sqrt defaults to false");
     }
 
     #[test]
