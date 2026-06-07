@@ -315,6 +315,7 @@ fn randomized_in_scope_boundary_invalid_coverage_is_deterministic_and_panic_free
         dbl_field("drop_rate", Some((0.0, true)), Some((1.0, true))),
         dbl_field("skip_drop", Some((0.0, true)), Some((1.0, true))),
         dbl_field("sigmoid", Some((0.0, false)), None),
+        dbl_field("poisson_max_delta_step", Some((0.0, false)), None),
         dbl_field("tweedie_variance_power", Some((1.0, true)), Some((2.0, false))),
     ];
 
@@ -431,6 +432,7 @@ fn assert_field_roundtrip(cfg: &Config, name: &str, expected: f64, is_int: bool)
             "drop_rate" => eq_dbl!(cfg.drop_rate),
             "skip_drop" => eq_dbl!(cfg.skip_drop),
             "sigmoid" => eq_dbl!(cfg.sigmoid),
+            "poisson_max_delta_step" => eq_dbl!(cfg.poisson_max_delta_step),
             "tweedie_variance_power" => eq_dbl!(cfg.tweedie_variance_power),
             _ => {}
         }

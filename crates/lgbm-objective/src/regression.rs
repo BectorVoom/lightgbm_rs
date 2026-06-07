@@ -85,6 +85,42 @@ pub enum Objective {
     /// 0.5) with `label_weight`; `IsRenewTreeOutput()` true (weighted residual
     /// median at 0.5 with `label_weight`).
     Mape,
+    /// `poisson` (`RegressionPoissonLoss`, `regression_objective.hpp:397`): the
+    /// score `f` is the LOG mean. `grad = exp(f) - label` (f64 exp, cast f32);
+    /// `hess = exp(f) * exp(max_delta_step)` where `max_delta_step = config
+    /// poisson_max_delta_step` (default 0.7). `BoostFromScore = SafeLog(L2 mean)`
+    /// (`:469`); `ConvertOutput = exp(f)`. `IsConstantHessian()` false (hessian
+    /// depends on `exp(f)`). Init guard: every label `>= 0` and `Σ label != 0`.
+    Poisson {
+        /// `max_delta_step_` (config `poisson_max_delta_step`); `exp(max_delta_step)`
+        /// scales the hessian (`regression_objective.hpp:441`).
+        max_delta_step: f64,
+    },
+    /// `gamma` (`RegressionGammaLoss`, `regression_objective.hpp:680`): subclasses
+    /// Poisson but overrides `GetGradients`: `exp_score = exp(-f)`,
+    /// `grad = 1 - label*exp_score`, `hess = label*exp_score` (f64, cast f32).
+    /// Inherits Poisson's `BoostFromScore = SafeLog(L2 mean)`, `ConvertOutput =
+    /// exp(f)`, label `>= 0` guard, and `IsConstantHessian() == false`.
+    Gamma,
+    /// `tweedie` (`RegressionTweedieLoss`, `regression_objective.hpp:707`):
+    /// subclasses Poisson. With `rho = config tweedie_variance_power` in `[1, 2)`:
+    /// `exp_1 = exp((1-rho)*f)`, `exp_2 = exp((2-rho)*f)`;
+    /// `grad = -label*exp_1 + exp_2`,
+    /// `hess = -label*(1-rho)*exp_1 + (2-rho)*exp_2` (f64, cast f32). Inherits
+    /// Poisson's `BoostFromScore = SafeLog(L2 mean)`, `ConvertOutput = exp(f)`,
+    /// label `>= 0` guard, and `IsConstantHessian() == false`.
+    Tweedie {
+        /// `rho_` (config `tweedie_variance_power`, range `[1, 2)`).
+        rho: f64,
+    },
+}
+
+/// C++ `Common::SafeLog` (`common.h:877`): `log(x)` for `x > 0`, else `-inf`.
+/// Used by the poisson/gamma/tweedie `BoostFromScore` to map the L2 label mean
+/// into the log-mean score space (`regression_objective.hpp:469`).
+#[inline]
+fn safe_log(x: f64) -> f64 {
+    if x > 0.0 { x.ln() } else { f64::NEG_INFINITY }
 }
 
 /// C++ MAPE `label_weight_[i] = 1.0f / std::max(1.0f, std::fabs(label_[i]))`
@@ -131,6 +167,13 @@ impl Objective {
             // `mape` config aliases (config_auto.cpp valid-objective list):
             // `mape`, `mean_absolute_percentage_error`.
             "mape" | "mean_absolute_percentage_error" => Ok(Objective::Mape),
+            // poisson/gamma/tweedie (OBJ-04 exp/log family). poisson/tweedie carry
+            // params filled by `from_config` (config.h defaults: poisson_max_delta_step
+            // 0.7, tweedie_variance_power 1.5); the bare-name parse seeds them so it is
+            // a valid variant. gamma has no objective param.
+            "poisson" => Ok(Objective::Poisson { max_delta_step: 0.7 }),
+            "gamma" => Ok(Objective::Gamma),
+            "tweedie" => Ok(Objective::Tweedie { rho: 1.5 }),
             other => Err(ObjectiveError::Unsupported {
                 name: other.to_string(),
             }),
@@ -178,8 +221,20 @@ impl Objective {
                 }
                 Ok(Objective::Quantile { alpha: config.alpha })
             }
+            // poisson max_delta_step is config `poisson_max_delta_step`
+            // (RegressionPoissonLoss ctor: `max_delta_step_ =
+            // config.poisson_max_delta_step`). The generic Config check covers `> 0`.
+            Objective::Poisson { .. } => Ok(Objective::Poisson {
+                max_delta_step: config.poisson_max_delta_step,
+            }),
+            // tweedie rho is config `tweedie_variance_power` (RegressionTweedieLoss
+            // ctor: `rho_ = config.tweedie_variance_power`). The generic Config check
+            // covers the `[1, 2)` range.
+            Objective::Tweedie { .. } => Ok(Objective::Tweedie {
+                rho: config.tweedie_variance_power,
+            }),
             // reg_sqrt only applies to the L2 regression family in C++; the rest
-            // (L1 / mape) ignore it.
+            // (L1 / mape / gamma) ignore it.
             other => Ok(other),
         }
     }
@@ -203,6 +258,10 @@ impl Objective {
             // Fair hess = c²/(|x|+c)² is per-row; RegressionFairLoss overrides
             // IsConstantHessian()==false (regression_objective.hpp:386).
             Objective::Fair { .. } => false,
+            // poisson/gamma/tweedie hessians all depend on exp(score) (per-row);
+            // RegressionPoissonLoss overrides IsConstantHessian()==false
+            // (regression_objective.hpp:474) and gamma/tweedie inherit it.
+            Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => false,
         }
     }
 
@@ -212,9 +271,14 @@ impl Objective {
     pub fn is_renew_tree_output(&self) -> bool {
         match self {
             // L2/huber/fair: the Newton output is the final leaf value (no renewal).
-            Objective::Regression { .. } | Objective::Huber { .. } | Objective::Fair { .. } => {
-                false
-            }
+            // poisson/gamma/tweedie inherit RegressionL2loss::IsRenewTreeOutput() ==
+            // false (the Newton step over exp-derived g/h is the final leaf value).
+            Objective::Regression { .. }
+            | Objective::Huber { .. }
+            | Objective::Fair { .. }
+            | Objective::Poisson { .. }
+            | Objective::Gamma
+            | Objective::Tweedie { .. } => false,
             // RegressionL1loss / RegressionQuantileloss / RegressionMAPELOSS all
             // override IsRenewTreeOutput() == true.
             Objective::RegressionL1 | Objective::Quantile { .. } | Objective::Mape => true,
@@ -244,12 +308,58 @@ impl Objective {
             // inherit RegressionL2loss but carry no `sqrt` flag (huber force-disables
             // it in C++; fair/quantile never set it via the typed builder), so the
             // labels pass through. Mape subclasses L1 — no transform.
+            // poisson/gamma/tweedie force-disable sqrt in C++ (the Poisson ctor warns
+            // and clears the flag) and carry no label transform — labels pass through.
             Objective::RegressionL1
             | Objective::Huber { .. }
             | Objective::Fair { .. }
             | Objective::Quantile { .. }
-            | Objective::Mape => labels.to_vec(),
+            | Objective::Mape
+            | Objective::Poisson { .. }
+            | Objective::Gamma
+            | Objective::Tweedie { .. } => labels.to_vec(),
         }
+    }
+
+    /// The C++ objective `Init` label-domain guard surfaced as a typed `Result`
+    /// (Security V5 / T-07-03-01), called once at train time before any gradient
+    /// work. poisson/gamma/tweedie require every label `>= 0` AND `Σ label != 0`
+    /// (`regression_objective.hpp:417-424`); the L2/L1/huber/fair/quantile/mape
+    /// objectives have no label-domain guard (they accept any finite label).
+    ///
+    /// # Errors
+    /// [`ObjectiveError::LabelRange`] for the first negative label (or a zero
+    /// label-sum) fed to poisson/gamma/tweedie — never a panic.
+    pub fn check_labels(&self, labels: &[f32]) -> Result<(), ObjectiveError> {
+        let name = match self {
+            Objective::Poisson { .. } => "poisson",
+            Objective::Gamma => "gamma",
+            Objective::Tweedie { .. } => "tweedie",
+            // No label-domain guard for the other regression objectives.
+            _ => return Ok(()),
+        };
+        // C++ Common::ObtainMinMaxSum → miny < 0 fatal, sumy == 0 fatal. The
+        // deterministic ordered fold over f32 labels (promoted to f64 for the sum, as
+        // the C++ `double sumy`).
+        let mut sumy = 0.0f64;
+        for &l in labels {
+            if l < 0.0 {
+                return Err(ObjectiveError::LabelRange {
+                    label: l as f64,
+                    objective: name.to_string(),
+                    reason: "at least one target label is negative (must be >= 0)".to_string(),
+                });
+            }
+            sumy += l as f64;
+        }
+        if sumy == 0.0 {
+            return Err(ObjectiveError::LabelRange {
+                label: 0.0,
+                objective: name.to_string(),
+                reason: "sum of labels is zero".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// C++ `RegressionL2loss::GetGradients` (no-weights path).
@@ -376,6 +486,51 @@ impl Objective {
                     hessians[i] = 1.0f32;
                 }
             }
+            Objective::Poisson { max_delta_step } => {
+                // RegressionPoissonLoss::GetGradients (no-weights,
+                // regression_objective.hpp:439-445):
+                //   exp_max_delta_step = exp(max_delta_step_)   (hoisted, f64)
+                //   exp_score = exp(score[i])                   (f64)
+                //   grad = (score_t)(exp_score - label_[i])
+                //   hess = (score_t)(exp_score * exp_max_delta_step)
+                let exp_max_delta_step = max_delta_step.exp();
+                for i in 0..n {
+                    let exp_score = score[i].exp();
+                    gradients[i] = (exp_score - label[i] as f64) as f32;
+                    hessians[i] = (exp_score * exp_max_delta_step) as f32;
+                }
+            }
+            Objective::Gamma => {
+                // RegressionGammaLoss::GetGradients (no-weights,
+                // regression_objective.hpp:694-700):
+                //   exp_score = exp(-score[i])                  (f64)
+                //   grad = (score_t)(1.0 - label_[i] * exp_score)
+                //   hess = (score_t)(label_[i] * exp_score)
+                for i in 0..n {
+                    let exp_score = (-score[i]).exp();
+                    let lab = label[i] as f64;
+                    gradients[i] = (1.0 - lab * exp_score) as f32;
+                    hessians[i] = (lab * exp_score) as f32;
+                }
+            }
+            Objective::Tweedie { rho } => {
+                // RegressionTweedieLoss::GetGradients (no-weights,
+                // regression_objective.hpp:729-737):
+                //   exp_1 = exp((1 - rho_) * score[i])          (f64)
+                //   exp_2 = exp((2 - rho_) * score[i])          (f64)
+                //   grad = (score_t)(-label_[i] * exp_1 + exp_2)
+                //   hess = (score_t)(-label_[i] * (1 - rho_) * exp_1 + (2 - rho_) * exp_2)
+                let rho = *rho;
+                let one_minus_rho = 1.0 - rho;
+                let two_minus_rho = 2.0 - rho;
+                for i in 0..n {
+                    let exp_1 = (one_minus_rho * score[i]).exp();
+                    let exp_2 = (two_minus_rho * score[i]).exp();
+                    let lab = label[i] as f64;
+                    gradients[i] = (-lab * exp_1 + exp_2) as f32;
+                    hessians[i] = (-lab * one_minus_rho * exp_1 + two_minus_rho * exp_2) as f32;
+                }
+            }
         }
         Ok(())
     }
@@ -432,6 +587,22 @@ impl Objective {
                 let data: Vec<f64> = label.iter().map(|&l| l as f64).collect();
                 percentile_fun(&data, 0.5)
             }
+            // RegressionPoissonLoss::BoostFromScore (regression_objective.hpp:469):
+            // `SafeLog(RegressionL2loss::BoostFromScore(0))` — the LOG of the L2 label
+            // mean (the score space is the log-mean). gamma/tweedie subclass Poisson
+            // and inherit this BoostFromScore unchanged. The L2 mean is the SAME
+            // ordered sequential f64 fold as the L2/huber/fair arm above.
+            Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => {
+                if label.is_empty() {
+                    return safe_log(0.0);
+                }
+                let mut suml = 0.0f64;
+                for &l in label {
+                    suml += l as f64;
+                }
+                let sumw = label.len() as f64;
+                safe_log(suml / sumw)
+            }
         }
     }
 
@@ -470,9 +641,12 @@ impl Objective {
             }
             // Non-renew objectives never reach here (guarded by is_renew_tree_output);
             // fall back to the unweighted median rather than panic.
-            Objective::Regression { .. } | Objective::Huber { .. } | Objective::Fair { .. } => {
-                percentile_fun(residuals, 0.5)
-            }
+            Objective::Regression { .. }
+            | Objective::Huber { .. }
+            | Objective::Fair { .. }
+            | Objective::Poisson { .. }
+            | Objective::Gamma
+            | Objective::Tweedie { .. } => percentile_fun(residuals, 0.5),
         }
     }
 
@@ -638,8 +812,10 @@ mod tests {
     // ---- huber/fair/quantile/mape (Plan 07-02, OBJ-04 family A) ----
 
     fn cfg_with(objective: &str, alpha: f64, fair_c: f64) -> lgbm_core::Config {
-        let mut c = lgbm_core::Config::default();
-        c.objective = objective.to_string();
+        let mut c = lgbm_core::Config {
+            objective: objective.to_string(),
+            ..Default::default()
+        };
         c.alpha = alpha;
         c.fair_c = fair_c;
         c
@@ -796,5 +972,157 @@ mod tests {
             < ORACLE_TOL as f64);
         assert!((Objective::Fair { c: 1.0 }.boost_from_score(&label) - 3.0).abs()
             < ORACLE_TOL as f64);
+    }
+
+    // ---- poisson/gamma/tweedie (Plan 07-03, OBJ-04 exp/log family) ----
+
+    #[test]
+    fn parse_exp_log_family_names() {
+        assert_eq!(
+            Objective::parse("poisson").unwrap(),
+            Objective::Poisson { max_delta_step: 0.7 }
+        );
+        assert_eq!(Objective::parse("gamma").unwrap(), Objective::Gamma);
+        assert_eq!(
+            Objective::parse("tweedie").unwrap(),
+            Objective::Tweedie { rho: 1.5 }
+        );
+    }
+
+    #[test]
+    fn from_config_fills_exp_log_params() {
+        // poisson_max_delta_step default 0.7; the alt 0.1 axis resolves.
+        let mut c = lgbm_core::Config {
+            objective: "poisson".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            Objective::from_config(&c).unwrap(),
+            Objective::Poisson { max_delta_step: 0.7 }
+        );
+        c.poisson_max_delta_step = 0.1;
+        assert_eq!(
+            Objective::from_config(&c).unwrap(),
+            Objective::Poisson { max_delta_step: 0.1 }
+        );
+        // tweedie_variance_power default 1.5; the alt 1.1/1.9 axes resolve.
+        let mut t = lgbm_core::Config {
+            objective: "tweedie".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            Objective::from_config(&t).unwrap(),
+            Objective::Tweedie { rho: 1.5 }
+        );
+        t.tweedie_variance_power = 1.9;
+        assert_eq!(
+            Objective::from_config(&t).unwrap(),
+            Objective::Tweedie { rho: 1.9 }
+        );
+    }
+
+    #[test]
+    fn exp_log_family_flags() {
+        // Non-constant hessian (exp-dependent), no renewal.
+        for obj in [
+            Objective::Poisson { max_delta_step: 0.7 },
+            Objective::Gamma,
+            Objective::Tweedie { rho: 1.5 },
+        ] {
+            assert!(!obj.is_constant_hessian(), "{obj:?} hessian is per-row");
+            assert!(!obj.is_renew_tree_output(), "{obj:?} has no renewal");
+        }
+    }
+
+    #[test]
+    fn poisson_gradient_and_hessian() {
+        // grad = exp(score) - label; hess = exp(score) * exp(max_delta_step).
+        let obj = Objective::Poisson { max_delta_step: 0.7 };
+        let score = [0.0f64, 1.0];
+        let label = [1.0f32, 2.0];
+        let mut grad = [0.0f32; 2];
+        let mut hess = [0.0f32; 2];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        let emds = 0.7f64.exp();
+        assert_eq!(grad[0], (0.0f64.exp() - 1.0) as f32); // exp(0)=1; 1-1=0
+        assert_eq!(grad[1], (1.0f64.exp() - 2.0) as f32);
+        assert_eq!(hess[0], (0.0f64.exp() * emds) as f32);
+        assert_eq!(hess[1], (1.0f64.exp() * emds) as f32);
+    }
+
+    #[test]
+    fn gamma_gradient_and_hessian() {
+        // exp_score = exp(-score); grad = 1 - label*exp_score; hess = label*exp_score.
+        let obj = Objective::Gamma;
+        let score = [0.0f64, 2.0];
+        let label = [3.0f32, 1.0];
+        let mut grad = [0.0f32; 2];
+        let mut hess = [0.0f32; 2];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        for i in 0..2 {
+            let es = (-score[i]).exp();
+            let lab = label[i] as f64;
+            assert_eq!(grad[i], (1.0 - lab * es) as f32);
+            assert_eq!(hess[i], (lab * es) as f32);
+        }
+    }
+
+    #[test]
+    fn tweedie_gradient_and_hessian() {
+        let rho = 1.5f64;
+        let obj = Objective::Tweedie { rho };
+        let score = [0.5f64, -1.0];
+        let label = [2.0f32, 4.0];
+        let mut grad = [0.0f32; 2];
+        let mut hess = [0.0f32; 2];
+        obj.get_gradients(&score, &label, &mut grad, &mut hess).unwrap();
+        for i in 0..2 {
+            let e1 = ((1.0 - rho) * score[i]).exp();
+            let e2 = ((2.0 - rho) * score[i]).exp();
+            let lab = label[i] as f64;
+            assert_eq!(grad[i], (-lab * e1 + e2) as f32);
+            assert_eq!(hess[i], (-lab * (1.0 - rho) * e1 + (2.0 - rho) * e2) as f32);
+        }
+    }
+
+    #[test]
+    fn exp_log_boost_from_score_is_safe_log_of_label_mean() {
+        // BoostFromScore = SafeLog(L2 mean). mean([1,2,3,4,5]) = 3 -> ln(3).
+        let label = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let expect = 3.0f64.ln();
+        for obj in [
+            Objective::Poisson { max_delta_step: 0.7 },
+            Objective::Gamma,
+            Objective::Tweedie { rho: 1.5 },
+        ] {
+            assert!(
+                (obj.boost_from_score(&label) - expect).abs() < ORACLE_TOL as f64,
+                "{obj:?} boost_from_score != ln(mean)"
+            );
+        }
+    }
+
+    #[test]
+    fn exp_log_check_labels_rejects_negative_and_zero_sum() {
+        // A negative label is rejected for each exp/log objective.
+        for obj in [
+            Objective::Poisson { max_delta_step: 0.7 },
+            Objective::Gamma,
+            Objective::Tweedie { rho: 1.5 },
+        ] {
+            let err = obj.check_labels(&[1.0f32, -0.5, 2.0]).unwrap_err();
+            assert!(
+                matches!(err, ObjectiveError::LabelRange { .. }),
+                "{obj:?} must reject a negative label"
+            );
+            // A zero label-sum is rejected.
+            let err0 = obj.check_labels(&[0.0f32, 0.0]).unwrap_err();
+            assert!(matches!(err0, ObjectiveError::LabelRange { .. }));
+            // A valid non-negative non-zero-sum corpus passes.
+            assert!(obj.check_labels(&[0.0f32, 1.0, 2.0]).is_ok());
+        }
+        // The non-exp/log regression objectives have no label-domain guard.
+        assert!(Objective::Regression { sqrt: false }.check_labels(&[-1.0f32]).is_ok());
+        assert!(Objective::Huber { alpha: 0.9 }.check_labels(&[-100.0f32]).is_ok());
     }
 }

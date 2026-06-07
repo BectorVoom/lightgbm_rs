@@ -25,9 +25,13 @@
 //! # Scope (Phase 7 boundary)
 //! Only the CORE objectives are in scope: `regression`/`regression_l1` (identity),
 //! `binary` (sigmoid), `multiclass` (softmax), `multiclassova`/`ova`/`ovr`
-//! (per-class sigmoid). Any other objective (huber/poisson/quantile/lambdarank/…)
-//! is rejected with [`ModelError::MalformedModel`] — never silently
-//! defaulted-to-identity (T-03-09).
+//! (per-class sigmoid). The OBJ-04/05 exp/log family adds `poisson`/`gamma`/
+//! `tweedie` (`ConvertOutput = exp`), `cross_entropy`/`xentropy` (sigmoid), and
+//! `cross_entropy_lambda`/`xentlambda` (`log1p(exp)`). The identity-`ConvertOutput`
+//! regression objectives (`huber`/`fair`/`quantile`/`mape`) are NOT parsed here —
+//! the caller maps them to [`ObjectiveKind::Regression`] (their predict-side
+//! transform IS the identity). Any other objective (lambdarank/…) is rejected with
+//! [`ModelError::MalformedModel`] — never silently defaulted-to-identity (T-03-09).
 
 use crate::error::ModelError;
 
@@ -69,6 +73,18 @@ pub enum ObjectiveKind {
         /// `sigmoid:` value (C++ default 1.0). Must be `> 0`.
         sigmoid: f64,
     },
+    /// `poisson` / `gamma` / `tweedie` (OBJ-04 exp/log family) — single-output
+    /// log-mean regression. `ConvertOutput`: `exp(input)`
+    /// (`regression_objective.hpp:460` poisson; gamma/tweedie subclass it).
+    Poisson,
+    /// `cross_entropy` / `xentropy` (OBJ-05) — single-output cross-entropy.
+    /// `ConvertOutput`: `1/(1+exp(-input))` (`xentropy_objective.hpp:131`).
+    CrossEntropy,
+    /// `cross_entropy_lambda` / `xentlambda` (OBJ-05) — single-output
+    /// alternative-parameterization cross-entropy. `ConvertOutput`:
+    /// `log1p(exp(input))` (the lambda, NOT a probability;
+    /// `xentropy_objective.hpp:251`).
+    CrossEntropyLambda,
 }
 
 impl ObjectiveKind {
@@ -164,6 +180,13 @@ impl ObjectiveKind {
                     sigmoid,
                 })
             }
+            // OBJ-04 exp/log family: ConvertOutput = exp(input). gamma/tweedie
+            // subclass Poisson and share the exp transform.
+            "poisson" | "gamma" | "tweedie" => Ok(ObjectiveKind::Poisson),
+            // OBJ-05 cross-entropy: sigmoid ConvertOutput.
+            "cross_entropy" | "xentropy" => Ok(ObjectiveKind::CrossEntropy),
+            // OBJ-05 cross-entropy lambda: log1p(exp) ConvertOutput.
+            "cross_entropy_lambda" | "xentlambda" => Ok(ObjectiveKind::CrossEntropyLambda),
             other => Err(ModelError::MalformedModel {
                 detail: format!("objective '{other}' out of Phase-3 scope"),
             }),
@@ -175,7 +198,11 @@ impl ObjectiveKind {
     /// `num_tree_per_iteration` for a well-formed model.
     pub fn num_output(&self) -> usize {
         match self {
-            ObjectiveKind::Regression { .. } | ObjectiveKind::Binary { .. } => 1,
+            ObjectiveKind::Regression { .. }
+            | ObjectiveKind::Binary { .. }
+            | ObjectiveKind::Poisson
+            | ObjectiveKind::CrossEntropy
+            | ObjectiveKind::CrossEntropyLambda => 1,
             ObjectiveKind::Multiclass { num_class }
             | ObjectiveKind::MulticlassOva { num_class, .. } => (*num_class).max(0) as usize,
         }
@@ -200,8 +227,32 @@ impl ObjectiveKind {
             ObjectiveKind::MulticlassOva { sigmoid, .. } => {
                 convert_multiclassova(input, output, *sigmoid);
             }
+            ObjectiveKind::Poisson => {
+                output[0] = convert_poisson(input[0]);
+            }
+            ObjectiveKind::CrossEntropy => {
+                // sigmoid with sigmoid_ == 1.0 (xentropy has no sigmoid param).
+                output[0] = convert_binary(input[0], 1.0);
+            }
+            ObjectiveKind::CrossEntropyLambda => {
+                output[0] = convert_cross_entropy_lambda(input[0]);
+            }
         }
     }
+}
+
+/// C++ `RegressionPoissonLoss::ConvertOutput` (`regression_objective.hpp:460`):
+/// `exp(input)`. gamma/tweedie subclass Poisson and share it.
+#[inline]
+pub fn convert_poisson(input: f64) -> f64 {
+    input.exp()
+}
+
+/// C++ `CrossEntropyLambda::ConvertOutput` (`xentropy_objective.hpp:251`):
+/// `log1p(exp(input))` (the lambda > 0, NOT a probability).
+#[inline]
+pub fn convert_cross_entropy_lambda(input: f64) -> f64 {
+    input.exp().ln_1p()
 }
 
 /// C++ `RegressionL2loss::ConvertOutput` (`regression_objective.hpp:148`):
@@ -406,19 +457,49 @@ mod tests {
 
     #[test]
     fn parse_rejects_out_of_scope_objective() {
-        for line in [
-            "lambdarank",
-            "huber",
-            "poisson",
-            "quantile alpha:0.9",
-            "rank_xendcg",
-        ] {
+        // lambdarank / rank_xendcg are out of scope. huber/quantile have an identity
+        // ConvertOutput — they are NOT parsed here (the caller maps them to
+        // ObjectiveKind::Regression), so the model-text parser rejects the bare names.
+        for line in ["lambdarank", "huber", "quantile alpha:0.9", "rank_xendcg"] {
             let err = ObjectiveKind::parse(line).unwrap_err();
             assert!(
                 matches!(err, ModelError::MalformedModel { .. }),
                 "{line} must be rejected, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_exp_log_family_convert_kinds() {
+        // poisson/gamma/tweedie -> exp ConvertOutput.
+        for line in ["poisson", "gamma", "tweedie"] {
+            assert_eq!(
+                ObjectiveKind::parse(line).unwrap(),
+                ObjectiveKind::Poisson,
+                "{line} must parse to Poisson (exp ConvertOutput)"
+            );
+        }
+        // exp(input): ln(2) -> 2.
+        let mut out = [0.0];
+        ObjectiveKind::Poisson.convert(&[2.0f64.ln()], &mut out);
+        assert!((out[0] - 2.0).abs() < 1e-12);
+
+        // cross_entropy / xentropy -> sigmoid ConvertOutput.
+        for line in ["cross_entropy", "xentropy"] {
+            assert_eq!(ObjectiveKind::parse(line).unwrap(), ObjectiveKind::CrossEntropy);
+        }
+        ObjectiveKind::CrossEntropy.convert(&[0.0], &mut out);
+        assert!((out[0] - 0.5).abs() < 1e-12, "sigmoid(0) = 0.5");
+
+        // cross_entropy_lambda / xentlambda -> log1p(exp) ConvertOutput.
+        for line in ["cross_entropy_lambda", "xentlambda"] {
+            assert_eq!(
+                ObjectiveKind::parse(line).unwrap(),
+                ObjectiveKind::CrossEntropyLambda
+            );
+        }
+        ObjectiveKind::CrossEntropyLambda.convert(&[0.0], &mut out);
+        assert!((out[0] - 2.0f64.ln()).abs() < 1e-12, "log1p(exp(0)) = ln(2)");
     }
 
     #[test]

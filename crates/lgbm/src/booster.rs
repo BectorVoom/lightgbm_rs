@@ -20,7 +20,9 @@ use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::MissingType;
 use lgbm_metric::{BinaryMetric, Metric, MultiLogloss};
 use lgbm_model::{GbdtModel, ObjectiveKind};
-use lgbm_objective::{Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective};
+use lgbm_objective::{
+    Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, Xentropy,
+};
 use lgbm_treelearner::learner::FeatureColumn;
 use lgbm_treelearner::{offset_for_most_freq_bin, SerialTreeLearner};
 
@@ -246,10 +248,25 @@ impl Booster {
 /// [`LgbmError`] for an unsupported objective/metric, an invalid corpus, or a
 /// loop/learner failure — never a panic (Security V5).
 pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError> {
-    // Resolve the training-side objective from config.objective (regression /
-    // regression_l1 / binary). The custom-closure path is `train_custom`.
+    // Resolve the training-side objective from config.objective. The custom-closure
+    // path is `train_custom`.
     let first = config.objective.split_whitespace().next().unwrap_or("");
-    let (boost_obj, transformed_labels): (BoostObjective<'static>, Vec<f32>) = match first {
+    let (boost_obj, transformed_labels) = resolve_objective(config, corpus)?;
+    let metrics = eval_metrics_for(first, config);
+    train_inner(config, corpus, boost_obj, transformed_labels, metrics)
+}
+
+/// Resolve the training-side [`BoostObjective`] + the (possibly transformed)
+/// labels from `config.objective` over `corpus`. Mirrors the C++ string-keyed
+/// `CreateObjectiveFunction` factory + the per-objective `Init` label guards
+/// (binary/multiclass class checks; poisson/gamma/tweedie `>= 0`; xentropy
+/// `[0, 1]`) surfaced as typed errors — never a panic.
+fn resolve_objective(
+    config: &Config,
+    corpus: &DenseCorpus,
+) -> Result<(BoostObjective<'static>, Vec<f32>), LgbmError> {
+    let first = config.objective.split_whitespace().next().unwrap_or("");
+    Ok(match first {
         "binary" => {
             let b = Binary::new(config.sigmoid).map_err(LgbmError::Objective)?;
             (BoostObjective::Binary(b), corpus.labels.clone())
@@ -266,15 +283,23 @@ pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError
                 .map_err(LgbmError::Objective)?;
             (BoostObjective::MulticlassOva(o), corpus.labels.clone())
         }
+        // cross_entropy / cross_entropy_lambda (OBJ-05): single-output xentropy with
+        // an Init `[0, 1]` label guard.
+        "cross_entropy" | "xentropy" | "cross_entropy_lambda" | "xentlambda" => {
+            let x = Xentropy::parse(&config.objective).map_err(LgbmError::Objective)?;
+            x.check_labels(&corpus.labels).map_err(LgbmError::Objective)?;
+            (BoostObjective::Xentropy(x), corpus.labels.clone())
+        }
         _ => {
-            // regression / regression_l1 (+ aliases) route through the enum factory.
+            // regression / regression_l1 / huber / fair / quantile / mape / poisson /
+            // gamma / tweedie (+ aliases) route through the enum factory. The exp/log
+            // objectives carry an Init `>= 0` (+ non-zero-sum) label guard.
             let o = Objective::from_config(config).map_err(LgbmError::Objective)?;
+            o.check_labels(&corpus.labels).map_err(LgbmError::Objective)?;
             let lbl = o.transform_labels(&corpus.labels);
             (BoostObjective::Builtin(o), lbl)
         }
-    };
-    let metrics = eval_metrics_for(first, config);
-    train_inner(config, corpus, boost_obj, transformed_labels, metrics)
+    })
 }
 
 /// Train a [`Booster`] with an optional validation set (BST-07 early stopping +
@@ -293,27 +318,7 @@ pub fn train_with_valid(
     valid: &DenseCorpus,
 ) -> Result<Booster, LgbmError> {
     let first = config.objective.split_whitespace().next().unwrap_or("");
-    let (boost_obj, transformed_labels): (BoostObjective<'static>, Vec<f32>) = match first {
-        "binary" => {
-            let b = Binary::new(config.sigmoid).map_err(LgbmError::Objective)?;
-            (BoostObjective::Binary(b), corpus.labels.clone())
-        }
-        "multiclass" | "softmax" => {
-            let m = MulticlassSoftmax::new(config.num_class, &corpus.labels)
-                .map_err(LgbmError::Objective)?;
-            (BoostObjective::Multiclass(m), corpus.labels.clone())
-        }
-        "multiclassova" | "multiclass_ova" | "ova" | "ovr" => {
-            let o = MulticlassOva::new(config.num_class, config.sigmoid, &corpus.labels)
-                .map_err(LgbmError::Objective)?;
-            (BoostObjective::MulticlassOva(o), corpus.labels.clone())
-        }
-        _ => {
-            let o = Objective::from_config(config).map_err(LgbmError::Objective)?;
-            let lbl = o.transform_labels(&corpus.labels);
-            (BoostObjective::Builtin(o), lbl)
-        }
-    };
+    let (boost_obj, transformed_labels) = resolve_objective(config, corpus)?;
     let metrics = eval_metrics_for(first, config);
     train_inner_full(config, corpus, Some(valid), boost_obj, transformed_labels, metrics)
 }

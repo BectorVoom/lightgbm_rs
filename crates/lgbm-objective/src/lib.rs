@@ -25,12 +25,14 @@ pub mod error;
 pub mod multiclass;
 pub mod percentile;
 pub mod regression;
+pub mod xentropy;
 
 pub use binary::Binary;
 pub use custom::CustomObjective;
 pub use error::ObjectiveError;
 pub use multiclass::{MulticlassOva, MulticlassSoftmax};
 pub use regression::Objective;
+pub use xentropy::{Xentropy, XentropyKind};
 
 // Re-export the predict-side transform so downstream callers (metric / boosting /
 // facade) have a single objective import surface. The canonical owner remains

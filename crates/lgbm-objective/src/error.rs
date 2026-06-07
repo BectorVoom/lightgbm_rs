@@ -57,6 +57,29 @@ pub enum ObjectiveError {
         name: String,
     },
 
+    /// A training label fell outside the range an exp/log objective requires.
+    ///
+    /// Security V5 / T-07-03-01: mirrors the C++ `Init` label guards surfaced as a
+    /// typed error rather than a `Log::Fatal` abort:
+    /// - poisson/gamma/tweedie (`regression_objective.hpp:417-419`):
+    ///   `Common::ObtainMinMaxSum` → `if (miny < 0) Log::Fatal("at least one target
+    ///   label is negative")` (and `sumy == 0` fatal).
+    /// - cross_entropy / cross_entropy_lambda (`xentropy_objective.hpp:57`):
+    ///   `Common::CheckElementsIntervalClosed<label_t>(label_, 0.0f, 1.0f, ...)`.
+    ///
+    /// Carries the offending value + the human-readable valid interval so a
+    /// malformed corpus can never feed `exp`/`log` an out-of-domain label (NaN /
+    /// `-inf` propagation).
+    #[error("label `{label}` out of range for objective `{objective}`: {reason}")]
+    LabelRange {
+        /// The offending label value (the first one found out of range).
+        label: f64,
+        /// The objective the label feeds.
+        objective: String,
+        /// Why the label is rejected (the C++ guard predicate, in words).
+        reason: String,
+    },
+
     /// An objective parameter fell outside its valid range.
     ///
     /// Security V5: mirrors a C++ `CHECK(...)` / `Log::Fatal` site surfaced as a

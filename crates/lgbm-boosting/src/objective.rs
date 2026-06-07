@@ -18,7 +18,7 @@
 //! the class-major score/grad/hess layout (multiclass_objective.hpp:149/255).
 
 use lgbm_objective::{
-    Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, ObjectiveError,
+    Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, ObjectiveError, Xentropy,
 };
 
 /// The training-side objective the boosting loop drives.
@@ -35,6 +35,9 @@ pub enum BoostObjective<'a> {
     Multiclass(MulticlassSoftmax),
     /// `multiclassova` — `num_class` one-vs-all binary objectives, one tree/class.
     MulticlassOva(MulticlassOva),
+    /// `cross_entropy` / `cross_entropy_lambda` (OBJ-05) — single-output
+    /// cross-entropy point loss over labels in `[0, 1]`.
+    Xentropy(Xentropy),
 }
 
 impl<'a> BoostObjective<'a> {
@@ -45,7 +48,8 @@ impl<'a> BoostObjective<'a> {
         match self {
             BoostObjective::Builtin(_)
             | BoostObjective::Binary(_)
-            | BoostObjective::Custom(_) => 1,
+            | BoostObjective::Custom(_)
+            | BoostObjective::Xentropy(_) => 1,
             BoostObjective::Multiclass(m) => m.num_model_per_iteration(),
             BoostObjective::MulticlassOva(o) => o.num_model_per_iteration(),
         }
@@ -60,6 +64,7 @@ impl<'a> BoostObjective<'a> {
         match self {
             BoostObjective::Builtin(o) => o.boost_from_score(label),
             BoostObjective::Binary(b) => b.boost_from_score(label),
+            BoostObjective::Xentropy(x) => x.boost_from_score(label),
             BoostObjective::Custom(_) => 0.0,
             BoostObjective::Multiclass(m) => m.boost_from_score(class_id),
             BoostObjective::MulticlassOva(o) => o.boost_from_score(class_id),
@@ -71,8 +76,11 @@ impl<'a> BoostObjective<'a> {
     /// multiclass variants it gates the per-class constant-tree path (Pitfall 6).
     pub fn class_need_train(&self, class_id: i32, label: &[f32]) -> bool {
         match self {
-            // Regression always trains; custom always trains (no class concept).
-            BoostObjective::Builtin(_) | BoostObjective::Custom(_) => true,
+            // Regression always trains; custom + xentropy always train (no class
+            // concept / single output).
+            BoostObjective::Builtin(_)
+            | BoostObjective::Custom(_)
+            | BoostObjective::Xentropy(_) => true,
             BoostObjective::Binary(b) => b.class_need_train(label),
             BoostObjective::Multiclass(m) => m.class_need_train(class_id),
             BoostObjective::MulticlassOva(o) => o.class_need_train(class_id),
@@ -107,6 +115,7 @@ impl<'a> BoostObjective<'a> {
         match self {
             BoostObjective::Builtin(o) => o.get_gradients(score, label, gradients, hessians),
             BoostObjective::Binary(b) => b.get_gradients(score, label, gradients, hessians),
+            BoostObjective::Xentropy(x) => x.get_gradients(score, label, gradients, hessians),
             BoostObjective::Custom(c) => c.get_gradients(score, gradients, hessians),
             BoostObjective::Multiclass(m) => m.get_gradients(score, gradients, hessians),
             BoostObjective::MulticlassOva(o) => o.get_gradients(score, gradients, hessians),
@@ -120,7 +129,8 @@ impl<'a> BoostObjective<'a> {
             BoostObjective::Binary(_)
             | BoostObjective::Custom(_)
             | BoostObjective::Multiclass(_)
-            | BoostObjective::MulticlassOva(_) => false,
+            | BoostObjective::MulticlassOva(_)
+            | BoostObjective::Xentropy(_) => false,
         }
     }
 
@@ -136,7 +146,8 @@ impl<'a> BoostObjective<'a> {
             BoostObjective::Binary(_)
             | BoostObjective::Custom(_)
             | BoostObjective::Multiclass(_)
-            | BoostObjective::MulticlassOva(_) => 0.0,
+            | BoostObjective::MulticlassOva(_)
+            | BoostObjective::Xentropy(_) => 0.0,
         }
     }
 }
