@@ -562,11 +562,60 @@ fn custom_cross_anchored_to_native_regression_l2() {
 }
 
 #[test]
-#[ignore = "MISSING — implemented in wave 4 (06-05): bagging RNG-replay (D-13 Option A) bagged-index parity"]
 fn bagging_rng() {
-    // L4: bagged row indices derived in-Rust from the replayed RNG sequence,
-    // asserted exact (compare_exact_u32) against the captured bag.
-    panic!("MISSING — implemented in wave 4 (06-05)");
+    // L4 (D-13 Option A): the full bag_data_indices array (in-bag ++ OOB tail)
+    // reproduced by `BaggingSampleStrategy::bagging` over the proven
+    // `lgbm_core::Random` LCG, asserted BIT-EXACT (compare_exact i32) against the
+    // committed RNG-replay golden `bag_indices_seed3_frac0.7.txt`. The bag is a pure
+    // function of (bagging_seed, bagging_fraction, num_data, block 1024), so a wrong
+    // RNG draw/order can never hide behind a near-matching model.
+    use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy};
+
+    let Some(text) = read_golden("bag_indices_seed3_frac0.7.txt") else {
+        return;
+    };
+    let mut cells = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Parse: seed=<S> fraction=<F> num_data=<N> bag_data_cnt=<C> indices=<csv>.
+        let mut seed = 0i32;
+        let mut fraction = 0.0f64;
+        let mut num_data = 0i32;
+        let mut bag_cnt = 0i32;
+        let mut expected: Vec<i32> = Vec::new();
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("seed=") {
+                seed = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("fraction=") {
+                fraction = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("num_data=") {
+                num_data = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("bag_data_cnt=") {
+                bag_cnt = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("indices=") {
+                expected = v.split(',').map(|t| t.parse::<i32>().unwrap()).collect();
+            }
+        }
+        let labels = vec![0.0f32; num_data as usize];
+        let cfg = BaggingConfig::new(fraction, 1.0, 1.0, 1, seed, false).unwrap();
+        let mut strat = BaggingSampleStrategy::reset_sample_config(cfg, num_data, &labels);
+        assert!(strat.bagging(0, &labels), "iter 0 must bag (need_re_bagging)");
+        assert_eq!(
+            strat.bag_data_cnt(),
+            bag_cnt,
+            "seed={seed} frac={fraction}: realized in-bag count != golden"
+        );
+        assert_eq!(
+            strat.bag_data_indices(),
+            expected.as_slice(),
+            "seed={seed} frac={fraction}: bag_data_indices not bit-exact vs RNG-replay golden"
+        );
+        cells += 1;
+    }
+    assert!(cells >= 1, "expected at least one bag golden cell");
 }
 
 // ========================= multiclass / multiclassova (06-04) =========================

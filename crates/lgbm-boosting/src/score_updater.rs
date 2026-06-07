@@ -106,6 +106,38 @@ impl ScoreUpdater {
         let end = off + self.num_data as usize;
         learner.add_prediction_to_score(tree, data_partition, &mut self.score[off..end]);
     }
+
+    /// C++ predict-side `ScoreUpdater::AddScore(tree, data_indices, data_cnt,
+    /// cur_tree_id)` (score_updater.hpp / gbdt.cpp:499-509 OOB path): add the tree's
+    /// per-row prediction to `score_` for a SELECTED set of rows, traversing the
+    /// tree by their real feature values (`tree.predict`). Used for the out-of-bag
+    /// rows when bagging (and, on the identity-binned corpus, equivalently for the
+    /// whole row set — the per-row predict is bit-exact to the partition scatter,
+    /// the L2 contract). `rows` are the GLOBAL row indices; `feature_row(row)`
+    /// yields that row's real feature value vector.
+    ///
+    /// A single-leaf (constant `as_constant`) tree still contributes its leaf value
+    /// (the `AsConstantTree` path adds its constant to every selected row) — but the
+    /// boosting loop only calls this for grown trees (`num_leaves > 1`) on the
+    /// bagging path; the constant-tree init is injected via `add_constant`.
+    pub fn add_tree_predict_path<FRow>(
+        &mut self,
+        tree: &Tree,
+        rows: &[i32],
+        cur_tree_id: i32,
+        feature_row: FRow,
+    ) where
+        FRow: Fn(i32) -> Vec<f64>,
+    {
+        if tree.num_leaves <= 1 {
+            return;
+        }
+        let off = self.offset(cur_tree_id);
+        for &row in rows {
+            let out = tree.predict(&feature_row(row));
+            self.score[off + row as usize] += out;
+        }
+    }
 }
 
 #[cfg(test)]

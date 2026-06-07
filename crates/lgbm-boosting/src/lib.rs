@@ -20,12 +20,16 @@
 //! Shrinkage → UpdateScore → AddBias) land in 06-02 (L2 spine) and 06-05
 //! (bagging/early-stopping).
 
+pub mod early_stopping;
 pub mod error;
 pub mod gbdt;
 pub mod objective;
+pub mod sample_strategy;
 pub mod score_updater;
 
+pub use early_stopping::{EarlyStopping, EvalSnapshot, MetricSpec};
 pub use error::BoostingError;
 pub use gbdt::{Gbdt, IterSnapshot};
 pub use objective::BoostObjective;
+pub use sample_strategy::{BaggingConfig, BaggingSampleStrategy, BAGGING_RAND_BLOCK};
 pub use score_updater::ScoreUpdater;

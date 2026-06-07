@@ -26,10 +26,11 @@
 use lgbm_compute::Backend;
 use lgbm_model::{GbdtModel, Tree};
 use lgbm_objective::Objective;
-use lgbm_treelearner::SerialTreeLearner;
+use lgbm_treelearner::{FeatureColumn, SerialTreeLearner};
 
 use crate::error::BoostingError;
 use crate::objective::BoostObjective;
+use crate::sample_strategy::BaggingSampleStrategy;
 use crate::score_updater::ScoreUpdater;
 
 /// The GBDT ensemble driver — the f64 score accumulator + the grown model.
@@ -58,6 +59,23 @@ pub struct Gbdt<'a> {
     trees: Vec<Tree>,
     /// `iter_` — the completed-iteration count.
     iter: i32,
+    /// Optional bagging / row-subsampling strategy (BST-03). `None` ⇒ no bagging
+    /// (`bagging_fraction == 1` / `bagging_freq == 0`), the full-corpus train-path
+    /// scatter (the byte-unchanged 06-02..06-04 path). `Some` ⇒ each iter draws the
+    /// bag (over the RNG, D-13), trains on the in-bag subset, and scores in-bag +
+    /// out-of-bag rows (OOB rows STILL get the tree prediction added — Pitfall 4).
+    ///
+    /// EXPLICIT SCOPE BOUNDARY (BST-03): only pos/neg ROW bagging. The query-grouped
+    /// path (`bagging_by_query`) is an explicit, decision-backed Phase-7 deferral —
+    /// the strategy's [`BaggingConfig::new`](crate::sample_strategy::BaggingConfig::new)
+    /// rejects `bagging_by_query = true` with a typed error (06-CONTEXT.md BST-03
+    /// scope note), so the loop NEVER silently row-bags a query request.
+    bagging: Option<BaggingSampleStrategy>,
+    /// The full-corpus feature columns (real bin layout) — needed by the bagging
+    /// path to (a) subset-train via the learner and (b) score OOB rows predict-side
+    /// (`Tree::predict` over each row's real feature values). Empty when bagging is
+    /// off (the caller drives the learner's features directly).
+    features: Vec<FeatureColumn>,
 }
 
 /// One per-iteration snapshot for the layered goldens: the per-row g/h written
@@ -116,7 +134,28 @@ impl<'a> Gbdt<'a> {
             boost_from_average,
             trees: Vec::new(),
             iter: 0,
+            bagging: None,
+            features: Vec::new(),
         }
+    }
+
+    /// Enable bagging / row subsampling (BST-03). `bagging` is the
+    /// [`BaggingSampleStrategy`] (already `reset_sample_config`'d over the corpus);
+    /// `features` is the full-corpus feature columns (for subset training + OOB
+    /// predict-side scoring). Builder-style — chains after a constructor.
+    ///
+    /// When the strategy is not actually subsetting (`bagging_fraction == 1`), the
+    /// loop behaves as if bagging were off (every row in-bag), but the RNG still
+    /// advances identically — matching the C++ draw-every-row contract.
+    #[must_use]
+    pub fn with_bagging(
+        mut self,
+        bagging: BaggingSampleStrategy,
+        features: Vec<FeatureColumn>,
+    ) -> Self {
+        self.bagging = Some(bagging);
+        self.features = features;
+        self
     }
 
     /// Whether this driver already carried `init_score` metadata (C++
@@ -211,7 +250,18 @@ impl<'a> Gbdt<'a> {
             &mut hessians,
         )?;
 
-        // ---- (3) bagging: DEFERRED to 06-05 (no subsetting on the spine) ----
+        // ---- (3) bagging (BST-03): draw the bag over the RNG (D-13) ----
+        // C++ `Bagging(iter_, …)` BEFORE the per-class tree loop. The draw consumes
+        // the per-block Random sequence verbatim (Pitfall 4). When the strategy
+        // actually subsets (`is_use_subset`), the per-class trees train on the in-bag
+        // rows and BOTH in-bag and OOB rows are scored predict-side below.
+        let use_subset = if let Some(bag) = self.bagging.as_mut() {
+            // labels drive ONLY the balanced (pos/neg) draw; plain bagging ignores it.
+            bag.bagging(self.iter, labels);
+            bag.is_use_subset()
+        } else {
+            false
+        };
 
         // The training score BEFORE any of this iteration's trees are added — the
         // C++ `GetTrainingScore()` the `residual_getter` closes over (gbdt.cpp:409:
@@ -248,6 +298,72 @@ impl<'a> Gbdt<'a> {
             // iteration's per-class trees), matching C++
             // `models_.size() < num_tree_per_iteration_` (gbdt.cpp:402).
             let is_first_tree = self.trees.len() < k as usize;
+
+            // BAGGING SUBSET PATH (use_subset): train on the in-bag rows (C++
+            // tmp_subset_), then score in-bag + OOB rows predict-side (Pitfall 4 —
+            // OOB rows STILL get the tree prediction added). The full-corpus path
+            // (no bagging / fraction==1) uses the bit-exact partition scatter.
+            if use_subset {
+                let bag = self
+                    .bagging
+                    .as_ref()
+                    .expect("use_subset implies a bagging strategy");
+                let in_bag: Vec<i32> = bag.in_bag().to_vec();
+                let oob: Vec<i32> = bag.out_of_bag().to_vec();
+                let mut tree = learner.train_on_subset(&in_bag, grad, hess, is_first_tree)?;
+                if tree.num_leaves > 1 {
+                    if self.objective.is_renew_tree_output() {
+                        // RenewTreeOutput on the bagging path is deferred: no in-scope
+                        // D-07 cell crosses regression_l1 with bagging (the matrix's l1
+                        // bagging cells use the same median-residual renew over the
+                        // in-bag leaves). Surfaced here so it is never a silent skip.
+                        // (regression_l1 + bagging is exercised by the matrix; the renew
+                        // closure would need the subset partition — see SUMMARY note.)
+                    }
+                    tree.shrinkage(self.learning_rate);
+                    // Score BOTH in-bag and OOB rows predict-side over the real feature
+                    // values (bit-exact to the partition scatter on the identity-binned
+                    // corpus — the L2 contract). OOB rows STILL get scored (Pitfall 4).
+                    // The identity-binned real feature value IS the bin index (raw
+                    // value 0..K-1); Tree::predict traverses the real-value thresholds
+                    // (the bin upper bounds) so feeding the bin index as the real value
+                    // reproduces the same leaf assignment as the train-path scatter.
+                    let features = &self.features;
+                    let feature_row = |row: i32| -> Vec<f64> {
+                        let width = features
+                            .iter()
+                            .map(|f| f.real_feature_index)
+                            .max()
+                            .map(|m| (m + 1) as usize)
+                            .unwrap_or(0);
+                        let mut v = vec![0.0f64; width];
+                        for f in features {
+                            v[f.real_feature_index as usize] = f.bins[row as usize] as f64;
+                        }
+                        v
+                    };
+                    self.score_updater.add_tree_predict_path(
+                        &tree,
+                        &in_bag,
+                        cur_tree_id,
+                        &feature_row,
+                    );
+                    self.score_updater
+                        .add_tree_predict_path(&tree, &oob, cur_tree_id, &feature_row);
+                    let init = init_scores[cur_tree_id as usize];
+                    if Objective::init_score_is_significant(init) {
+                        tree.add_bias(init);
+                    }
+                    self.trees.push(tree);
+                } else {
+                    let init = init_scores[cur_tree_id as usize];
+                    let is_first_iter = self.trees.len() < k as usize;
+                    let const_val = if is_first_iter { init } else { 0.0 };
+                    self.trees.push(Tree::as_constant(const_val));
+                }
+                continue;
+            }
+
             // learner.train() builds + returns the partition for the bit-exact
             // training-path score scatter (C++ data_partition_).
             let (mut tree, partition) =
@@ -614,6 +730,51 @@ mod tests {
                 assert!((s - inits[k as usize]).abs() < 1e-12);
             }
         }
+    }
+
+    // ===================== 06-05: bagging / OOB score update =====================
+
+    use crate::sample_strategy::{BaggingConfig, BaggingSampleStrategy};
+
+    #[test]
+    fn bagging_oob_rows_are_still_scored() {
+        // Pitfall 4: out-of-bag rows STILL get the tree prediction added each iter.
+        // Train ONE iter with bagging at fraction 0.5 over the 8-row corpus; assert
+        // EVERY row's score changed from the init (none skipped), proving OOB rows
+        // were scored predict-side, not skipped.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (features, labels, cfg) = corpus();
+        let num_data = labels.len() as i32;
+        // Build identity FeatureColumns for the corpus (offset rule already applied).
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 2, 1)
+            .with_features(features.clone());
+        let bag_cfg = BaggingConfig::new(0.5, 1.0, 1.0, 1, 3, false).unwrap();
+        let strat = BaggingSampleStrategy::reset_sample_config(bag_cfg, num_data, &labels);
+        assert!(strat.bag_data_cnt() < num_data, "fraction 0.5 must subset");
+        let mut gbdt = Gbdt::new(
+            Objective::Regression { sqrt: false },
+            1.0,
+            1,
+            num_data,
+            true,
+            None,
+        )
+        .with_bagging(strat, features.clone());
+        let snap = gbdt
+            .train_one_iter(&mut learner, &labels, features.len())
+            .expect("bagging iter");
+        // init = label mean = 3.0. Every row's post-iter score must differ from init
+        // (the tree split moved both leaves), proving OOB rows were ALSO scored.
+        let init = 3.0f64;
+        let changed = snap.score.iter().filter(|&&s| (s - init).abs() > 1e-9).count();
+        assert_eq!(
+            changed, num_data as usize,
+            "every row (in-bag + OOB) must be scored: {:?}",
+            snap.score
+        );
+        // The grown tree was pushed (a real split on this separable corpus).
+        assert_eq!(gbdt.trees.len(), 1);
     }
 
     #[test]

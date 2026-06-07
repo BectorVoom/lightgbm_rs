@@ -285,6 +285,56 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         Ok((tree, snaps))
     }
 
+    /// Train one tree over a ROW SUBSET (the C++ `tmp_subset_` bagging path,
+    /// bagging.hpp `is_use_subset_`). `in_bag` is the in-bag GLOBAL row indices (the
+    /// strategy's `bag_data_indices_[..bag_data_cnt]`, ascending); `gradients` /
+    /// `hessians` are the FULL (global) per-row buffers. The learner builds a subset
+    /// dataset (the in-bag rows' bins, in in-bag order) and the corresponding subset
+    /// grad/hess, grows the tree over it, and returns the grown [`Tree`].
+    ///
+    /// The returned tree's split thresholds are the same real-value bin upper bounds
+    /// (binning is identical for any row subset of an identity-binned corpus), so the
+    /// boosting layer scores BOTH in-bag and out-of-bag rows via the predict-side
+    /// [`Tree::predict`] over the original real feature values (bit-exact to the
+    /// train-path scatter on this identity-binned corpus — the L2 contract). This
+    /// mirrors the C++ result: in-bag rows scored via the data-partition scatter, OOB
+    /// rows via the tree predict-side add, both adding the SAME f64 leaf value once.
+    ///
+    /// # Errors
+    /// Propagates the learner-boundary checks (length / bin-range / num_leaves).
+    pub fn train_on_subset(
+        &mut self,
+        in_bag: &[i32],
+        gradients: &[f32],
+        hessians: &[f32],
+        is_first_tree: bool,
+    ) -> Result<Tree, TreeLearnerError> {
+        // Build subset feature columns (in-bag rows, in in-bag order) — every other
+        // FeatureColumn field (num_bin/offset/min_bin/max_bin/most_freq_bin/...) is
+        // a per-feature property independent of the row subset, so only `bins` is
+        // re-gathered.
+        let subset_features: Vec<FeatureColumn> = self
+            .features
+            .iter()
+            .map(|f| {
+                let bins: Vec<u32> = in_bag.iter().map(|&r| f.bins[r as usize]).collect();
+                FeatureColumn {
+                    bins,
+                    ..f.clone()
+                }
+            })
+            .collect();
+        let sub_grad: Vec<f32> = in_bag.iter().map(|&r| gradients[r as usize]).collect();
+        let sub_hess: Vec<f32> = in_bag.iter().map(|&r| hessians[r as usize]).collect();
+
+        // Swap in the subset features for the growth, restore afterward (the learner
+        // is reused across iterations with the full-corpus features).
+        let saved = std::mem::replace(&mut self.features, subset_features);
+        let result = self.train(&sub_grad, &sub_hess, is_first_tree);
+        self.features = saved;
+        result
+    }
+
     /// Like [`train`](Self::train) but ALSO returns the final [`DataPartition`]
     /// the tree was grown over (the row→leaf mapping after the last split).
     ///
