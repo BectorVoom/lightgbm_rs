@@ -252,11 +252,15 @@ def train(
 
     metrics = _resolve_metrics(params)
 
-    # Assemble the evaluation sets: list of (name, X, y).
+    # Assemble the evaluation sets: list of (name, X, y). ``valid_sets`` is the
+    # public surface (a list of ``(X, y)`` numpy tuples); ``_valid_data`` is the
+    # internal channel the sklearn wrappers use (same shape). Prefer whichever
+    # is provided.
+    valid_source = _valid_data if _valid_data is not None else valid_sets
     eval_sets: List[Tuple[str, np.ndarray, np.ndarray]] = []
-    if _valid_data is not None:
-        names = list(valid_names) if valid_names else [f"valid_{i}" for i in range(len(_valid_data))]
-        for i, (Xi, yi) in enumerate(_valid_data):
+    if valid_source is not None:
+        names = list(valid_names) if valid_names else [f"valid_{i}" for i in range(len(valid_source))]
+        for i, (Xi, yi) in enumerate(valid_source):
             nm = names[i] if i < len(names) else f"valid_{i}"
             eval_sets.append((nm, np.ascontiguousarray(Xi, dtype=np.float64), np.asarray(yi, dtype=np.float64)))
 
@@ -306,17 +310,22 @@ def train(
                     )
                 )
         except EarlyStopException as e:
-            best_iteration = e.best_iteration
+            best_iteration = e.best_iteration  # 0-based index from the callback
             break
 
-    # If early stopping fired, retrain to the best iteration so predict() uses it.
+    # If early stopping fired (or ran to the final-iteration check), retrain to
+    # the best iteration so predict() uses it. ``best_iteration`` is 0-based
+    # internally; expose it 1-based on the booster to match the official
+    # convention (model.best_iteration is the tree COUNT, e.g. 60 trees).
     if best_iteration >= 0:
-        best_booster = _core.train(params, train_set, num_boost_round=best_iteration + 1, fobj=fobj, feval=feval)
-        result = best_booster
+        n_best = best_iteration + 1
+        result = _core.train(params, train_set, num_boost_round=n_best, fobj=fobj, feval=feval)
+        reported_best = n_best
     else:
         result = last_booster if last_booster is not None else _core.train(params, train_set, num_boost_round=num_boost_round, fobj=fobj, feval=feval)
+        reported_best = -1
 
-    return _TrainedBooster(result, params, best_iteration=best_iteration)
+    return _TrainedBooster(result, params, best_iteration=reported_best)
 
 
 # ---------------------------------------------------------------------------
