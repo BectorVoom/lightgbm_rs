@@ -7,7 +7,18 @@ LightGBM code can switch ``import lightgbm`` -> ``import lightgbm_rs`` for the
 in-scope APIs.
 """
 
-from ._core import Booster, Dataset, LightGBMError, train
+from ._core import Booster, Dataset, LightGBMError
+from ._core import train as _core_train
+from .callback import (
+    CallbackEnv,
+    EarlyStopException,
+    early_stopping,
+    log_evaluation,
+    record_evaluation,
+    reset_parameter,
+)
+from .engine import CVBooster, cv
+from .engine import train as train
 
 
 def dataset_from_csr(csr, label):
@@ -81,6 +92,14 @@ __all__ = [
     "Dataset",
     "LightGBMError",
     "train",
+    "cv",
+    "CVBooster",
+    "CallbackEnv",
+    "EarlyStopException",
+    "early_stopping",
+    "log_evaluation",
+    "record_evaluation",
+    "reset_parameter",
     "dataset_from_csr",
     "dataset_from_csc",
     "dataset_from_polars",
