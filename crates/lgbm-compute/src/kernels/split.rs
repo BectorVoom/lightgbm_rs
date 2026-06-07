@@ -916,6 +916,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         };
         // offset=0, default_bin out of range so SKIP_DEFAULT_BIN never fires.
         let si = find_best_split_cpu(
@@ -954,6 +955,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         };
         let si = find_best_split_cpu(
             &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, 4.0, 4.0, 8,
@@ -973,6 +975,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         };
         // hist len 6 != 2*num_bin(4)=8
         let err = find_best_split_cpu(
@@ -1011,6 +1014,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         };
         let err = find_best_split_cpu(
             &client,

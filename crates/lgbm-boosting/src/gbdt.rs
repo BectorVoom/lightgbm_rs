@@ -1454,6 +1454,7 @@ mod tests {
             missing_type: MissingType::None,
             bin_upper_bound: vec![0.5, 1.5],
             real_feature_index: 0,
+            ..Default::default()
         };
         let f1 = FeatureColumn {
             bins: vec![0, 0, 1, 1, 0, 0, 1, 1],
@@ -1466,6 +1467,7 @@ mod tests {
             missing_type: MissingType::None,
             bin_upper_bound: vec![0.5, 1.5],
             real_feature_index: 1,
+            ..Default::default()
         };
         // Labels separable by feature 0.
         let labels = vec![1.0f32, 1.0, 1.0, 1.0, 5.0, 5.0, 5.0, 5.0];
@@ -1477,6 +1479,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         };
         (vec![f0, f1], labels, cfg)
     }

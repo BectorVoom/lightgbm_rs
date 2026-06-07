@@ -221,6 +221,31 @@ pub struct GainConfig {
     pub min_gain_to_split: f64,
     /// `double path_smooth` (config default 0.0 — smoothing, Phase-7+).
     pub path_smooth: f64,
+    /// `int min_data_per_group` (config default 100) — categorical many-vs-many
+    /// minimum rows per accumulated category group.
+    pub min_data_per_group: i32,
+    /// `int max_cat_threshold` (config default 32) — categorical many-vs-many cap
+    /// on the number of categories on one side.
+    pub max_cat_threshold: i32,
+    /// `double cat_l2` (config default 10.0) — extra l2 ADDED to lambda_l2 ONLY in
+    /// the per-category gain (NOT the `gain_shift` baseline — the deliberate
+    /// asymmetry, feature_histogram.cpp:163-168,248).
+    pub cat_l2: f64,
+    /// `double cat_smooth` (config default 10.0) — categorical CTR smoothing +
+    /// the `RoundInt(hess*cnt_factor) >= cat_smooth` many-vs-many filter.
+    pub cat_smooth: f64,
+    /// `int max_cat_to_onehot` (config default 4) — categorical features with
+    /// `num_bin <= max_cat_to_onehot` use the one-hot (one-vs-rest) path.
+    pub max_cat_to_onehot: i32,
+}
+
+impl Default for GainConfig {
+    /// The config.h defaults (so test literals can fill the categorical fields via
+    /// `..Default::default()` without restating them). Mirrors
+    /// `lgbm_core::Config::default()` for every field.
+    fn default() -> Self {
+        Self::from_config(&lgbm_core::Config::default())
+    }
 }
 
 impl GainConfig {
@@ -234,6 +259,11 @@ impl GainConfig {
             lambda_l2: c.lambda_l2,
             min_gain_to_split: c.min_gain_to_split,
             path_smooth: c.path_smooth,
+            min_data_per_group: c.min_data_per_group,
+            max_cat_threshold: c.max_cat_threshold,
+            cat_l2: c.cat_l2,
+            cat_smooth: c.cat_smooth,
+            max_cat_to_onehot: c.max_cat_to_onehot,
         }
     }
 

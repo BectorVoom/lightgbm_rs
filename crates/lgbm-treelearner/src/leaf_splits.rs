@@ -174,6 +174,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         }
     }
 

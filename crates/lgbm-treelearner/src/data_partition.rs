@@ -158,10 +158,94 @@ impl DataPartition {
         Ok((left_count, right_count))
     }
 
+    /// `DataPartition::Split` for a CATEGORICAL split — a host transcription of
+    /// `DenseBin::SplitCategoricalInner<USE_MIN_BIN=false>`
+    /// (`dense_bin.hpp:451-504`, the single-feature-group overload that hard-codes
+    /// `min_bin = 1`). Routes `leaf`'s rows by the INNER bin bitset into
+    /// `left_leaf` (kept as `leaf`, the `lte`/in-bitset side) and `right_leaf`
+    /// (the `gt`/default side).
+    ///
+    /// `threshold_inner` is the inner-bin bitset (`Common::ConstructBitset` over
+    /// the winning REAL BINS). `most_freq_bin` drives the default direction:
+    /// `offset = most_freq_bin == 0 ? 1 : 0`; a `bin == 0` row goes to the default
+    /// (right) side unless `most_freq_bin > 0` AND `most_freq_bin` is in the bitset
+    /// (then default → left). The in-bitset test is
+    /// `FindInBitset(threshold, bin - 1 + offset)` (min_bin == 1).
+    ///
+    /// Returns `(left_count, right_count)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_categorical(
+        &mut self,
+        leaf: i32,
+        right_leaf: i32,
+        feature_bins: &[u32],
+        threshold_inner: &[u32],
+        most_freq_bin: u32,
+    ) -> (i32, i32) {
+        let leaf_u = leaf as usize;
+        let begin = self.leaf_begin[leaf_u] as usize;
+        let count = self.leaf_count[leaf_u] as usize;
+        let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
+
+        let offset: u32 = if most_freq_bin == 0 { 1 } else { 0 };
+        // Default side: gt (right) unless most_freq_bin > 0 and in the bitset.
+        let default_left = most_freq_bin > 0 && find_in_bitset(threshold_inner, most_freq_bin);
+
+        let mut lte: Vec<u32> = Vec::with_capacity(count); // left / in-bitset
+        let mut gt: Vec<u32> = Vec::with_capacity(count); // right / default
+        for &row in &leaf_rows {
+            let bin = feature_bins[row as usize];
+            // USE_MIN_BIN == false: a `bin == 0` row goes to the default side.
+            if bin == 0 {
+                if default_left {
+                    lte.push(row);
+                } else {
+                    gt.push(row);
+                }
+            } else if find_in_bitset(threshold_inner, bin - 1 + offset) {
+                lte.push(row);
+            } else {
+                gt.push(row);
+            }
+        }
+
+        let left_count = lte.len() as i32;
+        let right_count = gt.len() as i32;
+
+        // Write [left | right] back into the leaf's slice (stable order).
+        let mut w = begin;
+        for &row in &lte {
+            self.indices[w] = row;
+            w += 1;
+        }
+        for &row in &gt {
+            self.indices[w] = row;
+            w += 1;
+        }
+
+        self.leaf_count[leaf_u] = left_count;
+        let right_u = right_leaf as usize;
+        self.leaf_begin[right_u] = begin as i32 + left_count;
+        self.leaf_count[right_u] = right_count;
+
+        (left_count, right_count)
+    }
+
     /// Total row count (`num_data_`).
     pub fn num_data(&self) -> i32 {
         self.num_data
     }
+}
+
+/// `Common::FindInBitset(bits, n, pos)` (`common.h:836`): `i1 = pos/32; if i1 >= n
+/// return false; (bits[i1] >> (pos%32)) & 1`.
+#[inline]
+fn find_in_bitset(bits: &[u32], pos: u32) -> bool {
+    let i1 = (pos / 32) as usize;
+    if i1 >= bits.len() {
+        return false;
+    }
+    (bits[i1] >> (pos % 32)) & 1 == 1
 }
 
 #[cfg(test)]

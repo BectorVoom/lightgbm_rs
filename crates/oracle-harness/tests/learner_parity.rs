@@ -241,6 +241,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
         missing_type: MissingType::None,
         bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
         real_feature_index: 0,
+        ..Default::default()
     };
     let f1 = FeatureColumn {
         bins: vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3],
@@ -253,6 +254,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
         missing_type: MissingType::None,
         bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
         real_feature_index: 1,
+        ..Default::default()
     };
 
     let cfg = GainConfig {
@@ -263,6 +265,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
         lambda_l2: 0.0,
         min_gain_to_split: 0.0,
         path_smooth: 0.0,
+        ..Default::default()
     };
     (vec![f0, f1], grad, hess, cfg, 4, -1)
 }
@@ -394,6 +397,7 @@ fn learner_parity_missing_routing() {
         missing_type: MissingType::None,
         bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
         real_feature_index: 0,
+        ..Default::default()
     };
     let g = vec![-4.0f32, -3.0, -3.0, -3.0, 3.0, 3.0, 4.0, 4.0];
     let h = vec![1.0f32; 8];
@@ -405,6 +409,7 @@ fn learner_parity_missing_routing() {
         lambda_l2: 0.0,
         min_gain_to_split: 0.0,
         path_smooth: 0.0,
+        ..Default::default()
     };
     let mut learner =
         SerialTreeLearner::new(&backend, &client, cfg, 2, 1).with_features(vec![f]);
@@ -559,6 +564,7 @@ fn col_sampler_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, 
             missing_type: MissingType::None,
             bin_upper_bound: upper,
             real_feature_index: real,
+            ..Default::default()
         }
     };
     let f0 = make(vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3], 4, 0);
@@ -574,6 +580,7 @@ fn col_sampler_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, 
         lambda_l2: 0.0,
         min_gain_to_split: 0.0,
         path_smooth: 0.0,
+        ..Default::default()
     };
     (vec![f0, f1, f2, f3], grad, hess, cfg, 4, -1)
 }
@@ -714,6 +721,7 @@ fn parse_real_gh(text: &str) -> Vec<GhCorpus> {
                         missing_type: MissingType::None,
                         bin_upper_bound: upper,
                         real_feature_index: real,
+                        ..Default::default()
                     });
                 }
                 "PTREE" => {
@@ -910,6 +918,7 @@ fn learner_parity_routing_self_consistency() {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         };
         for gh in &corpora {
             let mut learner = SerialTreeLearner::new(&backend, &client, cfg, gh.num_leaves, -1)
@@ -1023,6 +1032,7 @@ fn single_feature_corpus(
         missing_type: MissingType::None,
         bin_upper_bound: real_bin_upper,
         real_feature_index: 0,
+        ..Default::default()
     };
     let cfg = GainConfig {
         min_data_in_leaf: 1,
@@ -1032,6 +1042,7 @@ fn single_feature_corpus(
         lambda_l2: 0.0,
         min_gain_to_split: 0.0,
         path_smooth: 0.0,
+        ..Default::default()
     };
     (vec![f0], grad, hess, cfg, 4, -1)
 }

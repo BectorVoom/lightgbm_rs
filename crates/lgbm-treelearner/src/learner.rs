@@ -36,7 +36,7 @@ use lgbm_compute::error::ComputeError;
 use lgbm_compute::gain::{calculate_splitted_leaf_output, GainConfig};
 use lgbm_compute::Backend;
 use lgbm_compute::ComputeClientReexport as ComputeClient;
-use lgbm_dataset::bin_mapper::MissingType;
+use lgbm_dataset::bin_mapper::{BinType, MissingType};
 use lgbm_model::Tree;
 
 use crate::col_sampler::ColSampler;
@@ -117,6 +117,41 @@ pub struct FeatureColumn {
     /// The ORIGINAL feature index (`real_feature_idx_`) the tree's `split_feature`
     /// records and predict traverses.
     pub real_feature_index: i32,
+    /// C++ `BinMapper::bin_type()` — the per-feature dispatch flag
+    /// (`serial_tree_learner.cpp:779`). [`BinType::Numerical`] routes the
+    /// byte-untouched continuous split spine (D-06 HARD INVARIANT);
+    /// [`BinType::Categorical`] routes the additive
+    /// [`find_best_threshold_categorical`](crate::find_best_threshold_categorical)
+    /// branch. Defaults to `Numerical` so every spine call site is unchanged.
+    pub bin_type: BinType,
+    /// C++ `BinMapper::bin_2_categorical_` — bin index → ORIGINAL category value
+    /// (`BinToValue(bin)`, bin.h:138-143). Only populated for categorical
+    /// features; the categorical split converts each winning REAL BIN to its
+    /// category value to build the model-text (`cat_threshold`) bitset. Empty for
+    /// numeric features.
+    pub bin_to_category: Vec<i32>,
+}
+
+impl Default for FeatureColumn {
+    /// A numeric (continuous) feature with empty buffers — the spine default.
+    /// Used by `..FeatureColumn::default()` partial-init at construction sites that
+    /// want the `bin_type: Numerical` default without restating it.
+    fn default() -> Self {
+        Self {
+            bins: Vec::new(),
+            num_bin: 0,
+            offset: 0,
+            min_bin: 0,
+            max_bin: 0,
+            default_bin: 0,
+            most_freq_bin: 0,
+            missing_type: MissingType::None,
+            bin_upper_bound: Vec::new(),
+            real_feature_index: 0,
+            bin_type: BinType::Numerical,
+            bin_to_category: Vec::new(),
+        }
+    }
 }
 
 impl FeatureColumn {
@@ -181,6 +216,14 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// the ACTUAL growth path (not just in isolation). `None` in production (no-op,
     /// zero overhead beyond the `Option` check).
     subtract_audit: Option<std::cell::RefCell<Vec<(Vec<f64>, Vec<f64>)>>>,
+    /// Per-leaf winning categorical bitset (the `SplitInfo::cat_threshold` C++
+    /// carries on the split-info, kept OUT of the `Copy` [`SplitInfo`]). Indexed by
+    /// leaf id; `None` for a numeric (or no) winner. `scan_leaf_histogram` writes
+    /// the winner's category bins here when the cross-feature argmax is a
+    /// categorical feature; `split_inner` reads them to grow the categorical node.
+    /// Sized to `num_leaves` and reset alongside `best_split_per_leaf` each split.
+    /// A `RefCell` so the `&self` scan can record into it.
+    best_cat_threshold: std::cell::RefCell<Vec<Option<Vec<u32>>>>,
 }
 
 /// The per-split snapshot the spine emits for the D-06 golden: for each candidate
@@ -248,6 +291,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             strategy: BuildStrategy::RowWise,
             col_sampling: None,
             subtract_audit: None,
+            best_cat_threshold: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -548,6 +592,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut best_split_per_leaf: Vec<SplitInfo> =
             vec![SplitInfo::none(); self.num_leaves as usize];
         let mut best_split_feature: Vec<i32> = vec![-1; self.num_leaves as usize];
+        // Per-leaf winning categorical bitset (parallel to best_split_per_leaf).
+        // Reset per tree; entries set only when a categorical feature wins a leaf.
+        *self.best_cat_threshold.borrow_mut() = vec![None; self.num_leaves as usize];
 
         let mut snapshots: Vec<SplitSnapshot> = Vec::new();
 
@@ -618,6 +665,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             best_split_feature[new_left as usize] = -1;
             best_split_per_leaf[new_right as usize] = SplitInfo::none();
             best_split_feature[new_right as usize] = -1;
+            {
+                let mut cat = self.best_cat_threshold.borrow_mut();
+                cat[best_leaf as usize] = None;
+                cat[new_left as usize] = None;
+                cat[new_right as usize] = None;
+            }
 
             left_leaf = new_left;
             right_leaf = new_right;
@@ -1013,6 +1066,50 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             let cells = 2 * f.num_bin as usize;
             let hist = &buf[slot_off[fpos]..slot_off[fpos] + cells];
 
+            // ---- bin_type dispatch (serial_tree_learner.cpp:779) ----
+            // Categorical features route to the ADDITIVE many-vs-many/one-hot
+            // categorical finder (D-06: the numeric path below is byte-untouched).
+            // The categorical winner's bitset is stashed in `best_cat_threshold`
+            // indexed by leaf so `split_inner` can grow a categorical node.
+            if f.bin_type == BinType::Categorical {
+                // `find_best_threshold_categorical` expects the leaf hessian sum
+                // ALREADY bumped by +2*kEpsilon (mirroring FindBestThreshold,
+                // feature_histogram.hpp:172). The numeric path applies the same
+                // bump inside find_best_split; we apply it here at the call site.
+                let eps = f64::from(lgbm_core::types::K_EPSILON);
+                let sum_h_bumped = sum_h + 2.0 * eps;
+                let cat = crate::feature_histogram_categorical::find_best_threshold_categorical(
+                    hist,
+                    &self.cfg,
+                    f.num_bin as i32,
+                    f.offset,
+                    sum_g,
+                    sum_h_bumped,
+                    num_data_in_leaf,
+                );
+                let split = cat.split;
+                // Categorical features have no per-bin numeric gain arrays; the D-06
+                // numeric snapshot uses empty rev/fwd for them (the categorical
+                // diagnostics live in the dedicated categorical golden, not here).
+                records.push(FeatureSplitRecord {
+                    feature: f.real_feature_index,
+                    cand_rev: Vec::new(),
+                    cand_fwd: Vec::new(),
+                    split,
+                });
+                if split.gain > K_MIN_SCORE
+                    && split_gt(&split, f.real_feature_index, &leaf_best, leaf_best_feature)
+                {
+                    leaf_best = split;
+                    leaf_best_feature = f.real_feature_index;
+                    // Stash this categorical winner's bitset for the leaf; cleared
+                    // (set to None) if a later numeric/categorical feature wins.
+                    self.best_cat_threshold.borrow_mut()[leaf as usize] =
+                        Some(cat.cat_threshold.clone());
+                }
+                continue;
+            }
+
             // Authoritative dispatch flags (Pitfall 1). `run_forward` transcribes
             // the C++ per-missing_type branch dispatch (feature_histogram.hpp:
             // 420-429): the FORWARD scan runs ONLY for `num_bin>2 &&
@@ -1059,6 +1156,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         best_split_per_leaf[leaf as usize] = leaf_best;
         best_split_feature[leaf as usize] = leaf_best_feature;
+        // If the cross-feature winner is NOT a categorical feature, drop any
+        // categorical bitset that was stashed for this leaf by an earlier (losing)
+        // categorical candidate — `split_inner` must see `None` for a numeric
+        // winner. (Purely a side-structure cleanup; the numeric scan above is
+        // byte-untouched, D-06.)
+        let winner_is_cat = leaf_best_feature >= 0
+            && features
+                .iter()
+                .find(|c| c.real_feature_index == leaf_best_feature)
+                .map(|c| c.bin_type == BinType::Categorical)
+                .unwrap_or(false);
+        if !winner_is_cat {
+            self.best_cat_threshold.borrow_mut()[leaf as usize] = None;
+        }
         Ok(records)
     }
 
@@ -1234,6 +1345,31 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let new_left = best_leaf;
         let new_right = tree.num_leaves;
 
+        // ---- CATEGORICAL split path (serial_tree_learner.cpp:807-843) ----
+        // If this leaf's winner is a categorical feature, a category bitset was
+        // stashed in `best_cat_threshold`. Build the inner (bin) + real (category)
+        // bitsets, partition by the inner bitset, and grow a SplitCategorical node.
+        let cat_bins: Option<Vec<u32>> = self
+            .best_cat_threshold
+            .borrow_mut()
+            .get_mut(best_leaf as usize)
+            .and_then(|o| o.take());
+        if let Some(cat_threshold_bins) = cat_bins {
+            return self.split_inner_categorical(
+                tree,
+                data_partition,
+                f,
+                best_leaf,
+                feat_idx,
+                best,
+                &cat_threshold_bins,
+                smaller_leaf_splits,
+                larger_leaf_splits,
+                new_left,
+                new_right,
+            );
+        }
+
         // Partition this leaf's rows (TRL-07) via the Backend op.
         //
         // SINGLE-FEATURE-GROUP min_bin convention (D-09, the CR-01 fix): the C++
@@ -1359,6 +1495,143 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
 
         Ok((new_left, new_right))
+    }
+
+    /// The CATEGORICAL `SplitInner` (serial_tree_learner.cpp:807-871): build the
+    /// inner (bin) + real (category) bitsets, partition the leaf by the inner
+    /// bitset, grow a `SplitCategorical` node, and seed the child leaf-splits.
+    ///
+    /// `cat_threshold_bins` is the winning category set as REAL BINS (the finder's
+    /// `output->cat_threshold`). The inner bitset is `ConstructBitset` over those
+    /// bins; the real bitset is `ConstructBitset` over their CATEGORY VALUES
+    /// (`bin_to_category[bin]`, the C++ `RealThreshold`). The numeric split spine
+    /// is untouched (this is a sibling method, D-06).
+    #[allow(clippy::too_many_arguments)]
+    fn split_inner_categorical(
+        &self,
+        tree: &mut Tree,
+        data_partition: &mut DataPartition,
+        f: &FeatureColumn,
+        best_leaf: i32,
+        feat_idx: i32,
+        best: &SplitInfo,
+        cat_threshold_bins: &[u32],
+        smaller_leaf_splits: &mut LeafSplits,
+        larger_leaf_splits: &mut LeafSplits,
+        new_left: i32,
+        new_right: i32,
+    ) -> Result<(i32, i32), TreeLearnerError> {
+        use crate::feature_histogram_categorical::construct_bitset;
+
+        // Inner (bin) bitset for the data-partition routing.
+        let cat_bitset_inner = construct_bitset(cat_threshold_bins);
+        // Real (category-value) bitset for the model-text (the C++ RealThreshold of
+        // each winning bin, then ConstructBitset). For categorical, RealThreshold ==
+        // bin_2_categorical_[bin] (BinToValue). Negative category values cannot
+        // appear in a winning split (bin 0 is the NaN dummy and is never selected by
+        // the finder, which scans bin_start = 1 - offset).
+        let cat_values: Vec<u32> = cat_threshold_bins
+            .iter()
+            .map(|&bin| {
+                let v = f
+                    .bin_to_category
+                    .get(bin as usize)
+                    .copied()
+                    .unwrap_or(bin as i32);
+                v as u32
+            })
+            .collect();
+        let cat_bitset_real = construct_bitset(&cat_values);
+
+        // Partition by the inner bitset (left = in-bitset, right = default).
+        data_partition.split_categorical(
+            best_leaf,
+            new_right,
+            &f.bins,
+            &cat_bitset_inner,
+            f.most_freq_bin,
+        );
+
+        let missing_type_code = match f.missing_type {
+            MissingType::None => 0i8,
+            MissingType::Zero => 1,
+            MissingType::NaN => 2,
+        };
+        let split_gain_field = (best.gain + self.cfg.min_gain_to_split) as f32;
+        let actual_left_count = data_partition.leaf_count(new_left);
+        let actual_right_count = data_partition.leaf_count(new_right);
+
+        tree.split_categorical(
+            best_leaf,
+            feat_idx, // inner feature index (== real on the single-group spine)
+            feat_idx, // real feature index
+            &cat_bitset_real,
+            best.left_output,
+            best.right_output,
+            actual_left_count,
+            actual_right_count,
+            best.left_sum_hessian,
+            best.right_sum_hessian,
+            split_gain_field,
+            missing_type_code,
+        );
+
+        // Seed child leaf-splits — IDENTICAL to the numeric path (the SplitInfo
+        // sums/outputs are the same struct; only the node-growth differs).
+        self.seed_child_leaf_splits(
+            data_partition,
+            best,
+            smaller_leaf_splits,
+            larger_leaf_splits,
+            new_left,
+            new_right,
+        );
+
+        Ok((new_left, new_right))
+    }
+
+    /// Seed the two child `LeafSplits` from the parent's `SplitInfo`
+    /// (serial_tree_learner.cpp:851-871) — shared by the numeric and categorical
+    /// `SplitInner` paths. The smaller/larger selection uses the SplitInfo counts;
+    /// `num_data_in_leaf` is the PARTITION leaf-count.
+    fn seed_child_leaf_splits(
+        &self,
+        data_partition: &DataPartition,
+        best: &SplitInfo,
+        smaller_leaf_splits: &mut LeafSplits,
+        larger_leaf_splits: &mut LeafSplits,
+        new_left: i32,
+        new_right: i32,
+    ) {
+        let part_left = data_partition.leaf_count(new_left);
+        let part_right = data_partition.leaf_count(new_right);
+        if best.left_count < best.right_count {
+            smaller_leaf_splits.init_from_split(
+                part_left,
+                best.left_sum_gradient,
+                best.left_sum_hessian,
+                best.left_output,
+            );
+            larger_leaf_splits.init_from_split(
+                part_right,
+                best.right_sum_gradient,
+                best.right_sum_hessian,
+                best.right_output,
+            );
+        } else {
+            smaller_leaf_splits.init_from_split(
+                part_right,
+                best.right_sum_gradient,
+                best.right_sum_hessian,
+                best.right_output,
+            );
+            larger_leaf_splits.init_from_split(
+                part_left,
+                best.left_sum_gradient,
+                best.left_sum_hessian,
+                best.left_output,
+            );
+        }
     }
 }
 
@@ -1591,6 +1864,7 @@ mod tests {
             lambda_l2: 0.0,
             min_gain_to_split: 0.0,
             path_smooth: 0.0,
+            ..Default::default()
         }
     }
 
@@ -1612,6 +1886,7 @@ mod tests {
             missing_type: MissingType::None,
             bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
             real_feature_index: 0,
+            ..Default::default()
         };
         (f, gradients, hessians)
     }
@@ -1823,6 +2098,7 @@ mod tests {
             missing_type: MissingType::None,
             bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
             real_feature_index: 0,
+            ..Default::default()
         };
         // identical gradient/hessian per row -> no separating split has gain > 0.
         let gf = vec![1.0f32; 4];
@@ -1895,6 +2171,62 @@ mod tests {
         let s = tree.to_string();
         let parsed = Tree::parse(&s).expect("grown tree round-trips");
         assert_eq!(parsed.to_string(), s);
+    }
+
+    /// A categorical feature whose categories separate the gradient sign grows a
+    /// categorical split (CATEGORICAL_MASK set, num_cat==1) that predicts faithfully.
+    #[test]
+    fn learner_grows_a_categorical_split() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        // 8 rows, categorical feature with 3 real categories -> bins 1,2,3
+        // (bin 0 is the NaN dummy). most_freq_bin==0 -> offset 1.
+        // Categories: cat 10 (bin1), cat 20 (bin2), cat 30 (bin3).
+        // rows: cat10,cat10,cat10,cat10 (neg grad) | cat20..,cat30.. (pos grad).
+        let bins = vec![1u32, 1, 1, 1, 2, 2, 3, 3];
+        let gradients = vec![-5.0f32, -5.0, -5.0, -5.0, 4.0, 4.0, 5.0, 5.0];
+        let hessians = vec![1.0f32; 8];
+        let f = FeatureColumn {
+            bins,
+            num_bin: 4, // bins 0..3 (0 = NaN dummy)
+            offset: 1,  // most_freq_bin == 0
+            min_bin: 1,
+            max_bin: 3,
+            default_bin: 0,
+            most_freq_bin: 0,
+            missing_type: MissingType::None,
+            bin_upper_bound: Vec::new(),
+            real_feature_index: 0,
+            bin_type: BinType::Categorical,
+            // bin -> category value: bin0 = NaN dummy (-1), bin1=10, bin2=20, bin3=30.
+            bin_to_category: vec![-1, 10, 20, 30],
+        };
+        let mut cfg = relaxed_cfg();
+        // one-hot path (num_bin 4 <= max_cat_to_onehot 4); relax leaf gates.
+        cfg.min_data_in_leaf = 1;
+        cfg.min_sum_hessian_in_leaf = 0.0;
+        let mut learner = SerialTreeLearner::new(&backend, &client, cfg, 8, 1)
+            .with_features(vec![f]);
+        let tree = learner.train(&gradients, &hessians, true).expect("train ok");
+        assert_eq!(tree.num_leaves, 2, "a categorical split was grown");
+        assert_eq!(tree.num_cat, 1, "num_cat == 1");
+        // The node's decision_type has the categorical bit set.
+        assert!(
+            tree.decision_type[0] & 1 != 0,
+            "decision_type has CATEGORICAL_MASK: {}",
+            tree.decision_type[0]
+        );
+        // Rows conserved + byte-stable round-trip through model-text.
+        let total: i32 = tree.leaf_count.iter().sum();
+        assert_eq!(total, 8);
+        let s = tree.to_string();
+        assert!(s.contains("num_cat=1"));
+        let parsed = Tree::parse(&s).expect("round-trips");
+        assert_eq!(parsed.to_string(), s);
+        // Predict: a cat-10 row vs a cat-30 row land in different leaves.
+        let leaf_10 = parsed.get_leaf(&[10.0]);
+        let leaf_30 = parsed.get_leaf(&[30.0]);
+        assert_ne!(leaf_10, leaf_30, "cat 10 and cat 30 route to different leaves");
     }
 }
 

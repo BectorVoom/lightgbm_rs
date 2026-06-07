@@ -25,6 +25,7 @@
 pub mod col_sampler;
 pub mod data_partition;
 pub mod error;
+pub mod feature_histogram_categorical;
 pub mod fix_histogram;
 pub mod histogram_pool;
 pub mod leaf_splits;
@@ -34,6 +35,9 @@ pub mod split_info;
 pub use col_sampler::ColSampler;
 pub use data_partition::DataPartition;
 pub use error::TreeLearnerError;
+pub use feature_histogram_categorical::{
+    construct_bitset, find_best_threshold_categorical, CategoricalSplit,
+};
 pub use fix_histogram::fix_histogram;
 pub use histogram_pool::HistogramPool;
 pub use leaf_splits::LeafSplits;

@@ -181,6 +181,10 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
             missing_type: MissingType::None,
             bin_upper_bound: real_upper_bounds(num_bin),
             real_feature_index: j as i32,
+            // This identity-binned facade builds NUMERIC features only; the
+            // categorical path is driven via the parity harness / builder
+            // (07-08). bin_type defaults to Numerical so the spine is unchanged.
+            ..FeatureColumn::default()
         });
     }
     Ok(columns)

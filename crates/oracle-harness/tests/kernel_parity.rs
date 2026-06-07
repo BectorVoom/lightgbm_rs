@@ -573,6 +573,7 @@ fn kernel_parity_split_bit_exact_on_cpu() {
             lambda_l2: c.lambda_l2,
             min_gain_to_split: c.min_gain_to_split,
             path_smooth: 0.0,
+            ..Default::default()
         };
         let si = backend
             .find_best_split(
@@ -961,6 +962,7 @@ mod hip {
                 lambda_l2: c.lambda_l2,
                 min_gain_to_split: c.min_gain_to_split,
                 path_smooth: 0.0,
+                ..Default::default()
             };
 
             // (1) hip f32 raw 12 cells.
