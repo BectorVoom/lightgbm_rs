@@ -221,7 +221,19 @@ impl Booster {
     /// (identity for regression). Returns a `num_tree_per_iteration`-wide f32
     /// vector.
     pub fn predict_row(&self, features: &[f64]) -> Vec<f32> {
-        let raw = self.model.predict_raw(features, 0, -1);
+        let mut raw = self.model.predict_raw(features, 0, -1);
+        // RF (average_output) divides the per-tree SUM by num_iteration BEFORE the
+        // ConvertOutput (C++ gbdt_prediction.cpp:57-59: the `average_output_` block
+        // runs in `Predict` after `PredictRaw`). The stored leaf values are the RAW
+        // per-tree outputs; averaging happens at predict time.
+        if self.model.average_output {
+            let (_start, num) = self.model.init_predict(0, -1);
+            if num > 0 {
+                for v in &mut raw {
+                    *v /= num as f64;
+                }
+            }
+        }
         let mut transformed = vec![0.0f64; raw.len()];
         // For multiclass the convert reads the whole class vector; for the spine
         // (single output) it is the identity. ObjectiveKind::convert handles both.
@@ -441,6 +453,25 @@ fn train_inner_full(
             drop_seed: config.drop_seed,
         };
         gbdt = gbdt.with_dart(dart_cfg, features.clone());
+    }
+    // Random Forest (BST-06, RESEARCH Pattern 1 — an enum field on Gbdt):
+    // `boosting=rf` selects the averaged-tree variant with mandatory randomization
+    // (rf.hpp). RF re-derives grad/hess once from a constant init-score buffer,
+    // averages trees (no learning-rate accumulation), and renews leaves to the mean
+    // residual. The two RF CHECKs (objective != null; bagging OR feature_fraction
+    // active) surface as a typed BoostingError::RfConfig at the top of the RF train
+    // path. RF reuses the proven BaggingSampleStrategy (the 07-01 bit-exact bagging
+    // RNG golden carries over); the `with_bagging` call below also fires when
+    // bagging is active so the strategy is attached.
+    let rf_on = config.boosting == "rf";
+    if rf_on {
+        let feature_subsampling_active =
+            config.feature_fraction < 1.0 && config.feature_fraction > 0.0;
+        let rf_cfg = lgbm_boosting::RfConfig {
+            bagging_active: bagging_on,
+            feature_subsampling_active,
+        };
+        gbdt = gbdt.with_rf(rf_cfg, features.clone());
     }
     if goss_on {
         // GOSSStrategy::ResetSampleConfig CHECKs (top+other<=1, both>0) surface as a
@@ -812,6 +843,80 @@ mod tests {
         let p_low = booster.predict_row(&[0.0, 0.0]);
         let p_high = booster.predict_row(&[5.0, 2.0]);
         assert!(p_low[0] < p_high[0], "{} < {}", p_low[0], p_high[0]);
+    }
+
+    #[test]
+    fn rf_train_predict_averages_tree_outputs() {
+        // BST-06: boosting=rf trains end-to-end (averaged trees, mandatory bagging,
+        // no shrinkage) and predict() AVERAGES the stored RAW tree outputs (the
+        // average_output path divides the per-tree sum by num_iteration). The
+        // integration proof: predict() == (sum of stored trees' per-row outputs) /
+        // num_iteration for every row.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .boosting("rf")
+            .bagging_fraction(0.7)
+            .bagging_freq(1)
+            .bagging_seed(3)
+            .num_iterations(8)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.boosting, "rf");
+        let corpus = spine_corpus();
+        let booster = train(&cfg, &corpus).expect("rf train ok");
+        assert_eq!(booster.model().num_iteration(), 8);
+        // RF emits average_output.
+        assert!(
+            booster.model().average_output,
+            "RF model must set average_output"
+        );
+
+        // predict() == AVERAGE of the stored raw trees for every row.
+        let n_iter = booster.model().num_iteration();
+        for row in &corpus.features {
+            let raw_sum = booster.model().trees.iter().map(|t| t.predict(row)).sum::<f64>();
+            let manual_avg = (raw_sum / n_iter as f64) as f32;
+            let got = booster.predict_row(row)[0];
+            assert!(
+                (got - manual_avg).abs() < 1e-6,
+                "RF predict {got} must equal the average of the stored trees {manual_avg}"
+            );
+        }
+        // Monotone sanity: low-label rows predict lower than high-label rows.
+        let p_low = booster.predict_row(&[0.0, 0.0]);
+        let p_high = booster.predict_row(&[5.0, 2.0]);
+        assert!(p_low[0] < p_high[0], "{} < {}", p_low[0], p_high[0]);
+    }
+
+    #[test]
+    fn rf_without_randomization_is_typed_error() {
+        // BST-06 CHECK: boosting=rf with neither bagging nor feature_fraction<1 must
+        // surface a typed error (not a panic, not a silent collapse to one tree).
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .boosting("rf")
+            .num_iterations(5)
+            .num_leaves(4)
+            .min_data_in_leaf(1)
+            .boost_from_average(true)
+            .seed(1)
+            .deterministic(true)
+            .build()
+            .unwrap();
+        let corpus = spine_corpus();
+        let err = train(&cfg, &corpus).expect_err("RF with no randomization must error");
+        assert!(
+            matches!(
+                err,
+                LgbmError::Boosting(lgbm_boosting::BoostingError::RfConfig { .. })
+            ),
+            "expected RfConfig, got {err:?}"
+        );
     }
 
     #[test]

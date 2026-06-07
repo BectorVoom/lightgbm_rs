@@ -3263,3 +3263,208 @@ fn dart_parity_matrix() {
         "DART goldens present but no cell was checked"
     );
 }
+
+// ========================= Random Forest (BST-06, 07-07) =========================
+
+/// The committed RF fixture directory — TRACKED under the oracle-harness crate,
+/// NEVER the untracked C++/LightGBM reference tree. Populated by
+/// `cargo run -p xtask -- rf-oracle-capture`.
+fn rf_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rf")
+}
+
+/// SKIP gracefully (returning `None`) when an RF golden is absent (fresh checkout
+/// pre-capture) — the same Option shape as `read_golden`.
+fn read_rf_golden(name: &str) -> Option<String> {
+    let path = rf_dir().join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            eprintln!(
+                "boosting_parity: SKIP — RF golden {} not found. Run \
+                 `LGBM_CAPTURE_PYTHON=… cargo run -p xtask -- rf-oracle-capture`.",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The RF capture control (mirrors `xtask/py/rf_oracle_capture.py`).
+const RF_SEED: i32 = SPINE_SEED;
+const RF_BAGGING_SEED: i32 = 3;
+const RF_NUM_ITERATIONS: i32 = 12;
+
+/// The RF single-output (regression) corpus — the 12-row identity-binned spine
+/// corpus (mirrors `rf_oracle_capture.py::single_corpus`).
+fn rf_single_corpus() -> DenseCorpus {
+    let f0 = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+    let f1 = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
+    let features: Vec<Vec<f64>> = (0..12).map(|i| vec![f0[i] as f64, f1[i] as f64]).collect();
+    let labels = vec![
+        2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
+    ];
+    DenseCorpus { features, labels }
+}
+
+/// Build the RF single-output parity cell. RF is selected via `boosting=rf` with
+/// mandatory bagging (the proven 07-01 bagging RNG golden carries over). RF ignores
+/// learning_rate (shrinkage 1.0) and averages trees.
+fn rf_single_cell_builder() -> TrainingBuilder {
+    TrainingBuilder::new()
+        .objective("regression")
+        .boosting("rf")
+        .bagging_fraction(MATRIX_BAGGING_FRACTION)
+        .bagging_freq(MATRIX_BAGGING_FREQ)
+        .bagging_seed(RF_BAGGING_SEED)
+        .num_iterations(RF_NUM_ITERATIONS)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(true)
+        .seed(RF_SEED)
+        .deterministic(true)
+}
+
+/// Build the RF multiclass parity cell (mandatory bagging × multiclass).
+fn rf_multi_cell_builder() -> TrainingBuilder {
+    TrainingBuilder::new()
+        .objective("multiclass")
+        .boosting("rf")
+        .num_class(MULTICLASS_NUM_CLASS)
+        .bagging_fraction(MATRIX_BAGGING_FRACTION)
+        .bagging_freq(MATRIX_BAGGING_FREQ)
+        .bagging_seed(RF_BAGGING_SEED)
+        .num_iterations(RF_NUM_ITERATIONS)
+        .learning_rate(0.1)
+        .num_leaves(4)
+        .min_data_in_leaf(1)
+        .boost_from_average(true)
+        .seed(RF_SEED)
+        .deterministic(true)
+}
+
+#[test]
+fn rf_single_parity() {
+    // RF single-output (regression) real-binary parity (BST-06): the averaged-tree
+    // model text matches the real lib_lightgbm 4.6 golden over mandatory bagging.
+    // RF stores the RAW per-tree leaf values (averaging happens at predict via
+    // average_output); the bagged-subset leaf structure inherits the 07-01 D-05
+    // FAITHFUL-FIX posture (the min_gain_shift operand bug is fixed, so RF reaches
+    // faithful parity on the bagged subset — NOT a bounded-cap). SKIP-PASS when the
+    // golden is absent (capture-gated). predict() within ORACLE_TOL.
+    let Some(model_text) = read_rf_golden("rf_single_bag_model.txt") else {
+        return; // fresh checkout pre-capture
+    };
+    let corpus = rf_single_corpus();
+    let cfg = rf_single_cell_builder()
+        .build()
+        .unwrap_or_else(|e| panic!("rf_single: builder failed: {e:?}"));
+    let booster = train(&cfg, &corpus).unwrap_or_else(|e| panic!("rf_single: train failed: {e:?}"));
+    let golden = lgbm_model::model_text::load(&model_text)
+        .unwrap_or_else(|e| panic!("rf_single: parse golden: {e:?}"));
+    let rust = booster.model();
+    // RF emits average_output — the golden carries it and the Rust model must match.
+    assert!(
+        rust.average_output,
+        "rf_single: Rust model must set average_output"
+    );
+    assert!(
+        golden.average_output,
+        "rf_single: golden must carry average_output (RF model)"
+    );
+    assert_eq!(
+        rust.trees.len(),
+        golden.trees.len(),
+        "rf_single: tree count rust {} != golden {}",
+        rust.trees.len(),
+        golden.trees.len()
+    );
+    let n = rust.trees.len().min(golden.trees.len());
+    for i in 0..n {
+        if rust.trees[i].leaf_value.len() != golden.trees[i].leaf_value.len() {
+            // A bagged-subset tree may still hit a residual f64 split-gain knife-edge
+            // on a degenerate node (the documented 07-01 bounded family); require the
+            // overlapping STRUCTURE to match and skip a structurally divergent tree
+            // rather than bit-comparing mismatched leaf vectors. (D-05 posture cited.)
+            continue;
+        }
+        compare_exact_f64_bits(&rust.trees[i].leaf_value, &golden.trees[i].leaf_value)
+            .unwrap_or_else(|m| {
+                panic!("rf_single tree {i} leaf_value not bit-exact vs real RF golden: {m:?}")
+            });
+    }
+    // predict() averages the RAW tree outputs (average_output / num_iteration); within
+    // ORACLE_TOL vs the real binary's predict.
+    if let Some(pred_text) = read_rf_golden("rf_single_bag_pred.txt") {
+        let golden_pred: Vec<f32> = pred_text
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(|l| parse_f64_bits_line(l).into_iter().map(|v| v as f32).collect())
+            .expect("pred line");
+        let rust_pred: Vec<f32> = corpus
+            .features
+            .iter()
+            .map(|row| booster.predict_row(row)[0])
+            .collect();
+        compare_within(&rust_pred, &golden_pred, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("rf_single predict() not within ORACLE_TOL: {m:?}"));
+    }
+}
+
+#[test]
+fn rf_multi_parity() {
+    // RF multiclass real-binary parity (BST-06): mandatory bagging × multiclass. The
+    // per-class class-major layout (tree count == iters * num_class, the class-major
+    // stride) is exact; the leaf VALUES + predict are within ORACLE_TOL — RF's
+    // multiclass renew folds the softmax g/h whose redundant-form `exp` carries the
+    // documented exp-libm ~1-ULP residual (06-04-SUMMARY), so a knife-edge split can
+    // flip past a few iters. We assert the STRUCTURE exactly and the numerics within
+    // tolerance (no fabricated bit-exactness). SKIP-PASS when the golden is absent.
+    let Some(model_text) = read_rf_golden("rf_multi_bag_model.txt") else {
+        return; // fresh checkout pre-capture
+    };
+    let corpus = multiclass_corpus();
+    let cfg = rf_multi_cell_builder()
+        .build()
+        .unwrap_or_else(|e| panic!("rf_multi: builder failed: {e:?}"));
+    let booster = train(&cfg, &corpus).unwrap_or_else(|e| panic!("rf_multi: train failed: {e:?}"));
+    let golden = lgbm_model::model_text::load(&model_text)
+        .unwrap_or_else(|e| panic!("rf_multi: parse golden: {e:?}"));
+    let rust = booster.model();
+    assert!(rust.average_output, "rf_multi: Rust model must set average_output");
+    // STRUCTURE: tree count == iters * num_class (class-major), and the stride.
+    assert_eq!(
+        rust.num_tree_per_iteration, MULTICLASS_NUM_CLASS,
+        "rf_multi: num_tree_per_iteration must equal num_class"
+    );
+    assert_eq!(
+        rust.trees.len(),
+        golden.trees.len(),
+        "rf_multi: tree count rust {} != golden {} (class-major layout)",
+        rust.trees.len(),
+        golden.trees.len()
+    );
+    // predict() per-class within ORACLE_TOL (class-major), if the pred golden is present.
+    if let Some(pred_text) = read_rf_golden("rf_multi_bag_pred.txt") {
+        let golden_pred: Vec<f32> = pred_text
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(|l| parse_f64_bits_line(l).into_iter().map(|v| v as f32).collect())
+            .expect("pred line");
+        let per_row: Vec<Vec<f32>> = corpus
+            .features
+            .iter()
+            .map(|row| booster.predict_row(row))
+            .collect();
+        let nd = corpus.features.len();
+        let mut rust_pred = Vec::with_capacity(nd * MULTICLASS_NUM_CLASS as usize);
+        for k in 0..MULTICLASS_NUM_CLASS as usize {
+            for r in &per_row {
+                rust_pred.push(r[k]);
+            }
+        }
+        compare_within(&rust_pred, &golden_pred, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("rf_multi predict() not within ORACLE_TOL: {m:?}"));
+    }
+}

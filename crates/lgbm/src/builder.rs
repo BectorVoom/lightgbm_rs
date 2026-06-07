@@ -203,6 +203,15 @@ impl TrainingBuilder {
         self
     }
 
+    /// `feature_fraction` (per-tree feature sub-sampling rate, `(0, 1]`; the
+    /// `colsample_bytree` alias). For Random Forest (`boosting=rf`) this is the
+    /// alternative mandatory-randomization source to bagging (`rf.hpp:37`): RF
+    /// requires either active bagging OR `0 < feature_fraction < 1`.
+    pub fn feature_fraction(mut self, v: f64) -> Self {
+        self.params.insert("feature_fraction".into(), v.to_string());
+        self
+    }
+
     /// `boosting` (the boosting type / sample-strategy alias, e.g. `"gbdt"` or
     /// `"goss"`; BST-04). `boosting=goss` is the C++ alias-expansion that resolves to
     /// `boosting=gbdt` + `data_sample_strategy=goss` (config.cpp; `set.rs:472-476`).
@@ -407,6 +416,25 @@ mod tests {
         assert!(cfg.uniform_drop);
         assert!(cfg.xgboost_dart_mode);
         assert_eq!(cfg.drop_seed, 17);
+    }
+
+    #[test]
+    fn rf_setters_route_into_config() {
+        // BST-06: boosting=rf + the mandatory-randomization setters must round-trip.
+        let cfg = TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(5)
+            .num_leaves(4)
+            .boosting("rf")
+            .bagging_fraction(0.7)
+            .bagging_freq(1)
+            .feature_fraction(0.8)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.boosting, "rf", "boosting=rf must round-trip");
+        assert!((cfg.bagging_fraction - 0.7).abs() < 1e-12);
+        assert_eq!(cfg.bagging_freq, 1);
+        assert!((cfg.feature_fraction - 0.8).abs() < 1e-12);
     }
 
     #[test]

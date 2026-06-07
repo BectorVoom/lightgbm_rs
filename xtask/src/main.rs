@@ -152,6 +152,23 @@ pub const DART_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
 /// config.h:463, dart.hpp:45). Pinned so the drop RNG-replay golden is reproducible.
 pub const DART_DROP_SEED: i32 = 4;
 
+/// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W6 Random
+/// Forest (BST-06) oracle (plan 07-07). Reuses the SAME prebuilt-wheel binary;
+/// `rf-oracle-capture` asserts the installed version matches BEFORE training so a
+/// wrong version can never silently emit divergent RF goldens (threat T-07-07-SC).
+pub const RF_ORACLE_LIGHTGBM_VERSION: &str = MODEL_LIGHTGBM_VERSION;
+
+/// The recorded train seed for the Phase-7 W6 RF oracle (plan 07-07). The SAME
+/// seed the boosting matrix uses ([`BOOSTING_ORACLE_SEED`]); combined with
+/// `deterministic=true force_row_wise=true num_threads=1` it makes the RF goldens
+/// byte-idempotent. Recorded in REFERENCE_MANIFEST.md.
+pub const RF_ORACLE_SEED: i32 = BOOSTING_ORACLE_SEED;
+
+/// The per-block RNG seed base for RF's mandatory bagging (C++
+/// `config_->bagging_seed`, bagging.hpp). Pinned so the RF bagged-subset trees are
+/// reproducible (RF inherits the 07-01 bit-exact bagging RNG golden).
+pub const RF_BAGGING_SEED: i32 = 3;
+
 /// The pinned pip-`lightgbm` version used to TRAIN + dump the Phase-7 W3 extended
 /// metric (MET-03) oracle (plan 07-04). Reuses the SAME prebuilt-wheel binary as
 /// [`MODEL_LIGHTGBM_VERSION`]; `metric-oracle-capture` asserts the installed version
@@ -178,6 +195,7 @@ fn main() -> Result<()> {
         Some("subset-determinism-capture") => subset_determinism_capture(),
         Some("goss-oracle-capture") => goss_oracle_capture(),
         Some("dart-oracle-capture") => dart_oracle_capture(),
+        Some("rf-oracle-capture") => rf_oracle_capture(),
         Some("metric-oracle-capture") => metric_oracle_capture(),
         Some(other) => {
             bail!(
@@ -185,7 +203,7 @@ fn main() -> Result<()> {
                  (try: regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
-                 metric-oracle-capture)"
+                 rf-oracle-capture | metric-oracle-capture)"
             );
         }
         None => {
@@ -194,7 +212,7 @@ fn main() -> Result<()> {
                  <regen | bin-capture | model-capture | kernel-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
-                 metric-oracle-capture>"
+                 rf-oracle-capture | metric-oracle-capture>"
             );
             Ok(())
         }
@@ -1402,6 +1420,83 @@ fn dart_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- dart-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/dart/` \
+         is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
+    );
+    Ok(())
+}
+
+/// `rf-oracle-capture` — Phase-7 W6 Random Forest (BST-06) golden capture (plan
+/// 07-07).
+///
+/// Shells out to `xtask/py/rf_oracle_capture.py` (the real prebuilt `lib_lightgbm`
+/// 4.6 wheel) to dump the RF model-parity cells over mandatory-bagging × {single
+/// vs multiclass} (the averaged-tree leaf structure on the bagged subset, inheriting
+/// the 07-01 D-05 posture) + per-row preds. Asserts the installed lightgbm version
+/// BEFORE training (threat T-07-07-SC). Goldens land under the TRACKED oracle-harness
+/// fixtures dir — NEVER `LightGBM/`.
+fn rf_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/rf_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    // Goldens live under the TRACKED oracle-harness crate dir — NEVER LightGBM/.
+    let out_dir = root.join("crates/oracle-harness/tests/fixtures/rf");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating fixtures dir {}", out_dir.display()))?;
+
+    eprintln!(
+        "xtask rf-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        RF_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = RF_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python with `pip install lightgbm==4.6.0`. \
+         `cargo test` does NOT need this.",
+    )?;
+
+    eprintln!(
+        "xtask rf-oracle-capture: training the RF mandatory-bagging × {{single,multiclass}} \
+         cells on real lib_lightgbm and dumping the model + pred goldens ..."
+    );
+    run(
+        Command::new(&python)
+            .arg(&script)
+            .arg(&out_dir)
+            .arg(RF_ORACLE_SEED.to_string())
+            .arg(RF_BAGGING_SEED.to_string())
+            .arg(RF_ORACLE_LIGHTGBM_VERSION),
+        "rf_oracle_capture.py",
+    )?;
+
+    // At least the canonical single-output cell model must be written.
+    for name in ["rf_single_bag_model.txt", "rf_single_bag_pred.txt"] {
+        let p = out_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    eprintln!(
+        "xtask rf-oracle-capture: done. Wrote RF goldens under {}.",
+        out_dir.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- rf-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/rf/` \
          is empty (byte-idempotent real-binary dump). NEVER `git add LightGBM/`."
     );
     Ok(())
