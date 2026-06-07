@@ -335,6 +335,48 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         result
     }
 
+    /// Like [`train_on_subset`](Self::train_on_subset) but ALSO returns the final
+    /// [`DataPartition`] the subset tree was grown over — the row→leaf mapping in
+    /// **subset-row space** (each leaf's `indices_in_leaf` are indices into `in_bag`,
+    /// i.e. `0..in_bag.len()`, NOT full-corpus rows).
+    ///
+    /// The GBDT bagging path (06-06, WR-03) needs this to mirror the C++
+    /// `RenewTreeOutput` on the subset path (`serial_tree_learner.cpp:920-958`): the
+    /// `index_mapper` is the subset `data_partition_->GetIndexOnLeaf`, and the caller
+    /// maps each subset row `sr` through `bag_mapper[sr] = in_bag[sr]` to the
+    /// full-corpus row whose residual feeds `PercentileFun` (the median-residual leaf
+    /// output). Without the returned partition the caller cannot recover the in-bag
+    /// leaf membership and the renew block would be a silent no-op.
+    pub fn train_on_subset_returning_partition(
+        &mut self,
+        in_bag: &[i32],
+        gradients: &[f32],
+        hessians: &[f32],
+        is_first_tree: bool,
+    ) -> Result<(Tree, DataPartition), TreeLearnerError> {
+        // Build subset feature columns (in-bag rows, in in-bag order) — identical to
+        // `train_on_subset`; only `bins` is re-gathered (every other FeatureColumn
+        // field is a per-feature property independent of the row subset).
+        let subset_features: Vec<FeatureColumn> = self
+            .features
+            .iter()
+            .map(|f| {
+                let bins: Vec<u32> = in_bag.iter().map(|&r| f.bins[r as usize]).collect();
+                FeatureColumn {
+                    bins,
+                    ..f.clone()
+                }
+            })
+            .collect();
+        let sub_grad: Vec<f32> = in_bag.iter().map(|&r| gradients[r as usize]).collect();
+        let sub_hess: Vec<f32> = in_bag.iter().map(|&r| hessians[r as usize]).collect();
+
+        let saved = std::mem::replace(&mut self.features, subset_features);
+        let result = self.train_returning_partition(&sub_grad, &sub_hess, is_first_tree);
+        self.features = saved;
+        result
+    }
+
     /// Like [`train`](Self::train) but ALSO returns the final [`DataPartition`]
     /// the tree was grown over (the row→leaf mapping after the last split).
     ///

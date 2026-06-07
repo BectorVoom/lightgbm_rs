@@ -310,15 +310,41 @@ impl<'a> Gbdt<'a> {
                     .expect("use_subset implies a bagging strategy");
                 let in_bag: Vec<i32> = bag.in_bag().to_vec();
                 let oob: Vec<i32> = bag.out_of_bag().to_vec();
-                let mut tree = learner.train_on_subset(&in_bag, grad, hess, is_first_tree)?;
+                let (mut tree, subset_partition) = learner
+                    .train_on_subset_returning_partition(&in_bag, grad, hess, is_first_tree)?;
                 if tree.num_leaves > 1 {
+                    // RenewTreeOutput on the SUBSET path (WR-03 fix, mirrors C++
+                    // serial_tree_learner.cpp:920-958 + gbdt.cpp:430): no-op for L2
+                    // (IsRenewTreeOutput()==false), ACTIVE for regression_l1. The
+                    // subset partition's `indices_in_leaf` are subset-row indices; map
+                    // each through `in_bag[sr]` to the FULL-corpus row (the C++
+                    // `bag_mapper[index_mapper[i]]`) and take the median RESIDUAL
+                    // (`label[fr] - train_score_pre[offset+fr]`) over that leaf's rows
+                    // (PercentileFun alpha=0.5). MUST run BEFORE shrinkage (C++ order:
+                    // RenewTreeOutput → Shrinkage → UpdateScore → AddBias). Uses the
+                    // SAME `train_score_pre` snapshot + `offset` as the full-corpus
+                    // branch (the C++ `score_ptr = train_score_updater_->score()
+                    // + offset` over full-corpus rows).
                     if self.objective.is_renew_tree_output() {
-                        // RenewTreeOutput on the bagging path is deferred: no in-scope
-                        // D-07 cell crosses regression_l1 with bagging (the matrix's l1
-                        // bagging cells use the same median-residual renew over the
-                        // in-bag leaves). Surfaced here so it is never a silent skip.
-                        // (regression_l1 + bagging is exercised by the matrix; the renew
-                        // closure would need the subset partition — see SUMMARY note.)
+                        let obj = &self.objective;
+                        let labels_ref = labels;
+                        let score_ref = &train_score_pre;
+                        let in_bag_ref = &in_bag;
+                        learner.renew_tree_output(
+                            &mut tree,
+                            &subset_partition,
+                            Some(|_leaf: i32, subset_rows: &[u32]| {
+                                let residuals: Vec<f64> = subset_rows
+                                    .iter()
+                                    .map(|&sr| {
+                                        // bag_mapper[index_mapper[i]] = in_bag[subset_row]
+                                        let fr = in_bag_ref[sr as usize] as usize;
+                                        labels_ref[fr] as f64 - score_ref[offset + fr]
+                                    })
+                                    .collect();
+                                obj.renew_leaf_output(&residuals)
+                            }),
+                        );
                     }
                     tree.shrinkage(self.learning_rate);
                     // Score BOTH in-bag and OOB rows predict-side over the real feature
