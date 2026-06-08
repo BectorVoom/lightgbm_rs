@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "max_entries": 50,
+  "entries": [
+    {
+      "agent_id": "pending",
+      "task_description": "07-13 resume: GOSS count-inversion + 3 red Family-A cells + re-apply un-ignores",
+      "phase": "07",
+      "plan": "13",
+      "segment": 2,
+      "timestamp": "2026-06-08",
+      "status": "spawned",
+      "completion_timestamp": null
+    }
+  ]
+}

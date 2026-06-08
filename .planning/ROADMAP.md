@@ -391,5 +391,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 4. Compute Backend (CPU-first → ROCm) | 4/4 | Complete    | 2026-06-05 |
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
-| 7. Parity-Completing Variants | 12/12 | Complete    | 2026-06-07 |
+| 7. Parity-Completing Variants | 13/13 | Complete   | 2026-06-08 |
 | 8. Python Bindings | 8/8 | Complete    | 2026-06-08 |
