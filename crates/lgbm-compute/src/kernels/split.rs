@@ -936,6 +936,278 @@ pub fn find_best_splits_batched_f64_on<R: cubecl::Runtime>(
     Ok(out)
 }
 
+/// FUSED per-leaf batched best-split kernel (260608-mc5 THE COLLAPSE). ONE launch
+/// finds EVERY feature's best split for a leaf: cube `f` (`CUBE_POS_X`) scans only
+/// its `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of the concatenated f64
+/// histogram `hist` and writes only its 12-cell window `out[f*12 .. f*12+12]`
+/// (threat T-mc5-02). The per-feature scan is sequential, so the launch shape
+/// mirrors `construct_leaf_hist_batched_kernel`: `CubeCount::Static(num_feats,1,1)`,
+/// `CubeDim::new_1d(1)`.
+///
+/// The leaf-level scalars (`use_l1` .. `num_data`) are identical across features
+/// (the leaf totals + cfg + the host-computed `min_gain_shift`), so they are passed
+/// ONCE; only the per-feature params are device Arrays indexed by `f`. The body is
+/// the SHARED [`split_scan_body`] — the single source of the split math.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_kernel(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // LEAF-LEVEL scalars (shared across the batch).
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    split_scan_body(
+        hist,
+        slot_off[fi],
+        out,
+        f * 12u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+        fwd_count[fi],
+    );
+}
+
+/// FUSED batched per-leaf best-split launcher (260608-mc5 THE MERGE + THE COLLAPSE),
+/// **generic over the runtime** `R`. Finds the best split for EVERY feature in
+/// `feats` in ONE launch of [`find_best_splits_fused_kernel`], returning one
+/// [`SplitInfo`] per input feature **in input order** (T-lsx-01).
+///
+/// Both backends route through this single launcher: `CpuBackend` over
+/// [`ActiveRuntime`](crate::runtime::ActiveRuntime) (cubecl-cpu) and `RocmBackend`
+/// over the cubecl-hip runtime — the literal MERGE of the split-finding path. The
+/// f64 result is bit-identical to the per-feature [`find_best_splits_batched_f64_on`]
+/// loop (the shared `split_scan_body` is the same math, scanned over the same region
+/// per feature; the only difference is launch count).
+///
+/// Host-side BEFORE the single launch (V5, threat T-mc5-01, CLAUDE.md non-neg #4),
+/// for EACH feature: `num_bin == 0` / `2*num_bin` overflow / `na_as_missing` /
+/// non-default `max_delta_step`/`path_smooth` → typed error;
+/// `slot_off + 2*num_bin > buf.len()` → [`ComputeError::LengthMismatch`]. The
+/// leaf-level `!(sum_hessian > 0.0)` is rejected ONCE. Empty `feats` → `Ok(vec![])`
+/// with NO launch (T-mc5-03). All cubecl `unsafe` is confined here (CMP-01).
+///
+/// # Errors
+/// As above; propagates length / scope / deferred-branch typed errors.
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    buf: &[f64],
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> Result<Vec<SplitInfo>, ComputeError> {
+    // Empty batch: no launch (T-mc5-03).
+    if feats.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Phase-4 scope (leaf-level, checked once): only the default smoothing/clamp
+    // path is transcribed. Reject non-default values rather than mis-compute.
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_batched: max_delta_step / path_smooth are Phase-7+ scope \
+                     (only the default 0.0 path is transcribed)"
+                .to_string(),
+        });
+    }
+    // Reject non-positive OR NaN sum_hessian once (leaf-level; cnt_factor divides
+    // by the bumped sum_hessian). `!(x > 0.0)` is deliberately NaN-catching.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_batched: sum_hessian must be > 0 (cnt_factor divides by it)"
+                .to_string(),
+        });
+    }
+
+    // Per-feature V5 validation + per-feature device-array assembly (BEFORE launch).
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
+    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
+    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
+    for f in feats {
+        if f.na_as_missing {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                         implemented"
+                    .to_string(),
+            });
+        }
+        if f.num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(f.num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+            })?;
+        let end = f
+            .slot_off
+            .checked_add(cells)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "find_best_splits_batched: slot_off + region overflows".to_string(),
+            })?;
+        if end > buf.len() {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: buf.len(),
+            });
+        }
+        // Per-feature iteration counts — IDENTICAL to find_best_split_f64_on.
+        let num_bin_i = f.num_bin as i32;
+        let rev_count = (num_bin_i - 1).max(0);
+        let fwd_count = if f.run_forward {
+            (num_bin_i - 1 - f.offset).max(0)
+        } else {
+            0
+        };
+        slot_off_a.push(f.slot_off as u32);
+        num_bin_a.push(num_bin_i);
+        offset_a.push(f.offset);
+        default_bin_a.push(f.default_bin as i32);
+        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
+        rev_count_a.push(rev_count);
+        fwd_count_a.push(fwd_count);
+    }
+
+    // LEAF-LEVEL scalars computed ONCE (identical across features) — the 2*kEpsilon
+    // entry bump + min_gain_shift, exactly as find_best_split_f64_on does per call.
+    let two_eps = 2.0 * f64::from(K_EPSILON);
+    let sum_hessian_bumped = sum_hessian + two_eps;
+    let use_l1 = cfg.use_l1();
+    let gain_shift = crate::gain::get_leaf_gain(
+        use_l1,
+        sum_gradient,
+        sum_hessian_bumped,
+        cfg.lambda_l1,
+        cfg.lambda_l2,
+    );
+    let min_gain_shift = gain_shift + cfg.min_gain_to_split;
+
+    let out_len = n * 12;
+    let h_hist = client.create_from_slice(f64::as_bytes(buf));
+    let zeros = vec![0.0f64; out_len];
+    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
+    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
+    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
+    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
+    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // SAFETY: every handle is sized to its slice and outlives the launch. Cube `f`
+    // (`CUBE_POS_X < n`) reads only `[slot_off[f], slot_off[f]+2*num_bin[f])` — each
+    // validated `<= buf.len()` above — and writes only `out[f*12 .. f*12+12]` within
+    // the `n*12` allocation; the shared `split_scan_body` carries the same in-range /
+    // negative-`t` clamp guards as the single-feature kernel. All per-feature index
+    // arrays have exactly `n` elements. All cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        find_best_splits_fused_kernel::launch(
+            client,
+            CubeCount::Static(n as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_hist, buf.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            ArrayArg::from_raw_parts(h_slot, n),
+            ArrayArg::from_raw_parts(h_numbin, n),
+            ArrayArg::from_raw_parts(h_offset, n),
+            ArrayArg::from_raw_parts(h_defbin, n),
+            ArrayArg::from_raw_parts(h_skip, n),
+            ArrayArg::from_raw_parts(h_rev, n),
+            ArrayArg::from_raw_parts(h_fwd, n),
+            if use_l1 { 1u32 } else { 0u32 },
+            cfg.min_data_in_leaf,
+            cfg.min_sum_hessian_in_leaf,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian_bumped,
+            num_data,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = f64::from_bytes(&bytes);
+
+    // Decode each feature's 12-cell window with the SAME accept-gate as
+    // find_best_split_f64_on (feature_histogram.hpp:1031-1056). Push in input order.
+    let penalty = 1.0f64;
+    let mut out = Vec::with_capacity(n);
+    for f in 0..n {
+        let base = f * 12;
+        let is_splittable = cells[base] != 0.0;
+        let raw_threshold = cells[base + 1] as u32;
+        let raw_gain = cells[base + 2];
+        let left_count = cells[base + 3] as i32;
+        let right_count = cells[base + 4] as i32;
+        let left_sum_gradient = cells[base + 5];
+        let left_sum_hessian = cells[base + 6];
+        let right_sum_gradient = cells[base + 7];
+        let right_sum_hessian = cells[base + 8];
+        let default_left = cells[base + 9] != 0.0;
+        let left_output = cells[base + 10];
+        let right_output = cells[base + 11];
+
+        if is_splittable && raw_gain > f64::NEG_INFINITY {
+            out.push(SplitInfo {
+                threshold: raw_threshold,
+                gain: (raw_gain - min_gain_shift) * penalty,
+                left_count,
+                right_count,
+                left_sum_gradient,
+                left_sum_hessian,
+                right_sum_gradient,
+                right_sum_hessian,
+                left_output,
+                right_output,
+                default_left,
+            });
+        } else {
+            out.push(SplitInfo::none());
+        }
+    }
+    Ok(out)
+}
+
 /// **Native** host f64 best-split scan — the production cpu-anchor path (R2).
 ///
 /// Bit-IDENTICAL to [`find_best_split_cpu`] (the single-unit

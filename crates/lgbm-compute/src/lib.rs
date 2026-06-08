@@ -417,6 +417,41 @@ impl Backend for CpuBackend {
         // R2: native element-wise parent − child — bit-identical to the kernel path.
         kernels::subtract::subtract_histograms_cpu_native(parent, child)
     }
+
+    /// CPU override (260608-mc5 THE MERGE): route the batched per-leaf split through
+    /// the SAME fused cubecl kernel the GPU backend uses
+    /// ([`kernels::split::find_best_splits_batched_fused_f64_on`]) over the cubecl-cpu
+    /// [`ActiveRuntime`](runtime::ActiveRuntime) — so BOTH backends run ONE shared
+    /// f64 scan (`split_scan_body`) in ONE launch per leaf. The single-feature
+    /// [`find_best_split`](Backend::find_best_split) stays on the native scan
+    /// (`find_best_split_cpu_native`), so the per-feature kernel-parity anchor is
+    /// unaffected.
+    ///
+    /// NOTE (260608-mc5 Task-3 decision): if the cubecl-cpu per-leaf launch dispatch
+    /// materially regresses CPU wall-clock vs the R2 native baseline, this override
+    /// is reverted to the trait default (native per-feature loop) — the GPU fused
+    /// override and the shared `split_scan_body` helper are kept regardless. See the
+    /// 260608-mc5 SUMMARY for the measured decision.
+    fn find_best_splits_batched(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        buf: &[f64],
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        kernels::split::find_best_splits_batched_fused_f64_on(
+            client,
+            buf,
+            feats,
+            cfg,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )
+    }
 }
 
 /// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
@@ -553,12 +588,13 @@ impl Backend for RocmBackend {
         )
     }
 
-    /// GPU override (260608-lad Part 2): find ALL spine features' best splits for
-    /// this leaf via the runtime-generic batched f64 scan
-    /// ([`kernels::split::find_best_splits_batched_f64_on`]), one GPU launch per
-    /// feature (a single fused launch is the GPU-perf follow-up). Input order is
-    /// preserved (T-lsx-01); the f64 scan keeps the SAME gate order / eps / threshold
-    /// semantics as the CPU anchor (bit-exact f64 on gfx1100 — `max_abs_diff=0`).
+    /// GPU override (260608-mc5 THE COLLAPSE): find ALL spine features' best splits
+    /// for this leaf in ONE fused launch
+    /// ([`kernels::split::find_best_splits_batched_fused_f64_on`]) instead of the
+    /// per-feature loop-of-launches — `CubeCount::Static(num_feats,1,1)`, cube `f`
+    /// scans only its `[slot_off[f], slot_off[f]+2*num_bin[f])` region. Input order
+    /// is preserved (T-lsx-01); the f64 result is bit-identical to the per-feature
+    /// loop AND bit-exact to the CPU anchor on gfx1100 (`max_abs_diff=0`).
     fn find_best_splits_batched(
         &self,
         client: &ComputeClient<Self::Runtime>,
@@ -569,7 +605,7 @@ impl Backend for RocmBackend {
         sum_hessian: f64,
         num_data: i32,
     ) -> Result<Vec<SplitInfo>, ComputeError> {
-        kernels::split::find_best_splits_batched_f64_on(
+        kernels::split::find_best_splits_batched_fused_f64_on(
             client,
             buf,
             feats,
