@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 Phase: 08
 Plan: Not started
 Status: Executing (08-01..05 complete; Wave 4 plan 08-06 next)
-Last activity: 2026-06-08
+Last activity: 2026-06-08 - Completed quick task 260608-lsx: fuse histogram + find_best_split into one backend-generic kernel
 
 ### Plan 08-03 result (PYB-02 input widening — COMPLETE)
 
@@ -345,6 +345,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | 260608-kfu | Switchable RocmBackend (dispatch train to GPU, f64) | 2026-06-08 | complete ✓ | `--features rocm` dispatches train() to the gfx1100 GPU running f64 kernels — **bit-exact** to CPU (ROCm DOES run f64 despite has_f64=false flag). 4-op + 41-test GPU parity GREEN; default build untouched. **Honest: SLOW as-built (~214× slower — single-unit kernels); GPU speedup needs kernel parallelization (atomics/Plane → ~1e-6 gate).** |
 | 260608-kt8 | GPU-parallel f32-atomic histogram kernel | 2026-06-08 | complete ✓ | Parallel one-row-per-unit f32 `Atomic::fetch_add` histogram (gfx1100) replaces single-unit on RocmBackend — **15.2× faster** in isolation, ~1e-6 (max rel err 3.8e-7), atomic correctness proven under contention. End-to-end GPU train medium −44%. Default merge gate GREEN. **Still ~160× slower than CPU native — find_best_split/subtract/partition still single-unit (next levers).** |
 | 260608-lad | Backend abstraction + batched per-leaf GPU histogram (+find_best_split plan) | 2026-06-08 | partial ◑ | P1: `Backend::build_leaf_histograms_raw` batched seam (default loop = CPU bit-exact). P3: RocmBackend batched one-launch-per-leaf histogram → GPU train small 6.16→**4.61s**, medium 22.9→**16.6s**. Gates GREEN. P2 (find_best_split): measured launch-bound (parallel-per-feature ≈ 0 gain); batching it needs a careful scan_leaf_histogram refactor (GOSS/gate/bit-exact risk) — DESIGNED, deferred to its own task. |
+| 260608-lsx | Fuse histogram + find_best_split into one backend-generic kernel (lad P2) | 2026-06-08 | complete ✓ | New `Backend::find_best_splits_batched` (default = per-feature loop = CPU bit-exact anchor; RocmBackend overrides with batched f64 GPU path). `scan_leaf_histogram` refactored two-pass (gates → ONE batched call/leaf → argmax). Oracle GREEN: `kernel_parity` 5/5 (incl. new batched==per-feature bit-exact assertion), `learner_parity` 29/29 (trees byte-identical). Both `cpu` + `--features rocm` builds compile. **Honest: GPU launch-count collapse (one fused per-leaf scan kernel) is the perf follow-up; pre-existing f32 hip-split tol gap (04-ROCM-GAPS/D-03a) untouched.** |
 
 ## Performance Metrics
 
