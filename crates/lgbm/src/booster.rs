@@ -944,8 +944,12 @@ fn train_inner_columns_full(
     let backend = CpuBackend;
     #[cfg(not(feature = "rocm"))]
     let client = cpu_client();
+    // nn7 (L1): RocmBackend now carries interior-mutable device-resident state, so it
+    // is constructed via Default (no longer a unit struct). One instance per train()
+    // call (outside the GBDT iter loop) ⇒ the resident-bin cache persists across all
+    // trees in the train.
     #[cfg(feature = "rocm")]
-    let backend = RocmBackend;
+    let backend = RocmBackend::default();
     #[cfg(feature = "rocm")]
     let client = rocm_client();
     let gain = GainConfig::from_config(config);

@@ -314,6 +314,27 @@ pub trait Backend {
         }
         Ok(out)
     }
+
+    /// One-time per-train upload of the binned feature columns to the device
+    /// (260608-nn7 L1). The learner calls this ONCE per `train_inner` (before the
+    /// per-leaf growth loop) with every feature's GLOBAL-row bin column; a GPU
+    /// backend uploads them ONCE and caches the device `Handle` (interior
+    /// mutability), so per-leaf histogram builds gather rows ON DEVICE from the
+    /// resident buffer instead of re-uploading a host-gathered
+    /// `[num_features × rows]` bin matrix every leaf.
+    ///
+    /// The DEFAULT impl is a NO-OP: [`CpuBackend`] is the bit-exact host anchor and
+    /// keeps its per-feature host gather + native f64 fold
+    /// ([`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw) default),
+    /// so this seam adds ZERO behavior change to the CPU path. `feature_bins[fpos]`
+    /// is feature `fpos`'s full-column bin slice (length `num_data`); all columns
+    /// share the same `num_data`.
+    fn upload_resident_bins(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _feature_bins: &[&[u32]],
+    ) {
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -443,21 +464,41 @@ impl Backend for CpuBackend {
     // merge is PROVEN bit-exact on cpu even though it is not the production path.
 }
 
+/// The device-resident binned dataset cached inside [`RocmBackend`] (260608-nn7
+/// L1). Holds the ONE concatenated feature-column bin buffer's device `Handle`
+/// (feature-major, length `num_features * num_data`) plus the dimensions needed to
+/// index it (`f * num_data + row`). `Handle` is cheaply clonable (ref-counted), so
+/// "residency" = hold this Handle across all per-leaf launches within one train.
+#[cfg(feature = "rocm")]
+#[derive(Debug, Clone)]
+struct ResidentBins {
+    /// Concatenated feature-major bin columns: feature `f`'s row `r` is at
+    /// `f * num_data + r`. Uploaded ONCE per train.
+    handle: cubecl::server::Handle,
+    num_features: usize,
+    num_data: usize,
+}
+
 /// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
 /// to the cubecl-hip runtime running the **f64** kernels on the local gfx1100.
 ///
-/// The gfx1100 executes the f64 `construct`/`find_best_split`/`subtract` kernels
-/// bit-exactly to the cpu f64 anchor (verified: `max_abs_diff=0`), so this GPU path
-/// keeps the SAME numerical contract as the CPU anchor rather than the f32 ~1e-6
-/// hip mirror. (cubecl-hip reports `has_f64=false`, but that capability flag is
-/// conservative — the f64 op is real and exact.) `data_partition` is u32-only.
-///
-/// Switchable at the facade by the `rocm` feature: the default build uses
-/// [`CpuBackend`] (native f64), this is opt-in. The whole type is `#[cfg]`-gated so
-/// a CPU-only build never references the HIP runtime (SC#1, CMP-03).
+/// 260608-nn7 (L1): the backend now carries interior-mutable device state — a
+/// `RefCell<Option<ResidentBins>>` cache of the binned feature columns uploaded ONCE
+/// per train. The learner holds `&B` (shared ref) and the trait methods take
+/// `&self`, so the cache MUST be behind interior mutability (RefCell), NOT a
+/// `&mut self` signature change. The single-threaded train loop makes the RefCell
+/// borrow safe. Because a `RefCell` is not `Copy`, this type no longer derives
+/// `Copy` (it did before nn7); `CpuBackend` stays the stateless unit struct.
 #[cfg(feature = "rocm")]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RocmBackend;
+#[derive(Debug, Default)]
+pub struct RocmBackend {
+    /// The device-resident binned dataset, populated ONCE per train by
+    /// [`upload_resident_bins`](Backend::upload_resident_bins) and read by the
+    /// per-leaf [`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw)
+    /// override. `None` until the first upload (defensive fallback to the per-leaf
+    /// host-gather path).
+    resident_bins: std::cell::RefCell<Option<ResidentBins>>,
+}
 
 #[cfg(feature = "rocm")]
 impl Backend for RocmBackend {
@@ -549,11 +590,48 @@ impl Backend for RocmBackend {
         kernels::subtract::subtract_histograms_f64_on(client, parent, child)
     }
 
-    /// GPU override (part 3): build ALL features' RAW histograms for this leaf in ONE
-    /// batched kernel launch (instead of the default per-feature loop). Collapses the
-    /// per-feature construct launches to one per leaf — the launch-count win. f32
-    /// atomics ⇒ the ~1e-6 ROCm gate. `num_bins` is unused here (the per-feature slot
-    /// width is encoded by `slot_off`); the kernel writes `out[slot_off[f] + bin*2]`.
+    /// GPU override (260608-nn7 L1): upload the binned feature columns to the device
+    /// ONCE per train and cache the device `Handle` in `self.resident_bins` (interior
+    /// mutability). The columns are concatenated feature-major into ONE buffer
+    /// (`f * num_data + row`) so a single resident `Handle` covers every feature.
+    /// Per-leaf [`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw)
+    /// then gathers leaf rows ON DEVICE from this buffer, eliminating the per-leaf
+    /// `[num_features × rows]` host bin re-upload.
+    fn upload_resident_bins(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        feature_bins: &[&[u32]],
+    ) {
+        let num_features = feature_bins.len();
+        if num_features == 0 {
+            *self.resident_bins.borrow_mut() = None;
+            return;
+        }
+        let num_data = feature_bins[0].len();
+        // Concatenate every feature column feature-major into one host buffer, then
+        // upload ONCE. (All columns share num_data — the learner validates this.)
+        let mut concat: Vec<u32> = Vec::with_capacity(num_features * num_data);
+        for &col in feature_bins {
+            concat.extend_from_slice(col);
+        }
+        // `as_bytes` is `CubeElement::as_bytes` (the same call the histogram launchers
+        // use); the trait must be in scope to name it.
+        use cubecl::prelude::CubeElement;
+        let handle = client.create_from_slice(u32::as_bytes(&concat));
+        *self.resident_bins.borrow_mut() = Some(ResidentBins {
+            handle,
+            num_features,
+            num_data,
+        });
+    }
+
+    /// GPU override (part 3 + 260608-nn7 L1): build ALL features' RAW histograms for
+    /// this leaf in ONE batched kernel launch. When the device-resident bin cache is
+    /// populated (the L1 path), the kernel gathers leaf rows ON DEVICE from the
+    /// resident column buffer + a small per-leaf `leaf_rows` upload — the per-leaf
+    /// `[num_features × rows]` host bin upload is gone. Falls back to the host-gather
+    /// batched launcher if the cache is empty (defensive). Collapses the per-feature
+    /// construct launches to one per leaf. f32 atomics ⇒ the ~1e-6 ROCm gate.
     #[allow(clippy::too_many_arguments)]
     fn build_leaf_histograms_raw(
         &self,
@@ -566,6 +644,22 @@ impl Backend for RocmBackend {
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<f64>, ComputeError> {
+        // L1 device-resident path: gather on device from the cached column buffer.
+        if let Some(resident) = self.resident_bins.borrow().as_ref() {
+            return kernels::histogram::build_leaf_histograms_resident_f32_on(
+                client,
+                resident.handle.clone(),
+                resident.num_features,
+                resident.num_data,
+                slot_off,
+                slot_len,
+                leaf_rows,
+                gradients,
+                hessians,
+            );
+        }
+        // Defensive fallback: no resident cache (upload_resident_bins not called) —
+        // the original per-leaf host-gather batched launcher.
         kernels::histogram::build_leaf_histograms_batched_f32_on(
             client,
             feature_bins,

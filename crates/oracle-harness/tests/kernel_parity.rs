@@ -1451,4 +1451,80 @@ mod hip {
         }
         assert!(n > 0, "partition fixture parsed zero cases");
     }
+
+    /// nn7 (L1) parity gate: the DEVICE-RESIDENT leaf-histogram path (one-time column
+    /// upload + on-device gather of the small `leaf_rows`) must produce the SAME RAW
+    /// histogram as the original host-gather batched launcher
+    /// (`build_leaf_histograms_batched_f32_on`) on the SAME inputs. Both are
+    /// f32-atomic with the IDENTICAL `(feature, leaf-row)` launch shape, so they
+    /// match within `ORACLE_TOL` (and, since the atomic add SET is identical, are
+    /// typically bit-identical). This proves L1 changed the UPLOAD path only — not
+    /// the numbers — so the GPU tree decisions stay within the existing ~1e-6 gate.
+    #[test]
+    fn kernel_parity_resident_gather_equals_host_gather_on_hip() {
+        use lgbm_compute::kernels::histogram::build_leaf_histograms_batched_f32_on;
+        use lgbm_compute::RocmBackend;
+
+        let hip = rocm_client();
+
+        // A small synthetic dataset: 3 features over 10 rows, different bin counts.
+        let num_data = 10usize;
+        let f0: Vec<u32> = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1]; // num_bin 4
+        let f1: Vec<u32> = vec![0, 0, 1, 1, 2, 2, 0, 1, 2, 0]; // num_bin 3
+        let f2: Vec<u32> = vec![4, 3, 2, 1, 0, 1, 2, 3, 4, 0]; // num_bin 5
+        let num_bins: Vec<u32> = vec![4, 3, 5];
+        let feature_bins: Vec<&[u32]> = vec![&f0, &f1, &f2];
+        // Concatenated stride-2 slots: feature f occupies [slot_off[f], +2*num_bin).
+        let mut slot_off = Vec::with_capacity(num_bins.len());
+        let mut acc = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(acc);
+            acc += 2 * nb as usize;
+        }
+        let slot_len = acc;
+        // A non-trivial leaf subset (a strict subset of 0..num_data, out of order).
+        let leaf_rows: Vec<u32> = vec![1, 3, 4, 6, 7, 9];
+        let gradients: Vec<f32> =
+            (0..num_data).map(|i| 0.25 + i as f32 * 0.5).collect();
+        let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
+
+        // (a) ORIGINAL host-gather path (per-leaf [num_features × rows] upload).
+        let host = build_leaf_histograms_batched_f32_on(
+            &hip,
+            &feature_bins,
+            &slot_off,
+            slot_len,
+            &leaf_rows,
+            &gradients,
+            &hessians,
+        )
+        .expect("host-gather batched launcher");
+
+        // (b) NEW device-resident path: upload columns ONCE via the backend seam,
+        //     then build through the RocmBackend override (on-device gather). Both
+        //     use the same RocmBackend instance so the resident cache is populated.
+        let backend = RocmBackend::default();
+        backend.upload_resident_bins(&hip, &feature_bins);
+        let resident = backend
+            .build_leaf_histograms_raw(
+                &hip,
+                &feature_bins,
+                &num_bins,
+                &slot_off,
+                slot_len,
+                &leaf_rows,
+                &gradients,
+                &hessians,
+            )
+            .expect("resident-gather build_leaf_histograms_raw");
+
+        let host_f32: Vec<f32> = host.iter().map(|&x| x as f32).collect();
+        let resident_f32: Vec<f32> = resident.iter().map(|&x| x as f32).collect();
+        assert_eq!(host.len(), slot_len, "host histogram length");
+        assert_eq!(resident.len(), slot_len, "resident histogram length");
+        // Resident-gather (on-device gather from the one-time column upload) ==
+        // host-gather (per-leaf [num_features × rows] upload) within the ~1e-6 ROCm
+        // tolerance. The override routes through build_leaf_histograms_resident_f32_on.
+        assert_within("resident_vs_host/override", &resident_f32, &host_f32);
+    }
 }

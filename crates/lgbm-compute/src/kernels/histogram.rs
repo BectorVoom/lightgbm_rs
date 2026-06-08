@@ -494,3 +494,114 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
 }
+
+/// DEVICE-RESIDENT batched per-leaf histogram kernel (260608-nn7 L1). Identical
+/// `(feature f, leaf-row k)` unit mapping to [`construct_leaf_hist_batched_kernel`]
+/// BUT gathers the bin from the device-resident feature-column buffer on device
+/// (`resident_bins[f * num_data + leaf_rows[k]]`) instead of from a per-leaf
+/// host-gathered `gathered_bins[idx]` re-uploaded every leaf. This is the L1 win:
+/// the `[num_features × rows]` host bin upload per leaf is replaced by a one-time
+/// column upload (the resident buffer) + a small per-leaf `leaf_rows` index upload.
+///
+/// `num_data` is the resident column stride (the full train row count) passed as a
+/// scalar launch arg. Same f32-atomic accumulation ⇒ the ~1e-6 ROCm gate (cpu
+/// anchor stays bit-exact). `#[cfg(feature="rocm")]`.
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+pub fn construct_leaf_hist_resident_kernel(
+    resident_bins: &Array<u32>,
+    leaf_rows: &Array<u32>,
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>,
+    num_data: usize,
+    total: usize,
+    out: &mut Array<Atomic<f32>>,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx < total {
+        let r = ord_g.len(); // leaf-row count R
+        let f = idx / r; // feature index
+        let k = idx % r; // leaf-row position
+        // Gather on device from the resident column: feature f, the leaf's k-th row.
+        let row = leaf_rows[k] as usize;
+        let bin = resident_bins[f * num_data + row];
+        let cell = slot_off[f] as usize + bin as usize * 2;
+        out[cell].fetch_add(ord_g[k]);
+        out[cell + 1].fetch_add(ord_h[k]);
+    }
+}
+
+/// Host launcher for the DEVICE-RESIDENT batched per-leaf histogram (260608-nn7 L1).
+///
+/// Takes the cached resident feature-column `Handle` (uploaded ONCE per train,
+/// length `num_features * num_data`, feature-major) + the per-leaf `leaf_rows` index
+/// array (uploaded fresh each leaf, small) + the leaf's grad/hess (gathered host-side
+/// per leaf — small). Dispatches ONE kernel over all `num_features × R`
+/// `(feature, row)` units; the kernel gathers each bin from the resident column on
+/// device. Returns the concatenated RAW f64 histogram (`slot_len` cells) —
+/// FixHistogram + compaction stay in the caller.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] on a degenerate layout (mismatched lengths).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    num_features: usize,
+    num_data: usize,
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    gradients: &[f32],
+    hessians: &[f32],
+) -> Result<Vec<f64>, ComputeError> {
+    let rows = leaf_rows.len();
+    if rows == 0 || num_features == 0 {
+        return Ok(vec![0.0f64; slot_len]);
+    }
+    // Per-leaf uploads ONLY: the small leaf_rows index array + the leaf's grad/hess
+    // (gathered once, shared across features). The big bins matrix is ALREADY on the
+    // device (resident_bins) — no per-leaf re-upload of [num_features × rows].
+    let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+    let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+    let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
+
+    let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
+    let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
+    let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
+    let zeros = vec![0.0f32; slot_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+
+    let total = num_features * rows;
+    let cube_dim = 256u32;
+    let cube_count = (total as u32).div_ceil(cube_dim);
+
+    // SAFETY: `resident_bins` is sized `num_features * num_data` (uploaded once), the
+    // per-leaf handles are sized to their slices, and every handle outlives the
+    // launch. The kernel bounds-checks `idx < total`; `leaf_rows[k] < num_data` (leaf
+    // rows are a subset of 0..num_data) keeps `f*num_data + leaf_rows[k]` inside the
+    // resident buffer, and `bin < num_bin` for the feature keeps
+    // `slot_off[f] + bin*2 + 1` inside that feature's slot within `slot_len`. All
+    // cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        construct_leaf_hist_resident_kernel::launch(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
+            ArrayArg::from_raw_parts(h_rows, rows),
+            ArrayArg::from_raw_parts(h_g, rows),
+            ArrayArg::from_raw_parts(h_h, rows),
+            ArrayArg::from_raw_parts(h_slot, num_features),
+            num_data,
+            total,
+            ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}

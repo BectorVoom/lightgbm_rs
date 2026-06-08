@@ -663,6 +663,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // element-wise subtract over it (each feature's compacted region subtracts
         // independently; the zeroed compaction tails subtract to zero — D-05/A3).
         let (slot_off, slot_len) = feature_slot_layout(&features);
+
+        // nn7 (L1): one-time per-train upload of the binned feature columns to the
+        // backend's device-resident cache, BEFORE the per-leaf growth loop. For the
+        // CpuBackend this is the no-op default (zero behavior change); the RocmBackend
+        // uploads every column ONCE and gathers leaf rows on device per leaf — the
+        // per-leaf `[num_features × rows]` host bin upload is gone. The binned columns
+        // are immutable for the whole train, so upload once here (not per tree); the
+        // backend instance persists across trees (booster.rs constructs it per
+        // train() call, outside the GBDT iter loop).
+        let upload_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
+        self.backend.upload_resident_bins(self.client, &upload_bins);
+
         let mut pool = HistogramPool::new(self.num_leaves, slot_len);
         pool.reset_map();
 
