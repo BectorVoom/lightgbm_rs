@@ -8,12 +8,36 @@ is weakened and no horizon is silently capped for any deferred cell).
 
 ## DEF-07-02 — fair (all) + quantile bagged/iterated learner-level f64 split-gain knife-edge
 
-> **STATUS: OPEN.** Needs an 07-01-style source-built `lib_lightgbm` 4.6 CPU-only
-> single-thread FP execution trace to localize the split-gain operand, exactly as
-> 07-01 (D-05) did for the `binary`/`regression_l1` + bagging cells. OBJ-04 is
-> therefore PARTIALLY delivered in 07-02: huber, mape, and the quantile SPINE
-> shipped faithfully GREEN; fair (all) and quantile bagged/iterated are deferred
-> here.
+> **STATUS: RESOLVED (2026-06-08, plan 07-13)** — except the single bagged-renew
+> sub-cell re-scoped to **DEF-07-13-01** below. The original "f64 split-gain operand
+> knife-edge" framing was DISPROVEN by the 07-13 source-built FP trace: the real
+> defects were two learner-side count-source bugs, BOTH fixed C++-faithfully (no
+> tolerance weakened, no horizon capped):
+> 1. **`split_inner` seeded smaller/larger leaf-splits from SplitInfo
+>    `round_int(hess·cnt_factor)` counts instead of DATA-PARTITION counts** — C++ uses
+>    partition counts for both the tie-break (`serial_tree_learner.cpp:790-791/851`,
+>    `update_cnt=true`) and the histogram-pool dance (`GetGlobalDataCountInLeaf`). Only
+>    non-constant hessians tripped it. Fix: compare `part_left < part_right` (commit
+>    `15263df`).
+> 2. **Missing parent-splittability gate for subtracted children** — under GOSS
+>    amplification `cnt_factor = num_data / amplified_sum_hessian` is small, so per-bin
+>    `round_int(hess·cnt_factor)` rounds to 0 and a feature can fail `min_data_in_leaf`
+>    at the parent yet look splittable on a subtracted child. C++ propagates the parent
+>    `is_splittable_` flag (`serial_tree_learner.cpp:395-399`); Rust scanned all features
+>    unconditionally. Fix: propagate the gate (commit `56c31c7`). This also closed
+>    `fair_loop_matrix` (tree-5 ~2.085 — downstream of the same gate, NOT a 3rd defect).
+>
+> **12 of 13 Family-A cells un-ignored and asserting real-lib_lightgbm-4.6 parity**
+> (commit `8a4a5af`): all fair, all gamma, both tweedie, and `quantile_alpha_axis`.
+> OBJ-04 is now delivered for these. The full no-regression merge gate stayed
+> bit-exact GREEN (goss_parity_matrix, kernel_parity 4/4, learner_parity keystones,
+> subset_determinism_diagnostic, all `*_spine`/`*_gradients`). Root-cause evidence:
+> `.planning/debug/split-gain-knife-edge-07-02.md`, plan `07-13-PLAN.md` /
+> `07-13-SUMMARY.md`.
+>
+> _(Historical OPEN framing, superseded: "Needs an 07-01-style source-built
+> lib_lightgbm 4.6 FP trace to localize the split-gain operand ... fair (all) and
+> quantile bagged/iterated are deferred here.")_
 
 - **Discovered during:** 07-02 execution (OBJ-04 family A capture + replay), the
   "ship green, defer blocked cells" disposition (human-chosen at the 07-02
@@ -133,6 +157,30 @@ moved aside to
 (untracked, regeneratable by the capture xtask) so they do not contaminate the
 07-02 green run. They belong to their originating phases' deferral tracking, not
 DEF-07-02.
+
+---
+
+## DEF-07-13-01 — quantile bagged-renew structural divergence (`quantile_bag1_es0_bfa0`)
+
+> **STATUS: OPEN (re-scoped from DEF-07-02 by plan 07-13).** The ONE Family-A cell plan
+> 07-13 did NOT close. It is a DISTINCT root cause from the (now-fixed) DEF-07-02
+> count-source bugs — NOT the offset/split-gain path.
+
+- **Affected (ignored) cell:** `quantile_loop_matrix`, bagged sub-cell `quantile_bag1_es0_bfa0`
+  only (`crates/oracle-harness/tests/boosting_parity.rs`). The non-bagged
+  `quantile_alpha_axis` + the quantile SPINE are GREEN.
+- **Symptom:** 12-vs-10-tree STRUCTURAL divergence. Trees 0–3 are bit-exact; at iter 4
+  Rust's bagged subset has all-uniform gradients (0.1 → zero gain → constant 1-leaf tree)
+  while the Python-captured golden has a non-uniform 10-row subset (gain 0.4). This is the
+  **bagging-draw × quantile-`RenewTreeOutput`** interaction.
+- **Why the D-05 FP-trace method can't localize it:** the deterministic source-built
+  `lib_lightgbm` 4.6 CLI does NOT reproduce the golden — it stops at 1 tree ("No further
+  splits with positive gain" for quantile + bfa-off). So the source-build arbiter that
+  closed DEF-07-02/06-01 is unavailable here; this needs a DIFFERENT oracle (likely a
+  Python-wheel-side bagging-subset + renew trace), not a CLI FP trace.
+- **Disposition:** assertion left fully intact under `#[ignore]` with an honest reason
+  (no tolerance weakened, no horizon capped). Tracks a future bagging-renew-specific
+  investigation, separate from the closed DEF-07-02 split-gain/count family.
 
 ---
 
