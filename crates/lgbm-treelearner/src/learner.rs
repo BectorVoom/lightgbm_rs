@@ -1514,11 +1514,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // This is the kEpsilon-faithful derivation the direct rebuild cannot
                 // reproduce bit-for-bit.
                 debug_assert_eq!(larger_slot, parent_slot, "the larger child reuses the moved parent slot");
-                let parent_buf = pool.buffer(parent_slot).to_vec();
-                let smaller_buf = pool.buffer(smaller_slot).to_vec();
-                let derived = self
-                    .backend
-                    .subtract_histograms(self.client, &parent_buf, &smaller_buf)?;
+                // 260609-bfx follow-up: pass the pool slots directly — `subtract_histograms`
+                // only READS parent/child and returns a fresh owned buffer, so the two
+                // per-split `.to_vec()` scratch clones were redundant. `parent_slot ==
+                // larger_slot`, but `derived` is fully materialized (owns its data) before
+                // the `buffer_mut(larger_slot)` write below, so there is no aliasing. Same
+                // f64 cells, same op, same order → parity-neutral; one fewer Vec clone per
+                // use_subtract larger-child derivation (every split that retains a parent).
+                let derived = self.backend.subtract_histograms(
+                    self.client,
+                    pool.buffer(parent_slot),
+                    pool.buffer(smaller_slot),
+                )?;
                 // TEST audit hook (T-05-07-01): record (derived, direct) so a parity
                 // test can assert the subtracted larger child == a direct build of its
                 // own rows, cell-for-cell, in the LIVE growth path. Host-path only (the
