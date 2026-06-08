@@ -16,9 +16,20 @@ Each run adds one lever on top of the previous (cumulative):
 | **M0** | baseline (default release, system alloc) | 1.71s | 4.75s | 8.93s | 62.75ms |
 | **M1** | + `[profile.release]` lto=fat, cgu=1 | 1.68s | 4.58s | 8.68s | 62.25ms |
 | **M2** | + mimalloc global allocator | 1.61s | 4.35s | 8.25s | 61.50ms |
-| **M3** | + smallvec / buffer-reuse | _pending_ | | | |
+| **M3** | + gather buffer-reuse / candidate pre-size | 1.55s | 4.21s | 8.12s | 58.25ms |
 
-_(Filled in as each task lands.)_
+### Cumulative speedup (M0 → M3, all parity-safe levers)
+
+| size | train M0 | train M3 | speedup | predict M0 | predict M3 |
+|------|----------|----------|---------|------------|------------|
+| small  | 1.71s | 1.55s | **−9.4%** | 3.00ms | 2.89ms |
+| medium | 4.75s | 4.21s | **−11.4%** | 24.53ms | 23.34ms |
+| large  | 8.93s | 8.12s | **−9.1%** | 62.75ms | 58.25ms |
+
+**Parity gate after T4:** `cargo test -p oracle-harness` GREEN — boosting_parity 75,
+learner_parity 29, kernel_parity 4, predict_parity 5, raw_bin_train_parity 2,
+rng_parity 1, all bit-exact; core unit tests (lgbm 41, boosting 55, compute 18,
+treelearner 64) GREEN. Zero numeric change.
 
 ## C++ reference point
 

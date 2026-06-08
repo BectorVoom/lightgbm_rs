@@ -1425,14 +1425,22 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return;
         }
         let leaf_rows = data_partition.indices_in_leaf(leaf);
+        // Scratch gather buffers, allocated once per call and REUSED across every
+        // feature (each feature gathers exactly `leaf_rows.len()` rows). Parity-
+        // neutral: identical values pushed in identical order into
+        // `construct_histograms` — only the per-feature allocation churn is removed
+        // (3 allocations per leaf instead of 3×num_features).
+        let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
+        let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+        let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
         for (fpos, f) in features.iter().enumerate() {
             let cells = 2 * f.num_bin as usize;
             let region = &mut buf[slot_off[fpos]..slot_off[fpos] + cells];
             // ORDERED per-feature gradient/hessian for this leaf's rows (the C++
             // ordered fold — never reordered/parallelized).
-            let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
-            let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
-            let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+            ord_bins.clear();
+            ord_g.clear();
+            ord_h.clear();
             for &row in leaf_rows {
                 ord_bins.push(f.bins[row as usize]);
                 ord_g.push(gradients[row as usize]);
@@ -2095,8 +2103,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let get_grad = |t: i32| hist[(t as usize) << 1];
         let get_hess = |t: i32| hist[((t as usize) << 1) + 1];
 
-        // REVERSE (:854-936).
-        let mut cand_rev: Vec<f64> = Vec::new();
+        // REVERSE (:854-936). Pre-sized to `num_bin` (the push upper bound) so the
+        // per-feature per-leaf snapshot scan never reallocates mid-grow. Parity-
+        // neutral — capacity only, identical pushed sequence.
+        let mut cand_rev: Vec<f64> = Vec::with_capacity(num_bin.max(0) as usize);
         {
             let mut sum_right_gradient = 0.0f64;
             let mut sum_right_hessian = eps;
@@ -2149,8 +2159,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             }
         }
 
-        // FORWARD (:937-1029).
-        let mut cand_fwd: Vec<f64> = Vec::new();
+        // FORWARD (:937-1029). Pre-sized to `num_bin` (see REVERSE above).
+        let mut cand_fwd: Vec<f64> = Vec::with_capacity(num_bin.max(0) as usize);
         {
             let mut sum_left_gradient = 0.0f64;
             let mut sum_left_hessian = eps;
