@@ -257,17 +257,50 @@ pub fn scipy_csc_to_rows(
 /// Extract a polars [`Series`] as an owned `Vec<f64>`, null -> `NaN` (the facade
 /// `BinMapper` treats `NaN` as missing). Numeric columns are cast to f64; for a
 /// categorical/enum series this receives its already-physical-code repr.
+///
+/// Two ingest fast-paths, both byte-identical to the prior
+/// `cast().f64().into_iter().map(unwrap_or(NAN)).collect()`:
+/// - **O3:** skip the `cast(Float64)` (a whole extra `Series` allocation) when the
+///   column is ALREADY `Float64` — the common numeric case — borrowing it instead.
+/// - **O5:** build the `Vec` by walking the underlying Arrow CHUNKS
+///   (`downcast_iter`) rather than forcing a single materialized/rechunked buffer.
+///   A chunk with no validity bitmap (`null_count == 0`) is copied wholesale from
+///   its contiguous values slice; a chunk with nulls falls back to the per-value
+///   null -> NaN map. (The contiguous-copy step is what makes O5 a real win over
+///   `into_iter()`, which already walks chunks — it necessarily overlaps the O4
+///   no-null bulk-copy idea.)
 fn series_to_f64_vec(s: &Series, name: &str) -> PyResult<Vec<f64>> {
-    let casted = s.cast(&DataType::Float64).map_err(|e| {
-        PyValueError::new_err(format!(
-            "column '{name}': cannot convert dtype {:?} to numeric f64: {e}",
-            s.dtype()
-        ))
-    })?;
+    // O3: only allocate a casted Series when the dtype is not already Float64.
+    let casted: std::borrow::Cow<'_, Series> = if matches!(s.dtype(), DataType::Float64) {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(s.cast(&DataType::Float64).map_err(|e| {
+            PyValueError::new_err(format!(
+                "column '{name}': cannot convert dtype {:?} to numeric f64: {e}",
+                s.dtype()
+            ))
+        })?)
+    };
     let ca = casted
         .f64()
         .map_err(|e| PyValueError::new_err(format!("column '{name}': {e}")))?;
-    Ok(ca.into_iter().map(|opt| opt.unwrap_or(f64::NAN)).collect())
+
+    // O5: chunk-wise extraction — no rechunk, no materialized round-trip.
+    let mut out: Vec<f64> = Vec::with_capacity(ca.len());
+    for arr in ca.downcast_iter() {
+        match arr.validity() {
+            // No validity bitmap ⇒ every value present ⇒ copy the contiguous slice.
+            None => out.extend_from_slice(arr.values().as_slice()),
+            // Has a validity bitmap ⇒ map per value, null -> NaN (present NaN bits
+            // are preserved, identical to the prior into_iter().unwrap_or(NAN)).
+            Some(_) => {
+                for opt in arr.iter() {
+                    out.push(opt.copied().unwrap_or(f64::NAN));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Extract one DataFrame column's raw f64 feature values.
