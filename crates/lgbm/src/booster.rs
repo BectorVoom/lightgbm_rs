@@ -14,8 +14,17 @@
 use lgbm_boosting::objective::BoostObjective;
 use lgbm_boosting::{Gbdt, IterSnapshot};
 use lgbm_compute::gain::GainConfig;
+// Backend dispatch (switchable by the `rocm` feature). Default: the native-f64
+// CpuBackend (the bit-exact anchor). With `--features rocm`: the RocmBackend, which
+// runs the SAME f64 kernels on the local gfx1100 GPU.
+#[cfg(not(feature = "rocm"))]
 use lgbm_compute::runtime::cpu_client;
+#[cfg(not(feature = "rocm"))]
 use lgbm_compute::CpuBackend;
+#[cfg(feature = "rocm")]
+use lgbm_compute::runtime::rocm_client;
+#[cfg(feature = "rocm")]
+use lgbm_compute::RocmBackend;
 use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::{BinMapper, MissingType};
 use lgbm_metric::{BinaryMetric, Metric, MultiLogloss};
@@ -926,8 +935,19 @@ fn train_inner_columns_full(
     }
 
     // ---- the learner ----
+    // Backend dispatch is feature-switched (see the gated imports above): the
+    // default build trains on the native-f64 CpuBackend; `--features rocm` trains on
+    // the gfx1100 GPU via RocmBackend (same f64 kernels, bit-exact). The learner +
+    // GBDT loop below are generic over `B: Backend`, so only this construction site
+    // differs.
+    #[cfg(not(feature = "rocm"))]
     let backend = CpuBackend;
+    #[cfg(not(feature = "rocm"))]
     let client = cpu_client();
+    #[cfg(feature = "rocm")]
+    let backend = RocmBackend;
+    #[cfg(feature = "rocm")]
+    let client = rocm_client();
     let gain = GainConfig::from_config(config);
     let mut learner = SerialTreeLearner::new(
         &backend,

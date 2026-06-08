@@ -25,6 +25,10 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 # Route the process global allocator through mimalloc. Enabled for the optimized
 # benchmark runs (M2/M3) and intended for the shipped binaries.
 mimalloc = ["dep:mimalloc"]
+# Dispatch training compute to the ROCm/HIP GPU (f64 kernels on the local gfx1100)
+# instead of the native CPU backend. Opt-in: the default build stays on the CPU
+# anchor and never references the HIP runtime. Forwards to lgbm-compute/rocm.
+rocm = ["lgbm-compute/rocm"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }

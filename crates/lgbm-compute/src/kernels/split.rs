@@ -542,6 +542,46 @@ pub fn find_best_split_cpu(
     num_bin: u32,
     offset: i32,
     default_bin: u32,
+    most_freq_bin: u32,
+    skip_default_bin: bool,
+    na_as_missing: bool,
+    run_forward: bool,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> Result<SplitInfo, ComputeError> {
+    find_best_split_f64_on(
+        client,
+        hist,
+        cfg,
+        num_bin,
+        offset,
+        default_bin,
+        most_freq_bin,
+        skip_default_bin,
+        na_as_missing,
+        run_forward,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+    )
+}
+
+/// The f64 `find_best_split` cube path, **generic over the runtime** `R` so it runs
+/// on the cubecl-cpu anchor (via [`find_best_split_cpu`]) AND on cubecl-hip (the GPU
+/// `RocmBackend`) — the same f64 kernel, bit-exact across both. Identical host
+/// pre-step / scan / decode as before; only the runtime is generic.
+///
+/// # Errors
+/// Same as [`find_best_split_cpu`].
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_split_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist: &[f64],
+    cfg: &GainConfig,
+    num_bin: u32,
+    offset: i32,
+    default_bin: u32,
     _most_freq_bin: u32,
     skip_default_bin: bool,
     na_as_missing: bool,

@@ -96,6 +96,26 @@ pub fn construct_histograms_cpu(
     hess: &[f32],
     num_bin: u32,
 ) -> Result<Vec<f64>, ComputeError> {
+    construct_histograms_f64_on(client, binned, grad, hess, num_bin)
+}
+
+/// The f64 `construct_histograms` cube path, **generic over the runtime** `R` so it
+/// runs on the cubecl-cpu anchor (via [`construct_histograms_cpu`]) AND on
+/// cubecl-hip (the GPU `RocmBackend`). The gfx1100 executes this f64 kernel
+/// bit-exactly to the CPU anchor (verified: `max_abs_diff=0`), even though
+/// `probe_capabilities().has_f64` is reported `false` — the flag is conservative,
+/// the f64 op is real. Same single-owner ordered fold (`CubeDim::new_1d(1)`) and V5
+/// validation as before.
+///
+/// # Errors
+/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
+pub fn construct_histograms_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    binned: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_bin: u32,
+) -> Result<Vec<f64>, ComputeError> {
     // --- V5 boundary validation (T-04-01): never panic / UB on caller input ---
     // Shared with the f32 hip path (`construct_histograms_f32_on`); `out` is sized
     // 2 * num_bin cells, the `bin<<1` index math is overflow-guarded, and every

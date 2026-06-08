@@ -66,6 +66,21 @@ pub fn subtract_histograms_cpu(
     parent: &[f64],
     child: &[f64],
 ) -> Result<Vec<f64>, ComputeError> {
+    subtract_histograms_f64_on(client, parent, child)
+}
+
+/// The f64 `subtract_histograms` cube path, **generic over the runtime** `R` so it
+/// runs on the cubecl-cpu anchor (via [`subtract_histograms_cpu`]) AND on
+/// cubecl-hip (the GPU `RocmBackend`) — the same f64 element-wise kernel, bit-exact
+/// across both.
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `parent.len() != child.len()`.
+pub fn subtract_histograms_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    parent: &[f64],
+    child: &[f64],
+) -> Result<Vec<f64>, ComputeError> {
     // --- V5 boundary validation (T-04-01): equal `2*num_bin` lengths ---
     if parent.len() != child.len() {
         return Err(ComputeError::LengthMismatch {

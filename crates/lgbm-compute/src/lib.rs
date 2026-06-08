@@ -284,3 +284,106 @@ impl Backend for CpuBackend {
         kernels::subtract::subtract_histograms_cpu_native(parent, child)
     }
 }
+
+/// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
+/// to the cubecl-hip runtime running the **f64** kernels on the local gfx1100.
+///
+/// The gfx1100 executes the f64 `construct`/`find_best_split`/`subtract` kernels
+/// bit-exactly to the cpu f64 anchor (verified: `max_abs_diff=0`), so this GPU path
+/// keeps the SAME numerical contract as the CPU anchor rather than the f32 ~1e-6
+/// hip mirror. (cubecl-hip reports `has_f64=false`, but that capability flag is
+/// conservative — the f64 op is real and exact.) `data_partition` is u32-only.
+///
+/// Switchable at the facade by the `rocm` feature: the default build uses
+/// [`CpuBackend`] (native f64), this is opt-in. The whole type is `#[cfg]`-gated so
+/// a CPU-only build never references the HIP runtime (SC#1, CMP-03).
+#[cfg(feature = "rocm")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RocmBackend;
+
+#[cfg(feature = "rocm")]
+impl Backend for RocmBackend {
+    type Runtime = runtime::RocmRuntime;
+
+    fn construct_histograms(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        binned: &[u32],
+        ordered_gradients: &[f32],
+        ordered_hessians: &[f32],
+        num_bin: u32,
+    ) -> Result<Vec<f64>, ComputeError> {
+        kernels::histogram::construct_histograms_f64_on(
+            client,
+            binned,
+            ordered_gradients,
+            ordered_hessians,
+            num_bin,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_best_split(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        hist: &[f64],
+        cfg: &GainConfig,
+        num_bin: u32,
+        offset: i32,
+        default_bin: u32,
+        most_freq_bin: u32,
+        skip_default_bin: bool,
+        na_as_missing: bool,
+        run_forward: bool,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<SplitInfo, ComputeError> {
+        kernels::split::find_best_split_f64_on(
+            client,
+            hist,
+            cfg,
+            num_bin,
+            offset,
+            default_bin,
+            most_freq_bin,
+            skip_default_bin,
+            na_as_missing,
+            run_forward,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn data_partition(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        bins: &[u32],
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<(Vec<u32>, usize), ComputeError> {
+        kernels::partition::data_partition_on(
+            client,
+            bins,
+            num_bin,
+            min_bin,
+            max_bin,
+            threshold,
+            most_freq_bin,
+        )
+    }
+
+    fn subtract_histograms(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent: &[f64],
+        child: &[f64],
+    ) -> Result<Vec<f64>, ComputeError> {
+        kernels::subtract::subtract_histograms_f64_on(client, parent, child)
+    }
+}
