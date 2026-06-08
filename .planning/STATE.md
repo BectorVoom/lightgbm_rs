@@ -340,6 +340,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Quick ID | Task | Date | Status | Result |
 |----------|------|------|--------|--------|
 | 260608-iwj | Compare speed lightgbm vs lightgbm_rs + parity-safe optimise | 2026-06-08 | complete ✓ | Bench harness + 4 parity-safe levers (~9–11% train); bit-exact gate GREEN. **Finding: Rust ~40–80× slower than C++ 4.6** — roadmap R1–R4 in quick/260608-iwj-REPORT.md |
+| 260608-jpj | R1: make D-06 snapshot opt-in | 2026-06-08 | complete ✓ | Snapshot `per_bin_gains` now skipped on the production train path (golden-replay paths keep it); bit-exact gate GREEN. **~0% wall-clock (per_bin_gains dwarfed by histogram gather) — R2 is the real lever.** |
 
 ## Performance Metrics
 

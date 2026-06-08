@@ -263,6 +263,15 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// Indexed `[leaf][feature_position]`; reset per tree. `RefCell` so the `&self`
     /// scan records it.
     feature_splittable: std::cell::RefCell<Vec<Vec<bool>>>,
+    /// R1 (perf): when `false`, `scan_leaf_histogram` SKIPS the snapshot-only
+    /// `per_bin_gains` host re-scan (the per-feature per-bin gain arrays that feed
+    /// the D-06 `SplitSnapshot`). The grown tree is bit-identical either way — the
+    /// live split decision comes from `backend.find_best_split`, never from
+    /// `per_bin_gains` (a pure read). Set `true` by `train_with_snapshots` /
+    /// `train_with_col_sampler_trace` (the golden-replay paths) and `false` by
+    /// `train` / `train_returning_partition` (the production boosting path), so the
+    /// boosting loop pays nothing for snapshots it discards.
+    capture_snapshots: bool,
 }
 
 /// W10 advanced learner constraints (ADV-01..05) — the inactive `Default` is the
@@ -369,6 +378,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             branch_features: std::cell::RefCell::new(Vec::new()),
             extra_rng: std::cell::RefCell::new(None),
             feature_splittable: std::cell::RefCell::new(Vec::new()),
+            // Default OFF: the common `train` path discards snapshots, so by default
+            // we never pay the per_bin_gains re-scan. The snapshot wrappers opt in.
+            capture_snapshots: false,
         }
     }
 
@@ -389,7 +401,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<Tree, TreeLearnerError> {
-        Ok(self.train_with_snapshots(gradients, hessians, is_first_tree)?.0)
+        // Production path: snapshots are NOT requested, so skip the per_bin_gains
+        // re-scan (R1). Calls `train_inner` directly — NOT via `train_with_snapshots`
+        // — so `capture` stays false.
+        let (tree, _snaps, _trace, _part) =
+            self.train_inner(gradients, hessians, is_first_tree, false)?;
+        Ok(tree)
     }
 
     /// Like [`train`](Self::train) but also returns the per-split D-06 snapshots
@@ -402,7 +419,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>), TreeLearnerError> {
-        let (tree, snaps, _trace, _part) = self.train_inner(gradients, hessians, is_first_tree)?;
+        // Golden-replay path: capture the full D-06 snapshots (per_bin_gains ON).
+        let (tree, snaps, _trace, _part) =
+            self.train_inner(gradients, hessians, is_first_tree, true)?;
         Ok((tree, snaps))
     }
 
@@ -515,8 +534,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, DataPartition), TreeLearnerError> {
+        // Production boosting path (gbdt.rs:797,1125): snapshots discarded → OFF.
         let (tree, _snaps, _trace, part) =
-            self.train_inner(gradients, hessians, is_first_tree)?;
+            self.train_inner(gradients, hessians, is_first_tree, false)?;
         Ok((tree, part))
     }
 
@@ -532,8 +552,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace), TreeLearnerError> {
+        // Golden-replay path (TRL-08 RNG + D-06 snapshots): capture ON.
         let (tree, snaps, trace, _part) =
-            self.train_inner(gradients, hessians, is_first_tree)?;
+            self.train_inner(gradients, hessians, is_first_tree, true)?;
         Ok((tree, snaps, trace))
     }
 
@@ -546,7 +567,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         gradients: &[f32],
         hessians: &[f32],
         _is_first_tree: bool,
+        capture_snapshots: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace, DataPartition), TreeLearnerError> {
+        // R1: record whether this growth must emit D-06 snapshots. Read deep in
+        // `scan_leaf_histogram` to gate the snapshot-only `per_bin_gains` re-scan.
+        self.capture_snapshots = capture_snapshots;
         let num_data = gradients.len() as i32;
         let features = self.features.clone();
 
@@ -1728,7 +1753,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
             // Per-bin gain arrays for the D-06 snapshot (host re-scan of the SAME
             // fixed histogram via the gain primitive — localizes a divergence).
-            let (cand_rev, cand_fwd) = self.per_bin_gains(hist, f, sum_g, sum_h, num_data_in_leaf);
+            // R1: snapshot-ONLY work — skip it entirely on the production path
+            // (`capture_snapshots == false`). The live split (`split` above) and the
+            // splittability flag are already decided; the grown tree is identical.
+            let (cand_rev, cand_fwd) = if self.capture_snapshots {
+                self.per_bin_gains(hist, f, sum_g, sum_h, num_data_in_leaf)
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
             records.push(FeatureSplitRecord {
                 feature: f.real_feature_index,

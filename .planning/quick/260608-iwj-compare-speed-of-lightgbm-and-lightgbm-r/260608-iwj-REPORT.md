@@ -64,9 +64,14 @@ gap — closing it is an algorithmic/architectural effort, not allocator/flag tu
 
 ### Recommended optimization roadmap (out of scope here — needs parity care)
 
-- **R1 (largest, low risk): make the D-06 snapshot opt-in.** A `train()` that skips
-  `per_bin_gains` when snapshots aren't requested removes a whole per-feature
-  per-leaf host re-scan. Behavior-preserving for the model; verify bit-exact.
+- **R1 (DONE — low risk, but ~0% measured): make the D-06 snapshot opt-in.**
+  Implemented in quick task 260608-jpj — `train()`/`train_returning_partition()`
+  now skip the snapshot-only `per_bin_gains` re-scan; golden-replay paths
+  (`train_with_snapshots`) keep it. Bit-exact gate GREEN. **Measured wall-clock
+  win: within noise (~0%)** — `per_bin_gains` is just multiplies/divides over
+  num_bin cells, dwarfed by the histogram-construction gather. Kept for
+  correctness/cleanliness; its relative weight grows once R2 lands. **Correction
+  to the earlier "largest win" framing: R2 is the dominant cost, not R1.**
 - **R2 (large): batch/amortize the histogram backend.** Construct all features'
   histograms for a leaf in one dispatch (or keep bin data resident on-device)
   instead of one create/launch/readback per feature. Biggest structural win.
