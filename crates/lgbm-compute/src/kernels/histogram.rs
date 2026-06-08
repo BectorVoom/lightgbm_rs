@@ -30,13 +30,57 @@ use cubecl::prelude::*;
 use crate::error::ComputeError;
 use crate::runtime::ActiveRuntime;
 
-/// The single-owner ordered f64 fold (RESEARCH Pattern 1 + `dense_bin.hpp`).
+/// The single shared `#[cube]` single-owner ordered histogram fold — the SINGLE
+/// SOURCE OF TRUTH for the deterministic fold math (260608-n9j THE MERGE; the
+/// structural analog of 260608-mc5's [`crate::kernels::split::split_scan_body`]).
 ///
-/// Only `UNIT_POS == 0` executes the fold, in ascending row order, so the f64
-/// summation order is fixed and matches the C++ `num_threads=1` reference.
+/// Generic over the accumulation cell type `N: Numeric`: both the f64 cpu-anchor
+/// launch kernel ([`construct_hist_kernel`], `N = f64`) AND the f32 hip-mirror
+/// launch kernel ([`construct_hist_kernel_f32`], `N = f32`) call this helper, so
+/// the single-owner ordered fold, the `UNIT_POS == 0` ownership, the ascending
+/// row order, and the `bin<<1` stride-2 cell layout exist exactly ONCE. The ONLY
+/// difference between the two launch entry points is the `N` it is instantiated
+/// with — eliminating the prior hand-duplicated fold loop (a drift hazard).
+///
+/// Only `UNIT_POS == 0` executes the fold, in ascending row order, so the
+/// summation order is fixed and matches the C++ `num_threads=1` reference
+/// (RESEARCH Pitfall 1, D-04/D-04a).
+///
+/// Gradients/hessians are always READ as f32 (`score_t = float`); the cast
+/// `N::cast_from(grad[i])` is the accumulation widening:
+/// - For `N = f64` it is the f32→f64 widening — byte-identical to the prior
+///   `f64::cast_from(grad[i])` (the bit-exact cpu anchor, Pitfall 3).
+/// - For `N = f32` it is the identity cast — observably identical to the prior
+///   `out[ti] += grad[i]` (the ~1e-6-tolerated hip mirror, Pitfall 2/3).
+#[cube]
+fn hist_fold_body<N: Numeric>(
+    binned: &Array<u32>,
+    grad: &Array<f32>,
+    hess: &Array<f32>,
+    out: &mut Array<N>,
+) {
+    // Single-owner ordered fold — the deterministic anchor (Pitfall 1).
+    if UNIT_POS == 0 {
+        for i in 0..binned.len() {
+            // ti = bin<<1; grad cell at ti, hess cell at ti+1 (dense_bin.hpp:120).
+            // `binned[i]` is u32; widen to usize for indexing the `out` array.
+            let ti = binned[i] as usize * 2;
+            out[ti] += N::cast_from(grad[i]); // f32 read, N-cell accumulate
+            out[ti + 1] += N::cast_from(hess[i]);
+        }
+    }
+}
+
+/// The single-owner ordered f64 fold (RESEARCH Pattern 1 + `dense_bin.hpp`) — a
+/// THIN `#[cube(launch)]` wrapper that delegates to the shared generic
+/// [`hist_fold_body`] with `N = f64`. After the 260608-n9j merge this kernel
+/// holds NO fold logic of its own; the math lives once in `hist_fold_body`,
+/// shared with the f32 hip mirror.
 ///
 /// This is the **cpu anchor** path: gradients/hessians are read as f32 but
 /// summed into f64 cells (`hist_t = double`) — bit-exact vs C++ (Pitfall 3).
+/// `f64::cast_from(grad[i])` is exactly what `N::cast_from` lowers to for
+/// `N = f64`, so this is byte-identical to the pre-merge kernel.
 #[cube(launch)]
 pub fn construct_hist_kernel(
     binned: &Array<u32>,
@@ -44,25 +88,20 @@ pub fn construct_hist_kernel(
     hess: &Array<f32>,
     out: &mut Array<f64>,
 ) {
-    // Single-owner ordered fold — the deterministic anchor (Pitfall 1).
-    if UNIT_POS == 0 {
-        for i in 0..binned.len() {
-            // ti = bin<<1; grad cell at ti, hess cell at ti+1 (dense_bin.hpp:120).
-            // `binned[i]` is u32; widen to usize for indexing the f64 `out` array.
-            let ti = binned[i] as usize * 2;
-            out[ti] += f64::cast_from(grad[i]); // f32 read, f64 accumulate
-            out[ti + 1] += f64::cast_from(hess[i]);
-        }
-    }
+    hist_fold_body::<f64>(binned, grad, hess, out);
 }
 
 /// The f32-cell mirror of [`construct_hist_kernel`] for the no-f64 hip device
-/// (RESEARCH Pitfall 2/3, CMP-04). IDENTICAL fold structure and row order — the
+/// (RESEARCH Pitfall 2/3, CMP-04) — a THIN `#[cube(launch)]` wrapper that
+/// delegates to the shared generic [`hist_fold_body`] with `N = f32`. IDENTICAL
+/// fold structure and row order to the f64 kernel (they share the helper) — the
 /// ONLY difference is the accumulation cell type (`f32` instead of `f64`). hip
 /// (gfx1100) cannot allocate f64, so the histogram accumulates in f32, accepting
 /// the ~1e-6-tolerated divergence from the cpu f64 anchor (the divergence the
 /// oracle contract was designed to absorb, NOT a bug). The capability gate
 /// (`has_f64 == false`) routes the hip launch here; cpu keeps the f64 kernel.
+/// For `N = f32`, `N::cast_from(grad[i])` is the identity cast — observably
+/// identical to the pre-merge `out[ti] += grad[i]`.
 #[cube(launch)]
 pub fn construct_hist_kernel_f32(
     binned: &Array<u32>,
@@ -70,14 +109,7 @@ pub fn construct_hist_kernel_f32(
     hess: &Array<f32>,
     out: &mut Array<f32>,
 ) {
-    // SAME single-owner ordered fold, SAME row order — f32 cells only (Pitfall 3).
-    if UNIT_POS == 0 {
-        for i in 0..binned.len() {
-            let ti = binned[i] as usize * 2;
-            out[ti] += grad[i]; // f32 read, f32 accumulate (no f64 on hip)
-            out[ti + 1] += hess[i];
-        }
-    }
+    hist_fold_body::<f32>(binned, grad, hess, out);
 }
 
 /// Host-side `construct_histograms` on the cpu reference runtime.
