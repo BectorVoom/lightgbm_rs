@@ -1946,3 +1946,173 @@ fn learner_parity_cegb_tradeoff_half() {
 fn learner_parity_cegb_coupled() {
     run_constraints_cell("cegb_coupled");
 }
+
+/// 260608-p90 — resident==host tree-equivalence on the REAL hip GPU (NON-NEGOTIABLE
+/// #2). Grows the SAME pure-numeric-spine corpus (num_leaves 31) TWICE on a
+/// `RocmBackend`:
+///   - `RocmBackend::with_resident(true)`  → the device-resident chain (eligible):
+///     build→fix→compact→subtract→scan all stay on device.
+///   - `RocmBackend::with_resident(false)` → forces the HOST path (the SAME RocmBackend
+///     f32-atomic RAW build, but routed through the host read-back / host subtract /
+///     host scan).
+/// Both run the IDENTICAL f32-atomic build (the only ~1e-6 contributor); the
+/// downstream fix/compact (bit-exact, oib), subtract (exact f64), and scan (proven
+/// bit-identical, the from_handle kernel test) differ ONLY in WHERE they run. So the
+/// two grown trees must match: topology / split_feature / threshold / decision_type
+/// BIT-EXACT (via `to_string` structural fields), and leaf values within ~1e-6. If
+/// they diverge, the resident wiring changed the tree → STOP (do NOT weaken the tol).
+#[cfg(feature = "rocm")]
+mod hip {
+    use super::*;
+    use lgbm_compute::runtime::rocm_client;
+    use lgbm_compute::RocmBackend;
+
+    /// Build a deterministic pure-numeric-spine corpus: `num_features` numeric columns
+    /// over `num_data` rows, each column with `num_bin` bins (most_freq_bin 0 → offset
+    /// 1), a regression-style gradient, hessian 1.
+    #[allow(clippy::type_complexity)]
+    fn spine_corpus(
+        num_data: usize,
+        num_features: usize,
+        num_bin: u32,
+    ) -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>) {
+        let mut features = Vec::with_capacity(num_features);
+        for fi in 0..num_features {
+            // Deterministic bin assignment with a per-feature stride so columns differ.
+            let bins: Vec<u32> = (0..num_data)
+                .map(|r| (((r * 2654435761) ^ (fi * 40503) ^ (r / (fi + 1))) as u32) % num_bin)
+                .collect();
+            let upper: Vec<f64> = (0..num_bin).map(|b| b as f64 + 0.5).collect();
+            features.push(FeatureColumn {
+                bins,
+                num_bin,
+                offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+                min_bin: 0,
+                max_bin: num_bin - 1,
+                default_bin: num_bin,
+                most_freq_bin: 0,
+                missing_type: MissingType::None,
+                bin_upper_bound: upper,
+                real_feature_index: fi as i32,
+                ..Default::default()
+            });
+        }
+        // Gradient: a smooth deterministic function of the row; hessian 1 (L2).
+        let grad: Vec<f32> = (0..num_data)
+            .map(|r| ((r as f32) * 0.37).sin() * 3.0 + ((r % 7) as f32) - 3.0)
+            .collect();
+        let hess = vec![1.0f32; num_data];
+        (features, grad, hess)
+    }
+
+    fn cfg() -> GainConfig {
+        GainConfig {
+            min_data_in_leaf: 5,
+            min_sum_hessian_in_leaf: 1e-3,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn learner_parity_resident_equals_host_tree_on_hip() {
+        let client = rocm_client();
+        let (features, g, h) = spine_corpus(3000, 8, 48);
+        let num_leaves = 31i32;
+        let max_depth = -1i32;
+
+        // RESIDENT path (eligible).
+        let resident_backend = RocmBackend::with_resident(true);
+        assert!(
+            resident_backend.resident_pool_supported(),
+            "with_resident(true) must report supported"
+        );
+        let mut resident_learner =
+            SerialTreeLearner::new(&resident_backend, &client, cfg(), num_leaves, max_depth)
+                .with_features(features.clone());
+        let resident_tree = resident_learner
+            .train(&g, &h, true)
+            .expect("resident train ok");
+
+        // FORCED HOST path (same RocmBackend f32-atomic build, host routing).
+        let host_backend = RocmBackend::with_resident(false);
+        assert!(
+            !host_backend.resident_pool_supported(),
+            "with_resident(false) must report NOT supported (forces host path)"
+        );
+        let mut host_learner =
+            SerialTreeLearner::new(&host_backend, &client, cfg(), num_leaves, max_depth)
+                .with_features(features.clone());
+        let host_tree = host_learner.train(&g, &h, true).expect("host train ok");
+
+        // ---- Structural fields BIT-EXACT (topology / split_feature / decision_type) ----
+        assert_eq!(
+            resident_tree.num_leaves, host_tree.num_leaves,
+            "resident vs host: num_leaves diverged"
+        );
+        assert_eq!(
+            resident_tree.split_feature, host_tree.split_feature,
+            "resident vs host: split_feature topology diverged"
+        );
+        assert_eq!(
+            resident_tree.decision_type, host_tree.decision_type,
+            "resident vs host: decision_type diverged"
+        );
+        assert_eq!(
+            resident_tree.left_child, host_tree.left_child,
+            "resident vs host: left_child topology diverged"
+        );
+        assert_eq!(
+            resident_tree.right_child, host_tree.right_child,
+            "resident vs host: right_child topology diverged"
+        );
+        assert_eq!(
+            resident_tree.leaf_count, host_tree.leaf_count,
+            "resident vs host: leaf_count (data-partition) diverged"
+        );
+        assert_eq!(
+            resident_tree.internal_count, host_tree.internal_count,
+            "resident vs host: internal_count diverged"
+        );
+        // Thresholds are bin-indexed real upper bounds (exact f64 from the SAME bins),
+        // so the structural threshold record must be bit-exact too.
+        assert_eq!(
+            resident_tree.threshold, host_tree.threshold,
+            "resident vs host: threshold diverged"
+        );
+
+        // ---- leaf values within ~1e-6 (the f32-atomic RAW build is the only gap) ----
+        assert_eq!(
+            resident_tree.leaf_value.len(),
+            host_tree.leaf_value.len(),
+            "resident vs host: leaf_value length"
+        );
+        let tol = 1e-6f64;
+        let mut max_abs = 0.0f64;
+        for (i, (&rv, &hv)) in resident_tree
+            .leaf_value
+            .iter()
+            .zip(host_tree.leaf_value.iter())
+            .enumerate()
+        {
+            let d = (rv - hv).abs();
+            max_abs = max_abs.max(d);
+            // Relative-tolerant absolute check (the ~1e-6 ROCm contract).
+            let denom = hv.abs().max(1.0);
+            assert!(
+                d / denom <= tol || d <= tol,
+                "resident vs host leaf {i}: resident={rv} host={hv} abs_diff={d} > {tol} \
+                 — the resident chain changed the tree (DO NOT weaken; investigate)"
+            );
+        }
+        eprintln!(
+            "resident==host tree equivalence: {} leaves, max_abs leaf diff = {max_abs:.3e} \
+             (within ~1e-6 ROCm contract)",
+            resident_tree.leaf_value.len()
+        );
+    }
+}

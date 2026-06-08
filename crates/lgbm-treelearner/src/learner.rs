@@ -1358,23 +1358,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         //
         // 260608-p90: when resident-eligible, build the SMALLER (directly-built / root)
         // leaf's histogram DEVICE-RESIDENT (build→fix→compact stays on device) into the
-        // mirror's `smaller_slot`, and scan it from that Handle. T1 ALSO builds the host
-        // buffer (the transitional double-build, plan (b)) so the host subtract for the
-        // larger child still has its operands; T2 removes the host build once subtract
-        // is resident. `None` (ineligible / CpuBackend) is the byte-unchanged host path.
+        // mirror's `smaller_slot`, and scan it from that Handle. T2: NO host build on the
+        // eligible path — subtract is now resident (reads the device Handle), so the host
+        // pool buffer is never needed (the T1 transitional double-build is removed). The
+        // host pool slot is left as-is (zeroed/stale); it is not read on the eligible spine
+        // path (the spine pulls SplitInfos from the resident scan; categorical/monotone/
+        // extra-trees inline branches are unreachable when eligible; capture_snapshots is
+        // off). `None` (ineligible / CpuBackend) is the byte-unchanged host path.
         let smaller_resident_slot = if self.resident_eligible {
-            // Transitional host build (T1→T2): keeps the host pool slot populated for
-            // the host larger-child subtract. REMOVED in T2 (subtract goes resident).
-            self.build_leaf_histogram_into(
-                features,
-                gradients,
-                hessians,
-                data_partition,
-                slot_off,
-                smaller_leaf,
-                smaller_splits,
-                pool.buffer_mut(smaller_slot),
-            );
             self.build_resident_leaf_into(
                 features,
                 gradients,
@@ -1419,7 +1410,45 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut larger_records: Vec<FeatureSplitRecord> = Vec::new();
         if larger_leaf >= 0 {
             let larger_slot = larger_slot.expect("non-root larger child must hold a pool slot");
-            if let Some(parent_slot) = parent_slot {
+            // 260608-p90 T2: when resident-eligible AND a parent was retained, derive the
+            // larger child RESIDENT — `parent_slot` Handle − `smaller_slot` Handle →
+            // `larger_slot` Handle, on device, NO read-back. The device mirror is keyed by
+            // SLOT id and `pool.move_` preserves slot ids (larger_slot == parent_slot;
+            // see the slot-dance assertion), so the parent's resident Handle is already at
+            // `parent_slot` and no device move is needed (move_resident would be a no-op
+            // for a slot-id-keyed mirror; the host move_ only rewires leaf→slot). The
+            // derived larger child is NOT re-FixHistogram'd (non-negotiable #3).
+            let larger_resident_slot = if self.resident_eligible {
+                if let Some(parent_slot) = parent_slot {
+                    debug_assert_eq!(
+                        larger_slot, parent_slot,
+                        "the larger child reuses the moved parent slot (slot-id stable)"
+                    );
+                    self.backend.subtract_resident(
+                        self.client,
+                        parent_slot,
+                        smaller_slot,
+                        larger_slot,
+                        pool.hist_len(),
+                    )?;
+                } else {
+                    // No parent retained (cannot happen post-root in the spine) — build
+                    // the larger child resident directly into its slot.
+                    self.build_resident_leaf_into(
+                        features,
+                        gradients,
+                        hessians,
+                        data_partition,
+                        slot_off,
+                        pool.hist_len(),
+                        larger_slot,
+                        larger_leaf,
+                        larger_splits,
+                    )?;
+                }
+                Some(larger_slot)
+            } else if let Some(parent_slot) = parent_slot {
+                // ---- HOST path (ineligible / CpuBackend) — byte-unchanged. ----
                 // use_subtract: larger = parent − smaller over the WHOLE concatenated
                 // compacted buffer (FeatureHistogram::Subtract, feature_histogram.hpp:
                 // 140-144 — `larger_data_[i] -= smaller_data_[i]` per compacted cell).
@@ -1437,7 +1466,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     .subtract_histograms(self.client, &parent_buf, &smaller_buf)?;
                 // TEST audit hook (T-05-07-01): record (derived, direct) so a parity
                 // test can assert the subtracted larger child == a direct build of its
-                // own rows, cell-for-cell, in the LIVE growth path.
+                // own rows, cell-for-cell, in the LIVE growth path. Host-path only (the
+                // resident eligible path is inert here — audit is a non-spine diagnostic).
                 if let Some(audit) = self.subtract_audit.as_ref() {
                     let mut direct = vec![0.0f64; derived.len()];
                     self.build_leaf_histogram_into(
@@ -1453,6 +1483,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     audit.borrow_mut().push((derived.clone(), direct));
                 }
                 pool.buffer_mut(larger_slot).copy_from_slice(&derived);
+                None
             } else {
                 // No parent retained (cannot happen post-root in the current spine,
                 // but kept faithful to the C++ `else` direct-build branch): build the
@@ -1467,10 +1498,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     larger_splits,
                     pool.buffer_mut(larger_slot),
                 );
-            }
-            // T1: the LARGER (subtract-derived) child STILL uses the host path
-            // (subtract on host, scan host buf) — `None` resident slot. T2 makes this
-            // resident (subtract_resident → scan_resident_leaf).
+                None
+            };
             larger_records = self.scan_leaf_histogram(
                 features,
                 slot_off,
@@ -1482,7 +1511,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 larger_node_mask.as_deref(),
                 data_partition,
                 parent_splittable.as_deref(),
-                None,
+                larger_resident_slot,
             )?;
         }
         let _ = use_subtract; // recorded for clarity; the parent_slot Option drives it
