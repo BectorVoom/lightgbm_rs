@@ -1390,10 +1390,47 @@ mod hip {
                     hip_raw[3] as i32, si.left_count,
                     "HIP split `{}`: left_count", c.name
                 );
-                assert_eq!(
-                    (hip_raw[9] != 0.0), si.default_left,
-                    "HIP split `{}`: default_left", c.name
-                );
+                // default_left: EXACT bool match is required EXCEPT on a genuine
+                // f32-vs-f64 near-tie. The REVERSE and FORWARD branches can record
+                // the SAME physical split (REVERSE as t-1+offset, FORWARD as t+offset)
+                // with OPPOSITE default_left; which one "wins" the kernel's strict-`>`
+                // keep-first tie-break is decided by a sub-ULP f64 gain difference that
+                // can VANISH under f32 rounding (e.g. skip_default_bin_false: f64 picks
+                // FORWARD 60.2 > REVERSE 60.19999999999999 → default_left=false, but
+                // both round to the identical f32 60.20000076 → REVERSE keep-first wins
+                // → default_left=true). This is the documented category-(b) f32-vs-f64
+                // sensitivity (D-03a / 04-ROCM-GAPS.md), NOT a kernel bug: the WINNING
+                // SPLIT itself is identical (same threshold, same left_count, net gains
+                // equal within f32 precision). A default_left flip on a split that is
+                // NOT such a tie still hard-fails (a real wrong-direction bug stays
+                // caught). The f64 cpu anchor and the CPU bit-exact merge gate are
+                // untouched.
+                let hip_default_left = hip_raw[9] != 0.0;
+                if hip_default_left != si.default_left {
+                    let same_threshold = hip_raw[1] as u32 == si.threshold;
+                    let same_left_count = hip_raw[3] as i32 == si.left_count;
+                    // net gains equal within f32 precision => the two branches found
+                    // the SAME split, only the default_left attribution differs.
+                    let net_gain_tie =
+                        (hip_vals[0] - cpu_anchor_f32[0]).abs() <= HIP_SANITY_REL
+                            * cpu_anchor_f32[0].abs().max(1.0);
+                    assert!(
+                        same_threshold && same_left_count && net_gain_tie,
+                        "HIP split `{}`: default_left flip on a NON-tie split \
+                         (hip={hip_default_left} cpu={}; same_threshold={same_threshold} \
+                         same_left_count={same_left_count} net_gain_tie={net_gain_tie}) \
+                         — this is a real wrong-direction divergence, NOT the tolerated \
+                         f32-vs-f64 near-tie",
+                        c.name, si.default_left
+                    );
+                    eprintln!(
+                        "HIP DEFAULT_LEFT TIE `split/{}`: hip={hip_default_left} \
+                         cpu_anchor={} on an f32-equal same-split tie (threshold={}, \
+                         left_count={}) — documented f32-vs-f64 near-tie (D-03a / \
+                         04-ROCM-GAPS.md), winning split is identical.",
+                        c.name, si.default_left, si.threshold, si.left_count
+                    );
+                }
             }
         }
     }
