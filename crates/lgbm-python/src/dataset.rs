@@ -125,20 +125,22 @@ impl Dataset {
         label: PyReadonlyArray1<'_, f64>,
         categorical_feature: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        let (rows, _names, cat_indices) = polars_df_to_corpus(df, categorical_feature)?;
+        // O1: polars marshals into COLUMN-major data (the natural Arrow layout) and
+        // we store it column-major verbatim — no col→row→col double transpose.
+        let (columns, _names, cat_indices) = polars_df_to_corpus(df, categorical_feature)?;
         let labels = numpy_labels_to_f32(&label)?;
-        Self::from_rows_with_categorical(rows, labels, cat_indices)
+        Self::from_columns_with_categorical(columns, labels, cat_indices)
     }
 
     /// Number of rows in the dataset (mirrors `Dataset.num_data()`).
     fn num_data(&self) -> usize {
-        self.corpus.features.len()
+        self.corpus.num_data()
     }
 
     /// Number of features (columns) in the dataset (mirrors
     /// `Dataset.num_feature()`).
     fn num_feature(&self) -> usize {
-        self.corpus.features.first().map_or(0, Vec::len)
+        self.corpus.num_features()
     }
 }
 
@@ -160,23 +162,24 @@ impl Dataset {
         })
     }
 
-    /// Constructor tail for the polars path: same boundary validation as
-    /// [`Dataset::from_rows`], then set `categorical_features` so
-    /// `build_feature_columns_from_raw` routes those columns through
-    /// `find_bin_categorical` (D-04).
-    fn from_rows_with_categorical(
-        rows: Vec<Vec<f64>>,
+    /// Constructor tail for the polars/Arrow path: takes COLUMN-major `columns`
+    /// (`columns[j]` = feature `j`'s per-row values, as produced by
+    /// `polars_df_to_corpus`) and stores them column-major with NO transpose (O1).
+    /// Validates `label.len() == num_rows` and rectangularity at the boundary
+    /// (Security V5, T-08-03-01) BEFORE building the corpus; never panics.
+    fn from_columns_with_categorical(
+        columns: Vec<Vec<f64>>,
         labels: Vec<f32>,
         categorical_indices: Vec<usize>,
     ) -> PyResult<Self> {
-        if labels.len() != rows.len() {
+        let num_rows = columns.first().map_or(0, Vec::len);
+        if labels.len() != num_rows {
             return Err(PyValueError::new_err(format!(
-                "label length {} != number of data rows {}",
-                labels.len(),
-                rows.len()
+                "label length {} != number of data rows {num_rows}",
+                labels.len()
             )));
         }
-        let mut corpus = RawCorpus::new(rows, labels);
+        let mut corpus = RawCorpus::from_columns(columns, labels);
         corpus.categorical_features = categorical_indices;
         Ok(Dataset { corpus })
     }

@@ -307,14 +307,16 @@ fn column_feature_values(s: &Series, name: &str, as_categorical: bool) -> PyResu
     }
 }
 
-/// The owned parts a polars DataFrame marshals into: row-major f64 feature rows,
-/// the column (feature) names, and the indices routed to categorical features.
+/// The owned parts a polars DataFrame marshals into: COLUMN-major f64 feature
+/// columns (`columns[j]` = feature `j`'s per-row values), the column (feature)
+/// names, and the indices routed to categorical features.
 pub type CorpusParts = (Vec<Vec<f64>>, Vec<String>, Vec<usize>);
 
 /// Marshal a polars DataFrame (consumed Arrow-side in Rust via pyo3-polars — NO
 /// numpy round-trip, which would erase the Categorical/Enum dtype) into the owned
-/// f64 rows + feature names + categorical-feature index set that build a
-/// [`lgbm::RawCorpus`] (D-03/D-04).
+/// COLUMN-major f64 columns + feature names + categorical-feature index set that
+/// build a [`lgbm::RawCorpus`] (via `RawCorpus::from_columns`, D-03/D-04). The
+/// columns are returned in the source's natural Arrow layout — NO transpose (O1).
 ///
 /// Routing (D-04): with `categorical_override = None` (the default `'auto'`),
 /// `Categorical`/`Enum`/`String` columns are categorical and numeric columns are
@@ -386,12 +388,10 @@ pub fn polars_df_to_corpus(
         col_data.push(values);
     }
 
-    // Transpose column-major -> the row-major rows the facade consumes.
-    let mut rows: Vec<Vec<f64>> = vec![Vec::with_capacity(ncols); nrows];
-    for col in &col_data {
-        for (i, &v) in col.iter().enumerate() {
-            rows[i].push(v);
-        }
-    }
-    Ok((rows, names, cat_indices))
+    // O1: return the COLUMN-major data verbatim. The Arrow source is already
+    // columnar and the facade's `RawCorpus::from_columns` stores it column-major,
+    // so the old col→row transpose here (followed by a row→col transpose inside
+    // `build_feature_columns_from_raw`) is eliminated — binning reads each feature
+    // as a contiguous slice with no round trip.
+    Ok((col_data, names, cat_indices))
 }

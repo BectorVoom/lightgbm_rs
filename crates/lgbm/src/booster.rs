@@ -252,8 +252,18 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
 /// raw→bin→train path reproduces the identity-bin / C++ golden output.
 #[derive(Debug, Clone)]
 pub struct RawCorpus {
-    /// Row-major RAW feature values, `num_data` rows × `num_features` columns.
-    pub features: Vec<Vec<f64>>,
+    /// COLUMN-MAJOR flat RAW feature values (O1/O2): `value(row, col)` lives at
+    /// `col_major[col * num_rows + row]`. Was a row-major `Vec<Vec<f64>>` before
+    /// O1/O2 — flattened + transposed so the Python/Arrow ingest writes columns
+    /// directly ([`from_columns`](RawCorpus::from_columns)) and binning reads each
+    /// feature as a contiguous slice ([`column`](RawCorpus::column)), eliminating
+    /// the old col→row→col double transpose. Private: access via the methods so the
+    /// `col_major.len() == num_rows * num_cols` rectangularity invariant holds.
+    col_major: Vec<f64>,
+    /// Number of rows (`num_data`).
+    num_rows: usize,
+    /// Number of features (columns).
+    num_cols: usize,
     /// Per-row labels (length `num_data`).
     pub labels: Vec<f32>,
     /// Real-feature indices (columns) to bin as CATEGORICAL via
@@ -266,16 +276,106 @@ pub struct RawCorpus {
 }
 
 impl RawCorpus {
-    /// Construct a `RawCorpus` of all-numeric features with the default binning
-    /// [`Config`]. Use the struct literal directly to set `categorical_features`
-    /// or a custom `config`.
-    pub fn new(features: Vec<Vec<f64>>, labels: Vec<f32>) -> Self {
+    /// Construct from ROW-MAJOR `rows` (`num_data` rows × `num_features` cols) — the
+    /// numpy-dense / scipy-CSR / scipy-CSC ingest paths, which produce row-major
+    /// data. Transposes into the column-major store ONCE here (the single transpose
+    /// those row-major inputs require; it replaces the old per-column gather inside
+    /// [`build_feature_columns_from_raw`]). All-numeric, default [`Config`]; set
+    /// `categorical_features` / `config` on the returned value.
+    ///
+    /// A RAGGED `rows` (rows of differing length) leaves `col_major` empty so the
+    /// `col_major.len() == num_rows * num_cols` invariant fails and
+    /// [`build_feature_columns_from_raw`] surfaces a typed
+    /// [`LgbmError::InvalidCorpus`] (never panics — T-08-01-01).
+    pub fn new(rows: Vec<Vec<f64>>, labels: Vec<f32>) -> Self {
+        let num_rows = rows.len();
+        let num_cols = rows.first().map_or(0, Vec::len);
+        let rectangular = rows.iter().all(|r| r.len() == num_cols);
+        let col_major = if rectangular {
+            let mut cm = vec![0.0f64; num_rows * num_cols];
+            for (i, row) in rows.iter().enumerate() {
+                for (j, &v) in row.iter().enumerate() {
+                    cm[j * num_rows + i] = v;
+                }
+            }
+            cm
+        } else {
+            // Sentinel: empty buffer with non-zero dims ⇒ invariant fails ⇒ ragged
+            // surfaces as a typed error in build_feature_columns_from_raw.
+            Vec::new()
+        };
         Self {
-            features,
+            col_major,
+            num_rows,
+            num_cols,
             labels,
             categorical_features: Vec::new(),
             config: Config::default(),
         }
+    }
+
+    /// Construct directly from COLUMN-MAJOR `columns` (`columns[j]` = feature `j`'s
+    /// per-row values) — the polars/Arrow ingest path, where the source is already
+    /// columnar. Stores the columns VERBATIM with NO transpose (O1). All columns
+    /// must have the same length (= `num_rows`); a mismatch leaves the invariant
+    /// failing so [`build_feature_columns_from_raw`] returns a typed error.
+    /// All-numeric, default [`Config`]; set `categorical_features` / `config` after.
+    pub fn from_columns(columns: Vec<Vec<f64>>, labels: Vec<f32>) -> Self {
+        let num_cols = columns.len();
+        let num_rows = columns.first().map_or(0, Vec::len);
+        let rectangular = columns.iter().all(|c| c.len() == num_rows);
+        let mut col_major = Vec::with_capacity(num_rows * num_cols);
+        if rectangular {
+            for col in &columns {
+                col_major.extend_from_slice(col);
+            }
+        }
+        Self {
+            col_major,
+            num_rows,
+            num_cols,
+            labels,
+            categorical_features: Vec::new(),
+            config: Config::default(),
+        }
+    }
+
+    /// Number of rows (`num_data`).
+    pub fn num_data(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Number of features (columns).
+    pub fn num_features(&self) -> usize {
+        self.num_cols
+    }
+
+    /// `true` when the flat store is rectangular (`col_major.len() == rows*cols`).
+    /// `false` flags a ragged/mismatched construction (see [`new`](RawCorpus::new)).
+    fn is_rectangular(&self) -> bool {
+        self.col_major.len() == self.num_rows * self.num_cols
+    }
+
+    /// Contiguous slice of feature column `j` (O2: binning reads this directly with
+    /// no per-row gather). Caller must ensure rectangularity (checked upstream in
+    /// [`build_feature_columns_from_raw`]).
+    pub fn column(&self, j: usize) -> &[f64] {
+        let start = j * self.num_rows;
+        &self.col_major[start..start + self.num_rows]
+    }
+
+    /// Value at (`row`, `col`).
+    pub fn value(&self, row: usize, col: usize) -> f64 {
+        self.col_major[col * self.num_rows + row]
+    }
+
+    /// Materialise the row-major `Vec<Vec<f64>>` view (the col→row transpose) for
+    /// the few consumers that still want rows (e.g. batch predict in tests/benches).
+    /// NOT on the ingest hot path — kept off it deliberately.
+    pub fn to_rows(&self) -> Vec<Vec<f64>> {
+        (0..self.num_rows)
+            .map(|i| (0..self.num_cols).map(|j| self.value(i, j)).collect())
+            .collect()
     }
 }
 
@@ -300,13 +400,13 @@ pub fn build_feature_columns_from_raw(
     corpus: &RawCorpus,
 ) -> Result<Vec<FeatureColumn>, LgbmError> {
     // ---- shape validation BEFORE any binning / indexing (T-08-01-01) ----
-    let num_data = corpus.features.len();
+    let num_data = corpus.num_data();
     if num_data == 0 {
         return Err(LgbmError::InvalidCorpus {
             detail: "empty corpus (no rows)".into(),
         });
     }
-    let num_features = corpus.features[0].len();
+    let num_features = corpus.num_features();
     if num_features == 0 {
         return Err(LgbmError::InvalidCorpus {
             detail: "corpus row 0 has no features".into(),
@@ -320,12 +420,17 @@ pub fn build_feature_columns_from_raw(
             ),
         });
     }
-    for (i, row) in corpus.features.iter().enumerate() {
-        if row.len() != num_features {
-            return Err(LgbmError::InvalidCorpus {
-                detail: format!("row {i} has {} cols, expected {num_features}", row.len()),
-            });
-        }
+    // Rectangularity: a ragged/mismatched construction leaves the flat store sized
+    // wrong (col_major.len() != num_data*num_features). Mirrors the old per-row
+    // length CHECK; surfaces as a typed error, never a panic in column()/value().
+    if !corpus.is_rectangular() {
+        return Err(LgbmError::InvalidCorpus {
+            detail: format!(
+                "ragged corpus: feature store has {} values, expected num_data*num_features = {}",
+                corpus.col_major.len(),
+                num_data * num_features
+            ),
+        });
     }
     for &c in &corpus.categorical_features {
         if c >= num_features {
@@ -344,13 +449,14 @@ pub fn build_feature_columns_from_raw(
     let pre_filter = false;
     let mut columns = Vec::with_capacity(num_features);
     for j in 0..num_features {
-        // Gather the raw column (f64).
-        let column: Vec<f64> = corpus.features.iter().map(|row| row[j]).collect();
+        // Read the raw column as a CONTIGUOUS slice (O2 — no per-row gather; the
+        // column-major store already lays feature j out contiguously).
+        let column: &[f64] = corpus.column(j);
 
         // Build the per-column BinMapper (Route A).
         let mapper: BinMapper = if corpus.categorical_features.contains(&j) {
             BinMapper::find_bin_categorical(
-                column.clone(),
+                column.to_vec(),
                 cfg.max_bin,
                 cfg.min_data_in_bin,
                 cfg.min_data_in_leaf,
@@ -361,7 +467,7 @@ pub fn build_feature_columns_from_raw(
             )
         } else {
             BinMapper::find_bin_from_column(
-                &column,
+                column,
                 cfg.max_bin,
                 cfg.min_data_in_bin,
                 cfg.min_data_in_leaf,
@@ -414,9 +520,10 @@ pub fn build_feature_columns_from_raw(
 pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmError> {
     let first = config.objective.split_whitespace().next().unwrap_or("");
     // Resolve the objective over a thin DenseCorpus view (labels only are used by
-    // resolve_objective's label guards; the features are not re-binned there).
+    // resolve_objective's label guards; the features are NOT read there, so the
+    // view carries an empty feature matrix — no col→row transpose).
     let label_view = DenseCorpus {
-        features: corpus.features.clone(),
+        features: Vec::new(),
         labels: corpus.labels.clone(),
     };
     let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
@@ -424,7 +531,8 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
     let features = build_feature_columns_from_raw(corpus)?;
     train_inner_columns(
         config,
-        &corpus.features,
+        corpus.num_data() as i32,
+        feature_infos_from_columns(corpus),
         &corpus.labels,
         features,
         boost_obj,
@@ -798,7 +906,8 @@ where
     let features = build_feature_columns_from_raw(corpus)?;
     train_inner_columns(
         config,
-        &corpus.features,
+        corpus.num_data() as i32,
+        feature_infos_from_columns(corpus),
         &corpus.labels,
         features,
         BoostObjective::Custom(custom),
@@ -839,9 +948,12 @@ fn train_inner_full(
     // corpus, then delegates to the shared column-based driver. The raw→bin→train
     // path (train_raw) supplies pre-binned columns to `train_inner_columns` directly.
     let features = build_feature_columns(corpus)?;
+    let num_features = features.len();
+    let feature_infos = feature_infos_from_rows(&corpus.features, num_features);
     train_inner_columns_full(
         config,
-        &corpus.features,
+        corpus.features.len() as i32,
+        feature_infos,
         &corpus.labels,
         valid,
         features,
@@ -858,7 +970,8 @@ fn train_inner_full(
 #[allow(clippy::too_many_arguments)]
 fn train_inner_columns(
     config: &Config,
-    feature_rows: &[Vec<f64>],
+    num_data: i32,
+    feature_infos: String,
     corpus_labels: &[f32],
     features: Vec<FeatureColumn>,
     boost_obj: BoostObjective<'_>,
@@ -867,7 +980,8 @@ fn train_inner_columns(
 ) -> Result<Booster, LgbmError> {
     train_inner_columns_full(
         config,
-        feature_rows,
+        num_data,
+        feature_infos,
         corpus_labels,
         None,
         features,
@@ -877,14 +991,17 @@ fn train_inner_columns(
     )
 }
 
-/// The full column-based training driver: takes the raw feature rows (for the
-/// valid-score predict + feature_infos), the corpus labels (for metric eval), and
-/// the PRE-BUILT feature columns (identity-binned OR `BinMapper`-binned). All
-/// binning happens BEFORE this is called.
+/// The full column-based training driver: takes `num_data` and the precomputed
+/// per-feature `feature_infos` string (the caller derives these from its own
+/// representation — row-major for the [`DenseCorpus`] spine, column-major for the
+/// [`RawCorpus`] path), the corpus labels (for metric eval), and the PRE-BUILT
+/// feature columns (identity-binned OR `BinMapper`-binned). All binning happens
+/// BEFORE this is called.
 #[allow(clippy::too_many_arguments)]
 fn train_inner_columns_full(
     config: &Config,
-    feature_rows: &[Vec<f64>],
+    num_data: i32,
+    feature_infos: String,
     corpus_labels: &[f32],
     valid: Option<&DenseCorpus>,
     features: Vec<FeatureColumn>,
@@ -899,7 +1016,8 @@ fn train_inner_columns_full(
         .unwrap_or(ObjectiveKind::Regression { sqrt: false });
 
     // ---- feature columns (pre-built by the caller) ----
-    let num_data = feature_rows.len() as i32;
+    // num_data + feature_infos are supplied by the caller (derived from its own
+    // row-major / column-major store) — this driver no longer holds raw feature rows.
     let num_class = config.num_class.max(1);
     let num_features = features.len();
     let max_feature_idx = features
@@ -1244,7 +1362,7 @@ fn train_inner_columns_full(
         objective_string,
         max_feature_idx,
         feature_names(num_features),
-        feature_infos_from_rows(feature_rows, num_features),
+        feature_infos,
     );
 
     Ok(Booster {
@@ -1337,6 +1455,25 @@ fn feature_infos_from_rows(feature_rows: &[Vec<f64>], num_features: usize) -> St
             for row in feature_rows {
                 min = min.min(row[j]);
                 max = max.max(row[j]);
+            }
+            format!("[{}:{}]", fmt_bound(min), fmt_bound(max))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Column-major twin of [`feature_infos_from_rows`] for the [`RawCorpus`] path.
+/// Reads each feature as a contiguous slice; produces BYTE-IDENTICAL output to the
+/// row-major version for the same data (same per-feature min/max, same formatting) —
+/// the model-text `feature_infos` line is parity-checked, so this must not differ.
+fn feature_infos_from_columns(corpus: &RawCorpus) -> String {
+    (0..corpus.num_features())
+        .map(|j| {
+            let mut min = f64::INFINITY;
+            let mut max = f64::NEG_INFINITY;
+            for &v in corpus.column(j) {
+                min = min.min(v);
+                max = max.max(v);
             }
             format!("[{}:{}]", fmt_bound(min), fmt_bound(max))
         })
@@ -1777,11 +1914,10 @@ mod tests {
         // produce the SAME bin indices + num_bin as build_feature_columns.
         let corpus = spine_corpus();
         let identity = build_feature_columns(&corpus).expect("identity ok");
-        let raw = RawCorpus {
-            features: corpus.features.clone(),
-            labels: corpus.labels.clone(),
-            categorical_features: Vec::new(),
-            config: det_config("regression"),
+        let raw = {
+            let mut r = RawCorpus::new(corpus.features.clone(), corpus.labels.clone());
+            r.config = det_config("regression");
+            r
         };
         let bridged = build_feature_columns_from_raw(&raw).expect("raw ok");
         assert_eq!(identity.len(), bridged.len());
@@ -1804,11 +1940,10 @@ mod tests {
         let cfg = det_config("regression");
         let corpus = spine_corpus();
         let id_booster = train(&cfg, &corpus).expect("identity train");
-        let raw = RawCorpus {
-            features: corpus.features.clone(),
-            labels: corpus.labels.clone(),
-            categorical_features: Vec::new(),
-            config: cfg.clone(),
+        let raw = {
+            let mut r = RawCorpus::new(corpus.features.clone(), corpus.labels.clone());
+            r.config = cfg.clone();
+            r
         };
         let raw_booster = train_raw(&cfg, &raw).expect("raw train");
         // Leaf values bit-exact across all trees.
@@ -1849,11 +1984,10 @@ mod tests {
         let labels = vec![
             2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
         ];
-        let raw = RawCorpus {
-            features: features.clone(),
-            labels,
-            categorical_features: Vec::new(),
-            config: cfg.clone(),
+        let raw = {
+            let mut r = RawCorpus::new(features.clone(), labels);
+            r.config = cfg.clone();
+            r
         };
         let booster = train_raw(&cfg, &raw).expect("raw real train");
         assert_eq!(booster.model().num_iteration(), 10);
@@ -1884,11 +2018,11 @@ mod tests {
             Err(LgbmError::InvalidCorpus { .. })
         ));
         // out-of-range categorical index
-        let bad_cat = RawCorpus {
-            features: vec![vec![0.0], vec![1.0]],
-            labels: vec![1.0, 2.0],
-            categorical_features: vec![5],
-            config: cfg,
+        let bad_cat = {
+            let mut r = RawCorpus::new(vec![vec![0.0], vec![1.0]], vec![1.0, 2.0]);
+            r.categorical_features = vec![5];
+            r.config = cfg;
+            r
         };
         assert!(matches!(
             build_feature_columns_from_raw(&bad_cat),

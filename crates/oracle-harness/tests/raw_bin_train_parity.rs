@@ -84,11 +84,10 @@ fn raw_bin_train_matches_identity_bin() {
     let id_booster = train(&cfg, &corpus).expect("identity train ok");
 
     // Raw→bin→train path (RawCorpus, binned internally by the BinMapper).
-    let raw = RawCorpus {
-        features: corpus.features.clone(),
-        labels: corpus.labels.clone(),
-        categorical_features: Vec::new(),
-        config: cfg.clone(),
+    let raw = {
+        let mut r = RawCorpus::new(corpus.features.clone(), corpus.labels.clone());
+        r.config = cfg.clone();
+        r
     };
     let raw_booster = train_raw(&cfg, &raw).expect("raw train ok");
 
@@ -136,11 +135,10 @@ fn raw_bin_train_matches_cpp_golden() {
     let labels = vec![
         2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
     ];
-    let raw = RawCorpus {
-        features: features.clone(),
-        labels,
-        categorical_features: Vec::new(),
-        config: cfg.clone(),
+    let raw = {
+        let mut r = RawCorpus::new(features.clone(), labels);
+        r.config = cfg.clone();
+        r
     };
     let booster = train_raw(&cfg, &raw).expect("raw real-value train ok");
 
