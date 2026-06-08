@@ -1101,6 +1101,20 @@ fn train_inner_columns_full(
         let snap: IterSnapshot = gbdt
             .train_one_iter(&mut learner, &labels, num_features)
             .map_err(LgbmError::Boosting)?;
+
+        // DEF-07-13-01: a NON-FIRST no-split bagged round is POPPED by
+        // `train_one_iter` (C++ gbdt.cpp:440-447): no tree emitted, `self.iter` not
+        // advanced, score unchanged. Mirror the wheel/`lgb.train` driver: do NOT count
+        // it as an emitted iteration. Skip the per-iter score/grad-hess accumulation
+        // (a duplicate `snap.score` push would mis-align `iter_scores` with the emitted
+        // trees and corrupt the L2 per-iter golden), skip metric eval (no score
+        // change), and leave `ran_iters` / the eval cadence to the NEXT real round.
+        // The bag re-draws on the next round (`bagging_freq=1` re-bags every call) so
+        // the loop still grows the target tree count over `total_iters` boost rounds.
+        if !snap.emitted {
+            continue;
+        }
+
         ran_iters = it + 1;
         iter_scores.push(snap.score.clone());
         iter_grad_hess.push((snap.gradients.clone(), snap.hessians.clone()));

@@ -247,6 +247,17 @@ pub struct IterSnapshot {
     /// The full f64 score buffer AFTER this iteration's `UpdateScore`
     /// (class-major). This is the L2 per-iter accumulated-score golden.
     pub score: Vec<f64>,
+    /// Whether this boost round EMITTED a tree set and advanced the iteration
+    /// counter. `false` on a NON-FIRST no-split bagged round that C++
+    /// `GBDT::TrainOneIter` POPS (gbdt.cpp:440-446, the `!should_continue` path):
+    /// the would-be 1-leaf constant tree(s) are discarded, `self.iter` is NOT
+    /// advanced, and the next boost round re-bags (fresh RNG draw) and retries.
+    /// On such a round no tree was added and `score` is the UNCHANGED pre-round
+    /// score; the driver must NOT count it as an emitted iteration (no duplicate
+    /// `iter_scores` push, no `iter_grad_hess` push). On the FIRST iteration C++
+    /// KEEPS the no-split constant baseline (e.g. `regression_l1_bag1` Tree=0) and
+    /// advances, so `emitted` is `true` there.
+    pub emitted: bool,
 }
 
 impl<'a> Gbdt<'a> {
@@ -625,6 +636,16 @@ impl<'a> Gbdt<'a> {
         };
 
         // ---- (4) per-class tree loop ----
+        // C++ `GBDT::TrainOneIter` `should_continue` (gbdt.cpp:386/407): set true the
+        // moment ANY class's grown tree has `num_leaves > 1`. If NO class splits this
+        // round, C++ POPS this round's pushed trees (when there were already trees —
+        // i.e. NOT the first iteration) and does NOT advance `iter_` (gbdt.cpp:440-446).
+        let mut should_continue = false;
+        // `models_.size()` BEFORE this round's pushes (gbdt.cpp:402/421/442). The
+        // first iteration has `tree_count_before == 0`; the C++ pop guard
+        // `models_.size() > num_tree_per_iteration_` (= `tree_count_before > 0` after
+        // pushing K) keeps the first-iteration no-split constant baseline.
+        let tree_count_before = self.trees.len();
         for cur_tree_id in 0..k {
             let offset = (cur_tree_id as usize) * nd;
 
@@ -666,6 +687,9 @@ impl<'a> Gbdt<'a> {
                     is_first_tree,
                 )?;
                 if tree.num_leaves > 1 {
+                    // A real split this class → C++ `should_continue = true`
+                    // (gbdt.cpp:407): this round emits trees and advances `iter_`.
+                    should_continue = true;
                     // RenewTreeOutput on the SUBSET path (WR-03 fix, mirrors C++
                     // serial_tree_learner.cpp:920-958 + gbdt.cpp:430): no-op for L2
                     // (IsRenewTreeOutput()==false), ACTIVE for regression_l1.
@@ -773,6 +797,9 @@ impl<'a> Gbdt<'a> {
                 learner.train_returning_partition(grad, hess, is_first_tree)?;
 
             if tree.num_leaves > 1 {
+                // A real split this class → C++ `should_continue = true`
+                // (gbdt.cpp:407): this round emits trees and advances `iter_`.
+                should_continue = true;
                 // RenewTreeOutput: no-op for L2 (IsRenewTreeOutput()==false), active
                 // for regression_l1 — overwrite each leaf's output with the median
                 // RESIDUAL (`label[row] - train_score[offset+row]`) of its rows
@@ -829,6 +856,41 @@ impl<'a> Gbdt<'a> {
             }
         }
 
+        // ---- (4b) C++ `!should_continue` POP (gbdt.cpp:440-447) ----
+        // When NO class split this round (`should_continue == false`, every grown tree
+        // was a 1-leaf no-split), C++ `GBDT::TrainOneIter`:
+        //   - warns "Stopped training because there are no more leaves",
+        //   - if `models_.size() > num_tree_per_iteration_` (i.e. there were ALREADY
+        //     trees before this round — a NON-FIRST iteration) POPS this round's K
+        //     pushed constants, and
+        //   - `return true` WITHOUT `++iter_`.
+        // The Python-wheel / `lgb.train` driver then re-bags (fresh RNG draw) on the
+        // next boost round (`bagging_freq=1` re-bags every call regardless of `iter_`;
+        // the discarded round's bag draw already advanced the RNG so the next round
+        // draws the NEXT bag — the C++-faithful cadence) and grows a real tree. This
+        // is the DEF-07-13-01 fix: it closes the quantile_bag1_es0_bfa0 12→10-tree
+        // structural divergence WITHOUT touching the bagging draw, the learner, the
+        // histogram, or RenewTreeOutput (all verified bit-exact).
+        //
+        // The FIRST iteration (`tree_count_before == 0`, mirroring C++
+        // `models_.size() <= num_tree_per_iteration_`) is NOT popped: its no-split
+        // constant baseline is KEPT and the counter ADVANCES, leaving
+        // `regression_l1_bag1` Tree=0 and the first-iter-constant unit tests
+        // byte-unchanged. The pop is isolated to LATER no-split rounds.
+        if !should_continue && tree_count_before > 0 {
+            // Discard this round's pushed constant(s); do NOT advance `self.iter`.
+            self.trees.truncate(tree_count_before);
+            return Ok(IterSnapshot {
+                gradients,
+                hessians,
+                // No tree was added → score_ is unchanged from before this round; the
+                // driver must NOT count this as an emitted iteration (`emitted=false`):
+                // no duplicate `iter_scores` / `iter_grad_hess` push, no advance.
+                score: self.score_updater.scores().to_vec(),
+                emitted: false,
+            });
+        }
+
         // ---- (5) DART Normalize + push tree_weight ----
         // C++ `DART::TrainOneIter` (dart.hpp:58-71): after GBDT::TrainOneIter grows the
         // new tree, `Normalize()` re-adds + rescales the dropped trees, then (unless
@@ -847,6 +909,7 @@ impl<'a> Gbdt<'a> {
             gradients,
             hessians,
             score: self.score_updater.scores().to_vec(),
+            emitted: true,
         })
     }
 
@@ -1083,6 +1146,8 @@ impl<'a> Gbdt<'a> {
             gradients,
             hessians,
             score: self.score_updater.scores().to_vec(),
+            // RF averages a tree every round (no no-split pop) → always emitted.
+            emitted: true,
         })
     }
 
