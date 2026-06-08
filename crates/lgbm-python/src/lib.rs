@@ -12,6 +12,12 @@
 
 use pyo3::prelude::*;
 
+/// Route Rust-side allocations through mimalloc inside the extension module. This
+/// is parity-neutral (allocator choice does not affect floating-point results) and
+/// only governs this cdylib's Rust allocations, never CPython's object allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod booster;
 pub mod callbacks;
 pub mod dataset;

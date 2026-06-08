@@ -2204,6 +2204,7 @@ dependencies = [
  "lgbm-core",
  "lgbm-dataset",
  "lgbm-model",
+ "mimalloc",
  "numpy",
  "polars",
  "pyo3",

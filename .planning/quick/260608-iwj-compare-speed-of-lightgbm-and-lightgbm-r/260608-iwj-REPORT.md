@@ -15,7 +15,7 @@ Each run adds one lever on top of the previous (cumulative):
 |-----|---------------|-------------|--------------|-------------|---------------|
 | **M0** | baseline (default release, system alloc) | 1.71s | 4.75s | 8.93s | 62.75ms |
 | **M1** | + `[profile.release]` lto=fat, cgu=1 | 1.68s | 4.58s | 8.68s | 62.25ms |
-| **M2** | + mimalloc global allocator | _pending_ | | | |
+| **M2** | + mimalloc global allocator | 1.61s | 4.35s | 8.25s | 61.50ms |
 | **M3** | + smallvec / buffer-reuse | _pending_ | | | |
 
 _(Filled in as each task lands.)_

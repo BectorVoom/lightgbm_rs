@@ -9,6 +9,11 @@ lgbm = { path = "../lgbm" }
 lgbm-core = { path = "../lgbm-core" }
 lgbm-dataset = { path = "../lgbm-dataset" }
 lgbm-model = { path = "../lgbm-model" }
+# Process global allocator for the shipped extension module. Parity-neutral —
+# governs only Rust-side allocations inside the cdylib (not CPython's pymalloc),
+# the same pattern polars-python uses. Cuts the small-allocation churn of the
+# boosting → tree-learner gather loops under the GIL-released train/predict.
+mimalloc = { version = "0.1", default-features = false }
 # The PyO3 / numpy / pyo3-polars version triangle (08-RESEARCH Pitfall 1, BLOCKING):
 # pyo3 0.27 is the floor required by pyo3-polars 0.26; numpy 0.27 is the
 # pyo3-0.27-compatible rust-numpy release. Mixing numpy 0.28 (needs pyo3 0.28)
