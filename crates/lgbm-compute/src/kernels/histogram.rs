@@ -137,6 +137,43 @@ pub fn construct_histograms_cpu(
     Ok(f64::from_bytes(&bytes).to_vec())
 }
 
+/// **Native** host f64 fold — the production cpu-anchor path (R2).
+///
+/// Bit-IDENTICAL to [`construct_histograms_cpu`] (the single-unit
+/// `construct_hist_kernel`): the exact same ascending-row-order accumulation of
+/// `f32`-read gradients/hessians into `f64` cells, with the same `bin << 1` index
+/// math and the same V5 boundary validation. The cubecl-cpu kernel launches that
+/// loop as a `CubeDim::new_1d(1)` single owner — a fixed ~20–50µs dispatch cost
+/// per call wrapping a trivial sequential loop. This native version drops that
+/// overhead (5–210× faster per call; `probe_hist` measured bit_exact=true at
+/// R=300/2000/20000) while producing byte-identical output, because the
+/// arithmetic and order are the same.
+///
+/// `construct_histograms_cpu` is retained for the kernel-parity / ROCm-mirror
+/// tests; the f32 hip path ([`construct_histograms_f32_on`]) is untouched.
+///
+/// # Errors
+/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
+pub fn construct_histograms_cpu_native(
+    binned: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_bin: u32,
+) -> Result<Vec<f64>, ComputeError> {
+    let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
+    let mut out = vec![0.0f64; out_len];
+    // Ascending row order, f32 read → f64 accumulate, grad at bin<<1 / hess at +1 —
+    // the verbatim `construct_hist_kernel` body (dense_bin.hpp:99-141). The
+    // validation above guarantees every `binned[i] < num_bin`, so `ti + 1` stays in
+    // bounds; the loop uses checked indexing regardless (no `unsafe`).
+    for (i, &bin) in binned.iter().enumerate() {
+        let ti = bin as usize * 2;
+        out[ti] += f64::from(grad[i]);
+        out[ti + 1] += f64::from(hess[i]);
+    }
+    Ok(out)
+}
+
 /// Validate the `construct_histograms` inputs (shared by the f64 cpu path and
 /// the f32 hip path). Returns the histogram length `2 * num_bin` on success.
 ///

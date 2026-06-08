@@ -197,14 +197,18 @@ impl Backend for CpuBackend {
 
     fn construct_histograms(
         &self,
-        client: &ComputeClient<Self::Runtime>,
+        _client: &ComputeClient<Self::Runtime>,
         binned: &[u32],
         ordered_gradients: &[f32],
         ordered_hessians: &[f32],
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError> {
-        kernels::histogram::construct_histograms_cpu(
-            client,
+        // R2: native f64 fold — bit-identical to the single-unit `construct_hist_
+        // kernel` but without the ~20–50µs cubecl-cpu launch per call (the dominant
+        // train-time cost). The cubecl path stays in `construct_histograms_cpu` for
+        // the kernel-parity / ROCm-mirror tests. `_client` is unused on the native
+        // path (kept for the `Backend` trait signature + the hip/f32 backends).
+        kernels::histogram::construct_histograms_cpu_native(
             binned,
             ordered_gradients,
             ordered_hessians,
