@@ -335,6 +335,12 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 - 45-case numeric golden replay (bit-identical, SC#1/SC#5) + 6-case storage golden replay (byte-identical incl. 4-bit + sparse, SC#2); both regen idempotent.
 - `lgbm_core::Config` + `Config::from_params` are the config bag for all later crates (Phase 1).
 
+## Quick Tasks Completed
+
+| Quick ID | Task | Date | Status | Result |
+|----------|------|------|--------|--------|
+| 260608-iwj | Compare speed lightgbm vs lightgbm_rs + parity-safe optimise | 2026-06-08 | complete ✓ | Bench harness + 4 parity-safe levers (~9–11% train); bit-exact gate GREEN. **Finding: Rust ~40–80× slower than C++ 4.6** — roadmap R1–R4 in quick/260608-iwj-REPORT.md |
+
 ## Performance Metrics
 
 **Velocity:**
