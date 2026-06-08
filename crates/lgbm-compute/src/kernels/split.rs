@@ -796,8 +796,11 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
 
     let out_len = 12usize;
     let h_hist = client.create_from_slice(f64::as_bytes(hist));
-    let zeros = vec![0.0f64; out_len];
-    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    // O1 (260609-aqy): the kernel WRITES (never `+=`) all 12 `out` cells
+    // unconditionally (single unit, no early return), so `out` needs no zero-init.
+    // `empty()` skips the host zero-alloc + upload. Contrast the accumulate/atomic
+    // buffers in histogram.rs:161 which MUST stay zeroed.
+    let h_out = client.empty(out_len * core::mem::size_of::<f64>());
 
     // SAFETY: `h_hist` was allocated for exactly `hist.len() == 2*num_bin`
     // elements and `h_out` for `out_len` cells; both outlive the launch. The
@@ -1675,8 +1678,9 @@ pub fn find_best_split_raw_f32_on<R: cubecl::Runtime>(
 
     let out_len = 12usize;
     let h_hist = client.create_from_slice(f32::as_bytes(hist));
-    let zeros = vec![0.0f32; out_len];
-    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+    // O1 (260609-aqy): f32 mirror — kernel writes all 12 cells unconditionally, so
+    // `empty()` is safe here too (see the f64 single-feature launcher above).
+    let h_out = client.empty(out_len * core::mem::size_of::<f32>());
 
     // SAFETY: identical handle/length correspondence to `find_best_split_cpu` —
     // `h_hist` sized `2*num_bin`, `h_out` sized 12 f32 cells, both outliving the
