@@ -116,22 +116,40 @@ fn round_int_f32(x: f32) -> i32 {
     i32::cast_from(x + 0.5f32)
 }
 
-/// The single-owner ordered best-split scan (REVERSE + FORWARD branches).
+/// The single shared `#[cube]` REVERSE+FORWARD best-split scan body — the SINGLE
+/// SOURCE OF TRUTH for the f64 split math (260608-mc5 THE MERGE).
 ///
-/// `cfg`-style scalars (`min_data_in_leaf`, hessian/gain gates, lambdas,
-/// `min_gain_shift`, `use_l1`, `skip_default_bin`, `offset`, `default_bin`) are
-/// passed as comptime/scalar args. `sum_gradient`/`sum_hessian`/`num_data` are
-/// the leaf totals (`sum_hessian` already bumped by `2*kEpsilon`). `hist` is the
-/// stride-2 `[g0,h0,g1,h1,...]` f64 histogram.
-#[cube(launch)]
+/// Both the single-feature launch kernel ([`find_best_split_kernel`], bases 0,0)
+/// AND the fused per-leaf batched kernel ([`find_best_splits_fused_kernel`], cube
+/// `f` passing `hist_base = slot_off[f]`, `out_base = f*12`) call this helper, so
+/// the REVERSE+FORWARD scan, the gate ORDER, the eps placements, the
+/// `t-1+offset` / `t+offset` threshold arithmetic, the branchless-`select`
+/// encoding, the monotone `done` flag, and the finalization (subtract eps off the
+/// reported hessians) exist exactly ONCE. NO f64 op is reordered relative to the
+/// pre-extraction `find_best_split_kernel` body (RESEARCH Pitfall 5 / CLAUDE.md
+/// non-negotiable #1).
+///
+/// `hist_base` is the feature's start cell in the (possibly concatenated) stride-2
+/// `[g0,h0,g1,h1,...]` f64 histogram buffer; bin index `bi` reads
+/// `hist[hist_base + bi]`. `out_base` is the feature's 12-cell output window;
+/// finalization writes `out[out_base + 0..12]`. For the single-feature kernel both
+/// bases are 0, so the extraction is observably identical to the prior body.
+///
+/// `sum_hessian` is the leaf total ALREADY bumped by `2*kEpsilon` (the host bumps
+/// it before launch). The loop-carried mutables MUST init from LITERALS (cubecl-cpu
+/// MLIR lowering constraint #1) and every conditional store MUST be branchless
+/// `select` (constraint #2) — both encodings are kept verbatim here.
+#[cube]
 #[allow(clippy::too_many_arguments)]
-pub fn find_best_split_kernel(
+pub fn split_scan_body(
     hist: &Array<f64>,
+    hist_base: u32,
     out: &mut Array<f64>,
+    out_base: u32,
     num_bin: i32,
     offset: i32,
     default_bin: i32,
-    skip_default_bin: u32, // 0|1 (comptime-flavored runtime flag)
+    skip_default_bin: u32, // 0|1
     use_l1: u32,           // 0|1
     min_data_in_leaf: i32,
     min_sum_hessian_in_leaf: f64,
@@ -144,11 +162,10 @@ pub fn find_best_split_kernel(
     rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1)
     fwd_count: i32, // host-computed FORWARD iteration count = max(0, num_bin-1-offset)
 ) {
-    // Single-owner ordered scan: the launch uses `CubeDim::new_1d(1)` so exactly
-    // ONE unit exists (UNIT_POS == 0). The scan is inherently sequential; one
-    // owner is the cpu deterministic anchor. (No UNIT_POS guard is needed at
-    // CubeDim 1, and wrapping the whole complex body in an `if` tripped the
-    // cubecl-cpu MLIR lowering.)
+    // `hb`/`ob` are the feature's base offsets into the (concatenated) histogram and
+    // the 12-cell `out` window. They are 0,0 for the single-feature kernel.
+    let hb = hist_base as usize;
+    let ob = out_base as usize;
     let l1 = lambda_l1;
     let l2 = lambda_l2;
     let use_l1_b = use_l1 != 0;
@@ -227,7 +244,7 @@ pub fn find_best_split_kernel(
             // Branchless clamp (cubecl-cpu mis-lowers nested-`if`): a negative `t`
             // reads bin 0; it is inactive so it never contributes to any sum.
             let t_safe = select(t < 0, 0i32, t);
-            let bi = (t_safe as usize) * 2; // GET_GRAD index = t<<1
+            let bi = hb + (t_safe as usize) * 2; // GET_GRAD index = t<<1 (+ feature base)
             let g = hist[bi];
             let h = hist[bi + 1];
             sum_right_gradient += select(active, g, 0.0);
@@ -292,7 +309,7 @@ pub fn find_best_split_kernel(
             let skip = skip_def && (t + offset) == default_bin as i32;
             let active = !skip && !done;
             // t >= 0 always here (range starts at 0; NA_AS_MISSING=0 path).
-            let bi = (t as usize) * 2;
+            let bi = hb + (t as usize) * 2;
             let g = hist[bi];
             let h = hist[bi + 1];
             sum_left_gradient += select(active, g, 0.0);
@@ -352,18 +369,69 @@ pub fn find_best_split_kernel(
     let right_output =
         calculate_splitted_leaf_output(use_l1_b, right_sum_gradient, right_sum_hessian, l1, l2);
 
-    out[0] = is_splittable; // already an f64 flag (0.0 / 1.0)
-    out[1] = f64::cast_from(best_threshold);
-    out[2] = best_gain; // RAW best_gain (kMinScore if none)
-    out[3] = f64::cast_from(best_left_count);
-    out[4] = f64::cast_from(num_data - best_left_count); // right_count
-    out[5] = best_sum_left_gradient;
-    out[6] = best_sum_left_hessian - eps; // reported left_sum_hessian (:1042)
-    out[7] = right_sum_gradient;
-    out[8] = right_sum_hessian - eps; // reported right_sum_hessian (:1053)
-    out[9] = best_default_left; // already an f64 flag (0.0 / 1.0)
-    out[10] = left_output;
-    out[11] = right_output;
+    out[ob] = is_splittable; // already an f64 flag (0.0 / 1.0)
+    out[ob + 1] = f64::cast_from(best_threshold);
+    out[ob + 2] = best_gain; // RAW best_gain (kMinScore if none)
+    out[ob + 3] = f64::cast_from(best_left_count);
+    out[ob + 4] = f64::cast_from(num_data - best_left_count); // right_count
+    out[ob + 5] = best_sum_left_gradient;
+    out[ob + 6] = best_sum_left_hessian - eps; // reported left_sum_hessian (:1042)
+    out[ob + 7] = right_sum_gradient;
+    out[ob + 8] = right_sum_hessian - eps; // reported right_sum_hessian (:1053)
+    out[ob + 9] = best_default_left; // already an f64 flag (0.0 / 1.0)
+    out[ob + 10] = left_output;
+    out[ob + 11] = right_output;
+}
+
+/// The single-feature `find_best_split` launch kernel — a THIN `#[cube(launch)]`
+/// wrapper that delegates to the shared [`split_scan_body`] with bases `0, 0` (the
+/// whole histogram is one feature; the 12-cell `out` window starts at 0). After the
+/// 260608-mc5 merge this kernel holds NO scan logic of its own — the math lives
+/// once in `split_scan_body`, shared with the fused per-leaf batched kernel.
+///
+/// Launched single-owner (`CubeDim::new_1d(1)`): the scan is inherently sequential.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_split_kernel(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    num_bin: i32,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32, // 0|1 (comptime-flavored runtime flag)
+    use_l1: u32,           // 0|1
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1)
+    fwd_count: i32, // host-computed FORWARD iteration count = max(0, num_bin-1-offset)
+) {
+    split_scan_body(
+        hist,
+        0u32,
+        out,
+        0u32,
+        num_bin,
+        offset,
+        default_bin,
+        skip_default_bin,
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        rev_count,
+        fwd_count,
+    );
 }
 
 /// f32-cell mirror of [`find_best_split_kernel`] for the no-f64 hip device
