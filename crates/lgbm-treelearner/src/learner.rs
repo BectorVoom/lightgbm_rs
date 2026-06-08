@@ -340,12 +340,29 @@ pub struct SplitSnapshot {
 pub struct FeatureSplitRecord {
     /// ORIGINAL feature index.
     pub feature: i32,
-    /// Per-candidate REVERSE-branch gains (NaN where gated).
-    pub cand_rev: Vec<f64>,
-    /// Per-candidate FORWARD-branch gains (NaN where gated).
-    pub cand_fwd: Vec<f64>,
+    /// REVERSE-then-FORWARD per-candidate gains packed into ONE allocation
+    /// (260609-bfx snapshot-path alloc reduction: 2 retained Vecs/record → 1).
+    /// `rev_len` is the REVERSE prefix length; the remaining cells are FORWARD.
+    /// NaN marks a gated candidate. Empty for categorical features. Read via
+    /// [`cand_rev`](Self::cand_rev) / [`cand_fwd`](Self::cand_fwd).
+    gains: Vec<f64>,
+    rev_len: usize,
     /// The feature's best `SplitInfo`.
     pub split: SplitInfo,
+}
+
+impl FeatureSplitRecord {
+    /// Per-candidate REVERSE-branch gains (NaN where gated).
+    #[inline]
+    pub fn cand_rev(&self) -> &[f64] {
+        &self.gains[..self.rev_len]
+    }
+
+    /// Per-candidate FORWARD-branch gains (NaN where gated).
+    #[inline]
+    pub fn cand_fwd(&self) -> &[f64] {
+        &self.gains[self.rev_len..]
+    }
 }
 
 /// The `ColSampler` selection trace for one tree (TRL-08 RNG call-sequence
@@ -2024,8 +2041,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // diagnostics live in the dedicated categorical golden, not here).
                 records.push(FeatureSplitRecord {
                     feature: f.real_feature_index,
-                    cand_rev: Vec::new(),
-                    cand_fwd: Vec::new(),
+                    gains: Vec::new(),
+                    rev_len: 0,
                     split,
                 });
                 if split.gain > K_MIN_SCORE
@@ -2169,16 +2186,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // R1: snapshot-ONLY work — skip it entirely on the production path
             // (`capture_snapshots == false`). The live split (`split` above) and the
             // splittability flag are already decided; the grown tree is identical.
-            let (cand_rev, cand_fwd) = if self.capture_snapshots {
+            let (gains, rev_len) = if self.capture_snapshots {
                 self.per_bin_gains(hist, f, sum_g, sum_h, num_data_in_leaf)
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), 0)
             };
 
             records.push(FeatureSplitRecord {
                 feature: f.real_feature_index,
-                cand_rev,
-                cand_fwd,
+                gains,
+                rev_len,
                 split,
             });
 
@@ -2521,7 +2538,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
-    ) -> (Vec<f64>, Vec<f64>) {
+    ) -> (Vec<f64>, usize) {
         use lgbm_compute::gain::get_split_gains;
         let cfg = &self.cfg;
         let use_l1 = cfg.use_l1();
@@ -2548,10 +2565,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let get_grad = |t: i32| hist[(t as usize) << 1];
         let get_hess = |t: i32| hist[((t as usize) << 1) + 1];
 
-        // REVERSE (:854-936). Pre-sized to `num_bin` (the push upper bound) so the
-        // per-feature per-leaf snapshot scan never reallocates mid-grow. Parity-
-        // neutral — capacity only, identical pushed sequence.
-        let mut cand_rev: Vec<f64> = Vec::with_capacity(num_bin.max(0) as usize);
+        // REVERSE (:854-936) then FORWARD packed into ONE allocation (260609-bfx
+        // snapshot-path alloc reduction: 2 retained Vecs/record → 1). Pre-sized to
+        // `2*num_bin` (the combined push upper bound) so the per-feature per-leaf
+        // snapshot scan never reallocates mid-grow. Parity-neutral — capacity only,
+        // identical pushed sequence; `rev_len` (captured after the REVERSE block)
+        // splits the buffer into the REVERSE prefix and the FORWARD remainder.
+        let mut gains: Vec<f64> = Vec::with_capacity(2 * num_bin.max(0) as usize);
         {
             let mut sum_right_gradient = 0.0f64;
             let mut sum_right_hessian = eps;
@@ -2561,7 +2581,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             let mut t = t_start;
             while t >= t_end {
                 if skip && (t + offset) == default_bin {
-                    cand_rev.push(qnan);
+                    gains.push(qnan);
                     t -= 1;
                     continue;
                 }
@@ -2571,18 +2591,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 if right_count < cfg.min_data_in_leaf
                     || sum_right_hessian < cfg.min_sum_hessian_in_leaf
                 {
-                    cand_rev.push(qnan);
+                    gains.push(qnan);
                     t -= 1;
                     continue;
                 }
                 let left_count = num_data - right_count;
                 if left_count < cfg.min_data_in_leaf {
-                    cand_rev.push(qnan);
+                    gains.push(qnan);
                     break;
                 }
                 let sum_left_hessian = sum_hessian_bumped - sum_right_hessian;
                 if sum_left_hessian < cfg.min_sum_hessian_in_leaf {
-                    cand_rev.push(qnan);
+                    gains.push(qnan);
                     break;
                 }
                 let sum_left_gradient = sum_gradient - sum_right_gradient;
@@ -2596,16 +2616,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     l2,
                 );
                 if g <= min_gain_shift {
-                    cand_rev.push(qnan);
+                    gains.push(qnan);
                 } else {
-                    cand_rev.push(g);
+                    gains.push(g);
                 }
                 t -= 1;
             }
         }
 
-        // FORWARD (:937-1029). Pre-sized to `num_bin` (see REVERSE above).
-        let mut cand_fwd: Vec<f64> = Vec::with_capacity(num_bin.max(0) as usize);
+        // FORWARD (:937-1029) appended into the SAME buffer after the REVERSE prefix.
+        let rev_len = gains.len();
         {
             let mut sum_left_gradient = 0.0f64;
             let mut sum_left_hessian = eps;
@@ -2614,7 +2634,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             let mut t = 0i32;
             while t <= t_end {
                 if skip && (t + offset) == default_bin {
-                    cand_fwd.push(qnan);
+                    gains.push(qnan);
                     t += 1;
                     continue;
                 }
@@ -2624,18 +2644,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 if left_count < cfg.min_data_in_leaf
                     || sum_left_hessian < cfg.min_sum_hessian_in_leaf
                 {
-                    cand_fwd.push(qnan);
+                    gains.push(qnan);
                     t += 1;
                     continue;
                 }
                 let right_count = num_data - left_count;
                 if right_count < cfg.min_data_in_leaf {
-                    cand_fwd.push(qnan);
+                    gains.push(qnan);
                     break;
                 }
                 let sum_right_hessian = sum_hessian_bumped - sum_left_hessian;
                 if sum_right_hessian < cfg.min_sum_hessian_in_leaf {
-                    cand_fwd.push(qnan);
+                    gains.push(qnan);
                     break;
                 }
                 let sum_right_gradient = sum_gradient - sum_left_gradient;
@@ -2649,15 +2669,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     l2,
                 );
                 if g <= min_gain_shift {
-                    cand_fwd.push(qnan);
+                    gains.push(qnan);
                 } else {
-                    cand_fwd.push(g);
+                    gains.push(g);
                 }
                 t += 1;
             }
         }
 
-        (cand_rev, cand_fwd)
+        (gains, rev_len)
     }
 
     /// `SplitInner` (`serial_tree_learner.cpp:779-806`): partition the leaf, grow
@@ -3291,6 +3311,30 @@ mod tests {
             ..Default::default()
         };
         (f, gradients, hessians)
+    }
+
+    #[test]
+    fn per_bin_gains_packs_reverse_then_forward_one_alloc() {
+        // 260609-bfx: the D-06 snapshot per-bin gains are packed REVERSE-then-FORWARD
+        // into ONE allocation (was two separate Vecs per record); `rev_len` splits the
+        // buffer. Verify the producer fills both halves with the expected candidate
+        // counts so the `cand_rev()` / `cand_fwd()` accessors slice them correctly.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (f, _g, _h) = splittable_feature();
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 31, -1);
+
+        // FixHistogram'd per-bin (sum_grad, sum_hess) for the 4 bins (2 rows each).
+        let hist = vec![-10.0f64, 2.0, -8.0, 2.0, 8.0, 2.0, 10.0, 2.0];
+        let (gains, rev_len) = learner.per_bin_gains(&hist, &f, 0.0, 8.0, 8);
+
+        // REVERSE scans bins [num_bin-1 .. 1], FORWARD bins [0 .. num_bin-2]:
+        // 3 candidates each for a 4-bin feature with no gating.
+        assert_eq!(rev_len, 3, "reverse-branch candidate count (cand_rev() length)");
+        assert_eq!(gains.len(), 6, "one packed buffer = rev (3) + fwd (3)");
+        assert_eq!(gains.len() - rev_len, 3, "forward-branch candidate count (cand_fwd() length)");
+        // A splittable feature must surface at least one finite (non-gated) gain.
+        assert!(gains.iter().any(|v| v.is_finite()), "expected a real split gain");
     }
 
     #[test]
