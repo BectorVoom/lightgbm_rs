@@ -860,6 +860,133 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
 }
 
 // ===========================================================================
+// 260608-mc5 THREE-WAY MERGE GATE. Prove the FUSED per-leaf split kernel is
+// BIT-EXACT to BOTH the cubecl per-feature loop AND the native production scan:
+//   fused find_best_splits_batched_fused_f64_on
+//     == per-feature find_best_split_f64_on
+//     == find_best_split_cpu_native
+// for EVERY feature in input order (order preservation, T-lsx-01). This is the
+// gate that the merge (one shared split_scan_body math + one fused launch) did NOT
+// drift any of the three transcriptions. No tolerance — compare_exact_f64_bits.
+// ===========================================================================
+#[test]
+fn kernel_parity_fused_equals_per_feature_and_native() {
+    use lgbm_compute::kernels::split::{
+        find_best_split_cpu_native, find_best_split_f64_on, find_best_splits_batched_fused_f64_on,
+    };
+
+    let path = kernels_dir().join("split.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "kernel_parity(fused-split): SKIP — fixture {} not found.",
+            path.display()
+        );
+        return;
+    };
+    let cases = parse_split(&text);
+    assert!(!cases.is_empty(), "split fixture present but parsed zero cases");
+
+    let client = cpu_client();
+
+    // Same relaxed cfg as kernel_parity_batched_equals_per_feature_on_cpu so the
+    // scan exercises real winners (not all-none).
+    let cfg = GainConfig {
+        min_data_in_leaf: 1,
+        min_sum_hessian_in_leaf: 0.0,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+        ..Default::default()
+    };
+
+    // Assemble a MULTI-feature batch: concatenated buffer + per-feature records,
+    // skipping the deferred na_as_missing cases (a typed error in every path).
+    let mut buf: Vec<f64> = Vec::new();
+    let mut feats: Vec<BatchedSplitFeature> = Vec::new();
+    for c in &cases {
+        if c.na_as_missing {
+            continue;
+        }
+        let slot_off = buf.len();
+        buf.extend_from_slice(&c.hist);
+        feats.push(BatchedSplitFeature {
+            slot_off,
+            num_bin: c.num_bin as u32,
+            offset: c.offset,
+            default_bin: c.default_bin as u32,
+            most_freq_bin: 0,
+            skip_default_bin: c.skip_default_bin,
+            na_as_missing: c.na_as_missing,
+            run_forward: true,
+        });
+    }
+    assert!(!feats.is_empty(), "expected at least one batchable split case");
+
+    // Shared leaf totals across the whole batch (exactly how the learner calls the
+    // batched op per leaf). Finite/positive so every feature's scan is admissible.
+    let (sg, sh, nd) = (8.0f64, 8.0f64, 8i32);
+
+    // (1) ONE fused launch over all features.
+    let fused = find_best_splits_batched_fused_f64_on(&client, &buf, &feats, &cfg, sg, sh, nd)
+        .unwrap_or_else(|e| panic!("fused find_best_splits_batched_fused_f64_on failed: {e:?}"));
+    assert_eq!(fused.len(), feats.len(), "fused: one SplitInfo per input feature");
+
+    for (i, f) in feats.iter().enumerate() {
+        let cells = 2 * f.num_bin as usize;
+        let hist = &buf[f.slot_off..f.slot_off + cells];
+
+        // (2) cubecl per-feature scan (single-owner launch).
+        let per = find_best_split_f64_on(
+            &client, hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
+            f.skip_default_bin, f.na_as_missing, f.run_forward, sg, sh, nd,
+        )
+        .unwrap_or_else(|e| panic!("per-feature find_best_split_f64_on failed: {e:?}"));
+
+        // (3) native production scan.
+        let nat = find_best_split_cpu_native(
+            hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin, f.skip_default_bin,
+            f.na_as_missing, f.run_forward, sg, sh, nd,
+        )
+        .unwrap_or_else(|e| panic!("native find_best_split_cpu_native failed: {e:?}"));
+
+        let fields = |s: &lgbm_compute::SplitInfo| {
+            [
+                s.gain,
+                s.left_sum_gradient,
+                s.left_sum_hessian,
+                s.right_sum_gradient,
+                s.right_sum_hessian,
+                s.left_output,
+                s.right_output,
+            ]
+        };
+        let fu = fields(&fused[i]);
+        let pe = fields(&per);
+        let na = fields(&nat);
+
+        // fused == per-feature (bit-exact f64).
+        if let Err(m) = compare_exact_f64_bits(&fu, &pe) {
+            panic!("feature {i}: fused != per-feature (cubecl): {m}");
+        }
+        // per-feature == native (bit-exact f64) — the production anchor agreement.
+        if let Err(m) = compare_exact_f64_bits(&pe, &na) {
+            panic!("feature {i}: per-feature != native: {m}");
+        }
+        // Integer / flag fields: three-way exact equality.
+        assert_eq!(fused[i].threshold, per.threshold, "feature {i}: fused vs per threshold");
+        assert_eq!(per.threshold, nat.threshold, "feature {i}: per vs native threshold");
+        assert_eq!(fused[i].left_count, per.left_count, "feature {i}: fused vs per left_count");
+        assert_eq!(per.left_count, nat.left_count, "feature {i}: per vs native left_count");
+        assert_eq!(fused[i].right_count, per.right_count, "feature {i}: fused vs per right_count");
+        assert_eq!(per.right_count, nat.right_count, "feature {i}: per vs native right_count");
+        assert_eq!(fused[i].default_left, per.default_left, "feature {i}: fused vs per default_left");
+        assert_eq!(per.default_left, nat.default_left, "feature {i}: per vs native default_left");
+    }
+}
+
+// ===========================================================================
 // 04-03 PARTITION parity. Drive Backend::data_partition over the golden bins +
 // routing and assert the reordered index array + split_point match exactly.
 // ===========================================================================

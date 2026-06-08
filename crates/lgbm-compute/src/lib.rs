@@ -418,40 +418,29 @@ impl Backend for CpuBackend {
         kernels::subtract::subtract_histograms_cpu_native(parent, child)
     }
 
-    /// CPU override (260608-mc5 THE MERGE): route the batched per-leaf split through
-    /// the SAME fused cubecl kernel the GPU backend uses
-    /// ([`kernels::split::find_best_splits_batched_fused_f64_on`]) over the cubecl-cpu
-    /// [`ActiveRuntime`](runtime::ActiveRuntime) — so BOTH backends run ONE shared
-    /// f64 scan (`split_scan_body`) in ONE launch per leaf. The single-feature
-    /// [`find_best_split`](Backend::find_best_split) stays on the native scan
-    /// (`find_best_split_cpu_native`), so the per-feature kernel-parity anchor is
-    /// unaffected.
-    ///
-    /// NOTE (260608-mc5 Task-3 decision): if the cubecl-cpu per-leaf launch dispatch
-    /// materially regresses CPU wall-clock vs the R2 native baseline, this override
-    /// is reverted to the trait default (native per-feature loop) — the GPU fused
-    /// override and the shared `split_scan_body` helper are kept regardless. See the
-    /// 260608-mc5 SUMMARY for the measured decision.
-    fn find_best_splits_batched(
-        &self,
-        client: &ComputeClient<Self::Runtime>,
-        buf: &[f64],
-        feats: &[BatchedSplitFeature],
-        cfg: &GainConfig,
-        sum_gradient: f64,
-        sum_hessian: f64,
-        num_data: i32,
-    ) -> Result<Vec<SplitInfo>, ComputeError> {
-        kernels::split::find_best_splits_batched_fused_f64_on(
-            client,
-            buf,
-            feats,
-            cfg,
-            sum_gradient,
-            sum_hessian,
-            num_data,
-        )
-    }
+    // CPU batched split: 260608-mc5 Task-3 DECISION = keep the NATIVE per-feature
+    // path (the `Backend::find_best_splits_batched` trait default, which calls
+    // `self.find_best_split` == `find_best_split_cpu_native` per feature). The merge
+    // initially routed CpuBackend through `find_best_splits_batched_fused_f64_on`
+    // (the same fused cubecl kernel the GPU uses), but a measured bench_train run on
+    // this HEAD showed a MATERIAL CPU regression — the cubecl-cpu per-leaf launch
+    // dispatch dominates even when batched into ONE launch per leaf:
+    //   fused cubecl-cpu  vs  native (same HEAD, R2-equivalent):
+    //     small  223.92ms vs  42.86ms  (~5.2x slower)
+    //     medium 618.49ms vs 256.17ms  (~2.4x slower)
+    //     large    1.76s  vs 828.95ms  (~2.1x slower)
+    // (same root cause R2/260608-jyl found: the cubecl-cpu launch fixed cost, not
+    // the arithmetic). CLAUDE.md non-negotiable #2 forbids shipping a silent CPU
+    // slowdown, so the CpuBackend override is intentionally NOT defined here — the
+    // native trait default applies. The GPU `RocmBackend` KEEPS the fused override
+    // (one launch per leaf on gfx1100, f64 bit-exact), and the shared
+    // `split_scan_body` helper (THE MERGE: one source of the split math) stays for
+    // BOTH paths regardless. See the 260608-mc5 SUMMARY for the full measurement.
+    //
+    // The fused launcher `find_best_splits_batched_fused_f64_on` is generic over R,
+    // so it remains available for the cubecl-cpu runtime via the oracle three-way
+    // bit-exact gate (`kernel_parity_fused_equals_per_feature_and_native`) — the
+    // merge is PROVEN bit-exact on cpu even though it is not the production path.
 }
 
 /// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
