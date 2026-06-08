@@ -605,3 +605,196 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
 }
+
+/// ON-GPU `FixHistogram` + compaction kernel (260608-oib L3). ONE cube per feature
+/// (`CubeCount::Static(num_features,1,1)`, `CubeDim::new_1d(1)`), mirroring
+/// [`construct_leaf_hist_resident_kernel`] / the fused split kernel's
+/// one-cube-per-feature precedent. Cube `f` (`CUBE_POS_X`) owns ONLY its
+/// `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of the concatenated stride-2
+/// f64 histogram `hist` and rewrites it IN PLACE to the FixHistogram'd + compacted
+/// form — a VERBATIM port of the host `fix_histogram`
+/// (`fix_histogram.rs:50-80`, `Dataset::FixHistogram`) followed by
+/// `compact_histogram` (`learner.rs:2838-2864`).
+///
+/// The leaf RAW (un-bumped) `sum_gradient` / `sum_hessian` are leaf-level scalars
+/// shared across every feature (Pitfall 2: the RAW totals, NOT the `+2·kEpsilon`
+/// bumped value). All math is f64 — gfx1100 runs f64 despite `has_f64 == false`
+/// (the fused f64 split kernel precedent). Reading the SAME f64-widened cells and
+/// folding in the SAME ascending order as the host yields a BIT-IDENTICAL buffer.
+///
+/// `#[cfg(feature="rocm")]` — the CPU anchor keeps the host fix+compact unchanged.
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+pub fn fix_compact_kernel(
+    hist: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    most_freq_bin: &Array<i32>,
+    // LEAF-LEVEL scalars (shared across the batch) — the RAW (un-bumped) totals.
+    sum_gradient: f64,
+    sum_hessian: f64,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let base = slot_off[fi] as usize;
+    let nb = num_bin[fi];
+    let mfb = most_freq_bin[fi];
+    let off = offset[fi];
+
+    // ---- FixHistogram (fix_histogram.rs:50-80, Dataset::FixHistogram) ----
+    // C++ `if (most_freq_bin > 0)`: skip when mfb == 0 (bin 0 is never directly
+    // folded) OR mfb >= num_bin (defensive bound — leave untouched, no OOB write).
+    // Encoded as a single guard; the body runs only for a valid in-range mfb > 0.
+    let do_fix = mfb > 0 && mfb < nb;
+    if do_fix {
+        let mfbu = mfb as usize;
+        // Seed the most-freq cell with the RAW leaf totals (dataset.cpp:1490-1491).
+        // Literal-init loop-carried mutables (cubecl lowering discipline); the seed
+        // is added in below so init-from-arg + reassign is avoided.
+        let mut g = 0.0f64;
+        let mut h = 0.0f64;
+        g += sum_gradient;
+        h += sum_hessian;
+        // Subtract every OTHER bin's cell in ASCENDING bin order (load-bearing f64
+        // fold order — never reorder / parallelize). `i != mfb` via branchless
+        // select so the guarded cell is excluded without a nested-if mutation.
+        let count = nb; // num_bin
+        for i in 0..count {
+            let bi = base + (i as usize) * 2;
+            let gi = hist[bi];
+            let hi = hist[bi + 1];
+            let take = i != mfb;
+            g -= select(take, gi, 0.0);
+            h -= select(take, hi, 0.0);
+        }
+        let mi = base + mfbu * 2;
+        hist[mi] = g;
+        hist[mi + 1] = h;
+    }
+
+    // ---- compact (learner.rs:2838-2864) ----
+    // offset <= 0 → no-op. offset >= num_bin → zero the whole feature region.
+    // else: shift pair (c+offset) down to c for c in 0..(num_bin-offset) ASCENDING
+    // (src >= dst, so an in-place forward shift is safe), then zero the tail.
+    if off > 0 {
+        if off >= nb {
+            // Degenerate: nothing to keep — zero the whole feature region.
+            for c in 0..nb {
+                let dst = base + (c as usize) * 2;
+                hist[dst] = 0.0;
+                hist[dst + 1] = 0.0;
+            }
+        } else {
+            let keep = nb - off; // num_bin - offset
+            for c in 0..keep {
+                let dst = base + (c as usize) * 2;
+                let src = base + ((c + off) as usize) * 2;
+                hist[dst] = hist[src];
+                hist[dst + 1] = hist[src + 1];
+            }
+            // Zero the unused tail (the dropped-bin slots) so a stray read is inert.
+            for c in keep..nb {
+                let dst = base + (c as usize) * 2;
+                hist[dst] = 0.0;
+                hist[dst + 1] = 0.0;
+            }
+        }
+    }
+}
+
+/// Host launcher for the on-GPU fix+compact kernel (260608-oib L3, Task 1 form).
+///
+/// Takes ONE leaf's concatenated stride-2 f64 histogram `buf` (the SAME values the
+/// host gets by widening the f32-atomic cells), the per-feature
+/// `{slot_off, num_bin, offset, most_freq_bin}` arrays, and the leaf's RAW
+/// (un-bumped) `sum_gradient` / `sum_hessian`; uploads, launches one cube per
+/// feature, reads back the fixed+compacted f64 buffer. This Task-1 form keeps the
+/// readback so the kernel numerics are proven in isolation (Task 2 adds the
+/// device-Handle-in/Handle-out resident variant).
+///
+/// V5 boundary validation BEFORE launch (mirrors the fused split launcher):
+/// `num_bin == 0` → typed error; `2*num_bin` overflow → typed error;
+/// `slot_off + 2*num_bin > buf.len()` → [`ComputeError::LengthMismatch`]; empty
+/// feats → `Ok(buf unchanged)` with NO launch.
+///
+/// `feats` is `&[(slot_off, num_bin, offset, most_freq_bin)]` per feature, in the
+/// same order as the concatenated regions in `buf`.
+///
+/// # Errors
+/// As above (length / overflow validation, V5).
+#[cfg(feature = "rocm")]
+pub fn fix_compact_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    buf: &[f64],
+    feats: &[(usize, u32, i32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+) -> Result<Vec<f64>, ComputeError> {
+    // Empty batch: no launch (return the buffer unchanged).
+    if feats.is_empty() {
+        return Ok(buf.to_vec());
+    }
+
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut mfb_a: Vec<i32> = Vec::with_capacity(n);
+    for &(slot_off, num_bin, offset, most_freq_bin) in feats {
+        if num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "fix_compact: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {num_bin} overflows the histogram length"),
+            })?;
+        let end = slot_off
+            .checked_add(cells)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "fix_compact: slot_off + region overflows".to_string(),
+            })?;
+        if end > buf.len() {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: buf.len(),
+            });
+        }
+        slot_off_a.push(slot_off as u32);
+        num_bin_a.push(num_bin as i32);
+        offset_a.push(offset);
+        mfb_a.push(most_freq_bin as i32);
+    }
+
+    let h_hist = client.create_from_slice(f64::as_bytes(buf));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
+    let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
+
+    // SAFETY: every handle is sized to its slice and outlives the launch. Cube `f`
+    // (`CUBE_POS_X < n`) reads/writes only `[slot_off[f], slot_off[f]+2*num_bin[f])`
+    // — each validated `<= buf.len()` above — and `mfb < num_bin` keeps the
+    // reconstruct write in range; the per-feature index arrays all have exactly `n`
+    // elements. All cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        fix_compact_kernel::launch(
+            client,
+            CubeCount::Static(n as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_hist.clone(), buf.len()),
+            ArrayArg::from_raw_parts(h_slot, n),
+            ArrayArg::from_raw_parts(h_numbin, n),
+            ArrayArg::from_raw_parts(h_offset, n),
+            ArrayArg::from_raw_parts(h_mfb, n),
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_hist);
+    Ok(f64::from_bytes(&bytes).to_vec())
+}

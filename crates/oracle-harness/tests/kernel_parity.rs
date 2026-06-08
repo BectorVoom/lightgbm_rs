@@ -1527,4 +1527,137 @@ mod hip {
         // tolerance. The override routes through build_leaf_histograms_resident_f32_on.
         assert_within("resident_vs_host/override", &resident_f32, &host_f32);
     }
+
+    /// VERBATIM copy of the learner's private `compact_histogram`
+    /// (`lgbm-treelearner/src/learner.rs:2838-2864`) — replicated here (rather than
+    /// exposing the private fn) so the host reference path stays byte-for-byte the
+    /// production op while keeping `learner.rs` UNCHANGED (T-oib-02). Pairs with the
+    /// real exported `lgbm_treelearner::fix_histogram`.
+    fn host_compact_histogram(hist: &mut [f64], offset: i32) {
+        if offset <= 0 {
+            return;
+        }
+        let off = offset as usize;
+        let num_bin = hist.len() / 2;
+        if off >= num_bin {
+            for cell in hist.iter_mut() {
+                *cell = 0.0;
+            }
+            return;
+        }
+        for c in 0..(num_bin - off) {
+            let dst = c << 1;
+            let src = (c + off) << 1;
+            hist[dst] = hist[src];
+            hist[dst + 1] = hist[src + 1];
+        }
+        for cell in hist.iter_mut().skip((num_bin - off) << 1) {
+            *cell = 0.0;
+        }
+    }
+
+    /// 260608-oib Task 1 — the BIT-EXACT oracle: the on-GPU `fix_compact_kernel`
+    /// (via `fix_compact_f64_on`) must produce, for a leaf's concatenated RAW f64
+    /// histogram, the SAME buffer that applying the host `fix_histogram` then
+    /// `compact_histogram` PER FEATURE produces — BIT-IDENTICAL via
+    /// `compare_exact_f64_bits`. The numerical insight: reading the SAME f64-widened
+    /// cells and folding in the SAME ascending order yields a bit-identical result;
+    /// the only ~1e-6 difference (the f32-atomic RAW build) is NOT exercised here —
+    /// the RAW buffer is supplied directly as f64.
+    ///
+    /// Covers a MIXED-feature leaf concatenating:
+    ///  - Test A: mfb > 0, offset == 0  — fix RECONSTRUCTS the mfb cell, compact no-op.
+    ///  - Test B: mfb == 0, offset == 1 — fix NO-OP, compact DROPS bin 0 (DEF-07-02).
+    ///  - Test C: mfb >= num_bin        — fix no-op (defensive), offset 0 ⇒ compact no-op.
+    ///  - Test D: offset >= num_bin     — compact ZEROS the whole feature region.
+    /// Plus an extra mfb > 0 feature so the mixed concatenation exercises >1 fix.
+    #[test]
+    fn kernel_parity_fix_compact_equals_host_on_hip() {
+        use lgbm_compute::kernels::histogram::fix_compact_f64_on;
+        use lgbm_treelearner::fix_histogram;
+
+        let hip = rocm_client();
+
+        // RAW leaf totals (un-bumped) — Pitfall 2. Chosen so the reconstructs land
+        // on exactly-representable f64 values for an unambiguous bit-exact assert.
+        let sum_g = 100.0f64;
+        let sum_h = 250.0f64;
+
+        // Per-feature (num_bin, offset, most_freq_bin) + a RAW stride-2 region.
+        // Region layouts pulled from realistic bin counts; the mfb cell content is
+        // GARBAGE before fix (it is reconstructed) where mfb > 0.
+        struct Feat {
+            num_bin: u32,
+            offset: i32,
+            mfb: u32,
+            region: Vec<f64>, // 2*num_bin RAW cells
+        }
+        let feats = vec![
+            // Test A — mfb=2 (>0), offset=0, num_bin=4: reconstruct bin2, compact no-op.
+            Feat {
+                num_bin: 4,
+                offset: 0,
+                mfb: 2,
+                region: vec![1.0, 2.0, 3.0, 4.0, /*mfb2 garbage*/ 99.0, 88.0, 5.0, 6.0],
+            },
+            // Test B — mfb=0, offset=1, num_bin=3: fix no-op, compact drops bin0.
+            Feat {
+                num_bin: 3,
+                offset: 1,
+                mfb: 0,
+                region: vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            },
+            // Test C — mfb=9 (>=num_bin), offset=0, num_bin=4: fix no-op, compact no-op.
+            Feat {
+                num_bin: 4,
+                offset: 0,
+                mfb: 9,
+                region: vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5],
+            },
+            // Test D — offset=5 (>=num_bin=3): compact zeros the whole region.
+            Feat {
+                num_bin: 3,
+                offset: 5,
+                mfb: 0,
+                region: vec![7.0, 7.0, 8.0, 8.0, 9.0, 9.0],
+            },
+            // Extra — mfb=1 (>0), offset=0, num_bin=2: a second reconstruct in the mix.
+            Feat {
+                num_bin: 2,
+                offset: 0,
+                mfb: 1,
+                region: vec![3.0, 9.0, /*mfb1 garbage*/ 77.0, 66.0],
+            },
+        ];
+
+        // Concatenate the RAW regions + record per-feature (slot_off, num_bin, offset, mfb).
+        let mut buf: Vec<f64> = Vec::new();
+        let mut params: Vec<(usize, u32, i32, u32)> = Vec::new();
+        for f in &feats {
+            assert_eq!(f.region.len(), 2 * f.num_bin as usize, "region length");
+            let slot_off = buf.len();
+            params.push((slot_off, f.num_bin, f.offset, f.mfb));
+            buf.extend_from_slice(&f.region);
+        }
+
+        // HOST reference: fix_histogram (the exported op) then compact, per feature,
+        // over a clone of the SAME RAW buffer.
+        let mut host = buf.clone();
+        for (&(slot_off, num_bin, offset, mfb), _f) in params.iter().zip(feats.iter()) {
+            let cells = 2 * num_bin as usize;
+            let region = &mut host[slot_off..slot_off + cells];
+            fix_histogram(region, mfb, sum_g, sum_h);
+            host_compact_histogram(region, offset);
+        }
+
+        // GPU path: the on-device fix+compact kernel over the SAME RAW buffer.
+        let gpu = fix_compact_f64_on(&hip, &buf, &params, sum_g, sum_h)
+            .expect("fix_compact_f64_on");
+
+        assert_eq!(gpu.len(), host.len(), "fix_compact length");
+        // BIT-EXACT: same f64 cells, same ascending fold order ⇒ identical bits.
+        if let Err(m) = compare_exact_f64_bits(&gpu, &host) {
+            panic!("GPU fix_compact != host fix+compact (NOT bit-exact): {m}");
+        }
+    }
 }
