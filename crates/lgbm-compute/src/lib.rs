@@ -313,7 +313,11 @@ impl Backend for RocmBackend {
         ordered_hessians: &[f32],
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError> {
-        kernels::histogram::construct_histograms_f64_on(
+        // GPU-fast path (kt8): parallel f32-atomic accumulation (one unit per row,
+        // all lanes busy) instead of the single-unit f64 fold. This moves the GPU
+        // path to the ~1e-6 ROCm gate (f32 atomics, nondeterministic add order) —
+        // by design the GPU's contract; the cpu anchor stays bit-exact.
+        kernels::histogram::construct_histograms_parallel_f32_on(
             client,
             binned,
             ordered_gradients,
