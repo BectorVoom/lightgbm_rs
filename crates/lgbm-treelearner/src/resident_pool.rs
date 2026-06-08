@@ -153,3 +153,83 @@ pub fn resident_eligible(
     }
     true
 }
+
+/// 260608-t3t — the FUSED directly-built-leaf SIZE GATE. The fused
+/// build+fix+compact+scan kernel (`Backend::build_fix_scan_resident`) collapses a
+/// directly-built leaf's construct(1)+fix(1)+scan(1) = 3 launches into 1, attacking
+/// the launch-bound regime the s2b profile found (~205 launches/tree). It targets
+/// the SMALL/MEDIUM band (`num_data < `[`RESIDENT_MIN_NUM_DATA`]) — exactly where the
+/// 3-launch resident chain LOSES to the host path (s2b: host wins at 2k/8k) — to ask
+/// whether collapsing to ONE launch flips that.
+///
+/// PROVENANCE: placeholder until the Task 3 bench sweep sets it data-drivenly. Set so
+/// the fused path is OFF by default at every band unless the bench proves a win; the
+/// kernel + oracle + `LGBM_FUSED_FORCE` stay landed for future use either way.
+pub const FUSED_MAX_NUM_DATA: i32 = 0;
+
+/// CONSERVATIVE / FAIL-SAFE FUSED directly-built-leaf eligibility predicate (260608-t3t).
+///
+/// The fused path is a PERF KNOB layered on the SAME correctness-gated numeric spine
+/// as [`resident_eligible`] (every fail-safe check below is identical — categorical /
+/// monotone / interaction / extra_trees / forced-splits / non-default
+/// smoothing-clamp / capture all force the host path). When eligible, directly-built
+/// leaves (root + smaller children) route through the single fused launch; the
+/// subtract-derived larger children KEEP subtract+scan, and large keeps the
+/// atomic-parallel resident chain. ANY non-spine feature/config ⇒ `false` ⇒ the
+/// byte-unchanged host path.
+///
+/// `LGBM_FUSED_FORCE` (read once per call) OVERRIDES the size threshold for benching:
+/// - `LGBM_FUSED_FORCE=0` → force OFF (host/resident path) even when eligible.
+/// - `LGBM_FUSED_FORCE=1` → force the FUSED path, bypassing only the SIZE threshold
+///   (still gated by every correctness check above).
+/// - unset / other → the `num_data <= `[`FUSED_MAX_NUM_DATA`] threshold decides.
+///
+/// NOTE: the fused gate and the resident gate are MUTUALLY EXCLUSIVE per leaf — the
+/// learner consults `fused_directly_built_eligible` FIRST; if it is true the directly
+/// built leaf uses the fused launch, otherwise it falls back to the existing resident
+/// / host routing (`resident_eligible`). The fused gate is correctness-equivalent to
+/// the resident gate (same fail-safe spine; both grow the same tree within the ~1e-6
+/// f32 contract), so this is purely a launch-count perf decision.
+pub fn fused_directly_built_eligible(
+    backend_supported: bool,
+    num_data: i32,
+    features: &[FeatureColumn],
+    constraints: &LearnerConstraints,
+    capture_snapshots: bool,
+    cfg: &GainConfig,
+) -> bool {
+    if !backend_supported {
+        return false;
+    }
+    if capture_snapshots {
+        return false;
+    }
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return false;
+    }
+    if !constraints.monotone_constraints.is_empty() {
+        return false;
+    }
+    if !constraints.interaction_constraints.is_empty() {
+        return false;
+    }
+    if constraints.extra_trees {
+        return false;
+    }
+    if constraints.forced_splits.is_some() {
+        return false;
+    }
+    if features.iter().any(|f| f.bin_type == BinType::Categorical) {
+        return false;
+    }
+
+    // ---- runtime override THEN the num_data size gate (perf routing only) ----
+    match std::env::var("LGBM_FUSED_FORCE").ok().as_deref() {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
+    }
+    // At/below the (Task-3-measured) crossover the fused single-launch path wins;
+    // above it the host/resident routing decides. Default placeholder OFF.
+    num_data <= FUSED_MAX_NUM_DATA
+}

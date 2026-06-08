@@ -1117,6 +1117,10 @@ pub fn build_fix_scan_fused_kernel(
     skip_default_bin: &Array<u32>,
     rev_count: &Array<i32>,
     fwd_count: &Array<i32>,
+    // 0|1 per feature — whether THIS feature is scanned (a gated-out feature still has
+    // its histogram BUILT+fixed+compacted, for the subtraction trick, but is NOT
+    // scanned: its 12-cell out window is left zeroed ⇒ host decodes is_splittable == 0).
+    scan_active: &Array<u32>,
     // Stride of a resident column = full train row count.
     num_data_stride: usize,
     // LEAF-LEVEL scalars (shared across the batch).
@@ -1208,45 +1212,58 @@ pub fn build_fix_scan_fused_kernel(
     }
 
     // ---- Stage 4: SCAN (shared split_scan_body, split.rs:144) ----
-    // Over the fixed+compacted region; hist_base = slot_off[f], out_base = f*12.
-    // The SAME leaf scalars as find_best_splits_fused_kernel (split.rs:976-996):
-    // the 2*kEpsilon-BUMPED sum_hessian + host min_gain_shift for the scan entry.
-    crate::kernels::split::split_scan_body(
-        hist,
-        slot_off[fi],
-        out,
-        f * 12u32,
-        nb,
-        off,
-        default_bin[fi],
-        skip_default_bin[fi],
-        use_l1,
-        min_data_in_leaf,
-        min_sum_hessian_in_leaf,
-        lambda_l1,
-        lambda_l2,
-        min_gain_shift,
-        sum_gradient_raw,
-        sum_hessian_bumped,
-        num_data,
-        rev_count[fi],
-        fwd_count[fi],
-    );
+    // Build/fix/compact above ran for EVERY feature (the complete histogram the
+    // subtraction trick needs). The SCAN runs only for SCAN-ACTIVE features (the spine
+    // subset that passed the learner's col-sampler / parent-splittability / interaction
+    // gates); a gated-out feature leaves its 12-cell out window ZEROED ⇒ the host
+    // decodes is_splittable == 0 (a no-split sentinel) and never selects it. Over the
+    // fixed+compacted region; hist_base = slot_off[f], out_base = f*12. The SAME leaf
+    // scalars as find_best_splits_fused_kernel (split.rs:976-996): the 2*kEpsilon-BUMPED
+    // sum_hessian + host min_gain_shift for the scan entry.
+    if scan_active[fi] != 0 {
+        crate::kernels::split::split_scan_body(
+            hist,
+            slot_off[fi],
+            out,
+            f * 12u32,
+            nb,
+            off,
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient_raw,
+            sum_hessian_bumped,
+            num_data,
+            rev_count[fi],
+            fwd_count[fi],
+        );
+    }
 }
 
 /// Host launcher for the FUSED build+fix+compact+scan kernel (260608-t3t).
 ///
-/// Drives [`build_fix_scan_fused_kernel`] in ONE launch over all `feats` features,
-/// returning BOTH the resident fixed+compacted f64 histogram `Handle` (kept on
-/// device for the subtraction trick) AND one [`SplitInfo`] per feature in input
-/// order. Mirrors the V5 validation + marshalling of
+/// Drives [`build_fix_scan_fused_kernel`] in ONE launch. `feats` is the FULL
+/// per-feature list (every feature in fpos order) — build + fix + compact run for
+/// EVERY feature so the returned resident histogram is COMPLETE (the subtraction
+/// trick derives the larger child from it). `scan_active[fpos]` selects which
+/// features are SCANNED (the spine subset that passed the learner's
+/// col-sampler / parent-splittability / interaction gates); gated-out features are
+/// BUILT but NOT scanned.
+///
+/// Returns BOTH the resident fixed+compacted f64 histogram `Handle` (kept on device)
+/// AND one [`SplitInfo`] per SCAN-ACTIVE feature, in scan-active order (matching the
+/// learner's `batched_feats`). Mirrors the V5 validation + marshalling of
 /// [`build_fix_compact_resident_f64_on`] AND the host pre-step + decode/accept-gate
 /// of the fused split scan (split.rs:1212-1311).
 ///
-/// `feats` carries the per-feature scan params + the fix params; the leaf RAW
-/// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2), and
-/// the launcher computes the 2*kEpsilon-BUMPED sum_hessian + min_gain_shift for the
-/// scan exactly as `find_best_splits_fused_inner` does.
+/// The leaf RAW (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX
+/// (Pitfall 2); the launcher computes the 2*kEpsilon-BUMPED sum_hessian +
+/// min_gain_shift for the scan exactly as `find_best_splits_fused_inner` does.
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] / [`ComputeError::LengthMismatch`] on degenerate
@@ -1266,7 +1283,10 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     leaf_rows: &[u32],
     gradients: &[f32],
     hessians: &[f32],
+    // FULL per-feature list (fpos order) — build+fix+compact covers ALL of them.
     feats: &[crate::kernels::split::BatchedSplitFeature],
+    // `scan_active[fpos]` — whether feature fpos is SCANNED (length == feats.len()).
+    scan_active: &[bool],
     cfg: &crate::gain::GainConfig,
     sum_gradient_raw: f64,
     sum_hessian_raw: f64,
@@ -1280,6 +1300,12 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
         let zeros64 = vec![0.0f64; slot_len];
         let h_f64 = client.create_from_slice(f64::as_bytes(&zeros64));
         return Ok((h_f64, slot_len, Vec::new()));
+    }
+    if scan_active.len() != feats.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: feats.len(),
+            actual: scan_active.len(),
+        });
     }
 
     // Leaf-level default-path + sum_hessian checks (identical to the fused split
@@ -1299,12 +1325,12 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
         });
     }
 
-    // Per-feature slot offsets ride on `feats`; the parallel `slot_off` slice (the
-    // pool's per-feature offsets) must agree where present (consistency guard).
+    // `feats` is the FULL per-feature list (fpos order), so it agrees positionally
+    // with the pool's `slot_off` layout (consistency guard).
     debug_assert!(
         slot_off.len() >= feats.len()
             && feats.iter().enumerate().all(|(i, f)| slot_off[i] == f.slot_off),
-        "slot_off slice must agree with feats[*].slot_off"
+        "feats[*].slot_off must agree positionally with the pool slot_off layout"
     );
 
     // Per-feature V5 validation + device-array assembly (BEFORE launch).
@@ -1317,8 +1343,9 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
     let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
     let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
-    for f in feats {
-        if f.na_as_missing {
+    let mut scan_active_a: Vec<u32> = Vec::with_capacity(n);
+    for (fpos, f) in feats.iter().enumerate() {
+        if f.na_as_missing && scan_active[fpos] {
             return Err(ComputeError::Runtime {
                 detail: "build_fix_scan_resident: na_as_missing not yet implemented".to_string(),
             });
@@ -1360,6 +1387,7 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
         skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
         rev_count_a.push(rev_count);
         fwd_count_a.push(fwd_count);
+        scan_active_a.push(if scan_active[fpos] { 1u32 } else { 0u32 });
     }
 
     // LEAF-LEVEL scalars computed ONCE (the 2*kEpsilon entry bump + min_gain_shift),
@@ -1396,6 +1424,7 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+    let h_scan = client.create_from_slice(u32::as_bytes(&scan_active_a));
 
     // SAFETY: cube `f < n` reads the resident column at `f*num_data_stride +
     // leaf_rows[k]` (leaf_rows ⊂ 0..num_data_stride keeps it in range; the resident
@@ -1425,6 +1454,7 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
             ArrayArg::from_raw_parts(h_skip, n),
             ArrayArg::from_raw_parts(h_rev, n),
             ArrayArg::from_raw_parts(h_fwd, n),
+            ArrayArg::from_raw_parts(h_scan, n),
             num_data_stride,
             sum_gradient_raw,
             sum_hessian_raw,
@@ -1444,10 +1474,17 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     let cells = f64::from_bytes(&bytes);
 
     // Decode with the SAME accept-gate as find_best_splits_fused_inner
-    // (split.rs:1277-1311). Push in input order.
+    // (split.rs:1277-1311). Only SCAN-ACTIVE features have a meaningful out window
+    // (gated-out features were built but not scanned ⇒ their window is zeroed ⇒
+    // is_splittable == 0). Push the active features' SplitInfos in scan-active order
+    // (matching the learner's `batched_feats`).
     let penalty = 1.0f64;
-    let mut splits = Vec::with_capacity(n);
+    let active_count = scan_active.iter().filter(|&&a| a).count();
+    let mut splits = Vec::with_capacity(active_count);
     for f in 0..n {
+        if !scan_active[f] {
+            continue;
+        }
         let dbase = f * 12;
         let is_splittable = cells[dbase] != 0.0;
         let raw_threshold = cells[dbase + 1] as u32;

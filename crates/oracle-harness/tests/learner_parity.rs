@@ -2126,4 +2126,89 @@ mod hip {
             resident_tree.leaf_value.len()
         );
     }
+
+    /// 260608-t3t — the FUSED directly-built-leaf path (`LGBM_FUSED_FORCE=1`) must grow
+    /// the SAME tree as the forced-host path. Directly-built leaves (root + smaller
+    /// children) route through the single `build_fix_scan_resident` launch (build + fix
+    /// + compact + scan); subtract-derived larger children keep subtract+scan. Because
+    /// the fused kernel's per-feature SplitInfo is BIT-EXACT to the host pipeline (the
+    /// fused==host kernel oracle) and the resident-RAW f32-atomic build is the only
+    /// ~1e-6 contributor (same as the resident path), the two trees must match
+    /// STRUCTURALLY bit-exact (topology / split_feature / threshold / decision_type) and
+    /// leaf-values within ~1e-6. If they diverge, the fused wiring changed the tree →
+    /// STOP (do NOT weaken the tol).
+    #[test]
+    fn learner_parity_fused_equals_host_tree_on_hip() {
+        let client = rocm_client();
+        let (features, g, h) = spine_corpus(3000, 8, 48);
+        let num_leaves = 31i32;
+        let max_depth = -1i32;
+
+        // FUSED path (eligible). The 3000-row corpus is below FUSED_MAX_NUM_DATA's
+        // (placeholder OFF) threshold, so force the fused path via LGBM_FUSED_FORCE=1
+        // (bypasses ONLY the size gate; every correctness check still applies).
+        let fused_backend = RocmBackend::with_resident(true);
+        let mut fused_learner =
+            SerialTreeLearner::new(&fused_backend, &client, cfg(), num_leaves, max_depth)
+                .with_features(features.clone());
+        // SAFETY: single-threaded within this test; set→train→unset is sequential.
+        unsafe { std::env::set_var("LGBM_FUSED_FORCE", "1") };
+        let fused_tree = fused_learner.train(&g, &h, true).expect("fused train ok");
+        unsafe { std::env::remove_var("LGBM_FUSED_FORCE") };
+
+        // FORCED HOST path (same RocmBackend f32-atomic build, host routing).
+        let host_backend = RocmBackend::with_resident(false);
+        let mut host_learner =
+            SerialTreeLearner::new(&host_backend, &client, cfg(), num_leaves, max_depth)
+                .with_features(features.clone());
+        let host_tree = host_learner.train(&g, &h, true).expect("host train ok");
+
+        // ---- Structural fields BIT-EXACT ----
+        assert_eq!(fused_tree.num_leaves, host_tree.num_leaves, "fused vs host: num_leaves");
+        assert_eq!(
+            fused_tree.split_feature, host_tree.split_feature,
+            "fused vs host: split_feature topology"
+        );
+        assert_eq!(
+            fused_tree.decision_type, host_tree.decision_type,
+            "fused vs host: decision_type"
+        );
+        assert_eq!(fused_tree.left_child, host_tree.left_child, "fused vs host: left_child");
+        assert_eq!(fused_tree.right_child, host_tree.right_child, "fused vs host: right_child");
+        assert_eq!(fused_tree.leaf_count, host_tree.leaf_count, "fused vs host: leaf_count");
+        assert_eq!(
+            fused_tree.internal_count, host_tree.internal_count,
+            "fused vs host: internal_count"
+        );
+        assert_eq!(fused_tree.threshold, host_tree.threshold, "fused vs host: threshold");
+
+        // ---- leaf values within ~1e-6 (the f32-atomic RAW build is the only gap) ----
+        assert_eq!(
+            fused_tree.leaf_value.len(),
+            host_tree.leaf_value.len(),
+            "fused vs host: leaf_value length"
+        );
+        let tol = 1e-6f64;
+        let mut max_abs = 0.0f64;
+        for (i, (&fv, &hv)) in fused_tree
+            .leaf_value
+            .iter()
+            .zip(host_tree.leaf_value.iter())
+            .enumerate()
+        {
+            let d = (fv - hv).abs();
+            max_abs = max_abs.max(d);
+            let denom = hv.abs().max(1.0);
+            assert!(
+                d / denom <= tol || d <= tol,
+                "fused vs host leaf {i}: fused={fv} host={hv} abs_diff={d} > {tol} \
+                 — the fused chain changed the tree (DO NOT weaken; investigate)"
+            );
+        }
+        eprintln!(
+            "fused==host tree equivalence: {} leaves, max_abs leaf diff = {max_abs:.3e} \
+             (within ~1e-6 ROCm contract)",
+            fused_tree.leaf_value.len()
+        );
+    }
 }

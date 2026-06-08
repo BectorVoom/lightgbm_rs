@@ -452,14 +452,17 @@ pub trait Backend {
     /// 260608-t3t: FUSED directly-built-leaf path — build + fix + compact + scan a
     /// leaf's per-feature histogram in ONE launch. Builds the leaf's histogram
     /// DEVICE-RESIDENT (sequential f64 fold ⇒ bit-exact), fixes+compacts it, and
-    /// scans it for every feature's best split — STORING the fixed+compacted f64
-    /// Handle into mirror slot `slot` (so `subtract_resident` can still derive the
-    /// larger child from it) AND returning one [`SplitInfo`] per `feats` entry in
-    /// input order. Collapses `build_resident_leaf` + `scan_resident_leaf` (3
-    /// launches) into 1. `fix_feats`-equivalent fields ride on `feats`; the leaf RAW
-    /// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2),
-    /// the launcher derives the 2*kEpsilon-bumped scan operand internally. Default:
-    /// typed error (never called on cpu — the fused gate is off there).
+    /// scans it for every SCAN-ACTIVE feature's best split — STORING the
+    /// fixed+compacted f64 Handle into mirror slot `slot` (so `subtract_resident` can
+    /// still derive the larger child from it) AND returning one [`SplitInfo`] per
+    /// SCAN-ACTIVE feature in order. `feats` is the FULL per-feature list (fpos order)
+    /// — build+fix+compact run for EVERY feature so the resident histogram is COMPLETE
+    /// for the subtraction trick — and `scan_active[fpos]` selects which features are
+    /// scanned (the spine subset that passed the learner's gates). Collapses
+    /// `build_resident_leaf` + `scan_resident_leaf` (3 launches) into 1. The leaf RAW
+    /// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2), the
+    /// launcher derives the 2*kEpsilon-bumped scan operand internally. Default: typed
+    /// error (never called on cpu — the fused gate is off there).
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the fused
@@ -475,6 +478,7 @@ pub trait Backend {
         _gradients: &[f32],
         _hessians: &[f32],
         _feats: &[BatchedSplitFeature],
+        _scan_active: &[bool],
         _cfg: &GainConfig,
         _sum_gradient_raw: f64,
         _sum_hessian_raw: f64,
@@ -1053,6 +1057,7 @@ impl Backend for RocmBackend {
         gradients: &[f32],
         hessians: &[f32],
         feats: &[BatchedSplitFeature],
+        scan_active: &[bool],
         cfg: &GainConfig,
         sum_gradient_raw: f64,
         sum_hessian_raw: f64,
@@ -1077,6 +1082,7 @@ impl Backend for RocmBackend {
             gradients,
             hessians,
             feats,
+            scan_active,
             cfg,
             sum_gradient_raw,
             sum_hessian_raw,

@@ -2007,6 +2007,8 @@ mod hip {
                 run_forward: run_forward[fpos],
             })
             .collect();
+        // All features scan-active (the kernel oracle exercises the full scan path).
+        let scan_active = vec![true; feats.len()];
         let (hist_handle, len, fused_splits) = build_fix_scan_resident_f64_on(
             &hip,
             upload_resident_columns(&hip, &feature_bins),
@@ -2018,6 +2020,7 @@ mod hip {
             &gradients,
             &hessians,
             &feats,
+            &scan_active,
             &cfg,
             sum_g,
             sum_h,
