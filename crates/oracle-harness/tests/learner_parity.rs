@@ -1909,28 +1909,25 @@ fn learner_parity_forced_nested() {
     run_constraints_cell("forced_nested");
 }
 
-/// ADV-04 extra-trees RNG-replay: the SAME extra_seed must reproduce the real
+/// ADV-04 extra-trees RNG-replay: the SAME extra_seed reproduces the real
 /// binary's randomized-threshold tree bit-exact (the RNG-replay candidate).
 ///
-/// DEFERRED (DEF-07-11-03): the per-feature `Random(extra_seed + i)` +
-/// `NextInt(0, num_bin-2)` randomized-threshold mechanism is wired and
-/// DETERMINISTIC per seed (unit-tested: same seed ⇒ identical tree), but the
-/// realized RNG draw SEQUENCE diverges from lib_lightgbm's `meta_->rand` — the
-/// grown tree differs by ±1 leaf (seed6: rust 4 vs golden 3; seed9: rust 3 vs
-/// golden 4 — a SWAP, indicating an off-by-one in the per-(feature,leaf-scan) draw
-/// timing/order vs the C++ `BeforeNumerical` call sequence). RNG-replay fidelity
-/// needs a source-built `lib_lightgbm` `meta_->rand` draw trace to align the exact
-/// draw order. Assertion UNCHANGED; ignore-pending that trace.
+/// DEF-07-11-03 CLOSED (07-debug, source-built FP/RNG trace): the per-feature
+/// `Random(extra_seed + i)` + `NextInt(0, num_bin-2)` mechanism was correct, but the
+/// seed offset `i` must be the DATASET INNER feature index (feature_histogram.hpp:
+/// 1450), which LightGBM's feature bundling (dataset.cpp:387-406) REVERSES vs the
+/// real/sidecar column order for these dense corpora — confirmed by a source-built
+/// trace (`CPP_MAP inner=0 real=1`). Seeding by the inner (reversed) index aligns
+/// each feature's LCG stream with C++'s `meta_->rand`, fixing the root structure
+/// flip (seed6 4→3 leaves; seed9 3→4). The residual last-ULP leaf value was the
+/// same RAW-vs-`-kEpsilon` output-operand bug as DEF-07-11-01/02, fixed in
+/// `find_best_split_rand`. Both cells now bit-exact; no tolerance weakened.
 #[test]
-#[ignore = "DEF-07-11-03: extra-trees RNG draw-sequence alignment vs lib_lightgbm meta_->rand \
-            (mechanism deterministic + unit-tested); needs a source-built rand draw trace"]
 fn learner_parity_extra_trees_seed6() {
     run_constraints_cell("extra_trees_seed6");
 }
 
 #[test]
-#[ignore = "DEF-07-11-03: extra-trees RNG draw-sequence alignment vs lib_lightgbm meta_->rand \
-            (mechanism deterministic + unit-tested); needs a source-built rand draw trace"]
 fn learner_parity_extra_trees_seed9() {
     run_constraints_cell("extra_trees_seed9");
 }

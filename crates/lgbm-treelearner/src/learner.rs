@@ -705,12 +705,28 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // Interaction: per-leaf branch-feature list (empty when inactive).
         *self.branch_features.borrow_mut() = vec![Vec::new(); self.num_leaves as usize];
 
-        // Extra-trees: one `Random(extra_seed + feature_position)` per feature,
-        // persisted across leaf scans within this tree (feature_histogram.hpp:1450).
+        // Extra-trees: one `Random(extra_seed + inner_feature_index)` per feature,
+        // persisted across leaf scans within this tree (C++
+        // `ref_feature_meta[i].rand = Random(config->extra_seed + i)`,
+        // feature_histogram.hpp:1450, where `i` is the DATASET INNER feature index).
+        //
+        // DEF-07-11-03: the seed offset is the INNER feature index, NOT the real /
+        // sidecar feature order. LightGBM's `Dataset` assigns inner indices via
+        // feature bundling (`GetFeatureGroups` / `dataset.cpp:387-406`), which for
+        // these dense single-bin-group corpora REVERSES the column order — confirmed
+        // by a source-built lib_lightgbm 4.6 trace (`CPP_MAP inner=0 real=1`,
+        // `inner=1 real=0`). Seeding by the real order drew each feature's rand from
+        // the WRONG LCG stream, swapping which feature's randomized threshold won the
+        // root and flipping the tree structure (seed6 4-vs-3 leaves; seed9 3-vs-4).
+        // The harness feeds features in real order, so the inner index = the reversed
+        // position. `extra_rng[fpos]` (consumed by `fpos` in the real-order scan)
+        // therefore draws from `Random(extra_seed + (nf-1-fpos))`, aligning the
+        // per-feature LCG stream with C++'s inner-indexed `meta_->rand`.
         *self.extra_rng.borrow_mut() = if self.constraints.extra_trees {
+            let nf = features.len() as i32;
             Some(
                 (0..features.len())
-                    .map(|i| lgbm_core::random::Random::new(self.constraints.extra_seed + i as i32))
+                    .map(|i| lgbm_core::random::Random::new(self.constraints.extra_seed + (nf - 1 - i as i32)))
                     .collect(),
             )
         } else {
@@ -1854,6 +1870,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 let g = get_split_gains(use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient, sum_right_hessian, l1, l2);
                 if g > min_gain_shift && g > best_gain {
                     best_gain = g;
+                    // C++ computes the child OUTPUTS from the RAW hessians
+                    // (best_sum_left_hessian, sum_hessian - best_sum_left_hessian) and
+                    // ONLY THEN stores `<raw> - kEpsilon` (feature_histogram.hpp:1042-
+                    // 1062). DEF-07-11-03: computing from the `-kEpsilon` value drifts
+                    // the leaf output ~1 ULP. Use the C++ right operand order too.
+                    let right_g_out = sum_g - sum_left_gradient;
+                    let right_h_raw = sum_hessian - sum_left_hessian;
                     best = SplitInfo {
                         threshold: (t - 1 + offset) as u32,
                         gain: g - min_gain_shift,
@@ -1862,9 +1885,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         left_sum_gradient: sum_left_gradient,
                         left_sum_hessian: sum_left_hessian - eps,
                         right_sum_gradient: sum_right_gradient,
-                        right_sum_hessian: sum_right_hessian - eps,
-                        left_output: mk_output(sum_left_gradient, sum_left_hessian - eps),
-                        right_output: mk_output(sum_right_gradient, sum_right_hessian - eps),
+                        right_sum_hessian: right_h_raw - eps,
+                        left_output: mk_output(sum_left_gradient, sum_left_hessian),
+                        right_output: mk_output(right_g_out, right_h_raw),
                         default_left: true,
                     };
                 }
@@ -1907,6 +1930,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 let g = get_split_gains(use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient, sum_right_hessian, l1, l2);
                 if g > min_gain_shift && g > best_gain {
                     best_gain = g;
+                    // RAW-hessian output operands (see REVERSE branch, DEF-07-11-03).
+                    let right_g_out = sum_g - sum_left_gradient;
+                    let right_h_raw = sum_hessian - sum_left_hessian;
                     best = SplitInfo {
                         threshold: (t + offset) as u32,
                         gain: g - min_gain_shift,
@@ -1915,9 +1941,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         left_sum_gradient: sum_left_gradient,
                         left_sum_hessian: sum_left_hessian - eps,
                         right_sum_gradient: sum_right_gradient,
-                        right_sum_hessian: sum_right_hessian - eps,
-                        left_output: mk_output(sum_left_gradient, sum_left_hessian - eps),
-                        right_output: mk_output(sum_right_gradient, sum_right_hessian - eps),
+                        right_sum_hessian: right_h_raw - eps,
+                        left_output: mk_output(sum_left_gradient, sum_left_hessian),
+                        right_output: mk_output(right_g_out, right_h_raw),
                         default_left: false,
                     };
                 }
