@@ -150,6 +150,93 @@ impl Booster {
         };
         Ok(values.into_pyarray(py))
     }
+
+    // ---- persistence (D-10) : C++-compatible model text I/O + pickle --------
+
+    /// Serialize the model to LightGBM-compatible v4 model text (mirrors
+    /// `lightgbm.Booster.model_to_string`). Delegates to the 08-01 facade
+    /// [`lgbm::Booster::model_to_string`] (the Phase-3 byte-stable formatter).
+    fn model_to_string(&self) -> String {
+        self.inner.model_to_string()
+    }
+
+    /// Write the model text to `filename` (mirrors `lightgbm.Booster.save_model`).
+    /// Delegates to the 08-01 facade [`lgbm::Booster::save_model`]; an I/O failure
+    /// is mapped to a typed `lightgbm_rs.LightGBMError` (never a panic, T-08-08-02).
+    ///
+    /// # Errors
+    /// `lightgbm_rs.LightGBMError` wrapping the I/O failure detail.
+    fn save_model(&self, filename: &str) -> PyResult<()> {
+        self.inner
+            .save_model(std::path::Path::new(filename))
+            .map_err(LgbmErrorWrap)?;
+        Ok(())
+    }
+
+    /// Reconstruct a [`Booster`] from LightGBM model text (mirrors
+    /// `lightgbm.Booster(model_str=...)`). The untrusted text is parsed via the
+    /// validated `lgbm-model` loader inside the 08-01 facade
+    /// [`lgbm::Booster::model_from_string`]; malformed text → a typed
+    /// `lightgbm_rs.LightGBMError` (Security V5, T-08-08-01) — never a panic.
+    ///
+    /// # Errors
+    /// `lightgbm_rs.LightGBMError` when the text fails to parse.
+    #[staticmethod]
+    fn from_model_string(model_str: &str) -> PyResult<Self> {
+        let inner = FacadeBooster::model_from_string(model_str).map_err(LgbmErrorWrap)?;
+        Ok(Booster { inner })
+    }
+
+    /// Reconstruct a [`Booster`] from a model text FILE (mirrors
+    /// `lightgbm.Booster(model_file=...)`). The file is read (a read failure →
+    /// typed error, T-08-08-02) then parsed via the validated loader exactly like
+    /// [`from_model_string`](Self::from_model_string).
+    ///
+    /// # Errors
+    /// `lightgbm_rs.LightGBMError` on a file-read failure or malformed model text.
+    #[staticmethod]
+    fn from_model_file(model_file: &str) -> PyResult<Self> {
+        let text = std::fs::read_to_string(model_file).map_err(|e| {
+            crate::error::LightGBMError::new_err(format!(
+                "failed to read model file '{model_file}': {e}"
+            ))
+        })?;
+        let inner = FacadeBooster::model_from_string(&text).map_err(LgbmErrorWrap)?;
+        Ok(Booster { inner })
+    }
+
+    /// Pickle support (D-10): return the model string as the pickle state. A NEW
+    /// `Booster` is created via `__reduce__` (`from_model_string`) and this state
+    /// is replayed into it by `__setstate__`.
+    ///
+    /// SECURITY NOTE: a pickled model string is only as trustworthy as its source
+    /// — unpickling parses it through the validated loader, but `pickle` itself is
+    /// NOT a security boundary (standard caveat, T-08-08-03). Never unpickle a
+    /// model from an untrusted party.
+    fn __getstate__(&self) -> String {
+        self.inner.model_to_string()
+    }
+
+    /// Pickle support (D-10): rebuild `inner` from the model-string state via the
+    /// validated loader. Malformed state → typed `LightGBMError`, never a panic.
+    ///
+    /// # Errors
+    /// `lightgbm_rs.LightGBMError` when the pickled model text fails to parse.
+    fn __setstate__(&mut self, state: &str) -> PyResult<()> {
+        self.inner = FacadeBooster::model_from_string(state).map_err(LgbmErrorWrap)?;
+        Ok(())
+    }
+
+    /// Pickle entry point (D-10): `__reduce__` returns `(from_model_string, (state,))`
+    /// so unpickling reconstructs the `Booster` through the validated text loader
+    /// (the `#[pyclass]` has no `#[new]`, so the default reduce cannot rebuild it).
+    /// `__setstate__` is then replayed by the pickle protocol (a no-op re-parse here,
+    /// kept for the explicit getstate/setstate contract D-10 specifies).
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(Py<PyAny>, (String,))> {
+        let cls = py.get_type::<Booster>();
+        let ctor = cls.getattr("from_model_string")?;
+        Ok((ctor.unbind(), (self.inner.model_to_string(),)))
+    }
 }
 
 /// Train a [`Booster`] from a `params` dict and a [`Dataset`] (mirrors
