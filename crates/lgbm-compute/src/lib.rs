@@ -219,7 +219,7 @@ impl Backend for CpuBackend {
     #[allow(clippy::too_many_arguments)]
     fn find_best_split(
         &self,
-        client: &ComputeClient<Self::Runtime>,
+        _client: &ComputeClient<Self::Runtime>,
         hist: &[f64],
         cfg: &GainConfig,
         num_bin: u32,
@@ -233,8 +233,10 @@ impl Backend for CpuBackend {
         sum_hessian: f64,
         num_data: i32,
     ) -> Result<SplitInfo, ComputeError> {
-        kernels::split::find_best_split_cpu(
-            client,
+        // R2: native f64 scan — bit-identical to the single-unit find_best_split_
+        // kernel, without the per-(feature,leaf) cubecl launch. The cubecl path
+        // stays in find_best_split_cpu for kernel-parity / ROCm-mirror tests.
+        kernels::split::find_best_split_cpu_native(
             hist,
             cfg,
             num_bin,

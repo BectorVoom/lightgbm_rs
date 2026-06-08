@@ -190,7 +190,7 @@ pub fn find_best_split_kernel(
             // never drops below `t_end ∈ {0,1}`, so this is a strict no-op there.
             let in_range = t >= (1 - offset);
             // skip default bin (:864-868) — a `continue`, does NOT stop the scan.
-            let skip = skip_def && (t + offset) == default_bin;
+            let skip = skip_def && (t + offset) == default_bin as i32;
             // Accumulate only when in range, not skipped and not already stopped.
             let active = in_range && !skip && !done;
             // Branchless clamp (cubecl-cpu mis-lowers nested-`if`): a negative `t`
@@ -258,7 +258,7 @@ pub fn find_best_split_kernel(
         let mut done = false;
 
         for t in 0..count {
-            let skip = skip_def && (t + offset) == default_bin;
+            let skip = skip_def && (t + offset) == default_bin as i32;
             let active = !skip && !done;
             // t >= 0 always here (range starts at 0; NA_AS_MISSING=0 path).
             let bi = (t as usize) * 2;
@@ -396,7 +396,7 @@ pub fn find_best_split_kernel_f32(
             // cannot wrap `(t as usize)` into an OOB read (WR-02). No-op for the
             // valid offset∈{0,1} cases.
             let in_range = t >= (1 - offset);
-            let skip = skip_def && (t + offset) == default_bin;
+            let skip = skip_def && (t + offset) == default_bin as i32;
             let active = in_range && !skip && !done;
             let t_safe = select(t < 0, 0i32, t);
             let bi = (t_safe as usize) * 2;
@@ -448,7 +448,7 @@ pub fn find_best_split_kernel_f32(
         let mut done = false;
 
         for t in 0..count {
-            let skip = skip_def && (t + offset) == default_bin;
+            let skip = skip_def && (t + offset) == default_bin as i32;
             let active = !skip && !done;
             let bi = (t as usize) * 2;
             let g = hist[bi];
@@ -728,6 +728,252 @@ pub fn find_best_split_cpu(
             left_output,
             right_output,
             default_left,
+        })
+    } else {
+        Ok(SplitInfo::none())
+    }
+}
+
+/// **Native** host f64 best-split scan — the production cpu-anchor path (R2).
+///
+/// Bit-IDENTICAL to [`find_best_split_cpu`] (the single-unit
+/// `find_best_split_kernel`): the SAME host pre-step (V5 validation, the
+/// `2*kEpsilon` entry bump, `min_gain_shift`), the SAME REVERSE+FORWARD scan with
+/// the SAME gate ORDER / eps placements / operand orders, and the SAME decode +
+/// accept-gate — but run as plain Rust instead of a `CubeDim::new_1d(1)` cubecl
+/// launch, dropping the fixed ~20–50µs/call dispatch cost (this op runs once per
+/// feature per leaf, the other half of the per-(feature,leaf) launch overhead
+/// after `construct_histograms`).
+///
+/// The `select(c, a, b)` branchless encoding the kernel needs for cubecl-cpu's
+/// MLIR lowering becomes plain `if` here; the arithmetic is unchanged
+/// (`sum += select(active, x, 0.0)` ≡ `if active { sum += x }` since `+ 0.0` is a
+/// no-op, and the gain primitives are pure). `find_best_split_cpu` is retained for
+/// the kernel-parity / ROCm-mirror tests; the f32 hip path is untouched.
+///
+/// # Errors
+/// Same as [`find_best_split_cpu`] (V5 validation, deferred `na_as_missing`,
+/// non-default smoothing/clamp).
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_split_cpu_native(
+    hist: &[f64],
+    cfg: &GainConfig,
+    num_bin: u32,
+    offset: i32,
+    default_bin: u32,
+    _most_freq_bin: u32,
+    skip_default_bin: bool,
+    na_as_missing: bool,
+    run_forward: bool,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> Result<SplitInfo, ComputeError> {
+    use crate::gain::{calculate_splitted_leaf_output as calc_out, get_leaf_gain, get_split_gains};
+
+    // ---- V5 boundary validation (identical to find_best_split_cpu) ----
+    if na_as_missing {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                     implemented"
+                .to_string(),
+        });
+    }
+    if num_bin == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split: num_bin must be > 0".to_string(),
+        });
+    }
+    let expected = 2usize
+        .checked_mul(num_bin as usize)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!("num_bin {num_bin} overflows the histogram length"),
+        })?;
+    if hist.len() != expected {
+        return Err(ComputeError::LengthMismatch {
+            expected,
+            actual: hist.len(),
+        });
+    }
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split: sum_hessian must be > 0 (cnt_factor divides by it)"
+                .to_string(),
+        });
+    }
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_split: max_delta_step / path_smooth are Phase-7+ scope \
+                     (only the default 0.0 path is transcribed)"
+                .to_string(),
+        });
+    }
+
+    // ---- host pre-step: 2*kEpsilon bump + min_gain_shift (verbatim) ----
+    let two_eps = 2.0 * f64::from(K_EPSILON);
+    let sum_hessian_bumped = sum_hessian + two_eps;
+    let use_l1 = cfg.use_l1();
+    let gain_shift = get_leaf_gain(
+        use_l1,
+        sum_gradient,
+        sum_hessian_bumped,
+        cfg.lambda_l1,
+        cfg.lambda_l2,
+    );
+    let min_gain_shift = gain_shift + cfg.min_gain_to_split;
+
+    let num_bin_i = num_bin as i32;
+    let rev_count = (num_bin_i - 1).max(0);
+    let fwd_count = if run_forward {
+        (num_bin_i - 1 - offset).max(0)
+    } else {
+        0
+    };
+
+    // `Common::RoundInt(x) = (int)(x + 0.5f)` — the 0.5f widens to f64 exactly, the
+    // cast truncates toward zero (matches `i32::cast_from` in the kernel).
+    let round_int = |x: f64| -> i32 { (x + f64::from(0.5f32)) as i32 };
+
+    let l1 = cfg.lambda_l1;
+    let l2 = cfg.lambda_l2;
+    let cnt_factor = f64::from(num_data) / sum_hessian_bumped;
+    let min_sum_hessian_in_leaf = cfg.min_sum_hessian_in_leaf;
+    let min_data_in_leaf = cfg.min_data_in_leaf;
+
+    // Best-split running state — same literal inits as the kernel.
+    let mut best_sum_left_gradient = 0.0f64;
+    let mut best_sum_left_hessian = 0.0f64;
+    let mut best_gain = 0.0f64;
+    let mut best_left_count = 0i32;
+    let mut best_threshold = 0i32;
+    let mut is_splittable = false;
+    let mut best_default_left = true; // REVERSE default
+
+    // ===================== REVERSE branch (:854-936) =====================
+    {
+        let mut sum_right_gradient = 0.0f64;
+        let mut sum_right_hessian = f64::from(K_EPSILON);
+        let mut right_count = 0i32;
+        let t_start = num_bin_i - 1 - offset;
+        let mut done = false;
+        for k in 0..rev_count {
+            let t = t_start - k;
+            let in_range = t >= (1 - offset);
+            let skip = skip_default_bin && (t + offset) == default_bin as i32;
+            let active = in_range && !skip && !done;
+            if active {
+                // `active` implies `in_range` (t >= 1-offset >= 0 for offset∈{0,1}).
+                let bi = (t as usize) * 2;
+                sum_right_gradient += hist[bi];
+                sum_right_hessian += hist[bi + 1];
+                right_count += round_int(hist[bi + 1] * cnt_factor);
+            }
+            // Gates computed EVERY iteration (the running sums are unchanged when
+            // inactive); `done` is sticky and gates later iterations.
+            let left_count = num_data - right_count;
+            let sum_left_hessian = sum_hessian_bumped - sum_right_hessian;
+            let sum_left_gradient = sum_gradient - sum_right_gradient;
+            let cont =
+                right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+            let brk = left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+            done = done || (active && !cont && brk);
+            let consider = active && !cont && !done;
+            if consider {
+                let current_gain = get_split_gains(
+                    use_l1,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                );
+                if current_gain > min_gain_shift {
+                    is_splittable = true;
+                    if current_gain > best_gain {
+                        best_left_count = left_count;
+                        best_sum_left_gradient = sum_left_gradient;
+                        best_sum_left_hessian = sum_left_hessian;
+                        best_threshold = t - 1 + offset; // left<=thr, right>thr (:933)
+                        best_gain = current_gain;
+                        best_default_left = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ===================== FORWARD branch (:937-1029) ====================
+    {
+        let mut sum_left_gradient = 0.0f64;
+        let mut sum_left_hessian = f64::from(K_EPSILON);
+        let mut left_count = 0i32;
+        let mut done = false;
+        for t in 0..fwd_count {
+            let skip = skip_default_bin && (t + offset) == default_bin as i32;
+            let active = !skip && !done;
+            if active {
+                let bi = (t as usize) * 2;
+                sum_left_gradient += hist[bi];
+                sum_left_hessian += hist[bi + 1];
+                left_count += round_int(hist[bi + 1] * cnt_factor);
+            }
+            let right_count = num_data - left_count;
+            let sum_right_hessian = sum_hessian_bumped - sum_left_hessian;
+            let sum_right_gradient = sum_gradient - sum_left_gradient;
+            let cont =
+                left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+            let brk = right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+            done = done || (active && !cont && brk);
+            let consider = active && !cont && !done;
+            if consider {
+                let current_gain = get_split_gains(
+                    use_l1,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                );
+                if current_gain > min_gain_shift {
+                    is_splittable = true;
+                    if current_gain > best_gain {
+                        best_left_count = left_count;
+                        best_sum_left_gradient = sum_left_gradient;
+                        best_sum_left_hessian = sum_left_hessian;
+                        best_threshold = t + offset; // forward records t+offset (:1025)
+                        best_gain = current_gain;
+                        best_default_left = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- finalization (feature_histogram.hpp:1031-1056), same operand orders ----
+    let eps = f64::from(K_EPSILON);
+    let left_output = calc_out(use_l1, best_sum_left_gradient, best_sum_left_hessian, l1, l2);
+    let right_sum_gradient = sum_gradient - best_sum_left_gradient;
+    let right_sum_hessian = sum_hessian_bumped - best_sum_left_hessian;
+    let right_output = calc_out(use_l1, right_sum_gradient, right_sum_hessian, l1, l2);
+
+    // Accept gate (:1031): is_splittable && best_gain > -inf (finite). Reported
+    // gain is best_gain - min_gain_shift (penalty == 1).
+    if is_splittable && best_gain > f64::NEG_INFINITY {
+        Ok(SplitInfo {
+            threshold: best_threshold as u32,
+            gain: best_gain - min_gain_shift,
+            left_count: best_left_count,
+            right_count: num_data - best_left_count,
+            left_sum_gradient: best_sum_left_gradient,
+            left_sum_hessian: best_sum_left_hessian - eps, // (:1042)
+            right_sum_gradient,
+            right_sum_hessian: right_sum_hessian - eps, // (:1053)
+            left_output,
+            right_output,
+            default_left: best_default_left,
         })
     } else {
         Ok(SplitInfo::none())
