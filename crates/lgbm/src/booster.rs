@@ -1140,8 +1140,16 @@ fn train_inner_columns_full(
         }
 
         ran_iters = it + 1;
-        iter_scores.push(snap.score.clone());
-        iter_grad_hess.push((snap.gradients.clone(), snap.hessians.clone()));
+        // Move the per-iter snapshots into the golden-replay history instead of
+        // cloning them: `snap` is consumed by these moves (`snap.gradients` /
+        // `snap.hessians` have no later use, and the training-metric eval below now
+        // reads the just-pushed `iter_scores` element). `snap.score` is otherwise
+        // double-allocated — `train_one_iter` already `to_vec()`s it (gbdt.rs:911)
+        // and the previous `.clone()` here allocated it a second time. Pure alloc
+        // reduction; the retained data is byte-identical (parity-neutral).
+        iter_scores.push(snap.score);
+        iter_grad_hess.push((snap.gradients, snap.hessians));
+        let cur_score = iter_scores.last().expect("pushed above");
 
         // Incremental valid-score update: predict the trees grown THIS iter over the
         // valid rows (class-major), adding to the running valid_score.
@@ -1175,13 +1183,13 @@ fn train_inner_columns_full(
         // Training metrics: history is metric_freq-gated (MET-02 unchanged).
         if do_eval && provide_train {
             for (mi, m) in metrics.iter().enumerate() {
-                let v = m.eval(&snap.score, corpus_labels)?;
+                let v = m.eval(cur_score, corpus_labels)?;
                 // A custom-metric (feval) key is resolved lazily from the closure
                 // (the placeholder "custom" set at history-setup is overwritten on
                 // the first eval with the user-supplied name) so the recorded
                 // history key matches the user's metric name (PYB-04).
                 if matches!(m, EvalMetric::Custom(_)) {
-                    let name = m.resolved_name(&snap.score, corpus_labels);
+                    let name = m.resolved_name(cur_score, corpus_labels);
                     legacy_eval_history[mi].0 = name.clone();
                     train_eval_history[mi].0 = format!("training {name}");
                 }
