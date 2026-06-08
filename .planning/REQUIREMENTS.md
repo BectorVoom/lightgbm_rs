@@ -211,10 +211,10 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | ADV-05 | Phase 7 | Complete |
 | ADV-06 | Phase 7 | Complete |
 | ADV-07 | Phase 7 | Complete |
-| PYB-01 | Phase 8 | In Progress (08-01: Rust facade enabling slice — raw→bin→train + Booster methods; Python binding pending 08-02+) |
+| PYB-01 | Phase 8 | Complete (08-02 PyO3 Booster/Dataset/train, GIL released, A/B parity vs lightgbm 4.6 at 1e-6; 08-08 persistence) |
 | PYB-02 | Phase 8 | Complete |
-| PYB-03 | Phase 8 | Complete |
-| PYB-04 | Phase 8 | In Progress (08-01: custom-metric feval eval-history hook + refit facade method; Python callbacks pending 08-06) |
+| PYB-03 | Phase 8 | Complete (08-07 sklearn estimators + callbacks/cv; LGBMRanker lambdarank training deferred — objective not in _core) |
+| PYB-04 | Phase 8 | Complete (08-06 Python custom objective/metric callbacks + Booster.refit, custom-objective A/B at 1e-6) |
 
 **Coverage:**
 
