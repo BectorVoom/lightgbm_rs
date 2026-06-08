@@ -162,10 +162,21 @@ DEF-07-02.
 
 ## DEF-07-13-01 — quantile bagged-renew structural divergence (`quantile_bag1_es0_bfa0`)
 
-> **STATUS: ROOT-CAUSED, OPEN — needs an architectural GBDT-loop change (Rule 4).**
-> (07-debug, 2026-06-08, Python-wheel oracle.) DISTINCT from the closed DEF-07-02 count
-> bugs and from the closed DEF-07-11 ULP/RNG knife-edges — this is a boosting-LOOP
-> tree-emission policy divergence, surfaced as an architectural decision.
+> **STATUS: RESOLVED (2026-06-08, plan 07-14).** The proposed architectural fix below
+> was implemented C++-faithfully: `GBDT::train_one_iter` now sets `should_continue` only
+> on a real split, and on a NON-first no-split bagged round POPS the round's constant
+> trees + does NOT advance `iter` (mirroring `gbdt.cpp:406-447`); the wheel-driver
+> bookkeeping in `crates/lgbm/src/booster.rs` skips the popped round (no duplicate
+> `iter_scores` push; `best_iteration` = emitted count). Commits `824d30f` (fix),
+> `2dfb4f9` (diagnostic), `b560d13` (un-ignore). `quantile_loop_matrix` now grows 10
+> trees `[1,2,3,3,3,3,3,3,2,3]` (wheel tree4 ≡ Rust tree5, bit-exact) and is un-`#[ignore]`d.
+> The cross-variant no-regression gate stayed bit-exact GREEN (DART/GOSS/RF/all bagging +
+> first-iter baseline + Family-A/B); full `cargo test --workspace` = 0 failed, **0 ignored**.
+> Root-cause evidence: `.planning/debug/resolved/remaining-ignored-cells.md`; plan/summary
+> `07-14-PLAN.md` / `07-14-SUMMARY.md`.
+>
+> _(Historical OPEN framing, superseded: "ROOT-CAUSED, OPEN — needs an architectural
+> GBDT-loop change (Rule 4) ... a boosting-LOOP tree-emission policy divergence.")_
 
 - **Affected (ignored) cell:** `quantile_loop_matrix`, bagged sub-cell `quantile_bag1_es0_bfa0`
   only. The non-bagged `quantile_alpha_axis` + the quantile SPINE are GREEN.
