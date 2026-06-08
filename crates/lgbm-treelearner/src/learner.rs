@@ -1450,38 +1450,37 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return;
         }
         let leaf_rows = data_partition.indices_in_leaf(leaf);
-        // Scratch gather buffers, allocated once per call and REUSED across every
-        // feature (each feature gathers exactly `leaf_rows.len()` rows). Parity-
-        // neutral: identical values pushed in identical order into
-        // `construct_histograms` — only the per-feature allocation churn is removed
-        // (3 allocations per leaf instead of 3×num_features).
-        let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
-        let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
-        let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+        // BATCHED per-leaf histogram build (260608-lad): the backend builds ALL
+        // features' RAW histograms in one call (CPU: the per-feature gather+construct
+        // loop, bit-exact; GPU: one batched kernel launch + device-resident bins).
+        let feature_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
+        let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
+        let raw = self
+            .backend
+            .build_leaf_histograms_raw(
+                self.client,
+                &feature_bins,
+                &num_bins,
+                slot_off,
+                buf.len(),
+                leaf_rows,
+                gradients,
+                hessians,
+            )
+            .expect("build_leaf_histograms_raw on a validated leaf cannot fail");
+        // Host-side FixHistogram + compaction per feature (they read this leaf's
+        // sums + the per-feature compaction offset — kept in the learner, byte-for-
+        // byte the same ops in the same order as before).
         for (fpos, f) in features.iter().enumerate() {
             let cells = 2 * f.num_bin as usize;
-            let region = &mut buf[slot_off[fpos]..slot_off[fpos] + cells];
-            // ORDERED per-feature gradient/hessian for this leaf's rows (the C++
-            // ordered fold — never reordered/parallelized).
-            ord_bins.clear();
-            ord_g.clear();
-            ord_h.clear();
-            for &row in leaf_rows {
-                ord_bins.push(f.bins[row as usize]);
-                ord_g.push(gradients[row as usize]);
-                ord_h.push(hessians[row as usize]);
-            }
-            let mut hist = self
-                .backend
-                .construct_histograms(self.client, &ord_bins, &ord_g, &ord_h, f.num_bin)
-                .expect("construct_histograms on a validated leaf cannot fail");
+            let mut hist = raw[slot_off[fpos]..slot_off[fpos] + cells].to_vec();
             // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
             // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
             crate::fix_histogram::fix_histogram(&mut hist, f.most_freq_bin, sum_g, sum_h);
             // COMPACTED layout (D-09): shift real-bin `c+offset` into cell `c`,
             // zero the dropped tail. No-op for offset==0.
             compact_histogram(&mut hist, f.offset);
-            region.copy_from_slice(&hist);
+            buf[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&hist);
         }
     }
 

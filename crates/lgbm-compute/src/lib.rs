@@ -180,6 +180,59 @@ pub trait Backend {
         parent: &[f64],
         child: &[f64],
     ) -> Result<Vec<f64>, ComputeError>;
+
+    /// Build the RAW (pre-FixHistogram, pre-compact) per-feature histograms for ONE
+    /// leaf's rows, concatenated into a single `slot_len`-cell f64 buffer (feature
+    /// `fpos` occupies `[slot_off[fpos], slot_off[fpos] + 2*num_bins[fpos])`). This
+    /// is the batched per-leaf abstraction seam (260608-lad): the learner calls it
+    /// ONCE per leaf instead of looping `construct_histograms` per feature.
+    ///
+    /// The DEFAULT implementation here is exactly the per-feature host gather + per-
+    /// feature `construct_histograms` loop (the bit-exact CPU anchor path). A GPU
+    /// backend OVERRIDES this to gather + dispatch all features in ONE kernel launch
+    /// (and to keep the binned dataset device-resident), collapsing the per-feature
+    /// launch count to one per leaf.
+    ///
+    /// `feature_bins[fpos]` is feature `fpos`'s GLOBAL-row bin column; `leaf_rows`
+    /// are the leaf's global row indices (the ordered fold order). FixHistogram +
+    /// compaction stay in the caller (they read per-leaf sums + the compaction
+    /// offset), applied to each feature's region of the returned RAW buffer.
+    ///
+    /// # Errors
+    /// Propagates [`construct_histograms`](Backend::construct_histograms) errors.
+    #[allow(clippy::too_many_arguments)]
+    fn build_leaf_histograms_raw(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        feature_bins: &[&[u32]],
+        num_bins: &[u32],
+        slot_off: &[usize],
+        slot_len: usize,
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+    ) -> Result<Vec<f64>, ComputeError> {
+        let mut out = vec![0.0f64; slot_len];
+        // Scratch gather buffers, reused across features (the R2 buffer-reuse).
+        let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
+        let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+        let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+        for (fpos, &bins) in feature_bins.iter().enumerate() {
+            ord_bins.clear();
+            ord_g.clear();
+            ord_h.clear();
+            for &row in leaf_rows {
+                ord_bins.push(bins[row as usize]);
+                ord_g.push(gradients[row as usize]);
+                ord_h.push(hessians[row as usize]);
+            }
+            let hist =
+                self.construct_histograms(client, &ord_bins, &ord_g, &ord_h, num_bins[fpos])?;
+            let cells = 2 * num_bins[fpos] as usize;
+            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&hist);
+        }
+        Ok(out)
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
