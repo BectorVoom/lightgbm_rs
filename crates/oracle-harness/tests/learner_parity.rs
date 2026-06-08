@@ -1866,15 +1866,16 @@ fn learner_parity_monotone_advanced() {
     run_constraints_cell("mono_advanced_p0");
 }
 
-/// DEFERRED (DEF-07-11-01): the mixed +1/-1 monotone vector grows the tree
-/// bit-exact in STRUCTURE (split_feature/topology/threshold/counts) but the
-/// leaf VALUE diverges in the last f64 ULP (rust `0.05000…003` vs golden
-/// `0.04999…989`, ~1.4e-17) — a fold-order knife-edge in the monotone-clamped
-/// `CalculateSplittedLeafOutput` denominator, the SAME class as DEF-07-02. The
-/// assertion is UNCHANGED (bit-exact); ignore-pending a dedicated FP-trace fix.
+/// DEF-07-11-01 CLOSED (07-debug, source-built FP trace): the mixed +1/-1 monotone
+/// vector now grows the tree BIT-EXACT vs real lib_lightgbm 4.6 on every field incl.
+/// the leaf VALUES. Root cause: the Rust monotone `build_split` computed the clamped
+/// child OUTPUT from the already-`-kEpsilon`'d hessian, whereas C++
+/// `FindBestThresholdSequentially` (feature_histogram.hpp:1049-1066) computes
+/// `CalculateSplittedLeafOutput` from the RAW `best_sum_left_hessian` and only then
+/// stores `<raw> - kEpsilon`. Computing the output from the raw hessian (and using
+/// the C++ right operand order `sum_g - left_sum_g`, `sum_h - left_sum_h`) makes the
+/// leaf value bit-exact (`0.049999999999999989`). No tolerance weakened.
 #[test]
-#[ignore = "DEF-07-11-01: monotone mixed-vector leaf-value last-ULP fold-order knife-edge \
-            (structure bit-exact); needs a source-built lib_lightgbm FP trace like DEF-07-02"]
 fn learner_parity_monotone_mixed() {
     run_constraints_cell("mono_mixed");
 }
@@ -1894,16 +1895,16 @@ fn learner_parity_forced_single() {
     run_constraints_cell("forced_single");
 }
 
-/// DEFERRED (DEF-07-11-02): the NESTED forced-split (root + left/right forced
-/// children) grows bit-exact in STRUCTURE + threshold + counts, but the deeper
-/// continuation leaf VALUES diverge in 1-2 f64 ULPs (rust `0.6000…064` vs golden
-/// `0.6000…087`) — accumulated fold-order drift through the multi-level forced
-/// `GatherInfoForThreshold` seeding. `forced_single` (one forced split) is
-/// BIT-EXACT GREEN; only the nested seeding ULP-drifts. Assertion UNCHANGED;
-/// ignore-pending an FP-trace fix.
+/// DEF-07-11-02 CLOSED (07-debug, source-built FP trace): the NESTED forced-split
+/// (root + left/right forced children) now grows BIT-EXACT vs real lib_lightgbm 4.6
+/// incl. the deeper continuation leaf VALUES. TWO faithful fixes: (1) the forced BFS
+/// (`apply_forced_splits`) now CONSUMES each child's kEpsilon-bearing `split_inner`
+/// leaf-seed (carrying the parent REVERSE-scan provenance) instead of RE-FOLDING the
+/// leaf's rows — mirroring C++ `ForceSplits`, which seeds the next-level leaf-splits
+/// via `SplitInner` and never re-folds; (2) `gather_info_for_threshold` computes the
+/// child OUTPUTS from the RAW child hessian (C++ feature_histogram.hpp:580-590),
+/// storing `<raw> - kEpsilon`. `forced_single` stays bit-exact. No tolerance weakened.
 #[test]
-#[ignore = "DEF-07-11-02: nested forced-split deeper-leaf last-ULP fold-order knife-edge \
-            (structure + forced_single bit-exact); needs a source-built FP trace"]
 fn learner_parity_forced_nested() {
     run_constraints_cell("forced_nested");
 }

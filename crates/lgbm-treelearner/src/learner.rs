@@ -943,10 +943,37 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         left_leaf: &mut i32,
         right_leaf: &mut i32,
     ) -> Result<i32, TreeLearnerError> {
-        // The leaf-splits sums for a leaf: leaf 0 is seeded; child leaves are
-        // seeded by split_inner. We track per-leaf sums in a side map by reusing
-        // the root's smaller_leaf_splits for leaf 0 and re-deriving for children.
-        // Build the per-leaf sums lazily from the data_partition + grad/hess.
+        // The leaf-splits sums for a forced BFS leaf: leaf 0 (root) is the ordered
+        // f64 fold over ALL rows (C++ `LeafSplits::Init()` whole-dataset variant),
+        // and EVERY child leaf is seeded DIRECTLY from its parent split's `SplitInfo`
+        // by `split_inner` — NOT re-folded.
+        //
+        // DEF-07-11-02 fix: the prior code re-folded each forced leaf via
+        // `LeafSplits::init(rows)` at EVERY BFS level. C++ `ForceSplits`
+        // (serial_tree_learner.cpp:638-734) never re-folds: each BFS iteration's
+        // `GatherInfoForThreshold` consumes `left_leaf_splits->sum_gradients()/
+        // sum_hessians()/num_data_in_leaf()` — the leaf-splits the PRIOR `SplitInner`
+        // (serial_tree_learner.cpp:853-892) seeded from `best_split_info.{left,right}_
+        // sum_hessian` (= `best_sum_left_hessian - kEpsilon`, feature_histogram.hpp:
+        // 1042), carrying the parent REVERSE-scan kEpsilon + FixHistogram fold-order
+        // provenance. A fresh re-fold loses that provenance and drifts the deeper-leaf
+        // output denominator 1-2 ULPs (the SAME class as the 05-09 mfb>0 node-2 fix;
+        // see leaf_splits.rs:124-138). `forced_single` is unaffected (its only forced
+        // leaf is the root, whose whole-row fold == C++ `Init()` bit-exact).
+        //
+        // We track each leaf id's seeded `LeafSplits` in a side map: leaf 0 is the
+        // whole-row fold; after each `split_inner` the two children's kEpsilon-bearing
+        // splits (just written into `smaller_leaf_splits`/`larger_leaf_splits`) are
+        // stored by leaf id and consumed (NOT re-folded) when that child is the next
+        // BFS leaf.
+        let mut leaf_seed: std::collections::HashMap<i32, LeafSplits> =
+            std::collections::HashMap::new();
+        {
+            let root_rows: Vec<u32> = data_partition.indices_in_leaf(0).to_vec();
+            let mut root_splits = LeafSplits::new();
+            root_splits.init(gradients, hessians, &root_rows, &self.cfg);
+            leaf_seed.insert(0, root_splits);
+        }
         let mut count = 0i32;
         // BFS queue of (forced node, leaf id).
         let mut queue: std::collections::VecDeque<(crate::forced_splits::ForcedSplitNode, i32)> =
@@ -962,10 +989,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 Some(f) => f,
                 None => continue, // out-of-range guarded at parse; defensive skip
             };
-            // Seed this leaf's sums via an ordered f64 fold over its rows.
-            let leaf_rows: Vec<u32> = data_partition.indices_in_leaf(leaf).to_vec();
-            let mut leaf_splits = LeafSplits::new();
-            leaf_splits.init(gradients, hessians, &leaf_rows, &self.cfg);
+            // This leaf's seeded sums: leaf 0 is the whole-row fold; children carry the
+            // kEpsilon-bearing `SplitInfo` sums `split_inner` seeded (NOT a re-fold).
+            let leaf_splits = *leaf_seed
+                .get(&leaf)
+                .expect("forced BFS leaf must have a seeded LeafSplits (root or split_inner child)");
             #[allow(clippy::neg_cmp_op_on_partial_ord)]
             if !(leaf_splits.sum_hessians > 0.0) || leaf_splits.num_data_in_leaf <= 0 {
                 continue;
@@ -1024,6 +1052,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 &split,
                 &mut [],
             );
+            // Record each child's kEpsilon-bearing seeded LeafSplits (just written by
+            // `split_inner` into smaller/larger by PARTITION count, the 07-13 source).
+            // Map child leaf id → its seeded splits so the next BFS level CONSUMES
+            // these sums (NOT a re-fold). Mirror split_inner's `part_left < part_right`
+            // smaller/larger assignment exactly.
+            let part_left = data_partition.leaf_count(new_left);
+            let part_right = data_partition.leaf_count(new_right);
+            if part_left < part_right {
+                leaf_seed.insert(new_left, *smaller_leaf_splits);
+                leaf_seed.insert(new_right, *larger_leaf_splits);
+            } else {
+                leaf_seed.insert(new_right, *smaller_leaf_splits);
+                leaf_seed.insert(new_left, *larger_leaf_splits);
+            }
             *left_leaf = new_left;
             *right_leaf = new_right;
             count += 1;
@@ -1958,6 +2000,23 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return SplitInfo::none();
         }
         let mk_output = |g: f64, h: f64| calculate_splitted_leaf_output(use_l1, g, h, l1, l2);
+        // DEF-07-11-02: C++ `GatherInfoForThresholdNumericalInner`
+        // (feature_histogram.hpp:579-590) computes the child OUTPUTS from the RAW
+        // child hessians (`sum_left_hessian` and `sum_hessian - sum_left_hessian`),
+        // and ONLY THEN stores `{left,right}_sum_hessian = <raw> - kEpsilon`. The
+        // prior code computed the outputs from the already-`-kEpsilon` values, which
+        // shifted each forced child's leaf output by ~1 ULP (`6.0000000000000115`
+        // vs the golden `6.000000000000008`). The output operand is the RAW scan
+        // hessian; the stored sum carries the `-kEpsilon`. (The stored `right_sum_
+        // hessian` is `sum_hessian - sum_left_hessian - kEpsilon`, matching C++'s
+        // `output->right_sum_hessian` exactly — algebraically `sum_right_hessian -
+        // kEpsilon` but written via the C++ operand order.)
+        let right_h_raw = sum_hessian - sum_left_hessian;
+        // C++ computes the right output's gradient operand as `sum_gradient -
+        // sum_left_gradient` (feature_histogram.hpp:585), NOT the scan-accumulated
+        // `sum_right_gradient`; reproduce the exact operand order (they can differ in
+        // the last f64 ULP).
+        let right_g_for_output = sum_g - sum_left_gradient;
         SplitInfo {
             threshold,
             gain: current_gain - min_gain_shift,
@@ -1966,9 +2025,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             left_sum_gradient: sum_left_gradient,
             left_sum_hessian: sum_left_hessian - eps,
             right_sum_gradient: sum_right_gradient,
-            right_sum_hessian: sum_right_hessian - eps,
-            left_output: mk_output(sum_left_gradient, sum_left_hessian - eps),
-            right_output: mk_output(sum_right_gradient, sum_right_hessian - eps),
+            right_sum_hessian: right_h_raw - eps,
+            left_output: mk_output(sum_left_gradient, sum_left_hessian),
+            right_output: mk_output(right_g_for_output, right_h_raw),
             default_left: true,
         }
     }

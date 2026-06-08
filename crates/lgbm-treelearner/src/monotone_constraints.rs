@@ -291,10 +291,10 @@ pub fn find_best_split_monotone(
                     g - min_gain_shift,
                     left_count,
                     right_count,
+                    sum_g,
+                    sum_hessian,
                     sum_left_gradient,
-                    sum_left_hessian - eps,
-                    sum_right_gradient,
-                    sum_right_hessian - eps,
+                    sum_left_hessian,
                     constraint,
                     true,
                 );
@@ -348,10 +348,10 @@ pub fn find_best_split_monotone(
                     g - min_gain_shift,
                     left_count,
                     right_count,
+                    sum_g,
+                    sum_hessian,
                     sum_left_gradient,
-                    sum_left_hessian - eps,
-                    sum_right_gradient,
-                    sum_right_hessian - eps,
+                    sum_left_hessian,
                     constraint,
                     false,
                 );
@@ -364,6 +364,17 @@ pub fn find_best_split_monotone(
 }
 
 /// Assemble the winning [`SplitInfo`] with the clamped child outputs.
+///
+/// `sum_gradient`/`sum_hessian` are the leaf's RAW totals; `left_sum_gradient`/
+/// `left_sum_hessian` are the RAW (un-`kEpsilon`'d) child sums. C++
+/// (`feature_histogram.hpp:1049-1066`) computes the child OUTPUTS from the RAW
+/// hessians (`best_sum_left_hessian` and `sum_hessian - best_sum_left_hessian`) and
+/// ONLY THEN stores `{left,right}_sum_hessian = <raw> - kEpsilon`. Computing the
+/// output from the already-`-kEpsilon` value shifts the monotone leaf output ~1 ULP
+/// (`0.050000000000000003` vs golden `0.049999999999999989`) — the DEF-07-11-01
+/// fold-order knife-edge. The RIGHT operands also follow the C++ form
+/// (`sum_gradient - best_sum_left_gradient`, `sum_hessian - best_sum_left_hessian`),
+/// not the scan-accumulated `sum_right_*`, since those can differ in the last ULP.
 #[allow(clippy::too_many_arguments)]
 fn build_split(
     cfg: &GainConfig,
@@ -371,13 +382,16 @@ fn build_split(
     gain: f64,
     left_count: i32,
     right_count: i32,
+    sum_gradient: f64,
+    sum_hessian: f64,
     left_sum_gradient: f64,
     left_sum_hessian: f64,
-    right_sum_gradient: f64,
-    right_sum_hessian: f64,
     constraint: &BasicConstraint,
     default_left: bool,
 ) -> SplitInfo {
+    let eps = f64::from(lgbm_core::types::K_EPSILON);
+    let right_sum_gradient = sum_gradient - left_sum_gradient;
+    let right_sum_hessian = sum_hessian - left_sum_hessian;
     let left_output = calc_output_clamped(cfg, left_sum_gradient, left_sum_hessian, constraint);
     let right_output = calc_output_clamped(cfg, right_sum_gradient, right_sum_hessian, constraint);
     SplitInfo {
@@ -386,9 +400,9 @@ fn build_split(
         left_count,
         right_count,
         left_sum_gradient,
-        left_sum_hessian,
+        left_sum_hessian: left_sum_hessian - eps,
         right_sum_gradient,
-        right_sum_hessian,
+        right_sum_hessian: right_sum_hessian - eps,
         left_output,
         right_output,
         default_left,
