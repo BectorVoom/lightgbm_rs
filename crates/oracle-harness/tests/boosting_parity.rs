@@ -2535,6 +2535,101 @@ fn quantile_gradients() {
     assert_gradients(&booster, "quantile_gh_iter1.txt", "quantile_gh_iterN.txt");
 }
 
+/// DEF-07-13-01 STRUCTURAL CONTRACT (the Task-1 diagnostic — owns the exact 10-tree
+/// count guarantee that `quantile_loop_matrix`'s min-length helper does NOT assert).
+///
+/// Pins the C++ `GBDT::TrainOneIter` no-split BAGGED EMISSION semantics
+/// (gbdt.cpp:406-447), captured from the Python-wheel `lgb.train` oracle (the
+/// deterministic source-built CLI CANNOT reproduce this golden — `GBDT::Train`
+/// treats `!should_continue` as `is_finished` at gbdt.cpp:447 `return true` and stops
+/// entirely at 1 tree for quantile+bfa-off; the 10-tree golden is the wheel's
+/// continue-and-re-bag driver).
+///
+/// The C++ contract this test encodes:
+///   - On a NON-FIRST bagged iteration whose grown tree has `num_leaves <= 1` (no
+///     positive-gain split — uniform gradients on the bagged subset; quantile
+///     alpha=0.9 hits this mid-training), C++ sets `should_continue = false`, POPS
+///     the would-be 1-leaf constant tree (gbdt.cpp:440-446, the `!should_continue`
+///     path gated by `models_.size() > num_tree_per_iteration_`), and does NOT
+///     advance `iter_` — so the wheel/`lgb.train` driver re-bags (fresh RNG draw)
+///     on the next boost round and grows a real tree.
+///   - The FIRST-iteration no-split constant baseline (gbdt.cpp:419-434, the
+///     `models_.size() < num_tree_per_iteration_` guard) is KEPT (e.g.
+///     `regression_l1_bag1` Tree=0 stays a constant). The fix is isolated to LATER
+///     no-split bagged iterations.
+///
+/// The proven divergence: Rust APPENDS a 1-leaf `Tree::as_constant` and advances on
+/// EVERY no-split iteration (`gbdt.rs` no-split branches), so before the fix Rust
+/// grows 12 trees `[1,2,3,3,1,3,3,3,1,3,2,3]` vs the wheel's 10
+/// `[1,2,3,3,3,3,3,3,2,3]`; the 2 spurious constants (iters 4,8) shift every later
+/// tree (wheel tree4 ≡ Rust tree5, bit-exact). This is NOT a bagging-draw or
+/// RenewTreeOutput bug — both are verified bit-exact (iter4 in_bag=[0,1,4,5,6,7,8,9,10],
+/// oob=[2,3,11] in both; scores through tree 3 bit-exact to the wheel). See
+/// `.planning/debug/remaining-ignored-cells.md` (Group 3 / DEF-07-13-01).
+///
+/// FAILS on the current append-constant model (12 trees) — this is the structural
+/// target Task 2 turns green. No existing assertion altered; this is a NEW diagnostic
+/// alongside the matrix, reusing the committed `quantile_bag1_es0_bfa0` golden.
+#[test]
+fn quantile_bagged_no_split_emission_contract() {
+    // The committed wheel golden for the bagged sub-cell (10 trees,
+    // structure [1,2,3,3,3,3,3,3,2,3]). Skip-pass absent the capture.
+    let Some(model_text) = read_golden("quantile_bag1_es0_bfa0_model.txt") else {
+        return;
+    };
+    let golden = lgbm_model::model_text::load(&model_text)
+        .expect("parse quantile_bag1_es0_bfa0 golden");
+
+    // Drive the EXACT reproduction the loop matrix runs for this sub-cell:
+    // quantile, bag on, es off, bfa off, 12 boost rounds (MATRIX_NUM_ITERATIONS).
+    let corpus = spine_corpus();
+    let cfg = family_a_loop_builder("quantile", true, false, false)
+        .build()
+        .expect("quantile_bag1_es0_bfa0 builder");
+    let booster = train(&cfg, &corpus).expect("quantile_bag1_es0_bfa0 train");
+    let rust = booster.model();
+
+    // The wheel's no-split-bagged-pop semantics: 12 boost rounds, 2 popped
+    // (no-split) rounds (iters 4,8) → EXACTLY 10 emitted trees with the structure
+    // [1,2,3,3,3,3,3,3,2,3]. The current append-constant model grows 12
+    // ([1,2,3,3,1,3,3,3,1,3,2,3]) — this assertion FAILS until Task 2 lands the
+    // pop/skip + iter-non-advance + re-bag-retry fix.
+    let rust_structure: Vec<i32> = rust.trees.iter().map(|t| t.num_leaves).collect();
+    let golden_structure: Vec<i32> = golden.trees.iter().map(|t| t.num_leaves).collect();
+    assert_eq!(
+        golden_structure,
+        vec![1, 2, 3, 3, 3, 3, 3, 3, 2, 3],
+        "golden fixture drifted from the wheel 10-tree structure"
+    );
+    assert_eq!(
+        rust_structure, golden_structure,
+        "quantile_bag1_es0_bfa0: Rust tree structure {rust_structure:?} != wheel 10-tree \
+         {golden_structure:?}. C++ gbdt.cpp:406-447 POPS the would-be 1-leaf constant on a \
+         NON-FIRST no-split bagged iteration (does NOT advance iter_, re-bags next round); \
+         the current Rust path APPENDS a constant and advances → 12 trees \
+         [1,2,3,3,1,3,3,3,1,3,2,3]."
+    );
+    assert_eq!(
+        rust.trees.len(),
+        10,
+        "quantile_bag1_es0_bfa0: expected exactly 10 trees (12 rounds, 2 popped), got {}",
+        rust.trees.len()
+    );
+
+    // Every surviving tree matches the wheel (the renew percentile horizon). Once the
+    // 2 spurious constants at iters 4,8 are skipped, every later tree aligns — in
+    // particular the wheel's tree4
+    // (leaf_value=-0.18273995881080618 -0.00080994397401816802 0.09919005602598184)
+    // ≡ the current-Rust tree5, bit-exact (the proven "wheel tree4 ≡ Rust tree5").
+    for (i, (rt, gt)) in rust.trees.iter().zip(golden.trees.iter()).enumerate() {
+        let rl: Vec<f32> = rt.leaf_value.iter().map(|&v| v as f32).collect();
+        let gl: Vec<f32> = gt.leaf_value.iter().map(|&v| v as f32).collect();
+        compare_within(&rl, &gl, MATRIX_RESIDUAL_TOL).unwrap_or_else(|m| {
+            panic!("quantile_bag1_es0_bfa0 tree {i} leaf_value not within MATRIX_RESIDUAL_TOL: {m:?}")
+        });
+    }
+}
+
 #[test]
 #[ignore = "DEF-07-13-01: ROOT-CAUSED (07-debug, Python-wheel oracle) — NEEDS an architectural GBDT-loop change (Rule 4). The bagged renew sub-cell `quantile_bag1_es0_bfa0` is a 12-vs-10-tree STRUCTURAL divergence, and it is NOT a bagging-draw or renew bug: Rust's per-iteration bagged subset is BIT-EXACT to C++ (verified vs a standalone bagging.hpp sim — iter4 in_bag=[0,1,4,5,6,7,8,9,10], oob=[2,3,11] in both) AND Rust's scores through tree 3 are BIT-EXACT to the wheel. The divergence is the NO-SPLIT-TREE EMISSION policy: when a bagged iteration yields no positive-gain split (uniform gradients on the subset — quantile alpha=0.9 hits this mid-training), C++ `GBDT::TrainOneIter` (gbdt.cpp:406-447) POPS the would-be 1-leaf constant tree (the `!should_continue` path, 'Stopped training because there are no more leaves' warning) and does NOT advance `iter_`; the Python `lgb.train` driver re-bags with a fresh RNG draw on the next boost round. Rust (`gbdt.rs:765,828`) instead APPENDS a 1-leaf `Tree::as_constant` and advances, so Rust grows 12 trees [1,2,3,3,1,3,3,3,1,3,2,3] vs the wheel's 10 [1,2,3,3,3,3,3,3,2,3] — the 2 spurious constants (iters 4,8) shift every later tree (wheel tree4 == Rust tree5, bit-exact). The FIRST-iteration constant baseline (e.g. regression_l1_bag1 Tree=0) is KEPT in both, so the fix is isolated to LATER no-split bagged iterations and would NOT regress any of the 73 green boosting_parity cells (none has a non-first 1-leaf tree). The deterministic source-built CLI cannot reproduce the 10-tree golden (GBDT::Train breaks on is_finished, stopping at 1 tree), so this needed a Python-wheel oracle. FIX (deferred, architectural): replicate the C++ no-split pop/skip + iter-non-advance + re-bag-retry semantics in the Rust GBDT boosting loop. NOT a tolerance weakening; assertion intact under #[ignore]. See .planning/debug/remaining-ignored-cells.md."]
 fn quantile_loop_matrix() {
