@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use lgbm_compute::gain::{get_leaf_gain, get_split_gains, GainConfig};
 use lgbm_compute::runtime::cpu_client;
-use lgbm_compute::{Backend, CpuBackend};
+use lgbm_compute::{Backend, BatchedSplitFeature, CpuBackend};
 // The exact comparators are NOT re-exported from the crate root (lib.rs re-exports
 // only compare_within/abs_diff_within/Mismatch/ORACLE_TOL); import them via the
 // full module path.
@@ -658,6 +658,205 @@ fn kernel_parity_split_bit_exact_on_cpu() {
         "split golden must contain the `skip_default_bin_false` divergence case \
          (default_bin < num_bin but skip_default_bin==false, missing_type==None)"
     );
+}
+
+// ===========================================================================
+// 260608-lsx FUSED SPLIT parity. Prove the DEFAULT `find_best_splits_batched`
+// (the lad Part 2 batched seam) is BIT-EXACT to the per-feature `find_best_split`
+// loop on CPU — the contract that keeps the CpuBackend f64 anchor unchanged.
+//
+// We lay the committed split golden's feature cases into ONE concatenated leaf
+// histogram buffer (each case at a successive `slot_off`) with a matching
+// `Vec<BatchedSplitFeature>`, then (1) call `find_best_splits_batched` ONCE with a
+// single SHARED set of leaf totals, and (2) loop `find_best_split` per feature with
+// the SAME shared totals. The two SplitInfo vectors must be cell-for-cell bit-exact
+// (no tolerance). Using shared totals (not each golden's own totals) is required
+// because the batched op shares the leaf totals across the batch — exactly as the
+// learner calls it per leaf; the point is the batched-vs-loop EQUIVALENCE, not the
+// per-case C++ winner (that is `kernel_parity_split_bit_exact_on_cpu`'s job).
+// ===========================================================================
+#[test]
+fn kernel_parity_batched_equals_per_feature_on_cpu() {
+    let path = kernels_dir().join("split.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "kernel_parity(batched-split): SKIP — fixture {} not found.",
+            path.display()
+        );
+        return;
+    };
+    let cases = parse_split(&text);
+    assert!(!cases.is_empty(), "split fixture present but parsed zero cases");
+
+    let client = cpu_client();
+    let backend = CpuBackend;
+
+    // Shared leaf totals for the whole batch. Chosen finite/positive so every
+    // feature's scan is admissible (sum_hessian > 0 is the V5 precondition); the
+    // scan gates relax under min_data_in_leaf=1 / min_sum_hessian_in_leaf=0 so we
+    // exercise real winners, not all-`none()`.
+    let cfg = GainConfig {
+        min_data_in_leaf: 1,
+        min_sum_hessian_in_leaf: 0.0,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+        ..Default::default()
+    };
+
+    // Assemble the concatenated buffer + per-feature batch records. Skip the
+    // deferred na_as_missing cases (they are a typed error in either path).
+    let mut buf: Vec<f64> = Vec::new();
+    let mut feats: Vec<BatchedSplitFeature> = Vec::new();
+    // Per-feature shared totals (sum over each feature's own histogram so the
+    // scan's cnt_factor / leaf sums are self-consistent with that feature's bins).
+    let mut per_feat_totals: Vec<(f64, f64, i32)> = Vec::new();
+    for c in &cases {
+        if c.na_as_missing {
+            continue;
+        }
+        let slot_off = buf.len();
+        buf.extend_from_slice(&c.hist);
+        // Derive self-consistent leaf totals from THIS feature's histogram so the
+        // batched call and the per-feature call see identical, admissible inputs.
+        let mut sg = 0.0f64;
+        let mut sh = 0.0f64;
+        for bin in 0..c.num_bin as usize {
+            sg += c.hist[bin * 2];
+            sh += c.hist[bin * 2 + 1];
+        }
+        // num_data: any positive count; use the golden's if positive, else a fallback.
+        let nd = if c.num_data > 0 { c.num_data } else { 1 };
+        per_feat_totals.push((sg, sh, nd));
+        feats.push(BatchedSplitFeature {
+            slot_off,
+            num_bin: c.num_bin as u32,
+            offset: c.offset,
+            default_bin: c.default_bin as u32,
+            most_freq_bin: 0,
+            skip_default_bin: c.skip_default_bin,
+            na_as_missing: c.na_as_missing,
+            run_forward: true,
+        });
+    }
+    assert!(!feats.is_empty(), "expected at least one batchable split case");
+
+    // The batched op shares ONE set of leaf totals across the batch. To make the
+    // per-feature comparison apples-to-apples we run the batch ONCE PER distinct
+    // total set is overkill; instead drive each feature as its OWN single-element
+    // batch with its self-consistent totals, then ALSO run the per-feature
+    // `find_best_split` with the same totals, and assert equality. This proves the
+    // default batched impl composes `find_best_split` bit-exact for every feature.
+    for (i, f) in feats.iter().enumerate() {
+        let (sg, sh, nd) = per_feat_totals[i];
+        if !(sh > 0.0) {
+            // sum_hessian must be > 0; skip degenerate all-zero-hessian cases
+            // (both paths would return the same typed error — not interesting here).
+            continue;
+        }
+        let one = std::slice::from_ref(f);
+        let batched = backend
+            .find_best_splits_batched(&client, &buf, one, &cfg, sg, sh, nd)
+            .unwrap_or_else(|e| panic!("batched find_best_splits_batched failed: {e:?}"));
+        assert_eq!(batched.len(), 1, "one feature -> one SplitInfo");
+        let bsi = batched[0];
+
+        let cells = 2 * f.num_bin as usize;
+        let hist = &buf[f.slot_off..f.slot_off + cells];
+        let psi = backend
+            .find_best_split(
+                &client,
+                hist,
+                &cfg,
+                f.num_bin,
+                f.offset,
+                f.default_bin,
+                f.most_freq_bin,
+                f.skip_default_bin,
+                f.na_as_missing,
+                f.run_forward,
+                sg,
+                sh,
+                nd,
+            )
+            .unwrap_or_else(|e| panic!("per-feature find_best_split failed: {e:?}"));
+
+        // Every f64 field bit-exact (no tolerance), integer fields exact equality.
+        let got = [
+            bsi.gain,
+            bsi.left_sum_gradient,
+            bsi.left_sum_hessian,
+            bsi.right_sum_gradient,
+            bsi.right_sum_hessian,
+            bsi.left_output,
+            bsi.right_output,
+        ];
+        let exp = [
+            psi.gain,
+            psi.left_sum_gradient,
+            psi.left_sum_hessian,
+            psi.right_sum_gradient,
+            psi.right_sum_hessian,
+            psi.left_output,
+            psi.right_output,
+        ];
+        if let Err(m) = compare_exact_f64_bits(&got, &exp) {
+            panic!("batched feature {i}: f64 field divergence from per-feature: {m}");
+        }
+        assert_eq!(bsi.threshold, psi.threshold, "feature {i}: threshold");
+        assert_eq!(bsi.left_count, psi.left_count, "feature {i}: left_count");
+        assert_eq!(bsi.right_count, psi.right_count, "feature {i}: right_count");
+        assert_eq!(bsi.default_left, psi.default_left, "feature {i}: default_left");
+        assert_eq!(
+            bsi.gain == f64::NEG_INFINITY,
+            psi.gain == f64::NEG_INFINITY,
+            "feature {i}: is_splittable (kMinScore) agreement"
+        );
+    }
+
+    // Also exercise a genuine MULTI-feature batch (shared totals) to prove order
+    // preservation across the whole Vec: the i-th batched result must equal the
+    // i-th per-feature call with the SAME shared totals (T-lsx-01).
+    let (sg, sh, nd) = (8.0f64, 8.0f64, 8i32);
+    let multi = backend
+        .find_best_splits_batched(&client, &buf, &feats, &cfg, sg, sh, nd)
+        .unwrap_or_else(|e| panic!("multi-feature batched call failed: {e:?}"));
+    assert_eq!(multi.len(), feats.len(), "one SplitInfo per input feature");
+    for (i, f) in feats.iter().enumerate() {
+        let cells = 2 * f.num_bin as usize;
+        let hist = &buf[f.slot_off..f.slot_off + cells];
+        let psi = backend
+            .find_best_split(
+                &client, hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
+                f.skip_default_bin, f.na_as_missing, f.run_forward, sg, sh, nd,
+            )
+            .unwrap_or_else(|e| panic!("multi per-feature find_best_split failed: {e:?}"));
+        let got = [
+            multi[i].gain,
+            multi[i].left_sum_gradient,
+            multi[i].left_sum_hessian,
+            multi[i].right_sum_gradient,
+            multi[i].right_sum_hessian,
+            multi[i].left_output,
+            multi[i].right_output,
+        ];
+        let exp = [
+            psi.gain,
+            psi.left_sum_gradient,
+            psi.left_sum_hessian,
+            psi.right_sum_gradient,
+            psi.right_sum_hessian,
+            psi.left_output,
+            psi.right_output,
+        ];
+        if let Err(m) = compare_exact_f64_bits(&got, &exp) {
+            panic!("multi batched feature {i}: order-preservation/value divergence: {m}");
+        }
+        assert_eq!(multi[i].threshold, psi.threshold, "multi feature {i}: threshold");
+        assert_eq!(multi[i].default_left, psi.default_left, "multi feature {i}: default_left");
+    }
 }
 
 // ===========================================================================
