@@ -255,7 +255,7 @@ impl Backend for CpuBackend {
     #[allow(clippy::too_many_arguments)]
     fn data_partition(
         &self,
-        client: &ComputeClient<Self::Runtime>,
+        _client: &ComputeClient<Self::Runtime>,
         bins: &[u32],
         num_bin: u32,
         min_bin: u32,
@@ -263,8 +263,8 @@ impl Backend for CpuBackend {
         threshold: u32,
         most_freq_bin: u32,
     ) -> Result<(Vec<u32>, usize), ComputeError> {
-        kernels::partition::data_partition_cpu(
-            client,
+        // R2: native u32 routing + stable gather — bit-identical to the kernel path.
+        kernels::partition::data_partition_cpu_native(
             bins,
             num_bin,
             min_bin,
@@ -276,10 +276,11 @@ impl Backend for CpuBackend {
 
     fn subtract_histograms(
         &self,
-        client: &ComputeClient<Self::Runtime>,
+        _client: &ComputeClient<Self::Runtime>,
         parent: &[f64],
         child: &[f64],
     ) -> Result<Vec<f64>, ComputeError> {
-        kernels::subtract::subtract_histograms_cpu(client, parent, child)
+        // R2: native element-wise parent − child — bit-identical to the kernel path.
+        kernels::subtract::subtract_histograms_cpu_native(parent, child)
     }
 }

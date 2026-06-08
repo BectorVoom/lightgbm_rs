@@ -102,6 +102,27 @@ pub fn subtract_histograms_cpu(
     Ok(f64::from_bytes(&bytes).to_vec())
 }
 
+/// **Native** host f64 element-wise `parent - child` — the production cpu-anchor
+/// path (R2). Bit-IDENTICAL to [`subtract_histograms_cpu`] (the single-unit
+/// `subtract_hist_kernel`): the same `derived[i] = parent[i] - child[i]` over the
+/// `2*num_bin` cells and the same V5 length check, without the cubecl launch.
+/// The cubecl path is retained for the kernel-parity / ROCm-mirror tests.
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `parent.len() != child.len()`.
+pub fn subtract_histograms_cpu_native(
+    parent: &[f64],
+    child: &[f64],
+) -> Result<Vec<f64>, ComputeError> {
+    if parent.len() != child.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: parent.len(),
+            actual: child.len(),
+        });
+    }
+    Ok(parent.iter().zip(child).map(|(p, c)| p - c).collect())
+}
+
 /// Host-side `subtract_histograms` in **f32 cells** on ANY runtime (the no-f64
 /// hip path; CMP-03/CMP-04). Same `derived[i] = parent[i] - child[i]` math and
 /// V5 validation as [`subtract_histograms_cpu`], but in f32 cells. Generic over

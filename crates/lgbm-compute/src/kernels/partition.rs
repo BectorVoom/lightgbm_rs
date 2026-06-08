@@ -97,6 +97,89 @@ pub fn data_partition_cpu(
     data_partition_on(client, bins, num_bin, min_bin, max_bin, threshold, most_freq_bin)
 }
 
+/// **Native** host `data_partition` — the production cpu-anchor path (R2).
+///
+/// Bit-IDENTICAL to [`data_partition_cpu`] (the single-unit `data_partition_kernel`
+/// + host gather): the SAME integer `SplitInner` routing decision and the SAME
+/// stable two-pass gather (left rows in original order, then right), without the
+/// cubecl launch. The op is u32-only so there is no float order to preserve. The
+/// cubecl path is retained for the kernel-parity / ROCm-mirror tests.
+///
+/// # Errors
+/// Same as [`data_partition_cpu`] (V5: `num_bin > 0`, `threshold < num_bin`,
+/// every `bins[i] < num_bin`).
+#[allow(clippy::too_many_arguments)]
+pub fn data_partition_cpu_native(
+    bins: &[u32],
+    num_bin: u32,
+    min_bin: u32,
+    max_bin: u32,
+    threshold: u32,
+    most_freq_bin: u32,
+) -> Result<(Vec<u32>, usize), ComputeError> {
+    // --- V5 boundary validation (identical to data_partition_on) ---
+    if num_bin == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "data_partition: num_bin must be > 0".to_string(),
+        });
+    }
+    if threshold >= num_bin {
+        return Err(ComputeError::Runtime {
+            detail: format!("data_partition: threshold {threshold} >= num_bin {num_bin}"),
+        });
+    }
+    for (row, &b) in bins.iter().enumerate() {
+        if b >= num_bin {
+            return Err(ComputeError::BinIndexOutOfRange {
+                row,
+                bin: b,
+                num_bin,
+            });
+        }
+    }
+
+    let n = bins.len();
+    if n == 0 {
+        return Ok((Vec::new(), 0));
+    }
+
+    // Routing decision (dense_bin.hpp:322-365), integer-only — identical to the
+    // kernel: th = threshold + min_bin (−1 if most_freq_bin == 0); out-of-[min,max]
+    // rows take the default direction (`most_freq_bin > threshold` ⇒ gt).
+    let min_b = min_bin as i32;
+    let max_b = max_bin as i32;
+    let thr = threshold as i32;
+    let mut th = thr + min_b;
+    if most_freq_bin == 0 {
+        th -= 1;
+    }
+    let default_to_right = most_freq_bin as i32 > thr;
+    let go_right = |b: u32| -> bool {
+        let bin = b as i32;
+        if bin < min_b || bin > max_b {
+            default_to_right
+        } else {
+            bin > th
+        }
+    };
+
+    // Stable two-pass gather: left rows (route==0) then right rows (route==1), each
+    // in original order. split_point = left-row count.
+    let mut reordered: Vec<u32> = Vec::with_capacity(n);
+    for (i, &b) in bins.iter().enumerate() {
+        if !go_right(b) {
+            reordered.push(i as u32);
+        }
+    }
+    let split_point = reordered.len();
+    for (i, &b) in bins.iter().enumerate() {
+        if go_right(b) {
+            reordered.push(i as u32);
+        }
+    }
+    Ok((reordered, split_point))
+}
+
 /// Host-side `data_partition` on ANY runtime (generic over `R: Runtime`).
 ///
 /// `data_partition` is **f64-free** (the routing kernel reads/writes only `u32`),
