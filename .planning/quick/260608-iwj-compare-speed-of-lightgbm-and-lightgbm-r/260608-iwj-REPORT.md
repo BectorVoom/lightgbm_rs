@@ -72,9 +72,23 @@ gap — closing it is an algorithmic/architectural effort, not allocator/flag tu
   num_bin cells, dwarfed by the histogram-construction gather. Kept for
   correctness/cleanliness; its relative weight grows once R2 lands. **Correction
   to the earlier "largest win" framing: R2 is the dominant cost, not R1.**
-- **R2 (large): batch/amortize the histogram backend.** Construct all features'
-  histograms for a leaf in one dispatch (or keep bin data resident on-device)
-  instead of one create/launch/readback per feature. Biggest structural win.
+- **R2 (DONE — the big one, 10× on large): native CPU backend.** Implemented in
+  quick task 260608-jyl. Root cause was finer than "batch dispatch": every
+  cubecl-cpu op (`construct_histograms`, `find_best_split`, `subtract`,
+  `data_partition`) is a `CubeDim::new_1d(1)` SINGLE-UNIT sequential kernel, so the
+  cubecl launch (fixed ~20–50µs/call, probe-measured) wrapped a trivial scalar loop
+  — and these run per-(feature,leaf). Replaced all four CPU-anchor ops with native
+  Rust f64 loops INSIDE lgbm-compute (bit-identical: same arithmetic/order/eps;
+  proven by the gate). cubecl paths retained for kernel-parity / ROCm-mirror tests;
+  hip f32 path untouched. **Result: M0→after = small 44×, medium 18×, large 10×
+  faster; Rust went from ~40–80× slower than C++ 4.6 to ~2–4×** (small within 1.9×).
+  Bit-exact gate GREEN throughout.
+
+  | size | M0 | after R2 | speedup | vs C++ 4.6 (1-thread) |
+  |------|----|----|----|----|
+  | small  | 1.71s | 38.7ms  | 44×  | 1.9× slower |
+  | medium | 4.75s | 258ms   | 18×  | 3.4× slower |
+  | large  | 8.93s | 887ms   | 10×  | 4.3× slower |
 - **R3 (medium): columnar bin storage + subtraction trick on the CPU anchor**, so
   the larger child reuses parent−sibling instead of re-gathering.
 - **R4: rayon over features** for histogram construction (C++ parallelizes here);

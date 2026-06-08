@@ -341,6 +341,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 |----------|------|------|--------|--------|
 | 260608-iwj | Compare speed lightgbm vs lightgbm_rs + parity-safe optimise | 2026-06-08 | complete ✓ | Bench harness + 4 parity-safe levers (~9–11% train); bit-exact gate GREEN. **Finding: Rust ~40–80× slower than C++ 4.6** — roadmap R1–R4 in quick/260608-iwj-REPORT.md |
 | 260608-jpj | R1: make D-06 snapshot opt-in | 2026-06-08 | complete ✓ | Snapshot `per_bin_gains` now skipped on the production train path (golden-replay paths keep it); bit-exact gate GREEN. **~0% wall-clock (per_bin_gains dwarfed by histogram gather) — R2 is the real lever.** |
+| 260608-jyl | R2: native CPU backend (kill cubecl-cpu launch overhead) | 2026-06-08 | complete ✓ | All 4 hot-path CPU ops (construct/find_best_split/subtract/partition) replaced with native f64 loops (cubecl kept for ROCm-mirror); bit-exact gate GREEN. **10× large / 18× medium / 44× small vs M0; Rust now ~2–4× C++ 4.6 (was ~40–80×).** Next: R4 rayon-over-features. |
 
 ## Performance Metrics
 
