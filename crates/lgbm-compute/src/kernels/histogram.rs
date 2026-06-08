@@ -1052,3 +1052,434 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(handle);
     Ok(f64::from_bytes(&bytes).to_vec())
 }
+
+// ===========================================================================
+// 260608-t3t: FUSED per-feature build + fix + compact + best-split scan kernel.
+//
+// ONE cube per feature (`CubeCount::Static(num_features,1,1)`, `CubeDim::new_1d(1)`)
+// — single-owner ⇒ BIT-EXACT (the cpu-anchor f64 fold order), NO atomics, NO
+// cross-cube barrier. Cube `f` (`CUBE_POS_X`) owns ONLY its region
+// `[slot_off[f], slot_off[f] + 2*num_bin[f])`. The kernel collapses today's
+// directly-built-leaf chain — construct_leaf_hist_resident_kernel(1) +
+// fix_compact_kernel(1) + find_best_splits_fused_kernel(1) = 3 launches — into ONE.
+//
+// Stage 1 BUILD: SEQUENTIAL f64 gather→fold in ASCENDING leaf-row order (the CPU
+//   anchor order ⇒ bit-exact, NOT the ~1e-6 f32-atomic path). Mirrors
+//   `construct_leaf_hist_resident_kernel`'s bin layout / resident indexing
+//   (histogram.rs:511-533) but sequential into THIS cube's f64 region.
+// Stage 2 FIX: inlines `fix_compact_kernel`'s fix logic VERBATIM
+//   (histogram.rs:674-703) — RAW (un-bumped) sum_gradient/sum_hessian seed
+//   (Pitfall 2), ascending subtract via branchless `select`.
+// Stage 3 COMPACT: inlines `fix_compact_kernel`'s compact logic VERBATIM
+//   (histogram.rs:705-732) — offset shift + tail zero.
+// Stage 4 SCAN: calls the SHARED `split_scan_body` (split.rs:144) over the
+//   fixed+compacted region with the 2*kEpsilon-BUMPED sum_hessian + host
+//   min_gain_shift (the SAME scan operands `find_best_splits_fused_kernel` uses),
+//   writing the RAW 12-cell SplitInfo to `out[f*12..]`.
+//
+// Output BOTH the resident fixed+compacted f64 histogram (for the subtraction
+// trick) AND the per-feature SplitInfos, in ONE launch.
+//
+// `#[cfg(feature="rocm")]` — the CPU anchor keeps the host build/fix/compact/scan
+// unchanged (the fused gate is OFF on cpu).
+// ===========================================================================
+
+/// Fused per-feature BUILD + FIX + COMPACT + SCAN kernel (260608-t3t). See the
+/// module-level block above. Cube `f` owns its region of `hist` (f64 OUT, the
+/// resident fixed+compacted histogram, caller-zeroed) and writes its 12-cell
+/// window `out[f*12 .. f*12+12]` (the RAW SplitInfo cells, host-decoded).
+///
+/// The LEAF-LEVEL scalars are shared across every feature: the RAW (un-bumped)
+/// `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2); the
+/// 2*kEpsilon-BUMPED `sum_hessian_bumped` + the host `min_gain_shift` feed the SCAN
+/// (the distinct operands, matching `find_best_splits_fused_kernel`).
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn build_fix_scan_fused_kernel(
+    // Device-resident binned columns (feature-major, `f*num_data + row`) — INPUT.
+    resident_bins: &Array<u32>,
+    // The leaf's row indices (subset of 0..num_data) — INPUT.
+    leaf_rows: &Array<u32>,
+    // The leaf's grad/hess gathered host-side in leaf_rows order — INPUT (f32).
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    // f64 fixed+compacted histogram — OUTPUT (caller zeroes it before launch).
+    hist: &mut Array<f64>,
+    // RAW 12-cell-per-feature SplitInfo — OUTPUT.
+    out: &mut Array<f64>,
+    // Per-feature params (length == num_features).
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    most_freq_bin: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // Stride of a resident column = full train row count.
+    num_data_stride: usize,
+    // LEAF-LEVEL scalars (shared across the batch).
+    sum_gradient_raw: f64,
+    sum_hessian_raw: f64,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_hessian_bumped: f64,
+    num_data: i32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let base = slot_off[fi] as usize;
+    let nb = num_bin[fi];
+    let mfb = most_freq_bin[fi];
+    let off = offset[fi];
+
+    // ---- Stage 1: SEQUENTIAL f64 BUILD (ascending leaf-row order = cpu anchor) ----
+    // Zero this cube's region first (2 cells per bin), then gather each leaf row's
+    // bin from the resident column and ASCENDING-fold f32 grad/hess into the f64
+    // cells. `f64::cast_from(score_t f32)` reproduces the C++ float->double widen
+    // (Pitfall 3); the ascending fold order matches the host sequential build EXACTLY
+    // (the bit-exact contract — non-negotiable #2). NO atomics (single-owner cube).
+    for w in 0..nb {
+        let wbi = base + (w as usize) * 2;
+        hist[wbi] = 0.0;
+        hist[wbi + 1] = 0.0;
+    }
+    let rows = ord_g.len();
+    for k in 0..rows {
+        let row = leaf_rows[k] as usize;
+        let bin = resident_bins[fi * num_data_stride + row];
+        let cell = base + bin as usize * 2;
+        hist[cell] += f64::cast_from(ord_g[k]);
+        hist[cell + 1] += f64::cast_from(ord_h[k]);
+    }
+
+    // ---- Stage 2: FIX (fix_compact_kernel:674-703, VERBATIM) ----
+    // Seed the most-freq cell with the RAW (un-bumped) leaf totals (Pitfall 2),
+    // subtract every OTHER bin ASCENDING via branchless select. Runs only for a
+    // valid in-range mfb > 0.
+    let do_fix = mfb > 0 && mfb < nb;
+    if do_fix {
+        let mfbu = mfb as usize;
+        let mut g = 0.0f64;
+        let mut h = 0.0f64;
+        g += sum_gradient_raw;
+        h += sum_hessian_raw;
+        let count = nb;
+        for i in 0..count {
+            let bi = base + (i as usize) * 2;
+            let gi = hist[bi];
+            let hi = hist[bi + 1];
+            let take = i != mfb;
+            g -= select(take, gi, 0.0);
+            h -= select(take, hi, 0.0);
+        }
+        let mi = base + mfbu * 2;
+        hist[mi] = g;
+        hist[mi + 1] = h;
+    }
+
+    // ---- Stage 3: COMPACT (fix_compact_kernel:705-732, VERBATIM) ----
+    if off > 0 {
+        if off >= nb {
+            for c in 0..nb {
+                let dst = base + (c as usize) * 2;
+                hist[dst] = 0.0;
+                hist[dst + 1] = 0.0;
+            }
+        } else {
+            let keep = nb - off;
+            for c in 0..keep {
+                let dst = base + (c as usize) * 2;
+                let src = base + ((c + off) as usize) * 2;
+                hist[dst] = hist[src];
+                hist[dst + 1] = hist[src + 1];
+            }
+            for c in keep..nb {
+                let dst = base + (c as usize) * 2;
+                hist[dst] = 0.0;
+                hist[dst + 1] = 0.0;
+            }
+        }
+    }
+
+    // ---- Stage 4: SCAN (shared split_scan_body, split.rs:144) ----
+    // Over the fixed+compacted region; hist_base = slot_off[f], out_base = f*12.
+    // The SAME leaf scalars as find_best_splits_fused_kernel (split.rs:976-996):
+    // the 2*kEpsilon-BUMPED sum_hessian + host min_gain_shift for the scan entry.
+    crate::kernels::split::split_scan_body(
+        hist,
+        slot_off[fi],
+        out,
+        f * 12u32,
+        nb,
+        off,
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient_raw,
+        sum_hessian_bumped,
+        num_data,
+        rev_count[fi],
+        fwd_count[fi],
+    );
+}
+
+/// Host launcher for the FUSED build+fix+compact+scan kernel (260608-t3t).
+///
+/// Drives [`build_fix_scan_fused_kernel`] in ONE launch over all `feats` features,
+/// returning BOTH the resident fixed+compacted f64 histogram `Handle` (kept on
+/// device for the subtraction trick) AND one [`SplitInfo`] per feature in input
+/// order. Mirrors the V5 validation + marshalling of
+/// [`build_fix_compact_resident_f64_on`] AND the host pre-step + decode/accept-gate
+/// of the fused split scan (split.rs:1212-1311).
+///
+/// `feats` carries the per-feature scan params + the fix params; the leaf RAW
+/// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2), and
+/// the launcher computes the 2*kEpsilon-BUMPED sum_hessian + min_gain_shift for the
+/// scan exactly as `find_best_splits_fused_inner` does.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] / [`ComputeError::LengthMismatch`] on degenerate
+/// layout (mirrors the fused split launcher's per-feature V5 checks + the leaf-level
+/// `sum_hessian > 0` / `max_delta_step`/`path_smooth` default-path checks).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    num_features: usize,
+    num_data_stride: usize,
+    // Per-feature slot offsets ride on `feats` (`f.slot_off`); this slice is accepted
+    // for signature symmetry with `build_fix_compact_resident_f64_on` and asserted.
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    gradients: &[f32],
+    hessians: &[f32],
+    feats: &[crate::kernels::split::BatchedSplitFeature],
+    cfg: &crate::gain::GainConfig,
+    sum_gradient_raw: f64,
+    sum_hessian_raw: f64,
+    num_data: i32,
+) -> Result<(cubecl::server::Handle, usize, Vec<crate::gain::SplitInfo>), ComputeError> {
+    use crate::gain::SplitInfo;
+
+    // Empty batch / empty leaf: no launch — a zeroed resident hist + empty splits.
+    let rows = leaf_rows.len();
+    if feats.is_empty() || rows == 0 || num_features == 0 {
+        let zeros64 = vec![0.0f64; slot_len];
+        let h_f64 = client.create_from_slice(f64::as_bytes(&zeros64));
+        return Ok((h_f64, slot_len, Vec::new()));
+    }
+
+    // Leaf-level default-path + sum_hessian checks (identical to the fused split
+    // launcher; the scan divides cnt_factor by the bumped sum_hessian).
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return Err(ComputeError::Runtime {
+            detail: "build_fix_scan_resident: max_delta_step / path_smooth are Phase-7+ scope \
+                     (only the default 0.0 path is transcribed)"
+                .to_string(),
+        });
+    }
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian_raw > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "build_fix_scan_resident: sum_hessian must be > 0 (cnt_factor divides by it)"
+                .to_string(),
+        });
+    }
+
+    // Per-feature slot offsets ride on `feats`; the parallel `slot_off` slice (the
+    // pool's per-feature offsets) must agree where present (consistency guard).
+    debug_assert!(
+        slot_off.len() >= feats.len()
+            && feats.iter().enumerate().all(|(i, f)| slot_off[i] == f.slot_off),
+        "slot_off slice must agree with feats[*].slot_off"
+    );
+
+    // Per-feature V5 validation + device-array assembly (BEFORE launch).
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut mfb_a: Vec<i32> = Vec::with_capacity(n);
+    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
+    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
+    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
+    for f in feats {
+        if f.na_as_missing {
+            return Err(ComputeError::Runtime {
+                detail: "build_fix_scan_resident: na_as_missing not yet implemented".to_string(),
+            });
+        }
+        if f.num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "build_fix_scan_resident: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(f.num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+            })?;
+        let end = f
+            .slot_off
+            .checked_add(cells)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "build_fix_scan_resident: slot_off + region overflows".to_string(),
+            })?;
+        if end > slot_len {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: slot_len,
+            });
+        }
+        let num_bin_i = f.num_bin as i32;
+        let rev_count = (num_bin_i - 1).max(0);
+        let fwd_count = if f.run_forward {
+            (num_bin_i - 1 - f.offset).max(0)
+        } else {
+            0
+        };
+        slot_off_a.push(f.slot_off as u32);
+        num_bin_a.push(num_bin_i);
+        offset_a.push(f.offset);
+        mfb_a.push(f.most_freq_bin as i32);
+        default_bin_a.push(f.default_bin as i32);
+        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
+        rev_count_a.push(rev_count);
+        fwd_count_a.push(fwd_count);
+    }
+
+    // LEAF-LEVEL scalars computed ONCE (the 2*kEpsilon entry bump + min_gain_shift),
+    // exactly as find_best_splits_fused_inner (split.rs:1213-1223).
+    let two_eps = 2.0 * f64::from(lgbm_core::types::K_EPSILON);
+    let sum_hessian_bumped = sum_hessian_raw + two_eps;
+    let use_l1 = cfg.use_l1();
+    let gain_shift = crate::gain::get_leaf_gain(
+        use_l1,
+        sum_gradient_raw,
+        sum_hessian_bumped,
+        cfg.lambda_l1,
+        cfg.lambda_l2,
+    );
+    let min_gain_shift = gain_shift + cfg.min_gain_to_split;
+
+    // Per-leaf uploads (leaf_rows + the leaf's gathered grad/hess) + the zeroed
+    // outputs. The big resident bins matrix is ALREADY on device.
+    let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+    let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+    let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
+    let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
+    let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
+    let zeros64 = vec![0.0f64; slot_len];
+    let h_hist = client.create_from_slice(f64::as_bytes(&zeros64));
+    let out_len = n * 12;
+    let out_zeros = vec![0.0f64; out_len];
+    let h_out = client.create_from_slice(f64::as_bytes(&out_zeros));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
+    let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
+    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
+    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
+    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
+    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // SAFETY: cube `f < n` reads the resident column at `f*num_data_stride +
+    // leaf_rows[k]` (leaf_rows ⊂ 0..num_data_stride keeps it in range; the resident
+    // buffer is sized num_features*num_data_stride), and reads/writes `h_hist` only
+    // within its validated `[slot_off[f], slot_off[f]+2*num_bin[f]) <= slot_len`
+    // region, writing `h_out[f*12 .. f*12+12]` within the n*12 allocation. `bin <
+    // num_bin` (resident invariant) keeps the build cell in range; `mfb < num_bin`
+    // keeps the reconstruct in range. Every per-feature index array has exactly `n`
+    // elements; every handle outlives the launch. All cubecl unsafe confined here
+    // (CMP-01).
+    unsafe {
+        build_fix_scan_fused_kernel::launch(
+            client,
+            CubeCount::Static(n as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(resident_bins, num_features * num_data_stride),
+            ArrayArg::from_raw_parts(h_rows, rows),
+            ArrayArg::from_raw_parts(h_g, rows),
+            ArrayArg::from_raw_parts(h_h, rows),
+            ArrayArg::from_raw_parts(h_hist.clone(), slot_len),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            ArrayArg::from_raw_parts(h_slot, n),
+            ArrayArg::from_raw_parts(h_numbin, n),
+            ArrayArg::from_raw_parts(h_offset, n),
+            ArrayArg::from_raw_parts(h_mfb, n),
+            ArrayArg::from_raw_parts(h_defbin, n),
+            ArrayArg::from_raw_parts(h_skip, n),
+            ArrayArg::from_raw_parts(h_rev, n),
+            ArrayArg::from_raw_parts(h_fwd, n),
+            num_data_stride,
+            sum_gradient_raw,
+            sum_hessian_raw,
+            if use_l1 { 1u32 } else { 0u32 },
+            cfg.min_data_in_leaf,
+            cfg.min_sum_hessian_in_leaf,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            min_gain_shift,
+            sum_hessian_bumped,
+            num_data,
+        );
+    }
+
+    // Read back ONLY the SplitInfo cells; the histogram Handle stays resident.
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = f64::from_bytes(&bytes);
+
+    // Decode with the SAME accept-gate as find_best_splits_fused_inner
+    // (split.rs:1277-1311). Push in input order.
+    let penalty = 1.0f64;
+    let mut splits = Vec::with_capacity(n);
+    for f in 0..n {
+        let dbase = f * 12;
+        let is_splittable = cells[dbase] != 0.0;
+        let raw_threshold = cells[dbase + 1] as u32;
+        let raw_gain = cells[dbase + 2];
+        let left_count = cells[dbase + 3] as i32;
+        let right_count = cells[dbase + 4] as i32;
+        let left_sum_gradient = cells[dbase + 5];
+        let left_sum_hessian = cells[dbase + 6];
+        let right_sum_gradient = cells[dbase + 7];
+        let right_sum_hessian = cells[dbase + 8];
+        let default_left = cells[dbase + 9] != 0.0;
+        let left_output = cells[dbase + 10];
+        let right_output = cells[dbase + 11];
+
+        if is_splittable && raw_gain > f64::NEG_INFINITY {
+            splits.push(SplitInfo {
+                threshold: raw_threshold,
+                gain: (raw_gain - min_gain_shift) * penalty,
+                left_count,
+                right_count,
+                left_sum_gradient,
+                left_sum_hessian,
+                right_sum_gradient,
+                right_sum_hessian,
+                left_output,
+                right_output,
+                default_left,
+            });
+        } else {
+            splits.push(SplitInfo::none());
+        }
+    }
+
+    Ok((h_hist, slot_len, splits))
+}

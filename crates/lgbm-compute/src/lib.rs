@@ -448,6 +448,44 @@ pub trait Backend {
                 .to_string(),
         })
     }
+
+    /// 260608-t3t: FUSED directly-built-leaf path — build + fix + compact + scan a
+    /// leaf's per-feature histogram in ONE launch. Builds the leaf's histogram
+    /// DEVICE-RESIDENT (sequential f64 fold ⇒ bit-exact), fixes+compacts it, and
+    /// scans it for every feature's best split — STORING the fixed+compacted f64
+    /// Handle into mirror slot `slot` (so `subtract_resident` can still derive the
+    /// larger child from it) AND returning one [`SplitInfo`] per `feats` entry in
+    /// input order. Collapses `build_resident_leaf` + `scan_resident_leaf` (3
+    /// launches) into 1. `fix_feats`-equivalent fields ride on `feats`; the leaf RAW
+    /// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2),
+    /// the launcher derives the 2*kEpsilon-bumped scan operand internally. Default:
+    /// typed error (never called on cpu — the fused gate is off there).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the fused
+    /// kernel errors on RocmBackend.
+    #[allow(clippy::too_many_arguments)]
+    fn build_fix_scan_resident(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _slot: usize,
+        _slot_off: &[usize],
+        _slot_len: usize,
+        _leaf_rows: &[u32],
+        _gradients: &[f32],
+        _hessians: &[f32],
+        _feats: &[BatchedSplitFeature],
+        _cfg: &GainConfig,
+        _sum_gradient_raw: f64,
+        _sum_hessian_raw: f64,
+        _num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "build_fix_scan_resident: device-resident fused path not supported on this \
+                     backend"
+                .to_string(),
+        })
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -997,5 +1035,59 @@ impl Backend for RocmBackend {
         kernels::split::find_best_splits_batched_fused_f64_from_handle_on(
             client, handle, slot_len, feats, cfg, sum_gradient, sum_hessian, num_data,
         )
+    }
+
+    /// 260608-t3t: FUSED build+fix+compact+scan for a directly-built leaf. Reads the
+    /// resident bin cache, runs the SINGLE fused-kernel launch (build → fix →
+    /// compact → scan), STORES the returned fixed+compacted f64 Handle into mirror
+    /// slot `slot` (so `subtract_resident` finds it as the parent), and returns the
+    /// per-feature SplitInfos. Errors if the resident bin cache is empty (defensive).
+    #[allow(clippy::too_many_arguments)]
+    fn build_fix_scan_resident(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        slot: usize,
+        slot_off: &[usize],
+        slot_len: usize,
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        sum_gradient_raw: f64,
+        sum_hessian_raw: f64,
+        num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        let resident = self.resident_bins.borrow();
+        let Some(resident) = resident.as_ref() else {
+            return Err(ComputeError::Runtime {
+                detail: "build_fix_scan_resident: resident bin cache empty (upload_resident_bins \
+                         not called)"
+                    .to_string(),
+            });
+        };
+        let (handle, len, splits) = kernels::histogram::build_fix_scan_resident_f64_on(
+            client,
+            resident.handle.clone(),
+            resident.num_features,
+            resident.num_data,
+            slot_off,
+            slot_len,
+            leaf_rows,
+            gradients,
+            hessians,
+            feats,
+            cfg,
+            sum_gradient_raw,
+            sum_hessian_raw,
+            num_data,
+        )?;
+        debug_assert_eq!(len, slot_len, "fused resident leaf handle length");
+        let mut mirror = self.resident_pool.borrow_mut();
+        if slot >= mirror.len() {
+            mirror.resize_with(slot + 1, || None);
+        }
+        mirror[slot] = Some(handle);
+        Ok(splits)
     }
 }

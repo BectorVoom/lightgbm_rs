@@ -1872,4 +1872,210 @@ mod hip {
             );
         }
     }
+
+    /// 260608-t3t — the FUSED build+fix+compact+scan kernel
+    /// (`build_fix_scan_resident_f64_on`) must be BIT-EXACT to the host pipeline for a
+    /// directly-built leaf: (1) its RESIDENT fixed+compacted f64 histogram region ==
+    /// the host SEQUENTIAL f64 build (ascending leaf-row order) → `fix_histogram` (RAW
+    /// un-bumped sum_hessian, Pitfall 2) → host compact, via `compare_exact_f64_bits`;
+    /// and (2) its per-feature 12-cell SplitInfo == the host `find_best_split` (the
+    /// production `find_best_split_cpu_native`) over that SAME fixed+compacted region,
+    /// EXACTLY (every field). NO within-tol — the fused kernel folds in the SAME
+    /// ascending f64 order as the host sequential build, so the bits are identical.
+    ///
+    /// Covers: mfb > 0 reconstruct (f0 fix active), mfb == 0 / offset == 1 compaction
+    /// (f1, DEF-07-02 path — unchanged), offset == 0 no-op (f0/f2/f3), a REVERSE-winner
+    /// + a FORWARD-winner feature, and a no-split feature (is_splittable == 0).
+    #[test]
+    fn kernel_parity_build_fix_scan_equals_host_on_hip() {
+        use lgbm_compute::kernels::histogram::{
+            build_fix_scan_resident_f64_on, upload_resident_columns,
+        };
+        use lgbm_compute::kernels::split::{
+            find_best_split_cpu_native, read_f64_handle, BatchedSplitFeature,
+        };
+        use lgbm_treelearner::fix_histogram;
+
+        let hip = rocm_client();
+
+        // 4 features over 12 rows with assorted bin counts + mfb/offset/run_forward so
+        // fix (reconstruct) + compact (drop bin 0) both fire and we get a REVERSE
+        // winner, a FORWARD winner, and a no-split feature.
+        let num_data = 12usize;
+        // num_bin 4, mfb 2 (fix), offset 0, REVERSE scan only (run_forward=false).
+        let f0: Vec<u32> = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+        // num_bin 3, mfb 0, offset 1 (DEF-07-02 compaction), FORWARD allowed.
+        let f1: Vec<u32> = vec![0, 0, 1, 1, 2, 2, 0, 1, 2, 0, 1, 2];
+        // num_bin 5, mfb 1 (fix), offset 0, FORWARD allowed.
+        let f2: Vec<u32> = vec![4, 3, 2, 1, 0, 1, 2, 3, 4, 0, 2, 3];
+        // num_bin 2, mfb 0, offset 0, FORWARD allowed — CONSTANT over the leaf rows
+        // (every leaf row maps to bin 0; only the non-leaf rows 1/7/10 use bin 1), so
+        // no admissible split exists ⇒ is_splittable == 0 (the no-split coverage cell).
+        let f3: Vec<u32> = vec![0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0];
+        let feature_bins: Vec<&[u32]> = vec![&f0, &f1, &f2, &f3];
+        let num_bins: Vec<u32> = vec![4, 3, 5, 2];
+        let mfbs: Vec<u32> = vec![2, 0, 1, 0];
+        let offsets: Vec<i32> = vec![0, 1, 0, 0];
+        let default_bins: Vec<u32> = vec![0, 0, 0, 0];
+        let skip_default: Vec<bool> = vec![false, false, false, false];
+        let run_forward: Vec<bool> = vec![false, true, true, true];
+
+        let mut slot_off = Vec::with_capacity(num_bins.len());
+        let mut acc = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(acc);
+            acc += 2 * nb as usize;
+        }
+        let slot_len = acc;
+
+        // The leaf rows (ascending) + per-row grad/hess. Exactly f32-representable so
+        // the f32 reads widen losslessly; the ascending f64 fold then matches the host.
+        let leaf_rows: Vec<u32> = vec![0, 2, 3, 5, 6, 8, 9, 11];
+        let gradients: Vec<f32> = (0..num_data).map(|i| 0.5 + i as f32 * 0.25).collect();
+        let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 4) as f32 * 0.5).collect();
+
+        // Leaf RAW totals over the leaf rows (un-bumped) — Pitfall 2.
+        let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
+        let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
+        let num_data_in_leaf = leaf_rows.len() as i32;
+
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 1e-3,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+
+        // ---- HOST reference histogram: SEQUENTIAL f64 build (ascending leaf-row
+        // order) → fix_histogram (RAW un-bumped) → host compact, per feature. ----
+        let mut host = vec![0.0f64; slot_len];
+        for (fpos, col) in feature_bins.iter().enumerate() {
+            let base = slot_off[fpos];
+            // ascending leaf-row fold (the same order the fused kernel uses)
+            for &r in &leaf_rows {
+                let bin = col[r as usize] as usize;
+                let cell = base + bin * 2;
+                host[cell] += f64::from(gradients[r as usize]);
+                host[cell + 1] += f64::from(hessians[r as usize]);
+            }
+            let nb = num_bins[fpos];
+            let cells = 2 * nb as usize;
+            let region = &mut host[base..base + cells];
+            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
+            host_compact_histogram(region, offsets[fpos]);
+        }
+
+        // ---- HOST reference SplitInfo: production find_best_split per feature over
+        // the SAME fixed+compacted region. ----
+        let host_splits: Vec<lgbm_compute::SplitInfo> = (0..num_bins.len())
+            .map(|fpos| {
+                let base = slot_off[fpos];
+                let cells = 2 * num_bins[fpos] as usize;
+                let region = &host[base..base + cells];
+                find_best_split_cpu_native(
+                    region,
+                    &cfg,
+                    num_bins[fpos],
+                    offsets[fpos],
+                    default_bins[fpos],
+                    mfbs[fpos],
+                    skip_default[fpos],
+                    false,
+                    run_forward[fpos],
+                    sum_g,
+                    sum_h,
+                    num_data_in_leaf,
+                )
+                .expect("host find_best_split_cpu_native")
+            })
+            .collect();
+
+        // ---- FUSED kernel: build+fix+compact+scan in ONE launch. ----
+        let feats: Vec<BatchedSplitFeature> = (0..num_bins.len())
+            .map(|fpos| BatchedSplitFeature {
+                slot_off: slot_off[fpos],
+                num_bin: num_bins[fpos],
+                offset: offsets[fpos],
+                default_bin: default_bins[fpos],
+                most_freq_bin: mfbs[fpos],
+                skip_default_bin: skip_default[fpos],
+                na_as_missing: false,
+                run_forward: run_forward[fpos],
+            })
+            .collect();
+        let (hist_handle, len, fused_splits) = build_fix_scan_resident_f64_on(
+            &hip,
+            upload_resident_columns(&hip, &feature_bins),
+            feature_bins.len(),
+            num_data,
+            &slot_off,
+            slot_len,
+            &leaf_rows,
+            &gradients,
+            &hessians,
+            &feats,
+            &cfg,
+            sum_g,
+            sum_h,
+            num_data_in_leaf,
+        )
+        .expect("fused build_fix_scan_resident");
+
+        // (1) RESIDENT fixed+compacted histogram == host pipeline, BIT-EXACT.
+        assert_eq!(len, slot_len, "fused resident histogram length");
+        let fused_hist = read_f64_handle(&hip, hist_handle, slot_len);
+        if let Err(m) = compare_exact_f64_bits(&fused_hist, &host) {
+            panic!("fused resident histogram != host build+fix+compact (NOT bit-exact): {m}");
+        }
+
+        // (2) per-feature SplitInfo == host find_best_split, EXACTLY (every field).
+        assert_eq!(fused_splits.len(), host_splits.len(), "split count");
+        let mut saw_reverse = false;
+        let mut saw_forward = false;
+        let mut saw_no_split = false;
+        for (i, (fu, ho)) in fused_splits.iter().zip(host_splits.iter()).enumerate() {
+            // f64 fields bit-exact.
+            let fields = |s: &lgbm_compute::SplitInfo| {
+                [
+                    s.gain,
+                    s.left_sum_gradient,
+                    s.left_sum_hessian,
+                    s.right_sum_gradient,
+                    s.right_sum_hessian,
+                    s.left_output,
+                    s.right_output,
+                ]
+            };
+            if let Err(m) = compare_exact_f64_bits(&fields(fu), &fields(ho)) {
+                panic!("feature {i}: fused SplitInfo f64 fields != host (NOT bit-exact): {m}");
+            }
+            assert_eq!(fu.threshold, ho.threshold, "feature {i}: threshold");
+            assert_eq!(fu.left_count, ho.left_count, "feature {i}: left_count");
+            assert_eq!(fu.right_count, ho.right_count, "feature {i}: right_count");
+            assert_eq!(fu.default_left, ho.default_left, "feature {i}: default_left");
+            assert_eq!(
+                fu.gain.is_finite(),
+                ho.gain.is_finite(),
+                "feature {i}: splittability (gain finiteness)"
+            );
+            // Coverage bookkeeping: a finite-gain REVERSE (default_left) winner, a
+            // finite-gain FORWARD (!default_left) winner, and a no-split feature.
+            if ho.gain.is_finite() {
+                if ho.default_left {
+                    saw_reverse = true;
+                } else {
+                    saw_forward = true;
+                }
+            } else {
+                saw_no_split = true;
+            }
+        }
+        assert!(saw_reverse, "test must exercise a REVERSE-winner feature");
+        assert!(saw_forward, "test must exercise a FORWARD-winner feature");
+        assert!(saw_no_split, "test must exercise a no-split feature");
+    }
 }

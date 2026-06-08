@@ -1062,6 +1062,22 @@ pub fn upload_f64_buffer<R: cubecl::Runtime>(
     client.create_from_slice(f64::as_bytes(buf))
 }
 
+/// Read an f64 device `Handle` back to a `Vec<f64>` (260608-t3t) — a thin
+/// CMP-01-respecting helper so cubecl-free callers (the fused==host oracle) can read
+/// a resident histogram Handle without naming `cubecl` types. `len` is the cell
+/// count the Handle describes. `read_one_unchecked` is the same readback the kernel
+/// launchers use.
+pub fn read_f64_handle<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    handle: cubecl::server::Handle,
+    len: usize,
+) -> Vec<f64> {
+    let bytes = client.read_one_unchecked(handle);
+    let v = f64::from_bytes(&bytes).to_vec();
+    debug_assert_eq!(v.len(), len, "read_f64_handle length");
+    v
+}
+
 /// Handle-consuming sibling of [`find_best_splits_batched_fused_f64_on`] (260608-p90
 /// Task 1A) — the device-resident fused per-leaf split scan. IDENTICAL to the
 /// host-buf launcher EXCEPT it CONSUMES a device `Handle` for the concatenated
