@@ -18,6 +18,7 @@ pub mod runtime;
 
 pub use error::ComputeError;
 pub use gain::{GainConfig, SplitInfo};
+pub use kernels::split::BatchedSplitFeature;
 
 use cubecl::prelude::ComputeClient;
 
@@ -230,6 +231,86 @@ pub trait Backend {
                 self.construct_histograms(client, &ord_bins, &ord_g, &ord_h, num_bins[fpos])?;
             let cells = 2 * num_bins[fpos] as usize;
             out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&hist);
+        }
+        Ok(out)
+    }
+
+    /// Find the best split for EVERY spine feature of ONE leaf in a single batched
+    /// op (260608-lad Part 2): the fused per-leaf SPLIT SCAN over the concatenated
+    /// stride-2 f64 histogram `buf` (the same layout
+    /// [`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw) produces —
+    /// feature `f` occupies `[f.slot_off, f.slot_off + 2*f.num_bin)`). The learner
+    /// calls this ONCE per leaf instead of looping
+    /// [`find_best_split`](Backend::find_best_split) per feature.
+    ///
+    /// `feats` carries the per-feature dispatch parameters (one entry per scanned
+    /// spine feature, in ascending feature position); `cfg` + `sum_gradient` /
+    /// `sum_hessian` / `num_data` are the leaf totals shared across the batch.
+    /// Returns one [`SplitInfo`] per input feature, **in the SAME order as `feats`**
+    /// — order-preservation keeps the caller's cross-feature argmax (gain, then
+    /// smaller feature) tie-break identical, which is what keeps the CPU-grown tree
+    /// bit-exact (threat T-lsx-01).
+    ///
+    /// The DEFAULT impl (used by [`CpuBackend`] unchanged) loops
+    /// [`find_best_split`](Backend::find_best_split) over `feats` in order, so each
+    /// feature's [`SplitInfo`] is byte-identical to today's per-feature call — the
+    /// default IS the bit-exact f64 anchor. A GPU backend OVERRIDES this to find all
+    /// features' splits in one launch per leaf.
+    ///
+    /// An empty `feats` (every feature gated out / categorical-only leaf) returns an
+    /// empty Vec with no launch (threat T-lsx-03).
+    ///
+    /// # Errors
+    /// Propagates [`find_best_split`](Backend::find_best_split) errors; returns
+    /// [`ComputeError::LengthMismatch`] if any feature's
+    /// `[slot_off, slot_off + 2*num_bin)` region exceeds `buf` (V5, threat T-lsx-02
+    /// — no panic / UB).
+    fn find_best_splits_batched(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        buf: &[f64],
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        let mut out = Vec::with_capacity(feats.len());
+        for f in feats {
+            let cells = 2usize
+                .checked_mul(f.num_bin as usize)
+                .ok_or_else(|| ComputeError::Runtime {
+                    detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+                })?;
+            let end = f
+                .slot_off
+                .checked_add(cells)
+                .ok_or_else(|| ComputeError::Runtime {
+                    detail: "find_best_splits_batched: slot_off + region overflows".to_string(),
+                })?;
+            if end > buf.len() {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: buf.len(),
+                });
+            }
+            let hist = &buf[f.slot_off..end];
+            let si = self.find_best_split(
+                client,
+                hist,
+                cfg,
+                f.num_bin,
+                f.offset,
+                f.default_bin,
+                f.most_freq_bin,
+                f.skip_default_bin,
+                f.na_as_missing,
+                f.run_forward,
+                sum_gradient,
+                sum_hessian,
+                num_data,
+            )?;
+            out.push(si);
         }
         Ok(out)
     }
@@ -469,6 +550,33 @@ impl Backend for RocmBackend {
             leaf_rows,
             gradients,
             hessians,
+        )
+    }
+
+    /// GPU override (260608-lad Part 2): find ALL spine features' best splits for
+    /// this leaf via the runtime-generic batched f64 scan
+    /// ([`kernels::split::find_best_splits_batched_f64_on`]), one GPU launch per
+    /// feature (a single fused launch is the GPU-perf follow-up). Input order is
+    /// preserved (T-lsx-01); the f64 scan keeps the SAME gate order / eps / threshold
+    /// semantics as the CPU anchor (bit-exact f64 on gfx1100 — `max_abs_diff=0`).
+    fn find_best_splits_batched(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        buf: &[f64],
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        kernels::split::find_best_splits_batched_f64_on(
+            client,
+            buf,
+            feats,
+            cfg,
+            sum_gradient,
+            sum_hessian,
+            num_data,
         )
     }
 }

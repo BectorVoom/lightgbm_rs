@@ -63,6 +63,37 @@ use cubecl::prelude::*;
 
 use lgbm_core::types::K_EPSILON;
 
+/// Plain per-feature parameter record for the batched per-leaf split scan
+/// ([`Backend::find_best_splits_batched`](crate::Backend::find_best_splits_batched),
+/// 260608-lad Part 2). Carries EXACTLY the per-feature args the single-feature
+/// [`Backend::find_best_split`](crate::Backend::find_best_split) takes today
+/// (`lib.rs`), plus the feature's `slot_off` into the concatenated leaf histogram
+/// buffer (so each feature reads only `[slot_off, slot_off + 2*num_bin)` —
+/// reusing the validated slot layout `build_leaf_histograms_raw` produces).
+///
+/// The leaf totals (`sum_gradient` / `sum_hessian` / `num_data`) and the
+/// [`GainConfig`] are shared across the whole batch and passed separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchedSplitFeature {
+    /// This feature's start offset into the concatenated stride-2 f64 histogram
+    /// buffer; its region is `[slot_off, slot_off + 2*num_bin)`.
+    pub slot_off: usize,
+    /// The feature's bin count (`f.num_bin`). The histogram region is `2*num_bin`.
+    pub num_bin: u32,
+    /// The feature's bin-layout offset (`f.offset`, 1 iff `most_freq_bin == 0`).
+    pub offset: i32,
+    /// The feature's default bin (`f.default_bin`).
+    pub default_bin: u32,
+    /// The feature's most-frequent bin (`f.most_freq_bin`).
+    pub most_freq_bin: u32,
+    /// Authoritative `SKIP_DEFAULT_BIN` dispatch flag (`f.skip_default_bin()`).
+    pub skip_default_bin: bool,
+    /// Authoritative `NA_AS_MISSING` dispatch flag (`f.na_as_missing()`).
+    pub na_as_missing: bool,
+    /// Authoritative FORWARD-branch dispatch flag (`f.run_forward()`).
+    pub run_forward: bool,
+}
+
 use crate::error::ComputeError;
 use crate::gain::{
     calculate_splitted_leaf_output, calculate_splitted_leaf_output_f32, get_split_gains,
@@ -772,6 +803,69 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     } else {
         Ok(SplitInfo::none())
     }
+}
+
+/// Batched per-leaf f64 best-split scan, **generic over the runtime** `R` (the GPU
+/// `RocmBackend` override for 260608-lad Part 2). Finds the best split for EVERY
+/// feature in `feats` by scanning each feature's `[slot_off, slot_off + 2*num_bin)`
+/// region of the concatenated leaf histogram `buf`, returning one [`SplitInfo`] per
+/// input feature **in input order** (order-preservation is the cross-feature-argmax
+/// tie-break invariant, threat T-lsx-01).
+///
+/// This launches the SAME `find_best_split_f64_on` f64 scan per feature on the GPU
+/// runtime, so each result is bit-identical to the single-feature GPU path; the
+/// per-leaf launch-count collapse to a single fused kernel is a GPU-perf follow-up
+/// (the trait seam, the input-order contract, and the f64 numerics land here). Each
+/// feature reads only its own region (threat T-lsx-02); a `slot_off + 2*num_bin`
+/// overrun of `buf` is a typed [`ComputeError::LengthMismatch`] (no panic / UB).
+///
+/// # Errors
+/// Propagates [`find_best_split_f64_on`] errors; returns
+/// [`ComputeError::LengthMismatch`] if any feature's region exceeds `buf`.
+pub fn find_best_splits_batched_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    buf: &[f64],
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> Result<Vec<SplitInfo>, ComputeError> {
+    let mut out = Vec::with_capacity(feats.len());
+    for f in feats {
+        let cells = 2usize
+            .checked_mul(f.num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+            })?;
+        let end = f.slot_off.checked_add(cells).ok_or_else(|| ComputeError::Runtime {
+            detail: "find_best_splits_batched: slot_off + region overflows".to_string(),
+        })?;
+        if end > buf.len() {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: buf.len(),
+            });
+        }
+        let hist = &buf[f.slot_off..end];
+        let si = find_best_split_f64_on(
+            client,
+            hist,
+            cfg,
+            f.num_bin,
+            f.offset,
+            f.default_bin,
+            f.most_freq_bin,
+            f.skip_default_bin,
+            f.na_as_missing,
+            f.run_forward,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )?;
+        out.push(si);
+    }
+    Ok(out)
 }
 
 /// **Native** host f64 best-split scan — the production cpu-anchor path (R2).
