@@ -110,7 +110,7 @@
 - [x] **API-01**: Rust-native API — `Dataset`, `Booster`, `train`, `predict` mirroring LightGBM semantics
 - [x] **PYB-01**: Python bindings (PyO3 + maturin) mirroring the official `lightgbm` `Booster`/`Dataset` API
 - [x] **PYB-02**: NumPy interop (rust-numpy) for dense/sparse input and array outputs
-- [ ] **PYB-03**: Python sklearn-style wrapper API (`LGBMClassifier`/`LGBMRegressor`/`LGBMRanker`) parity
+- [x] **PYB-03**: Python sklearn-style wrapper API (`LGBMClassifier`/`LGBMRegressor`/`LGBMRanker`) parity
 - [x] **PYB-04**: Python `custom` objective/metric callbacks and `Booster.refit()` support
 
 ## v2 Requirements
@@ -213,7 +213,7 @@ Each v1 requirement maps to exactly one phase (see `.planning/ROADMAP.md`).
 | ADV-07 | Phase 7 | Complete |
 | PYB-01 | Phase 8 | In Progress (08-01: Rust facade enabling slice — raw→bin→train + Booster methods; Python binding pending 08-02+) |
 | PYB-02 | Phase 8 | Complete |
-| PYB-03 | Phase 8 | Pending |
+| PYB-03 | Phase 8 | Complete |
 | PYB-04 | Phase 8 | In Progress (08-01: custom-metric feval eval-history hook + refit facade method; Python callbacks pending 08-06) |
 
 **Coverage:**
