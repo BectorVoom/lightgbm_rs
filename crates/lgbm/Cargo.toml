@@ -16,6 +16,15 @@ lgbm-boosting = { path = "../lgbm-boosting" }
 # (the trait/types + the CPU anchor only — the facade names no cubecl runtime).
 lgbm-compute = { path = "../lgbm-compute" }
 thiserror = { workspace = true }
+# Optional drop-in global allocator (parity-neutral) for the bench harness and any
+# downstream binary that opts in via `--features mimalloc`. Off by default so the
+# library imposes no allocator on consumers.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+# Route the process global allocator through mimalloc. Enabled for the optimized
+# benchmark runs (M2/M3) and intended for the shipped binaries.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }
