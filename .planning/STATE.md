@@ -4,8 +4,8 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-06-08T00:21:27.920Z"
-last_activity: 2026-06-08 -- Completed 08-04 (PYB-02 polars DataFrame input via Arrow + dtype→categorical routing; categorical A/B vs real lightgbm 4.6 at atol=1e-6; full pytest suite 30 green) and 08-05 (full params-dict pipeline D-06/07/08)
+last_updated: "2026-06-08T01:00:39.487Z"
+last_activity: 2026-06-08
 progress:
   total_phases: 8
   completed_phases: 7
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-05)
 
 ## Current Position
 
-Phase: 08 (python-bindings) — EXECUTING
-Plan: 8 of 8
+Phase: 08
+Plan: Not started
 Status: Executing (08-01..05 complete; Wave 4 plan 08-06 next)
-Last activity: 2026-06-08 -- Completed 08-04 (PYB-02 polars DataFrame input via Arrow + dtype→categorical routing; categorical A/B vs real lightgbm 4.6 at atol=1e-6; full pytest suite 30 green) and 08-05 (full params-dict pipeline D-06/07/08)
+Last activity: 2026-06-08
 
 ### Plan 08-03 result (PYB-02 input widening — COMPLETE)
 
@@ -339,7 +339,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 
 **Velocity:**
 
-- Total plans completed: 34 (tracked)
+- Total plans completed: 42 (tracked)
 - Average duration: ~3 min
 - Total execution time: <1 hour
 
@@ -354,6 +354,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | 04 | 4 | - | - |
 | 06 | 6 | - | - |
 | 07 | 12 | - | - |
+| 08 | 8 | - | - |
 
 **Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 **Plan 01-03:** 2 TDD tasks, 3 files modified, 7 new tests (49 → 56); deterministic alias resolution + empty==absent reads; `cargo test --workspace` green.
