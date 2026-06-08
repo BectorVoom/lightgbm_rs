@@ -162,10 +162,37 @@ pub fn resident_eligible(
 /// 3-launch resident chain LOSES to the host path (s2b: host wins at 2k/8k) — to ask
 /// whether collapsing to ONE launch flips that.
 ///
-/// PROVENANCE: placeholder until the Task 3 bench sweep sets it data-drivenly. Set so
-/// the fused path is OFF by default at every band unless the bench proves a win; the
-/// kernel + oracle + `LGBM_FUSED_FORCE` stay landed for future use either way.
-pub const FUSED_MAX_NUM_DATA: i32 = 0;
+/// VERDICT: **OFF by default — the fused path is FLAT-to-NEGATIVE at every band.**
+///
+/// PROVENANCE (measured on the local gfx1100, `bench_train` all three ways via
+/// `LGBM_RESIDENT_FORCE` / `LGBM_FUSED_FORCE`, train_median of 5, 2 runs each):
+///
+/// | rows   | FORCE_HOST    | FORCE_RESIDENT | FORCE_FUSED   | winner |
+/// |--------|---------------|----------------|---------------|--------|
+/// | 2000   | 1.42 / 1.49 s | 1.62 / 1.66 s  | 1.62 / 1.66 s | HOST   |
+/// | 8000   | 4.56 / 4.25 s | 4.74 / 4.88 s  | 5.03 / 5.05 s | HOST   |
+/// | 20000  | 11.82 / 11.97 s | 11.58 / 11.68 s | 12.13 / 12.19 s | RESIDENT |
+///
+/// The fused kernel is PROVEN bit-exact (the fused==host kernel oracle + the
+/// fused==host TREE-equivalence test) and DOES cut launches (3 → 1 on the directly
+/// built leaves ≈ root + smaller children ≈ ~half of a num_leaves=31 tree ≈ ~16
+/// leaves/tree × 2 launches saved ≈ ~32 of ~205 ≈ ~15% fewer launches/tree). But the
+/// NET wall-clock is FLAT-to-WORSE: at small it ties the resident chain (~1.64 s) and
+/// loses to host (~1.45 s); at medium it is the SLOWEST of the three (~5.04 s vs host
+/// ~4.40 / resident ~4.81); at large it is marginally slower than both. The single-
+/// owner SEQUENTIAL f64 build the fused kernel uses (to stay bit-exact) replaces the
+/// resident chain's PARALLEL f32-atomic build, and on gfx1100 that sequential per-
+/// feature fold costs MORE than the ~2 launches/leaf it eliminates — the launch
+/// saving does not pay for the lost build parallelism. NO net win materialized.
+///
+/// Per the honesty mandate (non-negotiable #5): the result is reported FLAT/NEGATIVE
+/// and the fused kernel is GATED OFF by default. `FUSED_MAX_NUM_DATA = -1` makes
+/// `num_data <= FUSED_MAX_NUM_DATA` false for every real workload (`num_data >= 1`),
+/// so the fused path never auto-engages; the proven bit-exact kernel + oracle +
+/// `LGBM_FUSED_FORCE` override stay landed for future use (e.g. a future device that
+/// makes a sequential f64 fold cheap, or a fused-subtract follow-up — see the SUMMARY
+/// scope note).
+pub const FUSED_MAX_NUM_DATA: i32 = -1;
 
 /// CONSERVATIVE / FAIL-SAFE FUSED directly-built-leaf eligibility predicate (260608-t3t).
 ///
@@ -229,7 +256,9 @@ pub fn fused_directly_built_eligible(
         Some("1") => return true,
         _ => {}
     }
-    // At/below the (Task-3-measured) crossover the fused single-launch path wins;
-    // above it the host/resident routing decides. Default placeholder OFF.
+    // Task-3 VERDICT: the fused path is FLAT-to-NEGATIVE at every measured band, so
+    // `FUSED_MAX_NUM_DATA = -1` keeps this false for every real workload (the kernel
+    // stays OFF by default; only `LGBM_FUSED_FORCE=1` engages it). See the
+    // `FUSED_MAX_NUM_DATA` provenance block for the measured table + the why.
     num_data <= FUSED_MAX_NUM_DATA
 }
