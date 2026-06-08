@@ -74,3 +74,31 @@ def test_label_length_mismatch_raises_valueerror():
     y = rng.standard_normal(9)  # wrong length
     with pytest.raises(ValueError):
         lightgbm_rs.Dataset(X, y)
+
+
+def test_predict_too_few_features_raises_valueerror():
+    # Code-review CR-01: a too-narrow predict matrix must raise ValueError at the
+    # boundary, NOT panic out-of-bounds inside the GIL-released predict.
+    rng = np.random.default_rng(11)
+    n, d = 150, 5
+    X = rng.standard_normal((n, d))
+    y = X @ rng.standard_normal(d)
+    model = lightgbm_rs.train(_params(), lightgbm_rs.Dataset(X, y), num_boost_round=10)
+
+    narrow = rng.standard_normal((4, d - 2))  # fewer columns than trained
+    with pytest.raises(ValueError):
+        model.predict(narrow)
+
+
+def test_refit_too_few_features_raises_valueerror():
+    # Code-review CR-02: same width guard on the refit data matrix.
+    rng = np.random.default_rng(12)
+    n, d = 150, 5
+    X = rng.standard_normal((n, d))
+    y = X @ rng.standard_normal(d)
+    model = lightgbm_rs.train(_params(), lightgbm_rs.Dataset(X, y), num_boost_round=10)
+
+    narrow = rng.standard_normal((20, d - 1))
+    ylab = rng.standard_normal(20)
+    with pytest.raises(ValueError):
+        model.refit(narrow, ylab)

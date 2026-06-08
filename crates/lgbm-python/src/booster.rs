@@ -51,6 +51,7 @@ impl Booster {
         data: PyReadonlyArray2<'py, f64>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let rows = numpy_dense_to_rows(&data)?;
+        self.check_feature_width(&rows)?;
         // GIL RELEASED around the CPU-bound predict (D-13/SC#1).
         let preds: Vec<Vec<f32>> = py.detach(|| self.inner.predict(&rows));
         let nrows = preds.len();
@@ -103,6 +104,7 @@ impl Booster {
         decay_rate: f64,
     ) -> PyResult<()> {
         let rows = numpy_dense_to_rows(&data)?;
+        self.check_feature_width(&rows)?;
         let labels = refit_label_to_f32(&label)?;
         if labels.len() != rows.len() {
             return Err(PyValueError::new_err(format!(
@@ -236,6 +238,32 @@ impl Booster {
         let cls = py.get_type::<Booster>();
         let ctor = cls.getattr("from_model_string")?;
         Ok((ctor.unbind(), (self.inner.model_to_string(),)))
+    }
+}
+
+impl Booster {
+    /// Reject an input matrix narrower than the model's feature width
+    /// (`max_feature_idx + 1`) BEFORE any GIL-released `predict`/`refit`. Without
+    /// this guard a too-narrow row indexes `feature_values[split_feature[node]]`
+    /// out of bounds inside `Tree::get_leaf` — a panic that, raised inside
+    /// `Python::detach`, would cross the FFI boundary as a `PanicException` instead
+    /// of the contract-required `ValueError` (CLAUDE.md; code-review CR-01/CR-02).
+    ///
+    /// `numpy_dense_to_rows` guarantees rectangular, non-empty rows, so checking
+    /// the first row suffices. Extra trailing columns are tolerated (the facade
+    /// only reads indices `<= max_feature_idx`), matching the facade predict path.
+    fn check_feature_width(&self, rows: &[Vec<f64>]) -> PyResult<()> {
+        let required = (self.inner.model().max_feature_idx + 1).max(0) as usize;
+        if let Some(first) = rows.first()
+            && first.len() < required
+        {
+            return Err(PyValueError::new_err(format!(
+                "input has {} feature column(s) but the model expects at least {required} \
+                 (max_feature_idx + 1)",
+                first.len()
+            )));
+        }
+        Ok(())
     }
 }
 
