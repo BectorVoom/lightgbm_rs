@@ -295,6 +295,23 @@ class LGBMModel(BaseEstimator):
     def objective_(self) -> Union[str, Callable, None]:
         return self._objective
 
+    # --- pickle support (D-10) -------------------------------------------------
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Pickle a fitted estimator over the booster's model string (D-10).
+
+        sklearn pipelines pickle their steps; the compiled ``_core.Booster`` is
+        carried through the wrapper's own ``__getstate__`` (model text), and the
+        rest of the estimator is plain attributes. A non-string custom objective/
+        metric callable is intentionally NOT serialized here beyond what ``pickle``
+        can already handle on the attribute dict (it is restored on unpickle if it
+        is itself picklable, matching the official package's behavior).
+        """
+        return dict(self.__dict__)
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+
 
 class LGBMRegressor(_RegressorMixin, LGBMModel):
     """LightGBM-rs regressor (mirrors ``lightgbm.LGBMRegressor``)."""

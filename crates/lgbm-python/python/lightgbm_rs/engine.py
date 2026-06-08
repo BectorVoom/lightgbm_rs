@@ -204,9 +204,38 @@ class _TrainedBooster:
         )
         return self
 
+    # --- persistence (D-10) -------------------------------------------------
+
+    def model_to_string(self, **kwargs) -> str:
+        """Serialize to LightGBM-compatible model text (mirrors official)."""
+        return self._booster.model_to_string()
+
+    def save_model(self, filename: str, **kwargs) -> "_TrainedBooster":
+        """Write the C++-compatible model text to ``filename`` (mirrors official)."""
+        self._booster.save_model(str(filename))
+        return self
+
     @property
     def core_booster(self) -> _core.Booster:
         return self._booster
+
+    # Pickle over the model string (D-10): the wrapper carries the trained
+    # ``_core.Booster`` (which pickles via its own __reduce__) plus plain Python
+    # metadata; the explicit state dict keeps params/best_iteration/best_score and
+    # rebuilds the core booster from its model text on unpickle.
+    def __getstate__(self) -> Dict[str, Any]:
+        return {
+            "model_str": self._booster.model_to_string(),
+            "params": self.params,
+            "best_iteration": self.best_iteration,
+            "best_score": self.best_score,
+        }
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self._booster = _core.Booster.from_model_string(state["model_str"])
+        self.params = state.get("params", {})
+        self.best_iteration = state.get("best_iteration", -1)
+        self.best_score = state.get("best_score", {})
 
 
 class CVBooster:
