@@ -34,7 +34,7 @@
 
 use lgbm_compute::error::ComputeError;
 use lgbm_compute::gain::{calculate_splitted_leaf_output, GainConfig};
-use lgbm_compute::Backend;
+use lgbm_compute::{Backend, BatchedSplitFeature};
 use lgbm_compute::ComputeClientReexport as ComputeClient;
 use lgbm_dataset::bin_mapper::{BinType, MissingType};
 use lgbm_model::Tree;
@@ -1541,6 +1541,86 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // + the post-split row marking). Computed once per scan when CEGB active.
         let cegb_active = self.cegb.borrow().is_some();
 
+        // ---- PASS 1 (260608-lsx): gate-only pre-pass collecting the SPINE features
+        // into ONE batched find_best_splits_batched call. A "spine" feature is one
+        // that reaches the byte-untouched continuous `find_best_split` branch below:
+        // it passes the col-sampler mask, the LOAD-BEARING parent-splittability gate,
+        // and the ADV-02 interaction gate, AND is NOT categorical, NOT monotone, NOT
+        // extra-trees-randomized. Those gates are applied here in the IDENTICAL order
+        // and with the IDENTICAL predicates as the main loop (which still re-applies
+        // them — this pre-pass only DECIDES batch membership; it must not change which
+        // features the loop processes). Non-spine features keep their existing inline
+        // handling. `spine_batch_index[fpos]` maps a spine feature's position to its
+        // slot in the batched results; `None` for non-spine / gated-out features. ----
+        let mut batched_feats: Vec<BatchedSplitFeature> = Vec::with_capacity(features.len());
+        let mut spine_batch_index: Vec<Option<usize>> = vec![None; features.len()];
+        let monotone_active = self.monotone.borrow().is_some();
+        for (fpos, f) in features.iter().enumerate() {
+            if let Some(mask) = used_features {
+                if mask.get(fpos).copied().unwrap_or(1) == 0 {
+                    continue;
+                }
+            }
+            if let Some(ps) = parent_splittable {
+                if !ps.get(fpos).copied().unwrap_or(true) {
+                    continue;
+                }
+            }
+            if interaction_allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&f.real_feature_index))
+            {
+                continue;
+            }
+            if f.bin_type == BinType::Categorical {
+                continue;
+            }
+            // monotone-active feature ⇒ ADV-01 inline branch (NOT batched).
+            let monotone_type = if monotone_active {
+                self.monotone
+                    .borrow()
+                    .as_ref()
+                    .map(|mc| mc.feature_monotone(f.real_feature_index))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if monotone_type != 0 {
+                continue;
+            }
+            // extra-trees ⇒ ADV-04 randomized-threshold inline branch (NOT batched).
+            if self.constraints.extra_trees {
+                continue;
+            }
+            // This is a SPINE feature: record its batched params (ascending fpos).
+            spine_batch_index[fpos] = Some(batched_feats.len());
+            batched_feats.push(BatchedSplitFeature {
+                slot_off: slot_off[fpos],
+                num_bin: f.num_bin,
+                offset: f.offset,
+                default_bin: f.default_bin,
+                most_freq_bin: f.most_freq_bin,
+                skip_default_bin: f.skip_default_bin(),
+                na_as_missing: f.na_as_missing(),
+                run_forward: f.run_forward(),
+            });
+        }
+
+        // ---- ONE batched call per leaf for all spine features (260608-lsx). On
+        // CpuBackend this is the default per-feature-order loop ⇒ each result is
+        // byte-identical to the inline `find_best_split` it replaces; on RocmBackend
+        // it is the batched GPU override. Empty `batched_feats` ⇒ empty Vec, no
+        // launch (T-lsx-03). ----
+        let batched_splits = self.backend.find_best_splits_batched(
+            self.client,
+            buf,
+            &batched_feats,
+            &self.cfg,
+            sum_g,
+            sum_h,
+            num_data_in_leaf,
+        )?;
+
         for (fpos, f) in features.iter().enumerate() {
             // ColSampler gate (serial_tree_learner.cpp: `if (!is_feature_used[fi])
             // continue;`). On the spine (`used_features == None`) every feature is
@@ -1692,22 +1772,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     hist, f, skip_default_bin, run_forward, sum_g, sum_h, num_data_in_leaf, rt,
                 )
             } else {
-                // SPINE (byte-untouched): the bit-exact continuous finder.
-                self.backend.find_best_split(
-                    self.client,
-                    hist,
-                    &self.cfg,
-                    f.num_bin,
-                    f.offset,
-                    f.default_bin,
-                    f.most_freq_bin,
-                    skip_default_bin,
-                    na_as_missing,
-                    run_forward,
-                    sum_g,
-                    sum_h,
-                    num_data_in_leaf,
-                )?
+                // SPINE (260608-lsx): the bit-exact continuous finder is now run via
+                // the ONE batched find_best_splits_batched call above; pull THIS
+                // feature's SplitInfo from the batched results by the Pass-1 mapping.
+                // On CpuBackend the batched default impl is the per-feature
+                // `find_best_split` loop in this same order, so the looked-up value is
+                // byte-identical to the inline call it replaces (the grown tree is
+                // unchanged). `na_as_missing` is validated false on every committed
+                // case (deferred branch); `skip_default_bin` / `run_forward` were
+                // recorded into the BatchedSplitFeature in Pass 1.
+                let bi = spine_batch_index[fpos]
+                    .expect("spine feature reaching the continuous branch must have been batched");
+                let _ = (skip_default_bin, na_as_missing, run_forward);
+                batched_splits[bi]
             };
 
             // Record this feature's RAW splittability (C++ is_splittable_, set in
