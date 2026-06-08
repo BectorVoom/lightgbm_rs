@@ -507,10 +507,13 @@ impl Booster {
             .collect()
     }
 
-    /// Per-feature split-count importance (ADV-07). Delegates to
-    /// [`GbdtModel::feature_importance_split_count`].
+    /// Per-feature split-count importance (ADV-07). Delegates to the C++-faithful
+    /// [`GbdtModel::feature_importance_split_count_guarded`], which counts a split
+    /// toward its feature ONLY when `split_gain > 0` (`gbdt_model_text.cpp:636-642`,
+    /// `importance_type=0`) — matching the official `Booster.feature_importance`
+    /// 'split' semantics (code-review WR-01).
     pub fn feature_importance_split(&self) -> Vec<u64> {
-        self.model.feature_importance_split_count()
+        self.model.feature_importance_split_count_guarded()
     }
 
     /// Per-feature gain-sum importance (ADV-07). Delegates to
@@ -1883,9 +1886,11 @@ mod tests {
     #[test]
     fn booster_facade_importance_delegates() {
         let booster = trained_spine();
+        // WR-01: the facade 'split' importance is the C++-faithful GUARDED count
+        // (split_gain > 0), matching the official Booster.feature_importance.
         assert_eq!(
             booster.feature_importance_split(),
-            booster.model().feature_importance_split_count()
+            booster.model().feature_importance_split_count_guarded()
         );
         assert_eq!(
             booster.feature_importance_gain(),
