@@ -162,25 +162,40 @@ DEF-07-02.
 
 ## DEF-07-13-01 — quantile bagged-renew structural divergence (`quantile_bag1_es0_bfa0`)
 
-> **STATUS: OPEN (re-scoped from DEF-07-02 by plan 07-13).** The ONE Family-A cell plan
-> 07-13 did NOT close. It is a DISTINCT root cause from the (now-fixed) DEF-07-02
-> count-source bugs — NOT the offset/split-gain path.
+> **STATUS: ROOT-CAUSED, OPEN — needs an architectural GBDT-loop change (Rule 4).**
+> (07-debug, 2026-06-08, Python-wheel oracle.) DISTINCT from the closed DEF-07-02 count
+> bugs and from the closed DEF-07-11 ULP/RNG knife-edges — this is a boosting-LOOP
+> tree-emission policy divergence, surfaced as an architectural decision.
 
 - **Affected (ignored) cell:** `quantile_loop_matrix`, bagged sub-cell `quantile_bag1_es0_bfa0`
-  only (`crates/oracle-harness/tests/boosting_parity.rs`). The non-bagged
-  `quantile_alpha_axis` + the quantile SPINE are GREEN.
-- **Symptom:** 12-vs-10-tree STRUCTURAL divergence. Trees 0–3 are bit-exact; at iter 4
-  Rust's bagged subset has all-uniform gradients (0.1 → zero gain → constant 1-leaf tree)
-  while the Python-captured golden has a non-uniform 10-row subset (gain 0.4). This is the
-  **bagging-draw × quantile-`RenewTreeOutput`** interaction.
-- **Why the D-05 FP-trace method can't localize it:** the deterministic source-built
-  `lib_lightgbm` 4.6 CLI does NOT reproduce the golden — it stops at 1 tree ("No further
-  splits with positive gain" for quantile + bfa-off). So the source-build arbiter that
-  closed DEF-07-02/06-01 is unavailable here; this needs a DIFFERENT oracle (likely a
-  Python-wheel-side bagging-subset + renew trace), not a CLI FP trace.
-- **Disposition:** assertion left fully intact under `#[ignore]` with an honest reason
-  (no tolerance weakened, no horizon capped). Tracks a future bagging-renew-specific
-  investigation, separate from the closed DEF-07-02 split-gain/count family.
+  only. The non-bagged `quantile_alpha_axis` + the quantile SPINE are GREEN.
+- **Root cause (precisely localized):** NOT a bagging-draw or renew bug — both are bit-exact.
+  Rust's per-iteration bagged subset MATCHES the C++ `bagging.hpp` algorithm bit-for-bit
+  (verified vs a standalone sim: iter4 in_bag=[0,1,4,5,6,7,8,9,10], oob=[2,3,11] in both),
+  and Rust's scores through tree 3 are BIT-EXACT to the wheel. The divergence is the
+  **no-split-tree EMISSION policy**: when a bagged iteration yields no positive-gain split
+  (uniform gradients on the subset — quantile alpha=0.9 hits this mid-training), C++
+  `GBDT::TrainOneIter` (gbdt.cpp:406-447) POPS the would-be 1-leaf constant tree (the
+  `!should_continue` path, "Stopped training because there are no more leaves" warning) and
+  does NOT advance `iter_`; the Python `lgb.train` driver re-bags with a fresh RNG draw on
+  the next boost round. Rust (`gbdt.rs:765,828`) instead APPENDS a 1-leaf `Tree::as_constant`
+  and advances. Result: Rust grows 12 trees `[1,2,3,3,1,3,3,3,1,3,2,3]` vs the wheel's 10
+  `[1,2,3,3,3,3,3,3,2,3]`; the 2 spurious constants (iters 4,8) shift every later tree
+  (wheel tree4 == Rust tree5, bit-exact). The FIRST-iteration constant baseline is KEPT in
+  both (e.g. regression_l1_bag1 Tree=0), so the fix is isolated to LATER no-split bagged
+  iterations and would NOT regress any of the 73 green boosting_parity cells (scan confirms
+  none has a non-first 1-leaf tree).
+- **Why the D-05 CLI FP-trace method can't localize it:** the deterministic source-built CLI
+  `GBDT::Train` breaks on `is_finished`, stopping at 1 tree — so a Python-wheel oracle (which
+  drives `TrainOneIter` per round and continues past the no-split signal) was required.
+- **Proposed FIX (deferred — architectural, Rule 4):** replicate the C++ no-split pop/skip +
+  `iter_`-non-advance + re-bag-retry semantics in the Rust GBDT boosting loop. This changes
+  the shared boosting-loop tree-emission contract (tree count, the `as_constant` push path,
+  the per-iteration RNG-advance timing) and so warrants an explicit decision before landing.
+- **Disposition:** assertion left fully intact under `#[ignore]` with the sharpened honest
+  reason (no tolerance weakened, no horizon capped). Reproduction assets retained under
+  `/tmp/quantile_oracle/` (wheel model + bagging sim). See
+  `.planning/debug/remaining-ignored-cells.md`.
 
 ---
 
@@ -199,31 +214,27 @@ bit-exact** vs real lib_lightgbm 4.6:
   `cegb_coupled`)
 - forced SINGLE split (`forced_single`)
 
-**4 cells are DEFERRED** (`#[ignore]`, assertions UNCHANGED — bit-exact, never
-weakened). Each grows the tree bit-exact in STRUCTURE (split_feature / topology /
-threshold / counts) and diverges only in a last-f64-ULP leaf value or an RNG draw
-sequence — the SAME class as DEF-07-02 (a learner-level fold-order / RNG knife-edge
-that needs a source-built `lib_lightgbm` 4.6 FP / `meta_->rand` trace to align):
+**ALL 4 cells are now CLOSED bit-exact (07-debug, 2026-06-08)** — source-built
+`lib_lightgbm` 4.6 FP/RNG execution traces. Commits `1a9e1ef` (Group 1) + `3b03f6e`
+(Group 2). No tolerance weakened; structure assertions intact; full
+`cargo test --workspace` 0-failed, merge gate unchanged.
 
-- **DEF-07-11-01 — monotone MIXED vector** (`mono_mixed`): structure bit-exact;
-  leaf value `0.05000000000000003` vs golden `0.04999999999999989` (~1.4e-17) — a
-  fold-order ULP in the monotone-clamped `CalculateSplittedLeafOutput`.
-- **DEF-07-11-02 — NESTED forced split** (`forced_nested`): structure + threshold +
-  counts bit-exact; deeper continuation leaf values drift 1-2 ULPs through the
-  multi-level forced `GatherInfoForThreshold` seeding (`forced_single` is GREEN).
-- **DEF-07-11-03 — extra-trees RNG-replay** (`extra_trees_seed6`,
-  `extra_trees_seed9`): the per-feature `Random(extra_seed + i)` +
-  `NextInt(0, num_bin-2)` mechanism is wired + DETERMINISTIC per seed (unit-tested:
-  same seed ⇒ identical tree), but the realized draw SEQUENCE diverges from
-  lib_lightgbm's `meta_->rand` (seed6: 4 vs 3 leaves; seed9: 3 vs 4 — a SWAP ⇒ an
-  off-by-one in the per-(feature, leaf-scan) draw timing/order vs the C++
-  `BeforeNumerical` call sequence). Needs a source-built `meta_->rand` draw trace.
+- **DEF-07-11-01 — monotone MIXED vector** (`mono_mixed`): CLOSED. Root cause: the
+  monotone `build_split` computed the clamped child OUTPUT from the already-`kEpsilon`'d
+  hessian; C++ `FindBestThresholdSequentially` (feature_histogram.hpp:1049-1066)
+  computes `CalculateSplittedLeafOutput` from the RAW `best_sum_left_hessian` and only
+  THEN stores `<raw> - kEpsilon`. Fixed → bit-exact `0.049999999999999989`.
+- **DEF-07-11-02 — NESTED forced split** (`forced_nested`): CLOSED. Two fixes: (1) the
+  forced BFS (`apply_forced_splits`) consumes each child's kEpsilon-bearing `split_inner`
+  leaf-seed instead of re-folding (C++ `ForceSplits` never re-folds); (2)
+  `gather_info_for_threshold` computes child outputs from the RAW hessian
+  (feature_histogram.hpp:580-590). `forced_single` stays bit-exact.
+- **DEF-07-11-03 — extra-trees RNG-replay** (`extra_trees_seed6`, `extra_trees_seed9`):
+  CLOSED. Root cause: the per-feature RNG was seeded by the real/sidecar feature order,
+  but C++ seeds `Random(extra_seed + inner_i)` by the DATASET INNER feature index, which
+  feature bundling (dataset.cpp:387-406) REVERSES vs the columns for these dense corpora
+  (trace: `CPP_MAP inner=0 real=1`). Seeding by the inner (reversed) index aligns the LCG
+  streams (fixing the seed6 4→3 / seed9 3→4 swap); the residual last-ULP was the same
+  RAW-vs-`-kEpsilon` output-operand bug, fixed in `find_best_split_rand`.
 
-**Disposition:** ship the 10 GREEN bit-exact cells; the 4 knife-edges are honestly
-deferred (no tolerance weakened, no horizon capped, structure assertions intact).
-The gate MECHANISMS are all proven by the GREEN real-binary cells + the unit tests
-that show each gate alters split selection while inactive constraints match the
-spine byte-for-byte (D-06). These 4 extend the single future 07-01-style
-learner-level FP/RNG-trace fix plan (the same `find_best_split` / `meta_->rand`
-operand class as DEF-07-02). ADV-01..05 are delivered (mechanisms complete,
-majority bit-exact); the residual ULP/RNG cells track the FP-trace fix.
+**Disposition:** all 14 ADV-01..05 per-axis real-binary cells are GREEN bit-exact.
