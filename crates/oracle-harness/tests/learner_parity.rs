@@ -2025,7 +2025,13 @@ mod hip {
         let num_leaves = 31i32;
         let max_depth = -1i32;
 
-        // RESIDENT path (eligible).
+        // RESIDENT path (eligible). 260608-s2b Lever B added a num_data size gate
+        // (RESIDENT_MIN_NUM_DATA) — this 3000-row corpus is BELOW it, so force the
+        // resident path via LGBM_RESIDENT_FORCE=1 to keep exercising the resident
+        // chain (the env override bypasses ONLY the size threshold; every correctness
+        // check still applies). Restored immediately after the resident train so the
+        // host train below is unaffected. NOTE: this test reads `LGBM_RESIDENT_FORCE`;
+        // it is the sole consumer in this harness, so the brief global set is safe.
         let resident_backend = RocmBackend::with_resident(true);
         assert!(
             resident_backend.resident_pool_supported(),
@@ -2034,11 +2040,16 @@ mod hip {
         let mut resident_learner =
             SerialTreeLearner::new(&resident_backend, &client, cfg(), num_leaves, max_depth)
                 .with_features(features.clone());
+        // SAFETY: single-threaded within this test; set→train→unset is sequential.
+        unsafe { std::env::set_var("LGBM_RESIDENT_FORCE", "1") };
         let resident_tree = resident_learner
             .train(&g, &h, true)
             .expect("resident train ok");
+        unsafe { std::env::remove_var("LGBM_RESIDENT_FORCE") };
 
         // FORCED HOST path (same RocmBackend f32-atomic build, host routing).
+        // `with_resident(false)` short-circuits at backend_supported==false (before the
+        // env check), so it takes the host path regardless of the env var.
         let host_backend = RocmBackend::with_resident(false);
         assert!(
             !host_backend.resident_pool_supported(),

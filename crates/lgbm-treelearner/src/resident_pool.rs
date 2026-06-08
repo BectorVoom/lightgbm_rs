@@ -35,6 +35,28 @@ use lgbm_dataset::bin_mapper::BinType;
 
 use crate::learner::{FeatureColumn, LearnerConstraints};
 
+/// 260608-s2b Lever B — the device-resident SIZE GATE. Below this row count the
+/// per-leaf resident chain's extra GPU launches dominate (the workload is
+/// launch-bound, not compute-bound), so the byte-unchanged host path is the net
+/// win; at or above it the resident path's saved host read-back/re-upload pays off.
+///
+/// PROVENANCE (measured AFTER Lever A, on the local gfx1100, `bench_train` both ways
+/// via `LGBM_RESIDENT_FORCE`, train_median of 5, 2 runs each):
+///
+/// | rows   | FORCE_HOST | FORCE_RESIDENT | winner   |
+/// |--------|------------|----------------|----------|
+/// | 2000   | 1.50/1.43s | 1.64/1.66s     | HOST     |
+/// | 8000   | 4.33/4.18s | 4.68/4.89s     | HOST     |
+/// | 20000  | 11.95/12.11s | 11.50/11.73s | RESIDENT |
+///
+/// Even after Lever A cut the resident chain to 2 launches/leaf, the resident path
+/// LOSES at 2000 and 8000 rows (launch/overhead-bound) and only WINS at 20000 rows
+/// (compute-bound, where the saved per-leaf host read-back/re-upload pays off). The
+/// measured crossover lies in the (8000, 20000] bracket; the threshold is set at the
+/// middle of that bracket so small+medium route to the host winner and large routes to
+/// the resident winner. `LGBM_RESIDENT_FORCE` overrides it for benching either path.
+pub const RESIDENT_MIN_NUM_DATA: i32 = 12_000;
+
 /// CONSERVATIVE / FAIL-SAFE device-resident eligibility predicate (260608-p90).
 ///
 /// Returns `true` IFF the whole workload is a pure numeric spine that the resident
@@ -54,11 +76,29 @@ use crate::learner::{FeatureColumn, LearnerConstraints};
 /// CEGB is ALLOWED: its penalty is a post-split gain adjustment (no histogram read),
 /// applied to the resident scan's SplitInfo exactly as on the host path.
 ///
+/// 260608-s2b Lever B — SIZE GATE + runtime override. After the fail-safe
+/// correctness checks, `num_data < `[`RESIDENT_MIN_NUM_DATA`] routes the host path
+/// (the resident chain's extra per-leaf launches lose on launch-bound tiny
+/// workloads). The size gate is a PERF KNOB, not a correctness gate — both paths are
+/// proven equivalent (resident == host tree, p90 / s2b T0), so routing either way
+/// grows the same tree within the ~1e-6 f32 contract.
+///
+/// `LGBM_RESIDENT_FORCE` (read once per call) OVERRIDES the size threshold for
+/// benchmarking BOTH paths from a single binary without recompiling:
+/// - `LGBM_RESIDENT_FORCE=0` → force the HOST path (return `false`) even above the
+///   threshold, AFTER the fail-safe correctness checks still pass.
+/// - `LGBM_RESIDENT_FORCE=1` → force the RESIDENT path (skip the size threshold) even
+///   below it — still gated by every correctness check above (it can never enable
+///   resident on a categorical/monotone/etc. workload; it only bypasses the SIZE
+///   threshold, which is purely a perf decision between two correct paths).
+/// - unset / any other value → the `num_data` threshold decides.
+///
 /// If ANY non-spine feature/config is present → `false` → the byte-unchanged host
 /// path (a mis-gated resident path that skipped categorical/monotone handling would be
 /// a correctness bug — hence fail-safe).
 pub fn resident_eligible(
     backend_supported: bool,
+    num_data: i32,
     features: &[FeatureColumn],
     constraints: &LearnerConstraints,
     capture_snapshots: bool,
@@ -92,6 +132,23 @@ pub fn resident_eligible(
     }
     // Every feature must be numeric (no categorical many-vs-many).
     if features.iter().any(|f| f.bin_type == BinType::Categorical) {
+        return false;
+    }
+
+    // ---- 260608-s2b Lever B: runtime override THEN the num_data size gate ----
+    // The workload is correctness-eligible here (pure numeric spine). What remains is
+    // purely a PERF routing decision between two equivalent paths.
+    match std::env::var("LGBM_RESIDENT_FORCE").ok().as_deref() {
+        // Force HOST even though eligible (bench the host path / safety override).
+        Some("0") => return false,
+        // Force RESIDENT, bypassing only the SIZE threshold (still correctness-gated
+        // by every check above). Used to bench resident-on at small sizes.
+        Some("1") => return true,
+        // unset / other → fall through to the size threshold.
+        _ => {}
+    }
+    // Below the measured crossover the launch-bound host path wins → fall back.
+    if num_data < RESIDENT_MIN_NUM_DATA {
         return false;
     }
     true

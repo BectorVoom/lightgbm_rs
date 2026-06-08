@@ -589,8 +589,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `resident_pool_supported` so CpuBackend (false) NEVER takes the resident
         // branch; ANY non-spine feature/config falls back to the byte-unchanged host
         // path. Read in `find_best_splits` to route the per-leaf chain.
+        // 260608-s2b Lever B: pass `num_data` so `resident_eligible` can size-gate the
+        // resident path (below RESIDENT_MIN_NUM_DATA → host path; the launch-bound tiny
+        // workload regresses on the resident chain). `LGBM_RESIDENT_FORCE` overrides the
+        // size gate for benching both paths. Correctness checks still fail-safe first.
         self.resident_eligible = crate::resident_pool::resident_eligible(
             self.backend.resident_pool_supported(),
+            num_data,
             &features,
             &self.constraints,
             capture_snapshots,
