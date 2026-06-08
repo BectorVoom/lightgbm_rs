@@ -1626,7 +1626,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // loop, bit-exact; GPU: one batched kernel launch + device-resident bins).
         let feature_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
         let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
-        let raw = self
+        let mut raw = self
             .backend
             .build_leaf_histograms_raw(
                 self.client,
@@ -1644,14 +1644,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // byte the same ops in the same order as before).
         for (fpos, f) in features.iter().enumerate() {
             let cells = 2 * f.num_bin as usize;
-            let mut hist = raw[slot_off[fpos]..slot_off[fpos] + cells].to_vec();
-            // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
-            // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
-            crate::fix_histogram::fix_histogram(&mut hist, f.most_freq_bin, sum_g, sum_h);
-            // COMPACTED layout (D-09): shift real-bin `c+offset` into cell `c`,
-            // zero the dropped tail. No-op for offset==0.
-            compact_histogram(&mut hist, f.offset);
-            buf[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&hist);
+            let range = slot_off[fpos]..slot_off[fpos] + cells;
+            // Run FixHistogram + compaction IN PLACE on a &mut sub-slice of the
+            // learner-owned `raw` buffer (no per-feature clone). Same f64 cells,
+            // same op order, same storage type — only the intermediate Vec is gone.
+            {
+                let hist = &mut raw[range.clone()];
+                // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
+                // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
+                crate::fix_histogram::fix_histogram(hist, f.most_freq_bin, sum_g, sum_h);
+                // COMPACTED layout (D-09): shift real-bin `c+offset` into cell `c`,
+                // zero the dropped tail. No-op for offset==0.
+                compact_histogram(hist, f.offset);
+            }
+            buf[range.clone()].copy_from_slice(&raw[range]);
         }
     }
 
