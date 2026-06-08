@@ -248,6 +248,21 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// `BeforeNumerical` rand_threshold), so the RNG state must persist across
     /// leaf scans within a tree — hence a `RefCell<Vec<Random>>`.
     extra_rng: std::cell::RefCell<Option<Vec<lgbm_core::random::Random>>>,
+    /// Per-leaf per-feature `is_splittable` flags (C++ `FeatureHistogram::
+    /// is_splittable_`, serial_tree_learner.cpp:395-399). When a leaf is scanned,
+    /// `scan_leaf_histogram` records, for each feature POSITION, whether
+    /// `find_best_split` found ANY admissible candidate (gain finite). On the next
+    /// split the larger (subtracted) child consults its PARENT leaf's flags and
+    /// SKIPS any feature whose parent histogram was not splittable — the C++
+    /// `parent_leaf_histogram_array_[f].is_splittable()` gate. This is load-bearing
+    /// for GOSS: under gradient amplification a small `cnt_factor` rounds the
+    /// `round_int(hess·cnt_factor)` per-bin counts to 0, so a feature can be
+    /// not-splittable at the parent (every candidate fails `min_data_in_leaf`) yet
+    /// LOOK splittable on the subtracted child (whose larger `cnt_factor` no longer
+    /// rounds to 0); without the gate Rust picks a split C++ never considers.
+    /// Indexed `[leaf][feature_position]`; reset per tree. `RefCell` so the `&self`
+    /// scan records it.
+    feature_splittable: std::cell::RefCell<Vec<Vec<bool>>>,
 }
 
 /// W10 advanced learner constraints (ADV-01..05) — the inactive `Default` is the
@@ -353,6 +368,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             cegb: std::cell::RefCell::new(None),
             branch_features: std::cell::RefCell::new(Vec::new()),
             extra_rng: std::cell::RefCell::new(None),
+            feature_splittable: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -656,6 +672,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // Per-leaf winning categorical bitset (parallel to best_split_per_leaf).
         // Reset per tree; entries set only when a categorical feature wins a leaf.
         *self.best_cat_threshold.borrow_mut() = vec![None; self.num_leaves as usize];
+
+        // Per-leaf per-feature splittability (C++ FeatureHistogram::is_splittable_).
+        // Reset per tree; populated as each leaf is scanned. The root leaf (0) starts
+        // ALL-splittable so the root's own scan is never gated (C++ has no parent at
+        // the root → use_subtract is false → the gate is not consulted).
+        *self.feature_splittable.borrow_mut() =
+            vec![vec![true; num_features]; self.num_leaves as usize];
 
         // ---- W10 advanced-constraint per-tree setup (ADV-01..05) ----
         // Each is INACTIVE by default → `None`/empty → the scan + growth loop take
@@ -1132,6 +1155,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `parent_leaf_histogram_array_ != nullptr` (serial_tree_learner.cpp:398).
         let use_subtract = parent_slot.is_some();
 
+        // Parent-splittability gate input (serial_tree_learner.cpp:395-399): when a
+        // parent histogram is retained, BOTH children skip features the PARENT could
+        // not split on. The parent leaf id is `left_leaf` (its slot is the one the
+        // Get/Move dance retains). `None` on the root (no parent → no gate). Cloned
+        // out of the RefCell so the `&self` scans below can re-borrow it freely.
+        let parent_splittable: Option<Vec<bool>> = if use_subtract {
+            self.feature_splittable
+                .borrow()
+                .get(left_leaf as usize)
+                .cloned()
+        } else {
+            None
+        };
+
         // ColSampler.GetByNode draw ORDER (serial_tree_learner.cpp:479,487): the
         // SMALLER leaf is drawn FIRST (always), the LARGER leaf SECOND (only when a
         // larger child exists, i.e. not the root). Each call advances the shared
@@ -1214,6 +1251,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             best_split_feature,
             smaller_node_mask.as_deref(),
             data_partition,
+            parent_splittable.as_deref(),
         )?;
 
         // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
@@ -1280,6 +1318,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 best_split_feature,
                 larger_node_mask.as_deref(),
                 data_partition,
+                parent_splittable.as_deref(),
             )?;
         }
         let _ = use_subtract; // recorded for clarity; the parent_slot Option drives it
@@ -1372,6 +1411,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         best_split_feature: &mut [i32],
         used_features: Option<&[i8]>,
         data_partition: &DataPartition,
+        parent_splittable: Option<&[bool]>,
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
@@ -1380,6 +1420,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut records: Vec<FeatureSplitRecord> = Vec::with_capacity(features.len());
         let mut leaf_best = SplitInfo::none();
         let mut leaf_best_feature: i32 = -1;
+        // Per-feature splittability recorded for THIS leaf (consumed by the larger
+        // child of a LATER split via the parent-splittability gate below). Default
+        // false; set true when find_best_split yields a finite-gain candidate.
+        let mut this_leaf_splittable = vec![false; features.len()];
 
         // A leaf with no admissible hessian mass cannot be split (the `cnt_factor =
         // num_data / sum_hessian` division would divide by ~0). Leave its best as
@@ -1416,6 +1460,24 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     continue;
                 }
             }
+            // ---- Parent-splittability gate (serial_tree_learner.cpp:395-399) ----
+            // When this leaf is derived against a retained parent histogram
+            // (use_subtract), C++ SKIPS any feature whose PARENT histogram was not
+            // splittable: `if (!parent_leaf_histogram_array_[f].is_splittable())
+            // continue;`. Load-bearing under GOSS amplification — a small
+            // `cnt_factor` (= num_data/amplified_sum_hessian) rounds the
+            // `round_int(hess·cnt_factor)` per-bin counts to 0 at the parent, so a
+            // feature can fail `min_data_in_leaf` at the parent (not splittable) yet
+            // look splittable on this child (whose larger cnt_factor no longer
+            // rounds to 0). Without the gate Rust selects a split C++ never
+            // considers (GOSS tree-10 node1: Rust f1 gain 4.36 vs C++ picking f0
+            // 1.14 because the root's f1 was not splittable). `None` (smaller child
+            // / root) ⇒ no gate, every feature scanned.
+            if let Some(ps) = parent_splittable {
+                if !ps.get(fpos).copied().unwrap_or(true) {
+                    continue;
+                }
+            }
             // ADV-02 interaction gate: skip a feature not allowed to co-occur with
             // this node's branch features (additive — no-op when inactive).
             if interaction_allowed
@@ -1449,6 +1511,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     num_data_in_leaf,
                 );
                 let split = cat.split;
+                this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
                 // Categorical features have no per-bin numeric gain arrays; the D-06
                 // numeric snapshot uses empty rev/fwd for them (the categorical
                 // diagnostics live in the dedicated categorical golden, not here).
@@ -1557,6 +1620,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 )?
             };
 
+            // Record this feature's RAW splittability (C++ is_splittable_, set in
+            // FindBestThresholdSequentially when current_gain > min_gain_shift) —
+            // BEFORE any CEGB / monotone gain post-processing, exactly as C++ sets
+            // the flag inside the scan, not after ComputeBestSplitForFeature.
+            this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
             // ---- ADV-05 CEGB: SUBTRACT the per-split cost penalty from the gain
             // (ComputeBestSplitForFeature, serial_tree_learner.cpp:988-992) BEFORE
             // the argmax. No-op when CEGB inactive (D-06). ----
@@ -1627,6 +1695,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 .unwrap_or(false);
         if !winner_is_cat {
             self.best_cat_threshold.borrow_mut()[leaf as usize] = None;
+        }
+        // Persist this leaf's per-feature splittability for the parent-splittability
+        // gate of a FUTURE split's larger child (C++ FeatureHistogram::is_splittable_
+        // retained in the histogram pool slot). NOTE: when this scan was itself gated
+        // by a `parent_splittable` mask, the gated-out features were `continue`d and
+        // left `false` here — which is correct (a feature not splittable at the
+        // grandparent stays not splittable down the subtraction chain, matching C++
+        // where set_is_splittable(false) propagates).
+        {
+            let mut fs = self.feature_splittable.borrow_mut();
+            if let Some(slot) = fs.get_mut(leaf as usize) {
+                *slot = this_leaf_splittable;
+            }
         }
         Ok(records)
     }
