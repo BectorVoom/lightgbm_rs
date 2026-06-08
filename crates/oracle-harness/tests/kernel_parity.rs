@@ -1660,4 +1660,99 @@ mod hip {
             panic!("GPU fix_compact != host fix+compact (NOT bit-exact): {m}");
         }
     }
+
+    /// 260608-oib Task 2 (step 1) — the DEVICE-RESIDENT build→fix→compact chain
+    /// (`build_fix_compact_resident_*`) must produce the SAME fixed+compacted f64
+    /// histogram as the host path: the resident RAW build
+    /// (`build_leaf_histograms_resident_f32_on`) widened to f64, then host
+    /// `fix_histogram` + `compact_histogram` per feature. Both share the IDENTICAL
+    /// f32-atomic RAW build (same `(feature, leaf-row)` atomic-add set) and the
+    /// fix+compact step is bit-exact (Task 1), so they match within the ~1e-6 ROCm
+    /// tolerance (`assert_within`). This proves the on-device chain is faithful — the
+    /// live split-from-Handle wiring is deferred (SUMMARY), but the resident chain
+    /// itself is validated end-to-end.
+    #[test]
+    fn kernel_parity_resident_build_fix_compact_equals_host_on_hip() {
+        use lgbm_compute::kernels::histogram::{
+            build_fix_compact_resident_readback_f64_on, build_leaf_histograms_resident_f32_on,
+            upload_resident_columns,
+        };
+        use lgbm_treelearner::fix_histogram;
+
+        let hip = rocm_client();
+
+        // 3 features over 10 rows, different bin counts + non-trivial mfb/offset so
+        // the fix (reconstruct) and compact (drop bin 0) both fire.
+        let num_data = 10usize;
+        let f0: Vec<u32> = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1]; // num_bin 4, mfb 2, off 0
+        let f1: Vec<u32> = vec![0, 0, 1, 1, 2, 2, 0, 1, 2, 0]; // num_bin 3, mfb 0, off 1
+        let f2: Vec<u32> = vec![4, 3, 2, 1, 0, 1, 2, 3, 4, 0]; // num_bin 5, mfb 1, off 0
+        let num_bins: Vec<u32> = vec![4, 3, 5];
+        let mfbs: Vec<u32> = vec![2, 0, 1];
+        let offsets: Vec<i32> = vec![0, 1, 0];
+        let feature_bins: Vec<&[u32]> = vec![&f0, &f1, &f2];
+        let mut slot_off = Vec::with_capacity(num_bins.len());
+        let mut acc = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(acc);
+            acc += 2 * nb as usize;
+        }
+        let slot_len = acc;
+        let leaf_rows: Vec<u32> = vec![1, 3, 4, 6, 7, 9];
+        let gradients: Vec<f32> = (0..num_data).map(|i| 0.25 + i as f32 * 0.5).collect();
+        let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
+
+        // Leaf RAW totals over the leaf rows (un-bumped) — Pitfall 2.
+        let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
+        let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
+
+        // ---- HOST reference: resident RAW build (readback+widen) then host fix+compact.
+        let mut host = build_leaf_histograms_resident_f32_on(
+            &hip,
+            upload_resident_columns(&hip, &feature_bins),
+            feature_bins.len(),
+            num_data,
+            &slot_off,
+            slot_len,
+            &leaf_rows,
+            &gradients,
+            &hessians,
+        )
+        .expect("host resident RAW build"); // already widened f64 in the launcher
+        for fpos in 0..num_bins.len() {
+            let nb = num_bins[fpos];
+            let cells = 2 * nb as usize;
+            let region = &mut host[slot_off[fpos]..slot_off[fpos] + cells];
+            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
+            host_compact_histogram(region, offsets[fpos]);
+        }
+
+        // ---- GPU resident chain: build→fix→compact entirely on device, read back.
+        let fix_feats: Vec<(usize, u32, i32, u32)> = (0..num_bins.len())
+            .map(|fpos| (slot_off[fpos], num_bins[fpos], offsets[fpos], mfbs[fpos]))
+            .collect();
+        let gpu = build_fix_compact_resident_readback_f64_on(
+            &hip,
+            upload_resident_columns(&hip, &feature_bins),
+            feature_bins.len(),
+            num_data,
+            &slot_off,
+            slot_len,
+            &leaf_rows,
+            &gradients,
+            &hessians,
+            &fix_feats,
+            sum_g,
+            sum_h,
+        )
+        .expect("resident build_fix_compact readback");
+
+        assert_eq!(gpu.len(), slot_len, "resident chain length");
+        assert_eq!(host.len(), slot_len, "host chain length");
+        let gpu_f32: Vec<f32> = gpu.iter().map(|&x| x as f32).collect();
+        let host_f32: Vec<f32> = host.iter().map(|&x| x as f32).collect();
+        // Resident on-device build→fix→compact == host RAW build + host fix+compact
+        // within the f32-atomic RAW-build tolerance (the fix+compact step is bit-exact).
+        assert_within("resident_build_fix_compact_vs_host", &gpu_f32, &host_f32);
+    }
 }

@@ -798,3 +798,227 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_hist);
     Ok(f64::from_bytes(&bytes).to_vec())
 }
+
+/// Upload the binned feature columns to the device feature-major (feature `f`'s
+/// row `r` at `f * num_data + r`) and return the resident `Handle` — the same
+/// concatenated layout [`RocmBackend::upload_resident_bins`](crate::Backend::upload_resident_bins)
+/// caches internally, exposed for the resident-chain oracle so it can feed a raw
+/// Handle to [`build_fix_compact_resident_f64_on`] without naming `cubecl` types.
+/// All columns must share `num_data` (caller guarantees). `#[cfg(feature="rocm")]`.
+#[cfg(feature = "rocm")]
+pub fn upload_resident_columns<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    feature_bins: &[&[u32]],
+) -> cubecl::server::Handle {
+    let num_features = feature_bins.len();
+    let num_data = if num_features == 0 { 0 } else { feature_bins[0].len() };
+    let mut concat: Vec<u32> = Vec::with_capacity(num_features * num_data);
+    for &col in feature_bins {
+        concat.extend_from_slice(col);
+    }
+    client.create_from_slice(u32::as_bytes(&concat))
+}
+
+/// ON-DEVICE f32→f64 widen (260608-oib L3): copy every cell of an f32 buffer into
+/// an f64 buffer, one unit per cell. `f64::cast_from(src[i])` is the SAME widening
+/// the host readback does (`f64::from(x)`), so the resident chain's f64 buffer
+/// equals today's host-widened readback cell-for-cell — keeping the downstream
+/// fix+compact bit-identical to the host path. `#[cfg(feature="rocm")]`.
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+pub fn widen_f32_to_f64_kernel(src: &Array<f32>, dst: &mut Array<f64>) {
+    let idx = ABSOLUTE_POS;
+    if idx < src.len() {
+        dst[idx] = f64::cast_from(src[idx]);
+    }
+}
+
+/// DEVICE-RESIDENT build→fix→compact chain (260608-oib L3, Task 2 step 1).
+///
+/// Runs the resident build kernel ([`construct_leaf_hist_resident_kernel`]) into an
+/// f32-atomic device buffer, widens it to an f64 device buffer on-device
+/// ([`widen_f32_to_f64_kernel`] — matching the existing host readback widening),
+/// then launches the on-GPU fix+compact ([`fix_compact_kernel`], Task 1) over that
+/// f64 buffer, and RETURNS the fixed+compacted f64 device `Handle` (NOT a Vec) plus
+/// the buffer length. NO readback — the histogram VALUES never leave the device.
+///
+/// This is the resident analog of `build_leaf_histograms_resident_f32_on` +
+/// host fix+compact: the whole per-leaf build→fix→compact chain runs on device. The
+/// `fix_feats` carry the per-feature `(slot_off, num_bin, offset, most_freq_bin)`;
+/// `sum_gradient`/`sum_hessian` are the leaf RAW (un-bumped) totals (Pitfall 2).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] on a degenerate layout; propagates the same V5
+/// validation as [`fix_compact_f64_on`] / the resident build launcher.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    num_features: usize,
+    num_data: usize,
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    gradients: &[f32],
+    hessians: &[f32],
+    fix_feats: &[(usize, u32, i32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+) -> Result<(cubecl::server::Handle, usize), ComputeError> {
+    // ---- 1. RESIDENT RAW build into an f32-atomic device buffer ----
+    let rows = leaf_rows.len();
+    let zeros32 = vec![0.0f32; slot_len];
+    let h_raw = client.create_from_slice(f32::as_bytes(&zeros32));
+    if rows != 0 && num_features != 0 {
+        let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+        let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+        let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
+        let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
+        let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
+        let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
+        let total = num_features * rows;
+        let cube_dim = 256u32;
+        let cube_count = (total as u32).div_ceil(cube_dim);
+        // SAFETY: identical handle/length correspondence to
+        // `build_leaf_histograms_resident_f32_on`; the kernel bounds-checks `idx <
+        // total`, `leaf_rows[k] < num_data` keeps the resident read in range, and
+        // `bin < num_bin` keeps `slot_off[f] + bin*2 + 1` inside `slot_len`. All
+        // cubecl unsafe is confined here (CMP-01).
+        unsafe {
+            construct_leaf_hist_resident_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(cube_dim),
+                ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
+                ArrayArg::from_raw_parts(h_rows, rows),
+                ArrayArg::from_raw_parts(h_g, rows),
+                ArrayArg::from_raw_parts(h_h, rows),
+                ArrayArg::from_raw_parts(h_slot, num_features),
+                num_data,
+                total,
+                ArrayArg::from_raw_parts(h_raw.clone(), slot_len),
+            );
+        }
+    }
+
+    // ---- 2. WIDEN f32 → f64 on device (matches the host readback widening) ----
+    let zeros64 = vec![0.0f64; slot_len];
+    let h_f64 = client.create_from_slice(f64::as_bytes(&zeros64));
+    {
+        let cube_dim = 256u32;
+        let cube_count = (slot_len as u32).max(1).div_ceil(cube_dim);
+        // SAFETY: `h_raw` and `h_f64` are both sized `slot_len`; the kernel bounds-
+        // checks `idx < src.len()`. cubecl unsafe confined here (CMP-01).
+        unsafe {
+            widen_f32_to_f64_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(cube_dim),
+                ArrayArg::from_raw_parts(h_raw, slot_len),
+                ArrayArg::from_raw_parts(h_f64.clone(), slot_len),
+            );
+        }
+    }
+
+    // ---- 3. ON-GPU fix+compact over the f64 buffer (Task 1 kernel) ----
+    if !fix_feats.is_empty() {
+        let n = fix_feats.len();
+        let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+        let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+        let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+        let mut mfb_a: Vec<i32> = Vec::with_capacity(n);
+        for &(so, nb, off, mfb) in fix_feats {
+            if nb == 0 {
+                return Err(ComputeError::Runtime {
+                    detail: "build_fix_compact_resident: num_bin must be > 0".to_string(),
+                });
+            }
+            let cells = 2usize.checked_mul(nb as usize).ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {nb} overflows the histogram length"),
+            })?;
+            let end = so.checked_add(cells).ok_or_else(|| ComputeError::Runtime {
+                detail: "build_fix_compact_resident: slot_off + region overflows".to_string(),
+            })?;
+            if end > slot_len {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: slot_len,
+                });
+            }
+            slot_off_a.push(so as u32);
+            num_bin_a.push(nb as i32);
+            offset_a.push(off);
+            mfb_a.push(mfb as i32);
+        }
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+        let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+        let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
+        let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
+        // SAFETY: `h_f64` sized `slot_len`; cube `f < n` reads/writes only its
+        // validated `[slot_off[f], slot_off[f]+2*num_bin[f]) <= slot_len` region and
+        // `mfb < num_bin` keeps the reconstruct in range. cubecl unsafe confined here.
+        unsafe {
+            fix_compact_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(h_f64.clone(), slot_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_mfb, n),
+                sum_gradient,
+                sum_hessian,
+            );
+        }
+    }
+
+    Ok((h_f64, slot_len))
+}
+
+/// Readback variant of [`build_fix_compact_resident_f64_on`] (260608-oib L3, Task 2
+/// step 1 validation): runs the SAME device-resident build→fix→compact chain but
+/// reads the f64 buffer back to a `Vec<f64>`. Used by the oracle to prove the
+/// resident chain equals the host build (`build_leaf_histograms_resident_f32_on`)
+/// + host `fix_histogram` + host `compact_histogram` (within the ~1e-6 f32-atomic
+/// RAW-build tolerance; the fix+compact step itself is bit-exact, Task 1). Not on
+/// the live path — the live wiring is deferred (see SUMMARY).
+///
+/// # Errors
+/// Same as [`build_fix_compact_resident_f64_on`].
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    num_features: usize,
+    num_data: usize,
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    gradients: &[f32],
+    hessians: &[f32],
+    fix_feats: &[(usize, u32, i32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+) -> Result<Vec<f64>, ComputeError> {
+    let (handle, len) = build_fix_compact_resident_f64_on(
+        client,
+        resident_bins,
+        num_features,
+        num_data,
+        slot_off,
+        slot_len,
+        leaf_rows,
+        gradients,
+        hessians,
+        fix_feats,
+        sum_gradient,
+        sum_hessian,
+    )?;
+    debug_assert_eq!(len, slot_len);
+    let bytes = client.read_one_unchecked(handle);
+    Ok(f64::from_bytes(&bytes).to_vec())
+}
