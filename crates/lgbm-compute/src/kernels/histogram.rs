@@ -359,3 +359,106 @@ pub fn construct_histograms_parallel_f32_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
 }
+
+/// BATCHED per-leaf histogram: builds ALL features' RAW histograms for one leaf in
+/// ONE launch (260608-lad part 3). One unit per `(feature, leaf-row)` pair, each
+/// doing an f32 atomic add into that feature's region of the concatenated output.
+/// This collapses the per-feature launch count to ONE launch per leaf — the launch
+/// overhead (not the arithmetic) was the GPU bottleneck.
+///
+/// Layout (all host-gathered into flat buffers, so no division-by-scalar is needed
+/// in-kernel — dims come from array lengths):
+/// - `gathered_bins[f * R + k]` = feature `f`'s bin for the leaf's k-th row
+///   (`R == ord_g.len()` == leaf-row count, `num_features == slot_off.len()`).
+/// - `ord_g[k]` / `ord_h[k]` = the leaf's k-th row's gradient / hessian (gathered
+///   once, shared across features).
+/// - `slot_off[f]` = feature `f`'s start cell in the concatenated `out` buffer.
+///
+/// f32 atomics + nondeterministic order ⇒ the ~1e-6 ROCm gate (cpu anchor stays
+/// bit-exact). `#[cfg(feature="rocm")]`.
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+pub fn construct_leaf_hist_batched_kernel(
+    gathered_bins: &Array<u32>,
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>,
+    out: &mut Array<Atomic<f32>>,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx < gathered_bins.len() {
+        let r = ord_g.len(); // leaf-row count R
+        let f = idx / r; // feature index
+        let k = idx % r; // leaf-row position
+        let cell = slot_off[f] as usize + gathered_bins[idx] as usize * 2;
+        out[cell].fetch_add(ord_g[k]);
+        out[cell + 1].fetch_add(ord_h[k]);
+    }
+}
+
+/// Host launcher for the batched per-leaf histogram (the GPU-fast path, part 3).
+///
+/// Gathers each feature's leaf-row bins into one flat `[num_features × R]` buffer
+/// and the leaf's grad/hess once, then dispatches a SINGLE kernel over all
+/// `num_features × R` `(feature, row)` units. Returns the concatenated RAW f64
+/// histogram (`slot_len` cells) — FixHistogram + compaction stay in the caller.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] on a degenerate layout (mismatched lengths).
+#[cfg(feature = "rocm")]
+pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    feature_bins: &[&[u32]],
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    gradients: &[f32],
+    hessians: &[f32],
+) -> Result<Vec<f64>, ComputeError> {
+    let num_features = feature_bins.len();
+    let rows = leaf_rows.len();
+    if rows == 0 || num_features == 0 {
+        return Ok(vec![0.0f64; slot_len]);
+    }
+    // Host gather: per-feature leaf-row bins (flat, feature-major) + per-row grad/hess.
+    let mut gathered_bins: Vec<u32> = Vec::with_capacity(num_features * rows);
+    for &bins in feature_bins {
+        for &row in leaf_rows {
+            gathered_bins.push(bins[row as usize]);
+        }
+    }
+    let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+    let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+    let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
+
+    let h_bins = client.create_from_slice(u32::as_bytes(&gathered_bins));
+    let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
+    let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
+    let zeros = vec![0.0f32; slot_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+
+    let total = (num_features * rows) as u32;
+    let cube_dim = 256u32;
+    let cube_count = total.div_ceil(cube_dim);
+
+    // SAFETY: every handle is sized to its slice and outlives the launch; the kernel
+    // bounds-checks `idx < gathered_bins.len()`, and `gathered_bins[idx] < num_bin`
+    // for the feature keeps `slot_off[f] + bin*2 + 1` inside that feature's slot
+    // region within `slot_len`. All cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        construct_leaf_hist_batched_kernel::launch(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(h_bins, num_features * rows),
+            ArrayArg::from_raw_parts(h_g, rows),
+            ArrayArg::from_raw_parts(h_h, rows),
+            ArrayArg::from_raw_parts(h_slot, num_features),
+            ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}

@@ -443,4 +443,32 @@ impl Backend for RocmBackend {
     ) -> Result<Vec<f64>, ComputeError> {
         kernels::subtract::subtract_histograms_f64_on(client, parent, child)
     }
+
+    /// GPU override (part 3): build ALL features' RAW histograms for this leaf in ONE
+    /// batched kernel launch (instead of the default per-feature loop). Collapses the
+    /// per-feature construct launches to one per leaf — the launch-count win. f32
+    /// atomics ⇒ the ~1e-6 ROCm gate. `num_bins` is unused here (the per-feature slot
+    /// width is encoded by `slot_off`); the kernel writes `out[slot_off[f] + bin*2]`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_leaf_histograms_raw(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        feature_bins: &[&[u32]],
+        _num_bins: &[u32],
+        slot_off: &[usize],
+        slot_len: usize,
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+    ) -> Result<Vec<f64>, ComputeError> {
+        kernels::histogram::build_leaf_histograms_batched_f32_on(
+            client,
+            feature_bins,
+            slot_off,
+            slot_len,
+            leaf_rows,
+            gradients,
+            hessians,
+        )
+    }
 }
