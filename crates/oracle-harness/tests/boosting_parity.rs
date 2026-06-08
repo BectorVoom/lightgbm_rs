@@ -2479,21 +2479,18 @@ fn huber_alpha_axis() {
 // (DEF-07-02).
 
 #[test]
-#[ignore = "DEF-07-02: fair tiny-hessian learner-level f64 split-gain knife-edge (spine diverges tree 2 ~1.3); g/h into tree bit-exact (07-01-class), needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn fair_spine_end_to_end() {
     let (booster, corpus) = train_family_a_spine("fair");
     assert_model_and_pred(&booster, &corpus, "fair_spine_model.txt", "fair_spine_pred.txt");
 }
 
 #[test]
-#[ignore = "DEF-07-02: fair tiny-hessian learner-level f64 split-gain knife-edge (per-iter scores diverge once the tree-2 split flips); g/h bit-exact, needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn fair_score_accumulation() {
     let (booster, _) = train_family_a_spine("fair");
     assert_scores(&booster, "fair_scores.txt");
 }
 
 #[test]
-#[ignore = "DEF-07-02: fair tiny-hessian learner-level f64 split-gain knife-edge; the iter-5 g/h diff (~0.068) is downstream of the diverged tree-2 split, NOT an objective bug. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn fair_gradients() {
     // fair is the only family-A objective with a NON-constant hessian (c²/(|x|+c)²).
     let (booster, _) = train_family_a_spine("fair");
@@ -2501,13 +2498,11 @@ fn fair_gradients() {
 }
 
 #[test]
-#[ignore = "DEF-07-02: fair learner-level f64 split-gain knife-edge; the bfa-OFF loop cells diverge at tree 0 (~64–69 leaf drift) because the tiny non-constant hessian amplifies the Newton step on a borderline split. g/h bit-exact; needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn fair_loop_matrix() {
     replay_family_a_loop("fair");
 }
 
 #[test]
-#[ignore = "DEF-07-02: fair learner-level f64 split-gain knife-edge (fair_c=2.0 alt diverges on the same tiny-hessian split-amplification path); g/h bit-exact, needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn fair_c_axis() {
     // fair_c ∈ {1.0 default (spine), 2.0 alt}.
     replay_family_a_param_cell("fair", "fair_c", 2.0);
@@ -2541,20 +2536,16 @@ fn quantile_gradients() {
 }
 
 #[test]
-#[ignore = "DEF-07-02: quantile loop cells hit a 07-01-class learner-level f64 split-gain knife-edge — the BAGGED cells (quantile_bag1_*) diverge tree 4 (~0.18–0.36) AND structurally (12-vs-10 trees, bagged-renew divergence), and the non-bagged ITERATED cells diverge at tree 11 (~0.009–0.094). The quantile SPINE cell stays GREEN (asserted separately); g/h into each tree are bit-exact, so this is NOT an objective bug. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
+#[ignore = "DEF-07-02 (residual): the NON-bagged quantile cells are CLOSED by 07-13 (see quantile_alpha_axis, GREEN). The remaining RED is ONLY the BAGGED renew sub-cell `quantile_bag1_es0_bfa0` — a 12-vs-10-tree STRUCTURAL divergence (Rust inserts a spurious 1-leaf constant tree at iter 4 where the golden has a split). Root cause is the bagging-draw × quantile-RenewTreeOutput interaction, NOT the offset/split-gain histogram path this plan fixed: at iter 4 Rust's bagged subset has all-uniform gradients (0.1) → zero gain → constant, while the Python-captured golden has a non-uniform 10-row subset → gain 0.4. The deterministic source-built CLI does NOT reproduce the 10-tree golden (it stops at 1 tree: 'No further splits with positive gain' for quantile+bfa-off), so the proven 07-01/D-05 FP-trace method cannot localize it. Separate deeper investigation (bagging-draw/quantile-renew structural divergence) — out of scope for the most_freq_bin==0/offset fix. NOT a tolerance weakening; assertion left intact under #[ignore]. See .planning/debug/split-gain-knife-edge-07-02.md."]
 fn quantile_loop_matrix() {
-    // The {bag×es×bfa} loop incl. the BAGGED renew cells (`quantile_bag1_*`): under
-    // the 07-01 D-05 faithful-fix posture the bagged-subset RenewTreeOutput is
-    // faithful to C++, so these cells ASSERT real-binary parity (within
-    // MATRIX_RESIDUAL_TOL for the percentile renewal) — NOT skipped. See the D-05
-    // POSTURE note above. Currently #[ignore]'d under DEF-07-02 (the bagged-renew
-    // 12-vs-10-tree structural divergence + the non-bagged tree-11 split flip both
-    // need the 07-01-style FP-trace learner fix; ignore != tolerance weakening).
+    // The {bag×es×bfa} loop incl. the BAGGED renew cells (`quantile_bag1_*`): the
+    // NON-bagged cells assert real-binary parity GREEN (fixed by 07-13: partition-
+    // count leaf-split seeding + the parent-splittability gate). The BAGGED renew
+    // sub-cell remains a separate structural divergence (see #[ignore] above).
     replay_family_a_loop("quantile");
 }
 
 #[test]
-#[ignore = "DEF-07-02: quantile alpha=0.1 iterated (12-tree) param cell diverges at tree 11 (~0.009) on the same learner-level f64 split-gain knife-edge as the non-bagged loop cells; g/h bit-exact, needs source-built lib_lightgbm 4.6 FP trace. The quantile SPINE cell stays GREEN. See 07-parity .../deferred-items.md"]
 fn quantile_alpha_axis() {
     // alpha ∈ {0.9 default (spine), 0.1 alt}; the pinball asymmetry flips.
     replay_family_a_param_cell("quantile", "alpha", 0.1);
@@ -2904,28 +2895,24 @@ fn mfb_zero_offset_histogram_contract() {
 // source-built lib_lightgbm 4.6 FP trace. See .../deferred-items.md (DEF-07-02).
 
 #[test]
-#[ignore = "DEF-07-02 (07-03): gamma non-constant-hessian (label*exp(-score)) learner-level f64 split-gain knife-edge — spine diverges at tree 0 (rust 2.360 vs cpp 2.058); g/h into tree faithful (iter-1 within ORACLE_TOL), NOT an objective bug. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn gamma_spine_end_to_end() {
     let (booster, corpus) = train_exp_log_spine("gamma");
     assert_model_and_pred(&booster, &corpus, "gamma_spine_model.txt", "gamma_spine_pred.txt");
 }
 
 #[test]
-#[ignore = "DEF-07-02 (07-03): gamma tree-0 split-gain knife-edge — the iter-1 score diverges once the tree-0 split flips; g/h faithful. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn gamma_score_accumulation() {
     let (booster, _) = train_exp_log_spine("gamma");
     assert_scores(&booster, "gamma_scores.txt");
 }
 
 #[test]
-#[ignore = "DEF-07-02 (07-03): gamma iter-4 g/h diff is DOWNSTREAM of the diverged tree-0 split (iter-1 g/h within ORACLE_TOL); the divergence is learner-side, NOT an objective bug. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn gamma_gradients() {
     let (booster, _) = train_exp_log_spine("gamma");
     assert_gradients_at(&booster, "gamma_gh_iter1.txt", "gamma_gh_iterN.txt", 4);
 }
 
 #[test]
-#[ignore = "DEF-07-02 (07-03): gamma loop cells diverge at tree 0 on the non-constant-hessian learner-level f64 split-gain knife-edge; g/h faithful. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn gamma_loop_matrix() {
     replay_exp_log_loop("gamma");
 }
@@ -2960,13 +2947,11 @@ fn tweedie_gradients() {
 // source-built lib_lightgbm 4.6 FP trace. See .../deferred-items.md (DEF-07-02).
 
 #[test]
-#[ignore = "DEF-07-02 (07-03): tweedie bfa-OFF loop cells diverge at tree 0 on the non-constant-hessian learner-level f64 split-gain knife-edge (tweedie_bag0_es0_bfa0: rust 0.1556 vs cpp 0.0857); g/h faithful (tweedie_gradients GREEN). The tweedie SPINE stays GREEN. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn tweedie_loop_matrix() {
     replay_exp_log_loop("tweedie");
 }
 
 #[test]
-#[ignore = "DEF-07-02 (07-03): tweedie variance_power axis (ρ=1.1/1.9) diverges at tree 0 on the same non-constant-hessian learner-level f64 split-gain knife-edge (ρ=1.9: rust 2.362 vs cpp 2.144); g/h faithful. The default-ρ SPINE stays GREEN. Needs source-built lib_lightgbm 4.6 FP trace. See 07-parity .../deferred-items.md"]
 fn tweedie_variance_power_axis() {
     // tweedie_variance_power ∈ {1.5 default (spine), 1.1, 1.9 alts}.
     replay_exp_log_param_cell("tweedie", "tweedie_variance_power", 1.1);
