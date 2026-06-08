@@ -23,3 +23,13 @@ rust-version = "1.95"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 cubecl = "0.10.0"
+
+# Release profile tuned for the compute-heavy training path. Parity-neutral:
+# these flags change codegen, not floating-point semantics (no fast-math). Fat LTO
+# + a single codegen unit let the optimizer inline across the boosting →
+# tree-learner → compute crate boundaries that dominate train time.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
