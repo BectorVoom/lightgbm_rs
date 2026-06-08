@@ -2631,12 +2631,17 @@ fn quantile_bagged_no_split_emission_contract() {
 }
 
 #[test]
-#[ignore = "DEF-07-13-01: ROOT-CAUSED (07-debug, Python-wheel oracle) — NEEDS an architectural GBDT-loop change (Rule 4). The bagged renew sub-cell `quantile_bag1_es0_bfa0` is a 12-vs-10-tree STRUCTURAL divergence, and it is NOT a bagging-draw or renew bug: Rust's per-iteration bagged subset is BIT-EXACT to C++ (verified vs a standalone bagging.hpp sim — iter4 in_bag=[0,1,4,5,6,7,8,9,10], oob=[2,3,11] in both) AND Rust's scores through tree 3 are BIT-EXACT to the wheel. The divergence is the NO-SPLIT-TREE EMISSION policy: when a bagged iteration yields no positive-gain split (uniform gradients on the subset — quantile alpha=0.9 hits this mid-training), C++ `GBDT::TrainOneIter` (gbdt.cpp:406-447) POPS the would-be 1-leaf constant tree (the `!should_continue` path, 'Stopped training because there are no more leaves' warning) and does NOT advance `iter_`; the Python `lgb.train` driver re-bags with a fresh RNG draw on the next boost round. Rust (`gbdt.rs:765,828`) instead APPENDS a 1-leaf `Tree::as_constant` and advances, so Rust grows 12 trees [1,2,3,3,1,3,3,3,1,3,2,3] vs the wheel's 10 [1,2,3,3,3,3,3,3,2,3] — the 2 spurious constants (iters 4,8) shift every later tree (wheel tree4 == Rust tree5, bit-exact). The FIRST-iteration constant baseline (e.g. regression_l1_bag1 Tree=0) is KEPT in both, so the fix is isolated to LATER no-split bagged iterations and would NOT regress any of the 73 green boosting_parity cells (none has a non-first 1-leaf tree). The deterministic source-built CLI cannot reproduce the 10-tree golden (GBDT::Train breaks on is_finished, stopping at 1 tree), so this needed a Python-wheel oracle. FIX (deferred, architectural): replicate the C++ no-split pop/skip + iter-non-advance + re-bag-retry semantics in the Rust GBDT boosting loop. NOT a tolerance weakening; assertion intact under #[ignore]. See .planning/debug/remaining-ignored-cells.md."]
 fn quantile_loop_matrix() {
     // The {bag×es×bfa} loop incl. the BAGGED renew cells (`quantile_bag1_*`): the
     // NON-bagged cells assert real-binary parity GREEN (fixed by 07-13: partition-
     // count leaf-split seeding + the parent-splittability gate). The BAGGED renew
-    // sub-cell remains a separate structural divergence (see #[ignore] above).
+    // sub-cell `quantile_bag1_es0_bfa0` is now GREEN too (DEF-07-13-01 closed by
+    // 07-14: the C++-faithful no-split bagged pop/no-iter-advance/re-bag in the GBDT
+    // loop, gbdt.cpp:406-447). NOTE: this cell's helper (`replay_family_a_loop_cell`)
+    // compares only `min(rust.len, golden.len)` OVERLAPPING trees and does NOT assert
+    // tree-COUNT equality — the exact 10-tree structural guarantee is owned by the
+    // `quantile_bagged_no_split_emission_contract` diagnostic; this cell confirms the
+    // surviving trees are bit-exact (within MATRIX_RESIDUAL_TOL, the renew horizon).
     replay_family_a_loop("quantile");
 }
 
