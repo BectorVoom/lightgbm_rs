@@ -606,15 +606,30 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
 }
 
-/// ON-GPU `FixHistogram` + compaction kernel (260608-oib L3). ONE cube per feature
+/// ON-GPU WIDEN + `FixHistogram` + compaction kernel (260608-oib L3, FOLDED by
+/// 260608-s2b Lever A). ONE cube per feature
 /// (`CubeCount::Static(num_features,1,1)`, `CubeDim::new_1d(1)`), mirroring
 /// [`construct_leaf_hist_resident_kernel`] / the fused split kernel's
 /// one-cube-per-feature precedent. Cube `f` (`CUBE_POS_X`) owns ONLY its
-/// `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of the concatenated stride-2
-/// f64 histogram `hist` and rewrites it IN PLACE to the FixHistogram'd + compacted
-/// form — a VERBATIM port of the host `fix_histogram`
-/// (`fix_histogram.rs:50-80`, `Dataset::FixHistogram`) followed by
-/// `compact_histogram` (`learner.rs:2838-2864`).
+/// `[slot_off[f], slot_off[f] + 2*num_bin[f])` region.
+///
+/// 260608-s2b LEVER A — the standalone `widen_f32_to_f64_kernel` launch is FOLDED
+/// IN as this kernel's FIRST pass: cube `f` widens its own region from the f32 RAW
+/// histogram `h_raw` into the f64 output `hist` via `f64::cast_from(...)` — the
+/// IDENTICAL cast the standalone widen performed — then runs the EXACT same in-place
+/// `FixHistogram` + `compact` over `hist`. Because the widen cast and the f64 fix/
+/// compact fold order are byte-for-byte unchanged, the f64 output is BIT-IDENTICAL
+/// to the prior 3-launch "construct → widen → fix" chain; only the separate widen
+/// LAUNCH is eliminated (3 launches → 2). The widen is now the fix kernel's own
+/// first pass over its region.
+///
+/// `hist` (f64 OUT) must be zero-initialised by the caller (the tail/dropped cells
+/// the compact step does not overwrite stay 0, matching the prior zeroed f64 alloc).
+/// `h_raw` (f32 IN) holds the construct kernel's f32-atomic RAW cells.
+///
+/// A VERBATIM port of the host `fix_histogram` (`fix_histogram.rs:50-80`,
+/// `Dataset::FixHistogram`) followed by `compact_histogram` (`learner.rs:2838-2864`),
+/// preceded by the inline f32→f64 widen.
 ///
 /// The leaf RAW (un-bumped) `sum_gradient` / `sum_hessian` are leaf-level scalars
 /// shared across every feature (Pitfall 2: the RAW totals, NOT the `+2·kEpsilon`
@@ -626,6 +641,9 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
 #[cfg(feature = "rocm")]
 #[cube(launch)]
 pub fn fix_compact_kernel(
+    // f32 RAW histogram (construct-kernel output) — INPUT, read-only.
+    h_raw: &Array<f32>,
+    // f64 fixed+compacted histogram — OUTPUT (caller zeroes it before launch).
     hist: &mut Array<f64>,
     slot_off: &Array<u32>,
     num_bin: &Array<i32>,
@@ -641,6 +659,17 @@ pub fn fix_compact_kernel(
     let nb = num_bin[fi];
     let mfb = most_freq_bin[fi];
     let off = offset[fi];
+
+    // ---- FOLDED WIDEN (260608-s2b Lever A; was widen_f32_to_f64_kernel) ----
+    // Widen THIS feature's whole region f32→f64 into the output BEFORE the fix/
+    // compact reads it. `f64::cast_from` is the same cast the standalone widen used,
+    // so the f64 cells the fix below folds over are bit-identical to the prior
+    // widen-then-fix-in-place path. Ascending bin order; covers both cells per bin.
+    for w in 0..nb {
+        let wbi = base + (w as usize) * 2;
+        hist[wbi] = f64::cast_from(h_raw[wbi]);
+        hist[wbi + 1] = f64::cast_from(h_raw[wbi + 1]);
+    }
 
     // ---- FixHistogram (fix_histogram.rs:50-80, Dataset::FixHistogram) ----
     // C++ `if (most_freq_bin > 0)`: skip when mfb == 0 (bin 0 is never directly
@@ -703,37 +732,43 @@ pub fn fix_compact_kernel(
     }
 }
 
-/// Host launcher for the on-GPU fix+compact kernel (260608-oib L3, Task 1 form).
+/// Host launcher for the on-GPU FOLDED widen+fix+compact kernel (260608-oib L3,
+/// Task 1 form; signature updated by 260608-s2b Lever A).
 ///
-/// Takes ONE leaf's concatenated stride-2 f64 histogram `buf` (the SAME values the
-/// host gets by widening the f32-atomic cells), the per-feature
-/// `{slot_off, num_bin, offset, most_freq_bin}` arrays, and the leaf's RAW
-/// (un-bumped) `sum_gradient` / `sum_hessian`; uploads, launches one cube per
-/// feature, reads back the fixed+compacted f64 buffer. This Task-1 form keeps the
-/// readback so the kernel numerics are proven in isolation (Task 2 adds the
-/// device-Handle-in/Handle-out resident variant).
+/// Takes ONE leaf's concatenated stride-2 f32 RAW histogram `raw` (the construct
+/// kernel's f32-atomic output — the SAME cells the host would widen to f64), the
+/// per-feature `{slot_off, num_bin, offset, most_freq_bin}` arrays, and the leaf's
+/// RAW (un-bumped) `sum_gradient` / `sum_hessian`; uploads, allocates a zeroed f64
+/// output, launches one cube per feature (each widens its region inline then
+/// fixes+compacts), reads back the fixed+compacted f64 buffer. This Task-1 form
+/// keeps the readback so the kernel numerics are proven in isolation.
+///
+/// Lever A note: the kernel now folds the f32→f64 widen IN (`f64::cast_from`),
+/// so this launcher feeds the f32 RAW directly — bit-identical to the prior
+/// "supply pre-widened f64" form for any f32-representable RAW cell.
 ///
 /// V5 boundary validation BEFORE launch (mirrors the fused split launcher):
 /// `num_bin == 0` → typed error; `2*num_bin` overflow → typed error;
-/// `slot_off + 2*num_bin > buf.len()` → [`ComputeError::LengthMismatch`]; empty
-/// feats → `Ok(buf unchanged)` with NO launch.
+/// `slot_off + 2*num_bin > raw.len()` → [`ComputeError::LengthMismatch`]; empty
+/// feats → `Ok(raw widened to f64)` with NO launch.
 ///
 /// `feats` is `&[(slot_off, num_bin, offset, most_freq_bin)]` per feature, in the
-/// same order as the concatenated regions in `buf`.
+/// same order as the concatenated regions in `raw`.
 ///
 /// # Errors
 /// As above (length / overflow validation, V5).
 #[cfg(feature = "rocm")]
 pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
-    buf: &[f64],
+    raw: &[f32],
     feats: &[(usize, u32, i32, u32)],
     sum_gradient: f64,
     sum_hessian: f64,
 ) -> Result<Vec<f64>, ComputeError> {
-    // Empty batch: no launch (return the buffer unchanged).
+    // Empty batch: no launch — return the f32 RAW widened to f64 (the degenerate
+    // "widen-only" result, matching the prior f64 buffer pass-through).
     if feats.is_empty() {
-        return Ok(buf.to_vec());
+        return Ok(raw.iter().map(|&x| f64::from(x)).collect());
     }
 
     let n = feats.len();
@@ -757,10 +792,10 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
             .ok_or_else(|| ComputeError::Runtime {
                 detail: "fix_compact: slot_off + region overflows".to_string(),
             })?;
-        if end > buf.len() {
+        if end > raw.len() {
             return Err(ComputeError::LengthMismatch {
                 expected: end,
-                actual: buf.len(),
+                actual: raw.len(),
             });
         }
         slot_off_a.push(slot_off as u32);
@@ -769,23 +804,28 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
         mfb_a.push(most_freq_bin as i32);
     }
 
-    let h_hist = client.create_from_slice(f64::as_bytes(buf));
+    // f32 RAW INPUT + zeroed f64 OUTPUT (the folded kernel widens raw→out inline).
+    let h_raw = client.create_from_slice(f32::as_bytes(raw));
+    let zeros64 = vec![0.0f64; raw.len()];
+    let h_hist = client.create_from_slice(f64::as_bytes(&zeros64));
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
     let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
     let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
     let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
 
     // SAFETY: every handle is sized to its slice and outlives the launch. Cube `f`
-    // (`CUBE_POS_X < n`) reads/writes only `[slot_off[f], slot_off[f]+2*num_bin[f])`
-    // — each validated `<= buf.len()` above — and `mfb < num_bin` keeps the
-    // reconstruct write in range; the per-feature index arrays all have exactly `n`
-    // elements. All cubecl unsafe is confined here (CMP-01).
+    // (`CUBE_POS_X < n`) reads `h_raw` and reads/writes `h_hist` only within
+    // `[slot_off[f], slot_off[f]+2*num_bin[f])` — each validated `<= raw.len()`
+    // above — and `mfb < num_bin` keeps the reconstruct write in range; the
+    // per-feature index arrays all have exactly `n` elements. All cubecl unsafe is
+    // confined here (CMP-01).
     unsafe {
         fix_compact_kernel::launch(
             client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_1d(1),
-            ArrayArg::from_raw_parts(h_hist.clone(), buf.len()),
+            ArrayArg::from_raw_parts(h_raw, raw.len()),
+            ArrayArg::from_raw_parts(h_hist.clone(), raw.len()),
             ArrayArg::from_raw_parts(h_slot, n),
             ArrayArg::from_raw_parts(h_numbin, n),
             ArrayArg::from_raw_parts(h_offset, n),
@@ -819,28 +859,21 @@ pub fn upload_resident_columns<R: cubecl::Runtime>(
     client.create_from_slice(u32::as_bytes(&concat))
 }
 
-/// ON-DEVICE f32→f64 widen (260608-oib L3): copy every cell of an f32 buffer into
-/// an f64 buffer, one unit per cell. `f64::cast_from(src[i])` is the SAME widening
-/// the host readback does (`f64::from(x)`), so the resident chain's f64 buffer
-/// equals today's host-widened readback cell-for-cell — keeping the downstream
-/// fix+compact bit-identical to the host path. `#[cfg(feature="rocm")]`.
-#[cfg(feature = "rocm")]
-#[cube(launch)]
-pub fn widen_f32_to_f64_kernel(src: &Array<f32>, dst: &mut Array<f64>) {
-    let idx = ABSOLUTE_POS;
-    if idx < src.len() {
-        dst[idx] = f64::cast_from(src[idx]);
-    }
-}
+// (260608-s2b Lever A) The standalone `widen_f32_to_f64_kernel` was REMOVED — its
+// f32→f64 cast is now folded into `fix_compact_kernel`'s first pass (the inline
+// `f64::cast_from` widen), eliminating a per-leaf GPU launch. See the FOLDED WIDEN
+// block in `fix_compact_kernel`.
 
-/// DEVICE-RESIDENT build→fix→compact chain (260608-oib L3, Task 2 step 1).
+/// DEVICE-RESIDENT build→fix→compact chain (260608-oib L3, Task 2 step 1; FOLDED to
+/// 2 launches by 260608-s2b Lever A).
 ///
 /// Runs the resident build kernel ([`construct_leaf_hist_resident_kernel`]) into an
-/// f32-atomic device buffer, widens it to an f64 device buffer on-device
-/// ([`widen_f32_to_f64_kernel`] — matching the existing host readback widening),
-/// then launches the on-GPU fix+compact ([`fix_compact_kernel`], Task 1) over that
-/// f64 buffer, and RETURNS the fixed+compacted f64 device `Handle` (NOT a Vec) plus
-/// the buffer length. NO readback — the histogram VALUES never leave the device.
+/// f32-atomic device buffer, then launches the on-GPU FOLDED widen+fix+compact
+/// ([`fix_compact_kernel`]) which widens that f32 buffer to f64 INLINE (its first
+/// pass, `f64::cast_from` — matching the host readback widening) and fixes+compacts
+/// in one launch, and RETURNS the fixed+compacted f64 device `Handle` (NOT a Vec)
+/// plus the buffer length. NO readback — the histogram VALUES never leave the device.
+/// The standalone widen launch is GONE (3 launches → 2: construct + folded fix).
 ///
 /// This is the resident analog of `build_leaf_histograms_resident_f32_on` +
 /// host fix+compact: the whole per-leaf build→fix→compact chain runs on device. The
@@ -903,26 +936,20 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         }
     }
 
-    // ---- 2. WIDEN f32 → f64 on device (matches the host readback widening) ----
+    // ---- 2. (260608-s2b Lever A) Allocate the zeroed f64 OUTPUT. The standalone
+    //         widen launch is GONE — the folded fix kernel below widens each feature
+    //         region from `h_raw` (f32) into `h_f64` (f64) inline as its first pass,
+    //         then fixes+compacts. `fix_feats` covers EVERY feature region contiguously
+    //         (the learner enumerates all features; regions tile [0, slot_len)), so the
+    //         per-feature inline widen covers the whole buffer exactly as the prior
+    //         full-buffer widen did. The per-leaf spine launch count drops 3 → 2
+    //         (construct + folded fix). When `fix_feats` is empty (no features / no
+    //         rows) there is nothing to widen and `h_f64` stays zeroed — matching the
+    //         prior degenerate path (construct skipped ⇒ widen of zeros ⇒ zeros). ----
     let zeros64 = vec![0.0f64; slot_len];
     let h_f64 = client.create_from_slice(f64::as_bytes(&zeros64));
-    {
-        let cube_dim = 256u32;
-        let cube_count = (slot_len as u32).max(1).div_ceil(cube_dim);
-        // SAFETY: `h_raw` and `h_f64` are both sized `slot_len`; the kernel bounds-
-        // checks `idx < src.len()`. cubecl unsafe confined here (CMP-01).
-        unsafe {
-            widen_f32_to_f64_kernel::launch(
-                client,
-                CubeCount::Static(cube_count, 1, 1),
-                CubeDim::new_1d(cube_dim),
-                ArrayArg::from_raw_parts(h_raw, slot_len),
-                ArrayArg::from_raw_parts(h_f64.clone(), slot_len),
-            );
-        }
-    }
 
-    // ---- 3. ON-GPU fix+compact over the f64 buffer (Task 1 kernel) ----
+    // ---- 3. ON-GPU FOLDED widen+fix+compact over the f64 buffer (Lever A kernel) ----
     if !fix_feats.is_empty() {
         let n = fix_feats.len();
         let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
@@ -956,14 +983,17 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
         let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
         let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
-        // SAFETY: `h_f64` sized `slot_len`; cube `f < n` reads/writes only its
-        // validated `[slot_off[f], slot_off[f]+2*num_bin[f]) <= slot_len` region and
-        // `mfb < num_bin` keeps the reconstruct in range. cubecl unsafe confined here.
+        // SAFETY: `h_raw` (f32 IN) and `h_f64` (f64 OUT) are both sized `slot_len`;
+        // cube `f < n` reads `h_raw` and reads/writes `h_f64` only within its validated
+        // `[slot_off[f], slot_off[f]+2*num_bin[f]) <= slot_len` region (inline widen +
+        // fix + compact) and `mfb < num_bin` keeps the reconstruct in range. cubecl
+        // unsafe confined here.
         unsafe {
             fix_compact_kernel::launch(
                 client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(h_raw, slot_len),
                 ArrayArg::from_raw_parts(h_f64.clone(), slot_len),
                 ArrayArg::from_raw_parts(h_slot, n),
                 ArrayArg::from_raw_parts(h_numbin, n),

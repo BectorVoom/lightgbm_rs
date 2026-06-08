@@ -1630,19 +1630,23 @@ mod hip {
             },
         ];
 
-        // Concatenate the RAW regions + record per-feature (slot_off, num_bin, offset, mfb).
-        let mut buf: Vec<f64> = Vec::new();
+        // Concatenate the RAW regions as f32 (the construct kernel's output type;
+        // 260608-s2b Lever A — the folded kernel reads f32 RAW and widens inline).
+        // Every region value here is exactly f32-representable, so f32 carries the
+        // RAW losslessly and the host reference (widened f32→f64) is the exact same
+        // f64 the folded kernel produces from its inline `f64::cast_from`.
+        let mut raw32: Vec<f32> = Vec::new();
         let mut params: Vec<(usize, u32, i32, u32)> = Vec::new();
         for f in &feats {
             assert_eq!(f.region.len(), 2 * f.num_bin as usize, "region length");
-            let slot_off = buf.len();
+            let slot_off = raw32.len();
             params.push((slot_off, f.num_bin, f.offset, f.mfb));
-            buf.extend_from_slice(&f.region);
+            raw32.extend(f.region.iter().map(|&x| x as f32));
         }
 
-        // HOST reference: fix_histogram (the exported op) then compact, per feature,
-        // over a clone of the SAME RAW buffer.
-        let mut host = buf.clone();
+        // HOST reference: widen the SAME f32 RAW to f64 (the folded kernel's inline
+        // cast), then fix_histogram (the exported op) + compact, per feature.
+        let mut host: Vec<f64> = raw32.iter().map(|&x| f64::from(x)).collect();
         for (&(slot_off, num_bin, offset, mfb), _f) in params.iter().zip(feats.iter()) {
             let cells = 2 * num_bin as usize;
             let region = &mut host[slot_off..slot_off + cells];
@@ -1650,12 +1654,13 @@ mod hip {
             host_compact_histogram(region, offset);
         }
 
-        // GPU path: the on-device fix+compact kernel over the SAME RAW buffer.
-        let gpu = fix_compact_f64_on(&hip, &buf, &params, sum_g, sum_h)
+        // GPU path: the on-device FOLDED widen+fix+compact kernel over the f32 RAW.
+        let gpu = fix_compact_f64_on(&hip, &raw32, &params, sum_g, sum_h)
             .expect("fix_compact_f64_on");
 
         assert_eq!(gpu.len(), host.len(), "fix_compact length");
-        // BIT-EXACT: same f64 cells, same ascending fold order ⇒ identical bits.
+        // BIT-EXACT: same inline widen cast, same f64 cells, same ascending fold
+        // order ⇒ identical bits (the folded kernel == host fix+compact).
         if let Err(m) = compare_exact_f64_bits(&gpu, &host) {
             panic!("GPU fix_compact != host fix+compact (NOT bit-exact): {m}");
         }
