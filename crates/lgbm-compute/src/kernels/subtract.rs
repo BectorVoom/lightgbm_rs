@@ -138,6 +138,50 @@ pub fn subtract_histograms_cpu_native(
     Ok(parent.iter().zip(child).map(|(p, c)| p - c).collect())
 }
 
+/// Handle-in/Handle-out resident subtract (260608-p90 Task 2A) — the device-resident
+/// sibling of [`subtract_histograms_f64_on`]. Derives `out[i] = parent[i] - child[i]`
+/// over `len` stride-2 f64 cells entirely on device: it CONSUMES the `parent` and
+/// `child` device Handles, allocates a fresh `out` Handle of `len` f64 cells, launches
+/// the VERBATIM element-wise [`subtract_hist_kernel`] (the same EXACT-math kernel the
+/// host path uses — no new math), and RETURNS the `out` Handle. NO read-back — the
+/// derived larger child's histogram never leaves the device. The caller guarantees
+/// both input Handles describe `len` f64 cells (the pool's `slot_len`).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `len == 0` (degenerate — no cells to subtract).
+#[cfg(feature = "rocm")]
+pub fn subtract_histograms_f64_from_handles_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    parent: cubecl::server::Handle,
+    child: cubecl::server::Handle,
+    len: usize,
+) -> Result<cubecl::server::Handle, ComputeError> {
+    if len == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "subtract_histograms_from_handles: len must be > 0".to_string(),
+        });
+    }
+    let zeros = vec![0.0f64; len];
+    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+
+    // SAFETY: `parent`/`child`/`h_out` each describe exactly `len` f64 cells (the
+    // caller guarantees the inputs; `h_out` is allocated for `len` here) and outlive
+    // the launch; the kernel reads/writes only indices `0..len`. All cubecl unsafe is
+    // confined here (CMP-01).
+    unsafe {
+        subtract_hist_kernel::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(parent, len),
+            ArrayArg::from_raw_parts(child, len),
+            ArrayArg::from_raw_parts(h_out.clone(), len),
+        );
+    }
+
+    Ok(h_out)
+}
+
 /// Host-side `subtract_histograms` in **f32 cells** on ANY runtime (the no-f64
 /// hip path; CMP-03/CMP-04). Same `derived[i] = parent[i] - child[i]` math and
 /// V5 validation as [`subtract_histograms_cpu`], but in f32 cells. Generic over

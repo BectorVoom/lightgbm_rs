@@ -33,6 +33,7 @@ pub mod histogram_pool;
 pub mod leaf_splits;
 pub mod learner;
 pub mod monotone_constraints;
+pub mod resident_pool;
 pub mod split_info;
 
 pub use col_sampler::ColSampler;
@@ -46,8 +47,9 @@ pub use fix_histogram::fix_histogram;
 pub use forced_splits::{parse_forced_splits, ForcedSplitError, ForcedSplitNode};
 pub use histogram_pool::HistogramPool;
 pub use leaf_splits::LeafSplits;
-pub use learner::{BuildStrategy, FeatureColumn, SerialTreeLearner};
+pub use learner::{BuildStrategy, FeatureColumn, LearnerConstraints, SerialTreeLearner};
 pub use monotone_constraints::{BasicConstraint, MonotoneConstraints};
+pub use resident_pool::resident_eligible;
 pub use split_info::{split_gt, SplitInfo};
 
 /// THE single authoritative threshold-offset rule (`meta_->offset`), shared by

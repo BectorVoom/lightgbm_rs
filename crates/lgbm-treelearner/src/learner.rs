@@ -272,6 +272,13 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// `train` / `train_returning_partition` (the production boosting path), so the
     /// boosting loop pays nothing for snapshots it discards.
     capture_snapshots: bool,
+    /// 260608-p90: whether THIS train is device-resident-eligible (a pure numeric
+    /// spine on a resident-capable backend). Computed ONCE at the top of
+    /// `train_inner` via [`crate::resident_pool::resident_eligible`] and read in
+    /// `find_best_splits` to route the per-leaf build→fix→compact→subtract→scan chain
+    /// through the device-handle slot mirror (keeping histograms resident). `false`
+    /// (the default, and ALWAYS on CpuBackend) takes the byte-unchanged host path.
+    resident_eligible: bool,
 }
 
 /// W10 advanced learner constraints (ADV-01..05) — the inactive `Default` is the
@@ -381,6 +388,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // Default OFF: the common `train` path discards snapshots, so by default
             // we never pay the per_bin_gains re-scan. The snapshot wrappers opt in.
             capture_snapshots: false,
+            // Default OFF: recomputed per train in `train_inner` (260608-p90).
+            resident_eligible: false,
         }
     }
 
@@ -575,6 +584,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let num_data = gradients.len() as i32;
         let features = self.features.clone();
 
+        // 260608-p90: decide device-resident eligibility ONCE per train (CONSERVATIVE /
+        // fail-safe — see `resident_pool::resident_eligible`). ANDs in the backend's
+        // `resident_pool_supported` so CpuBackend (false) NEVER takes the resident
+        // branch; ANY non-spine feature/config falls back to the byte-unchanged host
+        // path. Read in `find_best_splits` to route the per-leaf chain.
+        self.resident_eligible = crate::resident_pool::resident_eligible(
+            self.backend.resident_pool_supported(),
+            &features,
+            &self.constraints,
+            capture_snapshots,
+            &self.cfg,
+        );
+
         // force_row_wise / force_col_wise (TRL-09, A1 / Open Q2): the two strategies
         // differ ONLY in the histogram-build ORDER, not the result. On the
         // single-thread deterministic anchor the Phase-4 `construct_histograms`
@@ -677,6 +699,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         let mut pool = HistogramPool::new(self.num_leaves, slot_len);
         pool.reset_map();
+        // 260608-p90: when eligible, reset the device-handle slot mirror alongside the
+        // host pool's reset_map, sized to the host pool's cache_size (== num_leaves).
+        // No-op on CpuBackend (the default trait impl) and when ineligible.
+        if self.resident_eligible {
+            self.backend
+                .reset_resident_pool(pool.cache_size(), slot_len);
+        }
 
         // Root leaf sums via the ordered f64 fold over ALL rows.
         let root_indices: Vec<u32> = (0..num_data as u32).collect();
@@ -1326,16 +1355,51 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ---- SMALLER child: build its concatenated histogram directly into its
         // pool slot (construct → FixHistogram raw sums → compact, per feature),
         // then scan it (serial_tree_learner.cpp:530-543). ----
-        self.build_leaf_histogram_into(
-            features,
-            gradients,
-            hessians,
-            data_partition,
-            slot_off,
-            smaller_leaf,
-            smaller_splits,
-            pool.buffer_mut(smaller_slot),
-        );
+        //
+        // 260608-p90: when resident-eligible, build the SMALLER (directly-built / root)
+        // leaf's histogram DEVICE-RESIDENT (build→fix→compact stays on device) into the
+        // mirror's `smaller_slot`, and scan it from that Handle. T1 ALSO builds the host
+        // buffer (the transitional double-build, plan (b)) so the host subtract for the
+        // larger child still has its operands; T2 removes the host build once subtract
+        // is resident. `None` (ineligible / CpuBackend) is the byte-unchanged host path.
+        let smaller_resident_slot = if self.resident_eligible {
+            // Transitional host build (T1→T2): keeps the host pool slot populated for
+            // the host larger-child subtract. REMOVED in T2 (subtract goes resident).
+            self.build_leaf_histogram_into(
+                features,
+                gradients,
+                hessians,
+                data_partition,
+                slot_off,
+                smaller_leaf,
+                smaller_splits,
+                pool.buffer_mut(smaller_slot),
+            );
+            self.build_resident_leaf_into(
+                features,
+                gradients,
+                hessians,
+                data_partition,
+                slot_off,
+                pool.hist_len(),
+                smaller_slot,
+                smaller_leaf,
+                smaller_splits,
+            )?;
+            Some(smaller_slot)
+        } else {
+            self.build_leaf_histogram_into(
+                features,
+                gradients,
+                hessians,
+                data_partition,
+                slot_off,
+                smaller_leaf,
+                smaller_splits,
+                pool.buffer_mut(smaller_slot),
+            );
+            None
+        };
         let smaller_records = self.scan_leaf_histogram(
             features,
             slot_off,
@@ -1347,6 +1411,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             smaller_node_mask.as_deref(),
             data_partition,
             parent_splittable.as_deref(),
+            smaller_resident_slot,
         )?;
 
         // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
@@ -1403,6 +1468,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     pool.buffer_mut(larger_slot),
                 );
             }
+            // T1: the LARGER (subtract-derived) child STILL uses the host path
+            // (subtract on host, scan host buf) — `None` resident slot. T2 makes this
+            // resident (subtract_resident → scan_resident_leaf).
             larger_records = self.scan_leaf_histogram(
                 features,
                 slot_off,
@@ -1414,6 +1482,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 larger_node_mask.as_deref(),
                 data_partition,
                 parent_splittable.as_deref(),
+                None,
             )?;
         }
         let _ = use_subtract; // recorded for clarity; the parent_slot Option drives it
@@ -1496,6 +1565,70 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
     }
 
+    /// 260608-p90: build ONE directly-built leaf's histogram DEVICE-RESIDENT (the
+    /// resident analog of [`build_leaf_histogram_into`](Self::build_leaf_histogram_into)).
+    /// Assembles the per-feature `(slot_off, num_bin, offset, most_freq_bin)` fix_feats
+    /// (the SAME params the host `fix_histogram` + `compact_histogram` use) and the
+    /// leaf RAW (un-bumped) sums (Pitfall 2), then drives
+    /// [`Backend::build_resident_leaf`](lgbm_compute::Backend::build_resident_leaf),
+    /// which runs build→widen→fix→compact entirely on device and stores the resulting
+    /// f64 Handle into mirror slot `slot`. Only called when `resident_eligible`.
+    ///
+    /// An empty / no-hessian leaf is skipped (matching the host build's `buildable`
+    /// guard): the resident scan of such a leaf is itself short-circuited by
+    /// `scan_leaf_histogram`'s `sum_h > 0` gate, so the (absent) Handle is never read.
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident_leaf_into(
+        &self,
+        features: &[FeatureColumn],
+        gradients: &[f32],
+        hessians: &[f32],
+        data_partition: &DataPartition,
+        slot_off: &[usize],
+        slot_len: usize,
+        slot: usize,
+        leaf: i32,
+        leaf_splits: &LeafSplits,
+    ) -> Result<(), TreeLearnerError> {
+        let sum_g = leaf_splits.sum_gradients;
+        let sum_h = leaf_splits.sum_hessians;
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let buildable = sum_h > 0.0 && leaf_splits.num_data_in_leaf > 0;
+        if !buildable {
+            // Leave the slot as-is; the scan's sum_h>0 gate skips this leaf so the
+            // Handle is never consulted.
+            return Ok(());
+        }
+        let leaf_rows = data_partition.indices_in_leaf(leaf);
+        let feature_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
+        let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
+        // fix_feats: per-feature (slot_off, num_bin, offset, most_freq_bin) — the SAME
+        // values the host fix_histogram (most_freq_bin) + compact_histogram (offset)
+        // consume, so the on-device fix+compact reproduces the host buffer bit-for-bit
+        // (the f32-atomic RAW build is the only ~1e-6 contributor; oib proved fix+compact
+        // bit-exact).
+        let fix_feats: Vec<(usize, u32, i32, u32)> = features
+            .iter()
+            .enumerate()
+            .map(|(fpos, f)| (slot_off[fpos], f.num_bin, f.offset, f.most_freq_bin))
+            .collect();
+        self.backend.build_resident_leaf(
+            self.client,
+            slot,
+            &feature_bins,
+            &num_bins,
+            slot_off,
+            slot_len,
+            leaf_rows,
+            gradients,
+            hessians,
+            &fix_feats,
+            sum_g,
+            sum_h,
+        )?;
+        Ok(())
+    }
+
     /// Scan one leaf's per-feature CONCATENATED compacted+fixed histogram (already
     /// in the pool slot `buf`, built directly OR derived via subtraction), running
     /// `find_best_split` per feature and recording the cross-feature argmax into
@@ -1514,6 +1647,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         used_features: Option<&[i8]>,
         data_partition: &DataPartition,
         parent_splittable: Option<&[bool]>,
+        // 260608-p90: when `Some(slot)` (resident-eligible), the SPINE batched scan
+        // reads the device-resident Handle in mirror slot `slot` (via
+        // `backend.scan_resident_leaf`) instead of the host `buf` (via
+        // `find_best_splits_batched`). Every other gate / argmax / record / bookkeeping
+        // path is BYTE-IDENTICAL — only the histogram SOURCE differs. `None` (the host
+        // path, always on CpuBackend) is unchanged. When `Some`, eligibility guarantees
+        // ZERO categorical/monotone/extra-trees features, so those inline branches are
+        // unreachable and `buf` is not read on the spine path.
+        resident_slot: Option<usize>,
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
@@ -1623,15 +1765,35 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // byte-identical to the inline `find_best_split` it replaces; on RocmBackend
         // it is the batched GPU override. Empty `batched_feats` ⇒ empty Vec, no
         // launch (T-lsx-03). ----
-        let batched_splits = self.backend.find_best_splits_batched(
-            self.client,
-            buf,
-            &batched_feats,
-            &self.cfg,
-            sum_g,
-            sum_h,
-            num_data_in_leaf,
-        )?;
+        //
+        // 260608-p90: when resident-eligible (`resident_slot == Some(slot)`), read the
+        // device-resident Handle in mirror slot `slot` instead of the host `buf` — the
+        // Handle-consuming fused scan (`scan_resident_leaf`) is byte-identical to the
+        // host-buf fused scan (same `split_scan_body`, same decode), so the per-feature
+        // SplitInfos are the SAME and the grown tree is unchanged. `slot_len ==
+        // buf.len()` (the pool slot length).
+        let batched_splits = if let Some(slot) = resident_slot {
+            self.backend.scan_resident_leaf(
+                self.client,
+                slot,
+                buf.len(),
+                &batched_feats,
+                &self.cfg,
+                sum_g,
+                sum_h,
+                num_data_in_leaf,
+            )?
+        } else {
+            self.backend.find_best_splits_batched(
+                self.client,
+                buf,
+                &batched_feats,
+                &self.cfg,
+                sum_g,
+                sum_h,
+                num_data_in_leaf,
+            )?
+        };
 
         for (fpos, f) in features.iter().enumerate() {
             // ColSampler gate (serial_tree_learner.cpp: `if (!is_feature_used[fi])

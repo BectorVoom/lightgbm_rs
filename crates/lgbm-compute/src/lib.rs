@@ -335,6 +335,119 @@ pub trait Backend {
         _feature_bins: &[&[u32]],
     ) {
     }
+
+    // ===================================================================
+    // 260608-p90: DEVICE-RESIDENT histogram-pool seam.
+    //
+    // A device-Handle slot mirror that follows the host `HistogramPool` slot
+    // bookkeeping, so a pure-numeric-spine tree keeps its per-leaf histograms
+    // DEVICE-RESIDENT from build through fix/compact/subtract/scan (eliminating the
+    // per-leaf host read-back + re-upload). Every method has a DEFAULT impl that
+    // makes the CPU path byte-unchanged: `resident_pool_supported() == false` means
+    // the learner's eligibility gate never takes the resident branch on CpuBackend,
+    // and the no-op / typed-error defaults are never reached on cpu. RocmBackend
+    // OVERRIDES all of them.
+    // ===================================================================
+
+    /// Whether this backend supports the device-resident histogram pool (260608-p90).
+    /// `false` (the default, CpuBackend) means the learner's `resident_eligible` gate
+    /// ANDs this in and ALWAYS takes the byte-unchanged host path. RocmBackend returns
+    /// `true`.
+    fn resident_pool_supported(&self) -> bool {
+        false
+    }
+
+    /// Clear/resize the device-handle slot mirror for a new tree (260608-p90), called
+    /// alongside the host `HistogramPool::reset_map`. Default: no-op (CpuBackend never
+    /// takes the resident branch).
+    fn reset_resident_pool(&self, _num_slots: usize, _slot_len: usize) {}
+
+    /// Build ONE leaf's per-feature histogram DEVICE-RESIDENT (build → f32→f64 widen →
+    /// fix → compact) and store the resulting f64 `Handle` into mirror slot `slot`
+    /// (260608-p90). Mirrors `build_leaf_histogram_into` but keeps the histogram on
+    /// device. `fix_feats[fpos]` is `(slot_off, num_bin, offset, most_freq_bin)` for
+    /// feature `fpos`; `sum_gradient` / `sum_hessian` are the leaf RAW (un-bumped)
+    /// totals (Pitfall 2). Default: typed error (never called on cpu — the gate is off).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the resident
+    /// build/fix/compact kernel errors on RocmBackend.
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident_leaf(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _slot: usize,
+        _feature_bins: &[&[u32]],
+        _num_bins: &[u32],
+        _slot_off: &[usize],
+        _slot_len: usize,
+        _leaf_rows: &[u32],
+        _gradients: &[f32],
+        _hessians: &[f32],
+        _fix_feats: &[(usize, u32, i32, u32)],
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+    ) -> Result<(), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "build_resident_leaf: device-resident pool not supported on this backend"
+                .to_string(),
+        })
+    }
+
+    /// Move the resident Handle from `src_slot` to `dst_slot` in the device mirror
+    /// (260608-p90), mirroring the host `HistogramPool::move_` slot reassignment so the
+    /// device mirror's slot→Handle map tracks the host pool's slot→leaf map. Default:
+    /// no-op.
+    fn move_resident(&self, _src_slot: usize, _dst_slot: usize) {}
+
+    /// Derive the larger child's resident histogram by the subtraction trick on device
+    /// (`parent_slot` Handle − `smaller_slot` Handle → `larger_slot` Handle, no
+    /// read-back; 260608-p90 Task 2). The derived larger child is NOT re-FixHistogram'd
+    /// (matches host/C++, non-negotiable #3). Default: typed error.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the resident
+    /// subtract kernel errors on RocmBackend.
+    fn subtract_resident(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _parent_slot: usize,
+        _smaller_slot: usize,
+        _larger_slot: usize,
+        _slot_len: usize,
+    ) -> Result<(), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "subtract_resident: device-resident pool not supported on this backend"
+                .to_string(),
+        })
+    }
+
+    /// Scan slot `slot`'s resident histogram Handle for every spine feature's best
+    /// split in ONE fused launch (260608-p90), reading back only the `n*12` SplitInfo
+    /// cells (the histogram Handle never leaves the device). Returns one [`SplitInfo`]
+    /// per `feats` entry, in input order (the cross-feature-argmax tie-break invariant).
+    /// Default: typed error.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported / empty slot) on the default; propagates
+    /// the fused split-scan errors on RocmBackend.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_resident_leaf(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _slot: usize,
+        _slot_len: usize,
+        _feats: &[BatchedSplitFeature],
+        _cfg: &GainConfig,
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+        _num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "scan_resident_leaf: device-resident pool not supported on this backend"
+                .to_string(),
+        })
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -490,7 +603,7 @@ struct ResidentBins {
 /// borrow safe. Because a `RefCell` is not `Copy`, this type no longer derives
 /// `Copy` (it did before nn7); `CpuBackend` stays the stateless unit struct.
 #[cfg(feature = "rocm")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RocmBackend {
     /// The device-resident binned dataset, populated ONCE per train by
     /// [`upload_resident_bins`](Backend::upload_resident_bins) and read by the
@@ -498,6 +611,51 @@ pub struct RocmBackend {
     /// override. `None` until the first upload (defensive fallback to the per-leaf
     /// host-gather path).
     resident_bins: std::cell::RefCell<Option<ResidentBins>>,
+    /// 260608-p90: the device-handle slot mirror, indexed by host `HistogramPool`
+    /// slot id. `resident_pool[slot]` holds the fixed+compacted f64 histogram `Handle`
+    /// for whichever leaf currently owns that slot, or `None` when the slot is empty.
+    /// The learner issues build/subtract/move/scan ops here at the SAME call sites
+    /// (with the SAME slot ids) it drives the host pool, so this mirror tracks the
+    /// host pool's slot→leaf map exactly (T-p90-02). Like `resident_bins`, the
+    /// single-threaded train loop makes the RefCell borrow safe (the nn7 rationale).
+    resident_pool: std::cell::RefCell<Vec<Option<cubecl::server::Handle>>>,
+    /// 260608-p90: test-only toggle to FORCE the host path on RocmBackend (so the
+    /// resident==host tree-equivalence test can grow the SAME f32-atomic-built tree
+    /// through the host read-back/subtract/scan chain). `true` (the default) reports
+    /// `resident_pool_supported() == true`; `false` forces the host path. Set only by
+    /// the test-only [`with_resident`](RocmBackend::with_resident) constructor.
+    resident_enabled: bool,
+}
+
+#[cfg(feature = "rocm")]
+impl Default for RocmBackend {
+    fn default() -> Self {
+        Self {
+            resident_bins: std::cell::RefCell::new(None),
+            resident_pool: std::cell::RefCell::new(Vec::new()),
+            // Production default: the device-resident pool is enabled.
+            resident_enabled: true,
+        }
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl RocmBackend {
+    /// TEST-ONLY constructor (260608-p90): build a RocmBackend that REPORTS
+    /// `resident_pool_supported() == enabled`. The resident==host tree-equivalence
+    /// test grows the SAME corpus twice on a RocmBackend — once with `with_resident(true)`
+    /// (the resident chain) and once with `with_resident(false)` (forcing the host
+    /// read-back/subtract/scan path) — and asserts the two trees match within ~1e-6.
+    /// The same f32-atomic RAW build runs in both cases; only the build→fix→compact→
+    /// subtract→scan ROUTING differs. Not used on the production path
+    /// ([`Default`] enables residency).
+    pub fn with_resident(enabled: bool) -> Self {
+        Self {
+            resident_bins: std::cell::RefCell::new(None),
+            resident_pool: std::cell::RefCell::new(Vec::new()),
+            resident_enabled: enabled,
+        }
+    }
 }
 
 #[cfg(feature = "rocm")]
@@ -696,6 +854,148 @@ impl Backend for RocmBackend {
             sum_gradient,
             sum_hessian,
             num_data,
+        )
+    }
+
+    // ---- 260608-p90: device-resident histogram-pool overrides ----
+
+    fn resident_pool_supported(&self) -> bool {
+        self.resident_enabled
+    }
+
+    /// Clear + resize the device-handle slot mirror for a new tree. `num_slots` is the
+    /// host pool's `cache_size`; `slot_len` is informational (the Handles carry their
+    /// own length). Drops every prior Handle (releasing device memory).
+    fn reset_resident_pool(&self, num_slots: usize, _slot_len: usize) {
+        let mut mirror = self.resident_pool.borrow_mut();
+        mirror.clear();
+        mirror.resize_with(num_slots, || None);
+    }
+
+    /// Build ONE leaf's histogram device-resident (build → widen → fix → compact) via
+    /// the oib `build_fix_compact_resident_f64_on` chain and STORE the returned
+    /// `(Handle, len)` into mirror slot `slot` (dropping any prior Handle). Falls back
+    /// to a typed error if the resident bin cache is empty (defensive — the learner
+    /// always uploads before the growth loop when eligible).
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident_leaf(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        slot: usize,
+        _feature_bins: &[&[u32]],
+        _num_bins: &[u32],
+        slot_off: &[usize],
+        slot_len: usize,
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+        fix_feats: &[(usize, u32, i32, u32)],
+        sum_gradient: f64,
+        sum_hessian: f64,
+    ) -> Result<(), ComputeError> {
+        let resident = self.resident_bins.borrow();
+        let Some(resident) = resident.as_ref() else {
+            return Err(ComputeError::Runtime {
+                detail: "build_resident_leaf: resident bin cache empty (upload_resident_bins not \
+                         called)"
+                    .to_string(),
+            });
+        };
+        let (handle, len) = kernels::histogram::build_fix_compact_resident_f64_on(
+            client,
+            resident.handle.clone(),
+            resident.num_features,
+            resident.num_data,
+            slot_off,
+            slot_len,
+            leaf_rows,
+            gradients,
+            hessians,
+            fix_feats,
+            sum_gradient,
+            sum_hessian,
+        )?;
+        debug_assert_eq!(len, slot_len, "resident leaf handle length");
+        let mut mirror = self.resident_pool.borrow_mut();
+        if slot >= mirror.len() {
+            mirror.resize_with(slot + 1, || None);
+        }
+        mirror[slot] = Some(handle);
+        Ok(())
+    }
+
+    /// Move the resident Handle from `src_slot` to `dst_slot`, mirroring the host
+    /// `HistogramPool::move_` (the slot reassignment that hands the parent's buffer to
+    /// the larger child). `src_slot` is left empty.
+    fn move_resident(&self, src_slot: usize, dst_slot: usize) {
+        let mut mirror = self.resident_pool.borrow_mut();
+        let max = src_slot.max(dst_slot);
+        if max >= mirror.len() {
+            mirror.resize_with(max + 1, || None);
+        }
+        let moved = mirror[src_slot].take();
+        mirror[dst_slot] = moved;
+    }
+
+    /// Derive the larger child resident: `parent_slot` Handle − `smaller_slot` Handle
+    /// → `larger_slot` Handle, on device, no read-back. The derived larger child is
+    /// NOT re-FixHistogram'd (non-negotiable #3).
+    fn subtract_resident(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent_slot: usize,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+    ) -> Result<(), ComputeError> {
+        let (parent_h, smaller_h) = {
+            let mirror = self.resident_pool.borrow();
+            let parent_h = mirror.get(parent_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: "subtract_resident: parent slot is empty".to_string(),
+                }
+            })?;
+            let smaller_h = mirror.get(smaller_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: "subtract_resident: smaller slot is empty".to_string(),
+                }
+            })?;
+            (parent_h, smaller_h)
+        };
+        let derived = kernels::subtract::subtract_histograms_f64_from_handles_on(
+            client, parent_h, smaller_h, slot_len,
+        )?;
+        let mut mirror = self.resident_pool.borrow_mut();
+        if larger_slot >= mirror.len() {
+            mirror.resize_with(larger_slot + 1, || None);
+        }
+        mirror[larger_slot] = Some(derived);
+        Ok(())
+    }
+
+    /// Scan slot `slot`'s resident Handle for every spine feature in ONE fused launch
+    /// (the Handle-consuming `find_best_splits_batched_fused_f64_from_handle_on`),
+    /// reading back only the SplitInfo cells. Errors if the slot is empty (defensive).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_resident_leaf(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        let handle = {
+            let mirror = self.resident_pool.borrow();
+            mirror.get(slot).and_then(|h| h.clone()).ok_or_else(|| ComputeError::Runtime {
+                detail: "scan_resident_leaf: slot is empty".to_string(),
+            })?
+        };
+        kernels::split::find_best_splits_batched_fused_f64_from_handle_on(
+            client, handle, slot_len, feats, cfg, sum_gradient, sum_hessian, num_data,
         )
     }
 }

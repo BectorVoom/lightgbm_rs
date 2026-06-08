@@ -1027,6 +1027,107 @@ pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
     sum_hessian: f64,
     num_data: i32,
 ) -> Result<Vec<SplitInfo>, ComputeError> {
+    // Empty batch: no launch (T-mc5-03). (Mirror the Handle variant's early return
+    // so the buf-based path never allocates a device handle for nothing.)
+    if feats.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Upload the host histogram buffer ONCE and delegate to the Handle-consuming
+    // body — the SINGLE SOURCE of the fused-scan validation/launch/decode (260608-p90:
+    // the resident scan reuses the SAME body with a device-resident Handle instead of
+    // this fresh upload, guaranteeing byte-identical numerics between the host-buf and
+    // resident scans). `as_bytes` is the same `CubeElement` call the kernel uses.
+    let h_hist = client.create_from_slice(f64::as_bytes(buf));
+    find_best_splits_batched_fused_f64_from_handle_on(
+        client,
+        h_hist,
+        buf.len(),
+        feats,
+        cfg,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+    )
+}
+
+/// Upload a host f64 slice to a device `Handle` and return it (260608-p90) — a thin
+/// CMP-01-respecting helper so cubecl-free callers (the oracle-harness resident-scan
+/// parity test) can feed a raw Handle to
+/// [`find_best_splits_batched_fused_f64_from_handle_on`] without naming `cubecl`
+/// types. `as_bytes` is the same `CubeElement` call the kernel launchers use.
+pub fn upload_f64_buffer<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    buf: &[f64],
+) -> cubecl::server::Handle {
+    client.create_from_slice(f64::as_bytes(buf))
+}
+
+/// Handle-consuming sibling of [`find_best_splits_batched_fused_f64_on`] (260608-p90
+/// Task 1A) — the device-resident fused per-leaf split scan. IDENTICAL to the
+/// host-buf launcher EXCEPT it CONSUMES a device `Handle` for the concatenated
+/// stride-2 f64 histogram buffer (NO `client.create_from_slice` upload), so the
+/// resident chain's fixed+compacted histogram never leaves the device. The SAME
+/// per-feature V5 validation (against `buf_len`), the SAME leaf scalars
+/// (`min_gain_shift` / `sum_hessian_bumped`), the SAME
+/// [`find_best_splits_fused_kernel`], and the SAME 12-cell decode + accept-gate are
+/// used — only the `n*12` `SplitInfo` cells are read back; the histogram Handle is
+/// never read back. The host-buf launcher delegates here after a one-time upload, so
+/// the two paths are byte-identical by construction (the resident==host invariant,
+/// non-negotiable #2).
+///
+/// `hist_handle` must describe exactly `buf_len` f64 cells (the caller's slot_len);
+/// the per-feature `[slot_off, slot_off + 2*num_bin)` regions are validated against
+/// `buf_len` before launch.
+///
+/// # Errors
+/// As [`find_best_splits_batched_fused_f64_on`] (length / scope / deferred-branch
+/// typed errors).
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_batched_fused_f64_from_handle_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> Result<Vec<SplitInfo>, ComputeError> {
+    // Delegate to the shared inner body — the single source of the fused-scan
+    // validation/launch/decode. The histogram lives in `hist_handle` (describing
+    // `buf_len` f64 cells); only the per-feature region BOUNDS are validated.
+    find_best_splits_fused_inner(
+        client,
+        hist_handle,
+        buf_len,
+        feats,
+        cfg,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+    )
+}
+
+/// Shared inner body for the fused per-leaf split scan (260608-p90 Task 1A — the
+/// single source of the validation / scalar pre-step / launch / decode). Both the
+/// host-buf launcher (after a one-time upload) and the resident
+/// Handle-consuming launcher call this with an already-allocated `hist_handle`
+/// describing `buf_len` f64 cells, so the host-buf and resident scans are
+/// byte-identical (non-negotiable #2). All cubecl `unsafe` is confined here (CMP-01).
+///
+/// # Errors
+/// As [`find_best_splits_batched_fused_f64_on`].
+#[allow(clippy::too_many_arguments)]
+fn find_best_splits_fused_inner<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> Result<Vec<SplitInfo>, ComputeError> {
     // Empty batch: no launch (T-mc5-03).
     if feats.is_empty() {
         return Ok(Vec::new());
@@ -1084,10 +1185,10 @@ pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
             .ok_or_else(|| ComputeError::Runtime {
                 detail: "find_best_splits_batched: slot_off + region overflows".to_string(),
             })?;
-        if end > buf.len() {
+        if end > buf_len {
             return Err(ComputeError::LengthMismatch {
                 expected: end,
-                actual: buf.len(),
+                actual: buf_len,
             });
         }
         // Per-feature iteration counts — IDENTICAL to find_best_split_f64_on.
@@ -1122,7 +1223,10 @@ pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     let out_len = n * 12;
-    let h_hist = client.create_from_slice(f64::as_bytes(buf));
+    // The histogram buffer is the caller-supplied device Handle (resident path) or
+    // the host-buf launcher's one-time upload — either way it describes `buf_len`
+    // f64 cells and is never read back (only the SplitInfo cells are).
+    let h_hist = hist_handle;
     let zeros = vec![0.0f64; out_len];
     let h_out = client.create_from_slice(f64::as_bytes(&zeros));
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
@@ -1144,7 +1248,7 @@ pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
             client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_1d(1),
-            ArrayArg::from_raw_parts(h_hist, buf.len()),
+            ArrayArg::from_raw_parts(h_hist, buf_len),
             ArrayArg::from_raw_parts(h_out.clone(), out_len),
             ArrayArg::from_raw_parts(h_slot, n),
             ArrayArg::from_raw_parts(h_numbin, n),

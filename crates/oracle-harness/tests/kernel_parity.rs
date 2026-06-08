@@ -1755,4 +1755,116 @@ mod hip {
         // within the f32-atomic RAW-build tolerance (the fix+compact step is bit-exact).
         assert_within("resident_build_fix_compact_vs_host", &gpu_f32, &host_f32);
     }
+
+    /// 260608-p90 Task 1E — the Handle-consuming fused split scan
+    /// (`find_best_splits_batched_fused_f64_from_handle_on`) must be BIT-IDENTICAL to
+    /// the host-buf fused scan (`find_best_splits_batched_fused_f64_on`): for the SAME
+    /// concatenated f64 histogram `buf`, uploading it to a device Handle and scanning
+    /// from the Handle yields the EXACT same `SplitInfo` (gain/threshold/counts/sums/
+    /// outputs/default_left) per feature as scanning the host buffer. This proves the
+    /// resident scan adds ZERO numeric change (the histogram source differs, the math
+    /// is the shared `split_scan_body`) — the foundation of the resident==host tree
+    /// equivalence (non-negotiable #2). EXACT compare (not within-tol): both paths run
+    /// the SAME f64 kernel on the SAME input bits.
+    #[test]
+    fn find_best_splits_batched_from_handle_equals_host_buf_on_hip() {
+        use lgbm_compute::kernels::split::{
+            find_best_splits_batched_fused_f64_from_handle_on,
+            find_best_splits_batched_fused_f64_on, upload_f64_buffer,
+        };
+
+        let hip = rocm_client();
+
+        // A leaf's CONCATENATED stride-2 f64 histogram over 3 spine features with
+        // different bin counts + offsets (so the REVERSE/FORWARD ranges + compaction
+        // offsets differ across features). Values are exactly-representable f64.
+        // feature 0: num_bin 4, offset 0  -> 8 cells
+        // feature 1: num_bin 3, offset 1  -> 6 cells
+        // feature 2: num_bin 5, offset 0  -> 10 cells
+        let buf: Vec<f64> = vec![
+            // f0 [g0,h0,...] 4 bins
+            2.0, 5.0, -1.0, 4.0, 3.0, 6.0, -2.0, 5.0,
+            // f1 3 bins (offset 1: bin 0 is the compacted-away most_freq cell content)
+            1.0, 3.0, 4.0, 7.0, -3.0, 4.0,
+            // f2 5 bins
+            0.5, 2.0, 1.5, 3.0, -1.0, 2.5, 2.0, 4.0, -0.5, 3.5,
+        ];
+        let mut feats: Vec<BatchedSplitFeature> = Vec::new();
+        feats.push(BatchedSplitFeature {
+            slot_off: 0,
+            num_bin: 4,
+            offset: 0,
+            default_bin: 0,
+            most_freq_bin: 2,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        });
+        feats.push(BatchedSplitFeature {
+            slot_off: 8,
+            num_bin: 3,
+            offset: 1,
+            default_bin: 0,
+            most_freq_bin: 0,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        });
+        feats.push(BatchedSplitFeature {
+            slot_off: 14,
+            num_bin: 5,
+            offset: 0,
+            default_bin: 0,
+            most_freq_bin: 1,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        });
+
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 1e-3,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        // Leaf totals (un-bumped); the launcher applies the +2*kEpsilon entry bump.
+        let sum_gradient = 5.0f64;
+        let sum_hessian = 40.0f64;
+        let num_data = 40i32;
+
+        // (a) host-buf scan.
+        let host = find_best_splits_batched_fused_f64_on(
+            &hip, &buf, &feats, &cfg, sum_gradient, sum_hessian, num_data,
+        )
+        .expect("host-buf fused scan");
+
+        // (b) Handle-consuming scan: upload the SAME buf to a device Handle, scan it.
+        let handle = upload_f64_buffer(&hip, &buf);
+        let from_handle = find_best_splits_batched_fused_f64_from_handle_on(
+            &hip,
+            handle,
+            buf.len(),
+            &feats,
+            &cfg,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )
+        .expect("Handle-consuming fused scan");
+
+        assert_eq!(host.len(), feats.len(), "host scan length");
+        assert_eq!(from_handle.len(), feats.len(), "handle scan length");
+        // EXACT per-feature SplitInfo equality (same f64 kernel, same input bits).
+        for (i, (h, f)) in host.iter().zip(from_handle.iter()).enumerate() {
+            assert_eq!(
+                h, f,
+                "feature {i}: Handle-consuming scan != host-buf scan (must be bit-identical): \
+                 host={h:?} handle={f:?}"
+            );
+        }
+    }
 }
