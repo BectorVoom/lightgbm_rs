@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-06-08T00:04:17.078Z"
+last_updated: "2026-06-08T00:21:27.920Z"
 last_activity: 2026-06-08 -- Completed 08-04 (PYB-02 polars DataFrame input via Arrow + dtype→categorical routing; categorical A/B vs real lightgbm 4.6 at atol=1e-6; full pytest suite 30 green) and 08-05 (full params-dict pipeline D-06/07/08)
 progress:
   total_phases: 8
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 54
-  completed_plans: 52
-  percent: 75
+  completed_plans: 53
+  percent: 88
 ---
 
 # Project State
@@ -398,6 +398,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 08 P08-05 | 10 min | 2 tasks | 5 files |
 | Phase 08 P08-06 | 35min | 3 tasks | 7 files |
 | Phase 08 P08-07 | 19min | 3 tasks | 7 files |
+| Phase 08 P08-08 | 12min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -467,6 +468,8 @@ Recent decisions affecting current work:
 - [Phase 08]: 08-05: params.rs build_config is the single Python params->Config seam (D-06/07/08); D-07 gate references lgbm_core OUT_OF_SCOPE_PARAMS
 - [Phase ?]: Public lightgbm_rs.train is callback-aware engine.train; per-iteration loop re-trains with incrementing num_boost_round, metrics evaluated in Python (no _core incremental API)
 - [Phase ?]: lgb.cv per-fold binning scope differs from real lightgbm; bit-exact cv parity needs a _core subset/reference capability (new Rust)
+- [Phase ?]: 08-08: PyO3 Booster persistence + pickle via __reduce__ routes unpickle through the validated lgbm-model loader (Security V5)
+- [Phase ?]: 08-08: cross-format parity proven — a real lightgbm 4.6 text model loads in lightgbm_rs and predicts within atol 1e-6 (D-10); Phase 8 (python-bindings) COMPLETE
 
 ### Pending Todos
 
@@ -496,6 +499,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-08T00:04:11.588Z
+Last session: 2026-06-08T00:21:00.688Z
 Stopped at: Completed 08-05-PLAN.md
 Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md

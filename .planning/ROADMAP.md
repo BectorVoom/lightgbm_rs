@@ -20,7 +20,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 5: Tree Learner + Split Finding** - Histogram serial learner, subtraction trick, leaf-wise growth, split-gain scan with per-split parity *(9/9 plans; 05-09 closed the final mfb>0 leaf-0 2-ULP BIT-EXACT via a real lib_lightgbm 4.6 FP execution trace — the serial learner is bit-exact to the real binary on BOTH committed corpora)*
 - [x] **Phase 6: GBDT Spine + Core Objectives/Metrics** - First end-to-end ~1e-6 (f32) train→predict with bagging, early stopping, Rust-native API *(6/6 plans executed; gap-closure 06-06 closed all five verification gaps A–E: CR-01 constant-tree leaf_count model-text now byte-exact, WR-01 every matrix cell asserts (no swallowed Results), CR-02 early-stop decoupled from metric_freq, GAP E reg_sqrt builder setter + golden, WR-03 subset renewal landed. Task 2b decision: regression_l1 + bagging TYPED-REJECTED (BoostingError::UnsupportedConfig) and deferred — L1 sign-gradient split-gain knife-edge over the bagged subset diverges from the C++ leaf STRUCTURE (rust:0.0 vs cpp:11.0); the related binary+bagging+bfa knife-edge is tracked as DEF-06-01. cargo test --workspace GREEN.)* (completed 2026-06-07)
 - [x] **Phase 7: Parity-Completing Variants** - GOSS/DART/RF, categorical/EFB splits, remaining objectives/metrics, ranking, SHAP, monotone, refit, importance (completed 2026-06-07)
-- [ ] **Phase 8: Python Bindings** - PyO3 + numpy bindings mirroring the official `lightgbm` Booster/Dataset/sklearn API
+- [x] **Phase 8: Python Bindings** - PyO3 + numpy bindings mirroring the official `lightgbm` Booster/Dataset/sklearn API (completed 2026-06-08)
 
 ## Phase Details
 
@@ -374,7 +374,7 @@ Plans:
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 08-08-PLAN.md — persistence: C++-compatible text I/O + pickle (D-10)
+- [x] 08-08-PLAN.md — persistence: C++-compatible text I/O + pickle (D-10)
 
 **UI hint**: no
 
@@ -392,4 +392,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Tree Learner + Split Finding | 9/9 | Complete (bit-exact vs real lib_lightgbm 4.6 on both corpora) | 2026-06-06 |
 | 6. GBDT Spine + Core Objectives/Metrics | 6/6 | Complete    | 2026-06-07 |
 | 7. Parity-Completing Variants | 12/12 | Complete    | 2026-06-07 |
-| 8. Python Bindings | 7/8 | In Progress|  |
+| 8. Python Bindings | 8/8 | Complete   | 2026-06-08 |
