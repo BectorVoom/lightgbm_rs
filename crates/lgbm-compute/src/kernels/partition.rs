@@ -50,7 +50,17 @@ pub fn data_partition_kernel(
     threshold: i32,
     most_freq_bin: i32,
 ) {
-    if UNIT_POS == 0 {
+    // ONE unit PER ROW (`ABSOLUTE_POS`). The `SplitInner` decision is per-row
+    // INDEPENDENT (`route[i] = f(bins[i])`, no cross-row carry) and integer-only,
+    // so there is no order to preserve — unlike the histogram f64 fold, which must
+    // stay single-owner sequential for bit-exactness. Each unit writes its OWN
+    // `route[i]` (disjoint, no atomics). Previously this scanned all rows on a
+    // single lane (`UNIT_POS == 0`); the parallel form is bit-identical (the host
+    // gather below is unchanged) and lets the GPU use all its lanes (260609-eu9).
+    let i = ABSOLUTE_POS;
+    // Tail units (i >= len) stay idle: the launch rounds the unit count up to a
+    // multiple of the cube dim (manual §4 Safe Indexing).
+    if i < bins.len() {
         // th = threshold + min_bin; if most_freq_bin == 0 then --th
         // (dense_bin.hpp:322-327). default_to_right = !(most_freq_bin <= threshold)
         // i.e. the default (out-of-[min,max]) rows go gt unless most_freq_bin <=
@@ -63,15 +73,13 @@ pub fn data_partition_kernel(
         // threshold` (then lte) — dense_bin.hpp:336-339. Equivalent to
         // `most_freq_bin > threshold`.
         let default_to_right = most_freq_bin > threshold; // 1=gt, 0=lte
-        for i in 0..bins.len() {
-            let bin = bins[i] as i32;
-            // USE_MIN_BIN, no-missing: out-of-[minb,maxb] -> default direction.
-            let is_default = bin < min_bin || bin > max_bin;
-            let gt = bin > th; // in-range: bin > th -> gt, else lte
-            // route = default ? default_to_right : (bin > th)
-            let go_right = select(is_default, default_to_right, gt);
-            route[i] = select(go_right, 1u32, 0u32);
-        }
+        let bin = bins[i] as i32;
+        // USE_MIN_BIN, no-missing: out-of-[minb,maxb] -> default direction.
+        let is_default = bin < min_bin || bin > max_bin;
+        let gt = bin > th; // in-range: bin > th -> gt, else lte
+        // route = default ? default_to_right : (bin > th)
+        let go_right = select(is_default, default_to_right, gt);
+        route[i] = select(go_right, 1u32, 0u32);
     }
 }
 
@@ -99,11 +107,12 @@ pub fn data_partition_cpu(
 
 /// **Native** host `data_partition` — the production cpu-anchor path (R2).
 ///
-/// Bit-IDENTICAL to [`data_partition_cpu`] (the single-unit `data_partition_kernel`
-/// + host gather): the SAME integer `SplitInner` routing decision and the SAME
-/// stable two-pass gather (left rows in original order, then right), without the
-/// cubecl launch. The op is u32-only so there is no float order to preserve. The
-/// cubecl path is retained for the kernel-parity / ROCm-mirror tests.
+/// Bit-IDENTICAL to [`data_partition_cpu`] (the one-unit-per-row
+/// `data_partition_kernel` + host gather): the SAME integer `SplitInner` routing
+/// decision and the SAME stable two-pass gather (left rows in original order, then
+/// right), without the cubecl launch. The op is u32-only so there is no float order
+/// to preserve. The cubecl path is retained for the kernel-parity / ROCm-mirror
+/// tests.
 ///
 /// # Errors
 /// Same as [`data_partition_cpu`] (V5: `num_bin > 0`, `threshold < num_bin`,
@@ -230,14 +239,21 @@ pub fn data_partition_on<R: cubecl::Runtime>(
     let zeros = vec![0u32; n];
     let h_route = client.create_from_slice(u32::as_bytes(&zeros));
 
+    // One unit per row; cube dim 256 (8 × the gfx1100 wave32), cube count covers n
+    // (mirrors the parallel histogram launcher). Each unit writes its own
+    // `route[idx]` (disjoint, no atomics); tail units `idx >= n` are bounds-guarded
+    // idle in the kernel.
+    let cube_dim = 256u32;
+    let cube_count = (n as u32).div_ceil(cube_dim);
+
     // SAFETY: `h_bins`/`h_route` each allocated for exactly `n` u32 elements and
-    // outlive the launch; the kernel reads/writes only indices `0..n`. All cubecl
-    // unsafe is confined here (CMP-01).
+    // outlive the launch; the kernel bounds-checks `idx < n` and writes only
+    // indices `0..n`. All cubecl unsafe is confined here (CMP-01).
     unsafe {
         data_partition_kernel::launch(
             client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
             ArrayArg::from_raw_parts(h_bins, n),
             ArrayArg::from_raw_parts(h_route.clone(), n),
             min_bin as i32,
