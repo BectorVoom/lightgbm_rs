@@ -392,6 +392,143 @@ pub fn construct_histograms_parallel_f32_on<R: cubecl::Runtime>(
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
 }
 
+/// LDS sub-histogram cap: `2 * 256` f32 cells = 2 KiB of shared memory per cube
+/// (grad+hess interleaved for up to 256 bins). cubecl `SharedMemory::new` needs a
+/// COMPTIME size, but num_bin varies at runtime (32/64/128/256); rather than
+/// specialize one kernel binary per bin count (LightGBM's `histogram{16,64,256}.cl`
+/// family approach), we allocate the fixed 256-bin max once (2 KiB ≪ the gfx1100
+/// 64 KiB LDS budget) and drive the active length with the runtime `lds_len`.
+#[cfg(feature = "rocm")]
+const HIST_LDS_MAX: usize = 512;
+
+/// PARALLEL f32 histogram with LDS-PRIVATIZED sub-histograms — the contention-
+/// reducing GPU path (260609-f8u, eo5 Finding #2).
+///
+/// The naive [`construct_hist_kernel_atomic_f32`] issues every row's grad/hess add
+/// straight into the GLOBAL histogram, so rows sharing a bin (the common case)
+/// serialize on global-memory atomic contention. This kernel instead gives each
+/// CUBE its own sub-histogram in shared memory (LDS): all units in the cube
+/// atomic-add into the LDS copy (intra-workgroup contention only — far cheaper than
+/// global), then the cube merges its sub-histogram into the global output with ONE
+/// global atomic per cell. Global atomic traffic drops from `2*n` to
+/// `CUBE_COUNT * 2*num_bin`. This mirrors LightGBM's OpenCL `histogram*.cl` design.
+///
+/// Accumulation is f32 in nondeterministic order (same as the naive atomic path) ⇒
+/// the SAME ~1e-6 ROCm gate vs the cpu f64 anchor (NOT bit-exact). Feature-gated to
+/// `rocm`. The cpu f64 fold anchor ([`construct_hist_kernel`]) is untouched.
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+pub fn construct_hist_kernel_lds_f32(
+    binned: &Array<u32>,
+    grad: &Array<f32>,
+    hess: &Array<f32>,
+    out: &mut Array<Atomic<f32>>,
+    lds_len: u32, // active sub-hist length = 2*num_bin (<= HIST_LDS_MAX), runtime
+) {
+    // Per-cube private sub-histogram in shared memory (comptime-sized to the max).
+    let sub = SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX);
+    // Positions are usize for indexing (mirrors construct_hist_kernel_atomic_f32's
+    // `binned[idx] as usize`); the builtins are u32 so cast once.
+    let cd = CUBE_DIM as usize;
+    let lds = lds_len as usize;
+    let n = binned.len();
+
+    // 1. Zero the ACTIVE LDS cells (strided across the cube's units).
+    let mut c = UNIT_POS as usize;
+    while c < lds {
+        sub[c].store(0.0f32);
+        c += cd;
+    }
+    sync_cube();
+
+    // 2. Scatter this cube's strided rows into the LDS sub-histogram (LDS atomics).
+    //    grad cell at bin<<1, hess at +1 (dense_bin.hpp:45 stride-2 layout).
+    let stride = CUBE_COUNT_X as usize * cd;
+    let mut i = CUBE_POS_X as usize * cd + UNIT_POS as usize;
+    while i < n {
+        let ti = binned[i] as usize * 2;
+        sub[ti].fetch_add(grad[i]);
+        sub[ti + 1].fetch_add(hess[i]);
+        i += stride;
+    }
+    sync_cube();
+
+    // 3. Merge the cube's sub-histogram into the global output (one global atomic
+    //    per active cell — `CUBE_COUNT * lds_len` total, vs `2*n` for the naive path).
+    let mut m = UNIT_POS as usize;
+    while m < lds {
+        out[m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
+/// Host launcher for the LDS-privatized parallel f32 histogram (GPU contention path).
+///
+/// Allocates a zeroed f32 histogram, launches `min(ceil(n/256), HIST_LDS_CUBES)`
+/// cubes of 256 units (each owning a 2 KiB LDS sub-hist), and widens the f32 result
+/// to f64. Capped at 256 bins (the LDS sub-hist size); `num_bin > 256` is rejected
+/// so the caller can fall back to the naive atomic path. Generic over `R: Runtime`.
+///
+/// # Errors
+/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5), plus a
+/// [`ComputeError::Runtime`] when `num_bin > 256`.
+#[cfg(feature = "rocm")]
+pub fn construct_histograms_lds_f32_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    binned: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_bin: u32,
+) -> Result<Vec<f64>, ComputeError> {
+    let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
+    if num_bin > 256 {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "construct_histograms_lds: num_bin {num_bin} > 256 exceeds the LDS sub-hist cap \
+                 (use construct_histograms_parallel_f32_on instead)"
+            ),
+        });
+    }
+    let n = binned.len();
+    if n == 0 {
+        return Ok(vec![0.0f64; out_len]);
+    }
+    let h_bin = client.create_from_slice(u32::as_bytes(binned));
+    let h_grad = client.create_from_slice(f32::as_bytes(grad));
+    let h_hess = client.create_from_slice(f32::as_bytes(hess));
+    // MUST be zero-init: the merge step (step 3) GLOBAL-accumulates into `out`.
+    let zeros = vec![0.0f32; out_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+
+    // 256 units/cube (8 × wave32). Cube count = enough to cover the rows but capped
+    // so the merge cost (cube_count * out_len global atomics) stays small relative
+    // to the saved 2*n global atomics. ~96 ≈ gfx1100 CU count.
+    let cube_dim = 256u32;
+    let max_cubes = 96u32;
+    let cube_count = (n as u32).div_ceil(cube_dim).clamp(1, max_cubes);
+
+    // SAFETY: `h_bin`/`h_grad`/`h_hess` sized `n`, `h_out` sized `out_len` f32 cells,
+    // each outliving the launch. The kernel strides `i` over `[0, n)` (bounds-checked
+    // `i < n`), and input validation guarantees `binned[i] < num_bin <= 256` so every
+    // `sub[bin*2 + 1]` / `out[bin*2 + 1]` index stays in `[0, out_len) ⊆ [0, 512)`.
+    // All cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        construct_hist_kernel_lds_f32::launch(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(h_bin, n),
+            ArrayArg::from_raw_parts(h_grad, n),
+            ArrayArg::from_raw_parts(h_hess, n),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            out_len as u32,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}
+
 /// BATCHED per-leaf histogram: builds ALL features' RAW histograms for one leaf in
 /// ONE launch (260608-lad part 3). One unit per `(feature, leaf-row)` pair, each
 /// doing an f32 atomic add into that feature's region of the concatenated output.
