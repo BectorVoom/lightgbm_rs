@@ -603,29 +603,50 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
     let h_bins = client.create_from_slice(u32::as_bytes(&gathered_bins));
     let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
     let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
-    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
     let zeros = vec![0.0f32; slot_len];
     let h_out = client.create_from_slice(f32::as_bytes(&zeros));
 
-    let total = (num_features * rows) as u32;
-    let cube_dim = 256u32;
-    let cube_count = total.div_ceil(cube_dim);
-
-    // SAFETY: every handle is sized to its slice and outlives the launch; the kernel
-    // bounds-checks `idx < gathered_bins.len()`, and `gathered_bins[idx] < num_bin`
-    // for the feature keeps `slot_off[f] + bin*2 + 1` inside that feature's slot
-    // region within `slot_len`. All cubecl unsafe is confined here (CMP-01).
-    unsafe {
-        construct_leaf_hist_batched_kernel::launch(
-            client,
-            CubeCount::Static(cube_count, 1, 1),
-            CubeDim::new_1d(cube_dim),
-            ArrayArg::from_raw_parts(h_bins, num_features * rows),
-            ArrayArg::from_raw_parts(h_g, rows),
-            ArrayArg::from_raw_parts(h_h, rows),
-            ArrayArg::from_raw_parts(h_slot, num_features),
-            ArrayArg::from_raw_parts(h_out.clone(), slot_len),
-        );
+    let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
+    if max_w <= HIST_LDS_MAX as u32 {
+        // LDS-privatized per-feature path: ONE cube per feature, 256 units each.
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+        // SAFETY: handles sized to their slices; cube f reads gathered_bins[f*R..]
+        // and writes only its slot region; bin < num_bin <= 256 keeps LDS/out indices
+        // in range. cubecl unsafe confined here (CMP-01).
+        unsafe {
+            construct_leaf_hist_batched_lds_kernel::launch(
+                client,
+                CubeCount::Static(num_features as u32, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(h_bins, num_features * rows),
+                ArrayArg::from_raw_parts(h_g, rows),
+                ArrayArg::from_raw_parts(h_h, rows),
+                ArrayArg::from_raw_parts(h_slot, num_features + 1),
+                ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+            );
+        }
+    } else {
+        // Naive fallback (a feature exceeds the 256-bin LDS cap).
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
+        let total = (num_features * rows) as u32;
+        let cube_dim = 256u32;
+        let cube_count = total.div_ceil(cube_dim);
+        // SAFETY: every handle is sized to its slice and outlives the launch; the kernel
+        // bounds-checks `idx < gathered_bins.len()`, and `gathered_bins[idx] < num_bin`
+        // for the feature keeps `slot_off[f] + bin*2 + 1` inside that feature's slot
+        // region within `slot_len`. All cubecl unsafe is confined here (CMP-01).
+        unsafe {
+            construct_leaf_hist_batched_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(cube_dim),
+                ArrayArg::from_raw_parts(h_bins, num_features * rows),
+                ArrayArg::from_raw_parts(h_g, rows),
+                ArrayArg::from_raw_parts(h_h, rows),
+                ArrayArg::from_raw_parts(h_slot, num_features),
+                ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+            );
+        }
     }
 
     let bytes = client.read_one_unchecked(h_out);
@@ -700,47 +721,223 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
     }
     // Per-leaf uploads ONLY: the small leaf_rows index array + the leaf's grad/hess
     // (gathered once, shared across features). The big bins matrix is ALREADY on the
-    // device (resident_bins) — no per-leaf re-upload of [num_features × rows].
-    let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
-    let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
-    let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
-
-    let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
-    let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
-    let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
-    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
+    // device (resident_bins). LDS-privatized per-feature build when every feature ≤
+    // 256 bins (naive fallback otherwise) — see `resident_raw_build_into`.
     let zeros = vec![0.0f32; slot_len];
     let h_out = client.create_from_slice(f32::as_bytes(&zeros));
-
-    let total = num_features * rows;
-    let cube_dim = 256u32;
-    let cube_count = (total as u32).div_ceil(cube_dim);
-
-    // SAFETY: `resident_bins` is sized `num_features * num_data` (uploaded once), the
-    // per-leaf handles are sized to their slices, and every handle outlives the
-    // launch. The kernel bounds-checks `idx < total`; `leaf_rows[k] < num_data` (leaf
-    // rows are a subset of 0..num_data) keeps `f*num_data + leaf_rows[k]` inside the
-    // resident buffer, and `bin < num_bin` for the feature keeps
-    // `slot_off[f] + bin*2 + 1` inside that feature's slot within `slot_len`. All
-    // cubecl unsafe is confined here (CMP-01).
-    unsafe {
-        construct_leaf_hist_resident_kernel::launch(
-            client,
-            CubeCount::Static(cube_count, 1, 1),
-            CubeDim::new_1d(cube_dim),
-            ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
-            ArrayArg::from_raw_parts(h_rows, rows),
-            ArrayArg::from_raw_parts(h_g, rows),
-            ArrayArg::from_raw_parts(h_h, rows),
-            ArrayArg::from_raw_parts(h_slot, num_features),
-            num_data,
-            total,
-            ArrayArg::from_raw_parts(h_out.clone(), slot_len),
-        );
-    }
+    resident_raw_build_into(
+        client,
+        resident_bins,
+        num_features,
+        num_data,
+        slot_off,
+        slot_len,
+        leaf_rows,
+        gradients,
+        hessians,
+        h_out.clone(),
+    );
 
     let bytes = client.read_one_unchecked(h_out);
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}
+
+// ===========================================================================
+// LDS-PRIVATIZED batched/resident RAW build (260609-fw1, eo5 Finding #2 — the
+// hot-path follow-up to the single-feature `construct_hist_kernel_lds_f32`).
+//
+// The naive batched/resident kernels above run ONE unit per `(feature, leaf-row)`
+// pair, each atomic-adding straight into the GLOBAL concatenated output — so rows
+// of a feature sharing a bin serialize on global-memory atomic contention. These
+// LDS kernels instead put ONE CUBE PER FEATURE: each cube owns a private
+// sub-histogram in shared memory (≤ HIST_LDS_MAX = 2 KiB, one feature ≤ 256 bins),
+// its units stride the leaf's rows doing cheap LDS atomics, then merge into that
+// feature's global slot once per cell. Global atomic traffic per feature drops from
+// `2*R` to `2*num_bin[f]`. Mirrors LightGBM's OpenCL histogram*.cl one-workgroup-
+// per-feature design. `slot_off` carries a SENTINEL final entry (= slot_len) so the
+// cube can read its feature's width `slot_off[f+1] - slot_off[f]`. f32 atomics ⇒ the
+// same ~1e-6 ROCm gate; capped at 256 bins/feature (caller falls back to the naive
+// kernel when any feature exceeds it).
+// ===========================================================================
+
+/// LDS resident RAW build: one cube per feature, gathers bins from the resident
+/// column on device (`resident_bins[f*num_data + leaf_rows[k]]`). `slot_off` has
+/// `num_features + 1` entries (sentinel = slot_len).
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_leaf_hist_resident_lds_kernel(
+    resident_bins: &Array<u32>,
+    leaf_rows: &Array<u32>,
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>, // length num_features + 1 (sentinel = slot_len)
+    num_data: usize,
+    out: &mut Array<Atomic<f32>>,
+) {
+    let f = CUBE_POS_X as usize; // ONE cube per feature
+    let base = slot_off[f] as usize;
+    let feat_len = slot_off[f + 1] as usize - base; // = 2*num_bin[f]
+    let r = ord_g.len();
+    let cd = CUBE_DIM as usize;
+
+    let sub = SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX);
+    // 1. zero this feature's active LDS cells.
+    let mut c = UNIT_POS as usize;
+    while c < feat_len {
+        sub[c].store(0.0f32);
+        c += cd;
+    }
+    sync_cube();
+    // 2. scatter the leaf's rows for THIS feature into LDS (resident on-device gather).
+    let col = f * num_data;
+    let mut k = UNIT_POS as usize;
+    while k < r {
+        let bin = resident_bins[col + leaf_rows[k] as usize] as usize;
+        let ti = bin * 2;
+        sub[ti].fetch_add(ord_g[k]);
+        sub[ti + 1].fetch_add(ord_h[k]);
+        k += cd;
+    }
+    sync_cube();
+    // 3. merge LDS → this feature's global slot.
+    let mut m = UNIT_POS as usize;
+    while m < feat_len {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
+/// LDS batched RAW build: one cube per feature, reads host-gathered bins
+/// (`gathered_bins[f*R + k]`). `slot_off` has `num_features + 1` entries (sentinel).
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+pub fn construct_leaf_hist_batched_lds_kernel(
+    gathered_bins: &Array<u32>, // [num_features * R], feature-major (f*R + k)
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>, // length num_features + 1 (sentinel = slot_len)
+    out: &mut Array<Atomic<f32>>,
+) {
+    let f = CUBE_POS_X as usize;
+    let base = slot_off[f] as usize;
+    let feat_len = slot_off[f + 1] as usize - base;
+    let r = ord_g.len();
+    let cd = CUBE_DIM as usize;
+
+    let sub = SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX);
+    let mut c = UNIT_POS as usize;
+    while c < feat_len {
+        sub[c].store(0.0f32);
+        c += cd;
+    }
+    sync_cube();
+    let fbase = f * r;
+    let mut k = UNIT_POS as usize;
+    while k < r {
+        let ti = gathered_bins[fbase + k] as usize * 2;
+        sub[ti].fetch_add(ord_g[k]);
+        sub[ti + 1].fetch_add(ord_h[k]);
+        k += cd;
+    }
+    sync_cube();
+    let mut m = UNIT_POS as usize;
+    while m < feat_len {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
+/// Build the sentinel `slot_off` (`num_features + 1` entries, final = `slot_len`)
+/// and the max per-feature slot width. LDS is eligible iff the widest feature fits
+/// `HIST_LDS_MAX` (≤ 256 bins).
+#[cfg(feature = "rocm")]
+fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
+    let mut s: Vec<u32> = Vec::with_capacity(slot_off.len() + 1);
+    for &o in slot_off {
+        s.push(o as u32);
+    }
+    s.push(slot_len as u32);
+    let max_w = s.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    (s, max_w)
+}
+
+/// Shared RESIDENT RAW-build launch into a caller-provided zeroed f32 `h_out`
+/// (slot_len cells): LDS per-feature path when every feature ≤ 256 bins, else the
+/// naive `construct_leaf_hist_resident_kernel`. Used by both
+/// [`build_leaf_histograms_resident_f32_on`] and the resident chain
+/// [`build_fix_compact_resident_f64_on`] so the LDS/naive decision lives in ONE place.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn resident_raw_build_into<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    num_features: usize,
+    num_data: usize,
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    gradients: &[f32],
+    hessians: &[f32],
+    h_out: cubecl::server::Handle,
+) {
+    let rows = leaf_rows.len();
+    if rows == 0 || num_features == 0 {
+        return;
+    }
+    let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+    let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+    let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
+    let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
+    let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
+    let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
+
+    if max_w <= HIST_LDS_MAX as u32 {
+        // LDS per-feature path: ONE cube per feature, 256 units each.
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+        // SAFETY: resident_bins sized num_features*num_data; h_rows/h_g/h_h sized rows;
+        // h_slot sized num_features+1; h_out sized slot_len. Cube f reads only its
+        // feature's column + slot region; bin < num_bin <= 256 keeps LDS/out indices
+        // in range. All cubecl unsafe is confined here (CMP-01).
+        unsafe {
+            construct_leaf_hist_resident_lds_kernel::launch(
+                client,
+                CubeCount::Static(num_features as u32, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
+                ArrayArg::from_raw_parts(h_rows, rows),
+                ArrayArg::from_raw_parts(h_g, rows),
+                ArrayArg::from_raw_parts(h_h, rows),
+                ArrayArg::from_raw_parts(h_slot, num_features + 1),
+                num_data,
+                ArrayArg::from_raw_parts(h_out, slot_len),
+            );
+        }
+    } else {
+        // Naive fallback (a feature exceeds the 256-bin LDS cap).
+        let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
+        let total = num_features * rows;
+        let cube_dim = 256u32;
+        let cube_count = (total as u32).div_ceil(cube_dim);
+        // SAFETY: identical to the prior in-place naive launch (idx<total bound,
+        // resident read in range, slot write in range). cubecl unsafe confined (CMP-01).
+        unsafe {
+            construct_leaf_hist_resident_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(cube_dim),
+                ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
+                ArrayArg::from_raw_parts(h_rows, rows),
+                ArrayArg::from_raw_parts(h_g, rows),
+                ArrayArg::from_raw_parts(h_h, rows),
+                ArrayArg::from_raw_parts(h_slot, num_features),
+                num_data,
+                total,
+                ArrayArg::from_raw_parts(h_out, slot_len),
+            );
+        }
+    }
 }
 
 /// ON-GPU WIDEN + `FixHistogram` + compaction kernel (260608-oib L3, FOLDED by
@@ -1037,41 +1234,23 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     sum_hessian: f64,
 ) -> Result<(cubecl::server::Handle, usize), ComputeError> {
     // ---- 1. RESIDENT RAW build into an f32-atomic device buffer ----
-    let rows = leaf_rows.len();
+    // LDS-privatized per-feature build when every feature ≤ 256 bins (naive fallback
+    // otherwise) — the SAME `resident_raw_build_into` the readback launcher uses, so
+    // the resident-pool chain and the host path share one accumulation structure.
     let zeros32 = vec![0.0f32; slot_len];
     let h_raw = client.create_from_slice(f32::as_bytes(&zeros32));
-    if rows != 0 && num_features != 0 {
-        let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
-        let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
-        let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
-        let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
-        let h_g = client.create_from_slice(f32::as_bytes(&ord_g));
-        let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
-        let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
-        let total = num_features * rows;
-        let cube_dim = 256u32;
-        let cube_count = (total as u32).div_ceil(cube_dim);
-        // SAFETY: identical handle/length correspondence to
-        // `build_leaf_histograms_resident_f32_on`; the kernel bounds-checks `idx <
-        // total`, `leaf_rows[k] < num_data` keeps the resident read in range, and
-        // `bin < num_bin` keeps `slot_off[f] + bin*2 + 1` inside `slot_len`. All
-        // cubecl unsafe is confined here (CMP-01).
-        unsafe {
-            construct_leaf_hist_resident_kernel::launch(
-                client,
-                CubeCount::Static(cube_count, 1, 1),
-                CubeDim::new_1d(cube_dim),
-                ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
-                ArrayArg::from_raw_parts(h_rows, rows),
-                ArrayArg::from_raw_parts(h_g, rows),
-                ArrayArg::from_raw_parts(h_h, rows),
-                ArrayArg::from_raw_parts(h_slot, num_features),
-                num_data,
-                total,
-                ArrayArg::from_raw_parts(h_raw.clone(), slot_len),
-            );
-        }
-    }
+    resident_raw_build_into(
+        client,
+        resident_bins,
+        num_features,
+        num_data,
+        slot_off,
+        slot_len,
+        leaf_rows,
+        gradients,
+        hessians,
+        h_raw.clone(),
+    );
 
     // ---- 2. (260608-s2b Lever A) Allocate the zeroed f64 OUTPUT. The standalone
     //         widen launch is GONE — the folded fix kernel below widens each feature
