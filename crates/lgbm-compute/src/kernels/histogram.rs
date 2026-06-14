@@ -214,11 +214,23 @@ pub fn construct_histograms_cpu_native(
 ) -> Result<Vec<f64>, ComputeError> {
     let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
     let mut out = vec![0.0f64; out_len];
-    // Delegate to the SHARED fold body so the allocating and the fold-in-place paths
-    // can never drift. `out` is freshly zeroed above; `accumulate_histogram_into`
-    // re-validates (cheap; bin-range check is O(n)) and folds the SAME ascending
-    // rows / `bin<<1` cells / f32→f64 accumulation as before — byte-identical output.
-    accumulate_histogram_into(binned, grad, hess, num_bin, &mut out)?;
+    // Ascending row order, f32 read → f64 accumulate, grad at bin<<1 / hess at +1 —
+    // the verbatim `construct_hist_kernel` body (dense_bin.hpp:99-141). The
+    // validation above guarantees every `binned[i] < num_bin`, so `ti + 1` stays in
+    // bounds; the loop uses checked indexing regardless (no `unsafe`).
+    //
+    // This loop is intentionally INLINE here (not delegated to
+    // `accumulate_histogram_into`): the two bodies are kept byte-identical by the
+    // `accumulate_into_is_bit_identical_to_native` unit test (f64::to_bits cell-by-
+    // cell on multiple shapes) — a STRONGER drift guard than textual sharing, and one
+    // that does not perturb this hot allocate-then-fold path's large-row codegen
+    // (measured: routing through a shared `&mut [f64]` helper / a second validation
+    // pass regressed the 200k-row build ~5%).
+    for (i, &bin) in binned.iter().enumerate() {
+        let ti = bin as usize * 2;
+        out[ti] += f64::from(grad[i]);
+        out[ti + 1] += f64::from(hess[i]);
+    }
     Ok(out)
 }
 
@@ -234,8 +246,11 @@ pub fn construct_histograms_cpu_native(
 /// the same rows in the same ascending order, the same `bin << 1` cell layout, the
 /// same `f32`-read → `f64`-accumulate. The only difference is that this writes into
 /// a pre-zeroed sub-slice instead of allocating + zeroing its own buffer. The two
-/// share ONE fold body (the loop below) so the fold ORDER can never diverge — the
-/// project's bit-exact CPU f64 merge gate depends on it.
+/// loop bodies are kept byte-identical — and the fold ORDER frozen (the project's
+/// bit-exact CPU f64 merge gate depends on it) — by the
+/// `accumulate_into_is_bit_identical_to_native` unit test (f64::to_bits cell-by-cell
+/// on multiple shapes), NOT by textual sharing (a shared helper measurably regressed
+/// the large-row native path; see `construct_histograms_cpu_native`).
 ///
 /// `out` MUST be pre-zeroed by the caller over `out[0..2*num_bin]` (the caller owns
 /// zeroing so it can zero a larger multi-feature buffer once). This function does

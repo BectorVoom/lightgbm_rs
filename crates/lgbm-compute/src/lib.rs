@@ -227,23 +227,10 @@ pub trait Backend {
                 ord_g.push(gradients[row as usize]);
                 ord_h.push(hessians[row as usize]);
             }
-            // R3 fold-in-place: fold this feature DIRECTLY into its pre-zeroed `out`
-            // sub-slice — no per-feature Vec, no memset, no memcpy. `out` was zeroed
-            // once above (`vec![0.0f64; slot_len]`), so the destination region is
-            // already 0.0; the native accumulator only adds. The fold ORDER (same
-            // ascending rows, same bin<<1 cells, f32→f64) is byte-identical to the
-            // prior `construct_histograms + copy_from_slice` path, preserving the
-            // bit-exact CPU f64 merge gate. `_client` is unused on the native fold.
-            let _ = client;
+            let hist =
+                self.construct_histograms(client, &ord_bins, &ord_g, &ord_h, num_bins[fpos])?;
             let cells = 2 * num_bins[fpos] as usize;
-            let slot = slot_off[fpos];
-            kernels::histogram::accumulate_histogram_into(
-                &ord_bins,
-                &ord_g,
-                &ord_h,
-                num_bins[fpos],
-                &mut out[slot..slot + cells],
-            )?;
+            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&hist);
         }
         Ok(out)
     }
