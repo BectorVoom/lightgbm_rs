@@ -2142,6 +2142,7 @@ dependencies = [
  "lgbm-core",
  "lgbm-dataset",
  "oracle-harness",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

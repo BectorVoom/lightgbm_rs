@@ -9,6 +9,7 @@ cubecl = { workspace = true, features = ["cpu"] }
 lgbm-core = { path = "../lgbm-core" }
 lgbm-dataset = { path = "../lgbm-dataset" }
 thiserror = { workspace = true }
+rayon = "1.10"
 
 [features]
 # `cpu` (default) keeps the cubecl-cpu reference runtime always available — it is

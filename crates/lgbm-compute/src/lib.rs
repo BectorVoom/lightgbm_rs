@@ -186,6 +186,93 @@ impl BinColumn {
     }
 }
 
+/// Fold ONE feature's narrow bin column into the pre-zeroed histogram `h`
+/// (`len == 2 * num_bin`): ascending `leaf_rows`, grad at `bin<<1` / hess at `+1`,
+/// f32-read → f64-accumulate. The [`BinColumn`] width `match` is OUTSIDE the row
+/// loop (monomorphic arms — spike 004), and the fold ORDER is byte-identical to
+/// `construct_histograms_cpu_native`, so this is the single bit-exact fold body used
+/// by BOTH the serial and the parallel build paths.
+///
+/// Precondition (caller-established once per train, T-04-01 relocation): every
+/// `bins[row] < num_bin`. Debug-asserted; release trusts the upstream gate.
+#[inline]
+fn fold_one_feature(bins: &BinColumn, leaf_rows: &[u32], ord_g: &[f32], ord_h: &[f32], h: &mut [f64]) {
+    macro_rules! fold {
+        ($v:expr) => {
+            for (k, &row) in leaf_rows.iter().enumerate() {
+                let bin = $v[row as usize] as usize;
+                debug_assert!(bin * 2 + 1 < h.len(), "bin out of range — caller must establish bin < num_bin once per train (T-04-01)");
+                h[bin * 2] += f64::from(ord_g[k]);
+                h[bin * 2 + 1] += f64::from(ord_h[k]);
+            }
+        };
+    }
+    match bins {
+        BinColumn::U8(v) => fold!(v),
+        BinColumn::U16(v) => fold!(v),
+        BinColumn::U32(v) => fold!(v),
+    }
+}
+
+/// Build the concatenated stride-2 per-feature histogram buffer (feature `f` occupies
+/// `[slot_off[f], slot_off[f] + 2*num_bins[f])`). `parallel` (spike 005 / R4) selects
+/// rayon-over-features — each feature folds its OWN histogram Vec from the shared
+/// read-only `ord_g`/`ord_h`, then a sequential copy assembles `out` — versus the
+/// serial reused-scratch path for small leaves (rayon dispatch overhead crushes tiny
+/// per-feature folds). Both paths call [`fold_one_feature`] with the SAME fold order
+/// and write disjoint `out` regions, so the result is BYTE-IDENTICAL regardless of
+/// `parallel` or thread scheduling (proven by `build_histograms_parallel_equals_serial`)
+/// — the bit-exact merge gate holds for the multi-threaded anchor.
+fn build_histograms_into(
+    feature_bins: &[&BinColumn],
+    num_bins: &[u32],
+    slot_off: &[usize],
+    slot_len: usize,
+    leaf_rows: &[u32],
+    ord_g: &[f32],
+    ord_h: &[f32],
+    parallel: bool,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; slot_len];
+    if parallel {
+        use rayon::prelude::*;
+        let hists: Vec<Vec<f64>> = (0..feature_bins.len())
+            .into_par_iter()
+            .map(|fpos| {
+                let mut h = vec![0.0f64; 2 * num_bins[fpos] as usize];
+                fold_one_feature(feature_bins[fpos], leaf_rows, ord_g, ord_h, &mut h);
+                h
+            })
+            .collect();
+        for (fpos, h) in hists.into_iter().enumerate() {
+            out[slot_off[fpos]..slot_off[fpos] + h.len()].copy_from_slice(&h);
+        }
+    } else {
+        let max_cells = num_bins.iter().copied().max().map_or(0, |m| 2 * m as usize);
+        let mut scratch = vec![0.0f64; max_cells];
+        for (fpos, &bins) in feature_bins.iter().enumerate() {
+            let cells = 2 * num_bins[fpos] as usize;
+            for c in scratch[..cells].iter_mut() {
+                *c = 0.0;
+            }
+            fold_one_feature(bins, leaf_rows, ord_g, ord_h, &mut scratch[..cells]);
+            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&scratch[..cells]);
+        }
+    }
+    out
+}
+
+/// The leaf-row count at/above which a per-leaf build parallelizes over features
+/// (spike 005: parallel wins ≈≥12k rows; 16384 keeps small+medium serial with zero
+/// regression while parallelizing the genuinely large leaves — large train −26%).
+/// Override via `LGBM_PAR_THRESHOLD`.
+fn par_build_threshold() -> usize {
+    std::env::var("LGBM_PAR_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16384)
+}
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
@@ -392,7 +479,6 @@ pub trait Backend {
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<f64>, ComputeError> {
-        let mut out = vec![0.0f64; slot_len];
         // SPIKE 003: gather the ordered gradients/hessians ONCE per leaf — they are
         // identical across every feature (only the bin column differs), so the prior
         // per-feature re-gather repeated this work `num_features` times. Mirrors C++
@@ -421,63 +507,17 @@ pub trait Backend {
         // cache-density win lives here (no per-element width branch / accessor in the
         // hot loop). The fold ORDER and the `bin as usize * 2` index arithmetic are
         // IDENTICAL across arms and identical to the prior u32 path ⇒ bit-exact.
-        let max_cells = num_bins
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |m| 2 * m as usize);
-        let mut scratch = vec![0.0f64; max_cells];
-        for (fpos, &bins) in feature_bins.iter().enumerate() {
-            let num_bin = num_bins[fpos];
-            let cells = 2 * num_bin as usize;
-            for c in scratch[..cells].iter_mut() {
-                *c = 0.0;
-            }
-            // Per-width monomorphic fold: one tight loop per BinColumn arm. The
-            // closure-free `match` ensures no per-iteration width dispatch.
-            match bins {
-                BinColumn::U8(v) => {
-                    for (k, &row) in leaf_rows.iter().enumerate() {
-                        let bin = v[row as usize] as usize;
-                        debug_assert!(
-                            (bin as u32) < num_bin,
-                            "bin {bin} >= num_bin {num_bin} — caller must establish the \
-                             bin-range invariant once per train (T-04-01 relocation)"
-                        );
-                        let ti = bin * 2;
-                        scratch[ti] += f64::from(ord_g[k]);
-                        scratch[ti + 1] += f64::from(ord_h[k]);
-                    }
-                }
-                BinColumn::U16(v) => {
-                    for (k, &row) in leaf_rows.iter().enumerate() {
-                        let bin = v[row as usize] as usize;
-                        debug_assert!(
-                            (bin as u32) < num_bin,
-                            "bin {bin} >= num_bin {num_bin} — caller must establish the \
-                             bin-range invariant once per train (T-04-01 relocation)"
-                        );
-                        let ti = bin * 2;
-                        scratch[ti] += f64::from(ord_g[k]);
-                        scratch[ti + 1] += f64::from(ord_h[k]);
-                    }
-                }
-                BinColumn::U32(v) => {
-                    for (k, &row) in leaf_rows.iter().enumerate() {
-                        let bin = v[row as usize] as usize;
-                        debug_assert!(
-                            (bin as u32) < num_bin,
-                            "bin {bin} >= num_bin {num_bin} — caller must establish the \
-                             bin-range invariant once per train (T-04-01 relocation)"
-                        );
-                        let ti = bin * 2;
-                        scratch[ti] += f64::from(ord_g[k]);
-                        scratch[ti + 1] += f64::from(ord_h[k]);
-                    }
-                }
-            }
-            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&scratch[..cells]);
-        }
+        // SPIKE 005 (R4): build each feature's histogram in parallel across rayon WHEN the
+        // leaf is big enough to amortize task dispatch (>= par_build_threshold), else the
+        // serial reused-scratch path. Both call the SAME `fold_one_feature` body with the
+        // SAME ascending order into disjoint `out` regions ⇒ byte-identical result; the
+        // per-feature independence makes it thread-count-deterministic (bit-exact gate
+        // holds). The threshold protects small/medium leaves — unconditional parallel
+        // regressed 2k-row train ~5× on rayon dispatch overhead.
+        let parallel = r >= par_build_threshold();
+        let out = build_histograms_into(
+            feature_bins, num_bins, slot_off, slot_len, leaf_rows, &ord_g, &ord_h, parallel,
+        );
         Ok(out)
     }
 
@@ -1380,6 +1420,53 @@ impl Backend for RocmBackend {
         }
         mirror[slot] = Some(handle);
         Ok(splits)
+    }
+}
+
+#[cfg(test)]
+mod par_build_tests {
+    use super::{build_histograms_into, BinColumn};
+
+    /// Spike 005 / R4 bit-exact guard: the rayon-parallel per-feature build MUST
+    /// produce a byte-identical (f64::to_bits) `out` to the serial path — the
+    /// per-feature folds are independent + same-order, so thread scheduling can never
+    /// change the result. Guards the multi-threaded anchor's determinism.
+    #[test]
+    fn build_histograms_parallel_equals_serial() {
+        // Synthetic 4-feature leaf, mixed widths, scattered leaf_rows.
+        let rows: u32 = 5000;
+        let cols: Vec<BinColumn> = (0..4u32)
+            .map(|f| {
+                let nb = [32u32, 200, 257, 70000][f as usize];
+                let v: Vec<u32> = (0..rows)
+                    .map(|r| {
+                        let h = (r as u64).wrapping_mul(2_654_435_761).wrapping_add(f as u64 * 97);
+                        (h % nb as u64) as u32
+                    })
+                    .collect();
+                BinColumn::new(v, nb)
+            })
+            .collect();
+        let num_bins: Vec<u32> = vec![32, 200, 257, 70000];
+        let mut slot_off = Vec::new();
+        let mut off = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(off);
+            off += 2 * nb as usize;
+        }
+        let slot_len = off;
+        // Scattered row order (mimic real leaf_rows).
+        let leaf_rows: Vec<u32> = (0..rows).map(|i| (i.wrapping_mul(2_654_435_761)) % rows).collect();
+        let ord_g: Vec<f32> = (0..rows).map(|i| (i % 13) as f32 * 0.1).collect();
+        let ord_h: Vec<f32> = (0..rows).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+        let refs: Vec<&BinColumn> = cols.iter().collect();
+
+        let serial = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, false);
+        let parallel = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, true);
+        assert_eq!(serial.len(), parallel.len());
+        for (i, (s, p)) in serial.iter().zip(&parallel).enumerate() {
+            assert_eq!(s.to_bits(), p.to_bits(), "cell {i}: serial {s} != parallel {p} (not bit-identical)");
+        }
     }
 }
 
