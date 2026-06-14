@@ -704,6 +704,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     actual: f.bins.len(),
                 });
             }
+            // V5 / threat T-04-01 — the SINGLE bin-range gate, RELOCATED from the
+            // per-element kernel fold (spike-003b). This loop runs ONCE over the
+            // FIXED feature columns at train entry (amortized O(rows) once/train,
+            // not O(leaf_rows) per build per iter), rejecting any `bin >= num_bin`
+            // with `BinIndexOutOfRange` BEFORE any leaf histogram is built. After
+            // this gate, the fused CPU `Backend::build_leaf_histograms_raw`
+            // (lgbm-compute/src/lib.rs) folds BRANCHLESS trusting `bin < num_bin`
+            // (matching C++ `dense_bin.hpp`, which folds `data_[i]` with no
+            // per-element check). See that fn's "Bin-range precondition" doc — this
+            // is its authoritative precondition source; the two sites cross-reference
+            // via `BinIndexOutOfRange`. Do NOT remove or weaken this loop: it is the
+            // relocated mitigation, not a redundant check.
             for &b in &f.bins {
                 if b >= f.num_bin {
                     return Err(TreeLearnerError::BinIndexOutOfRange {
@@ -3406,6 +3418,44 @@ mod tests {
         assert!(tree.num_leaves >= 2, "a splittable input grows at least 2 leaves");
         // The root split routes low bins left, high bins right.
         assert_eq!(tree.split_feature[0], 0);
+    }
+
+    #[test]
+    fn train_rejects_out_of_range_bin_with_typed_error() {
+        // V5 / threat T-04-01 RELOCATION (spike-003b): the per-element bin-range
+        // check moved OUT of the now-branchless `build_leaf_histograms_raw` fold
+        // into the once-per-train upstream gate in `train_inner` (learner.rs:700-714).
+        // This test proves the V5 guarantee SURVIVES at its new location — an
+        // out-of-range bin is rejected with the typed `BinIndexOutOfRange` BEFORE
+        // any leaf builds, carrying the exact offending index + num_bin.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        // num_bin = 3, but the last row's bin is 3 (== num_bin, out of range).
+        let f = FeatureColumn {
+            bins: vec![0u32, 1, 3],
+            num_bin: 3,
+            offset: 0,
+            min_bin: 0,
+            max_bin: 2,
+            default_bin: 3,
+            most_freq_bin: 0,
+            missing_type: MissingType::None,
+            bin_upper_bound: vec![0.5, 1.5, 2.5],
+            real_feature_index: 0,
+            ..Default::default()
+        };
+        let g = vec![-1.0f32, 0.0, 1.0];
+        let h = vec![1.0f32; 3];
+        let mut learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 8, -1)
+            .with_features(vec![f]);
+        match learner.train(&g, &h, true) {
+            Err(TreeLearnerError::BinIndexOutOfRange { index, num_bin }) => {
+                assert_eq!(index, 3, "rejection must carry the exact offending bin");
+                assert_eq!(num_bin, 3, "rejection must carry the feature's num_bin");
+            }
+            Ok(_) => panic!("train must REJECT an out-of-range bin, not grow a tree"),
+            Err(other) => panic!("expected BinIndexOutOfRange, got {other:?}"),
+        }
     }
 
     /// Two features: f0 is cleanly splittable (low bins neg grad, high bins pos),
