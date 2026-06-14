@@ -214,18 +214,23 @@ pub trait Backend {
         hessians: &[f32],
     ) -> Result<Vec<f64>, ComputeError> {
         let mut out = vec![0.0f64; slot_len];
-        // Scratch gather buffers, reused across features (the R2 buffer-reuse).
-        let mut ord_bins: Vec<u32> = Vec::with_capacity(leaf_rows.len());
-        let mut ord_g: Vec<f32> = Vec::with_capacity(leaf_rows.len());
-        let mut ord_h: Vec<f32> = Vec::with_capacity(leaf_rows.len());
+        // SPIKE 003: gather the ordered gradients/hessians ONCE per leaf — they are
+        // identical across every feature (only the bin column differs), so the prior
+        // per-feature re-gather repeated this work `num_features` times. Mirrors C++
+        // `ordered_gradients_`/`ordered_hessians_` reuse. Values + order unchanged ⇒
+        // bit-exact. Only `ord_bins` is re-gathered per feature.
+        let r = leaf_rows.len();
+        let mut ord_g: Vec<f32> = Vec::with_capacity(r);
+        let mut ord_h: Vec<f32> = Vec::with_capacity(r);
+        for &row in leaf_rows {
+            ord_g.push(gradients[row as usize]);
+            ord_h.push(hessians[row as usize]);
+        }
+        let mut ord_bins: Vec<u32> = Vec::with_capacity(r);
         for (fpos, &bins) in feature_bins.iter().enumerate() {
             ord_bins.clear();
-            ord_g.clear();
-            ord_h.clear();
             for &row in leaf_rows {
                 ord_bins.push(bins[row as usize]);
-                ord_g.push(gradients[row as usize]);
-                ord_h.push(hessians[row as usize]);
             }
             let hist =
                 self.construct_histograms(client, &ord_bins, &ord_g, &ord_h, num_bins[fpos])?;
