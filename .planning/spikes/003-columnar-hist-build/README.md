@@ -73,6 +73,37 @@ This change touches only the gather, keeping the existing tight per-feature
 `construct_histograms` + streaming copy — so it *removes* memory traffic everywhere and
 helps large MORE (32 features × redundant gather eliminated).
 
+## Follow-on lever 003b — fused build-from-column (further win, gated on validation relocation)
+
+After shipping the once-gather win, probed the next lever: **fuse the gather and fold**
+— iterate leaf rows once reading the bin directly from the column into a reused
+per-feature hot scratch (no `ord_bins` materialization, no per-feature alloc). Mirrors
+C++ `dense_bin.hpp` (which folds `data_[i]` directly, with NO per-element bin
+validation).
+
+Measured (vs the shipped spike-003 once-gather HEAD):
+
+| variant | train small | train large | verdict |
+|---------|-------------|-------------|---------|
+| spike-003 (shipped) | 32.55 ms | 2.89 s | baseline |
+| fused + per-element bin-check branch | 27.34 ms (−16%) | 2.97 s (**+2.8%**) | large regressed |
+| fused + branchless clamp+OOB-flag (V5-safe) | 28.70 ms (−12%) | 2.99 s (**+3.4%**) | large regressed |
+| **fused, NO per-element check** | **26.97 ms (−17%)** | **2.76 s (−4.5%)** | **wins both** |
+
+**Key finding:** the fused build wins big at small AND large — but ONLY if the hot
+fold is branchless. ANY per-element bin-safety check (early-return branch OR
+branchless clamp+OR) serializes the loop and costs ~3–8% at large, flipping it to a
+regression. The V5 per-element `bin < num_bin` check (threat T-04-01) is the blocker.
+
+**Disposition: NOT shipped here.** Unlocking it cleanly requires **relocating the bin
+validation** from the per-element hot path to a **once-per-train upstream check** (the
+learner validates each feature column's bin range when `with_features` is set; the
+per-leaf build then trusts the invariant and folds branchless — exactly what C++ does).
+That keeps a real defensive check (amortized O(rows) once/train instead of
+O(leaf_rows) per build per iter) AND gets the branchless hot loop. It touches the
+`Backend::build_leaf_histograms_raw` V5 contract + threat model, so it is a planned
+follow-up, not a spike edit. Reverted to the clean spike-003 shipped state.
+
 ## Signal for the Build
 
 - **SHIP IT** — committed as the R3 perf win (the lever quick-260614-p0n was looking
