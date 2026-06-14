@@ -199,12 +199,35 @@ pub trait Backend {
     /// compaction stay in the caller (they read per-leaf sums + the compaction
     /// offset), applied to each feature's region of the returned RAW buffer.
     ///
+    /// # Bin-range precondition (V5 / threat T-04-01, RELOCATED — spike-003b)
+    /// The hot fold below is **branchless**: it reads `bins[row]` and folds it into
+    /// `scratch[bin*2 (+1)]` with NO per-element `bin < num_bin` check. This is a
+    /// CALLER-GUARANTEED PRECONDITION: every `feature_bins[fpos][row] <
+    /// num_bins[fpos]` MUST hold. That invariant is established ONCE per train by the
+    /// upstream bin-range gate in `lgbm-treelearner` `SerialTreeLearner::train`
+    /// (`train_inner`, learner.rs:700-714), which iterates every feature column and
+    /// every bin and rejects any `bin >= num_bin` with
+    /// `TreeLearnerError::BinIndexOutOfRange` BEFORE any leaf is built. The feature
+    /// columns are fixed for the whole train, so the amortized cost is O(rows) ONCE
+    /// per train instead of O(leaf_rows) per build per iteration. This mirrors C++
+    /// `dense_bin.hpp` (`ConstructHistogramInner`), which folds `data_[i]` directly
+    /// with no per-element validation, trusting the binning invariant. Spike-003b
+    /// proved ANY per-element check (early-return OR branchless clamp+OOB-flag)
+    /// serializes the fold and regresses the 200k-row build ~3-8%; the branchless
+    /// form wins both scales (-17% small / -4.5% large).
+    ///
     /// # Errors
-    /// Propagates [`construct_histograms`](Backend::construct_histograms) errors.
+    /// The fused fold no longer returns `BinIndexOutOfRange` per element — there is
+    /// no per-element check (see the precondition above; the production guarantee is
+    /// the upstream once-per-train gate, and a `debug_assert!(bin < num_bin)` is the
+    /// debug/test defense-in-depth that catches a violated precondition). The body
+    /// has no fallible per-feature call; the `Result` is retained for the trait
+    /// signature and a GPU override's fallible launch, and this default impl returns
+    /// `Ok(out)`.
     #[allow(clippy::too_many_arguments)]
     fn build_leaf_histograms_raw(
         &self,
-        client: &ComputeClient<Self::Runtime>,
+        _client: &ComputeClient<Self::Runtime>,
         feature_bins: &[&[u32]],
         num_bins: &[u32],
         slot_off: &[usize],
@@ -218,7 +241,7 @@ pub trait Backend {
         // identical across every feature (only the bin column differs), so the prior
         // per-feature re-gather repeated this work `num_features` times. Mirrors C++
         // `ordered_gradients_`/`ordered_hessians_` reuse. Values + order unchanged ⇒
-        // bit-exact. Only `ord_bins` is re-gathered per feature.
+        // bit-exact.
         let r = leaf_rows.len();
         let mut ord_g: Vec<f32> = Vec::with_capacity(r);
         let mut ord_h: Vec<f32> = Vec::with_capacity(r);
@@ -226,16 +249,39 @@ pub trait Backend {
             ord_g.push(gradients[row as usize]);
             ord_h.push(hessians[row as usize]);
         }
-        let mut ord_bins: Vec<u32> = Vec::with_capacity(r);
+        // SPIKE 003b: FUSE the per-feature bin gather into the fold. Read `bins[row]`
+        // inline and fold directly into a REUSED per-feature hot scratch (sized to the
+        // widest feature, <= 2*max_num_bin) — NOT `ord_bins` materialization, NOT a
+        // per-feature alloc, and NOT a fold into the big multi-feature `out` buffer
+        // (p0n proved folding into `out` cache-scatters and regresses large ~9%). The
+        // fold is BRANCHLESS: no per-element bin check (see the precondition doc above),
+        // only a `debug_assert!`. The f64 fold ORDER is byte-identical to
+        // `construct_histograms_cpu_native` — ascending `leaf_rows`, grad at `bin<<1`,
+        // hess at `+1`, f32-read -> f64-accumulate — so the bit-exact gate holds.
+        let max_cells = num_bins
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| 2 * m as usize);
+        let mut scratch = vec![0.0f64; max_cells];
         for (fpos, &bins) in feature_bins.iter().enumerate() {
-            ord_bins.clear();
-            for &row in leaf_rows {
-                ord_bins.push(bins[row as usize]);
+            let num_bin = num_bins[fpos];
+            let cells = 2 * num_bin as usize;
+            for c in scratch[..cells].iter_mut() {
+                *c = 0.0;
             }
-            let hist =
-                self.construct_histograms(client, &ord_bins, &ord_g, &ord_h, num_bins[fpos])?;
-            let cells = 2 * num_bins[fpos] as usize;
-            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&hist);
+            for (k, &row) in leaf_rows.iter().enumerate() {
+                let bin = bins[row as usize];
+                debug_assert!(
+                    bin < num_bin,
+                    "bin {bin} >= num_bin {num_bin} — caller must establish the \
+                     bin-range invariant once per train (T-04-01 relocation)"
+                );
+                let ti = bin as usize * 2;
+                scratch[ti] += f64::from(ord_g[k]);
+                scratch[ti + 1] += f64::from(ord_h[k]);
+            }
+            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&scratch[..cells]);
         }
         Ok(out)
     }
