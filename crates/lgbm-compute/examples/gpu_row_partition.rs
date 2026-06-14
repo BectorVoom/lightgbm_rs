@@ -76,6 +76,85 @@ fn build_rp(
     }
 }
 
+/// K=4 register-batched variant of `build_rp` (Lever 2, LightGBM `NUM_DATA_PER_THREAD`):
+/// each unit gathers 4 strided rows' bins + grad/hess, then issues the 4 LDS atomics — so
+/// the hardware pipelines the 4 independent scattered reads before the dependent atomics.
+/// Same row-partition layout as `build_rp` (P = `CUBE_COUNT_Y`).
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn build_rp_k4(
+    resident_bins: &Array<u32>,
+    leaf_rows: &Array<u32>,
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>,
+    num_data: usize,
+    feat_len: u32,
+    out: &mut Array<Atomic<f32>>,
+) {
+    let f = CUBE_POS_X as usize;
+    let p = CUBE_POS_Y as usize;
+    let np = CUBE_COUNT_Y as usize;
+    let cd = CUBE_DIM as usize;
+    let fl = feat_len as usize;
+    let r = ord_g.len();
+    let base = slot_off[f] as usize;
+    let col = f * num_data;
+
+    let sub = SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX);
+    let mut c = UNIT_POS as usize;
+    while c < fl {
+        sub[c].store(0.0f32);
+        c += cd;
+    }
+    sync_cube();
+
+    let stride = np * cd;
+    let s2 = stride * 2;
+    let s3 = stride * 3;
+    let step = stride * 4;
+    let mut k = p * cd + UNIT_POS as usize;
+    // 4-row register-batched body: gather all 4 bins/grads/hesses first (independent
+    // loads the compiler can pipeline), then the 4 LDS atomics.
+    while k + s3 < r {
+        let b0 = resident_bins[col + leaf_rows[k] as usize] as usize * 2;
+        let b1 = resident_bins[col + leaf_rows[k + stride] as usize] as usize * 2;
+        let b2 = resident_bins[col + leaf_rows[k + s2] as usize] as usize * 2;
+        let b3 = resident_bins[col + leaf_rows[k + s3] as usize] as usize * 2;
+        let g0 = ord_g[k];
+        let g1 = ord_g[k + stride];
+        let g2 = ord_g[k + s2];
+        let g3 = ord_g[k + s3];
+        let h0 = ord_h[k];
+        let h1 = ord_h[k + stride];
+        let h2 = ord_h[k + s2];
+        let h3 = ord_h[k + s3];
+        sub[b0].fetch_add(g0);
+        sub[b0 + 1].fetch_add(h0);
+        sub[b1].fetch_add(g1);
+        sub[b1 + 1].fetch_add(h1);
+        sub[b2].fetch_add(g2);
+        sub[b2 + 1].fetch_add(h2);
+        sub[b3].fetch_add(g3);
+        sub[b3 + 1].fetch_add(h3);
+        k += step;
+    }
+    // tail (< 4 rows left for this unit)
+    while k < r {
+        let ti = resident_bins[col + leaf_rows[k] as usize] as usize * 2;
+        sub[ti].fetch_add(ord_g[k]);
+        sub[ti + 1].fetch_add(ord_h[k]);
+        k += stride;
+    }
+    sync_cube();
+    let mut m = UNIT_POS as usize;
+    while m < fl {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
 #[cfg(not(feature = "rocm"))]
 fn main() {
     eprintln!("this micro-bench requires --features rocm (gfx1100). Re-run with it.");
@@ -207,4 +286,70 @@ fn main() {
         println!();
     }
     println!("\n# speedup column is vs P=1 round-1. >1.0 = row-partitioning wins.");
+
+    // --- Lever 2: register-batching (K=4) vs K=1 at the winning P=16 ---
+    let p_best = 16u32;
+    let bench_k4 = |p: u32| -> std::time::Duration {
+        let out = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slot_len]));
+        let t = Instant::now();
+        for _ in 0..LAUNCHES {
+            unsafe {
+                build_rp_k4::launch(
+                    &client,
+                    CubeCount::Static(FEATS as u32, p, 1),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(d_bins.clone(), FEATS * NUM_DATA),
+                    ArrayArg::from_raw_parts(d_rows.clone(), r),
+                    ArrayArg::from_raw_parts(d_g.clone(), r),
+                    ArrayArg::from_raw_parts(d_h.clone(), r),
+                    ArrayArg::from_raw_parts(d_slot.clone(), FEATS),
+                    NUM_DATA,
+                    feat_len,
+                    ArrayArg::from_raw_parts(out.clone(), slot_len),
+                );
+            }
+        }
+        let _ = client.read_one_unchecked(out);
+        t.elapsed()
+    };
+    // correctness: K4 must match K1 within f32-atomic noise.
+    let k1v = verify(p_best);
+    let k4_out = {
+        let out = client.create_from_slice(f32::as_bytes(&vec![0.0f32; slot_len]));
+        unsafe {
+            build_rp_k4::launch(
+                &client,
+                CubeCount::Static(FEATS as u32, p_best, 1),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(d_bins.clone(), FEATS * NUM_DATA),
+                ArrayArg::from_raw_parts(d_rows.clone(), r),
+                ArrayArg::from_raw_parts(d_g.clone(), r),
+                ArrayArg::from_raw_parts(d_h.clone(), r),
+                ArrayArg::from_raw_parts(d_slot.clone(), FEATS),
+                NUM_DATA,
+                feat_len,
+                ArrayArg::from_raw_parts(out.clone(), slot_len),
+            );
+        }
+        f32::from_bytes(&client.read_one_unchecked(out)).to_vec()
+    };
+    let k_max_rel = k1v
+        .iter()
+        .zip(k4_out.iter())
+        .map(|(a, b)| (*a as f64 - *b as f64).abs() / (*a as f64).abs().max(1.0))
+        .fold(0.0f64, f64::max);
+    let _ = bench(p_best);
+    let _ = bench_k4(p_best);
+    println!("\n# Lever 2: register-batching K=4 vs K=1 at P={p_best} (correctness max_rel={k_max_rel:.2e}):");
+    for round in 1..=3 {
+        let e1 = bench(p_best);
+        let e4 = bench_k4(p_best);
+        let ms1 = e1.as_secs_f64() * 1e3;
+        let ms4 = e4.as_secs_f64() * 1e3;
+        println!(
+            "round{round}:  K1={ms1:.0}ms  K4={ms4:.0}ms  K4/K1={:.2}x",
+            ms1 / ms4
+        );
+    }
+    println!("# K4/K1 > 1.0 ⇒ register-batching helps; ship it. <= 1.0 ⇒ keep K=1 (null result).");
 }
