@@ -214,16 +214,64 @@ pub fn construct_histograms_cpu_native(
 ) -> Result<Vec<f64>, ComputeError> {
     let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
     let mut out = vec![0.0f64; out_len];
+    // Delegate to the SHARED fold body so the allocating and the fold-in-place paths
+    // can never drift. `out` is freshly zeroed above; `accumulate_histogram_into`
+    // re-validates (cheap; bin-range check is O(n)) and folds the SAME ascending
+    // rows / `bin<<1` cells / f32→f64 accumulation as before — byte-identical output.
+    accumulate_histogram_into(binned, grad, hess, num_bin, &mut out)?;
+    Ok(out)
+}
+
+/// **Fold-in-place** native f64 accumulator — the per-feature build hot path (R3).
+///
+/// Folds the SAME ascending rows as [`construct_histograms_cpu_native`] directly
+/// into a caller-owned, **caller-pre-zeroed** `out` sub-slice — NO intermediate
+/// per-feature `Vec`, NO copy. This eliminates the per-feature alloc + memset +
+/// memcpy that spike 002 localized as ~63% of low-row train time (build = 232µs/
+/// iter vs C++ 44.5µs/iter).
+///
+/// The arithmetic is byte-for-byte identical to `construct_histograms_cpu_native`:
+/// the same rows in the same ascending order, the same `bin << 1` cell layout, the
+/// same `f32`-read → `f64`-accumulate. The only difference is that this writes into
+/// a pre-zeroed sub-slice instead of allocating + zeroing its own buffer. The two
+/// share ONE fold body (the loop below) so the fold ORDER can never diverge — the
+/// project's bit-exact CPU f64 merge gate depends on it.
+///
+/// `out` MUST be pre-zeroed by the caller over `out[0..2*num_bin]` (the caller owns
+/// zeroing so it can zero a larger multi-feature buffer once). This function does
+/// NOT zero `out`.
+///
+/// # Errors
+/// - Same length / bin-range validation as [`construct_histograms_cpu_native`]
+///   (V5, runs BEFORE any write).
+/// - [`ComputeError::LengthMismatch`] if `out.len() < 2 * num_bin` (no panic, V5).
+pub fn accumulate_histogram_into(
+    binned: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_bin: u32,
+    out: &mut [f64],
+) -> Result<(), ComputeError> {
+    let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
+    // V5: the caller's sub-slice must hold the full 2*num_bin histogram. Surface a
+    // typed error (no panic) BEFORE writing any cell.
+    if out.len() < out_len {
+        return Err(ComputeError::LengthMismatch {
+            expected: out_len,
+            actual: out.len(),
+        });
+    }
     // Ascending row order, f32 read → f64 accumulate, grad at bin<<1 / hess at +1 —
     // the verbatim `construct_hist_kernel` body (dense_bin.hpp:99-141). The
     // validation above guarantees every `binned[i] < num_bin`, so `ti + 1` stays in
-    // bounds; the loop uses checked indexing regardless (no `unsafe`).
+    // bounds; the loop uses checked indexing regardless (no `unsafe`). Folding into a
+    // pre-zeroed sub-slice yields bytes identical to the allocating path.
     for (i, &bin) in binned.iter().enumerate() {
         let ti = bin as usize * 2;
         out[ti] += f64::from(grad[i]);
         out[ti + 1] += f64::from(hess[i]);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Validate the `construct_histograms` inputs (shared by the f64 cpu path and
@@ -1835,4 +1883,109 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     }
 
     Ok((h_hist, slot_len, splits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accumulate_histogram_into, construct_histograms_cpu_native};
+    use crate::error::ComputeError;
+
+    /// Assert two f64 histograms are bit-identical, cell-by-cell (`to_bits()`).
+    fn assert_bits_eq(a: &[f64], b: &[f64]) {
+        assert_eq!(a.len(), b.len(), "histogram lengths differ");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "cell {i} differs: {x} ({:#018x}) vs {y} ({:#018x})",
+                x.to_bits(),
+                y.to_bits(),
+            );
+        }
+    }
+
+    /// The fold-in-place accumulator produces bytes identical to the allocating
+    /// path on multiple shapes — the bit-exact merge-gate invariant in unit form.
+    #[test]
+    fn accumulate_into_is_bit_identical_to_native() {
+        // Shape A: small, a few bins, repeated bins, mixed-sign gradients.
+        let binned_a: Vec<u32> = vec![0, 2, 1, 2, 0, 3, 1, 2, 3, 0];
+        let grad_a: Vec<f32> = vec![0.5, -1.25, 3.0, 0.125, -2.5, 7.75, -0.0625, 1.5, -4.0, 0.25];
+        let hess_a: Vec<f32> = vec![1.0, 0.5, 2.0, 0.25, 1.5, 0.75, 3.0, 0.125, 2.5, 1.0];
+        let num_bin_a = 4u32;
+
+        let want_a =
+            construct_histograms_cpu_native(&binned_a, &grad_a, &hess_a, num_bin_a).unwrap();
+        let mut got_a = vec![0.0f64; 2 * num_bin_a as usize];
+        accumulate_histogram_into(&binned_a, &grad_a, &hess_a, num_bin_a, &mut got_a).unwrap();
+        assert_bits_eq(&want_a, &got_a);
+
+        // Shape B: larger, more bins, values chosen so fold ORDER matters for f64
+        // accumulation (catastrophic-cancellation-sensitive magnitudes).
+        let n = 257usize;
+        let num_bin_b = 16u32;
+        let mut binned_b = Vec::with_capacity(n);
+        let mut grad_b = Vec::with_capacity(n);
+        let mut hess_b = Vec::with_capacity(n);
+        for i in 0..n {
+            binned_b.push((i as u32) % num_bin_b);
+            // Alternating large/small magnitudes to expose any reordering.
+            let g = if i % 2 == 0 {
+                1e7_f32 + i as f32
+            } else {
+                -(1e-3_f32) * i as f32
+            };
+            grad_b.push(g);
+            hess_b.push((i as f32).mul_add(0.001, 0.5));
+        }
+
+        let want_b =
+            construct_histograms_cpu_native(&binned_b, &grad_b, &hess_b, num_bin_b).unwrap();
+        let mut got_b = vec![0.0f64; 2 * num_bin_b as usize];
+        accumulate_histogram_into(&binned_b, &grad_b, &hess_b, num_bin_b, &mut got_b).unwrap();
+        assert_bits_eq(&want_b, &got_b);
+    }
+
+    /// Folding into a pre-zeroed sub-slice of a LARGER buffer writes only its own
+    /// region and matches the standalone native build bit-for-bit (the multi-feature
+    /// `out` layout `build_leaf_histograms_raw` uses).
+    #[test]
+    fn accumulate_into_subslice_matches_native() {
+        let binned: Vec<u32> = vec![0, 1, 1, 0, 2, 2, 1];
+        let grad: Vec<f32> = vec![1.0, -2.0, 0.5, 4.0, -1.0, 0.25, 3.0];
+        let hess: Vec<f32> = vec![0.5, 1.0, 2.0, 0.25, 1.5, 0.75, 0.125];
+        let num_bin = 3u32;
+        let cells = 2 * num_bin as usize;
+
+        let want = construct_histograms_cpu_native(&binned, &grad, &hess, num_bin).unwrap();
+
+        // A larger pre-zeroed buffer with the histogram placed at an offset.
+        let off = cells; // place feature in the second slot
+        let mut buf = vec![0.0f64; 3 * cells];
+        accumulate_histogram_into(&binned, &grad, &hess, num_bin, &mut buf[off..off + cells])
+            .unwrap();
+
+        assert_bits_eq(&want, &buf[off..off + cells]);
+        // Untouched regions stay exactly zero.
+        assert!(buf[..off].iter().all(|&v| v.to_bits() == 0.0f64.to_bits()));
+        assert!(buf[off + cells..].iter().all(|&v| v.to_bits() == 0.0f64.to_bits()));
+    }
+
+    /// An undersized `out` sub-slice is a typed `LengthMismatch`, NOT a panic (V5).
+    #[test]
+    fn accumulate_into_rejects_short_out() {
+        let binned: Vec<u32> = vec![0, 1, 2];
+        let grad: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let hess: Vec<f32> = vec![1.0, 1.0, 1.0];
+        let num_bin = 4u32; // needs 8 cells
+        let mut out = vec![0.0f64; 4]; // too short
+
+        let err =
+            accumulate_histogram_into(&binned, &grad, &hess, num_bin, &mut out).unwrap_err();
+        assert!(
+            matches!(err, ComputeError::LengthMismatch { expected, actual }
+                if expected == 8 && actual == 4),
+            "expected LengthMismatch{{8,4}}, got {err:?}"
+        );
+    }
 }
