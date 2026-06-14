@@ -26,7 +26,7 @@ fn assert_bit_exact(cpu: &[f64], gpu: &[f64], what: &str) {
 #[test]
 fn rocm_backend_construct_histograms_bit_exact() {
     let cpu = CpuBackend;
-    let gpu = RocmBackend;
+    let gpu = RocmBackend::default();
     let cc = cpu_client();
     let gc = rocm_client();
 
@@ -47,7 +47,7 @@ fn rocm_backend_construct_histograms_bit_exact() {
 #[test]
 fn rocm_backend_find_best_split_bit_exact() {
     let cpu = CpuBackend;
-    let gpu = RocmBackend;
+    let gpu = RocmBackend::default();
     let cc = cpu_client();
     let gc = rocm_client();
     let cfg = GainConfig::default();
@@ -97,7 +97,7 @@ fn rocm_backend_find_best_split_bit_exact() {
 #[test]
 fn rocm_backend_subtract_histograms_bit_exact() {
     let cpu = CpuBackend;
-    let gpu = RocmBackend;
+    let gpu = RocmBackend::default();
     let cc = cpu_client();
     let gc = rocm_client();
 
@@ -112,7 +112,7 @@ fn rocm_backend_subtract_histograms_bit_exact() {
 #[test]
 fn rocm_backend_data_partition_matches() {
     let cpu = CpuBackend;
-    let gpu = RocmBackend;
+    let gpu = RocmBackend::default();
     let cc = cpu_client();
     let gc = rocm_client();
 

@@ -1500,7 +1500,7 @@ mod hip {
     #[test]
     fn kernel_parity_resident_gather_equals_host_gather_on_hip() {
         use lgbm_compute::kernels::histogram::build_leaf_histograms_batched_f32_on;
-        use lgbm_compute::RocmBackend;
+        use lgbm_compute::{BinColumn, RocmBackend};
 
         let hip = rocm_client();
 
@@ -1542,10 +1542,18 @@ mod hip {
         //     use the same RocmBackend instance so the resident cache is populated.
         let backend = RocmBackend::default();
         backend.upload_resident_bins(&hip, &feature_bins);
+        // `build_leaf_histograms_raw` takes typed `BinColumn`s (u8-bins work, spike-004);
+        // `upload_resident_bins` still takes the `&[&[u32]]` columns above.
+        let cols: Vec<BinColumn> = vec![
+            BinColumn::new(f0.clone(), num_bins[0]),
+            BinColumn::new(f1.clone(), num_bins[1]),
+            BinColumn::new(f2.clone(), num_bins[2]),
+        ];
+        let col_refs: Vec<&BinColumn> = cols.iter().collect();
         let resident = backend
             .build_leaf_histograms_raw(
                 &hip,
-                &feature_bins,
+                &col_refs,
                 &num_bins,
                 &slot_off,
                 slot_len,
