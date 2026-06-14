@@ -1,0 +1,42 @@
+# Spike Conventions
+
+Patterns established across spike sessions. New spikes follow these unless the question requires otherwise.
+
+## Stack
+
+- **Rust + cubecl 0.10**, the project's own crates. Spikes that touch the histogram/build path
+  live as `crates/lgbm-compute/examples/*.rs` (not throwaway scripts) so they compile against the
+  real kernels and types.
+- **CPU spikes** (002–005): plain `cargo bench`/example timing, compared vs `lib_lightgbm` 4.6.
+- **GPU spikes** (006, 007): `--features rocm` examples on the local gfx1100.
+
+## GPU micro-bench harness (spikes 006, 007)
+
+The repeatable shape for "is kernel-change X faster on the GPU?":
+
+1. **Isolate ONE kernel access pattern** in a `#[cube(launch)]` fn that mirrors the production
+   kernel (e.g. resident-column gather + f32-atomic accumulate). Vary only the one thing under
+   test (bin width in 006; row-partition count P in 007). Bench the variant against a baseline
+   that is **byte-identical to production** (006: u32; 007: P=1).
+2. **Drive it from `lgbm_compute::runtime::rocm_client()`**, `create_from_slice` device handles
+   once, loop `LAUNCHES` accumulating launches, force sync with a final `read_one_unchecked`.
+3. **Report within-round ratios, not vs a fixed cold baseline.** Round-1 of the first variant is
+   cold-start inflated — comparing across rounds overstates wins. Read each round's variants
+   against each other, and re-run across **2–3 process restarts** to kill warmup-drift before
+   declaring a verdict.
+4. **Always include a correctness column** vs the production-equivalent baseline (max_abs +
+   max_rel diff). f32-atomic reorder noise is expected; watch for divergence that *grows* with
+   the change (007: more partitions → wider divergence — a real parity interaction, not noise).
+5. **Gate findings against the MANIFEST Requirements**: the CPU f64 anchor is the bit-exact merge
+   gate and must stay untouched; the GPU ~1e-6 parity contract at large shapes is separately open.
+
+`gpu_bin_width.rs` (006) and `gpu_row_partition.rs` (007) are the reference harnesses.
+
+## Tools & Libraries
+
+- `cubecl` 0.10 LDS API: `SharedMemory::<Atomic<f32>>::new(COMPTIME_SIZE)`, `sync_cube()`,
+  per-cube atomics. `Array<u8>` compiles+runs on HIP (006). f64 ops run on gfx1100 despite
+  `has_f64 == false` (used by the f64 anchor kernels).
+- Reference baseline for GPU kernel parity/perf = AMD's ROCm fork `LightGBM-release-4.6.0.99/`
+  (hipified CUDA), NOT mainline `LightGBM/` — see
+  `.planning/notes/cubecl-vs-rocm-histogram-kernel-comparison.md`.
