@@ -287,6 +287,20 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// `train_inner` via [`crate::resident_pool::fused_directly_built_eligible`]; `false`
     /// (default, ALWAYS on CpuBackend) takes the existing resident/host routing.
     fused_eligible: bool,
+    /// R3 (perf, 260614-p0n): reused per-feature `num_bin` descriptor for
+    /// [`build_leaf_histogram_into`](Self::build_leaf_histogram_into). The feature
+    /// set is FIXED per train (set once via [`with_features`](Self::with_features)),
+    /// so the `Vec<u32>` of per-feature bin counts is identical on every leaf build —
+    /// it is filled LAZILY on the first build (so it survives `with_features`, which
+    /// may run after `new`) and re-borrowed thereafter, eliminating one `Vec<u32>`
+    /// allocation per leaf-histogram build. `RefCell` so the `&self` build can fill /
+    /// read it. The CONTENT and ORDER are byte-identical to the prior per-call
+    /// `features.iter().map(|f| f.num_bin).collect()`, so the fold inputs (and thus
+    /// the bit-exact CPU f64 tree) are unchanged. The `feature_bins: Vec<&[u32]>`
+    /// stays a per-call local: its `&[u32]` borrow is tied to the `features`
+    /// parameter lifetime and cannot be stored behind `&self` without infecting the
+    /// struct with a lifetime param (an architectural change the plan defers).
+    build_num_bins: std::cell::RefCell<Vec<u32>>,
 }
 
 /// W10 advanced learner constraints (ADV-01..05) — the inactive `Default` is the
@@ -417,6 +431,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             resident_eligible: false,
             // Default OFF: recomputed per train in `train_inner` (260608-t3t).
             fused_eligible: false,
+            // R3 (260614-p0n): filled lazily on the first leaf-histogram build.
+            build_num_bins: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1657,13 +1673,29 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // features' RAW histograms in one call (CPU: the per-feature gather+construct
         // loop, bit-exact; GPU: one batched kernel launch + device-resident bins).
         let feature_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
-        let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
+        // R3 (260614-p0n): the per-feature `num_bin` descriptor is identical on every
+        // leaf build (the feature set is fixed per train). Fill the learner-held
+        // scratch lazily on the first build (it survives `with_features`) or whenever
+        // the feature count changes; re-borrow it thereafter. The CONTENT and ORDER
+        // are byte-identical to `features.iter().map(|f| f.num_bin).collect()`, so the
+        // fold inputs — and thus the bit-exact f64 tree — are unchanged.
+        let mut num_bins_ref = self.build_num_bins.borrow_mut();
+        if num_bins_ref.len() != features.len()
+            || num_bins_ref
+                .iter()
+                .zip(features.iter())
+                .any(|(&n, f)| n != f.num_bin)
+        {
+            num_bins_ref.clear();
+            num_bins_ref.extend(features.iter().map(|f| f.num_bin));
+        }
+        let num_bins: &[u32] = &num_bins_ref;
         let mut raw = self
             .backend
             .build_leaf_histograms_raw(
                 self.client,
                 &feature_bins,
-                &num_bins,
+                num_bins,
                 slot_off,
                 buf.len(),
                 leaf_rows,
