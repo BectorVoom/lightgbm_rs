@@ -17,12 +17,18 @@ subtract**, and **data partition**. Batching each to ~one launch per leaf (or pe
 tree level) cuts the launch count that scales with features → the dominant cost while
 launch-bound.
 
-## Trigger
+## Trigger — REFRAMED 2026-06-14 by spike 001
 
-Activate when the crossover spike (`.planning/todos/pending/spike-gpu-cpu-crossover.md`)
-reports that **launches still dominate** at the largest tested shape — i.e. GPU has not
-yet crossed CPU and the instrumentation points at dispatch count, not transfer/compute.
-Do NOT do this speculatively; the spike decides whether it's on the critical path.
+Spike 001 (`001-gpu-cpu-crossover`) proved GPU already crosses CPU at ~700k rows with
+today's kernels, so this is **no longer a prerequisite** for "GPU wins at scale" — it's
+now an **optimisation** to *lower the crossover*. The GPU has a large launch-bound
+floor (~5–6s for 30 iters, flat for rows ≤100k); batching find_best_split / subtract /
+partition shaves that floor → moves the crossover **left** so GPU wins at smaller
+datasets (below 700k). Quantified payoff: every second cut from the floor pulls the
+crossover down by ~47k-rows-worth of CPU work.
+
+Activate when: we want GPU to beat CPU below ~700k rows, OR profiling at the crossover
+region shows dispatch count still dominating. Do NOT do it speculatively.
 
 ## Notes from prior art
 

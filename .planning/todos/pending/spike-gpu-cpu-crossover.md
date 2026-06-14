@@ -44,8 +44,23 @@ experiment needs **no kernel changes** — just run the existing path bigger:
   ~1e-6 contract. Don't trade parity for speed.
 - Large synthetic data only for benching; don't commit multi-MB fixtures.
 
-## Kick off
+## Outcome — DONE 2026-06-14 (spike 001, VALIDATED)
 
-Run `/gsd-spike` on this todo to start the measurement loop.
+Crossover **exists with today's kernels** ≈ **700k rows** (feat=50/bins=255/31 leaves,
+gfx1100). CPU wins below it (17× at 20k, 1.1× at 500k); GPU wins above ~1M and the
+gap widens (1.24× at 1M, 1.45× at 2M, still climbing). No batched
+find_best_split/subtract/partition work was needed to reach it.
 
-See `.planning/notes/gpu-track-goal-crossover-at-scale.md` for the full framing.
+Full write-up + data table: `.planning/spikes/001-gpu-cpu-crossover/README.md`.
+Reusable harness: `crates/lgbm/examples/bench_crossover.rs`.
+
+Open follow-ups:
+- **Parity gate at scale** (NEW): confirm the ~1e-6 GPU-vs-CPU contract still holds at
+  1M+ rows — spike measured speed only.
+- Seed [[batch-find-best-split-subtract-partition]] is now an *optimisation* (lower the
+  ~5–6s launch floor → move crossover left), not a prerequisite.
+
+## Kick off (historical)
+
+Ran via `/gsd-spike` on this todo. See
+`.planning/notes/gpu-track-goal-crossover-at-scale.md` for the original framing.
