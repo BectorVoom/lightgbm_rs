@@ -102,6 +102,41 @@ Relative error ≈ `6e-8`. `is_splittable`, `threshold`, `left_count`, and
    occur; `cargo build -p lgbm-compute --features rocm` built clean without a
    `ROCM_PATH` override.
 
+4. **G-09-01 — row-partitioned LDS build (phase-09 / spike-007) f32 residual.**
+   The large-leaf histogram build now splits a feature's rows across `P` cubes
+   (`row_partition_count`, gated to leaves ≥ `ROWPART_MIN_LEAF`; P=1 below the gate,
+   byte-identical to the prior kernel). This changes the **f32 fold structure** on
+   large leaves: P independent partial-sum trees, then an atomic merge.
+   - **It does NOT degrade f64-anchor parity at tested shapes.** Measured
+     (`rocm_row_partition.rs`, 50k×8×64): P=1 vs cpu f64 anchor `rel=1.7e-6`; P=16
+     vs anchor `rel=2.0e-7` — i.e. **P>1 is *closer* to the anchor**, because 16
+     partial trees each sum fewer f32 values (tree summation is more accurate than
+     the long sequential f32 fold).
+   - The spike's larger `~2e-5 rel` figure was **GPU-vs-GPU(P=1)** run divergence at
+     1M rows (independent atomic-commit order across the two launches), NOT a
+     vs-anchor degradation. Both paths sit inside the same best-effort f32 gate as
+     G-04-01.
+   - **Gate:** `rocm_row_partition.rs` holds P=1 to the `<1e-5` f32-LDS bound and
+     P>1 to a documented `<5e-5` relative bound (headroom over the 1M-row figure).
+     The cpu f64 anchor and the bit-exact CPU merge gate are **untouched**. This is
+     the "separate, still-open large-shape GPU parity gate" the spikes/MANIFEST
+     Requirements anticipated — now bounded by the large-leaf gate.
+   - **Register-batching (K=4) was a NULL result** (`gpu_row_partition.rs`,
+     `K4/K1 = 0.89–0.98×` at P=16): at saturating occupancy the bottleneck is LDS
+     atomic contention, not load latency, so K stays 1.
+
+### Pre-existing rocm-test bit-rot (NOT introduced by phase-09 — flagged for cleanup)
+
+The `--features rocm` test suite has two latent compile breaks, independent of the
+row-partition work, because the rocm tests are not in the default CI gate and drifted:
+- `crates/lgbm-compute/tests/rocm_backend_parity.rs` — `let gpu = RocmBackend;` no
+  longer compiles (`RocmBackend` gained fields in `faa162b`/260608-kfu).
+- `crates/oracle-harness/tests/kernel_parity.rs:1548` — `build_leaf_histograms_raw`
+  now takes `&[&BinColumn]`, the test still passes `&Vec<&[u32]>` (u8-bins work).
+Phase-09's parity is therefore verified via the **new** `rocm_row_partition.rs` +
+the green `rocm_parallel_histogram.rs` (single-feature LDS) rather than the
+bit-rotted resident `kernel_parity` cases.
+
 ## How this was verified (reproduce on a gfx1100 ROCm host)
 
 ```bash
