@@ -33,3 +33,13 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 
+# Profiling profile (spike 002): opt-3 like release for representative hot-loop
+# codegen, but LTO OFF + debug symbols so callgrind/profilers can attribute cost to
+# distinct per-phase functions instead of one fat-LTO-inlined mega-function. NOT a
+# perf-measurement profile — used only to localize where train time goes.
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = true
+

@@ -47,6 +47,22 @@ partition, score update, grad/hess, boosting glue — does Rust overspend vs C++
   apples-to-apples A/B; single-thread both sides to match.
 - Don't git-add the `LightGBM/` C++ tree — see [[lightgbm-ref-tree-untracked]].
 
-## Kick off
+## Outcome — DONE 2026-06-14 (spike 002, VALIDATED)
 
-Run `/gsd-spike` on this todo. Framing: `.planning/notes/low-row-gap-fixed-per-iteration-overhead.md`.
+Gap localized to **histogram construction (build)**: Rust **232µs/iter** vs C++ **44.5**
+(5.2×) = **187.5µs of the ~188µs/iter gap**. Split scan (1.4×) and partition (2.1×) are
+near parity. Not cache-bound at low rows (LL miss 0.1%); the cost is the per-feature
+row-major `Vec<Vec<f64>>` gather + alloc churn (22% of in-main instructions = malloc/
+memset/memcpy, *inside* the build). Fixed startup (~350µs cubecl client init) is one-
+time, negligible at 100 iters. Full write-up: `.planning/spikes/002-lowrow-phase-ab/`.
+
+Fix priority (both target histogram build):
+1. R3 columnar pre-binned storage + subtraction reuse (structural — the big lever).
+2. Seed [[reuse-tree-learner-scratch-across-iters]] — kill alloc churn (CONFIRMED relevant).
+
+Reusable infra landed in-tree: `lgbm_treelearner::phase_prof` (env-gated, zero-overhead
+when off), `[profile.profiling]`, `bench_crossover.rs` dump hook.
+
+## Kick off (historical)
+
+Ran via `/gsd-spike`. Framing: `.planning/notes/low-row-gap-fixed-per-iteration-overhead.md`.

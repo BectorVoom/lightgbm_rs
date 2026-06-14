@@ -139,6 +139,8 @@ fn main() {
             train_times.push(t0.elapsed());
             std::hint::black_box(&booster);
         }
+        // Spike 002: per-phase wall-clock breakdown (env LGBM_PHASE_PROF=1).
+        lgbm_treelearner::phase_prof::dump(&s.name);
         let train_med = median(train_times);
         let rows_per_s = s.rows as f64 / train_med.as_secs_f64();
         println!(

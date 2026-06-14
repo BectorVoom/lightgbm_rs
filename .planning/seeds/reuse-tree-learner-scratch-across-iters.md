@@ -21,11 +21,19 @@ churn that's invisible at large rows but ~half the cost at 2k.
 Aligns with the recorded "real lever = tree-learner scratch + rayon"
 ([[optimisor-manual-applicability]]).
 
-## Trigger
+## Trigger — CONFIRMED 2026-06-14 by spike 002
 
-Activate ONLY if the spike (`.planning/todos/pending/spike-lowrow-phase-ab.md`)
-attributes the gap to alloc/setup phases. If the A/B instead fingers a compute phase
-or finds the overhead diffuse, this seed does not apply — don't do it speculatively.
+Spike 002 attributed ~the entire low-row gap to **histogram construction (build)**,
+and callgrind showed **22% of in-main instructions are malloc/memset/memcpy** living
+*inside* that build. So alloc churn IS real and IS in the hot phase — this seed is
+confirmed relevant. Scope it to the **histogram build path**: reuse the per-feature
+gather + histogram buffers across iterations instead of re-allocating + re-zeroing per
+feature per leaf (`build_leaf_histogram_into` zeroes `buf` every call).
+
+NOTE: this is the *tactical* half. The *structural* fix for the same phase is roadmap
+**R3** (columnar pre-binned storage + subtraction reuse — replace the row-major
+`Vec<Vec<f64>>` gather). R3 likely subsumes much of this seed; sequence R3 first or
+co-design them. Both target histogram build, the one phase that's 5.2× off C++.
 
 ## Notes / guardrails
 

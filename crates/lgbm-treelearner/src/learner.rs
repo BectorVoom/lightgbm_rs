@@ -903,34 +903,38 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ---- the leaf-wise loop (serial_tree_learner.cpp:218-236) ----
         for _split in 0..(self.num_leaves - 1 - forced_count) {
             // BeforeFindBestSplit (gates + smaller-child selection).
-            let did = self.before_find_best_split(
-                &tree,
-                &data_partition,
-                left_leaf,
-                right_leaf,
-                &mut best_split_per_leaf,
-            );
+            let did = crate::phase_prof::time(&crate::phase_prof::BEFORE_NS, || {
+                self.before_find_best_split(
+                    &tree,
+                    &data_partition,
+                    left_leaf,
+                    right_leaf,
+                    &mut best_split_per_leaf,
+                )
+            });
             if did {
                 // FindBestSplits: build smaller histogram (and larger via subtract),
                 // then per-feature find_best_split + cross-feature argmax. The
                 // per-node ColSampler draws (smaller-then-larger) happen INSIDE
                 // find_best_splits in the exact C++ order (T-05-04-01).
-                let snap = self.find_best_splits(
-                    &features,
-                    gradients,
-                    hessians,
-                    &data_partition,
-                    &mut pool,
-                    &slot_off,
-                    &smaller_leaf_splits,
-                    &larger_leaf_splits,
-                    left_leaf,
-                    right_leaf,
-                    &mut best_split_per_leaf,
-                    &mut best_split_feature,
-                    col_sampler.as_mut(),
-                    &mut trace,
-                )?;
+                let snap = crate::phase_prof::time(&crate::phase_prof::HISTSPLIT_NS, || {
+                    self.find_best_splits(
+                        &features,
+                        gradients,
+                        hessians,
+                        &data_partition,
+                        &mut pool,
+                        &slot_off,
+                        &smaller_leaf_splits,
+                        &larger_leaf_splits,
+                        left_leaf,
+                        right_leaf,
+                        &mut best_split_per_leaf,
+                        &mut best_split_feature,
+                        col_sampler.as_mut(),
+                        &mut trace,
+                    )
+                })?;
                 snapshots.push(snap);
             }
 
@@ -943,16 +947,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
             // SplitInner: partition + grow the node + seed child leaf-splits.
             let feat_idx = best_split_feature[best_leaf as usize];
-            let (new_left, new_right) = self.split_inner(
-                &mut tree,
-                &mut data_partition,
-                &features,
-                best_leaf,
-                feat_idx,
-                &best,
-                &mut smaller_leaf_splits,
-                &mut larger_leaf_splits,
-            )?;
+            let (new_left, new_right) =
+                crate::phase_prof::time(&crate::phase_prof::PARTITION_NS, || {
+                    self.split_inner(
+                        &mut tree,
+                        &mut data_partition,
+                        &features,
+                        best_leaf,
+                        feat_idx,
+                        &best,
+                        &mut smaller_leaf_splits,
+                        &mut larger_leaf_splits,
+                    )
+                })?;
 
             // ---- W10 post-split constraint updates (ADV-01/02/05) ----
             self.update_constraints_after_split(
@@ -1633,6 +1640,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         leaf_splits: &LeafSplits,
         buf: &mut [f64],
     ) {
+        let _g = crate::phase_prof::guard(&crate::phase_prof::BUILD_NS);
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
         // Empty / no-hessian leaf: leave the slot zeroed (it will not be scanned).
@@ -1788,6 +1796,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
+        let _g = crate::phase_prof::guard(&crate::phase_prof::SCAN_NS);
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
         let num_data_in_leaf = leaf_splits.num_data_in_leaf;

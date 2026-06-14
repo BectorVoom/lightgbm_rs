@@ -26,6 +26,7 @@ pub mod col_sampler;
 pub mod cost_effective_gradient_boosting;
 pub mod data_partition;
 pub mod error;
+pub mod phase_prof;
 pub mod feature_histogram_categorical;
 pub mod fix_histogram;
 pub mod forced_splits;
