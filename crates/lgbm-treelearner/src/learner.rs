@@ -733,13 +733,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // VALUE FITS the narrow type, but the `bin < num_bin` VALUE check must
             // STILL run (a u8 column can hold a value >= a num_bin that is < 256).
             // This gate is the relocated T-04-01 mitigation — do NOT weaken it.
-            for b in f.bins.iter_u32() {
-                if b >= f.num_bin {
-                    return Err(TreeLearnerError::BinIndexOutOfRange {
-                        index: b,
-                        num_bin: f.num_bin,
-                    });
-                }
+            // `first_ge` is a MONOMORPHIC per-width slice scan (no boxed iterator /
+            // dynamic dispatch on the hot per-row path — spike 004 small-row fix); it
+            // returns the first offending bin VALUE so the rejection still carries the
+            // exact index.
+            if let Some(b) = f.bins.first_ge(f.num_bin) {
+                return Err(TreeLearnerError::BinIndexOutOfRange {
+                    index: b,
+                    num_bin: f.num_bin,
+                });
             }
             if f.na_as_missing() {
                 // NA_AS_MISSING forward branch deferred (RESEARCH A5) — surface the
@@ -798,12 +800,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // are immutable for the whole train, so upload once here (not per tree); the
         // backend instance persists across trees (booster.rs constructs it per
         // train() call, outside the GBDT iter loop).
-        // Widen each narrow column to u32 ONCE here (cold) for the GPU upload — the
-        // Rocm path is byte-unchanged (it uploads a u32 resident buffer). The
-        // CpuBackend default is a no-op, so the owned u32 Vecs are dropped.
-        let upload_owned: Vec<Vec<u32>> = features.iter().map(|f| f.bins.to_u32_vec()).collect();
-        let upload_bins: Vec<&[u32]> = upload_owned.iter().map(Vec::as_slice).collect();
-        self.backend.upload_resident_bins(self.client, &upload_bins);
+        // SPIKE 004: only widen the narrow columns to u32 when the backend actually
+        // consumes them (`wants_resident_bins()` — true on Rocm, false on the
+        // CpuBackend no-op default). This avoids a per-tree `num_features`-Vec u32
+        // allocation on the CPU path (the bins are stored narrow now; widening for a
+        // no-op upload was a measured small-row regression). The Rocm path is
+        // byte-unchanged — it still receives the same u32 resident buffer.
+        if self.backend.wants_resident_bins() {
+            let upload_owned: Vec<Vec<u32>> =
+                features.iter().map(|f| f.bins.to_u32_vec()).collect();
+            let upload_bins: Vec<&[u32]> = upload_owned.iter().map(Vec::as_slice).collect();
+            self.backend.upload_resident_bins(self.client, &upload_bins);
+        }
 
         let mut pool = HistogramPool::new(self.num_leaves, slot_len);
         pool.reset_map();

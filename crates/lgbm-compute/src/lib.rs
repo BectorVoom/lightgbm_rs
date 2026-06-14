@@ -149,16 +149,40 @@ impl BinColumn {
         }
     }
 
-    /// Iterate the column widened to `u32` (the once-per-train bin-range gate +
-    /// most-freq scans). Avoids materializing a `Vec<u32>`.
+    /// Iterate the column widened to `u32` (cold scans that don't need the tight
+    /// monomorphic loop). Boxes the per-variant iterator so all three arms share one
+    /// return type — do NOT use this on a hot per-row path (the boxed dynamic
+    /// dispatch is a measured small-row regression); use a direct `match self` over
+    /// the narrow slice, or [`first_ge`](BinColumn::first_ge), instead.
     pub fn iter_u32(&self) -> impl Iterator<Item = u32> + '_ {
-        // Box the per-variant iterator so all three arms share one return type.
         let it: Box<dyn Iterator<Item = u32> + '_> = match self {
             BinColumn::U8(v) => Box::new(v.iter().map(|&b| u32::from(b))),
             BinColumn::U16(v) => Box::new(v.iter().map(|&b| u32::from(b))),
             BinColumn::U32(v) => Box::new(v.iter().copied()),
         };
         it
+    }
+
+    /// Return the FIRST element `>= bound` (widened to `u32`), or `None` if every
+    /// element is `< bound`. This is the allocation-free, MONOMORPHIC per-width scan
+    /// the once-per-train bin-range gate uses (the `bin < num_bin` VALUE check) — it
+    /// dispatches on the width ONCE then runs a tight slice loop per arm, avoiding
+    /// the boxed [`iter_u32`](BinColumn::iter_u32) dynamic dispatch on the hot
+    /// per-row path (spike 004 small-row regression fix).
+    #[inline]
+    #[must_use]
+    pub fn first_ge(&self, bound: u32) -> Option<u32> {
+        match self {
+            BinColumn::U8(v) => v
+                .iter()
+                .map(|&b| u32::from(b))
+                .find(|&b| b >= bound),
+            BinColumn::U16(v) => v
+                .iter()
+                .map(|&b| u32::from(b))
+                .find(|&b| b >= bound),
+            BinColumn::U32(v) => v.iter().copied().find(|&b| b >= bound),
+        }
     }
 }
 
@@ -556,6 +580,18 @@ pub trait Backend {
         _client: &ComputeClient<Self::Runtime>,
         _feature_bins: &[&[u32]],
     ) {
+    }
+
+    /// Whether [`upload_resident_bins`](Backend::upload_resident_bins) actually
+    /// consumes its `&[&[u32]]` argument (spike 004). With narrow [`BinColumn`]
+    /// storage, the learner must WIDEN each column to `u32` to call
+    /// `upload_resident_bins`; that widening allocates `num_features` u32 Vecs ONCE
+    /// per `train_inner`. On [`CpuBackend`] the upload is a no-op, so the learner
+    /// SKIPS the widening entirely (gated on this returning `false`) — avoiding a
+    /// per-tree allocation that has no effect. RocmBackend returns `true` so its
+    /// resident u32 upload still receives the byte-identical column data.
+    fn wants_resident_bins(&self) -> bool {
+        false
     }
 
     // ===================================================================
@@ -1025,6 +1061,14 @@ impl Backend for RocmBackend {
         kernels::subtract::subtract_histograms_f64_on(client, parent, child)
     }
 
+    /// The GPU path's resident u32 upload DOES consume the widened columns (spike
+    /// 004): the learner widens each [`BinColumn`] to u32 once and calls
+    /// [`upload_resident_bins`](Backend::upload_resident_bins) so the resident buffer
+    /// is byte-identical to HEAD.
+    fn wants_resident_bins(&self) -> bool {
+        true
+    }
+
     /// GPU override (260608-nn7 L1): upload the binned feature columns to the device
     /// ONCE per train and cache the device `Handle` in `self.resident_bins` (interior
     /// mutability). The columns are concatenated feature-major into ONE buffer
@@ -1409,6 +1453,21 @@ mod bin_column_tests {
         ] {
             assert_eq!(BinColumn::new(v.clone(), nb).to_u32_vec(), v);
         }
+    }
+
+    #[test]
+    fn first_ge_finds_first_out_of_range_per_width() {
+        // U8: first value >= 4 is the 5 at index 2.
+        assert_eq!(BinColumn::new(vec![0, 1, 5, 2], 256).first_ge(4), Some(5));
+        // U16: first value >= 300 is 350.
+        assert_eq!(BinColumn::new(vec![0, 350, 1], 400).first_ge(300), Some(350));
+        // U32: first value >= 70_000 is 70_000.
+        assert_eq!(
+            BinColumn::new(vec![0, 70_000, 1], 80_000).first_ge(70_000),
+            Some(70_000)
+        );
+        // None when every element is below the bound.
+        assert_eq!(BinColumn::new(vec![0, 1, 2, 3], 256).first_ge(4), None);
     }
 
     #[test]
