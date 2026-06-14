@@ -464,6 +464,45 @@ pub fn construct_histograms_parallel_f32_on<R: cubecl::Runtime>(
 #[cfg(feature = "rocm")]
 const HIST_LDS_MAX: usize = 512;
 
+/// Row-partition (`grid_dim_y` analog) tuning — spike-007 (`.planning/spikes/007-*`).
+/// The LDS build launches one cube per feature; on a large leaf that is only
+/// `num_features` workgroups, starving the GPU (gfx1100 = 96 CUs). Splitting a feature's
+/// rows across `P` cubes raises occupancy. Spike measured a stable **1.3–1.4×** at
+/// `P=16` (~8 workgroups/CU); **`P=32` over-partitioned and regressed**, so `P` is a tuned
+/// target, never a maximize.
+///
+/// `ROWPART_MIN_LEAF`: below this leaf-row count, `P=1` (byte-identical to the pre-row-part
+/// kernel). Well above the `RESIDENT_MIN_NUM_DATA=12_000` resident gate and the ≤8k-row
+/// parity-test shapes, so every existing parity test runs the unchanged `P=1` path — the
+/// large-leaf f32 divergence the spike found (4e-7→~2e-5 rel) only appears above this gate.
+#[cfg(feature = "rocm")]
+const ROWPART_MIN_LEAF: usize = 256_000;
+/// ~8 workgroups × 96 CUs (gfx1100). Total target cubes across all features.
+#[cfg(feature = "rocm")]
+const ROWPART_TARGET_CUBES: u32 = 768;
+/// Spike-007 sweet spot; clamp so we never over-partition into the P=32 regression.
+#[cfg(feature = "rocm")]
+const ROWPART_P_MAX: u32 = 16;
+
+/// Row partitions `P` for the LDS build: `clamp(target_cubes / num_features, 1, P_MAX)` on
+/// large leaves, else `1`. `LGBM_ROWPART_MIN` overrides the leaf threshold (benching). Pure
+/// CPU logic — no device handle — so it is unit-testable without a GPU.
+#[cfg(feature = "rocm")]
+fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
+    let min_leaf = std::env::var("LGBM_ROWPART_MIN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(ROWPART_MIN_LEAF);
+    if num_features == 0 || leaf_rows < min_leaf {
+        return 1;
+    }
+    let nf = num_features as u32;
+    if nf >= ROWPART_TARGET_CUBES {
+        return 1;
+    }
+    (ROWPART_TARGET_CUBES / nf).clamp(1, ROWPART_P_MAX)
+}
+
 /// PARALLEL f32 histogram with LDS-PRIVATIZED sub-histograms — the contention-
 /// reducing GPU path (260609-f8u, eo5 Finding #2).
 ///
@@ -671,15 +710,17 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
 
     let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
     if max_w <= HIST_LDS_MAX as u32 {
-        // LDS-privatized per-feature path: ONE cube per feature, 256 units each.
+        // LDS-privatized per-feature path: `P` cubes per feature (row-partitioned, spike-007),
+        // 256 units each. P=1 on small/medium leaves ⇒ byte-identical to the prior launch.
+        let p = row_partition_count(num_features, rows);
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
-        // SAFETY: handles sized to their slices; cube f reads gathered_bins[f*R..]
+        // SAFETY: handles sized to their slices; cube (f,p) reads gathered_bins[f*R..]
         // and writes only its slot region; bin < num_bin <= 256 keeps LDS/out indices
         // in range. cubecl unsafe confined here (CMP-01).
         unsafe {
             construct_leaf_hist_batched_lds_kernel::launch(
                 client,
-                CubeCount::Static(num_features as u32, 1, 1),
+                CubeCount::Static(num_features as u32, p, 1),
                 CubeDim::new_1d(256),
                 ArrayArg::from_raw_parts(h_bins, num_features * rows),
                 ArrayArg::from_raw_parts(h_g, rows),
@@ -852,15 +893,21 @@ pub fn construct_leaf_hist_resident_lds_kernel(
         c += cd;
     }
     sync_cube();
-    // 2. scatter the leaf's rows for THIS feature into LDS (resident on-device gather).
+    // 2. scatter THIS partition's strided rows into LDS (resident on-device gather).
+    //    Row-partitioned (260615 phase-09 / spike-007): `CubeCount = (num_features, P)`, so
+    //    cube `(f, p)` owns row-slice `p*cd, +P*cd, …`. P comes from `CUBE_COUNT_Y`; P=1
+    //    (the small/medium gate) reduces this to the prior `k=UNIT_POS, stride cd` loop
+    //    byte-for-byte. All P cubes of feature f atomic-merge into the same global slot
+    //    (step 3), so the split is additive and order-free.
     let col = f * num_data;
-    let mut k = UNIT_POS as usize;
+    let stride = CUBE_COUNT_Y as usize * cd;
+    let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
     while k < r {
         let bin = resident_bins[col + leaf_rows[k] as usize] as usize;
         let ti = bin * 2;
         sub[ti].fetch_add(ord_g[k]);
         sub[ti + 1].fetch_add(ord_h[k]);
-        k += cd;
+        k += stride;
     }
     sync_cube();
     // 3. merge LDS → this feature's global slot.
@@ -895,13 +942,16 @@ pub fn construct_leaf_hist_batched_lds_kernel(
         c += cd;
     }
     sync_cube();
+    // Row-partitioned scatter (260615 phase-09): cube `(f, p)` strides row-slice
+    // `p*cd, +P*cd, …`; P=`CUBE_COUNT_Y`. P=1 reduces to the prior `k=UNIT_POS, stride cd`.
     let fbase = f * r;
-    let mut k = UNIT_POS as usize;
+    let stride = CUBE_COUNT_Y as usize * cd;
+    let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
     while k < r {
         let ti = gathered_bins[fbase + k] as usize * 2;
         sub[ti].fetch_add(ord_g[k]);
         sub[ti + 1].fetch_add(ord_h[k]);
-        k += cd;
+        k += stride;
     }
     sync_cube();
     let mut m = UNIT_POS as usize;
@@ -956,16 +1006,20 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
     let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
 
     if max_w <= HIST_LDS_MAX as u32 {
-        // LDS per-feature path: ONE cube per feature, 256 units each.
+        // LDS per-feature path: `P` cubes per feature (row-partitioned, spike-007), 256 units
+        // each. P=1 on small/medium leaves ⇒ byte-identical to the prior one-cube-per-feature
+        // launch. The grid's y-dim carries P; each cube of feature f atomic-merges into the
+        // same global slot (additive).
+        let p = row_partition_count(num_features, rows);
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
         // SAFETY: resident_bins sized num_features*num_data; h_rows/h_g/h_h sized rows;
-        // h_slot sized num_features+1; h_out sized slot_len. Cube f reads only its
+        // h_slot sized num_features+1; h_out sized slot_len. Cube (f,p) reads only its
         // feature's column + slot region; bin < num_bin <= 256 keeps LDS/out indices
         // in range. All cubecl unsafe is confined here (CMP-01).
         unsafe {
             construct_leaf_hist_resident_lds_kernel::launch(
                 client,
-                CubeCount::Static(num_features as u32, 1, 1),
+                CubeCount::Static(num_features as u32, p, 1),
                 CubeDim::new_1d(256),
                 ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
                 ArrayArg::from_raw_parts(h_rows, rows),
@@ -2002,5 +2056,29 @@ mod tests {
                 if expected == 8 && actual == 4),
             "expected LengthMismatch{{8,4}}, got {err:?}"
         );
+    }
+
+    /// The row-partition heuristic (spike-007): 1 on small/few-feature shapes (so the
+    /// build stays byte-identical to the pre-row-part kernel), a tuned P in [2, P_MAX]
+    /// on large-leaf × few-feature shapes, never exceeding P_MAX (the P=32 regression
+    /// guard). Pure CPU logic — no GPU. Assumes `LGBM_ROWPART_MIN` is unset (default).
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn row_partition_count_heuristic() {
+        use super::{row_partition_count, ROWPART_MIN_LEAF, ROWPART_P_MAX, ROWPART_TARGET_CUBES};
+        // Small leaf → P=1 (covers the ≤8k-row parity-test shapes + the 12k resident gate).
+        assert_eq!(row_partition_count(50, 8_000), 1);
+        assert_eq!(row_partition_count(50, ROWPART_MIN_LEAF - 1), 1);
+        // Degenerate / already-saturated → 1.
+        assert_eq!(row_partition_count(0, 10_000_000), 1);
+        assert_eq!(row_partition_count(ROWPART_TARGET_CUBES as usize, ROWPART_MIN_LEAF), 1);
+        assert_eq!(row_partition_count(ROWPART_TARGET_CUBES as usize + 50, ROWPART_MIN_LEAF), 1);
+        // Large leaf + few features → tuned P, clamped, never > P_MAX.
+        let p = row_partition_count(50, ROWPART_MIN_LEAF);
+        assert!((2..=ROWPART_P_MAX).contains(&p), "P={p} out of [2,{ROWPART_P_MAX}]");
+        assert_eq!(p, (ROWPART_TARGET_CUBES / 50).clamp(1, ROWPART_P_MAX));
+        // Very few features clamp to P_MAX (768/1, 768/2 both ≥ 16).
+        assert_eq!(row_partition_count(1, ROWPART_MIN_LEAF), ROWPART_P_MAX);
+        assert_eq!(row_partition_count(2, ROWPART_MIN_LEAF), ROWPART_P_MAX);
     }
 }
