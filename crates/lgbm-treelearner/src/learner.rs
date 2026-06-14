@@ -35,6 +35,7 @@
 use lgbm_compute::error::ComputeError;
 use lgbm_compute::gain::{calculate_splitted_leaf_output, GainConfig};
 use lgbm_compute::{Backend, BatchedSplitFeature};
+pub use lgbm_compute::BinColumn;
 use lgbm_compute::ComputeClientReexport as ComputeClient;
 use lgbm_dataset::bin_mapper::{BinType, MissingType};
 use lgbm_model::Tree;
@@ -84,9 +85,13 @@ const K_MIN_SCORE: f64 = f64::NEG_INFINITY;
 /// the caller (or the capture harness) supplies these directly.
 #[derive(Debug, Clone)]
 pub struct FeatureColumn {
-    /// Per-GLOBAL-ROW bin index (the `u32`-widened `Bin::data(row)`), length
-    /// `num_data`. The histogram/partition ops index this by row id.
-    pub bins: Vec<u32>,
+    /// Per-GLOBAL-ROW bin index, length `num_data`, stored in the NARROWEST
+    /// unsigned type for `num_bin` (spike 004 — [`BinColumn`]). The hot histogram
+    /// fold reads the narrow type directly per-width; cold readers
+    /// (partition/bagging/validation/scatter/GPU upload) go through the widening
+    /// [`BinColumn::bin`] / [`BinColumn::iter_u32`] / [`BinColumn::to_u32_vec`]
+    /// accessors. The bin VALUE is unchanged ⇒ bit-exact.
+    pub bins: BinColumn,
     /// C++ `num_bin` — this feature's bin count (the histogram has `2*num_bin`
     /// cells).
     pub num_bin: u32,
@@ -140,7 +145,7 @@ impl Default for FeatureColumn {
     /// want the `bin_type: Numerical` default without restating it.
     fn default() -> Self {
         Self {
-            bins: Vec::new(),
+            bins: BinColumn::U32(Vec::new()),
             num_bin: 0,
             offset: 0,
             min_bin: 0,
@@ -509,7 +514,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             .features
             .iter()
             .map(|f| {
-                let bins: Vec<u32> = in_bag.iter().map(|&r| f.bins[r as usize]).collect();
+                // Re-gather the in-bag rows PRESERVING the narrow width (the subset
+                // column keeps the same BinColumn variant). `in_bag` is `&[i32]`;
+                // widen to u32 for the gather row ids.
+                let rows: Vec<u32> = in_bag.iter().map(|&r| r as u32).collect();
+                let bins = f.bins.gather(&rows);
                 FeatureColumn {
                     bins,
                     ..f.clone()
@@ -553,7 +562,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             .features
             .iter()
             .map(|f| {
-                let bins: Vec<u32> = in_bag.iter().map(|&r| f.bins[r as usize]).collect();
+                // Re-gather the in-bag rows PRESERVING the narrow width (the subset
+                // column keeps the same BinColumn variant). `in_bag` is `&[i32]`;
+                // widen to u32 for the gather row ids.
+                let rows: Vec<u32> = in_bag.iter().map(|&r| r as u32).collect();
+                let bins = f.bins.gather(&rows);
                 FeatureColumn {
                     bins,
                     ..f.clone()
@@ -716,7 +729,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // is its authoritative precondition source; the two sites cross-reference
             // via `BinIndexOutOfRange`. Do NOT remove or weaken this loop: it is the
             // relocated mitigation, not a redundant check.
-            for &b in &f.bins {
+            // Read via the widening iterator — width selection guarantees the bin
+            // VALUE FITS the narrow type, but the `bin < num_bin` VALUE check must
+            // STILL run (a u8 column can hold a value >= a num_bin that is < 256).
+            // This gate is the relocated T-04-01 mitigation — do NOT weaken it.
+            for b in f.bins.iter_u32() {
                 if b >= f.num_bin {
                     return Err(TreeLearnerError::BinIndexOutOfRange {
                         index: b,
@@ -781,7 +798,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // are immutable for the whole train, so upload once here (not per tree); the
         // backend instance persists across trees (booster.rs constructs it per
         // train() call, outside the GBDT iter loop).
-        let upload_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
+        // Widen each narrow column to u32 ONCE here (cold) for the GPU upload — the
+        // Rocm path is byte-unchanged (it uploads a u32 resident buffer). The
+        // CpuBackend default is a no-op, so the owned u32 Vecs are dropped.
+        let upload_owned: Vec<Vec<u32>> = features.iter().map(|f| f.bins.to_u32_vec()).collect();
+        let upload_bins: Vec<&[u32]> = upload_owned.iter().map(Vec::as_slice).collect();
         self.backend.upload_resident_bins(self.client, &upload_bins);
 
         let mut pool = HistogramPool::new(self.num_leaves, slot_len);
@@ -1684,7 +1705,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // BATCHED per-leaf histogram build (260608-lad): the backend builds ALL
         // features' RAW histograms in one call (CPU: the per-feature gather+construct
         // loop, bit-exact; GPU: one batched kernel launch + device-resident bins).
-        let feature_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
+        let feature_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
         // R3 (260614-p0n): the per-feature `num_bin` descriptor is identical on every
         // leaf build (the feature set is fixed per train). Fill the learner-held
         // scratch lazily on the first build (it survives `with_features`) or whenever
@@ -1772,7 +1793,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return Ok(());
         }
         let leaf_rows = data_partition.indices_in_leaf(leaf);
-        let feature_bins: Vec<&[u32]> = features.iter().map(|f| f.bins.as_slice()).collect();
+        let feature_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
         let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
         // fix_feats: per-feature (slot_off, num_bin, offset, most_freq_bin) — the SAME
         // values the host fix_histogram (most_freq_bin) + compact_histogram (offset)
@@ -3347,7 +3368,7 @@ mod tests {
     /// bins (neg) from high bins (pos) so a positive-gain split exists.
     fn splittable_feature() -> (FeatureColumn, Vec<f32>, Vec<f32>) {
         // rows 0..7 -> bins 0,0,1,1,2,2,3,3 (2 rows per bin).
-        let bins = vec![0u32, 0, 1, 1, 2, 2, 3, 3];
+        let bins = BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3], 4);
         let gradients = vec![-5.0f32, -5.0, -4.0, -4.0, 4.0, 4.0, 5.0, 5.0];
         let hessians = vec![1.0f32; 8];
         let f = FeatureColumn {
@@ -3432,7 +3453,7 @@ mod tests {
         let client = cpu_client();
         // num_bin = 3, but the last row's bin is 3 (== num_bin, out of range).
         let f = FeatureColumn {
-            bins: vec![0u32, 1, 3],
+            bins: BinColumn::new(vec![0u32, 1, 3], 3),
             num_bin: 3,
             offset: 0,
             min_bin: 0,
@@ -3466,7 +3487,7 @@ mod tests {
         // 8 rows. f0 bins increasing; f1 bins increasing but gradient arranged so
         // f1's best unconstrained split is "decreasing" (left output > right).
         let f0 = FeatureColumn {
-            bins: vec![0u32, 0, 1, 1, 2, 2, 3, 3],
+            bins: BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3], 4),
             num_bin: 4,
             offset: 0,
             min_bin: 0,
@@ -3479,7 +3500,7 @@ mod tests {
             ..Default::default()
         };
         let f1 = FeatureColumn {
-            bins: vec![0u32, 1, 2, 3, 0, 1, 2, 3],
+            bins: BinColumn::new(vec![0u32, 1, 2, 3, 0, 1, 2, 3], 4),
             real_feature_index: 1,
             ..f0.clone()
         };
@@ -3837,7 +3858,7 @@ mod tests {
         // (c) a no-positive-gain synthetic (uniform gradient -> flat histogram)
         //     yields a single-leaf tree (best.gain <= 0 break).
         let flat = FeatureColumn {
-            bins: vec![0u32, 1, 2, 3],
+            bins: BinColumn::new(vec![0u32, 1, 2, 3], 4),
             num_bin: 4,
             offset: 0,
             min_bin: 0,
@@ -3932,7 +3953,7 @@ mod tests {
         // (bin 0 is the NaN dummy). most_freq_bin==0 -> offset 1.
         // Categories: cat 10 (bin1), cat 20 (bin2), cat 30 (bin3).
         // rows: cat10,cat10,cat10,cat10 (neg grad) | cat20..,cat30.. (pos grad).
-        let bins = vec![1u32, 1, 1, 1, 2, 2, 3, 3];
+        let bins = BinColumn::new(vec![1u32, 1, 1, 1, 2, 2, 3, 3], 4);
         let gradients = vec![-5.0f32, -5.0, -5.0, -5.0, 4.0, 4.0, 5.0, 5.0];
         let hessians = vec![1.0f32; 8];
         let f = FeatureColumn {

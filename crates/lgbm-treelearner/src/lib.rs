@@ -48,7 +48,7 @@ pub use fix_histogram::fix_histogram;
 pub use forced_splits::{parse_forced_splits, ForcedSplitError, ForcedSplitNode};
 pub use histogram_pool::HistogramPool;
 pub use leaf_splits::LeafSplits;
-pub use learner::{BuildStrategy, FeatureColumn, LearnerConstraints, SerialTreeLearner};
+pub use learner::{BinColumn, BuildStrategy, FeatureColumn, LearnerConstraints, SerialTreeLearner};
 pub use monotone_constraints::{BasicConstraint, MonotoneConstraints};
 pub use resident_pool::resident_eligible;
 pub use split_info::{split_gt, SplitInfo};

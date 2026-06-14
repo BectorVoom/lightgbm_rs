@@ -33,6 +33,7 @@ use lgbm_objective::{
     Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, Xentropy,
 };
 use lgbm_treelearner::learner::FeatureColumn;
+use lgbm_treelearner::BinColumn;
 use lgbm_treelearner::{offset_for_most_freq_bin, SerialTreeLearner};
 
 use crate::error::LgbmError;
@@ -221,7 +222,7 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
             .map(|(idx, _)| idx as u32)
             .unwrap_or(0);
         columns.push(FeatureColumn {
-            bins,
+            bins: BinColumn::new(bins, num_bin),
             num_bin,
             offset: offset_for_most_freq_bin(most_freq_bin),
             min_bin: 0,
@@ -491,7 +492,7 @@ pub fn build_feature_columns_from_raw(
         let bin_to_category = mapper.bin_2_categorical_.clone();
 
         columns.push(FeatureColumn {
-            bins,
+            bins: BinColumn::new(bins, num_bin),
             num_bin,
             offset: offset_for_most_freq_bin(most_freq_bin),
             // Single-feature group: the feature owns bins [0, num_bin-1].

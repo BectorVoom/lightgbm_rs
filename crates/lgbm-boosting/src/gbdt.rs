@@ -758,7 +758,7 @@ impl<'a> Gbdt<'a> {
                             .unwrap_or(0);
                         let mut v = vec![0.0f64; width];
                         for f in features {
-                            v[f.real_feature_index as usize] = f.bins[row as usize] as f64;
+                            v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
                         }
                         v
                     };
@@ -1174,7 +1174,7 @@ impl<'a> Gbdt<'a> {
                 .unwrap_or(0);
             let mut v = vec![0.0f64; width];
             for f in features {
-                v[f.real_feature_index as usize] = f.bins[row as usize] as f64;
+                v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
             }
             v
         };
@@ -1305,7 +1305,7 @@ impl<'a> Gbdt<'a> {
             .unwrap_or(0);
         let mut v = vec![0.0f64; width];
         for f in &self.features {
-            v[f.real_feature_index as usize] = f.bins[row as usize] as f64;
+            v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
         }
         v
     }
@@ -1681,6 +1681,7 @@ mod tests {
     use lgbm_compute::runtime::cpu_client;
     use lgbm_dataset::bin_mapper::MissingType;
     use lgbm_treelearner::learner::FeatureColumn;
+    use lgbm_treelearner::BinColumn;
 
     /// A tiny 2-feature corpus that produces a real (>1-leaf) split, mirroring the
     /// learner_parity spine shape. 8 rows, 2 binary-ish features.
@@ -1690,7 +1691,7 @@ mod tests {
         // offset=0 for a most_freq_bin==0 feature mis-routes the partition.
         let off0 = lgbm_treelearner::offset_for_most_freq_bin(0);
         let f0 = FeatureColumn {
-            bins: vec![0, 0, 0, 0, 1, 1, 1, 1],
+            bins: BinColumn::new(vec![0, 0, 0, 0, 1, 1, 1, 1], 2),
             num_bin: 2,
             offset: off0,
             min_bin: 0,
@@ -1703,7 +1704,7 @@ mod tests {
             ..Default::default()
         };
         let f1 = FeatureColumn {
-            bins: vec![0, 0, 1, 1, 0, 0, 1, 1],
+            bins: BinColumn::new(vec![0, 0, 1, 1, 0, 0, 1, 1], 2),
             num_bin: 2,
             offset: off0,
             min_bin: 0,
@@ -1989,12 +1990,12 @@ mod tests {
         let (features, _l, cfg) = corpus();
         // 12 distinct-gradient rows so GOSS has a non-degenerate top-k threshold.
         let f0 = FeatureColumn {
-            bins: vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+            bins: BinColumn::new(vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1], features[0].num_bin),
             real_feature_index: 0,
             ..features[0].clone()
         };
         let f1 = FeatureColumn {
-            bins: vec![0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+            bins: BinColumn::new(vec![0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1], features[1].num_bin),
             real_feature_index: 1,
             ..features[1].clone()
         };
@@ -2147,12 +2148,12 @@ mod tests {
     fn dart_corpus() -> (Vec<FeatureColumn>, Vec<f32>, GainConfig) {
         let (features, _l, cfg) = corpus();
         let f0 = FeatureColumn {
-            bins: vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+            bins: BinColumn::new(vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1], features[0].num_bin),
             real_feature_index: 0,
             ..features[0].clone()
         };
         let f1 = FeatureColumn {
-            bins: vec![0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+            bins: BinColumn::new(vec![0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1], features[1].num_bin),
             real_feature_index: 1,
             ..features[1].clone()
         };

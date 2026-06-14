@@ -23,6 +23,7 @@
 
 use lgbm_compute::error::ComputeError;
 use lgbm_compute::Backend;
+use lgbm_compute::BinColumn;
 // `ComputeClient` is re-exported by the compute seam (CMP-01) so this crate names
 // the Backend ops' client argument without ever depending on `cubecl` directly.
 use lgbm_compute::ComputeClientReexport as ComputeClient;
@@ -110,7 +111,7 @@ impl DataPartition {
         client: &ComputeClient<B::Runtime>,
         leaf: i32,
         right_leaf: i32,
-        feature_bins: &[u32],
+        feature_bins: &BinColumn,
         num_bin: u32,
         min_bin: u32,
         max_bin: u32,
@@ -122,11 +123,13 @@ impl DataPartition {
         let count = self.leaf_count[leaf_u] as usize;
 
         // Gather the leaf's per-row bins in the current `indices_` order so the
-        // Backend op's stable reorder is RELATIVE to this leaf's row order.
+        // Backend op's stable reorder is RELATIVE to this leaf's row order. The
+        // per-row bin READ widens via the accessor; the partition LOGIC is
+        // unchanged.
         let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
         let leaf_feature_bins: Vec<u32> = leaf_rows
             .iter()
-            .map(|&row| feature_bins[row as usize])
+            .map(|&row| feature_bins.bin(row as usize))
             .collect();
 
         // The Backend op owns the SplitInner routing + stable two-pass gather.
@@ -181,7 +184,7 @@ impl DataPartition {
         &mut self,
         leaf: i32,
         right_leaf: i32,
-        feature_bins: &[u32],
+        feature_bins: &BinColumn,
         cat_bitset_real: &[u32],
         bin_to_category: &[i32],
     ) -> (i32, i32) {
@@ -193,7 +196,7 @@ impl DataPartition {
         let mut lte: Vec<u32> = Vec::with_capacity(count); // left / in-bitset
         let mut gt: Vec<u32> = Vec::with_capacity(count); // right / default
         for &row in &leaf_rows {
-            let bin = feature_bins[row as usize];
+            let bin = feature_bins.bin(row as usize);
             let cat = bin_to_category
                 .get(bin as usize)
                 .copied()
@@ -267,7 +270,7 @@ mod tests {
         let client = cpu_client();
         let mut dp = DataPartition::new(8, 4);
         // bins per row; threshold=3 -> bin<=3 left, bin>3 right (num_bin=8).
-        let feature_bins = vec![1u32, 5, 3, 7, 0, 4, 2, 6];
+        let feature_bins = BinColumn::new(vec![1u32, 5, 3, 7, 0, 4, 2, 6], 8);
         let (left, right) = dp
             .split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8)
             .expect("split ok");
@@ -289,7 +292,7 @@ mod tests {
         let backend = CpuBackend;
         let client = cpu_client();
         let mut dp = DataPartition::new(8, 4);
-        let feature_bins = vec![1u32, 5, 3, 7, 0, 4, 2, 6];
+        let feature_bins = BinColumn::new(vec![1u32, 5, 3, 7, 0, 4, 2, 6], 8);
         dp.split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8)
             .unwrap();
         // Now split leaf 1 (rows 1,3,5,7 with bins 5,7,4,6) at threshold 5:

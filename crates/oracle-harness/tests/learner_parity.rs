@@ -26,6 +26,7 @@ use lgbm_compute::{runtime::cpu_client, Backend, CpuBackend};
 use lgbm_dataset::bin_mapper::MissingType;
 use lgbm_model::Tree;
 use lgbm_treelearner::learner::{BuildStrategy, FeatureColumn, SerialTreeLearner};
+use lgbm_treelearner::BinColumn;
 use oracle_harness::comparator::compare_exact_f64_bits;
 
 /// The committed learner golden directory — TRACKED under the oracle-harness
@@ -231,7 +232,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
     let hess = vec![1.0f32; 12];
 
     let f0 = FeatureColumn {
-        bins: vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        bins: BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], 6),
         num_bin: 6,
         offset: lgbm_treelearner::offset_for_most_freq_bin(0),
         min_bin: 0,
@@ -244,7 +245,7 @@ fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
         ..Default::default()
     };
     let f1 = FeatureColumn {
-        bins: vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3],
+        bins: BinColumn::new(vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3], 4),
         num_bin: 4,
         offset: lgbm_treelearner::offset_for_most_freq_bin(0),
         min_bin: 0,
@@ -334,15 +335,15 @@ fn learner_parity_subtract() {
     let num_data = g.len();
 
     // Parent (all rows) histogram for feature 0.
-    let all_bins: Vec<u32> = (0..num_data).map(|i| f.bins[i]).collect();
+    let all_bins: Vec<u32> = (0..num_data).map(|i| f.bins.bin(i)).collect();
     let parent = backend
         .construct_histograms(&client, &all_bins, &g, &h, f.num_bin)
         .expect("parent hist");
 
     // Split feature 0 at threshold 2 (bins {0,1,2} left, {3,4,5} right).
     // SMALLER child = whichever has fewer rows; here both have 6, so pick left.
-    let left_rows: Vec<usize> = (0..num_data).filter(|&i| f.bins[i] <= 2).collect();
-    let right_rows: Vec<usize> = (0..num_data).filter(|&i| f.bins[i] > 2).collect();
+    let left_rows: Vec<usize> = (0..num_data).filter(|&i| f.bins.bin(i) <= 2).collect();
+    let right_rows: Vec<usize> = (0..num_data).filter(|&i| f.bins.bin(i) > 2).collect();
     let smaller_rows = if left_rows.len() <= right_rows.len() {
         &left_rows
     } else {
@@ -354,14 +355,14 @@ fn learner_parity_subtract() {
         &left_rows
     };
 
-    let sm_bins: Vec<u32> = smaller_rows.iter().map(|&i| f.bins[i]).collect();
+    let sm_bins: Vec<u32> = smaller_rows.iter().map(|&i| f.bins.bin(i)).collect();
     let sm_g: Vec<f32> = smaller_rows.iter().map(|&i| g[i]).collect();
     let sm_h: Vec<f32> = smaller_rows.iter().map(|&i| h[i]).collect();
     let smaller = backend
         .construct_histograms(&client, &sm_bins, &sm_g, &sm_h, f.num_bin)
         .expect("smaller hist");
 
-    let lg_bins: Vec<u32> = larger_rows.iter().map(|&i| f.bins[i]).collect();
+    let lg_bins: Vec<u32> = larger_rows.iter().map(|&i| f.bins.bin(i)).collect();
     let lg_g: Vec<f32> = larger_rows.iter().map(|&i| g[i]).collect();
     let lg_h: Vec<f32> = larger_rows.iter().map(|&i| h[i]).collect();
     let larger_direct = backend
@@ -387,7 +388,7 @@ fn learner_parity_missing_routing() {
 
     // 8 rows, 4 bins, most_freq_bin = 1 (so FixHistogram reconstructs bin 1).
     let f = FeatureColumn {
-        bins: vec![0u32, 1, 1, 1, 2, 2, 3, 3],
+        bins: BinColumn::new(vec![0u32, 1, 1, 1, 2, 2, 3, 3], 4),
         num_bin: 4,
         offset: lgbm_treelearner::offset_for_most_freq_bin(1),
         min_bin: 0,
@@ -554,7 +555,7 @@ fn col_sampler_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, 
     let make = |bins: Vec<u32>, num_bin: u32, real: i32| -> FeatureColumn {
         let upper: Vec<f64> = (0..num_bin).map(|b| b as f64 + 0.5).collect();
         FeatureColumn {
-            bins,
+            bins: BinColumn::new(bins, num_bin),
             num_bin,
             offset: lgbm_treelearner::offset_for_most_freq_bin(0),
             min_bin: 0,
@@ -711,7 +712,7 @@ fn parse_real_gh(text: &str) -> Vec<GhCorpus> {
                     let bins = parse_u32_semi(field(&bt_tokens, "bins").unwrap_or(""));
                     let upper = parse_f64_bits_semi(field(&bt_tokens, "upper").unwrap_or(""));
                     features.push(FeatureColumn {
-                        bins,
+                        bins: BinColumn::new(bins, num_bin),
                         num_bin,
                         offset: lgbm_treelearner::offset_for_most_freq_bin(most_freq_bin),
                         min_bin,
@@ -805,7 +806,7 @@ fn row_feature_values(features: &[FeatureColumn], row: usize) -> Vec<f64> {
         .max(0) as usize;
     let mut fv = vec![0.0f64; width];
     for f in features {
-        let bin = f.bins[row] as usize;
+        let bin = f.bins.bin(row) as usize;
         let val = f
             .bin_upper_bound
             .get(bin)
@@ -1022,7 +1023,7 @@ fn single_feature_corpus(
 ) -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
     let hess = vec![1.0f32; grad.len()];
     let f0 = FeatureColumn {
-        bins,
+        bins: BinColumn::new(bins, num_bin),
         num_bin,
         offset: lgbm_treelearner::offset_for_most_freq_bin(most_freq_bin),
         min_bin: 0,
@@ -1442,7 +1443,7 @@ fn cat_corpus(
 ) -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainConfig, i32, i32) {
     let hess = vec![1.0f32; s.grad.len()];
     let f0 = FeatureColumn {
-        bins: s.bins.clone(),
+        bins: BinColumn::new(s.bins.clone(), s.num_bin),
         num_bin: s.num_bin,
         offset: lgbm_treelearner::offset_for_most_freq_bin(s.most_freq_bin),
         min_bin: 0,
@@ -1784,7 +1785,7 @@ fn con_corpus(s: &ConSidecar) -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, GainCo
         .iter()
         .enumerate()
         .map(|(fi, f)| FeatureColumn {
-            bins: f.bins.clone(),
+            bins: BinColumn::new(f.bins.clone(), f.num_bin),
             num_bin: f.num_bin,
             offset: lgbm_treelearner::offset_for_most_freq_bin(f.most_freq_bin),
             min_bin: 0,
@@ -1984,7 +1985,7 @@ mod hip {
                 .collect();
             let upper: Vec<f64> = (0..num_bin).map(|b| b as f64 + 0.5).collect();
             features.push(FeatureColumn {
-                bins,
+                bins: BinColumn::new(bins, num_bin),
                 num_bin,
                 offset: lgbm_treelearner::offset_for_most_freq_bin(0),
                 min_bin: 0,

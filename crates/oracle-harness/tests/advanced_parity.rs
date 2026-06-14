@@ -27,6 +27,7 @@ use lgbm_dataset::bin_mapper::MissingType;
 use lgbm_model::model_text::load;
 use lgbm_objective::Objective;
 use lgbm_treelearner::learner::FeatureColumn;
+use lgbm_treelearner::BinColumn;
 
 const LR: f64 = 0.1;
 // f32-vs-f64 accumulation tolerance for refit leaf outputs (the CPU f64-fold anchor
@@ -136,7 +137,7 @@ fn feature_columns(sidecar: &AdvSidecar) -> Vec<FeatureColumn> {
         .iter()
         .enumerate()
         .map(|(fi, f)| FeatureColumn {
-            bins: f.bins.clone(),
+            bins: BinColumn::new(f.bins.clone(), f.num_bin),
             num_bin: f.num_bin,
             offset: lgbm_treelearner::offset_for_most_freq_bin(f.most_freq_bin),
             min_bin: 0,

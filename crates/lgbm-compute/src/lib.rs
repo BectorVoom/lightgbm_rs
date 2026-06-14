@@ -30,6 +30,138 @@ use cubecl::prelude::ComputeClient;
 /// `lgbm_compute::ComputeClient`).
 pub use cubecl::prelude::ComputeClient as ComputeClientReexport;
 
+/// A feature column's per-row bin indices, stored in the NARROWEST unsigned type
+/// for its `num_bin` (spike 004 — columnar narrow bins). Faithful to C++
+/// `DenseBin<uint8_t>` / `<uint16_t>` / `<uint32_t>`, which picks the narrowest
+/// bin type per feature so the hot histogram gather+fold is cache-dense.
+///
+/// Defined HERE (the lowest crate, which owns the [`Backend`] trait + the hot
+/// fold) and re-exported from `lgbm-treelearner` (`lgbm-treelearner` depends on
+/// `lgbm-compute`, NOT vice versa — putting this in `lgbm-treelearner` and
+/// importing it here would be a dependency CYCLE).
+///
+/// The bin VALUE is unchanged — only stored narrower and widened at read time —
+/// so the f64 histogram fold order + values are byte-identical and the tree stays
+/// bit-exact. The HOT CPU fold reads the narrow type DIRECTLY per-width
+/// (monomorphic match, no per-element width branch in the row loop); COLD readers
+/// (partition, bagging, validation, scatter, GPU upload) go through the widening
+/// [`bin`](BinColumn::bin) / [`iter_u32`](BinColumn::iter_u32) /
+/// [`to_u32_vec`](BinColumn::to_u32_vec) accessors.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BinColumn {
+    /// `num_bin <= 256` — the default `max_bin=255` common case (carries the win).
+    U8(Vec<u8>),
+    /// `256 < num_bin <= 65536`.
+    U16(Vec<u16>),
+    /// `num_bin > 65536`.
+    U32(Vec<u32>),
+}
+
+impl BinColumn {
+    /// Build the narrowest-typed column for `num_bin`: `u8` if `num_bin <= 256`,
+    /// `u16` if `num_bin <= 65536`, else `u32`. Width is selected by `num_bin`
+    /// (the type's capacity), NOT by the observed max value — so
+    /// `new(vec![0,1], 256)` is `U8` even though the max is 1, mirroring C++
+    /// `DenseBin<VAL_T>` (the bin TYPE is fixed by the feature's bin count).
+    ///
+    /// The once-per-train bin-range gate (the authoritative `bin < num_bin` VALUE
+    /// check, `lgbm-treelearner` learner.rs) runs upstream of any tree growth, so
+    /// width selection only needs the cast to be loss-free: a `debug_assert!`
+    /// guards that each bin FITS the chosen narrow type (the truncation /
+    /// memory-safety concern, T-ruz-01), which always holds because the type is
+    /// sized to `num_bin`'s capacity. We do NOT assert `bin < num_bin` here — that
+    /// is the gate's job, and a deliberately-edge value equal to `num_bin` is a
+    /// valid input to construct (it is rejected later by the gate, not by `new`).
+    #[must_use]
+    pub fn new(bins: Vec<u32>, num_bin: u32) -> Self {
+        if num_bin <= 256 {
+            BinColumn::U8(
+                bins.into_iter()
+                    .map(|b| {
+                        debug_assert!(b <= u32::from(u8::MAX), "bin {b} does not fit u8 width");
+                        b as u8
+                    })
+                    .collect(),
+            )
+        } else if num_bin <= 65536 {
+            BinColumn::U16(
+                bins.into_iter()
+                    .map(|b| {
+                        debug_assert!(b <= u32::from(u16::MAX), "bin {b} does not fit u16 width");
+                        b as u16
+                    })
+                    .collect(),
+            )
+        } else {
+            BinColumn::U32(bins)
+        }
+    }
+
+    /// Read row `row`'s bin index, WIDENED to `u32` (the cold-reader accessor).
+    /// Identical to the prior `Vec<u32>` index read for every variant.
+    #[inline]
+    #[must_use]
+    pub fn bin(&self, row: usize) -> u32 {
+        match self {
+            BinColumn::U8(v) => u32::from(v[row]),
+            BinColumn::U16(v) => u32::from(v[row]),
+            BinColumn::U32(v) => v[row],
+        }
+    }
+
+    /// The number of rows in the column.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            BinColumn::U8(v) => v.len(),
+            BinColumn::U16(v) => v.len(),
+            BinColumn::U32(v) => v.len(),
+        }
+    }
+
+    /// Whether the column has no rows.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Re-gather the column at `rows` (each a global row id), PRESERVING the same
+    /// width as `self` — the bagging-subset gather keeps the narrow storage.
+    #[must_use]
+    pub fn gather(&self, rows: &[u32]) -> BinColumn {
+        match self {
+            BinColumn::U8(v) => BinColumn::U8(rows.iter().map(|&r| v[r as usize]).collect()),
+            BinColumn::U16(v) => BinColumn::U16(rows.iter().map(|&r| v[r as usize]).collect()),
+            BinColumn::U32(v) => BinColumn::U32(rows.iter().map(|&r| v[r as usize]).collect()),
+        }
+    }
+
+    /// Widen the WHOLE column to a `Vec<u32>` (cold; used only by the GPU upload
+    /// and parity-test asserts). Round-trips: `new(v, nb).to_u32_vec() == v`.
+    #[must_use]
+    pub fn to_u32_vec(&self) -> Vec<u32> {
+        match self {
+            BinColumn::U8(v) => v.iter().map(|&b| u32::from(b)).collect(),
+            BinColumn::U16(v) => v.iter().map(|&b| u32::from(b)).collect(),
+            BinColumn::U32(v) => v.clone(),
+        }
+    }
+
+    /// Iterate the column widened to `u32` (the once-per-train bin-range gate +
+    /// most-freq scans). Avoids materializing a `Vec<u32>`.
+    pub fn iter_u32(&self) -> impl Iterator<Item = u32> + '_ {
+        // Box the per-variant iterator so all three arms share one return type.
+        let it: Box<dyn Iterator<Item = u32> + '_> = match self {
+            BinColumn::U8(v) => Box::new(v.iter().map(|&b| u32::from(b))),
+            BinColumn::U16(v) => Box::new(v.iter().map(|&b| u32::from(b))),
+            BinColumn::U32(v) => Box::new(v.iter().copied()),
+        };
+        it
+    }
+}
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
@@ -228,7 +360,7 @@ pub trait Backend {
     fn build_leaf_histograms_raw(
         &self,
         _client: &ComputeClient<Self::Runtime>,
-        feature_bins: &[&[u32]],
+        feature_bins: &[&BinColumn],
         num_bins: &[u32],
         slot_off: &[usize],
         slot_len: usize,
@@ -258,6 +390,13 @@ pub trait Backend {
         // only a `debug_assert!`. The f64 fold ORDER is byte-identical to
         // `construct_histograms_cpu_native` — ascending `leaf_rows`, grad at `bin<<1`,
         // hess at `+1`, f32-read -> f64-accumulate — so the bit-exact gate holds.
+        //
+        // SPIKE 004: the bin column is NARROW ([`BinColumn`], u8/u16/u32). Dispatch
+        // on the width ONCE per feature (OUTSIDE the row loop) so each arm is a
+        // MONOMORPHIC tight loop reading the narrow element directly — the
+        // cache-density win lives here (no per-element width branch / accessor in the
+        // hot loop). The fold ORDER and the `bin as usize * 2` index arithmetic are
+        // IDENTICAL across arms and identical to the prior u32 path ⇒ bit-exact.
         let max_cells = num_bins
             .iter()
             .copied()
@@ -270,16 +409,48 @@ pub trait Backend {
             for c in scratch[..cells].iter_mut() {
                 *c = 0.0;
             }
-            for (k, &row) in leaf_rows.iter().enumerate() {
-                let bin = bins[row as usize];
-                debug_assert!(
-                    bin < num_bin,
-                    "bin {bin} >= num_bin {num_bin} — caller must establish the \
-                     bin-range invariant once per train (T-04-01 relocation)"
-                );
-                let ti = bin as usize * 2;
-                scratch[ti] += f64::from(ord_g[k]);
-                scratch[ti + 1] += f64::from(ord_h[k]);
+            // Per-width monomorphic fold: one tight loop per BinColumn arm. The
+            // closure-free `match` ensures no per-iteration width dispatch.
+            match bins {
+                BinColumn::U8(v) => {
+                    for (k, &row) in leaf_rows.iter().enumerate() {
+                        let bin = v[row as usize] as usize;
+                        debug_assert!(
+                            (bin as u32) < num_bin,
+                            "bin {bin} >= num_bin {num_bin} — caller must establish the \
+                             bin-range invariant once per train (T-04-01 relocation)"
+                        );
+                        let ti = bin * 2;
+                        scratch[ti] += f64::from(ord_g[k]);
+                        scratch[ti + 1] += f64::from(ord_h[k]);
+                    }
+                }
+                BinColumn::U16(v) => {
+                    for (k, &row) in leaf_rows.iter().enumerate() {
+                        let bin = v[row as usize] as usize;
+                        debug_assert!(
+                            (bin as u32) < num_bin,
+                            "bin {bin} >= num_bin {num_bin} — caller must establish the \
+                             bin-range invariant once per train (T-04-01 relocation)"
+                        );
+                        let ti = bin * 2;
+                        scratch[ti] += f64::from(ord_g[k]);
+                        scratch[ti + 1] += f64::from(ord_h[k]);
+                    }
+                }
+                BinColumn::U32(v) => {
+                    for (k, &row) in leaf_rows.iter().enumerate() {
+                        let bin = v[row as usize] as usize;
+                        debug_assert!(
+                            (bin as u32) < num_bin,
+                            "bin {bin} >= num_bin {num_bin} — caller must establish the \
+                             bin-range invariant once per train (T-04-01 relocation)"
+                        );
+                        let ti = bin * 2;
+                        scratch[ti] += f64::from(ord_g[k]);
+                        scratch[ti + 1] += f64::from(ord_h[k]);
+                    }
+                }
             }
             out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&scratch[..cells]);
         }
@@ -428,7 +599,7 @@ pub trait Backend {
         &self,
         _client: &ComputeClient<Self::Runtime>,
         _slot: usize,
-        _feature_bins: &[&[u32]],
+        _feature_bins: &[&BinColumn],
         _num_bins: &[u32],
         _slot_off: &[usize],
         _slot_len: usize,
@@ -900,7 +1071,7 @@ impl Backend for RocmBackend {
     fn build_leaf_histograms_raw(
         &self,
         client: &ComputeClient<Self::Runtime>,
-        feature_bins: &[&[u32]],
+        feature_bins: &[&BinColumn],
         _num_bins: &[u32],
         slot_off: &[usize],
         slot_len: usize,
@@ -909,6 +1080,9 @@ impl Backend for RocmBackend {
         hessians: &[f32],
     ) -> Result<Vec<f64>, ComputeError> {
         // L1 device-resident path: gather on device from the cached column buffer.
+        // The kernel input is byte-IDENTICAL to HEAD — residency uses the u32 buffer
+        // uploaded once by `upload_resident_bins`, so the narrow `feature_bins` is
+        // not even consulted here.
         if let Some(resident) = self.resident_bins.borrow().as_ref() {
             return kernels::histogram::build_leaf_histograms_resident_f32_on(
                 client,
@@ -923,10 +1097,13 @@ impl Backend for RocmBackend {
             );
         }
         // Defensive fallback: no resident cache (upload_resident_bins not called) —
-        // the original per-leaf host-gather batched launcher.
+        // widen each narrow column to u32 ONCE (cold) so the host-gather batched
+        // launcher sees the SAME byte-identical u32 input as HEAD.
+        let widened: Vec<Vec<u32>> = feature_bins.iter().map(|c| c.to_u32_vec()).collect();
+        let widened_refs: Vec<&[u32]> = widened.iter().map(Vec::as_slice).collect();
         kernels::histogram::build_leaf_histograms_batched_f32_on(
             client,
-            feature_bins,
+            &widened_refs,
             slot_off,
             slot_len,
             leaf_rows,
@@ -988,7 +1165,7 @@ impl Backend for RocmBackend {
         &self,
         client: &ComputeClient<Self::Runtime>,
         slot: usize,
-        _feature_bins: &[&[u32]],
+        _feature_bins: &[&BinColumn],
         _num_bins: &[u32],
         slot_off: &[usize],
         slot_len: usize,
@@ -1159,5 +1336,90 @@ impl Backend for RocmBackend {
         }
         mirror[slot] = Some(handle);
         Ok(splits)
+    }
+}
+
+#[cfg(test)]
+mod bin_column_tests {
+    use super::BinColumn;
+
+    #[test]
+    fn width_selected_by_num_bin_boundaries() {
+        // num_bin 256 -> U8 (the inclusive upper edge of u8 capacity).
+        assert!(matches!(BinColumn::new(vec![0, 1, 255], 256), BinColumn::U8(_)));
+        // num_bin 257 -> U16 (one past u8 capacity).
+        assert!(matches!(BinColumn::new(vec![0, 256], 257), BinColumn::U16(_)));
+        // num_bin 65536 -> U16 (the inclusive upper edge of u16 capacity).
+        assert!(matches!(BinColumn::new(vec![0, 65535], 65536), BinColumn::U16(_)));
+        // num_bin 65537 -> U32 (one past u16 capacity).
+        assert!(matches!(BinColumn::new(vec![0, 65536], 65537), BinColumn::U32(_)));
+    }
+
+    #[test]
+    fn width_selected_by_num_bin_not_observed_max() {
+        // max == 1 but num_bin == 256 still selects U8 (type fixed by bin count).
+        assert!(matches!(BinColumn::new(vec![0, 1], 256), BinColumn::U8(_)));
+        // max == 1 but num_bin == 300 selects U16.
+        assert!(matches!(BinColumn::new(vec![0, 1], 300), BinColumn::U16(_)));
+    }
+
+    #[test]
+    fn len_and_bin_widen_per_variant() {
+        let u8c = BinColumn::new(vec![0, 1, 255], 256);
+        assert_eq!(u8c.len(), 3);
+        assert_eq!(u8c.bin(2), 255u32);
+
+        let u16c = BinColumn::new(vec![0, 300], 300);
+        assert_eq!(u16c.bin(1), 300u32);
+
+        let u32c = BinColumn::new(vec![0, 70_000], 70_000);
+        assert_eq!(u32c.bin(1), 70_000u32);
+    }
+
+    #[test]
+    fn is_empty_reports_empty_column() {
+        assert!(BinColumn::U32(Vec::new()).is_empty());
+        assert!(!BinColumn::new(vec![0], 256).is_empty());
+    }
+
+    #[test]
+    fn gather_preserves_width() {
+        let u8c = BinColumn::new(vec![5, 6, 7, 8], 256);
+        let g = u8c.gather(&[3, 1]);
+        assert!(matches!(g, BinColumn::U8(_)));
+        assert_eq!(g.to_u32_vec(), vec![8, 6]);
+
+        let u16c = BinColumn::new(vec![5, 6, 7, 8], 300);
+        let g16 = u16c.gather(&[0, 2]);
+        assert!(matches!(g16, BinColumn::U16(_)));
+        assert_eq!(g16.to_u32_vec(), vec![5, 7]);
+
+        let u32c = BinColumn::new(vec![5, 6, 7, 8], 70_000);
+        let g32 = u32c.gather(&[2, 0]);
+        assert!(matches!(g32, BinColumn::U32(_)));
+        assert_eq!(g32.to_u32_vec(), vec![7, 5]);
+    }
+
+    #[test]
+    fn to_u32_vec_round_trips_all_widths() {
+        for (v, nb) in [
+            (vec![0u32, 1, 255], 256u32),
+            (vec![0u32, 1, 300], 301),
+            (vec![0u32, 1, 70_000], 70_001),
+        ] {
+            assert_eq!(BinColumn::new(v.clone(), nb).to_u32_vec(), v);
+        }
+    }
+
+    #[test]
+    fn iter_u32_matches_to_u32_vec() {
+        for (v, nb) in [
+            (vec![0u32, 5, 255], 256u32),
+            (vec![0u32, 5, 300], 301),
+            (vec![0u32, 5, 70_000], 70_001),
+        ] {
+            let c = BinColumn::new(v.clone(), nb);
+            assert_eq!(c.iter_u32().collect::<Vec<u32>>(), v);
+        }
     }
 }
