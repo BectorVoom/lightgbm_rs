@@ -22,6 +22,13 @@
 pub struct GradientDiscretizer {
     num_grad_quant_bins: i32,
     is_constant_hessian: bool,
+    /// `stochastic_rounding` (C++ default TRUE). When set, rounding adds a per-row random
+    /// `∈ [0,1)` (sign-aware) instead of `0.5` — unbiased over the ensemble. Functionally
+    /// faithful to C++ but NOT bit-matched (C++ uses a precomputed mt19937 sequence); the
+    /// DETERMINISTIC path (`stochastic = false`) is the C++ parity gate (phase-10 W4).
+    stochastic: bool,
+    /// Reproducible xorshift64 state (seeded) so `deterministic=true` stochastic runs repeat.
+    rng_state: u64,
     // Set per iteration by `discretize`.
     grad_scale: f64,
     hess_scale: f64,
@@ -47,6 +54,8 @@ impl GradientDiscretizer {
         Self {
             num_grad_quant_bins,
             is_constant_hessian,
+            stochastic: false,
+            rng_state: 0,
             grad_scale: 0.0,
             hess_scale: 0.0,
             inv_grad_scale: 0.0,
@@ -54,6 +63,18 @@ impl GradientDiscretizer {
             max_grad_abs: 0.0,
             max_hess_abs: 0.0,
         }
+    }
+
+    /// Stochastic-rounding discretizer (C++ `stochastic_rounding=true`, its default): rounding
+    /// adds a per-row random ∈ [0,1) instead of 0.5. `seed` makes it reproducible. NOT bit-matched
+    /// to C++ (different RNG) — use [`Self::new`] (deterministic) for the C++ parity gate.
+    #[must_use]
+    pub fn new_stochastic(num_grad_quant_bins: i32, is_constant_hessian: bool, seed: u64) -> Self {
+        let mut d = Self::new(num_grad_quant_bins, is_constant_hessian);
+        d.stochastic = true;
+        // xorshift64 must never start at 0; mix the seed so 0 is a valid caller seed.
+        d.rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        d
     }
 
     #[must_use]
@@ -105,12 +126,20 @@ impl GradientDiscretizer {
 
         let mut out = vec![0i8; 2 * n];
         for i in 0..n {
-            out[2 * i + 1] = quantize_signed(f64::from(grad[i]), self.inv_grad_scale);
+            // Rounding bias: deterministic 0.5, or a per-row random ∈ [0,1) for stochastic
+            // rounding (separate grad/hess draws, mirroring C++'s two random-value arrays).
+            let (bg, bh) = if self.stochastic {
+                (next_u01(&mut self.rng_state), next_u01(&mut self.rng_state))
+            } else {
+                (0.5, 0.5)
+            };
+            let g = f64::from(grad[i]) * self.inv_grad_scale;
+            out[2 * i + 1] = (if grad[i] >= 0.0 { g + bg } else { g - bg }) as i8;
             out[2 * i] = if self.is_constant_hessian {
                 1
             } else {
-                // hessian is non-negative; C++ always adds +0.5 (no sign branch).
-                (f64::from(hess[i]) * self.inv_hess_scale + 0.5) as i8
+                // hessian is non-negative; C++ adds the (positive) bias, no sign branch.
+                (f64::from(hess[i]) * self.inv_hess_scale + bh) as i8
             };
         }
         out
@@ -178,15 +207,17 @@ pub fn construct_int_histogram(
     out
 }
 
-/// Sign-aware deterministic quantization (`gradient_discretizer.cpp:145-147`):
-/// `g >= 0 ? trunc(g*inv + 0.5) : trunc(g*inv - 0.5)`. Rust `as i8` truncates toward zero
-/// for in-range values (matching C++ `static_cast<int8_t>`) and saturates out-of-range
-/// (C++ is UB there; valid `num_grad_quant_bins` keep values in range).
+/// Reproducible xorshift64 → `[0, 1)` for stochastic rounding (seeded, so `deterministic=true`
+/// stochastic runs repeat). Not C++'s mt19937 sequence — the deterministic path is the parity gate.
 #[inline]
-fn quantize_signed(value: f64, inv_scale: f64) -> i8 {
-    let scaled = value * inv_scale;
-    let biased = if value >= 0.0 { scaled + 0.5 } else { scaled - 0.5 };
-    biased as i8
+fn next_u01(state: &mut u64) -> f64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    // Top 53 bits → a uniform double in [0, 1).
+    (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
 #[cfg(test)]
@@ -255,6 +286,49 @@ mod tests {
     fn empty_input_is_safe() {
         let mut d = GradientDiscretizer::new(4, true);
         assert!(d.discretize(&[], &[]).is_empty());
+    }
+
+    // ---- W6: stochastic rounding ----
+
+    /// Same seed → identical output (reproducible under `deterministic=true`).
+    #[test]
+    fn stochastic_is_reproducible_per_seed() {
+        let grad: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) * 0.013).collect();
+        let hess = vec![1.0f32; 200];
+        let mut a = GradientDiscretizer::new_stochastic(16, true, 42);
+        let mut b = GradientDiscretizer::new_stochastic(16, true, 42);
+        assert_eq!(a.discretize(&grad, &hess), b.discretize(&grad, &hess));
+        let mut c = GradientDiscretizer::new_stochastic(16, true, 43);
+        assert_ne!(a.discretize(&grad, &hess), c.discretize(&grad, &hess), "different seed differs");
+    }
+
+    /// Unbiasedness: an OFF-grid gradient stochastically rounded over many rows de-quantizes
+    /// to ~the true value (the rounding noise averages out), whereas DETERMINISTIC rounding
+    /// is biased to the nearest grid point. Coarse bins (4) magnify the effect.
+    #[test]
+    fn stochastic_rounding_is_unbiased() {
+        // Two ±1.0 rows fix max|g|=1 → grad_scale 0.5 (grid points at multiples of 0.5). The
+        // bulk value 0.3 sits OFF-grid (scaled = 0.6): deterministic biases it up to the 0.5
+        // grid point; stochastic rounds to 1 w.p. 0.6 / 0 w.p. 0.4 → de-quant averages ~0.3.
+        let n = 20_002;
+        let mut grad = vec![0.3f32; n];
+        grad[0] = 1.0;
+        grad[1] = -1.0;
+        let hess = vec![1.0f32; n];
+        let bulk = 2..n; // the off-grid 0.3 rows
+
+        let mut det = GradientDiscretizer::new(4, true);
+        let qd = det.discretize(&grad, &hess);
+        let det_sum: i64 = bulk.clone().map(|i| i64::from(qd[2 * i + 1])).sum();
+        let det_mean = det.dequantize_grad(det_sum) / (n - 2) as f64;
+
+        let mut sto = GradientDiscretizer::new_stochastic(4, true, 7);
+        let qs = sto.discretize(&grad, &hess);
+        let sto_sum: i64 = bulk.map(|i| i64::from(qs[2 * i + 1])).sum();
+        let sto_mean = sto.dequantize_grad(sto_sum) / (n - 2) as f64;
+
+        assert!((det_mean - 0.5).abs() < 1e-9, "deterministic biases to the grid point: {det_mean}");
+        assert!((sto_mean - 0.3).abs() < 0.01, "stochastic should be ~unbiased: {sto_mean}");
     }
 
     // ---- Wave 2: integer histogram ----

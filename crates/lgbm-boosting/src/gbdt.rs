@@ -33,12 +33,22 @@ use lgbm_treelearner::{FeatureColumn, GradientDiscretizer, SerialTreeLearner};
 /// W3b). `is_constant_hessian` is inferred from the buffer (L2 → constant, binary/etc → varies)
 /// so no objective surgery is needed. Each row's grad/hess is replaced by `int8 × scale` (f32),
 /// the quantized value the learner then builds histograms from. Deterministic rounding only.
-fn quantize_grad_hess_in_place(grad: &mut [f32], hess: &mut [f32], num_grad_quant_bins: i32) {
+fn quantize_grad_hess_in_place(
+    grad: &mut [f32],
+    hess: &mut [f32],
+    num_grad_quant_bins: i32,
+    stochastic: bool,
+    seed: u64,
+) {
     if grad.is_empty() {
         return;
     }
     let is_constant_hessian = hess.iter().all(|&h| h == hess[0]);
-    let mut d = GradientDiscretizer::new(num_grad_quant_bins, is_constant_hessian);
+    let mut d = if stochastic {
+        GradientDiscretizer::new_stochastic(num_grad_quant_bins, is_constant_hessian, seed)
+    } else {
+        GradientDiscretizer::new(num_grad_quant_bins, is_constant_hessian)
+    };
     let q = d.discretize(grad, hess); // i8 pairs [hess, grad]
     let (gs, hs) = (d.grad_scale(), d.hess_scale());
     for i in 0..grad.len() {
@@ -257,6 +267,9 @@ pub struct Gbdt<'a> {
     use_quantized_grad: bool,
     /// `config_->num_grad_quant_bins` (MUST be ≤254 for the i8 discretized storage).
     num_grad_quant_bins: i32,
+    /// `config_->stochastic_rounding` (C++ default true). Functional (seeded, reproducible);
+    /// the deterministic path is the C++ parity gate. Used only if `use_quantized_grad`.
+    quant_stochastic: bool,
 }
 
 /// One per-iteration snapshot for the layered goldens: the per-row g/h written
@@ -334,17 +347,24 @@ impl<'a> Gbdt<'a> {
             features: Vec::new(),
             use_quantized_grad: false,
             num_grad_quant_bins: 4,
+            quant_stochastic: false,
         }
     }
 
     /// Enable the opt-in `use_quantized_grad` APPROXIMATE training mode (phase-10): each
-    /// iteration's gradients/hessians are quantized to int8 (deterministic rounding) before
-    /// the learner. `num_grad_quant_bins` MUST be ≤254 (i8 storage). The default exact path
-    /// is unaffected unless this is called with `enabled = true`.
+    /// iteration's gradients/hessians are quantized to int8 before the learner. `num_grad_quant_bins`
+    /// MUST be ≤254 (i8 storage). `stochastic` selects stochastic rounding (C++ default) vs
+    /// deterministic (the C++ parity gate). The default exact path is unaffected unless `enabled`.
     #[must_use]
-    pub fn with_quantized_grad(mut self, enabled: bool, num_grad_quant_bins: i32) -> Self {
+    pub fn with_quantized_grad(
+        mut self,
+        enabled: bool,
+        num_grad_quant_bins: i32,
+        stochastic: bool,
+    ) -> Self {
         self.use_quantized_grad = enabled;
         self.num_grad_quant_bins = num_grad_quant_bins;
+        self.quant_stochastic = stochastic;
         self
     }
 
@@ -681,10 +701,15 @@ impl<'a> Gbdt<'a> {
         if self.use_quantized_grad {
             for cur_tree_id in 0..k as usize {
                 let off = cur_tree_id * nd;
+                // Per-(iter, class) seed: stochastic rounding varies each tree yet repeats for a
+                // fixed run (deterministic=true reproducibility).
+                let seed = ((self.iter as u64) << 20) ^ (cur_tree_id as u64) ^ 0x5170_2010;
                 quantize_grad_hess_in_place(
                     &mut gradients[off..off + nd],
                     &mut hessians[off..off + nd],
                     self.num_grad_quant_bins,
+                    self.quant_stochastic,
+                    seed,
                 );
             }
         }
