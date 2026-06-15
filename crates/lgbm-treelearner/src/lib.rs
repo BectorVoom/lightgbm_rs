@@ -30,6 +30,7 @@ pub mod phase_prof;
 pub mod feature_histogram_categorical;
 pub mod fix_histogram;
 pub mod forced_splits;
+pub mod gradient_discretizer;
 pub mod histogram_pool;
 pub mod leaf_splits;
 pub mod learner;
@@ -46,6 +47,7 @@ pub use feature_histogram_categorical::{
 };
 pub use fix_histogram::fix_histogram;
 pub use forced_splits::{parse_forced_splits, ForcedSplitError, ForcedSplitNode};
+pub use gradient_discretizer::GradientDiscretizer;
 pub use histogram_pool::HistogramPool;
 pub use leaf_splits::LeafSplits;
 pub use learner::{BinColumn, BuildStrategy, FeatureColumn, LearnerConstraints, SerialTreeLearner};
