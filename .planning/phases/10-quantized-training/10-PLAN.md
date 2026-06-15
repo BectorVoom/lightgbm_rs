@@ -41,9 +41,19 @@ a SEPARATE mode with its OWN parity contract:
   fits int16, else int32. Avoids int16 overflow on large leaves.
 - De-quant: bin sums (int) × scale → f64 grad/hess sums for split gain.
 
+## Wave status (2026-06-15)
+
+- **W1 ✅** GradientDiscretizer core (53cc4a1) — 5 tests
+- **W2 ✅** integer histogram + de-quant (9af04f7) — 3 tests
+- **W3a ✅** config knobs + e2e split pipeline (0328f6a) — recovers exact split @ <5% gain
+- **W4 ✅ (oracle set up)** C++ quantized goldens + harness (112dcc2); comparison `#[ignore]` pending W3b
+- **W3b ⬜ NEXT** production GBDT-loop/backend wiring — activates the W4 parity gate
+- **W5 ⬜** GPU packed-int kernel + speed · **W6 ⬜** stochastic rounding + renew_leaf
+- Discovery: `num_grad_quant_bins ≤ 254` (i8 storage; 256 overflows → constant model)
+
 ## Waves
 
-### Wave 1 — GradientDiscretizer core (CPU, deterministic) ← THIS SESSION
+### Wave 1 — GradientDiscretizer core (CPU, deterministic) ✅ DONE
 `crates/lgbm-treelearner/src/gradient_discretizer.rs`. Pure numeric core:
 - `grad_scale`/`hess_scale` from max-abs (constant-hessian branch).
 - Deterministic quantize f32 grad/hess → i8 pairs `[hess, grad]` (sign-aware ±0.5, the verbatim
