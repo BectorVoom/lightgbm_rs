@@ -65,6 +65,12 @@ pred_exact = exact_model.predict(X)
 pathlib.Path(__file__).with_name("quant_binary.pred_exact").write_text(
     "".join(f"{p:.17g}\n" for p in pred_exact))
 
+# Quantized WITH leaf renewal — for the renew-effect delta check.
+renew_model = lgb.train({**params, "quant_train_renew_leaf": True},
+                        lgb.Dataset(X, label=y), num_boost_round=NUM_ROUND)
+pathlib.Path(__file__).with_name("quant_binary.pred_renew").write_text(
+    "".join(f"{p:.17g}\n" for p in renew_model.predict(X)))
+
 golden = {
     "_about": "LightGBM 4.6 use_quantized_grad=True, stochastic_rounding=False golden (phase-10 W4)",
     "lightgbm_version": lgb.__version__,

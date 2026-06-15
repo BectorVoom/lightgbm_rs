@@ -57,6 +57,18 @@ fn quantize_grad_hess_in_place(
     }
 }
 
+/// Soft-threshold for the L1-regularized leaf output (C++ `Common::ThresholdL1`): shrink the
+/// gradient sum toward 0 by `l1`. For `l1 == 0` it is the identity (the common case).
+fn threshold_l1(sum_grad: f64, l1: f64) -> f64 {
+    if sum_grad > l1 {
+        sum_grad - l1
+    } else if sum_grad < -l1 {
+        sum_grad + l1
+    } else {
+        0.0
+    }
+}
+
 use crate::error::BoostingError;
 use crate::objective::BoostObjective;
 use crate::sample_strategy::{BaggingSampleStrategy, GossSampleStrategy};
@@ -270,6 +282,13 @@ pub struct Gbdt<'a> {
     /// `config_->stochastic_rounding` (C++ default true). Functional (seeded, reproducible);
     /// the deterministic path is the C++ parity gate. Used only if `use_quantized_grad`.
     quant_stochastic: bool,
+    /// `config_->quant_train_renew_leaf`. After a quantized tree's structure is built, recompute
+    /// its leaf outputs from the ORIGINAL (non-quantized) gradients — `RenewIntGradTreeOutput`.
+    /// Used only if `use_quantized_grad`.
+    quant_renew_leaf: bool,
+    /// `lambda_l1` / `lambda_l2` for the renewed-leaf formula `-ThresholdL1(ΣG,l1)/(ΣH+l2)`.
+    quant_l1: f64,
+    quant_l2: f64,
 }
 
 /// One per-iteration snapshot for the layered goldens: the per-row g/h written
@@ -348,7 +367,21 @@ impl<'a> Gbdt<'a> {
             use_quantized_grad: false,
             num_grad_quant_bins: 4,
             quant_stochastic: false,
+            quant_renew_leaf: false,
+            quant_l1: 0.0,
+            quant_l2: 0.0,
         }
+    }
+
+    /// Enable `quant_train_renew_leaf`: after each quantized tree is grown, recompute its leaf
+    /// outputs from the ORIGINAL gradients via `-ThresholdL1(ΣG,l1)/(ΣH+l2)`. No-op unless
+    /// `use_quantized_grad` is also on. `l1`/`l2` are `lambda_l1`/`lambda_l2`.
+    #[must_use]
+    pub fn with_quant_renew_leaf(mut self, enabled: bool, l1: f64, l2: f64) -> Self {
+        self.quant_renew_leaf = enabled;
+        self.quant_l1 = l1;
+        self.quant_l2 = l2;
+        self
     }
 
     /// Enable the opt-in `use_quantized_grad` APPROXIMATE training mode (phase-10): each
@@ -698,6 +731,14 @@ impl<'a> Gbdt<'a> {
         // Runs AFTER GetGradients + bagging/GOSS amplification (mirroring C++ DiscretizeGradients
         // at the start of the learner's Train), and only here — the exact path never enters this
         // branch. Deterministic rounding only (stochastic is W6).
+        // Preserve the ORIGINAL (non-quantized) grad/hess for leaf renewal (quant_train_renew_leaf)
+        // — the in-place quantization below would otherwise overwrite them.
+        let orig_grad_hess: Option<(Vec<f32>, Vec<f32>)> =
+            if self.use_quantized_grad && self.quant_renew_leaf {
+                Some((gradients.clone(), hessians.clone()))
+            } else {
+                None
+            };
         if self.use_quantized_grad {
             for cur_tree_id in 0..k as usize {
                 let off = cur_tree_id * nd;
@@ -907,6 +948,27 @@ impl<'a> Gbdt<'a> {
                             obj.renew_leaf_output(&residuals, &leaf_labels)
                         }),
                     );
+                }
+                // Quantized leaf renewal (quant_train_renew_leaf, phase-10 W6): recompute each
+                // leaf output from the ORIGINAL gradients (RenewIntGradTreeOutput). Mutually
+                // exclusive-in-practice with the objective renew above (that is regression_l1;
+                // quantized renew is the gradient-sum formula). Full-corpus path only.
+                if self.quant_renew_leaf {
+                    if let Some((og, oh)) = orig_grad_hess.as_ref() {
+                        let (l1, l2) = (self.quant_l1, self.quant_l2);
+                        learner.renew_tree_output(
+                            &mut tree,
+                            &partition,
+                            Some(|_leaf: i32, rows: &[u32]| {
+                                let (mut sg, mut sh) = (0.0f64, 0.0f64);
+                                for &row in rows {
+                                    sg += f64::from(og[offset + row as usize]);
+                                    sh += f64::from(oh[offset + row as usize]);
+                                }
+                                -threshold_l1(sg, l1) / (sh + l2)
+                            }),
+                        );
+                    }
                 }
                 // Shrinkage BEFORE UpdateScore.
                 tree.shrinkage(shrink_rate);

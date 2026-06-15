@@ -147,6 +147,56 @@ fn rust_quantized_train_matches_cpp() {
     );
 }
 
+/// W6: leaf renewal (`quant_train_renew_leaf`) recomputes leaf outputs from the original
+/// gradients. Verify the Rust renew EFFECT (renew vs no-renew) matches C++'s in magnitude —
+/// the same delta-gate logic as the quantization effect (isolates the feature from the
+/// pre-existing RawCorpus exact-path gap).
+#[test]
+fn rust_quant_renew_leaf_matches_cpp_effect() {
+    use lgbm::{train_raw, Config, RawCorpus, TrainingBuilder};
+
+    let (rows, labels) = read_xy();
+    let mut cfg: Config = TrainingBuilder::new()
+        .objective("binary").num_iterations(10).learning_rate(0.1)
+        .num_leaves(7).min_data_in_leaf(5).seed(1).deterministic(true)
+        .build().unwrap();
+    cfg.max_bin = 63;
+    cfg.num_threads = 1;
+    cfg.force_row_wise = true;
+    cfg.feature_pre_filter = false;
+    cfg.use_quantized_grad = true;
+    cfg.num_grad_quant_bins = 128;
+    cfg.stochastic_rounding = false;
+
+    let pred_q: Vec<f32> = train_raw(&cfg, &RawCorpus::new(rows.clone(), labels.clone()))
+        .unwrap().predict(&rows).iter().map(|r| r[0]).collect();
+    let mut cfg_r = cfg.clone();
+    cfg_r.quant_train_renew_leaf = true;
+    let pred_qr: Vec<f32> = train_raw(&cfg_r, &RawCorpus::new(rows.clone(), labels))
+        .unwrap().predict(&rows).iter().map(|r| r[0]).collect();
+
+    let rust_eff = pred_qr.iter().zip(pred_q.iter())
+        .map(|(a, b)| f64::from((*a - *b).abs()))
+        .fold((0.0f64, 0.0f64), |(mx, sm), d| (mx.max(d), sm + d));
+    let (re_max, re_mean) = (rust_eff.0, rust_eff.1 / pred_q.len() as f64);
+
+    let cpp_q = read_preds();
+    let cpp_r = read_named_preds("quant_binary.pred_renew");
+    let cpp_eff = cpp_r.iter().zip(cpp_q.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold((0.0f64, 0.0f64), |(mx, sm), d| (mx.max(d), sm + d));
+    let (ce_max, ce_mean) = (cpp_eff.0, cpp_eff.1 / cpp_q.len() as f64);
+    eprintln!("RENEW EFFECT  Rust |renew-quant|: max={re_max:.3e} mean={re_mean:.3e}");
+    eprintln!("RENEW EFFECT  C++  |renew-quant|: max={ce_max:.3e} mean={ce_mean:.3e}");
+
+    // Renew must (a) actually change predictions and (b) in C++'s regime (small refinement).
+    assert!(re_max > 1e-6, "renew had no effect — not wired");
+    assert!(
+        re_mean < 5.0 * ce_mean.max(1e-4) && re_max < 5.0 * ce_max.max(1e-3),
+        "Rust renew effect (max={re_max:.3e}) not in C++'s regime (max={ce_max:.3e})"
+    );
+}
+
 fn read_named_preds(name: &str) -> Vec<f64> {
     std::fs::read_to_string(fixture(name))
         .unwrap_or_default()
