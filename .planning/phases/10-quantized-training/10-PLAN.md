@@ -46,10 +46,15 @@ a SEPARATE mode with its OWN parity contract:
 - **W1 ✅** GradientDiscretizer core (53cc4a1) — 5 tests
 - **W2 ✅** integer histogram + de-quant (9af04f7) — 3 tests
 - **W3a ✅** config knobs + e2e split pipeline (0328f6a) — recovers exact split @ <5% gain
-- **W4 ✅ (oracle set up)** C++ quantized goldens + harness (112dcc2); comparison `#[ignore]` pending W3b
-- **W3b ⬜ NEXT** production GBDT-loop/backend wiring — activates the W4 parity gate
+- **W4 ✅** C++ quantized goldens + harness (112dcc2)
+- **W3b ✅** end-to-end CPU quantized training + faithful gate (2e698a5) — quantized mode RUNS;
+  gate active. **CPU quantized training is now functional + gated.**
 - **W5 ⬜** GPU packed-int kernel + speed · **W6 ⬜** stochastic rounding + renew_leaf
-- Discovery: `num_grad_quant_bins ≤ 254` (i8 storage; 256 overflows → constant model)
+- Discoveries: (1) `num_grad_quant_bins ≤ 254` (i8 storage; 256 overflows → constant model).
+  (2) **Pre-existing exact-path gap on fresh CONTINUOUS RawCorpus data** (~0.28 vs C++) —
+  predates phase-10, NOT a quantization issue (isolated via the exact/quant×Rust/C++ 2×2). The
+  faithful gate is the QUANTIZATION DELTA (Rust |quant−exact| ≈ C++ |quant−exact|), which passes.
+  Worth a separate investigation but out of phase-10 scope.
 
 ## Waves
 
