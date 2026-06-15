@@ -34,8 +34,16 @@ pub struct GradientDiscretizer {
 impl GradientDiscretizer {
     /// `num_grad_quant_bins` and the constant-hessian flag are fixed for the run
     /// (`use_quantized_grad` config). Scales are computed per iteration in [`Self::discretize`].
+    /// `num_grad_quant_bins` MUST be ≤ 254: the discretized gradient is `i8` and maps to
+    /// `±bins/2`, so `bins/2` must fit `i8::MAX` (127). C++ overflows silently (UB) and the
+    /// model learns nothing — verified against LightGBM 4.6 (256 → constant model). The
+    /// config default is 4.
     #[must_use]
     pub fn new(num_grad_quant_bins: i32, is_constant_hessian: bool) -> Self {
+        debug_assert!(
+            (1..=254).contains(&num_grad_quant_bins),
+            "num_grad_quant_bins {num_grad_quant_bins} must be in 1..=254 (i8 discretized storage)"
+        );
         Self {
             num_grad_quant_bins,
             is_constant_hessian,

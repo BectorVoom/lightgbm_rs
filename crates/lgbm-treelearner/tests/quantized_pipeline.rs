@@ -46,8 +46,8 @@ fn quantized_pipeline_recovers_exact_split() {
     let th = n as f64;
     let (exact_bin, exact_gain) = best_split(&exact, num_bin, tg, th);
 
-    // Quantized pipeline at 256 levels (spike-008: ~1e-2 rel envelope at this bin count).
-    let mut d = GradientDiscretizer::new(256, true);
+    // Quantized pipeline at 254 levels (max for i8 discretized storage; ~1e-2 rel envelope).
+    let mut d = GradientDiscretizer::new(254, true);
     let q = d.discretize(&grad, &hess);
     let rows: Vec<u32> = (0..n as u32).collect();
     let int_h = construct_int_histogram(&binned, &q, &rows, num_bin as u32);
