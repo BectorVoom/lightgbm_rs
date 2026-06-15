@@ -118,6 +118,56 @@ impl GradientDiscretizer {
     pub fn dequantize_hess(&self, int_hess_sum: i64) -> f64 {
         int_hess_sum as f64 * self.hess_scale
     }
+
+    /// De-quantize a whole integer histogram (`[g0,h0,g1,h1,…]`, even=grad/odd=hess) into the
+    /// f64 stride-2 layout the existing split-finder + `fix_histogram` consume. Per-cell
+    /// `int_sum × scale`. Because scaling distributes over the sum, this equals building an
+    /// f64 histogram from per-row de-quantized values — so the quantized path slots straight
+    /// into the existing downstream with only the build swapped.
+    #[must_use]
+    pub fn dequantize_histogram(&self, int_hist: &[i64]) -> Vec<f64> {
+        int_hist
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if i % 2 == 0 {
+                    v as f64 * self.grad_scale
+                } else {
+                    v as f64 * self.hess_scale
+                }
+            })
+            .collect()
+    }
+}
+
+/// Build the integer histogram (exact i64 grad/hess sums per bin) from a quantized buffer
+/// over `leaf_rows` — the quantized analog of `accumulate_histogram_into` (Wave 2).
+///
+/// `discretized` holds `[hess_i, grad_i]` i8 pairs (from [`GradientDiscretizer::discretize`]):
+/// `discretized[2*row] = hess`, `discretized[2*row + 1] = grad`. `binned[row]` is the row's
+/// bin. Output is interleaved `[g0,h0,g1,h1,…]` of length `2 * num_bin` (grad at `bin*2`, hess
+/// at `bin*2 + 1` — the SAME layout as the exact f64 histogram, so de-quant feeds downstream
+/// unchanged).
+///
+/// i64 accumulation is exact and overflow-free — it equals C++'s int32/int16 histogram VALUE
+/// (the dynamic bit-width in `SetNumBitsInHistogramBin` is a storage/perf choice; the integer
+/// sum is identical whenever the narrow path doesn't overflow, which C++ guarantees by gating).
+#[must_use]
+pub fn construct_int_histogram(
+    binned: &[u32],
+    discretized: &[i8],
+    leaf_rows: &[u32],
+    num_bin: u32,
+) -> Vec<i64> {
+    let mut out = vec![0i64; 2 * num_bin as usize];
+    for &row in leaf_rows {
+        let r = row as usize;
+        let bin = binned[r] as usize;
+        let ti = bin * 2;
+        out[ti] += i64::from(discretized[2 * r + 1]); // grad
+        out[ti + 1] += i64::from(discretized[2 * r]); // hess
+    }
+    out
 }
 
 /// Sign-aware deterministic quantization (`gradient_discretizer.cpp:145-147`):
@@ -197,5 +247,69 @@ mod tests {
     fn empty_input_is_safe() {
         let mut d = GradientDiscretizer::new(4, true);
         assert!(d.discretize(&[], &[]).is_empty());
+    }
+
+    // ---- Wave 2: integer histogram ----
+
+    /// Int histogram sums the quantized grads/hess per bin (grad at bin*2, hess at +1).
+    /// grads [1,-1,0.5,-0.5] (constant hess) at bins=4 → ints [2,-2,1,-1], hess ≡1.
+    /// Place rows in bins [0,0,1,1]: bin0 grad=2+(-2)=0 hess=2 ; bin1 grad=1+(-1)=0 hess=2.
+    #[test]
+    fn int_histogram_sums_per_bin() {
+        let grad = [1.0f32, -1.0, 0.5, -0.5];
+        let hess = [1.0f32; 4];
+        let mut d = GradientDiscretizer::new(4, true);
+        let q = d.discretize(&grad, &hess);
+        let binned = [0u32, 0, 1, 1];
+        let rows = [0u32, 1, 2, 3];
+        let h = construct_int_histogram(&binned, &q, &rows, 2);
+        assert_eq!(h, vec![0, 2, 0, 2]); // [g0,h0,g1,h1]
+    }
+
+    /// Self-consistency: de-quant(Σ int) == Σ (int × scale) built per-row — the property
+    /// that lets the quantized path reuse the exact downstream (scaling distributes over Σ).
+    #[test]
+    fn dequant_histogram_distributes_over_sum() {
+        let grad = [0.7f32, -0.3, 0.9, -0.8, 0.2];
+        let hess = [0.1f32, 0.2, 0.15, 0.25, 0.05];
+        let mut d = GradientDiscretizer::new(16, false);
+        let q = d.discretize(&grad, &hess);
+        let binned = [0u32, 1, 0, 1, 0];
+        let rows = [0u32, 1, 2, 3, 4];
+        let int_h = construct_int_histogram(&binned, &q, &rows, 2);
+        let deq = d.dequantize_histogram(&int_h);
+
+        // Per-row reference: de-quant each row's int grad/hess, accumulate in f64.
+        let mut ref_h = vec![0.0f64; 4];
+        for (k, &row) in rows.iter().enumerate() {
+            let _ = k;
+            let r = row as usize;
+            let b = binned[r] as usize;
+            ref_h[b * 2] += f64::from(q[2 * r + 1]) * d.grad_scale();
+            ref_h[b * 2 + 1] += f64::from(q[2 * r]) * d.hess_scale();
+        }
+        for (a, b) in deq.iter().zip(ref_h.iter()) {
+            assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+        }
+    }
+
+    /// Histogram subtraction still works on int sums (parent − child = sibling), exactly —
+    /// integers subtract without error, so the quantized path keeps the subtraction trick.
+    #[test]
+    fn int_histogram_subtraction_is_exact() {
+        let grad: Vec<f32> = (0..20).map(|i| (i as f32 - 10.0) * 0.1).collect();
+        let hess = vec![1.0f32; 20];
+        let mut d = GradientDiscretizer::new(8, true);
+        let q = d.discretize(&grad, &hess);
+        let binned: Vec<u32> = (0..20).map(|i| (i % 3) as u32).collect();
+        let all: Vec<u32> = (0..20).collect();
+        let left: Vec<u32> = (0..20).filter(|i| i % 2 == 0).collect();
+        let right: Vec<u32> = (0..20).filter(|i| i % 2 == 1).collect();
+        let parent = construct_int_histogram(&binned, &q, &all, 3);
+        let lh = construct_int_histogram(&binned, &q, &left, 3);
+        let rh = construct_int_histogram(&binned, &q, &right, 3);
+        for i in 0..parent.len() {
+            assert_eq!(parent[i] - lh[i], rh[i], "subtraction mismatch at {i}");
+        }
     }
 }
