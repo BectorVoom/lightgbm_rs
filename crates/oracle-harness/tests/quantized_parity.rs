@@ -65,10 +65,10 @@ fn read_xy() -> (Vec<Vec<f64>>, Vec<f32>) {
 }
 
 /// Wave 3b: train the Rust quantized Booster on the golden's corpus with its params and
-/// compare per-row predictions to the C++ `use_quantized_grad` golden. The bound is the
-/// APPROXIMATE-mode contract (spike-008), NOT the exact ~1e-6 anchor: Rust de-quantizes per
-/// row (f32) while C++ de-quantizes the int sum, so a small residual + occasional tie-driven
-/// split divergence is expected and documented here.
+/// compare per-row predictions to the C++ `use_quantized_grad` golden. Asserts BOTH absolute
+/// parity (exact path f32-bit-faithful; quantized within the approximate residual) AND the
+/// quantization-DELTA match. (The earlier ~0.28 absolute gap was a RawCorpus binning-config
+/// footgun — `train_raw`'s config now drives binning — NOT a quantization issue.)
 #[test]
 fn rust_quantized_train_matches_cpp() {
     use lgbm::{train_raw, Config, RawCorpus, TrainingBuilder};
@@ -120,8 +120,14 @@ fn rust_quantized_train_matches_cpp() {
     };
     let (qe_max, qe_mean) = delta(&pred, &golden); // Rust-quant vs C++-quant (absolute)
     let (xe_max, xe_mean) = delta(&pred_exact, &cpp_exact); // Rust-exact vs C++-exact (absolute)
-    eprintln!("Rust-exact vs C++-exact (pre-existing RawCorpus binning gap): max={xe_max:.3e} mean={xe_mean:.3e}");
-    eprintln!("Rust-quant vs C++-quant (absolute, conflates the above):      max={qe_max:.3e} mean={qe_mean:.3e}");
+    eprintln!("Rust-exact vs C++-exact (continuous RawCorpus): max={xe_max:.3e} mean={xe_mean:.3e}");
+    eprintln!("Rust-quant vs C++-quant (absolute):             max={qe_max:.3e} mean={qe_mean:.3e}");
+
+    // ABSOLUTE parity gates — now meaningful since the RawCorpus binning-config footgun is fixed
+    // (train_raw's config drives binning). The exact path is f32-bit-faithful on continuous data;
+    // the quantized model matches C++ to the (approximate) quantization residual.
+    assert!(xe_max < 1e-5, "exact RawCorpus path diverged from C++: max={xe_max:.3e} (f32 gate)");
+    assert!(qe_max < 1e-2, "quantized model diverged from C++ beyond the approximate residual: max={qe_max:.3e}");
 
     // The QUANTIZATION DELTA is the faithful gate: quantization must perturb the Rust model
     // the same way it perturbs C++ (both relative to their own exact model). This isolates the

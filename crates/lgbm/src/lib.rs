@@ -20,7 +20,7 @@ pub use booster::{
     train, train_custom, train_custom_raw_with_metric, train_custom_with_metric, train_raw,
     train_with_valid, Booster, CustomMetricClosure, DenseCorpus, RawCorpus,
 };
-pub use booster::build_feature_columns_from_raw;
+pub use booster::{build_feature_columns_from_raw, build_feature_columns_from_raw_with_config};
 pub use builder::TrainingBuilder;
 pub use error::LgbmError;
 

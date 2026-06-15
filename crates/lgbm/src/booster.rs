@@ -400,6 +400,21 @@ impl RawCorpus {
 pub fn build_feature_columns_from_raw(
     corpus: &RawCorpus,
 ) -> Result<Vec<FeatureColumn>, LgbmError> {
+    // Back-compat shim: bin with the corpus's OWN config. The train paths instead call
+    // `_with_config` with the TRAINING config so a `config` passed to `train_raw`/`train`
+    // is authoritative for binning (max_bin/min_data_in_bin), not silently shadowed by the
+    // `RawCorpus::new` default (the phase-10 RawCorpus-gap root cause).
+    build_feature_columns_from_raw_with_config(corpus, &corpus.config)
+}
+
+/// As [`build_feature_columns_from_raw`] but binning uses the EXPLICIT `bin_config`
+/// (max_bin, min_data_in_bin, use_missing, …) rather than `corpus.config`. Categorical
+/// feature indices still come from the corpus. The train facade passes its training config
+/// here so binning honors the config the caller actually supplied.
+pub fn build_feature_columns_from_raw_with_config(
+    corpus: &RawCorpus,
+    bin_config: &Config,
+) -> Result<Vec<FeatureColumn>, LgbmError> {
     // ---- shape validation BEFORE any binning / indexing (T-08-01-01) ----
     let num_data = corpus.num_data();
     if num_data == 0 {
@@ -443,7 +458,7 @@ pub fn build_feature_columns_from_raw(
         }
     }
 
-    let cfg = &corpus.config;
+    let cfg = bin_config;
     // The pre-filter threshold is OFF by default (no min_data_in_leaf filtering of
     // bins) for the facade — matching the in-memory sample path. The BinMapper
     // builders take care of scaling internally.
@@ -529,7 +544,7 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
     };
     let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
     let metrics = eval_metrics_for(first, config);
-    let features = build_feature_columns_from_raw(corpus)?;
+    let features = build_feature_columns_from_raw_with_config(corpus, config)?;
     train_inner_columns(
         config,
         corpus.num_data() as i32,
@@ -904,7 +919,7 @@ where
         Some(f) => vec![EvalMetric::Custom(f)],
         None => vec![EvalMetric::Reg(Metric::L2)],
     };
-    let features = build_feature_columns_from_raw(corpus)?;
+    let features = build_feature_columns_from_raw_with_config(corpus, config)?;
     train_inner_columns(
         config,
         corpus.num_data() as i32,
