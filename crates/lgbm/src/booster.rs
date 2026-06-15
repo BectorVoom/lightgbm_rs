@@ -1096,6 +1096,9 @@ fn train_inner_columns_full(
         config.boost_from_average,
         None,
     );
+    // Opt-in `use_quantized_grad` APPROXIMATE mode (phase-10): quantizes grad/hess each iter
+    // before the learner. No-op when false (the default) — the exact path is untouched.
+    gbdt = gbdt.with_quantized_grad(config.use_quantized_grad, config.num_grad_quant_bins);
     // DART (BST-05, RESEARCH Pattern 1 — an enum field on Gbdt): `boosting=dart`
     // selects the DART drop+normalize variant. DART subclasses GBDT in C++ and can
     // coexist with bagging (the sample strategy is independent); the spine validates

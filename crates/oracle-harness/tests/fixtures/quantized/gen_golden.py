@@ -55,6 +55,16 @@ model = lgb.train(params, ds, num_boost_round=NUM_ROUND)
 pred = model.predict(X)                       # probability
 raw = model.predict(X, raw_score=True)        # margin (pre-sigmoid)
 
+# Diagnostic companion: the EXACT-mode model on the SAME data/params (quantization off),
+# so the Rust side can isolate "exact-path parity" from "quantization-path parity".
+exact_params = {k: v for k, v in params.items()
+                if k not in ("use_quantized_grad", "num_grad_quant_bins",
+                             "stochastic_rounding", "quant_train_renew_leaf")}
+exact_model = lgb.train(exact_params, lgb.Dataset(X, label=y), num_boost_round=NUM_ROUND)
+pred_exact = exact_model.predict(X)
+pathlib.Path(__file__).with_name("quant_binary.pred_exact").write_text(
+    "".join(f"{p:.17g}\n" for p in pred_exact))
+
 golden = {
     "_about": "LightGBM 4.6 use_quantized_grad=True, stochastic_rounding=False golden (phase-10 W4)",
     "lightgbm_version": lgb.__version__,

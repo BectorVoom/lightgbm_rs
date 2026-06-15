@@ -27,7 +27,25 @@ use lgbm_compute::Backend;
 use lgbm_core::random::Random;
 use lgbm_model::{GbdtModel, Tree};
 use lgbm_objective::Objective;
-use lgbm_treelearner::{FeatureColumn, SerialTreeLearner};
+use lgbm_treelearner::{FeatureColumn, GradientDiscretizer, SerialTreeLearner};
+
+/// Quantize one class's `grad`/`hess` IN PLACE to their de-quantized int8 values (phase-10
+/// W3b). `is_constant_hessian` is inferred from the buffer (L2 → constant, binary/etc → varies)
+/// so no objective surgery is needed. Each row's grad/hess is replaced by `int8 × scale` (f32),
+/// the quantized value the learner then builds histograms from. Deterministic rounding only.
+fn quantize_grad_hess_in_place(grad: &mut [f32], hess: &mut [f32], num_grad_quant_bins: i32) {
+    if grad.is_empty() {
+        return;
+    }
+    let is_constant_hessian = hess.iter().all(|&h| h == hess[0]);
+    let mut d = GradientDiscretizer::new(num_grad_quant_bins, is_constant_hessian);
+    let q = d.discretize(grad, hess); // i8 pairs [hess, grad]
+    let (gs, hs) = (d.grad_scale(), d.hess_scale());
+    for i in 0..grad.len() {
+        grad[i] = (f64::from(q[2 * i + 1]) * gs) as f32;
+        hess[i] = (f64::from(q[2 * i]) * hs) as f32;
+    }
+}
 
 use crate::error::BoostingError;
 use crate::objective::BoostObjective;
@@ -233,6 +251,12 @@ pub struct Gbdt<'a> {
     /// (`Tree::predict` over each row's real feature values). Empty when bagging is
     /// off (the caller drives the learner's features directly).
     features: Vec<FeatureColumn>,
+    /// `config_->use_quantized_grad` (phase-10). When true, each iteration's gradients
+    /// and hessians are quantized in-place (deterministic int8) before the learner — the
+    /// opt-in APPROXIMATE mode (spike-008). Default false → the exact path is untouched.
+    use_quantized_grad: bool,
+    /// `config_->num_grad_quant_bins` (MUST be ≤254 for the i8 discretized storage).
+    num_grad_quant_bins: i32,
 }
 
 /// One per-iteration snapshot for the layered goldens: the per-row g/h written
@@ -308,7 +332,20 @@ impl<'a> Gbdt<'a> {
             dart: None,
             rf: None,
             features: Vec::new(),
+            use_quantized_grad: false,
+            num_grad_quant_bins: 4,
         }
+    }
+
+    /// Enable the opt-in `use_quantized_grad` APPROXIMATE training mode (phase-10): each
+    /// iteration's gradients/hessians are quantized to int8 (deterministic rounding) before
+    /// the learner. `num_grad_quant_bins` MUST be ≤254 (i8 storage). The default exact path
+    /// is unaffected unless this is called with `enabled = true`.
+    #[must_use]
+    pub fn with_quantized_grad(mut self, enabled: bool, num_grad_quant_bins: i32) -> Self {
+        self.use_quantized_grad = enabled;
+        self.num_grad_quant_bins = num_grad_quant_bins;
+        self
     }
 
     /// Enable the DART boosting variant (BST-05, RESEARCH Pattern 1 — an enum field,
@@ -634,6 +671,23 @@ impl<'a> Gbdt<'a> {
             (BoostingVariant::Dart, Some(d)) => d.shrinkage_rate,
             _ => self.learning_rate,
         };
+
+        // ---- (3b) quantize gradients (use_quantized_grad, phase-10 W3b) ----
+        // APPROXIMATE mode (spike-008): replace each class's grad/hess in place with their
+        // de-quantized int8 quantization, so the UNCHANGED learner builds the quantized model.
+        // Runs AFTER GetGradients + bagging/GOSS amplification (mirroring C++ DiscretizeGradients
+        // at the start of the learner's Train), and only here — the exact path never enters this
+        // branch. Deterministic rounding only (stochastic is W6).
+        if self.use_quantized_grad {
+            for cur_tree_id in 0..k as usize {
+                let off = cur_tree_id * nd;
+                quantize_grad_hess_in_place(
+                    &mut gradients[off..off + nd],
+                    &mut hessians[off..off + nd],
+                    self.num_grad_quant_bins,
+                );
+            }
+        }
 
         // ---- (4) per-class tree loop ----
         // C++ `GBDT::TrainOneIter` `should_continue` (gbdt.cpp:386/407): set true the
