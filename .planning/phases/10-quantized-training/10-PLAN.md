@@ -47,9 +47,14 @@ a SEPARATE mode with its OWN parity contract:
 - **W2 ✅** integer histogram + de-quant (9af04f7) — 3 tests
 - **W3a ✅** config knobs + e2e split pipeline (0328f6a) — recovers exact split @ <5% gain
 - **W4 ✅** C++ quantized goldens + harness (112dcc2)
-- **W3b ✅** end-to-end CPU quantized training + faithful gate (2e698a5) — quantized mode RUNS;
-  gate active. **CPU quantized training is now functional + gated.**
-- **W5 ⬜** GPU packed-int kernel + speed · **W6 ⬜** stochastic rounding + renew_leaf
+- **W3b ✅** end-to-end CPU quantized training + faithful gate (2e698a5)
+- **W5 ✅** GPU packed-int kernel (90cc6e6) — **NULL**: int/f32 = 1.00–1.01×, no speed win (the
+  two f32 atomics hit different cells so never contended; build is per-bin-contention bound).
+  Don't wire a GPU int path — CPU mode stands alone.
+- **W6 ✅** stochastic rounding (3d861b2, seeded/reproducible/unbiased) + quant_train_renew_leaf
+  (18d7870, recompute leaf outputs from original grads; renew effect matches C++ regime)
+- **PHASE COMPLETE.** CPU `use_quantized_grad` mode: deterministic + stochastic rounding +
+  renew_leaf, faithfully gated vs C++ (quantization & renew DELTA gates). Exact path untouched.
 - Discoveries: (1) `num_grad_quant_bins ≤ 254` (i8 storage; 256 overflows → constant model).
   (2) **Pre-existing exact-path gap on fresh CONTINUOUS RawCorpus data** (~0.28 vs C++) —
   predates phase-10, NOT a quantization issue (isolated via the exact/quant×Rust/C++ 2×2). The
