@@ -1,12 +1,22 @@
 ---
 title: 16-bit discretized histogram path (gradient discretizer)
-trigger_condition: Row-partitioning saturates the GPU and atomic WIDTH (not occupancy) becomes the next histogram-build bottleneck
+trigger_condition: A SEPARATE opt-in approximate `use_quantized_grad` mode is scoped as a product decision (NOT for the exact build — see spike-008)
 planted_date: 2026-06-15
 type: seed
 context: /gsd-explore "Compare learning kernel in C++ hip and cubecl, then optimise cubecl kernel"
 ---
 
 # Seed: 16-bit discretized histogram path
+
+> **UPDATE 2026-06-15 (spike-008, INVALIDATED for exact parity):** measured the
+> quantization envelope — even at full int16 the drift is ~3.2e-4 rel, ~30× over the 1e-5
+> f32 gate / ~300× over the ~1e-6 contract; LightGBM's default (4 bins) is 200%+ error.
+> This path is `use_quantized_grad` (default FALSE) — an APPROXIMATE mode by construction.
+> It can NEVER be a drop-in for the exact histogram build. Reframed: this seed is now a
+> **product decision** to add a separate opt-in approximate-training mode (new config
+> surface, its own approximate contract, ensemble-level accuracy validation), NOT a kernel
+> perf optimization. Do not pull forward as a parity-path lever. Probe:
+> `crates/lgbm-compute/examples/quant_parity_probe.rs`.
 
 LightGBM's ROCm kernel has a discretized variant (`CUDAConstructDiscretizedHistogram*Kernel`,
 `__shared__ int16_t shared_hist[...]`, driven by `cuda_gradient_discretizer.cu` and the
