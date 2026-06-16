@@ -32,6 +32,32 @@ The repeatable shape for "is kernel-change X faster on the GPU?":
 
 `gpu_bin_width.rs` (006) and `gpu_row_partition.rs` (007) are the reference harnesses.
 
+## CPU data-layout micro-bench harness (spikes 010, 011)
+
+For "is data-structure change X faster on the CPU?", the **end-to-end `bench_train`
+example is too noisy** to resolve a single-function change (±10% run-to-run; at the
+bench shapes the targeted op is a small slice of train time). Both spikes had to fall
+back to an **isolated in-process microbench** of the one function/structure:
+
+1. **Reproduce ONLY the structure/op under test** as `before`/`after` *local closures*
+   (self-contained, not depending on which variant currently ships), in a permanent
+   `#[ignore]`d in-crate test (it needs the private fold/layout). Run with
+   `--ignored --nocapture`.
+2. **Interleave before/after per launch** to cancel thermal/scheduler drift; report the
+   **median** of N launches after a warmup; `black_box` a sink to defeat DCE.
+3. **Sweep the size** — the win/regression often only appears at the shapes the code
+   path actually runs on (011: scatter regressed only at threshold leaf sizes; 010: the
+   alloc ceiling only matters at medium/large slot_len). A single size hides it.
+4. **Re-run across 2–3 process restarts** before a verdict (warmup/allocator drift).
+5. **THEN confirm end-to-end** with `bench_train` — the isolated ceiling OVERSTATES the
+   real win (010: 8–22% isolated → ~4% end-to-end, allocator amortizes). Ship on the
+   end-to-end number, not the microbench.
+6. **Bit-exact gate** for any anchor-touching change: `cargo test -p lgbm-treelearner
+   --lib` + `cargo test -p oracle-harness` (incl. `raw_bin_train_parity` vs lib_lightgbm).
+
+`spike010_pool_alloc_ceiling` and `spike011_microbench` are the reference harnesses
+(in-crate, `#[ignore]`d; sources copied to each spike dir).
+
 ## Tools & Libraries
 
 - `cubecl` 0.10 LDS API: `SharedMemory::<Atomic<f32>>::new(COMPTIME_SIZE)`, `sync_cube()`,
