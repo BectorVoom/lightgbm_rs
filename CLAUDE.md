@@ -315,7 +315,7 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 
 ## Project Skills
 
-No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
+- **Spike findings for lightgbm_rs** (implementation patterns, constraints, gotchas for optimising `Vec<Vec<T>>` / per-iteration allocation in the CPU training path — histogram pool flatten+reuse, parallel-build false-sharing, the cold-ceiling-overstates-warm rule) → `Skill("spike-findings-lightgbm_rs")`
 <!-- GSD:skills-end -->
 
 <!-- GSD:workflow-start source:GSD defaults -->
