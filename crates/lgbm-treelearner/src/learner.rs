@@ -306,6 +306,19 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// parameter lifetime and cannot be stored behind `&self` without infecting the
     /// struct with a lifetime param (an architectural change the plan defers).
     build_num_bins: std::cell::RefCell<Vec<u32>>,
+    /// Spike 012 (perf): the leaf→histogram buffer pool, REUSED across every tree in
+    /// this train instead of reallocated per tree at the top of `train_inner`. The
+    /// feature set + `num_leaves` are fixed per train, so `cache_size`/`hist_len` are
+    /// identical on every tree; the pool is `take()`n at the top of `train_inner`,
+    /// `reset_map()`'d (clears ONLY the leaf→slot index maps — buffer CONTENTS are
+    /// fully overwritten before any read: directly-built leaves zero+fill the whole
+    /// slot in `build_leaf_histogram_into`, subtract-derived leaves `copy_from_slice`
+    /// the whole slot), used, then stored back. This eliminates the per-tree
+    /// `num_leaves`-slot allocation + zeroing + first-touch page faults that the
+    /// per-tree flat arena (spike 010) still paid — its 8–22%/tree isolated ceiling.
+    /// Lazily built on the first tree (survives `with_features`); rebuilt only if the
+    /// geometry ever changes. Bit-exact (same slot semantics as within-tree reuse).
+    hist_pool: Option<HistogramPool>,
 }
 
 /// W10 advanced learner constraints (ADV-01..05) — the inactive `Default` is the
@@ -438,14 +451,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             fused_eligible: false,
             // R3 (260614-p0n): filled lazily on the first leaf-histogram build.
             build_num_bins: std::cell::RefCell::new(Vec::new()),
+            // Spike 012: built lazily on the first tree, reused across all trees.
+            hist_pool: None,
         }
     }
 
     /// Grow one tree from fixed `gradients`/`hessians` (`SerialTreeLearner::Train`).
     ///
     /// `features` are the spine's per-feature columns (all used, `feature_fraction
-    /// = 1.0`); `is_first_tree` is carried for API parity (unused on the spine —
-    /// there is no histogram-cache reuse across trees here).
+    /// = 1.0`); `is_first_tree` is carried for API parity. The histogram BUFFER
+    /// pool is reused across trees (spike 012, `hist_pool`), but the per-tree
+    /// `reset_map` makes each tree's slot assignment independent — the C++
+    /// `is_first_tree` cache-reuse semantics are not relied on.
     ///
     /// # Errors
     /// V5 boundary (`TreeLearnerError`, never a panic): `gradients.len() ==
@@ -813,7 +830,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             self.backend.upload_resident_bins(self.client, &upload_bins);
         }
 
-        let mut pool = HistogramPool::new(self.num_leaves, slot_len);
+        // Spike 012: REUSE the pool across trees. Take the cached pool if its
+        // geometry matches this train's (it always does — features + num_leaves are
+        // fixed per train), else build fresh (first tree, or a geometry change).
+        // `reset_map` clears only the index maps; the buffers carry the previous
+        // tree's contents but every slot is fully overwritten before any read
+        // (see `build_leaf_histogram_into`'s full zero+fill and the subtract path's
+        // copy_from_slice), so this is bit-exact with a fresh pool.
+        let want_cache = self.num_leaves.max(1) as usize;
+        let mut pool = match self.hist_pool.take() {
+            Some(p) if p.cache_size() == want_cache && p.hist_len() == slot_len => p,
+            _ => HistogramPool::new(self.num_leaves, slot_len),
+        };
         pool.reset_map();
         // 260608-p90: when eligible, reset the device-handle slot mirror alongside the
         // host pool's reset_map, sized to the host pool's cache_size (== num_leaves).
@@ -1049,6 +1077,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             right_leaf = new_right;
         }
 
+        // Spike 012: hand the pool back for the next tree to reuse (the per-tree
+        // alloc+zero+page-fault is paid once per train, not once per tree).
+        self.hist_pool = Some(pool);
         Ok((tree, snapshots, trace, data_partition))
     }
 
@@ -3352,6 +3383,85 @@ fn arg_max(best_split_per_leaf: &[SplitInfo], best_feature: &[i32]) -> i32 {
         }
     }
     best_idx
+}
+
+#[cfg(test)]
+mod spike013 {
+    //! Spike 013 — is the per-tree `feature_splittable = vec![vec![true; nf]; nl]`
+    //! bool matrix (`learner.rs:~891`) worth flattening / reusing? It is the same
+    //! `vec![template; n]` clone-memcpy pattern as the histogram pool (spike 010),
+    //! but ~1.5KB instead of multi-MB. This isolates its per-tree construction cost
+    //! as a fraction of per-tree train time. Run:
+    //!   cargo test -p lgbm-treelearner --release --lib spike013_feature_splittable -- --ignored --nocapture
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn spike013_feature_splittable() {
+        // (name, num_leaves, num_features, per-tree wall ns from bench_train)
+        let shapes = [
+            ("small ", 31usize, 12usize, 266_000.0f64),
+            ("medium", 31, 30, 1_320_000.0),
+            ("large ", 31, 50, 4_400_000.0),
+        ];
+        let trees = 500usize;
+        let warm = 50usize;
+        let med = |v: &mut Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        eprintln!("spike013 feature_splittable per-tree construction (median of {trees}):");
+        for (name, nl, nf, per_tree_ns) in shapes {
+            let mut sink = 0usize;
+
+            // (1) CURRENT: vec![vec![true; nf]; nl] — nl allocs + clone-memcpy.
+            let mut t_cur = Vec::with_capacity(trees);
+            for i in 0..(trees + warm) {
+                let s = Instant::now();
+                let m: Vec<Vec<bool>> = vec![vec![true; nf]; nl];
+                let d = s.elapsed();
+                sink += m[i % nl][i % nf] as usize;
+                if i >= warm {
+                    t_cur.push(d);
+                }
+            }
+
+            // (2) FLAT: one vec![true; nl*nf] arena.
+            let mut t_flat = Vec::with_capacity(trees);
+            for i in 0..(trees + warm) {
+                let s = Instant::now();
+                let m: Vec<bool> = vec![true; nl * nf];
+                let d = s.elapsed();
+                sink += m[i % (nl * nf)] as usize;
+                if i >= warm {
+                    t_flat.push(d);
+                }
+            }
+
+            // (3) REUSE: allocate once, per tree just reset to true (fill).
+            let mut arena = vec![true; nl * nf];
+            let mut t_reuse = Vec::with_capacity(trees);
+            for i in 0..(trees + warm) {
+                let s = Instant::now();
+                arena.iter_mut().for_each(|b| *b = true);
+                let d = s.elapsed();
+                sink += arena[i % (nl * nf)] as usize;
+                if i >= warm {
+                    t_reuse.push(d);
+                }
+            }
+
+            std::hint::black_box(sink);
+            let cur = med(&mut t_cur);
+            let flat = med(&mut t_flat);
+            let reuse = med(&mut t_reuse);
+            let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() * 1e9 / per_tree_ns;
+            eprintln!(
+                "  {name} ({nl}×{nf}): cur={:>8.3?} ({:.3}% of tree)  flat={:>8.3?}  reuse={:>8.3?}  | ceiling={:.3}% of per-tree",
+                cur, pct(cur), flat, reuse, pct(cur) - pct(reuse),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
