@@ -315,7 +315,7 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 
 ## Project Skills
 
-- **Spike findings for lightgbm_rs** (implementation patterns, constraints, gotchas for optimising `Vec<Vec<T>>` / per-iteration allocation in the CPU training path — histogram pool flatten+reuse, parallel-build false-sharing, the cold-ceiling-overstates-warm rule) → `Skill("spike-findings-lightgbm_rs")`
+- **Spike findings for lightgbm_rs** (the train-speed perf campaign, spikes 001–013 — CPU histogram-build wins: once-gather/u8-bins/feature-parallel/pool flatten+reuse; GPU kernel: row-partition lever, u8/packing/quant nulls; GPU-vs-CPU routing; the bit-exact + cold-ceiling-overstates-warm rules) → `Skill("spike-findings-lightgbm_rs")`
 <!-- GSD:skills-end -->
 
 <!-- GSD:workflow-start source:GSD defaults -->
