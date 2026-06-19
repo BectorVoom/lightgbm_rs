@@ -2401,6 +2401,18 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
     // launch does NOT change numerics — only bounds-check codegen is removed; the f64
     // sequential fold / scan order is identical (bit-exact).
+    //
+    // PERF/BENEFIT (measured — quick 260619-ol8, dual-kernel single-binary interleaved A/B
+    // on gfx1100, `examples/launch_unchecked_ab.rs`): this is the ONE swept kernel where
+    // launch_unchecked pays off measurably — ~9–16% faster launch-bound, ~40–46% (≈1.8×)
+    // faster compute-bound, sign-stable with non-overlapping p25/p75 spread. Because the
+    // checked/unchecked arms are bit-identical f64, the delta is PURE bounds-check codegen.
+    // It surfaces HERE (and not in the f32-atomic / resident-LDS kernels, where ol8 measured
+    // NULL) precisely because this kernel runs long SINGLE-UNIT SEQUENTIAL loops
+    // (`CubeDim::new_1d(1)`, one cube per feature) — a per-access bounds branch compounds
+    // over every leaf-row × bin iteration with nothing to hide behind, whereas the atomic
+    // kernels are atomic-contention / memory-latency bound and mask it. So launch_unchecked
+    // is strongly justified for this kernel on perf grounds, not merely safe.
     unsafe {
         build_fix_scan_fused_kernel::launch_unchecked(
             client,
