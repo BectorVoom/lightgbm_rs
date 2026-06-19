@@ -362,6 +362,42 @@ pub fn unified_bfs_threshold() -> usize {
         .unwrap_or(100)
 }
 
+/// The feature-count at/above which the subtract-derived (larger / use_subtract) child's
+/// per-feature `{subtract → scan}` runs inside ONE rayon region (the host f64 analog of
+/// [`unified_bfs_threshold`] but for the larger child, fused subtract+scan with NO build
+/// and NO fix — quick 260620-b97) instead of the two-step whole-buffer
+/// [`subtract_histograms`](Backend::subtract_histograms) + a separate
+/// [`find_best_splits_batched`](Backend::find_best_splits_batched) scan. Override via
+/// `LGBM_UNIFIED_SUBSCAN_THRESHOLD`.
+///
+/// Keyed on `feats.len()` (the same scan-work proxy as [`unified_bfs_threshold`]). The
+/// larger child has NO parallel build to contend with (only a cheap serial subtract), so
+/// quick 260620-9cp's build/scan contention is STRUCTURALLY ABSENT — yet the A/B
+/// crossover is MATERIALLY higher than a48's smaller-child threshold (100), so a SEPARATE
+/// env is justified (the larger child's single rayon fork/join over the subtract+scan only
+/// amortizes above ~130 features; below that it is overlapping/within-spread).
+///
+/// DEFAULT (quick 260620-b97): WIN at `feats.len() >= 130`. The A/B measured on cubecl-cpu
+/// (warm, train-wall = decisive metric, A = larger-child two-step at a48 HEAD, B = larger
+/// child also subtract-unified):
+///   - 200 feat: A ~953ms vs B ~888ms (−6.8%, sign-stable, NO run overlap).
+///   - 150 feat: A ~771ms vs B ~745ms (−3.4%, sign-stable, NO run overlap).
+///   - 130 feat: A ~718ms vs B ~698ms (−2.8%, sign-stable, NO run overlap).
+///   - 120 feat: A ~672ms vs B ~663ms (−1.3%, distributions OVERLAP — not sign-stable).
+///   - 10  feat (narrow): below threshold in BOTH ⇒ identical two-step code, no regression.
+/// Tuned default = 130: the 120-feat zone (overlapping, not sign-stable) keeps the
+/// byte-unchanged two-step path; genuinely wide leaves (≥130 feat) take the fused
+/// subtract→scan for the sign-stable train-wall gain. Both adoption gates met (wide
+/// sign-stable gain AND no narrow regression). Set `LGBM_UNIFIED_SUBSCAN_THRESHOLD=0` to
+/// force the fused path on for the bit-exact parity proof; `usize::MAX` to force two-step.
+/// See the 260620-b97 SUMMARY for the full A/B.
+pub fn unified_subscan_threshold() -> usize {
+    std::env::var("LGBM_UNIFIED_SUBSCAN_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(130)
+}
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that

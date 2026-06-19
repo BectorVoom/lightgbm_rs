@@ -1601,16 +1601,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // parent histogram was retained (so the larger child IS derived by subtract,
             // not directly built), the subtract-audit diagnostic is OFF (the audit-active
             // path MUST take the byte-unchanged two-step so T-05-07-01 stays valid), and
-            // the leaf is wide enough (`unified_bfs_threshold()` — the SAME scan-work
-            // proxy a48 uses; Task 2 decides whether a separate threshold is justified).
-            // When set, the seam materializes parent/smaller scratch and the fused
-            // subtract→scan runs inside `scan_leaf_histogram`. The larger child has NO
+            // the leaf is wide enough. quick 260620-b97 A/B: the larger child's crossover
+            // (~130 feat) is materially HIGHER than a48's smaller threshold (100), so it
+            // keys on a SEPARATE `unified_subscan_threshold()` (default 130, env
+            // `LGBM_UNIFIED_SUBSCAN_THRESHOLD`) — leaving a48's smaller-unified default at
+            // 100 untouched. When set, the seam materializes parent/smaller scratch and the
+            // fused subtract→scan runs inside `scan_leaf_histogram`. The larger child has NO
             // parallel build to contend with (only the cheap serial subtract), so 9cp's
             // contention is structurally absent.
             let larger_unified = !self.resident_eligible
                 && parent_slot.is_some()
                 && self.subtract_audit.is_none()
-                && features.len() >= lgbm_compute::unified_bfs_threshold();
+                && features.len() >= lgbm_compute::unified_subscan_threshold();
             // Owned (parent, smaller) scratch for the fused subtract, materialized at the
             // seam (aliasing-safe: parent_slot == larger_slot) and consumed by the scan.
             let mut larger_subtract_inputs: Option<(Vec<f64>, Vec<f64>)> = None;
