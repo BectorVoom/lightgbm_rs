@@ -76,3 +76,52 @@ NEITHER per-feature op order NOR the cross-feature argmax (still serial, feature
 region). Bit-exact by the same proof that makes the parallel build (Spike-005,
 `build_histograms_parallel_equals_serial`) and the 9cp parallel scan bit-exact — both green
 forced-on. Proven here by the Task-4 `LGBM_UNIFIED_BFS_THRESHOLD=0` forced-on parity gate.
+
+---
+
+# Task 3 — A/B Verdict: CONDITIONAL WIN (threshold = 100 features)
+
+Unlike the two prior sibling NULLs (8v4 per-call 2-lane fork/join ~13× slower; 9cp
+cross-feature scan par_iter contending with the parallel build, +11% train-wall), the unified
+region IS a sign-stable warm train-wall win — but ONLY above ~100 features, so it ships gated.
+
+Measured on cubecl-cpu (f64 anchor), warm (cold iteration discarded), 3-run medians,
+20 000 rows × 128 bins. Decisive metric = warm end-to-end train-wall (`bench_train`);
+phase counters (`bench_split_scan`, 255 bins) localize the mechanism.
+
+| config | mode A (two-step, default) | mode B (unified, THRESHOLD=0) | delta (train-wall) |
+|--------|---------------------------|-------------------------------|--------------------|
+| narrow (10 feat)  | 169 ms (162.6/169.3/172.8) | 246 ms (244.5/246.3/246.7) | **+45% WORSE** (sign-stable) |
+| wide (120 feat)   | 810 ms (800.6/810.5/821.6) | 755 ms (754.7/755.1/762.7) | **−6.8% WIN** (sign-stable, no overlap) |
+
+Phase counters (`bench_split_scan`, 255 bins, BUILD+SCAN fused into SCAN_NS in mode B):
+- narrow: A build+scan 61.4+34.5 = 95.9 ms → B fused 124.9 ms (+30%); warm_wall 166.7→217.9 ms.
+- wide:   A build+scan 431.2+348.5 = 779.7 ms → B fused 569.7 ms (**−27%**); warm_wall 1049.9→910.7 ms (−13%).
+
+Mechanism confirmed: at wide, fusing build+fix+compact+scan into ONE rayon fork/join (vs the
+two-step's TWO) keeps each feature's histogram cache-hot in its building thread, removing the
+9cp two-region contention → −27% on the hot region, −6.8% warm train-wall. At narrow, the single
+fork/join overhead at 10 features dominates (the 8v4/9cp narrow-is-catastrophic lesson).
+
+Crossover sweep (train-wall, median of 3, 128 bins):
+
+| feat | A med | B med | delta |
+|------|-------|-------|-------|
+| 20 | 221.3 | 297.7 | +34.6% |
+| 30 | 289.8 | 339.7 | +17.2% |
+| 40 | 351.9 | 372.8 |  +5.9% |
+| 50 | 394.1 | 429.9 |  +9.1% |
+| 60 | 459.6 | 476.1 |  +3.6% |
+| 80 | 573.8 | 577.5 |  +0.6% (within spread) |
+| 90 | 624.8/629.8/639.6 | 611.7/641.3/642.2 | overlapping / sign-flips |
+| 100 | 705.7/709.3/721.3 | 674.7/681.5/691.6 | **−5%, no overlap** |
+| 120 | 810.8/814.5/823.2 | 760.9/773.8/773.9 | **−6%, no overlap** |
+
+B is a regression or within-spread up to ~90 feat; it becomes sign-stable-below-A only at
+≥100 feat. **Tuned default threshold = 100** (keyed on `feats.len()`, mirroring
+`par_scan_threshold`): narrow/medium (≤90 feat) keep the byte-unchanged serial two-step (zero
+regression); genuinely wide leaves (≥100 feat) take the unified region for the −6% gain. Both
+adoption gates met — wide sign-stable gain AND no narrow regression at the tuned threshold.
+
+Default-path verification (threshold=100 baked): narrow 167–179 ms (== mode A, serial, no
+regression); wide 748–776 ms warm (== mode B, the unified win vs mode-A 810 ms baseline).
