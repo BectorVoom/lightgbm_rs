@@ -868,7 +868,7 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
 /// column on device (`resident_bins[f*num_data + leaf_rows[k]]`). `slot_off` has
 /// `num_features + 1` entries (sentinel = slot_len).
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_leaf_hist_resident_lds_kernel(
     resident_bins: &Array<u32>,
@@ -1399,8 +1399,28 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // h_slot sized num_features+1; h_out sized slot_len. Cube (f,p) reads only its
         // feature's column + slot region; bin < num_bin <= 256 keeps LDS/out indices
         // in range. All cubecl unsafe is confined here (CMP-01).
+        //
+        // LAUNCH_UNCHECKED (NRW-01, copied from the mirror template at the cuda-mirror
+        // launcher): we call `::launch_unchecked`, dropping the in-kernel per-access
+        // bounds-check codegen `::launch` emits in the scatter hot loops. This is sound
+        // because every device access is host-proven in range BEFORE upload:
+        //   - `resident_bins[col + leaf_rows[k]]` (`col = f*num_data`) — `leaf_rows` ⊂
+        //     `[0, num_data)` (the caller's resident contract / upload-time validation)
+        //     and `resident_bins.len() == num_features*num_data`, so for `f in
+        //     [0, num_features)` the index `f*num_data + leaf_rows[k] < num_features*num_data`;
+        //   - `slot_off[f]` / `slot_off[f+1]` — `h_slot` has `num_features + 1` entries
+        //     (sentinel = slot_len) and `f = CUBE_POS_X < num_features`;
+        //   - `ord_g[k]` / `ord_h[k]` — `h_g`/`h_h` sized `rows`, `k < r = ord_g.len()`;
+        //   - the LDS `sub[bin*2 + 1]` stays within `HIST_LDS_MAX` (every feature
+        //     `num_bin <= 256`, the `max_w <= HIST_LDS_MAX` branch gate);
+        //   - `out[base + m]` for `m < feat_len = slot_off[f+1] - slot_off[f]` stays inside
+        //     that feature's slot within `slot_len` (`h_out` sized slot_len).
+        // i.e. the host-side V5 checks discharge exactly the obligations the
+        // launch_unchecked contract requires, and the launch does NOT change numerics —
+        // only bounds-check codegen is removed; scatter order / f32-atomic accumulation
+        // is identical.
         unsafe {
-            construct_leaf_hist_resident_lds_kernel::launch(
+            construct_leaf_hist_resident_lds_kernel::launch_unchecked(
                 client,
                 CubeCount::Static(num_features as u32, p, 1),
                 CubeDim::new_1d(256),
@@ -1473,7 +1493,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
 ///
 /// `#[cfg(feature="rocm")]` — the CPU anchor keeps the host fix+compact unchanged.
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn fix_compact_kernel(
     // f32 RAW histogram (construct-kernel output) — INPUT, read-only.
     h_raw: &Array<f32>,
@@ -1653,8 +1673,24 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     // above — and `mfb < num_bin` keeps the reconstruct write in range; the
     // per-feature index arrays all have exactly `n` elements. All cubecl unsafe is
     // confined here (CMP-01).
+    //
+    // LAUNCH_UNCHECKED (NRW-01): we call `::launch_unchecked`, dropping the in-kernel
+    // per-access bounds-check codegen in the per-feature fix/compact loops. This is a
+    // ZERO-numeric-risk switch: the kernel is f64 and DETERMINISTIC (one cube per
+    // feature, `CubeDim::new_1d(1)`, ascending fold) so the result stays bit-exact. Every
+    // device access is host-proven in range BEFORE upload:
+    //   - `h_raw[wbi]` / `h_raw[wbi+1]` and `h_hist[...]` for the inline widen + fix +
+    //     compact — cube `f < n` touches only `[slot_off[f], slot_off[f] + 2*num_bin[f])`,
+    //     and the loop above validated `slot_off[f] + 2*num_bin[f] <= raw.len()` for every
+    //     feature; both `h_raw` and `h_hist` are sized `raw.len()`;
+    //   - `mfb < num_bin` (the `do_fix` guard) keeps the reconstruct cell in the region;
+    //   - the per-feature `slot_off`/`num_bin`/`offset`/`most_freq_bin` arrays all have
+    //     exactly `n` elements and `f < n`.
+    // i.e. the host-side V5 checks discharge exactly the obligations the launch_unchecked
+    // contract requires, and the launch does NOT change numerics — only bounds-check
+    // codegen is removed; the f64 fold order is identical (bit-exact).
     unsafe {
-        fix_compact_kernel::launch(
+        fix_compact_kernel::launch_unchecked(
             client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_1d(1),
@@ -1804,8 +1840,22 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         // `[slot_off[f], slot_off[f]+2*num_bin[f]) <= slot_len` region (inline widen +
         // fix + compact) and `mfb < num_bin` keeps the reconstruct in range. cubecl
         // unsafe confined here.
+        //
+        // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+        // bounds-check codegen in the fix/compact loops. ZERO numeric risk — same f64
+        // deterministic kernel as `fix_compact_f64_on` (one cube per feature, ascending
+        // fold, bit-exact). Host-proven accesses BEFORE upload:
+        //   - `h_raw[...]` / `h_f64[...]` — cube `f < n` touches only
+        //     `[slot_off[f], slot_off[f] + 2*num_bin[f])`, validated `<= slot_len` in the
+        //     loop above; both buffers sized `slot_len`;
+        //   - `mfb < num_bin` (the `do_fix` guard) keeps the reconstruct cell in range;
+        //   - the per-feature `slot_off`/`num_bin`/`offset`/`most_freq_bin` arrays all have
+        //     exactly `n` elements and `f < n`.
+        // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+        // launch does NOT change numerics — only bounds-check codegen is removed; the f64
+        // fold order is identical (bit-exact).
         unsafe {
-            fix_compact_kernel::launch(
+            fix_compact_kernel::launch_unchecked(
                 client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_1d(1),
@@ -1910,7 +1960,7 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 /// 2*kEpsilon-BUMPED `sum_hessian_bumped` + the host `min_gain_shift` feed the SCAN
 /// (the distinct operands, matching `find_best_splits_fused_kernel`).
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_scan_fused_kernel(
     // Device-resident binned columns (feature-major, `f*num_data + row`) — INPUT.
@@ -2251,8 +2301,30 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     // keeps the reconstruct in range. Every per-feature index array has exactly `n`
     // elements; every handle outlives the launch. All cubecl unsafe confined here
     // (CMP-01).
+    //
+    // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+    // bounds-check codegen in the build + fix + scan loops. ZERO numeric risk — the kernel
+    // is f64 and DETERMINISTIC (one cube per feature, `CubeDim::new_1d(1)`, SEQUENTIAL
+    // ascending leaf-row fold, NO atomics) so it stays the bit-exact cpu-anchor order.
+    // Every device access is host-proven in range BEFORE upload:
+    //   - `resident_bins[f*num_data_stride + leaf_rows[k]]` — `leaf_rows` ⊂
+    //     `[0, num_data_stride)` (caller resident contract) and the resident buffer is
+    //     sized `num_features*num_data_stride`, so `f < n <= num_features` keeps it in range;
+    //   - `leaf_rows[k]` for `k < rows` (`h_rows` sized `rows`); `ord_g[k]`/`ord_h[k]`
+    //     (`h_g`/`h_h` sized `rows`);
+    //   - `hist[...]` (the f64 build/fix/compact) — cube `f < n` touches only
+    //     `[slot_off[f], slot_off[f] + 2*num_bin[f])`, validated `<= slot_len` in the
+    //     per-feature loop above (`h_hist` sized `slot_len`); `bin < num_bin` keeps the
+    //     build cell and `mfb < num_bin` the reconstruct cell in that region;
+    //   - `out[f*12 .. f*12+12]` within the `n*12` allocation (`h_out` sized `n*12`);
+    //   - every per-feature param array (`slot_off`/`num_bin`/`offset`/`most_freq_bin`/
+    //     `default_bin`/`skip_default_bin`/`rev_count`/`fwd_count`/`scan_active`) has
+    //     exactly `n` elements and `f < n`.
+    // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+    // launch does NOT change numerics — only bounds-check codegen is removed; the f64
+    // sequential fold / scan order is identical (bit-exact).
     unsafe {
-        build_fix_scan_fused_kernel::launch(
+        build_fix_scan_fused_kernel::launch_unchecked(
             client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_1d(1),
