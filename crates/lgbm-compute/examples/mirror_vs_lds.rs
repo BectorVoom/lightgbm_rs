@@ -18,11 +18,22 @@
 //!    differ ONLY in their native grad/hess input form.
 //!  - The mirror gathers grad/hess IN-KERNEL from full-corpus arrays (`grad[data_index]`),
 //!    so there is no host-side gather to attribute — its number is intrinsic.
-//!  - The LDS path consumes LEAF-LENGTH `ord_g`/`ord_h` gathered HOST-SIDE
-//!    (`ord_g[k] = grad[leaf_rows[k]]`). Production (lib.rs:497) pays that gather per
-//!    leaf, so we report TWO LDS numbers:
-//!      * lds_incl_ms — the gather is INSIDE the timed closure (the real production cost),
-//!      * lds_excl_ms — the gather is hoisted OUTSIDE (kernel-only attribution).
+//!  - The LDS launcher `build_leaf_histograms_resident_f32_on` ALSO takes FULL-CORPUS
+//!    grad/hess and gathers the leaf-length `ord_g`/`ord_h` HOST-SIDE *INSIDE itself*
+//!    (histogram.rs `resident_raw_build_into`, `ord_g[k]=grad[leaf_rows[k]]`) — exactly
+//!    as the wired production path passes them (learner.rs:1767, full-corpus). So both
+//!    launchers receive full-corpus arrays; the host gather production pays is INTERNAL
+//!    to the LDS launcher, not a caller step.
+//!    [DEVIATION — Rule 3, 260619-ngo] The plan's interface contract said the caller
+//!    host-gathers ord_g/ord_h to leaf length BEFORE the LDS call; the real launcher does
+//!    that gather internally and a leaf-length array would index out of bounds. We honor
+//!    the plan's INTENT (report production cost + a gather-excluded kernel-only number)
+//!    by: timing the full launcher as lds_incl (gather included — production's real cost),
+//!    timing the host gather alone, and deriving lds_excl = lds_incl - gather (kernel +
+//!    uploads, the host gather production could independently remove). No kernel/lib edit.
+//!  - So we report TWO LDS numbers:
+//!      * lds_incl_ms — the full launcher (internal host gather INCLUDED) = production cost,
+//!      * lds_excl_ms — lds_incl minus the separately-timed host gather (kernel-only view).
 //!
 //! WARM-VS-COLD (load-bearing, spike-findings SKILL): WARMUP>=2 discarded launches per
 //! variant, MEDIAN of TIMED>=5, a device sync (result read-back) inside every timed call,
@@ -90,18 +101,19 @@ fn main() {
     println!("# mirror-vs-LDS resident-histogram A/B  num_data={NUM_DATA} feats={FEATS}");
     println!("# warmup={WARMUP} discarded, median of {TIMED} timed launches per variant.");
     println!("# resident bin buffer uploaded ONCE per cell, OUTSIDE both timed loops (excluded).");
-    println!("# lds_incl = LDS kernel + production host-side ord_g/ord_h gather (real cost);");
-    println!("# lds_excl = LDS kernel only (gather hoisted out); mirror gathers in-kernel.");
+    println!("# lds_incl = full LDS launcher (its INTERNAL host ord_g/ord_h gather included) = prod cost;");
+    println!("# lds_excl = lds_incl minus the separately-timed host gather (kernel+uploads only).");
     println!("# speedup       = lds_incl / mirror  (>1.0 => mirror beats the production LDS path)");
     println!("# speedup_kernel= lds_excl / mirror  (>1.0 => mirror beats the LDS kernel alone)");
     println!();
     println!(
-        "{:>9} | {:>5} | {:>11} | {:>11} | {:>11} | {:>9} | {:>13}",
-        "leaf", "bins", "mirror_ms", "lds_incl_ms", "lds_excl_ms", "speedup", "speedup_kernel"
+        "{:>9} | {:>5} | {:>11} | {:>11} | {:>11} | {:>9} | {:>9} | {:>13}",
+        "leaf", "bins", "mirror_ms", "lds_incl_ms", "lds_excl_ms", "gather_ms", "speedup",
+        "speedup_kernel"
     );
     println!(
-        "{:-<10}+{:-<7}+{:-<13}+{:-<13}+{:-<13}+{:-<11}+{:-<15}",
-        "", "", "", "", "", "", ""
+        "{:-<10}+{:-<7}+{:-<13}+{:-<13}+{:-<13}+{:-<11}+{:-<11}+{:-<15}",
+        "", "", "", "", "", "", "", ""
     );
 
     // Full-corpus grad/hess (the mirror's native form; gathered in-kernel by data_index).
@@ -140,11 +152,6 @@ fn main() {
         for (leaf_name, leaf_rows) in leaves.iter() {
             let leaf_rows: &[u32] = leaf_rows.as_slice();
 
-            // Host-gathered LEAF-LENGTH ord_g/ord_h for the gather-EXCLUDED LDS variant
-            // (gather once, outside the timed loop).
-            let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| grad[r as usize]).collect();
-            let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hess[r as usize]).collect();
-
             // ---- (3) MIRROR: in-kernel gather is intrinsic — no gather-excluded variant.
             let mirror_call = || {
                 let out = construct_histograms_cuda_mirror_resident_on(
@@ -175,11 +182,11 @@ fn main() {
             }
             let mirror_med = median(&mut mirror_ms);
 
-            // ---- (1) LDS gather-INCLUDED: gather ord_g/ord_h INSIDE the timed closure,
-            //          then call the launcher. This is what production pays per leaf.
+            // ---- (1) LDS gather-INCLUDED (production cost): the FULL launcher, fed
+            //          FULL-CORPUS grad/hess exactly as the wired learner does
+            //          (learner.rs:1767). Its internal host gather (resident_raw_build_into)
+            //          is part of the timed cost — this is what production pays per leaf.
             let lds_incl_call = || {
-                let g: Vec<f32> = leaf_rows.iter().map(|&r| grad[r as usize]).collect();
-                let h: Vec<f32> = leaf_rows.iter().map(|&r| hess[r as usize]).collect();
                 let out = build_leaf_histograms_resident_f32_on(
                     &client,
                     resident_handle.clone(),
@@ -188,8 +195,8 @@ fn main() {
                     &slot_off,
                     slot_len,
                     leaf_rows,
-                    &g,
-                    &h,
+                    &grad, // FULL-CORPUS — launcher gathers ord_g/ord_h to leaf length itself.
+                    &hess,
                 )
                 .unwrap();
                 out
@@ -207,33 +214,27 @@ fn main() {
             }
             let lds_incl_med = median(&mut lds_incl_ms);
 
-            // ---- (2) LDS gather-EXCLUDED: ord_g/ord_h already gathered above (outside the
-            //          timed loop); time only the launcher call (kernel-only attribution).
-            let lds_excl_call = || {
-                let out = build_leaf_histograms_resident_f32_on(
-                    &client,
-                    resident_handle.clone(),
-                    FEATS,
-                    NUM_DATA,
-                    &slot_off,
-                    slot_len,
-                    leaf_rows,
-                    &ord_g,
-                    &ord_h,
-                )
-                .unwrap();
-                out[0]
+            // ---- (2) HOST GATHER alone: time the exact gather the launcher does internally
+            //          (ord_g[k]=grad[leaf_rows[k]], ord_h likewise). lds_excl is then
+            //          lds_incl - gather (kernel + uploads only; the host gather production
+            //          could remove independently). black_box keeps the gather from being
+            //          optimized away (the result feeds a sink read).
+            let gather_call = || {
+                let g: Vec<f32> = leaf_rows.iter().map(|&r| grad[r as usize]).collect();
+                let h: Vec<f32> = leaf_rows.iter().map(|&r| hess[r as usize]).collect();
+                std::hint::black_box(g[0]) + std::hint::black_box(h[0])
             };
             for _ in 0..WARMUP {
-                let _ = lds_excl_call();
+                let _ = gather_call();
             }
-            let mut lds_excl_ms: Vec<f64> = Vec::with_capacity(TIMED);
+            let mut gather_ms: Vec<f64> = Vec::with_capacity(TIMED);
             for _ in 0..TIMED {
                 let t = Instant::now();
-                let _ = lds_excl_call();
-                lds_excl_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                let _ = gather_call();
+                gather_ms.push(t.elapsed().as_secs_f64() * 1e3);
             }
-            let lds_excl_med = median(&mut lds_excl_ms);
+            let gather_med = median(&mut gather_ms);
+            let lds_excl_med = (lds_incl_med - gather_med).max(0.0);
 
             // SANITY ASSERT (same-input correctness, NOT the parity gate): the two kernels
             // must compute the SAME RAW histogram within the f32-atomic envelope. The real
@@ -242,12 +243,13 @@ fn main() {
             assert_same_input(&mirror_hist, &lds_hist, &cell);
 
             println!(
-                "{:>9} | {:>5} | {:>11.3} | {:>11.3} | {:>11.3} | {:>8.2}x | {:>12.2}x",
+                "{:>9} | {:>5} | {:>11.3} | {:>11.3} | {:>11.3} | {:>9.3} | {:>8.2}x | {:>12.2}x",
                 leaf_name,
                 num_bin,
                 mirror_med,
                 lds_incl_med,
                 lds_excl_med,
+                gather_med,
                 lds_incl_med / mirror_med,
                 lds_excl_med / mirror_med,
             );
@@ -256,8 +258,9 @@ fn main() {
 
     println!();
     println!("# EXCLUDED from both timed loops: the resident feature-major bin upload (once/cell).");
-    println!("# INCLUDED in lds_incl: the production host-side ord_g/ord_h gather to leaf length.");
-    println!("# lds_excl hoists that gather out (kernel-only). Mirror gathers grad/hess in-kernel.");
+    println!("# INCLUDED in lds_incl: the launcher's INTERNAL host ord_g/ord_h gather (production cost).");
+    println!("# lds_excl = lds_incl - gather_ms (kernel + per-leaf uploads; gather removed). Mirror");
+    println!("# gathers grad/hess in-kernel, so the gather tax is intrinsic to it (no separate column).");
     println!("# speedup>1.0 => mirror faster than the production LDS path; <1.0 => LDS faster.");
     println!("# Same-input sanity assert (ABS 5e-6 / REL 1e-5) passed for every cell printed above.");
     println!("# MEASUREMENT ONLY — does NOT wire into lib.rs / the learner. MANUAL bench, NOT a gate.");
