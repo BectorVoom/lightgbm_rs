@@ -1004,7 +1004,7 @@ pub fn construct_leaf_hist_batched_lds_kernel(
 /// `num_features + 1` entries (sentinel = slot_len) so cube `f` reads its feature's
 /// width `slot_off[f+1] - slot_off[f] = 2*num_bin[f]`.
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_hist_cuda_mirror_kernel(
     data: &Array<u32>,         // resident feature-major bins: data[f*num_data + row]
@@ -1170,12 +1170,167 @@ pub fn construct_histograms_cuda_mirror_on<R: cubecl::Runtime>(
     // outlives the launch, and the per-feature bin-range check keeps every
     // `slot_off[f] + bin*2 + 1` inside that feature's slot within `slot_len`. All
     // cubecl unsafe is confined to this launcher (CMP-01).
+    //
+    // LAUNCH_UNCHECKED (MWR-01): we call `::launch_unchecked`, which drops the
+    // in-kernel per-access bounds-check codegen the manual emits for `::launch`.
+    // This is sound because the full V5 boundary validation ABOVE already proves
+    // every device access is in range BEFORE upload:
+    //   - `data[col + data_index]`  — every `data_index = data_indices[k] < num_data`
+    //     is checked, and `data.len() == num_features * num_data`, so `f*num_data +
+    //     data_index < num_features*num_data` for `f in [0, num_features)`;
+    //   - `grad[data_index]` / `hess[data_index]` — `grad.len()==hess.len()==num_data`
+    //     and `data_index < num_data`;
+    //   - `out[base + m]` for `m < feat_len` — every gathered `bin < num_bin <= 256`
+    //     so `slot_off[f] + bin*2 + 1` stays inside that feature's slot within
+    //     `slot_len`, and the LDS sub-hist write `sub[bin*2 + 1]` stays within
+    //     `HIST_LDS_MAX` (num_bin<=256).
+    // i.e. the host-side checks discharge exactly the obligations the launch_unchecked
+    // contract requires, and the launch does NOT change numerics — only bounds-check
+    // codegen is removed; the scatter order / f32-atomic accumulation is identical.
     unsafe {
-        construct_hist_cuda_mirror_kernel::launch(
+        construct_hist_cuda_mirror_kernel::launch_unchecked(
             client,
             CubeCount::Static(num_features as u32, p, 1),
             CubeDim::new_1d(256),
             ArrayArg::from_raw_parts(h_data, num_features * num_data),
+            ArrayArg::from_raw_parts(h_idx, rows),
+            ArrayArg::from_raw_parts(h_grad, num_data),
+            ArrayArg::from_raw_parts(h_hess, num_data),
+            ArrayArg::from_raw_parts(h_slot, num_features + 1),
+            num_data,
+            ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}
+
+/// **Upload-once / CUDA-faithful** resident-`Handle` variant of
+/// [`construct_histograms_cuda_mirror_on`] (MWR-02).
+///
+/// The per-call launcher above `create_from_slice`s the FULL feature-major bin buffer
+/// (`num_features * num_data` u32 = the dominant transfer) on EVERY call. The real
+/// CUDA `cuda_single_gpu_tree_learner` keeps the binned data RESIDENT on device,
+/// uploaded ONCE per train; only the per-leaf `data_indices` (+ the per-iteration
+/// grad/hess) change between calls. This variant mirrors that model: the caller is
+/// responsible for having uploaded the feature-major bin buffer ONCE (length
+/// `num_features * num_data`) and passes its device `Handle` — this function does NOT
+/// re-upload it. Per call it uploads ONLY `data_indices`, `grad`, `hess`, the sentinel
+/// `slot_off`, and the zeroed `out`. This is the same upload-once pattern as
+/// [`build_leaf_histograms_resident_f32_on`].
+///
+/// Launches the SAME [`construct_hist_cuda_mirror_kernel`] with the SAME `CubeCount` /
+/// `CubeDim` / argument order as the per-call launcher — only the `data` source (a
+/// pre-uploaded `Handle` instead of a fresh `create_from_slice`) differs — so the
+/// numerics are identical (the f32-atomic scatter order / contention model is
+/// unchanged). f32 atomics ⇒ the ~1e-6 ROCm gate; the result is widened to f64 on
+/// read-back.
+///
+/// This is a TESTED PRIMITIVE (rocm_cuda_mirror.rs), NOT wired into the production
+/// histogram / build path (that live wiring is the deferred follow-up DEF-f8u-01).
+///
+/// Because the bins are NOT on the host here, this variant CANNOT run the per-feature
+/// bin-range scan the per-call variant does (that scan reads `data[...]` from the host
+/// slice). It validates everything reachable host-side instead: `grad.len()==num_data`,
+/// `hess.len()==num_data`, `slot_off.len()==num_features`, `num_bin <= 256`, every
+/// `data_indices[k] < num_data`, and `num_features != 0`. The bin-range invariant
+/// (every resident bin `< num_bin`) is the CALLER's upload-time responsibility — the
+/// resident buffer must have been validated when it was built/uploaded (the same
+/// contract as [`build_leaf_histograms_resident_f32_on`], whose resident `Handle` was
+/// validated at `upload_resident_bins` time).
+///
+/// # Errors
+/// - [`ComputeError::LengthMismatch`] if `grad`/`hess` length `!= num_data`.
+/// - [`ComputeError::Runtime`] on a degenerate layout (`slot_off.len() != num_features`,
+///   `num_features == 0` with a non-empty leaf), an out-of-range `data_index`, or
+///   `num_bin > 256` (LDS cap).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_histograms_cuda_mirror_resident_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    num_data: usize,
+    num_features: usize,
+    data_indices: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    slot_off: &[usize],
+    slot_len: usize,
+    num_bin: u32,
+) -> Result<Vec<f64>, ComputeError> {
+    // ---- V5 boundary validation (T-mwr-01) — everything reachable host-side. ----
+    // The bin-range scan the per-call variant runs is NOT possible here (bins are
+    // resident on device, not on the host); that invariant is the caller's upload-time
+    // responsibility (mirrors `build_leaf_histograms_resident_f32_on`).
+    if grad.len() != num_data || hess.len() != num_data {
+        return Err(ComputeError::LengthMismatch {
+            expected: num_data,
+            actual: grad.len().min(hess.len()),
+        });
+    }
+    if slot_off.len() != num_features {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "cuda_mirror_resident: slot_off len {} != num_features {num_features}",
+                slot_off.len()
+            ),
+        });
+    }
+    if num_bin > 256 {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "cuda_mirror_resident: num_bin {num_bin} > 256 exceeds the LDS sub-hist cap"
+            ),
+        });
+    }
+    for &di in data_indices {
+        let row = di as usize;
+        if row >= num_data {
+            return Err(ComputeError::Runtime {
+                detail: format!("cuda_mirror_resident: data_index {row} >= num_data {num_data}"),
+            });
+        }
+    }
+
+    // Early return on an empty leaf — no launch (mirror of the CUDA no-op path).
+    if data_indices.is_empty() || num_features == 0 {
+        return Ok(vec![0.0f64; slot_len]);
+    }
+
+    let rows = data_indices.len();
+    // Per-call uploads ONLY: the small per-leaf data_indices + the per-iter grad/hess +
+    // the sentinel slot_off + the zeroed out. The big feature-major bin buffer is
+    // ALREADY on the device (`resident_bins`) — NOT re-uploaded here (the MWR-02 win).
+    let h_idx = client.create_from_slice(u32::as_bytes(data_indices));
+    let h_grad = client.create_from_slice(f32::as_bytes(grad));
+    let h_hess = client.create_from_slice(f32::as_bytes(hess));
+    let zeros = vec![0.0f32; slot_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+    let (slot_s, _max_w) = slot_off_sentinel(slot_off, slot_len);
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+
+    let p = row_partition_count(num_features, rows);
+
+    // SAFETY: same handle/length correspondence and the SAME launch config as
+    // `construct_histograms_cuda_mirror_on` — `resident_bins` is the pre-uploaded
+    // feature-major buffer sized `num_features * num_data` (the caller's contract),
+    // `h_idx` sized `rows`, `h_grad`/`h_hess` sized `num_data`, `h_slot` has
+    // `num_features + 1` entries, `h_out` sized `slot_len`; each handle outlives the
+    // launch. We use `::launch_unchecked` (drops the in-kernel bounds-check codegen,
+    // MWR-01): host-side V5 proves `data_indices[k] < num_data` (so `grad[data_index]`,
+    // `hess[data_index]`, and `data[f*num_data + data_index]` are in range), and the
+    // per-feature BIN-RANGE invariant (`bin < num_bin <= 256`, keeping `out[base+m]`
+    // for `m < feat_len` inside the feature's slot and `sub[bin*2+1]` inside
+    // `HIST_LDS_MAX`) is the CALLER's upload-time responsibility for the resident
+    // buffer — exactly as in `build_leaf_histograms_resident_f32_on`. All cubecl
+    // unsafe is confined to this launcher (CMP-01).
+    unsafe {
+        construct_hist_cuda_mirror_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(num_features as u32, p, 1),
+            CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
             ArrayArg::from_raw_parts(h_idx, rows),
             ArrayArg::from_raw_parts(h_grad, num_data),
             ArrayArg::from_raw_parts(h_hess, num_data),
