@@ -237,8 +237,9 @@ fn main() {
 
                 // ---- Arm B: deferred-sync (cubecl lazy execution, manual ch.05) ----
                 // Allocate feats distinct out handles, submit all feats launches back-to-
-                // back WITHOUT reading, THEN drain each handle (the deferred sync — the
-                // reads force the whole queued batch to complete). Same SAFETY obligations
+                // back WITHOUT reading, THEN drain all handles in ONE `client.read` call (the
+                // deferred sync — that one read forces the whole queued batch to complete).
+                // Same SAFETY obligations
                 // as arm A (identical launches, identical inputs); only the sync timing moves.
                 let arm_b = || -> Vec<f64> {
                     // N distinct zeroed out handles up front.
@@ -259,11 +260,14 @@ fn main() {
                             );
                         }
                     }
-                    // Deferred drain: read each handle. The last read forces the full queue
-                    // to drain — arm B pays ONE drain phase vs arm A's N interleaved drains.
+                    // Deferred drain: ONE `client.read(Vec<Handle>)` call (cubecl 0.10's
+                    // idiomatic batch drain, cubecl-runtime client.rs:131) drains all `feats`
+                    // handles in a single blocking sync — the clean form of the hand-rolled
+                    // N× `read_one_unchecked` loop. Arm B still pays ONE drain phase vs arm A's
+                    // N interleaved drains; bytes come back in handle (feature) order, so the
+                    // concatenation order is identical to arm A.
                     let mut concat = Vec::with_capacity(feats * out_len);
-                    for h_out in h_outs {
-                        let bytes = client.read_one_unchecked(h_out);
+                    for bytes in client.read(h_outs) {
                         concat.extend(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)));
                     }
                     concat
