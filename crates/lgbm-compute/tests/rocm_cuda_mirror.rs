@@ -14,7 +14,11 @@
 //! (ABS 1e-6 / REL 1e-5), NEVER GPU-vs-GPU (memory DEF-f8u-01).
 #![cfg(feature = "rocm")]
 
-use lgbm_compute::kernels::histogram::{construct_histograms_cpu, construct_histograms_cuda_mirror_on};
+use cubecl::prelude::CubeElement;
+use lgbm_compute::kernels::histogram::{
+    construct_histograms_cpu, construct_histograms_cuda_mirror_on,
+    construct_histograms_cuda_mirror_resident_on,
+};
 use lgbm_compute::runtime::{cpu_client, rocm_client};
 
 /// Assert two RAW histograms agree within the f32-atomic accumulation envelope —
@@ -193,4 +197,46 @@ fn cuda_mirror_full_corpus_leaf_matches_anchor() {
 
     let anchor = cpu_anchor(&corpus, &data_indices);
     assert_close(&anchor, &gpu, "cuda_mirror_full");
+}
+
+#[test]
+fn cuda_mirror_resident_matches_cpu_anchor_within_tol() {
+    // The upload-once / CUDA-faithful path (MWR-02): the feature-major bin buffer is
+    // uploaded to the device ONCE, then the resident launcher is called with that
+    // Handle (re-uploading only the per-leaf data_indices + grad/hess). It must produce
+    // the SAME histogram as the per-call path and the CPU f64 anchor — i.e. switching
+    // to launch_unchecked AND to a resident Handle did NOT change numerics. Pinned
+    // GPU-vs-CPU-f64-anchor, NEVER GPU-vs-GPU (memory DEF-f8u-01).
+    let corpus = make_corpus();
+    let gc = rocm_client();
+
+    // Same non-trivial leaf subset as the per-call dense test.
+    let data_indices: Vec<u32> = (7..corpus.num_data).step_by(3).map(|r| r as u32).collect();
+    assert!(data_indices.len() > 100, "leaf must be non-trivial");
+
+    let slot_len = corpus.num_features * 2 * corpus.num_bin as usize;
+    let slot_off: Vec<usize> = (0..corpus.num_features)
+        .map(|f| f * 2 * corpus.num_bin as usize)
+        .collect();
+
+    // Upload the feature-major resident bin buffer ONCE (the caller's contract), then
+    // pass its Handle into the resident launcher.
+    let resident = gc.create_from_slice(u32::as_bytes(&corpus.resident));
+
+    let gpu = construct_histograms_cuda_mirror_resident_on(
+        &gc,
+        resident,
+        corpus.num_data,
+        corpus.num_features,
+        &data_indices,
+        &corpus.grad,
+        &corpus.hess,
+        &slot_off,
+        slot_len,
+        corpus.num_bin,
+    )
+    .unwrap();
+
+    let anchor = cpu_anchor(&corpus, &data_indices);
+    assert_close(&anchor, &gpu, "cuda_mirror_resident");
 }
