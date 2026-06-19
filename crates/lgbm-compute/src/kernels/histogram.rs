@@ -468,6 +468,232 @@ pub fn construct_histograms_parallel_f32_on<R: cubecl::Runtime>(
     Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
 }
 
+/// WARP-AGGREGATED f32-atomic histogram (quick-260619-p93) — a comptime-gated
+/// `_plane` VARIANT of [`construct_hist_kernel_atomic_f32`], NOT a replacement.
+///
+/// The baseline kernel issues `2*n` GLOBAL atomic `fetch_add`s (one grad + one
+/// hess per row), so rows of a wave that share a destination `bin` serialize on
+/// global-memory atomic contention. This variant optionally collapses the within-
+/// plane same-bin adds into ONE global atomic per distinct bin per plane, cutting
+/// up to `PLANE_DIM` adds to one — the classic CUDA "warp-aggregated atomics"
+/// pattern (RESEARCH §correctness-crux).
+///
+/// `#[comptime] use_plane: bool` is a FEATURE-SPECIALIZATION flag (cubecl manual
+/// "Feature Specialization with Comptime Flags"): each `use_plane` value compiles
+/// a DISTINCT kernel binary with NO device branch on the flag. The CPU-only build
+/// never compiles the `rocm` cfg, so it never emits ANY plane codegen.
+///
+/// - `use_plane == false`: the EXACT baseline body — `out[bin*2].fetch_add(grad)`,
+///   `out[bin*2+1].fetch_add(hess)`. A byte-faithful twin of the shipped kernel
+///   (the A/B baseline arm; see `examples/plane_aggregate_ab.rs`).
+/// - `use_plane == true`: CORRECT same-bin warp aggregation. A naive whole-plane
+///   `plane_sum` is WRONG here (each lane's `bin` is data-dependent and divergent;
+///   summing all lanes and writing one bin corrupts the histogram — RESEARCH
+///   Pitfall 1). cubecl 0.10 has NO `plane_match_any`, so lanes are grouped by
+///   equal bin via a LEADER-ITERATION loop:
+///     1. each lane holds its `bin` (active lanes only; the `idx < len` predicate
+///        gates participation, so tail/out-of-range lanes never claim a group);
+///     2. while any active lane is unclaimed: `plane_ballot(unclaimed && active)`
+///        → pick the FIRST set lane (the ballot word selected + indexed by the
+///        runtime `PLANE_DIM`, `trailing_zeros` for its lane id — NEVER a hardcoded
+///        32, RESEARCH Pitfall 6), `plane_shuffle` that lane's bin to all lanes as
+///        `leader_bin`;
+///     3. `mine = unclaimed && active && (my_bin == leader_bin)`; the group's grad
+///        / hess are reduced with a MASKED `plane_sum` (each non-member lane
+///        contributes `0.0`);
+///     4. the group's elected lane (its leader = the first unclaimed lane, itself a
+///        member) issues a SINGLE `out[leader_bin*2].fetch_add(group_grad)` +
+///        `out[leader_bin*2+1].fetch_add(group_hess)`;
+///     5. `claimed |= mine`; repeat until no active lane is unclaimed.
+///
+/// **Parity:** the plane group reduction is an f32 TREE reduction — a DIFFERENT
+/// accumulation order than the baseline's sequential atomic chain — but BOTH are
+/// non-deterministic f32 accumulations held to the CPU f64 anchor at ABS 5e-6 /
+/// REL 1e-5 (the gate D-03a / 04-ROCM-GAPS was designed for exactly this f32
+/// reordering). A tree reduction is typically MORE accurate than a long sequential
+/// chain, so the plane arm is expected to stay well inside the existing envelope.
+/// This kernel does NOT touch the CPU f64 anchor ([`construct_hist_kernel`] /
+/// [`construct_hist_kernel_f32`]) and widens no tolerance. `#[cfg(feature="rocm")]`.
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+pub fn construct_hist_kernel_atomic_f32_plane(
+    binned: &Array<u32>,
+    grad: &Array<f32>,
+    hess: &Array<f32>,
+    out: &mut Array<Atomic<f32>>,
+    #[comptime] use_plane: bool,
+) {
+    let idx = ABSOLUTE_POS;
+    // Bounds check: the launch rounds the unit count up to a multiple of the cube
+    // dim, so the tail units (idx >= len) must stay idle (manual §4 Safe Indexing).
+    // `active` drives plane participation in the use_plane arm (tail lanes never
+    // join a group); the non-plane arm just guards the scatter.
+    let active = idx < binned.len();
+
+    if use_plane {
+        // --- CORRECT same-bin warp aggregation (RESEARCH §correctness-crux) ---
+        // Active lanes load their bin/grad/hess; inactive (tail) lanes hold neutral
+        // values and never become claimed (active==false keeps `mine` false).
+        let mut my_bin = 0u32;
+        let mut my_grad = 0.0f32;
+        let mut my_hess = 0.0f32;
+        if active {
+            my_bin = binned[idx];
+            my_grad = grad[idx];
+            my_hess = hess[idx];
+        }
+
+        let lane = UNIT_POS_PLANE;
+        // Inactive (tail) lanes start "claimed" so they never participate in a group;
+        // active lanes start unclaimed.
+        let mut claimed = !active;
+
+        // Leader iteration: each pass elects one still-unclaimed bin and retires its
+        // whole group. Bounded by PLANE_DIM passes (≥1 lane retired per pass). Loop
+        // the runtime plane width so every lane runs the same trip count.
+        let mut pass = 0u32;
+        while pass < PLANE_DIM {
+            // Is ANY active lane still unclaimed? (plane-wide predicate)
+            let any_unclaimed = plane_any(!claimed);
+            if any_unclaimed {
+                // Ballot the still-unclaimed lanes; find the FIRST set lane. The
+                // ballot is ALWAYS 4×u32 (128 bits) regardless of the runtime plane
+                // width (Pitfall 6) — scan all 4 words; words beyond the active plane
+                // are always 0, so they never produce a false leader (this is what
+                // makes the scan PLANE_DIM-correct without hardcoding 32: a wave32
+                // plane only ever sets bits in word 0, a wave64 plane in words 0..1).
+                let ballot = plane_ballot(!claimed);
+                let mut leader_word = 0usize;
+                let mut found_word = false;
+                let mut w = 0usize;
+                while w < 4usize {
+                    let bits = ballot[w];
+                    if !found_word && bits != 0u32 {
+                        leader_word = w;
+                        found_word = true;
+                    }
+                    w += 1usize;
+                }
+                let leader_bits = ballot[leader_word];
+                let leader_lane = leader_word as u32 * 32u32 + leader_bits.trailing_zeros();
+
+                // Broadcast the leader lane's bin to all lanes. Dynamic source ⇒
+                // plane_shuffle (plane_broadcast needs a const index).
+                let leader_bin = plane_shuffle(my_bin, leader_lane);
+
+                // Membership: a still-unclaimed lane whose bin equals the leader's
+                // (inactive lanes are already claimed, so excluded).
+                let mine = !claimed && (my_bin == leader_bin);
+
+                // Masked group reduction (non-members contribute 0.0). A plane TREE
+                // reduction — the f32 reorder the parity envelope was designed for.
+                let mut cg = 0.0f32;
+                let mut ch = 0.0f32;
+                if mine {
+                    cg = my_grad;
+                    ch = my_hess;
+                }
+                let group_grad = plane_sum(cg);
+                let group_hess = plane_sum(ch);
+
+                // The leader lane (the first unclaimed lane, itself a group member by
+                // construction) issues ONE global atomic per cell for the whole group.
+                if lane == leader_lane {
+                    let ti = leader_bin as usize * 2;
+                    out[ti].fetch_add(group_grad);
+                    out[ti + 1].fetch_add(group_hess);
+                }
+
+                // Retire the group.
+                if mine {
+                    claimed = true;
+                }
+            }
+            pass += 1u32;
+        }
+    } else if active {
+        // --- byte-faithful baseline body (the A/B baseline arm) ---
+        let ti = binned[idx] as usize * 2; // grad cell at bin<<1, hess at +1
+        out[ti].fetch_add(grad[idx]);
+        out[ti + 1].fetch_add(hess[idx]);
+    }
+}
+
+/// Host launcher for the warp-aggregated f32-atomic histogram (quick-260619-p93).
+///
+/// A near-verbatim copy of [`construct_histograms_parallel_f32_on`] (same V5
+/// boundary checks, same zeroed-f32 alloc, same `ceil(n/256)` cube count of 256
+/// units, same f32→f64 widen on read-back) that launches
+/// [`construct_hist_kernel_atomic_f32_plane`] with the `use_plane` comptime flag.
+/// `use_plane == false` reproduces the shipped baseline arm BYTE-FAITHFULLY (so the
+/// A/B bench can use ONE launcher for both arms, isolating exactly the warp-
+/// aggregation codegen); `use_plane == true` selects the same-bin aggregation arm.
+///
+/// **`use_plane == true` requires plane collectives.** The caller MUST gate it on
+/// the existing [`crate::runtime::probe_capabilities`]`(client).has_plane` (cpu =
+/// false, gfx1100 = true) — this launcher does NOT re-probe; pass `use_plane=false`
+/// (the byte-faithful baseline arm) when `has_plane` is false. Generic over
+/// `R: Runtime` (runs on cubecl-hip). Kept a rocm-gated PRIMITIVE — wired into the
+/// training path ONLY on a robust positive bench (see 260619-p93-FINDINGS.md).
+///
+/// # Errors
+/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
+#[cfg(feature = "rocm")]
+pub fn construct_histograms_parallel_f32_plane_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    binned: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_bin: u32,
+    use_plane: bool,
+) -> Result<Vec<f64>, ComputeError> {
+    let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
+    let n = binned.len();
+    if n == 0 {
+        return Ok(vec![0.0f64; out_len]);
+    }
+    let h_bin = client.create_from_slice(u32::as_bytes(binned));
+    let h_grad = client.create_from_slice(f32::as_bytes(grad));
+    let h_hess = client.create_from_slice(f32::as_bytes(hess));
+    let zeros = vec![0.0f32; out_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+
+    // One unit per row; cube dim 256 (8 × the gfx1100 wave32), cube count covers n.
+    let cube_dim = 256u32;
+    let cube_count = (n as u32).div_ceil(cube_dim);
+
+    // SAFETY: identical handle/length correspondence to
+    // `construct_histograms_parallel_f32_on` — `h_bin`/`h_grad`/`h_hess` sized `n`,
+    // `h_out` sized `out_len` f32 cells, each outliving the launch. The kernel
+    // bounds-checks `idx < n` (the `active` predicate), and input validation
+    // guarantees every `binned[i] < num_bin` so `out[bin*2 + 1]` (baseline arm) and
+    // `out[leader_bin*2 + 1]` (plane arm; `leader_bin` is some active lane's bin via
+    // `plane_shuffle`) stay in the `out_len` allocation. All cubecl unsafe is
+    // confined here (CMP-01).
+    //
+    // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+    // bounds-check codegen; every device access is host-proven in range BEFORE
+    // upload (the V5 checks discharge exactly the launch_unchecked obligations).
+    // The launch does NOT change numerics — the `use_plane` flag selects the
+    // accumulation ORDER (sequential atomics vs the f32 plane tree reduction); both
+    // are the same nondeterministic ~1e-6 path held to the CPU f64 anchor.
+    unsafe {
+        construct_hist_kernel_atomic_f32_plane::launch_unchecked(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(h_bin, n),
+            ArrayArg::from_raw_parts(h_grad, n),
+            ArrayArg::from_raw_parts(h_hess, n),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            use_plane,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}
+
 /// LDS sub-histogram cap: `2 * 256` f32 cells = 2 KiB of shared memory per cube
 /// (grad+hess interleaved for up to 256 bins). cubecl `SharedMemory::new` needs a
 /// COMPTIME size, but num_bin varies at runtime (32/64/128/256); rather than
