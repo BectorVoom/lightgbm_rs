@@ -269,3 +269,35 @@ hip envelope is unaffected by construction. To exercise the Case-A confirmation 
 hardware: `cargo run --release -p lgbm-compute --features rocm --example
 batched_read_audit_ab` (gfx1100; expected delta ~0 within p25/p75 — the two read idioms are
 the same `read_async(vec![h]) -> read_sync` drain).
+
+---
+
+## gfx1100 A/B confirmation run (executed 2026-06-19)
+
+Ran the Case-A harness on the real gfx1100 (`AMD Radeon 860M`, probed
+`Capabilities { has_plane: true, has_f64: false, has_f32_atomic: true, plane_size: 32 }`),
+**3 process restarts** (`cargo run --release -p lgbm-compute --features rocm --example
+batched_read_audit_ab`). Arm A = `client.read_one_unchecked(h)` (production); arm B =
+`client.read(vec![h])` (the manual's batched idiom, n=1). `delta% = (a_med - b_med)/a_med * 100`.
+
+| regime | rows | bins | delta% run1 | delta% run2 | delta% run3 | sign-stable? | bytes_eq |
+|--------|-----:|-----:|------------:|------------:|------------:|--------------|----------|
+| launch-bound  | 1024   | 16  | +6.53 | +6.90 | +1.30 | no (all small, +) | yes |
+| launch-bound  | 1024   | 64  | −0.39 | +2.20 | +5.52 | **flips** | yes |
+| launch-bound  | 1024   | 256 | −9.12 | −9.08 | −6.16 | same-sign but ~2 µs abs on a 0.022 ms read, spreads overlap → sub-noise | yes |
+| compute-bound | 200000 | 16  | +2.65 | +0.27 | −4.01 | **flips** | yes |
+| compute-bound | 200000 | 64  | +3.93 | +2.30 | −1.88 | **flips** | yes |
+| compute-bound | 200000 | 256 | −4.87 | −7.94 | +16.15 | **flips** | yes |
+
+**Verdict CONFIRMED on hardware (CASE A — NULL):**
+
+- `bytes_eq = yes` in all 18 cells across all 3 restarts — the read idiom changes no values
+  (compared within the f32-atomic envelope per DEF-f8u-01, since the kernel is relaunched per arm).
+- 5 of 6 cells **sign-flip** across restarts (most starkly compute-bound/256: −4.87 → −7.94 → +16.15),
+  and every delta sits inside the p25/p75 spread. The one same-sign cell (launch-bound/256, ~−6 to −9%)
+  is a ~2 µs absolute difference on a sub-0.025 ms read with heavily overlapping spreads — sub-noise.
+- This is exactly the equivalence the verdict rests on: `read_one_unchecked(h)` and `read(vec![h])`
+  are the SAME `read_async(vec![h]) → read_sync` drain (cubecl-runtime-0.10.0 client.rs:131-149).
+  Production emits ONE consolidated out-handle per launcher, so there is no N-handle read loop for
+  the batched idiom to collapse → **no remaining batched-read lever to wire.** Measurement only;
+  no production code touched.
