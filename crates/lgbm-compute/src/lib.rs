@@ -804,6 +804,18 @@ pub trait Backend {
 /// Binds [`runtime::ActiveRuntime`] (cubecl-cpu under the default `cpu` feature)
 /// and dispatches [`construct_histograms`](Backend::construct_histograms) to the
 /// single-owner ordered f64 fold in [`kernels::histogram`].
+/// quick-260620-8v4 opt-in gate for the additive 2-lane native split scan. Read
+/// ONCE from `LGBM_SPLIT_2LANE` (`"1"` => on). OFF by default: the serial
+/// [`kernels::split::find_best_split_cpu_native`] is the bit-exact source of truth
+/// and the production path; the 2-lane variant is selected only for the explicit
+/// A/B latency measurement (it produces byte-identical SplitInfos either way).
+#[cfg(feature = "cpu")]
+fn split_2lane_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_SPLIT_2LANE").map(|v| v == "1").unwrap_or(false))
+}
+
 #[cfg(feature = "cpu")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
@@ -853,20 +865,44 @@ impl Backend for CpuBackend {
         // R2: native f64 scan — bit-identical to the single-unit find_best_split_
         // kernel, without the per-(feature,leaf) cubecl launch. The cubecl path
         // stays in find_best_split_cpu for kernel-parity / ROCm-mirror tests.
-        kernels::split::find_best_split_cpu_native(
-            hist,
-            cfg,
-            num_bin,
-            offset,
-            default_bin,
-            most_freq_bin,
-            skip_default_bin,
-            na_as_missing,
-            run_forward,
-            sum_gradient,
-            sum_hessian,
-            num_data,
-        )
+        //
+        // quick-260620-8v4: an OPT-IN additive 2-lane variant runs the REVERSE and
+        // FORWARD passes on two rayon lanes (bit-identical winner — see
+        // `find_best_split_cpu_native_2lane`). Gated behind `LGBM_SPLIT_2LANE=1` so
+        // the DEFAULT path is the unchanged serial source of truth; the 2-lane path
+        // is only selected for the explicit A/B measurement. Both paths produce
+        // byte-identical SplitInfos (asserted by `split_2lane_equals_serial_*`).
+        if split_2lane_enabled() {
+            kernels::split::find_best_split_cpu_native_2lane(
+                hist,
+                cfg,
+                num_bin,
+                offset,
+                default_bin,
+                most_freq_bin,
+                skip_default_bin,
+                na_as_missing,
+                run_forward,
+                sum_gradient,
+                sum_hessian,
+                num_data,
+            )
+        } else {
+            kernels::split::find_best_split_cpu_native(
+                hist,
+                cfg,
+                num_bin,
+                offset,
+                default_bin,
+                most_freq_bin,
+                skip_default_bin,
+                na_as_missing,
+                run_forward,
+                sum_gradient,
+                sum_hessian,
+                num_data,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
