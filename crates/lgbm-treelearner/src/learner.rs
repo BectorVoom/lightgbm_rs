@@ -1584,6 +1584,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             smaller_resident_slot,
             smaller_fused,
             smaller_unified,
+            // quick 260620-b97: the directly-built smaller child is never subtract-unified.
+            None,
             gradients,
             hessians,
         )?;
@@ -1593,6 +1595,25 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut larger_records: Vec<FeatureSplitRecord> = Vec::new();
         if larger_leaf >= 0 {
             let larger_slot = larger_slot.expect("non-root larger child must hold a pool slot");
+            // quick 260620-b97: the UNIFIED host subtract→scan path for the
+            // subtract-derived larger child (the use_subtract analog of a48's
+            // `smaller_unified`). Eligible ONLY when CpuBackend (not resident/GPU), a
+            // parent histogram was retained (so the larger child IS derived by subtract,
+            // not directly built), the subtract-audit diagnostic is OFF (the audit-active
+            // path MUST take the byte-unchanged two-step so T-05-07-01 stays valid), and
+            // the leaf is wide enough (`unified_bfs_threshold()` — the SAME scan-work
+            // proxy a48 uses; Task 2 decides whether a separate threshold is justified).
+            // When set, the seam materializes parent/smaller scratch and the fused
+            // subtract→scan runs inside `scan_leaf_histogram`. The larger child has NO
+            // parallel build to contend with (only the cheap serial subtract), so 9cp's
+            // contention is structurally absent.
+            let larger_unified = !self.resident_eligible
+                && parent_slot.is_some()
+                && self.subtract_audit.is_none()
+                && features.len() >= lgbm_compute::unified_bfs_threshold();
+            // Owned (parent, smaller) scratch for the fused subtract, materialized at the
+            // seam (aliasing-safe: parent_slot == larger_slot) and consumed by the scan.
+            let mut larger_subtract_inputs: Option<(Vec<f64>, Vec<f64>)> = None;
             // 260608-p90 T2: when resident-eligible AND a parent was retained, derive the
             // larger child RESIDENT — `parent_slot` Handle − `smaller_slot` Handle →
             // `larger_slot` Handle, on device, NO read-back. The device mirror is keyed by
@@ -1631,7 +1652,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 }
                 Some(larger_slot)
             } else if let Some(parent_slot) = parent_slot {
-                // ---- HOST path (ineligible / CpuBackend) — byte-unchanged. ----
+                // ---- HOST path (ineligible / CpuBackend). ----
                 // use_subtract: larger = parent − smaller over the WHOLE concatenated
                 // compacted buffer (FeatureHistogram::Subtract, feature_histogram.hpp:
                 // 140-144 — `larger_data_[i] -= smaller_data_[i]` per compacted cell).
@@ -1642,37 +1663,53 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // This is the kEpsilon-faithful derivation the direct rebuild cannot
                 // reproduce bit-for-bit.
                 debug_assert_eq!(larger_slot, parent_slot, "the larger child reuses the moved parent slot");
-                // 260609-bfx follow-up: pass the pool slots directly — `subtract_histograms`
-                // only READS parent/child and returns a fresh owned buffer, so the two
-                // per-split `.to_vec()` scratch clones were redundant. `parent_slot ==
-                // larger_slot`, but `derived` is fully materialized (owns its data) before
-                // the `buffer_mut(larger_slot)` write below, so there is no aliasing. Same
-                // f64 cells, same op, same order → parity-neutral; one fewer Vec clone per
-                // use_subtract larger-child derivation (every split that retains a parent).
-                let derived = self.backend.subtract_histograms(
-                    self.client,
-                    pool.buffer(parent_slot),
-                    pool.buffer(smaller_slot),
-                )?;
-                // TEST audit hook (T-05-07-01): record (derived, direct) so a parity
-                // test can assert the subtracted larger child == a direct build of its
-                // own rows, cell-for-cell, in the LIVE growth path. Host-path only (the
-                // resident eligible path is inert here — audit is a non-spine diagnostic).
-                if let Some(audit) = self.subtract_audit.as_ref() {
-                    let mut direct = vec![0.0f64; derived.len()];
-                    self.build_leaf_histogram_into(
-                        features,
-                        gradients,
-                        hessians,
-                        data_partition,
-                        slot_off,
-                        larger_leaf,
-                        larger_splits,
-                        &mut direct,
-                    );
-                    audit.borrow_mut().push((derived.clone(), direct));
+                if larger_unified {
+                    // quick 260620-b97: UNIFIED host subtract→scan. The fused
+                    // subtract+scan runs INSIDE `scan_leaf_histogram` (so it reuses
+                    // Pass-1's exact spine-gating to build `scan_active`, identical to the
+                    // two-step path). Here we only materialize the owned parent/smaller
+                    // scratch (`parent_slot == larger_slot`, so copy BEFORE the &mut
+                    // larger write the scan performs — the same aliasing-safe pattern the
+                    // two-step `derived` uses) and hand them to the scan. Subtract-audit is
+                    // OFF here (the gate excludes audit-active), so the audit hook is
+                    // unreachable on this branch.
+                    larger_subtract_inputs = Some((
+                        pool.buffer(parent_slot).to_vec(),
+                        pool.buffer(smaller_slot).to_vec(),
+                    ));
+                } else {
+                    // 260609-bfx follow-up: pass the pool slots directly — `subtract_histograms`
+                    // only READS parent/child and returns a fresh owned buffer, so the two
+                    // per-split `.to_vec()` scratch clones were redundant. `parent_slot ==
+                    // larger_slot`, but `derived` is fully materialized (owns its data) before
+                    // the `buffer_mut(larger_slot)` write below, so there is no aliasing. Same
+                    // f64 cells, same op, same order → parity-neutral; one fewer Vec clone per
+                    // use_subtract larger-child derivation (every split that retains a parent).
+                    let derived = self.backend.subtract_histograms(
+                        self.client,
+                        pool.buffer(parent_slot),
+                        pool.buffer(smaller_slot),
+                    )?;
+                    // TEST audit hook (T-05-07-01): record (derived, direct) so a parity
+                    // test can assert the subtracted larger child == a direct build of its
+                    // own rows, cell-for-cell, in the LIVE growth path. Host-path only (the
+                    // resident eligible path is inert here — audit is a non-spine diagnostic).
+                    if let Some(audit) = self.subtract_audit.as_ref() {
+                        let mut direct = vec![0.0f64; derived.len()];
+                        self.build_leaf_histogram_into(
+                            features,
+                            gradients,
+                            hessians,
+                            data_partition,
+                            slot_off,
+                            larger_leaf,
+                            larger_splits,
+                            &mut direct,
+                        );
+                        audit.borrow_mut().push((derived.clone(), direct));
+                    }
+                    pool.buffer_mut(larger_slot).copy_from_slice(&derived);
                 }
-                pool.buffer_mut(larger_slot).copy_from_slice(&derived);
                 None
             } else {
                 // No parent retained (cannot happen post-root in the current spine,
@@ -1706,10 +1743,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 parent_splittable.as_deref(),
                 larger_resident_slot,
                 false,
-                // quick 260620-a48: the subtract-derived larger child is NEVER unified —
-                // it has a true data dependency on the smaller's complete histogram and
-                // its buffer is already built (subtract or direct) before this scan.
+                // quick 260620-a48: the larger child is never BUILD-unified (no per-feature
+                // fold). quick 260620-b97: it CAN be SUBTRACT-unified — `larger_unified`
+                // routes the scan through `subtract_scan` (fused subtract→scan) using the
+                // scratch in `larger_subtract_inputs`; the build-unified flag stays false.
                 false,
+                larger_subtract_inputs.take(),
                 gradients,
                 hessians,
             )?;
@@ -1929,6 +1968,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `build_leaf_histogram_into` at the seam is SKIPPED for this leaf. `false` keeps
         // the existing host-buf scan (the buffer is pre-built by the seam).
         unified_build: bool,
+        // quick 260620-b97: `Some((parent, smaller))` (CpuBackend subtract-derived larger
+        // child, above `unified_bfs_threshold`) routes the SPINE scan through ONE rayon
+        // `subtract_scan` region that SUBTRACTS (parent − smaller per feature, NO fix)
+        // into `buf` (complete for downstream) AND scans the spine subset — the
+        // use_subtract analog of `unified_build`/`build_fix_scan`. The standalone
+        // `subtract_histograms` + `copy_from_slice` at the seam is REPLACED for this leaf.
+        // `None` keeps the existing host-buf scan (the buffer is pre-derived by the seam).
+        // `unified_build` and `subtract_inputs.is_some()` are mutually exclusive (a leaf is
+        // either directly built or subtract-derived, never both).
+        subtract_inputs: Option<(Vec<f64>, Vec<f64>)>,
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
@@ -2064,7 +2113,48 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `batched_feats` order (Pass 1 pushed spine features in ascending fpos), so the
         // downstream `spine_batch_index[fpos]` lookup is byte-identical to the two-step
         // path. Only on CpuBackend + directly-built smaller leaf + above threshold.
-        let batched_splits = if unified_build {
+        let batched_splits = if let Some((parent_hist, smaller_hist)) = subtract_inputs.as_ref() {
+            // quick 260620-b97: UNIFIED host subtract→scan for the larger child. ONE rayon
+            // region SUBTRACTS (parent − smaller per feature, NO fix — non-negotiable #3)
+            // into `buf` (complete for downstream non-spine branches) AND scans the spine
+            // subset (`scan_active`). `all_feats` is the full fpos-ordered param list;
+            // `scan_active[fpos]` is true iff the feature is in `batched_feats`
+            // (`spine_batch_index[fpos].is_some()`), the SAME gating the two-step path
+            // applies — so the returned scan-active `Some(..)` entries, extracted in
+            // ascending fpos, are EXACTLY `batched_feats` order ⇒ byte-identical to the
+            // two-step subtract + separate scan. CpuBackend only (the seam gates it).
+            debug_assert!(!unified_build, "a leaf is never both build-unified and subtract-unified");
+            let all_feats: Vec<BatchedSplitFeature> = features
+                .iter()
+                .enumerate()
+                .map(|(fpos, f)| BatchedSplitFeature {
+                    slot_off: slot_off[fpos],
+                    num_bin: f.num_bin,
+                    offset: f.offset,
+                    default_bin: f.default_bin,
+                    most_freq_bin: f.most_freq_bin,
+                    skip_default_bin: f.skip_default_bin(),
+                    na_as_missing: f.na_as_missing(),
+                    run_forward: f.run_forward(),
+                })
+                .collect();
+            let scan_active: Vec<bool> =
+                spine_batch_index.iter().map(|idx| idx.is_some()).collect();
+            let per_feat = self.backend.subtract_scan(
+                self.client,
+                parent_hist,
+                smaller_hist,
+                buf,
+                &all_feats,
+                &scan_active,
+                &self.cfg,
+                sum_g,
+                sum_h,
+                num_data_in_leaf,
+            )?;
+            // Extract scan-active SplitInfos in ascending fpos ⇒ batched_feats order.
+            per_feat.into_iter().flatten().collect::<Vec<SplitInfo>>()
+        } else if unified_build {
             let leaf_rows = data_partition.indices_in_leaf(leaf);
             let all_feats: Vec<BatchedSplitFeature> = features
                 .iter()

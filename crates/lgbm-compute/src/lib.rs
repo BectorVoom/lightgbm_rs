@@ -938,6 +938,56 @@ pub trait Backend {
                 .to_string(),
         })
     }
+
+    /// quick 260620-b97: UNIFIED host per-feature `{subtract → scan}` for the
+    /// subtract-derived (larger / use_subtract) child, run inside ONE rayon region — the
+    /// host f64 analog of [`build_fix_scan`](Backend::build_fix_scan) but for the larger
+    /// child, with NO build and NO fix (non-negotiable #3: C++ runs no FixHistogram on the
+    /// use_subtract larger child; both operands are already fixed+compacted).
+    ///
+    /// Each feature computes its OWN private region `parent[start..end] −
+    /// smaller[start..end]` (the exact cell-wise op of
+    /// [`subtract_histograms`](Backend::subtract_histograms) over the disjoint range) and
+    /// — IF `scan_active[fpos]` — scans it, WITHOUT a cross-region fork/join hand-off. After
+    /// the region a SERIAL ordered loop copies each private region into its disjoint
+    /// `larger_buf[slot_off..]` range (the COMPLETE larger-child histogram) and assembles
+    /// the per-feature `Option<SplitInfo>` results in feature-index order.
+    ///
+    /// BIT-EXACT: each feature is independent — same f64 cells, same `p − s` op, same
+    /// order as the two-step `subtract_histograms` + per-feature scan; the (serial,
+    /// feature-order) argmax is unchanged ⇒ byte-identical to the two-step path (proven
+    /// FORCED-ON via `LGBM_UNIFIED_BFS_THRESHOLD=0`). `sum_gradient`/`sum_hessian` are the
+    /// larger child's RAW leaf totals (passed to the scan only — no fix uses them here).
+    ///
+    /// Default: typed error — only [`CpuBackend`] overrides this (the unified path is the
+    /// CPU-only host analog; the resident/GPU larger child keeps `subtract_resident`). The
+    /// learner's `larger_unified` gate ANDs in `!resident_eligible` so this is never
+    /// reached on a GPU backend.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported) on the default; on CpuBackend,
+    /// [`ComputeError::LengthMismatch`] for an out-of-range feature region (ascending,
+    /// validated against parent/smaller/larger ⇒ deterministic lowest-index error) or a
+    /// propagated [`find_best_split`](Backend::find_best_split) error.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _parent: &[f64],
+        _smaller: &[f64],
+        _larger_buf: &mut [f64],
+        _all_feats: &[BatchedSplitFeature],
+        _scan_active: &[bool],
+        _cfg: &GainConfig,
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+        _num_data: i32,
+    ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "subtract_scan: unified host subtract+scan not supported on this backend"
+                .to_string(),
+        })
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -1281,6 +1331,38 @@ impl Backend for CpuBackend {
             num_data,
         )
     }
+
+    // quick 260620-b97: UNIFIED host subtract+scan — delegate to the inherent impl
+    // (the host f64 analog for the use_subtract larger child). CpuBackend ONLY;
+    // RocmBackend keeps the trait-default typed error (its larger child is the
+    // resident `subtract_resident` path).
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent: &[f64],
+        smaller: &[f64],
+        larger_buf: &mut [f64],
+        all_feats: &[BatchedSplitFeature],
+        scan_active: &[bool],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
+        self.subtract_scan_impl(
+            client,
+            parent,
+            smaller,
+            larger_buf,
+            all_feats,
+            scan_active,
+            cfg,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )
+    }
 }
 
 /// quick 260620-a48: the host f64 analog of the GPU `build_fix_scan_resident` fusion.
@@ -1396,6 +1478,142 @@ impl CpuBackend {
             let (hist, split) = res?;
             let (start, end) = ranges[fpos];
             buf[start..end].copy_from_slice(&hist);
+            splits.push(split);
+        }
+        Ok(splits)
+    }
+
+    /// quick 260620-b97: UNIFIED host subtract+scan for the subtract-derived LARGER
+    /// child — the host f64 analog of [`build_fix_scan_impl`] but for the use_subtract
+    /// child, fusing per-feature `{subtract → scan}` into ONE rayon region. There is NO
+    /// build step (the larger child's histogram is `parent − smaller`, already
+    /// fixed+compacted in both operands) and NO fix step (non-negotiable #3: C++ runs no
+    /// FixHistogram on the use_subtract larger child — only ComputeBestSplit).
+    ///
+    /// BIT-EXACT SAFETY: each task computes a PRIVATE region `parent[start..end] −
+    /// smaller[start..end]` (the exact cell-wise op of [`subtract_histograms`] over the
+    /// disjoint range) into its own buffer, then scans it; `par_iter` preserves input
+    /// order so the serial assembly stays feature-index-ordered. Same f64 cells, same op,
+    /// same order ⇒ byte-identical to the two-step `subtract_histograms` + per-feature
+    /// scan, so the bit-exact CPU f64 anchor holds (proven FORCED-ON in the parity gate).
+    ///
+    /// DETERMINISTIC ERROR ORDER: the per-feature `[slot_off, slot_off + 2*num_bin)`
+    /// range validation is hoisted BEFORE the parallel map and walks features in
+    /// ascending index, validated against `parent.len()`, `smaller.len()`, AND
+    /// `larger_buf.len()` — so a parallel error race can never change WHICH error
+    /// surfaces (the lowest-index offender, matching `subtract_histograms`'
+    /// whole-buffer length check). The map itself is then infallible on the validated
+    /// slices.
+    ///
+    /// Scope: CpuBackend ONLY, called behind the host `larger_unified` gate; the
+    /// resident/GPU larger child keeps `subtract_resident`. RocmBackend is untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan_impl(
+        &self,
+        client: &ComputeClient<<Self as Backend>::Runtime>,
+        parent: &[f64],
+        smaller: &[f64],
+        larger_buf: &mut [f64],
+        all_feats: &[BatchedSplitFeature],
+        scan_active: &[bool],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(scan_active.len(), all_feats.len());
+
+        // 1) Hoisted ascending-order validation ⇒ deterministic lowest-index error
+        //    (matches the two-step `subtract_histograms`' whole-buffer length check).
+        //    Each feature's `[start, end)` is validated against parent/smaller/larger so
+        //    the parallel map is infallible on the validated slices.
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(all_feats.len());
+        for f in all_feats {
+            let cells =
+                2usize
+                    .checked_mul(f.num_bin as usize)
+                    .ok_or_else(|| ComputeError::Runtime {
+                        detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+                    })?;
+            let end = f
+                .slot_off
+                .checked_add(cells)
+                .ok_or_else(|| ComputeError::Runtime {
+                    detail: "subtract_scan: slot_off + region overflows".to_string(),
+                })?;
+            if end > larger_buf.len() {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: larger_buf.len(),
+                });
+            }
+            if end > parent.len() {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: parent.len(),
+                });
+            }
+            if end > smaller.len() {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: smaller.len(),
+                });
+            }
+            ranges.push((f.slot_off, end));
+        }
+
+        // 2) ONE rayon fork/join over features. Each task: subtract → scan into its OWN
+        //    private buffer (cache-hot, no cross-region hand-off). Returns
+        //    `(private_region, Option<SplitInfo>)`; `par_iter` preserves input order so
+        //    the serial assembly below stays feature-index-ordered (bit-exact argmax).
+        let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> = all_feats
+            .par_iter()
+            .zip(scan_active.par_iter())
+            .zip(ranges.par_iter())
+            .map(|((f, &active), &(start, end))| {
+                // (a) SUBTRACT: own private region = parent − smaller over the disjoint
+                //     range (the same cell-wise op as `subtract_histograms`). NO fix, NO
+                //     compact — both operands are already fixed+compacted.
+                let region: Vec<f64> = parent[start..end]
+                    .iter()
+                    .zip(&smaller[start..end])
+                    .map(|(p, s)| p - s)
+                    .collect();
+                // (b) SCAN (only if spine-active): own SplitInfo from the derived region.
+                let split = if active {
+                    Some(self.find_best_split(
+                        client,
+                        &region,
+                        cfg,
+                        f.num_bin,
+                        f.offset,
+                        f.default_bin,
+                        f.most_freq_bin,
+                        f.skip_default_bin,
+                        f.na_as_missing,
+                        f.run_forward,
+                        sum_gradient,
+                        sum_hessian,
+                        num_data,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((region, split))
+            })
+            .collect();
+
+        // 3) SERIAL ordered assembly: copy each private region into its disjoint
+        //    `larger_buf` region (COMPLETE histogram for the larger child) and collect
+        //    the per-feature SplitInfos in feature-index order. Propagate the lowest-index
+        //    scan error (the validated ranges already guarantee region-length safety).
+        let mut splits: Vec<Option<SplitInfo>> = Vec::with_capacity(all_feats.len());
+        for (fpos, res) in results.into_iter().enumerate() {
+            let (region, split) = res?;
+            let (start, end) = ranges[fpos];
+            larger_buf[start..end].copy_from_slice(&region);
             splits.push(split);
         }
         Ok(splits)
@@ -2138,6 +2356,7 @@ mod build_fix_scan_tests {
         compact_histogram_inline, fix_histogram_inline, fold_one_feature, Backend, BatchedSplitFeature,
         BinColumn, CpuBackend,
     };
+    use crate::error::ComputeError;
     use crate::gain::GainConfig;
     use crate::runtime::cpu_client;
 
@@ -2346,6 +2565,141 @@ mod build_fix_scan_tests {
         assert!(res[1].is_none(), "feature 1 ineligible -> None");
         assert!(res[2].is_some(), "feature 2 active -> Some");
         assert!(res[3].is_none(), "feature 3 ineligible -> None");
+    }
+
+    // ---- quick 260620-b97: subtract_scan (larger child: subtract → scan, NO fix) ----
+
+    /// Build a parent histogram and a smaller-child histogram (both already
+    /// fixed+compacted, as they are in the pool) for the b97 fixture features, so the
+    /// larger child = parent − smaller is exercised. The two histograms use disjoint
+    /// row sets, but the test only needs them to be ARBITRARY valid f64 buffers — the
+    /// subtract is a pure cell-wise op and the scan reads the derived buffer.
+    fn parent_and_smaller(
+        feats: &[BatchedSplitFeature],
+        slot_len: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut parent = vec![0.0f64; slot_len];
+        let mut smaller = vec![0.0f64; slot_len];
+        for (fpos, f) in feats.iter().enumerate() {
+            let cells = 2 * f.num_bin as usize;
+            for k in 0..cells {
+                // Deterministic, distinct, non-trivial values so subtract is meaningful.
+                let h = ((fpos * 131 + k) as u64).wrapping_mul(2_654_435_761);
+                parent[f.slot_off + k] = (h % 1000) as f64 * 0.013 + 7.0;
+                smaller[f.slot_off + k] = (h % 311) as f64 * 0.007 + 1.0;
+            }
+        }
+        (parent, smaller)
+    }
+
+    /// BEHAVIOR 1+2: subtract_scan writes larger_buf == parent − smaller cell-for-cell
+    /// for EVERY feature, AND returns SplitInfos byte-identical to a separate per-feature
+    /// scan of that derived buffer, in EXACTLY feature-index order. NO fix step.
+    #[test]
+    fn subtract_scan_bit_exact_and_ordered_vs_two_step() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let cfg = relaxed_cfg();
+        let (_cols, _num_bins, _slot_off, slot_len, _leaf_rows, _grads, _hess, feats, sum_g, sum_h, num_data) =
+            fixture();
+        let (parent, smaller) = parent_and_smaller(&feats, slot_len);
+
+        // Two-step reference: whole-buffer subtract, then per-feature scan.
+        let derived_ref = backend
+            .subtract_histograms(&client, &parent, &smaller)
+            .expect("two-step subtract");
+
+        let scan_active = vec![true; feats.len()];
+        let mut larger_buf = vec![0.0f64; slot_len];
+        let got = backend
+            .subtract_scan(
+                &client, &parent, &smaller, &mut larger_buf, &feats, &scan_active, &cfg, sum_g,
+                sum_h, num_data,
+            )
+            .expect("subtract_scan");
+
+        // (a) larger_buf bit-identical to the whole-buffer subtract over every cell.
+        for (i, (w, g)) in derived_ref.iter().zip(&larger_buf).enumerate() {
+            assert_eq!(w.to_bits(), g.to_bits(), "larger_buf cell {i}: two-step {w} != fused {g}");
+        }
+
+        // (b) per-feature SplitInfos byte-identical to a separate scan of derived_ref.
+        assert_eq!(got.len(), feats.len(), "one result slot per feature");
+        for (fpos, f) in feats.iter().enumerate() {
+            let cells = 2 * f.num_bin as usize;
+            let hist = &derived_ref[f.slot_off..f.slot_off + cells];
+            let want = backend
+                .find_best_split(
+                    &client, hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
+                    f.skip_default_bin, f.na_as_missing, f.run_forward, sum_g, sum_h, num_data,
+                )
+                .expect("two-step scan");
+            let g = got[fpos].expect("scan-active feature has a SplitInfo");
+            assert_eq!(g.gain.to_bits(), want.gain.to_bits(), "feature {fpos}: gain");
+            assert_eq!(g.threshold, want.threshold, "feature {fpos}: threshold");
+            assert_eq!(g.default_left, want.default_left, "feature {fpos}: default_left");
+            assert_eq!(g.left_count, want.left_count, "feature {fpos}: left_count");
+            assert_eq!(
+                g.left_sum_gradient.to_bits(),
+                want.left_sum_gradient.to_bits(),
+                "feature {fpos}: left_sum_gradient"
+            );
+        }
+    }
+
+    /// BEHAVIOR: an ineligible (non-scan-active) feature returns `None` (NOT scanned)
+    /// while still being subtracted into larger_buf. Scan-active features return `Some`.
+    #[test]
+    fn subtract_scan_ineligible_feature_returns_none_but_still_subtracted() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let cfg = relaxed_cfg();
+        let (_cols, _num_bins, _slot_off, slot_len, _leaf_rows, _grads, _hess, feats, sum_g, sum_h, num_data) =
+            fixture();
+        let (parent, smaller) = parent_and_smaller(&feats, slot_len);
+        let derived_ref = backend
+            .subtract_histograms(&client, &parent, &smaller)
+            .expect("two-step subtract");
+
+        // Features 0 and 2 active, 1 and 3 ineligible.
+        let scan_active = vec![true, false, true, false];
+        let mut larger_buf = vec![0.0f64; slot_len];
+        let res = backend
+            .subtract_scan(
+                &client, &parent, &smaller, &mut larger_buf, &feats, &scan_active, &cfg, sum_g,
+                sum_h, num_data,
+            )
+            .expect("subtract_scan");
+        assert!(res[0].is_some(), "feature 0 active -> Some");
+        assert!(res[1].is_none(), "feature 1 ineligible -> None");
+        assert!(res[2].is_some(), "feature 2 active -> Some");
+        assert!(res[3].is_none(), "feature 3 ineligible -> None");
+        // Buffer is COMPLETE even for non-scan-active features (larger child needs all).
+        for (i, (w, g)) in derived_ref.iter().zip(&larger_buf).enumerate() {
+            assert_eq!(w.to_bits(), g.to_bits(), "buf cell {i}: subtract must run for all feats");
+        }
+    }
+
+    /// BEHAVIOR: a length mismatch (larger_buf too short for a feature's region) is the
+    /// deterministic lowest-index LengthMismatch, matching the hoisted validation.
+    #[test]
+    fn subtract_scan_length_mismatch_is_deterministic() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let cfg = relaxed_cfg();
+        let (_cols, _num_bins, _slot_off, slot_len, _leaf_rows, _grads, _hess, feats, sum_g, sum_h, num_data) =
+            fixture();
+        let (parent, smaller) = parent_and_smaller(&feats, slot_len);
+        let scan_active = vec![true; feats.len()];
+        // larger_buf one cell short of the last feature's region end.
+        let mut larger_buf = vec![0.0f64; slot_len - 1];
+        let err = backend
+            .subtract_scan(
+                &client, &parent, &smaller, &mut larger_buf, &feats, &scan_active, &cfg, sum_g,
+                sum_h, num_data,
+            )
+            .expect_err("short larger_buf must error");
+        assert!(matches!(err, ComputeError::LengthMismatch { .. }), "got {err:?}");
     }
 }
 
