@@ -14,5 +14,20 @@ lgbm-compute = { path = "../lgbm-compute" }
 lgbm-model = { path = "../lgbm-model" }
 thiserror = { workspace = true }
 
+[features]
+# Example-only (`bench_split_scan`): forward `--features rocm` down to the facade
+# `lgbm` dev-dependency so the harness can drive the gfx1100 HIP backend for the
+# informational rocm SCAN-fraction row. The LIBRARY crate has no GPU runtime
+# (CMP-01 containment) — this only wires the dev-dependency's feature for the
+# example binary; a default build pulls in no HIP toolchain.
+rocm = ["lgbm/rocm"]
+
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }
+# Example-only (`bench_split_scan`): drive the full per-leaf BUILD/SCAN hot path
+# through the facade `train()` so the phase_prof BUILD_NS/SCAN_NS counters measure
+# the EXACT production code path (not a synthetic re-implementation). This is a
+# dev-dependency cycle (lgbm -> lgbm-treelearner normally; lgbm-treelearner -> lgbm
+# dev-only), which cargo permits — the same idiom oracle-harness uses for its
+# replay tests. Never pulled in by downstream library consumers.
+lgbm = { path = "../lgbm" }
