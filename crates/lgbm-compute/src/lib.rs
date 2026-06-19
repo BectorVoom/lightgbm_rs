@@ -318,6 +318,33 @@ fn par_scan_threshold() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The feature-count at/above which the directly-built (smaller/root) leaf's
+/// per-feature `{build histogram → fix_histogram → compact → scan}` runs inside ONE
+/// rayon region (the host f64 analog of the GPU `build_fix_scan_resident` fusion,
+/// quick 260620-a48) instead of the two-step `build_leaf_histogram_into` +
+/// `find_best_splits_batched`.
+///
+/// Keyed on `feats.len()` — the SAME scan-work proxy as [`par_scan_threshold`] —
+/// because the contention this lever removes (quick 260620-9cp: a parallel scan
+/// `par_iter` fighting the already-parallel build `par_iter`) scales with the
+/// feature count, and narrow leaves were catastrophic in BOTH 8v4 and 9cp. Below the
+/// threshold the leaf takes the byte-unchanged serial two-step path. Override via
+/// `LGBM_UNIFIED_BFS_THRESHOLD`.
+///
+/// DEFAULT (quick 260620-a48): HONEST NULL — the unified region is kept available
+/// (env-reachable, bit-exact-proven FORCED-ON via `LGBM_UNIFIED_BFS_THRESHOLD=0`) but
+/// is NOT the effective default, so the threshold is `usize::MAX` (unreachable). The
+/// A/B measured on cubecl-cpu (warm, 3-run medians) showed the wide train-wall gain
+/// was within run-to-run spread / sign-flipped while narrow regressed, so per the
+/// project's audit-before-wire value the serial two-step stays the effective default.
+/// See the 260620-a48 SUMMARY for the full A/B.
+pub fn unified_bfs_threshold() -> usize {
+    std::env::var("LGBM_UNIFIED_BFS_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
@@ -833,6 +860,67 @@ pub trait Backend {
                 .to_string(),
         })
     }
+
+    /// quick 260620-a48: UNIFIED host per-feature `{build → fix → compact → scan}` for
+    /// the directly-built (smaller/root) leaf, run inside ONE rayon region — the host f64
+    /// analog of [`build_fix_scan_resident`](Backend::build_fix_scan_resident).
+    ///
+    /// Each feature folds its OWN private histogram (cache-hot in the building thread),
+    /// runs `fix_histogram` (RAW sums + `most_freq_bin` reconstruct) + `compact`
+    /// (`offset` shift) IN PLACE on it, and — IF `scan_active[fpos]` — scans it, all
+    /// WITHOUT a cross-region fork/join hand-off (the contention quick 260620-9cp found:
+    /// a parallel scan `par_iter` fighting the parallel build `par_iter`). After the
+    /// region a SERIAL ordered loop copies each private histogram into its disjoint
+    /// `buf[slot_off..]` region (the COMPLETE leaf histogram for the subtract-derived
+    /// larger child) and assembles the per-feature `Option<SplitInfo>` results in
+    /// feature-index order.
+    ///
+    /// `all_feats[fpos]` carries every feature's `(slot_off, num_bin, offset,
+    /// most_freq_bin, …)` (the SAME `BatchedSplitFeature` Pass-1 builds);
+    /// build+fix+compact run for EVERY feature (the histogram must be COMPLETE for the
+    /// subtract trick) while `scan_active[fpos]` selects which features are scanned (the
+    /// spine subset that passed the caller's PASS-1 gates). `None` for non-scan-active
+    /// features; the caller's serial cross-feature argmax merges these with the inline
+    /// (categorical / monotone / extra-trees) branches in feature-index order.
+    ///
+    /// BIT-EXACT: each feature is independent — disjoint region, own ascending-`leaf_rows`
+    /// fold, own ascending-bin `fix`/`compact`, own scan. Co-locating the three phases on
+    /// one thread changes NEITHER per-feature op order NOR the (serial, feature-order)
+    /// argmax ⇒ byte-identical to the two-step path (proven FORCED-ON via
+    /// `LGBM_UNIFIED_BFS_THRESHOLD=0`). `sum_gradient`/`sum_hessian` are the RAW
+    /// (un-bumped) leaf totals (Pitfall 2 — the `fix` operand).
+    ///
+    /// Default: typed error — only [`CpuBackend`] overrides this (the unified path is the
+    /// CPU-only host analog; RocmBackend keeps `build_fix_scan_resident`). The learner's
+    /// `unified_bfs` gate ANDs in `!resident_pool_supported()` so this is never reached on
+    /// a GPU backend.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported) on the default; on CpuBackend,
+    /// [`ComputeError::LengthMismatch`] for an out-of-range feature region (ascending ⇒
+    /// deterministic lowest-index error) or a propagated
+    /// [`find_best_split`](Backend::find_best_split) error.
+    #[allow(clippy::too_many_arguments)]
+    fn build_fix_scan(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _buf: &mut [f64],
+        _feature_bins: &[&BinColumn],
+        _leaf_rows: &[u32],
+        _gradients: &[f32],
+        _hessians: &[f32],
+        _all_feats: &[BatchedSplitFeature],
+        _scan_active: &[bool],
+        _cfg: &GainConfig,
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+        _num_data: i32,
+    ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "build_fix_scan: unified host build+fix+scan not supported on this backend"
+                .to_string(),
+        })
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -1140,6 +1228,218 @@ impl Backend for CpuBackend {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    // quick 260620-a48: UNIFIED host build+fix+scan — delegate to the inherent impl
+    // (the host f64 analog of the GPU build_fix_scan_resident). CpuBackend ONLY;
+    // RocmBackend keeps the trait-default typed error (its fusion is the resident path).
+    #[allow(clippy::too_many_arguments)]
+    fn build_fix_scan(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        buf: &mut [f64],
+        feature_bins: &[&BinColumn],
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+        all_feats: &[BatchedSplitFeature],
+        scan_active: &[bool],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
+        self.build_fix_scan_impl(
+            client,
+            buf,
+            feature_bins,
+            leaf_rows,
+            gradients,
+            hessians,
+            all_feats,
+            scan_active,
+            cfg,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )
+    }
+}
+
+/// quick 260620-a48: the host f64 analog of the GPU `build_fix_scan_resident` fusion.
+#[cfg(feature = "cpu")]
+impl CpuBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn build_fix_scan_impl(
+        &self,
+        client: &ComputeClient<<Self as Backend>::Runtime>,
+        buf: &mut [f64],
+        feature_bins: &[&BinColumn],
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+        all_feats: &[BatchedSplitFeature],
+        scan_active: &[bool],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(feature_bins.len(), all_feats.len());
+        debug_assert_eq!(scan_active.len(), all_feats.len());
+
+        // 1) Gather the ordered gradients/hessians ONCE per leaf (identical across every
+        //    feature — only the bin column differs; mirrors `build_leaf_histograms_raw`
+        //    SPIKE 003). Values + order unchanged ⇒ bit-exact fold inputs.
+        let r = leaf_rows.len();
+        let mut ord_g: Vec<f32> = Vec::with_capacity(r);
+        let mut ord_h: Vec<f32> = Vec::with_capacity(r);
+        for &row in leaf_rows {
+            ord_g.push(gradients[row as usize]);
+            ord_h.push(hessians[row as usize]);
+        }
+
+        // 2) Hoisted ascending-order validation ⇒ deterministic lowest-index error
+        //    (matches the two-step / serial path's first-failure behavior). Records each
+        //    feature's validated `[start, end)` so the parallel map is infallible.
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(all_feats.len());
+        for f in all_feats {
+            let cells =
+                2usize
+                    .checked_mul(f.num_bin as usize)
+                    .ok_or_else(|| ComputeError::Runtime {
+                        detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+                    })?;
+            let end = f
+                .slot_off
+                .checked_add(cells)
+                .ok_or_else(|| ComputeError::Runtime {
+                    detail: "build_fix_scan: slot_off + region overflows".to_string(),
+                })?;
+            if end > buf.len() {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: buf.len(),
+                });
+            }
+            ranges.push((f.slot_off, end));
+        }
+
+        // 3) ONE rayon fork/join over features. Each task: build → fix → compact → scan
+        //    into its OWN private buffer (cache-hot, no cross-region hand-off). Returns
+        //    `(private_hist, Option<SplitInfo>)`; `par_iter` preserves input order so the
+        //    serial assembly below stays feature-index-ordered (bit-exact argmax).
+        let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> = all_feats
+            .par_iter()
+            .zip(scan_active.par_iter())
+            .zip(feature_bins.par_iter())
+            .map(|((f, &active), bins)| {
+                let cells = 2 * f.num_bin as usize;
+                // (a) BUILD: own private histogram, ascending leaf_rows, grad at bin<<1.
+                let mut hist = vec![0.0f64; cells];
+                fold_one_feature(bins, leaf_rows, &ord_g, &ord_h, &mut hist);
+                // (b) FIX: most_freq_bin reconstruct on RAW leaf sums (Pitfall 2). No-op
+                //     for most_freq_bin==0 (the C++ `if (most_freq_bin > 0)` guard).
+                fix_histogram_inline(&mut hist, f.most_freq_bin, sum_gradient, sum_hessian);
+                // (c) COMPACT: shift real-bin `c+offset` into `c`, zero the tail (D-09).
+                //     No-op for offset==0.
+                compact_histogram_inline(&mut hist, f.offset);
+                // (d) SCAN (only if spine-active): own SplitInfo from the disjoint hist.
+                let split = if active {
+                    Some(self.find_best_split(
+                        client,
+                        &hist,
+                        cfg,
+                        f.num_bin,
+                        f.offset,
+                        f.default_bin,
+                        f.most_freq_bin,
+                        f.skip_default_bin,
+                        f.na_as_missing,
+                        f.run_forward,
+                        sum_gradient,
+                        sum_hessian,
+                        num_data,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((hist, split))
+            })
+            .collect();
+
+        // 4) SERIAL ordered assembly: copy each private hist into its disjoint `buf`
+        //    region (COMPLETE histogram for the subtract-larger child) and collect the
+        //    per-feature SplitInfos in feature-index order. Propagate the lowest-index
+        //    scan error (the validated ranges already guarantee region-length safety).
+        let mut splits: Vec<Option<SplitInfo>> = Vec::with_capacity(all_feats.len());
+        for (fpos, res) in results.into_iter().enumerate() {
+            let (hist, split) = res?;
+            let (start, end) = ranges[fpos];
+            buf[start..end].copy_from_slice(&hist);
+            splits.push(split);
+        }
+        Ok(splits)
+    }
+}
+
+/// `Dataset::FixHistogram` reconstruct (the compute-crate inline twin of the
+/// learner-side `fix_histogram::fix_histogram`, kept here to avoid a treelearner→
+/// compute circular dep). Byte-identical op order: seed the most-freq cell with the
+/// RAW leaf totals, subtract every other bin in ASCENDING order. No-op for
+/// `most_freq_bin == 0` (C++ `if (most_freq_bin > 0)`).
+#[cfg(feature = "cpu")]
+#[inline]
+fn fix_histogram_inline(hist: &mut [f64], most_freq_bin: u32, sum_gradient: f64, sum_hessian: f64) {
+    if most_freq_bin == 0 {
+        return;
+    }
+    let num_bin = hist.len() / 2;
+    let mfb = most_freq_bin as usize;
+    if mfb >= num_bin {
+        return;
+    }
+    let g_idx = mfb << 1;
+    let h_idx = g_idx + 1;
+    let mut g = sum_gradient;
+    let mut h = sum_hessian;
+    for i in 0..num_bin {
+        if i != mfb {
+            g -= hist[i << 1];
+            h -= hist[(i << 1) + 1];
+        }
+    }
+    hist[g_idx] = g;
+    hist[h_idx] = h;
+}
+
+/// COMPACTED-layout shift (the compute-crate inline twin of the learner-side
+/// `compact_histogram`). Shift pair `c + off` down to `c` in ASCENDING order, zero the
+/// dropped tail. No-op for `offset <= 0`. Byte-identical to the two-step compaction.
+#[cfg(feature = "cpu")]
+#[inline]
+fn compact_histogram_inline(hist: &mut [f64], offset: i32) {
+    if offset <= 0 {
+        return;
+    }
+    let off = offset as usize;
+    let num_bin = hist.len() / 2;
+    if off >= num_bin {
+        for cell in hist.iter_mut() {
+            *cell = 0.0;
+        }
+        return;
+    }
+    for c in 0..(num_bin - off) {
+        let dst = c << 1;
+        let src = (c + off) << 1;
+        hist[dst] = hist[src];
+        hist[dst + 1] = hist[src + 1];
+    }
+    for cell in hist.iter_mut().skip((num_bin - off) << 1) {
+        *cell = 0.0;
     }
 }
 
@@ -1812,6 +2112,223 @@ mod par_build_tests {
              SCATTER into shared `out` (rejected)       : {ma:?}/build\n  \
              ratio live/scatter: {ratio:.3}x  (<1 ⇒ scatter SLOWER ⇒ keep Vec<Vec>)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod build_fix_scan_tests {
+    use super::{
+        compact_histogram_inline, fix_histogram_inline, fold_one_feature, Backend, BatchedSplitFeature,
+        BinColumn, CpuBackend,
+    };
+    use crate::gain::GainConfig;
+    use crate::runtime::cpu_client;
+
+    /// Build a small synthetic multi-feature leaf (mixed widths, scattered rows) and the
+    /// per-feature `BatchedSplitFeature` params + slot layout.
+    fn fixture() -> (
+        Vec<BinColumn>,
+        Vec<u32>,
+        Vec<usize>,
+        usize,
+        Vec<u32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<BatchedSplitFeature>,
+        f64,
+        f64,
+        i32,
+    ) {
+        let rows: u32 = 400;
+        let num_bins: Vec<u32> = vec![8, 5, 16, 4];
+        // most_freq_bin per feature: exercise both the offset==1 (mfb==0) and the
+        // mfb>0 FixHistogram-reconstruct paths.
+        let most_freq: Vec<u32> = vec![0, 2, 0, 1];
+        let cols: Vec<BinColumn> = num_bins
+            .iter()
+            .enumerate()
+            .map(|(f, &nb)| {
+                let v: Vec<u32> = (0..rows)
+                    .map(|r| {
+                        let h = (r as u64).wrapping_mul(2_654_435_761).wrapping_add(f as u64 * 131);
+                        (h % nb as u64) as u32
+                    })
+                    .collect();
+                BinColumn::new(v, nb)
+            })
+            .collect();
+        let mut slot_off = Vec::new();
+        let mut off = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(off);
+            off += 2 * nb as usize;
+        }
+        let slot_len = off;
+        let leaf_rows: Vec<u32> =
+            (0..rows).map(|i| (i.wrapping_mul(2_654_435_761)) % rows).collect();
+        let gradients: Vec<f32> = (0..rows).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let hessians: Vec<f32> = (0..rows).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+        let feats: Vec<BatchedSplitFeature> = num_bins
+            .iter()
+            .enumerate()
+            .map(|(f, &nb)| BatchedSplitFeature {
+                slot_off: slot_off[f],
+                num_bin: nb,
+                offset: if most_freq[f] == 0 { 1 } else { 0 },
+                default_bin: nb, // out of range -> SKIP_DEFAULT_BIN never fires
+                most_freq_bin: most_freq[f],
+                skip_default_bin: false,
+                na_as_missing: false,
+                run_forward: false,
+            })
+            .collect();
+        // RAW leaf sums over the leaf rows (the fix operand, Pitfall 2).
+        let mut sum_g = 0.0f64;
+        let mut sum_h = 0.0f64;
+        for &row in &leaf_rows {
+            sum_g += f64::from(gradients[row as usize]);
+            sum_h += f64::from(hessians[row as usize]);
+        }
+        let num_data = leaf_rows.len() as i32;
+        (
+            cols, num_bins, slot_off, slot_len, leaf_rows, gradients, hessians, feats, sum_g, sum_h,
+            num_data,
+        )
+    }
+
+    fn relaxed_cfg() -> GainConfig {
+        GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        }
+    }
+
+    /// BEHAVIOR 1+2: the unified region returns SplitInfos byte-identical to the
+    /// two-step path for every scan-active feature, in EXACTLY feature-index order.
+    #[test]
+    fn unified_build_fix_scan_bit_exact_and_ordered_vs_two_step() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let cfg = relaxed_cfg();
+        let (cols, _num_bins, _slot_off, slot_len, leaf_rows, grads, hess, feats, sum_g, sum_h, num_data) =
+            fixture();
+        let refs: Vec<&BinColumn> = cols.iter().collect();
+        // Ordered grads/hess for the two-step reference fold.
+        let ord_g: Vec<f32> = leaf_rows.iter().map(|&r| grads[r as usize]).collect();
+        let ord_h: Vec<f32> = leaf_rows.iter().map(|&r| hess[r as usize]).collect();
+
+        // All features scan-active (every feature is spine).
+        let scan_active = vec![true; feats.len()];
+        let mut buf = vec![0.0f64; slot_len];
+        let unified = backend
+            .build_fix_scan(
+                &client, &mut buf, &refs, &leaf_rows, &grads, &hess, &feats, &scan_active, &cfg,
+                sum_g, sum_h, num_data,
+            )
+            .expect("unified region");
+
+        assert_eq!(unified.len(), feats.len(), "one result slot per feature");
+        for (fpos, f) in feats.iter().enumerate() {
+            // Two-step reference for this feature: build raw -> fix -> compact -> scan.
+            let cells = 2 * f.num_bin as usize;
+            let mut hist = vec![0.0f64; cells];
+            fold_one_feature(&cols[fpos], &leaf_rows, &ord_g, &ord_h, &mut hist);
+            fix_histogram_inline(&mut hist, f.most_freq_bin, sum_g, sum_h);
+            compact_histogram_inline(&mut hist, f.offset);
+            let want = backend
+                .find_best_split(
+                    &client, &hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
+                    f.skip_default_bin, f.na_as_missing, f.run_forward, sum_g, sum_h, num_data,
+                )
+                .expect("two-step scan");
+            let got = unified[fpos].expect("scan-active feature has a SplitInfo");
+            assert_eq!(
+                got.gain.to_bits(),
+                want.gain.to_bits(),
+                "feature {fpos}: unified gain != two-step gain (not bit-identical)"
+            );
+            assert_eq!(got.threshold, want.threshold, "feature {fpos}: threshold");
+            assert_eq!(got.default_left, want.default_left, "feature {fpos}: default_left");
+            assert_eq!(got.left_count, want.left_count, "feature {fpos}: left_count");
+            assert_eq!(
+                got.left_sum_gradient.to_bits(),
+                want.left_sum_gradient.to_bits(),
+                "feature {fpos}: left_sum_gradient"
+            );
+        }
+    }
+
+    /// BEHAVIOR: the unified region writes the COMPLETE fixed+compacted histogram into
+    /// `buf` for EVERY feature (needed by the subtract-derived larger child) —
+    /// byte-identical to the two-step `build_leaf_histograms_raw` + per-feature fix+compact.
+    #[test]
+    fn unified_buf_is_complete_and_bit_exact() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let cfg = relaxed_cfg();
+        let (cols, num_bins, slot_off, slot_len, leaf_rows, grads, hess, feats, sum_g, sum_h, num_data) =
+            fixture();
+        let refs: Vec<&BinColumn> = cols.iter().collect();
+
+        // Two-step reference buffer: batched raw build, then per-feature fix+compact.
+        let mut want_buf = backend
+            .build_leaf_histograms_raw(
+                &client, &refs, &num_bins, &slot_off, slot_len, &leaf_rows, &grads, &hess,
+            )
+            .expect("raw build");
+        for (fpos, f) in feats.iter().enumerate() {
+            let cells = 2 * f.num_bin as usize;
+            let range = slot_off[fpos]..slot_off[fpos] + cells;
+            let h = &mut want_buf[range.clone()];
+            fix_histogram_inline(h, f.most_freq_bin, sum_g, sum_h);
+            compact_histogram_inline(h, f.offset);
+        }
+
+        // Unified region (mark only feature 0 scan-active to prove build runs for ALL).
+        let mut scan_active = vec![false; feats.len()];
+        scan_active[0] = true;
+        let mut got_buf = vec![0.0f64; slot_len];
+        let _ = backend
+            .build_fix_scan(
+                &client, &mut got_buf, &refs, &leaf_rows, &grads, &hess, &feats, &scan_active, &cfg,
+                sum_g, sum_h, num_data,
+            )
+            .expect("unified region");
+
+        for (i, (w, g)) in want_buf.iter().zip(&got_buf).enumerate() {
+            assert_eq!(w.to_bits(), g.to_bits(), "buf cell {i}: two-step {w} != unified {g}");
+        }
+    }
+
+    /// BEHAVIOR: an ineligible (non-scan-active) feature returns `None` (it is NOT
+    /// scanned) while still being built into `buf`. Scan-active features return `Some`.
+    #[test]
+    fn unified_ineligible_feature_returns_none() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let cfg = relaxed_cfg();
+        let (cols, _num_bins, _slot_off, slot_len, leaf_rows, grads, hess, feats, sum_g, sum_h, num_data) =
+            fixture();
+        let refs: Vec<&BinColumn> = cols.iter().collect();
+        // Features 0 and 2 active, 1 and 3 ineligible.
+        let scan_active = vec![true, false, true, false];
+        let mut buf = vec![0.0f64; slot_len];
+        let res = backend
+            .build_fix_scan(
+                &client, &mut buf, &refs, &leaf_rows, &grads, &hess, &feats, &scan_active, &cfg,
+                sum_g, sum_h, num_data,
+            )
+            .expect("unified region");
+        assert!(res[0].is_some(), "feature 0 active -> Some");
+        assert!(res[1].is_none(), "feature 1 ineligible -> None");
+        assert!(res[2].is_some(), "feature 2 active -> Some");
+        assert!(res[3].is_none(), "feature 3 ineligible -> None");
     }
 }
 

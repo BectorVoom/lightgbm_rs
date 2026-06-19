@@ -1525,6 +1525,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // fixed+compacted Handle into `smaller_slot`, so the subtract-derived larger
         // child still finds its parent. `smaller_fused` signals the fused scan path.
         let smaller_fused = self.fused_eligible;
+        // quick 260620-a48: the UNIFIED host build+fix+scan path is the CpuBackend
+        // directly-built (smaller/root) leaf analog of `smaller_fused`. It is eligible
+        // ONLY when neither GPU-fused nor resident (i.e. CpuBackend), and gated by
+        // `unified_bfs_threshold()` keyed on the feature count (the same scan-work proxy
+        // as `par_scan_threshold` — narrow leaves were catastrophic in 8v4/9cp). When
+        // set, the standalone `build_leaf_histogram_into` below is SKIPPED; the build is
+        // FUSED into `scan_leaf_histogram`'s one rayon region.
+        let smaller_unified =
+            !smaller_fused && !self.resident_eligible
+                && features.len() >= lgbm_compute::unified_bfs_threshold();
         let smaller_resident_slot = if smaller_fused {
             // No separate build — the fused scan builds+fixes+compacts+scans in 1 launch
             // and stores the Handle into smaller_slot.
@@ -1542,6 +1552,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 smaller_splits,
             )?;
             Some(smaller_slot)
+        } else if smaller_unified {
+            // No separate build — the unified scan region builds+fixes+compacts EVERY
+            // feature into `buf` (complete for the subtract-derived larger child) and
+            // scans the spine subset, in ONE rayon fork/join.
+            None
         } else {
             self.build_leaf_histogram_into(
                 features,
@@ -1560,7 +1575,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             slot_off,
             smaller_leaf,
             smaller_splits,
-            pool.buffer(smaller_slot),
+            pool.buffer_mut(smaller_slot),
             best_split_per_leaf,
             best_split_feature,
             smaller_node_mask.as_deref(),
@@ -1568,6 +1583,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             parent_splittable.as_deref(),
             smaller_resident_slot,
             smaller_fused,
+            smaller_unified,
             gradients,
             hessians,
         )?;
@@ -1682,13 +1698,17 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 slot_off,
                 larger_leaf,
                 larger_splits,
-                pool.buffer(larger_slot),
+                pool.buffer_mut(larger_slot),
                 best_split_per_leaf,
                 best_split_feature,
                 larger_node_mask.as_deref(),
                 data_partition,
                 parent_splittable.as_deref(),
                 larger_resident_slot,
+                false,
+                // quick 260620-a48: the subtract-derived larger child is NEVER unified —
+                // it has a true data dependency on the smaller's complete histogram and
+                // its buffer is already built (subtract or direct) before this scan.
                 false,
                 gradients,
                 hessians,
@@ -1873,7 +1893,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         slot_off: &[usize],
         leaf: i32,
         leaf_splits: &LeafSplits,
-        buf: &[f64],
+        // quick 260620-a48: `&mut` so the UNIFIED host build+fix+scan path
+        // (`unified_build == true`) can BUILD this leaf's complete histogram into the
+        // pool slot in-region (instead of a separate `build_leaf_histogram_into` call at
+        // the seam). The non-unified paths re-borrow it immutably and are byte-unchanged.
+        buf: &mut [f64],
         best_split_per_leaf: &mut [SplitInfo],
         best_split_feature: &mut [i32],
         used_features: Option<&[i8]>,
@@ -1897,6 +1921,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // FULL-corpus `gradients`/`hessians` (the launcher gathers leaf rows on device).
         // `false` keeps the existing scan-only path (host buf or resident-Handle scan).
         fused_build: bool,
+        // quick 260620-a48: when `true` (CpuBackend directly-built smaller leaf, above
+        // `unified_bfs_threshold`), the SPINE scan is preceded by ONE rayon region that
+        // BUILDS (per-feature private fold), fixes, compacts EVERY feature into `buf`
+        // (complete for the subtract-derived larger child) AND scans the spine subset —
+        // the host f64 analog of `fused_build`/`build_fix_scan_resident`. The standalone
+        // `build_leaf_histogram_into` at the seam is SKIPPED for this leaf. `false` keeps
+        // the existing host-buf scan (the buffer is pre-built by the seam).
+        unified_build: bool,
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
@@ -2023,7 +2055,51 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // scan_resident_leaf (the fused==host oracle, T1) — same `split_scan_body`, same
         // decode, same fix/compact f64 fold order — so the grown tree is unchanged; only
         // the launch count drops (3 → 1 on directly-built leaves).
-        let batched_splits = if fused_build {
+        // quick 260620-a48: the UNIFIED host build+fix+scan branch. Builds (per-feature
+        // private fold), fixes, compacts EVERY feature into `buf` (COMPLETE for the
+        // subtract-derived larger child) AND scans the spine subset (`scan_active`),
+        // inside ONE rayon region — the host f64 analog of the GPU `fused_build`. The
+        // returned `Vec<Option<SplitInfo>>` is fpos-ordered; we extract the `Some`
+        // (scan-active) entries in ascending fpos into `batched_splits`, which is EXACTLY
+        // `batched_feats` order (Pass 1 pushed spine features in ascending fpos), so the
+        // downstream `spine_batch_index[fpos]` lookup is byte-identical to the two-step
+        // path. Only on CpuBackend + directly-built smaller leaf + above threshold.
+        let batched_splits = if unified_build {
+            let leaf_rows = data_partition.indices_in_leaf(leaf);
+            let all_feats: Vec<BatchedSplitFeature> = features
+                .iter()
+                .enumerate()
+                .map(|(fpos, f)| BatchedSplitFeature {
+                    slot_off: slot_off[fpos],
+                    num_bin: f.num_bin,
+                    offset: f.offset,
+                    default_bin: f.default_bin,
+                    most_freq_bin: f.most_freq_bin,
+                    skip_default_bin: f.skip_default_bin(),
+                    na_as_missing: f.na_as_missing(),
+                    run_forward: f.run_forward(),
+                })
+                .collect();
+            let scan_active: Vec<bool> =
+                spine_batch_index.iter().map(|idx| idx.is_some()).collect();
+            let feature_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
+            let per_feat = self.backend.build_fix_scan(
+                self.client,
+                buf,
+                &feature_bins,
+                leaf_rows,
+                gradients,
+                hessians,
+                &all_feats,
+                &scan_active,
+                &self.cfg,
+                sum_g,
+                sum_h,
+                num_data_in_leaf,
+            )?;
+            // Extract scan-active SplitInfos in ascending fpos ⇒ batched_feats order.
+            per_feat.into_iter().flatten().collect::<Vec<SplitInfo>>()
+        } else if fused_build {
             let slot = resident_slot
                 .expect("fused_build requires a resident slot to store the histogram Handle");
             let leaf_rows = data_partition.indices_in_leaf(leaf);
@@ -2079,7 +2155,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         } else {
             self.backend.find_best_splits_batched(
                 self.client,
-                buf,
+                &buf[..],
                 &batched_feats,
                 &self.cfg,
                 sum_g,
