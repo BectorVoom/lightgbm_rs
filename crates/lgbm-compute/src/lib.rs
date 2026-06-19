@@ -331,18 +331,35 @@ fn par_scan_threshold() -> usize {
 /// threshold the leaf takes the byte-unchanged serial two-step path. Override via
 /// `LGBM_UNIFIED_BFS_THRESHOLD`.
 ///
-/// DEFAULT (quick 260620-a48): HONEST NULL — the unified region is kept available
-/// (env-reachable, bit-exact-proven FORCED-ON via `LGBM_UNIFIED_BFS_THRESHOLD=0`) but
-/// is NOT the effective default, so the threshold is `usize::MAX` (unreachable). The
-/// A/B measured on cubecl-cpu (warm, 3-run medians) showed the wide train-wall gain
-/// was within run-to-run spread / sign-flipped while narrow regressed, so per the
-/// project's audit-before-wire value the serial two-step stays the effective default.
+/// DEFAULT (quick 260620-a48): CONDITIONAL WIN at `feats.len() >= 100`. The unified
+/// region removes the quick-260620-9cp cross-region contention (a parallel scan
+/// `par_iter` fighting the already-parallel build `par_iter`) by fusing
+/// build+fix+compact+scan for each spine feature into ONE rayon fork/join, keeping
+/// each feature's histogram cache-hot in its building thread through fix and scan.
+/// The A/B measured on cubecl-cpu (warm, 3-run medians, train-wall = decisive metric):
+///   - WIDE (120 feat, 20k rows): fused build+scan 779.7ms→569.7ms (−27%), warm
+///     train-wall A 810ms vs B 755ms (−6.8%, sign-stable, no run overlap across all 3
+///     runs at 100 AND 120 feat). The phase counters confirm the mechanism: the
+///     two-step path forks/joins TWICE (build then scan), the unified path ONCE.
+///   - NARROW (10 feat, 20k rows): fused build+scan 95.9ms→124.9ms (+30%), warm
+///     train-wall A 169ms vs B 246ms (+45%, sign-stable WORSE) — the single rayon
+///     fork/join overhead at 10 features dominates (the 8v4/9cp narrow-is-catastrophic
+///     lesson). So narrow MUST stay serial two-step.
+///   - SWEEP crossover: B regresses or is within-spread up to ~90 feat (feat=80 +0.6%,
+///     feat=90 overlapping/sign-flips); B becomes sign-stable-below-A only at ≥100 feat
+///     (feat=100 −5%, feat=120 −6%, neither overlapping A's spread).
+/// Tuned default = 100: narrow/medium (≤90 feat) keep the byte-unchanged serial
+/// two-step path (zero regression); genuinely wide leaves (≥100 feat) take the unified
+/// region for the sign-stable −6% train-wall gain. Both adoption gates met (wide
+/// sign-stable gain AND no narrow regression at the tuned threshold). Set
+/// `LGBM_UNIFIED_BFS_THRESHOLD=0` to force the unified path on for the bit-exact parity
+/// proof; set a large value (or `usize::MAX`) to force the serial two-step path.
 /// See the 260620-a48 SUMMARY for the full A/B.
 pub fn unified_bfs_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_BFS_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(usize::MAX)
+        .unwrap_or(100)
 }
 
 /// The compute backend seam (CMP-01).

@@ -23,6 +23,7 @@ use lgbm::{train, DenseCorpus, TrainingBuilder};
 
 /// A benchmark size: `rows` × `features`, each feature identity-binned into
 /// `bins` distinct integer values (`0..bins-1`, all present).
+#[derive(Clone, Copy)]
 struct Size {
     name: &'static str,
     rows: usize,
@@ -83,11 +84,26 @@ fn main() {
     const TRAIN_REPS: usize = 5;
     const PREDICT_REPS: usize = 7;
 
-    let sizes = [
+    // quick 260620-a48: optional single-config override so the unified build+fix+scan
+    // A/B can measure warm train-wall on a narrow (~10 feat) AND a wide (~120 feat)
+    // config without writing a new harness. When BENCH_FEATURES is set, the default
+    // small/medium/large sweep is replaced by one config built from BENCH_ROWS (default
+    // 20000) × BENCH_FEATURES × BENCH_BINS (default 128).
+    let env_usize = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+    let default_sizes = [
         Size { name: "small ", rows: 2_000, features: 12, bins: 32 },
         Size { name: "medium", rows: 8_000, features: 30, bins: 64 },
         Size { name: "large ", rows: 20_000, features: 50, bins: 128 },
     ];
+    let sizes: Vec<Size> = match env_usize("BENCH_FEATURES") {
+        Some(feat) => vec![Size {
+            name: "custom",
+            rows: env_usize("BENCH_ROWS").unwrap_or(20_000),
+            features: feat,
+            bins: env_usize("BENCH_BINS").unwrap_or(128),
+        }],
+        None => default_sizes.to_vec(),
+    };
 
     println!("# lightgbm_rs bench  (allocator: {alloc}, iters: {ITERS}, leaves: {LEAVES})");
     println!(
