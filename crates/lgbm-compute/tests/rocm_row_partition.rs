@@ -128,3 +128,65 @@ fn row_partition_batched_matches_cpu_anchor_p1_and_p_gt_1() {
          rel(P>1 vs anchor)={rel_pn:e}  rel(P>1 vs P1)={rel_pp:e}"
     );
 }
+
+/// NRW-01 re-pin: the NAIVE batched fallback kernel `construct_leaf_hist_batched_kernel`
+/// (the `max_w > HIST_LDS_MAX` branch of `build_leaf_histograms_batched_f32_on`) is the
+/// ONE swept production kernel without dedicated GPU-vs-CPU-f64-anchor coverage — the
+/// row-partition test above and `rocm_parallel_histogram.rs` only exercise the LDS branch
+/// (every feature ≤ 256 bins). This forces the naive branch with a SINGLE feature of
+/// 300 bins (> 256, so `max_w = 600 > HIST_LDS_MAX = 512`) and re-pins the
+/// launch_unchecked result to the CPU f64 anchor within the ~1e-6 f32-atomic gate
+/// (ABS 5e-6 / REL 1e-5), proving the `::launch` → `::launch_unchecked` switch did not
+/// change the naive-fallback numerics. GPU-vs-CPU-f64-anchor, NEVER GPU-vs-GPU
+/// (DEF-f8u-01). A BOUNDED leaf subset is used (not the full corpus) to avoid the
+/// DEF-MWR-01 near-zero-grad full-corpus flake.
+#[test]
+fn naive_batched_fallback_matches_cpu_anchor_within_tol() {
+    let client = rocm_client();
+
+    // ONE feature of 300 bins > 256 ⇒ max_w = 600 > HIST_LDS_MAX (512) ⇒ the launcher
+    // routes through the NAIVE `construct_leaf_hist_batched_kernel`, not the LDS kernel.
+    let num_data = 8_000usize;
+    let num_bin = 300usize;
+
+    let col: Vec<u32> = (0..num_data)
+        .map(|r| ((r as u64).wrapping_mul(2_654_435_761) % num_bin as u64) as u32)
+        .collect();
+    let feature_bins: Vec<&[u32]> = vec![col.as_slice()];
+
+    // Bounded leaf subset (7..num_data).step_by(3) — the stable-test pattern that avoids
+    // the DEF-MWR-01 full-corpus near-zero-grad cancellation cells.
+    let leaf_rows: Vec<u32> = (7..num_data as u32).step_by(3).collect();
+    // Small-magnitude pseudo-residual gradients (like real boosting gradients).
+    let g: Vec<f32> = (0..num_data).map(|i| ((i as f32) * 0.000_123).sin() * 0.5).collect();
+    let h: Vec<f32> = vec![1.0f32; num_data];
+
+    let feat_len = 2 * num_bin;
+    let slot_off: Vec<usize> = vec![0];
+    let slot_len = feat_len;
+
+    let anchor = cpu_ref(&feature_bins, &slot_off, slot_len, &leaf_rows, &g, &h);
+    let gpu = build_leaf_histograms_batched_f32_on(
+        &client, &feature_bins, &slot_off, slot_len, &leaf_rows, &g, &h,
+    )
+    .unwrap();
+
+    // ABS 5e-6 / REL 1e-5 — the established f32-atomic-vs-f64-anchor gate. The naive
+    // path accumulates in f32 in nondeterministic order, so it carries the same ~1e-6
+    // gap as the LDS path; launch_unchecked does not change that order.
+    let mut max_abs = 0.0f64;
+    let mut max_rel_e = 0.0f64;
+    for (a, b) in anchor.iter().zip(&gpu) {
+        let diff = (a - b).abs();
+        max_abs = max_abs.max(diff);
+        max_rel_e = max_rel_e.max(diff / a.abs().max(1.0));
+    }
+    eprintln!(
+        "naive-batched-fallback vs cpu f64 anchor: max_abs={max_abs:e}  max_rel={max_rel_e:e}"
+    );
+    assert!(
+        max_abs < 5e-6 || max_rel_e < 1e-5,
+        "naive batched fallback diverged from the cpu f64 anchor beyond the f32-atomic \
+         gate: max_abs={max_abs:e}, max_rel={max_rel_e:e}"
+    );
+}
