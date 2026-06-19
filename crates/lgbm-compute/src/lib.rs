@@ -296,13 +296,26 @@ fn par_build_threshold() -> usize {
 /// Spike 005 — would regress narrow leaves here). Override via
 /// `LGBM_PAR_SCAN_THRESHOLD`.
 ///
-/// DEFAULT (quick 260620-9cp): tuned so wide leaves win sign-stably and narrow
-/// leaves do not regress (see the A/B table in the 260620-9cp SUMMARY).
+/// DEFAULT (quick 260620-9cp): HONEST NULL — the parallel scan is kept available
+/// (env-reachable, bit-exact-proven FORCED-ON) but is NOT the effective default,
+/// so the threshold is set effectively-unreachable (`usize::MAX`). The A/B measured
+/// on cubecl-cpu (warm, 3-run medians):
+///   - narrow (10 feat): SCAN serial 31.7ms vs parallel 104.4ms (3.3× WORSE),
+///     train-wall 156ms vs 287ms — fork/join overhead at 10 features dominates.
+///   - wide (120 feat):  SCAN serial 353ms vs parallel 309ms (−13%, sign-stable),
+///     BUT train-wall 1066ms vs 1184ms (+11%, sign-stable WORSE) — the per-leaf
+///     scan fork/join CONTENDS with the already-rayon-parallel BUILD path
+///     (BUILD_NS rose 438→520ms), so the isolated SCAN_NS win does NOT translate
+///     to a warm train-wall win; it regresses overall.
+/// Adoption criterion (wide train-wall gain AND no narrow regression) is NOT met,
+/// so per the project's audit-before-wire value the serial loop stays the effective
+/// default. Set `LGBM_PAR_SCAN_THRESHOLD=0` (or any small value) to force the
+/// parallel path on for the bit-exact parity proof / future re-measurement.
 fn par_scan_threshold() -> usize {
     std::env::var("LGBM_PAR_SCAN_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(usize::MAX)
 }
 
 /// The compute backend seam (CMP-01).
