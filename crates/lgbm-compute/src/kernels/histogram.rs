@@ -961,6 +961,234 @@ pub fn construct_leaf_hist_batched_lds_kernel(
     }
 }
 
+// ===========================================================================
+// FAITHFUL CubeCL MIRROR of CUDAConstructHistogramDenseKernel (quick-260619-j9t)
+//
+// Structural port of LightGBM's signature CUDA inner kernel
+// (`LightGBM-release-4.6.0.99/src/treelearner/cuda/cuda_histogram_constructor.cu`
+// lines ~18-70, `CUDAConstructHistogramDenseKernel`) — the histogram-construction
+// kernel of `cuda_single_gpu_tree_learner`. It ships as a TESTED PRIMITIVE
+// (rocm_cuda_mirror.rs), NOT wired into the production build/resident path (that
+// live wiring is the deferred follow-up DEF-f8u-01).
+//
+// The signature CUDA structure this reproduces, distinct from the existing
+// batched/resident LDS kernels (which pre-gather `ord_g[k]` / `leaf_rows[k]`):
+//   (1) INDIRECT in-kernel gather — `data_index = data_indices[k]` (mirror of CUDA
+//       `data_index = data_indices_ref_this_block[inner_data_index]`), then index a
+//       RESIDENT feature-major bin buffer at `column_start * num_data + data_index`
+//       (mirror of `data_ptr[data_index * ncols + tx]` via the resident
+//       `f * num_data + row` layout RocmBackend::upload_resident_bins uses); grad/hess
+//       are gathered in FULL-CORPUS order as `grad[data_index]` / `hess[data_index]`
+//       (CUDA `cuda_gradients[data_index]`), NOT pre-gathered — the indirection the
+//       existing kernels lack.
+//   (2) 2D (column, row) tile — `CUBE_POS_X` selects the feature/column (CUDA
+//       `threadIdx.x`/`blockIdx.x` partition column), `UNIT_POS` strides over the
+//       leaf rows (CUDA `threadIdx.y`); row-partitioned over `CUBE_POS_Y` (CUDA
+//       `blockIdx.y`) so a large leaf is split across `P` cubes (CUDA `gridDim.y`).
+//   (3) per-CUBE LDS sub-histogram (CUDA `__shared__ shared_hist`,
+//       `SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX)`): zero it strided, sync_cube,
+//       atomic-add each row's (grad,hess) into the LDS cell at `bin*2` (CUDA
+//       `atomicAdd_block`), sync_cube, then flush each active LDS cell to the global
+//       `out` slot with ONE atomic per cell (CUDA `atomicAdd_system`).
+//
+// f32 atomics ⇒ nondeterministic accumulation ⇒ the ~1e-6 ROCm gate vs the CPU f64
+// anchor (NOT bit-exact, by design — pinned in rocm_cuda_mirror.rs, never GPU-vs-GPU).
+// Capped at 256 bins/feature (the HIST_LDS_MAX sub-hist budget). `#[cfg(feature="rocm")]`.
+// ===========================================================================
+
+/// One cube per `(feature f = CUBE_POS_X, row-partition p = CUBE_POS_Y)`. Mirrors
+/// `CUDAConstructHistogramDenseKernel`: indirect in-kernel `data_indices` gather, a
+/// resident feature-major bin buffer (`data[f*num_data + data_index]`), full-corpus
+/// grad/hess gather (`grad[data_index]`), a per-cube LDS sub-histogram with atomic
+/// accumulate, then a single global atomic flush per cell. `slot_off` has
+/// `num_features + 1` entries (sentinel = slot_len) so cube `f` reads its feature's
+/// width `slot_off[f+1] - slot_off[f] = 2*num_bin[f]`.
+#[cfg(feature = "rocm")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_hist_cuda_mirror_kernel(
+    data: &Array<u32>,         // resident feature-major bins: data[f*num_data + row]
+    data_indices: &Array<u32>, // the leaf's row indices (data_indices_in_leaf)
+    grad: &Array<f32>,         // FULL-corpus gradients (gathered in-kernel)
+    hess: &Array<f32>,         // FULL-corpus hessians
+    slot_off: &Array<u32>,     // length num_features + 1 (sentinel = slot_len)
+    num_data: usize,           // resident column stride (full train row count)
+    out: &mut Array<Atomic<f32>>,
+) {
+    let f = CUBE_POS_X as usize; // column/feature (CUDA threadIdx.x partition column)
+    let base = slot_off[f] as usize;
+    let feat_len = slot_off[f + 1] as usize - base; // = 2*num_bin[f]
+    let r = data_indices.len(); // num_data_in_smaller_leaf
+    let cd = CUBE_DIM as usize;
+    let col = f * num_data; // resident column start (CUDA partition_column_start * num_data)
+
+    // (3a) Per-cube LDS sub-histogram (CUDA __shared__ shared_hist), comptime-max-sized.
+    let sub = SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX);
+    // Zero this feature's active LDS cells, strided across the cube's units.
+    let mut c = UNIT_POS as usize;
+    while c < feat_len {
+        sub[c].store(0.0f32);
+        c += cd;
+    }
+    sync_cube();
+
+    // (1)+(2) Indirect-gather scatter into LDS. Row-partitioned: cube (f, p) owns the
+    // row-slice `p*cd, +P*cd, …` (CUDA blockIdx.y block_start striding); P=CUBE_COUNT_Y.
+    // P=1 reduces to `k = UNIT_POS, stride cd`. All P cubes of feature f atomic-merge
+    // into the same global slot (step 3), so the split is additive and order-free.
+    let stride = CUBE_COUNT_Y as usize * cd;
+    let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
+    while k < r {
+        // CUDA: data_index = data_indices_ref_this_block[inner_data_index]
+        let data_index = data_indices[k] as usize;
+        // CUDA: cuda_gradients[data_index] / cuda_hessians[data_index] (full-corpus order)
+        let g = grad[data_index];
+        let h = hess[data_index];
+        // CUDA: data_ptr[data_index * ncols + tx] via the resident f*num_data+row layout
+        let bin = data[col + data_index] as usize;
+        let ti = bin * 2; // grad cell at bin<<1, hess at +1 (dense_bin stride-2)
+        sub[ti].fetch_add(g); // CUDA atomicAdd_block(pos_ptr, grad)
+        sub[ti + 1].fetch_add(h); // CUDA atomicAdd_block(pos_ptr + 1, hess)
+        k += stride;
+    }
+    sync_cube();
+
+    // (3b) Flush LDS → this feature's global slot, ONE atomic per cell (CUDA
+    // atomicAdd_system to feature_histogram_ptr). All P partitions accumulate here.
+    let mut m = UNIT_POS as usize;
+    while m < feat_len {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
+/// Host launcher for the CUDA-mirror histogram kernel ([`construct_hist_cuda_mirror_kernel`]).
+///
+/// Mirrors `CUDAHistogramConstructor::LaunchConstructHistogramKernel`: one cube per
+/// feature-column partition (`gridDim.x = num_features`), row-partitioned over
+/// `CUBE_POS_Y` (CUDA `gridDim.y`) on large leaves (spike-007 occupancy). Validates
+/// every input at the `Backend` boundary (Security V5 / T-j9t-01: bin-range + length
+/// per feature) BEFORE the upload, early-returns zeros on an empty leaf, and widens
+/// the f32 result to f64 (the learner's pool is f64; the ~1e-6 gate absorbs the gap).
+///
+/// `data` is the RESIDENT feature-major bin buffer (`data[f*num_data + row]`, length
+/// `num_features * num_data`), `data_indices` the leaf's row indices, `grad`/`hess`
+/// the FULL-corpus gradients/hessians (gathered in-kernel, length `num_data`),
+/// `slot_off` the per-feature start cells (length `num_features`, sentinel appended
+/// internally), `slot_len` the concatenated output length. Capped at 256 bins/feature
+/// (the LDS sub-hist budget).
+///
+/// f32 atomics ⇒ ~1e-6 ROCm gate (documented; pinned vs the CPU f64 anchor in
+/// rocm_cuda_mirror.rs, never GPU-vs-GPU — DEF-f8u-01).
+///
+/// # Errors
+/// - [`ComputeError::LengthMismatch`] if a per-feature length is inconsistent.
+/// - [`ComputeError::BinIndexOutOfRange`] if any leaf row's bin `>= num_bin`.
+/// - [`ComputeError::Runtime`] on a degenerate layout, an out-of-range data index,
+///   or `num_bin > 256` (LDS cap).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_histograms_cuda_mirror_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    data: &[u32],
+    num_data: usize,
+    num_features: usize,
+    data_indices: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    slot_off: &[usize],
+    slot_len: usize,
+    num_bin: u32,
+) -> Result<Vec<f64>, ComputeError> {
+    // ---- V5 boundary validation (T-j9t-01) — BEFORE any device upload. ----
+    if grad.len() != num_data || hess.len() != num_data {
+        return Err(ComputeError::LengthMismatch {
+            expected: num_data,
+            actual: grad.len().min(hess.len()),
+        });
+    }
+    if data.len() != num_features * num_data {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "cuda_mirror: resident data len {} != num_features {num_features} * num_data {num_data}",
+                data.len()
+            ),
+        });
+    }
+    if slot_off.len() != num_features {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "cuda_mirror: slot_off len {} != num_features {num_features}",
+                slot_off.len()
+            ),
+        });
+    }
+    if num_bin > 256 {
+        return Err(ComputeError::Runtime {
+            detail: format!("cuda_mirror: num_bin {num_bin} > 256 exceeds the LDS sub-hist cap"),
+        });
+    }
+    // Every leaf data index must be in [0, num_data); every gathered bin in [0, num_bin).
+    for &di in data_indices {
+        let row = di as usize;
+        if row >= num_data {
+            return Err(ComputeError::Runtime {
+                detail: format!("cuda_mirror: data_index {row} >= num_data {num_data}"),
+            });
+        }
+        for f in 0..num_features {
+            let bin = data[f * num_data + row];
+            if bin >= num_bin {
+                return Err(ComputeError::BinIndexOutOfRange { row, bin, num_bin });
+            }
+        }
+    }
+
+    // Early return on an empty leaf — no launch (mirror of the CUDA no-op path).
+    if data_indices.is_empty() || num_features == 0 {
+        return Ok(vec![0.0f64; slot_len]);
+    }
+
+    let rows = data_indices.len();
+    let h_data = client.create_from_slice(u32::as_bytes(data));
+    let h_idx = client.create_from_slice(u32::as_bytes(data_indices));
+    let h_grad = client.create_from_slice(f32::as_bytes(grad));
+    let h_hess = client.create_from_slice(f32::as_bytes(hess));
+    let zeros = vec![0.0f32; slot_len];
+    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
+    let (slot_s, _max_w) = slot_off_sentinel(slot_off, slot_len);
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+
+    // gridDim.x = num_features (one cube per feature-column partition); gridDim.y = P
+    // row-partitions (spike-007 occupancy on a large leaf). 256 units/cube (8 × wave32).
+    let p = row_partition_count(num_features, rows);
+
+    // SAFETY: `h_data` is sized `num_features * num_data`, `h_idx`/(implicit grad/hess
+    // index range) validated above so `data[f*num_data + data_indices[k]]` and
+    // `grad[data_indices[k]]` stay in range; `h_grad`/`h_hess` sized `num_data`;
+    // `h_slot` has `num_features + 1` entries; `h_out` sized `slot_len`. Each handle
+    // outlives the launch, and the per-feature bin-range check keeps every
+    // `slot_off[f] + bin*2 + 1` inside that feature's slot within `slot_len`. All
+    // cubecl unsafe is confined to this launcher (CMP-01).
+    unsafe {
+        construct_hist_cuda_mirror_kernel::launch(
+            client,
+            CubeCount::Static(num_features as u32, p, 1),
+            CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(h_data, num_features * num_data),
+            ArrayArg::from_raw_parts(h_idx, rows),
+            ArrayArg::from_raw_parts(h_grad, num_data),
+            ArrayArg::from_raw_parts(h_hess, num_data),
+            ArrayArg::from_raw_parts(h_slot, num_features + 1),
+            num_data,
+            ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
+}
+
 /// Build the sentinel `slot_off` (`num_features + 1` entries, final = `slot_len`)
 /// and the max per-feature slot width. LDS is eligible iff the widest feature fits
 /// `HIST_LDS_MAX` (≤ 256 bins).
