@@ -386,7 +386,7 @@ pub fn construct_histograms_f32_on<R: cubecl::Runtime>(
 /// ROCm gate the contract was designed for, D-03a) — NOT bit-exact. Feature-gated
 /// to `rocm` so the CPU-only build never emits atomic codegen.
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn construct_hist_kernel_atomic_f32(
     binned: &Array<u32>,
     grad: &Array<f32>,
@@ -439,8 +439,21 @@ pub fn construct_histograms_parallel_f32_on<R: cubecl::Runtime>(
     // each outlives the launch. The kernel bounds-checks `idx < n`, and input
     // validation guarantees every `binned[i] < num_bin` so `out[bin*2 + 1]` stays in
     // the `out_len` allocation. All cubecl unsafe is confined here (CMP-01).
+    //
+    // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+    // bounds-check codegen in the `2*n` scatter. Every device access is host-proven in
+    // range BEFORE upload:
+    //   - `binned[idx]` / `grad[idx]` / `hess[idx]` — `idx = ABSOLUTE_POS` is guarded by
+    //     the kernel's own `idx < binned.len()` (the launch rounds the unit count up, so
+    //     tail units stay idle); `h_bin`/`h_grad`/`h_hess` are all sized `n`;
+    //   - `out[bin*2]` / `out[bin*2 + 1]` — `validate_histogram_inputs` proves every
+    //     `binned[idx] < num_bin`, so `bin*2 + 1 < 2*num_bin = out_len` (`h_out` sized
+    //     `out_len`).
+    // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+    // launch does NOT change numerics — only bounds-check codegen is removed; the
+    // f32-atomic scatter order is identical (the same nondeterministic ~1e-6 path).
     unsafe {
-        construct_hist_kernel_atomic_f32::launch(
+        construct_hist_kernel_atomic_f32::launch_unchecked(
             client,
             CubeCount::Static(cube_count, 1, 1),
             CubeDim::new_1d(cube_dim),
@@ -519,7 +532,7 @@ fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
 /// the SAME ~1e-6 ROCm gate vs the cpu f64 anchor (NOT bit-exact). Feature-gated to
 /// `rocm`. The cpu f64 fold anchor ([`construct_hist_kernel`]) is untouched.
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn construct_hist_kernel_lds_f32(
     binned: &Array<u32>,
     grad: &Array<f32>,
@@ -614,8 +627,21 @@ pub fn construct_histograms_lds_f32_on<R: cubecl::Runtime>(
     // `i < n`), and input validation guarantees `binned[i] < num_bin <= 256` so every
     // `sub[bin*2 + 1]` / `out[bin*2 + 1]` index stays in `[0, out_len) ⊆ [0, 512)`.
     // All cubecl unsafe is confined here (CMP-01).
+    //
+    // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+    // bounds-check codegen in the zero / scatter / merge loops. Every device access is
+    // host-proven in range BEFORE upload:
+    //   - `binned[i]` / `grad[i]` / `hess[i]` — the scatter strides `i` over `[0, n)`
+    //     (the kernel's own `while i < n` guard); all three buffers sized `n`;
+    //   - the LDS `sub[ti+1]` (`ti = binned[i]*2`) — `binned[i] < num_bin <= 256` so
+    //     `ti+1 < 2*256 = HIST_LDS_MAX` (the comptime LDS size), and the zero/merge loops
+    //     stride `c`/`m` over `[0, lds = out_len)`;
+    //   - `out[m]` for `m < lds = out_len` — `h_out` sized `out_len`.
+    // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+    // launch does NOT change numerics — only bounds-check codegen is removed; the
+    // f32-atomic LDS scatter / merge order is identical (~1e-6 path).
     unsafe {
-        construct_hist_kernel_lds_f32::launch(
+        construct_hist_kernel_lds_f32::launch_unchecked(
             client,
             CubeCount::Static(cube_count, 1, 1),
             CubeDim::new_1d(cube_dim),
@@ -648,7 +674,7 @@ pub fn construct_histograms_lds_f32_on<R: cubecl::Runtime>(
 /// f32 atomics + nondeterministic order ⇒ the ~1e-6 ROCm gate (cpu anchor stays
 /// bit-exact). `#[cfg(feature="rocm")]`.
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn construct_leaf_hist_batched_kernel(
     gathered_bins: &Array<u32>,
     ord_g: &Array<f32>,
@@ -717,8 +743,26 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
         // SAFETY: handles sized to their slices; cube (f,p) reads gathered_bins[f*R..]
         // and writes only its slot region; bin < num_bin <= 256 keeps LDS/out indices
         // in range. cubecl unsafe confined here (CMP-01).
+        //
+        // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+        // bounds-check codegen in the zero / scatter / merge loops. Every device access is
+        // host-proven in range BEFORE upload:
+        //   - `gathered_bins[fbase + k]` (`fbase = f*r`) — the host gather built
+        //     `gathered_bins` as `[num_features * rows]` feature-major and the scatter
+        //     strides `k` over `[0, r = rows)`, so `f*r + k < num_features*rows` for
+        //     `f = CUBE_POS_X < num_features` (`h_bins` sized `num_features * rows`);
+        //   - `ord_g[k]` / `ord_h[k]` for `k < r` (`h_g`/`h_h` sized `rows`);
+        //   - `slot_off[f]` / `slot_off[f+1]` — `h_slot` has `num_features + 1` entries
+        //     (sentinel), `f < num_features`;
+        //   - the LDS `sub[ti+1]` and `out[base + m]` for `m < feat_len = slot_off[f+1] -
+        //     slot_off[f]` — the LDS branch gate `max_w <= HIST_LDS_MAX` guarantees every
+        //     feature width fits the comptime LDS size and stays inside its slot within
+        //     `slot_len` (`h_out` sized `slot_len`).
+        // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+        // launch does NOT change numerics — only bounds-check codegen is removed; the
+        // f32-atomic scatter / merge order is identical (~1e-6 path).
         unsafe {
-            construct_leaf_hist_batched_lds_kernel::launch(
+            construct_leaf_hist_batched_lds_kernel::launch_unchecked(
                 client,
                 CubeCount::Static(num_features as u32, p, 1),
                 CubeDim::new_1d(256),
@@ -739,8 +783,24 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
         // bounds-checks `idx < gathered_bins.len()`, and `gathered_bins[idx] < num_bin`
         // for the feature keeps `slot_off[f] + bin*2 + 1` inside that feature's slot
         // region within `slot_len`. All cubecl unsafe is confined here (CMP-01).
+        //
+        // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+        // bounds-check codegen in the `num_features*R` scatter. Every device access is
+        // host-proven in range BEFORE upload:
+        //   - `gathered_bins[idx]` — `idx = ABSOLUTE_POS` is guarded by the kernel's own
+        //     `idx < gathered_bins.len()` (`h_bins` sized `num_features * rows`);
+        //   - `ord_g[k]` / `ord_h[k]` (`k = idx % r`, `r = ord_g.len() = rows`) — `k < r`
+        //     (`h_g`/`h_h` sized `rows`);
+        //   - `slot_off[f]` (`f = idx / r < num_features`) — `h_slot` sized `num_features`
+        //     in this naive fallback;
+        //   - `out[cell]` / `out[cell+1]` (`cell = slot_off[f] + bin*2`) — the host bins
+        //     are bounded `bin < num_bin` for the feature, so the write stays inside that
+        //     feature's slot within `slot_len` (`h_out` sized `slot_len`).
+        // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+        // launch does NOT change numerics — only bounds-check codegen is removed; the
+        // f32-atomic scatter order is identical (~1e-6 path).
         unsafe {
-            construct_leaf_hist_batched_kernel::launch(
+            construct_leaf_hist_batched_kernel::launch_unchecked(
                 client,
                 CubeCount::Static(cube_count, 1, 1),
                 CubeDim::new_1d(cube_dim),
@@ -769,7 +829,7 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
 /// scalar launch arg. Same f32-atomic accumulation ⇒ the ~1e-6 ROCm gate (cpu
 /// anchor stays bit-exact). `#[cfg(feature="rocm")]`.
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn construct_leaf_hist_resident_kernel(
     resident_bins: &Array<u32>,
     leaf_rows: &Array<u32>,
@@ -921,7 +981,7 @@ pub fn construct_leaf_hist_resident_lds_kernel(
 /// LDS batched RAW build: one cube per feature, reads host-gathered bins
 /// (`gathered_bins[f*R + k]`). `slot_off` has `num_features + 1` entries (sentinel).
 #[cfg(feature = "rocm")]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn construct_leaf_hist_batched_lds_kernel(
     gathered_bins: &Array<u32>, // [num_features * R], feature-major (f*R + k)
     ord_g: &Array<f32>,
@@ -1442,8 +1502,26 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         let cube_count = (total as u32).div_ceil(cube_dim);
         // SAFETY: identical to the prior in-place naive launch (idx<total bound,
         // resident read in range, slot write in range). cubecl unsafe confined (CMP-01).
+        //
+        // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+        // bounds-check codegen in the `total`-wide scatter. Every device access is
+        // host-proven in range BEFORE upload:
+        //   - all units guarded by the kernel's own `idx < total` (`total = num_features *
+        //     rows`, the cube count rounds up so tail units stay idle);
+        //   - `resident_bins[f*num_data + row]` (`f = idx/r < num_features`, `row =
+        //     leaf_rows[k]`) — `leaf_rows` ⊂ `[0, num_data)` (caller resident contract)
+        //     and `resident_bins.len() == num_features*num_data`, so the index is in range;
+        //   - `leaf_rows[k]` / `ord_g[k]` / `ord_h[k]` (`k = idx % r`, `r = ord_g.len() =
+        //     rows`) — `k < r` (`h_rows`/`h_g`/`h_h` sized `rows`);
+        //   - `slot_off[f]` for `f < num_features` (`h_slot` sized `num_features`);
+        //   - `out[cell]` / `out[cell+1]` (`cell = slot_off[f] + bin*2`) — the resident
+        //     bin-range invariant (`bin < num_bin`, upload-time) keeps the write inside
+        //     that feature's slot within `slot_len` (`h_out` sized `slot_len`).
+        // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
+        // launch does NOT change numerics — only bounds-check codegen is removed; the
+        // f32-atomic scatter order is identical (~1e-6 path).
         unsafe {
-            construct_leaf_hist_resident_kernel::launch(
+            construct_leaf_hist_resident_kernel::launch_unchecked(
                 client,
                 CubeCount::Static(cube_count, 1, 1),
                 CubeDim::new_1d(cube_dim),
