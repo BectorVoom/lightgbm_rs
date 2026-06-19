@@ -282,6 +282,29 @@ fn par_build_threshold() -> usize {
         .unwrap_or(16384)
 }
 
+/// The feature-count at/above which a per-leaf SPLIT SCAN parallelizes across
+/// features (ONE rayon fork/join per leaf, amortized over all features).
+///
+/// Unlike the BUILD gate ([`par_build_threshold`], keyed on leaf ROWS) the scan
+/// work scales with `num_features × num_bins`, NOT leaf rows — each per-feature
+/// `find_best_split` reads a DISJOINT `buf` region and is row-count-independent.
+/// So this gate is keyed on `feats.len()` (the simplest defensible scan-work
+/// proxy; bin counts are near-uniform across a leaf's spine features, so feature
+/// count alone separates the narrow/wide regimes — confirmed by the quick
+/// 260620-9cp A/B). Below the threshold the serial loop runs verbatim (the same
+/// per-feature dispatch overhead that regressed the unconditional BUILD path —
+/// Spike 005 — would regress narrow leaves here). Override via
+/// `LGBM_PAR_SCAN_THRESHOLD`.
+///
+/// DEFAULT (quick 260620-9cp): tuned so wide leaves win sign-stably and narrow
+/// leaves do not regress (see the A/B table in the 260620-9cp SUMMARY).
+fn par_scan_threshold() -> usize {
+    std::env::var("LGBM_PAR_SCAN_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64)
+}
+
 /// The compute backend seam (CMP-01).
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
@@ -960,6 +983,151 @@ impl Backend for CpuBackend {
     // so it remains available for the cubecl-cpu runtime via the oracle three-way
     // bit-exact gate (`kernel_parity_fused_equals_per_feature_and_native`) — the
     // merge is PROVEN bit-exact on cpu even though it is not the production path.
+
+    // quick-260620-9cp (R4 split-scan lever): override the per-leaf SPLIT SCAN to
+    // parallelize the per-feature loop with ONE rayon fork/join per leaf, amortized
+    // across all features — replacing the trait-default serial `for f in feats`.
+    //
+    // BIT-EXACT SAFETY (the load-bearing invariant):
+    //  - Each `find_best_split` reads a DISJOINT `buf[f.slot_off..end]` region and
+    //    returns an INDEPENDENT `SplitInfo`; per-feature f64 accumulation order is
+    //    UNTOUCHED ⇒ thread-count-deterministic.
+    //  - `par_iter().map(...).collect::<Vec<_>>()` PRESERVES input order, so out[i]
+    //    still corresponds to feats[i]. The caller's cross-feature argmax
+    //    (`scan_leaf_histogram`, gain-then-smaller-feature tie-break) consumes the Vec
+    //    in feature order ⇒ byte-identical to the serial loop ⇒ the bit-exact CPU
+    //    f64 anchor gate holds (proven FORCED-ON via LGBM_PAR_SCAN_THRESHOLD=0).
+    //
+    // DETERMINISTIC ERROR ORDER: the `[slot_off, slot_off+2*num_bin)` range
+    // validation is hoisted BEFORE the parallel map and walks features in ascending
+    // index, returning the LOWEST-index offending feature's error — so a parallel
+    // error race can NEVER change WHICH error surfaces (matches the serial loop,
+    // which returns on the first offending feature). The map itself is then
+    // infallible on the validated hist slices.
+    //
+    // GATE: `par_scan_threshold()` keyed on `feats.len()` (scan work ∝ features ×
+    // bins, NOT leaf rows — a rows-based gate would be WRONG). Below threshold the
+    // serial path runs verbatim, protecting narrow leaves from the per-feature
+    // dispatch overhead (the same overhead that regressed the unconditional BUILD
+    // path, Spike 005). Empty feats ⇒ empty Vec, no work (threat T-lsx-03).
+    //
+    // Scope: CpuBackend ONLY. RocmBackend keeps its fused-launch override (lib.rs).
+    fn find_best_splits_batched(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        buf: &[f64],
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        num_data: i32,
+    ) -> Result<Vec<SplitInfo>, ComputeError> {
+        // Sub-threshold (incl. empty): the trait-default serial loop verbatim —
+        // zero behavior change, and the per-feature dispatch overhead that would
+        // regress narrow leaves is avoided.
+        if feats.len() < par_scan_threshold() {
+            let mut out = Vec::with_capacity(feats.len());
+            for f in feats {
+                let cells = 2usize
+                    .checked_mul(f.num_bin as usize)
+                    .ok_or_else(|| ComputeError::Runtime {
+                        detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+                    })?;
+                let end =
+                    f.slot_off
+                        .checked_add(cells)
+                        .ok_or_else(|| ComputeError::Runtime {
+                            detail: "find_best_splits_batched: slot_off + region overflows"
+                                .to_string(),
+                        })?;
+                if end > buf.len() {
+                    return Err(ComputeError::LengthMismatch {
+                        expected: end,
+                        actual: buf.len(),
+                    });
+                }
+                let hist = &buf[f.slot_off..end];
+                let si = self.find_best_split(
+                    client,
+                    hist,
+                    cfg,
+                    f.num_bin,
+                    f.offset,
+                    f.default_bin,
+                    f.most_freq_bin,
+                    f.skip_default_bin,
+                    f.na_as_missing,
+                    f.run_forward,
+                    sum_gradient,
+                    sum_hessian,
+                    num_data,
+                )?;
+                out.push(si);
+            }
+            return Ok(out);
+        }
+
+        use rayon::prelude::*;
+
+        // 1) Hoisted validation in ascending feature order ⇒ deterministic error:
+        //    return the LOWEST-index offending feature's error, identical to the
+        //    serial loop's first-failure behavior. Records each feature's validated
+        //    `[start, end)` so the parallel map is infallible on the hist slice.
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
+        for f in feats {
+            let cells =
+                2usize
+                    .checked_mul(f.num_bin as usize)
+                    .ok_or_else(|| ComputeError::Runtime {
+                        detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+                    })?;
+            let end = f
+                .slot_off
+                .checked_add(cells)
+                .ok_or_else(|| ComputeError::Runtime {
+                    detail: "find_best_splits_batched: slot_off + region overflows".to_string(),
+                })?;
+            if end > buf.len() {
+                return Err(ComputeError::LengthMismatch {
+                    expected: end,
+                    actual: buf.len(),
+                });
+            }
+            ranges.push((f.slot_off, end));
+        }
+
+        // 2) ONE fork/join per leaf, amortized across all features. `par_iter()`
+        //    preserves order ⇒ out[i] corresponds to feats[i]. find_best_split takes
+        //    `&self` + `client: &ComputeClient` (shared refs) and `buf` is `&[f64]`
+        //    (shared) ⇒ Send+Sync-safe to fan out; the validated ranges make each
+        //    closure infallible.
+        let out: Vec<SplitInfo> = feats
+            .par_iter()
+            .zip(ranges.par_iter())
+            .map(|(f, &(start, end))| {
+                let hist = &buf[start..end];
+                // SAFETY of unwrap-free path: find_best_split itself only errors on
+                // region-length issues already validated above; treat any residual
+                // error as a hard fault by propagating through a Result collect.
+                self.find_best_split(
+                    client,
+                    hist,
+                    cfg,
+                    f.num_bin,
+                    f.offset,
+                    f.default_bin,
+                    f.most_freq_bin,
+                    f.skip_default_bin,
+                    f.na_as_missing,
+                    f.run_forward,
+                    sum_gradient,
+                    sum_hessian,
+                    num_data,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
 }
 
 /// The device-resident binned dataset cached inside [`RocmBackend`] (260608-nn7
