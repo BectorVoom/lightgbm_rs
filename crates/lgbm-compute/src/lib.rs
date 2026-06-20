@@ -318,6 +318,72 @@ fn par_scan_threshold() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Floor for a core-scaled unified-fusion threshold (quick 260620-c5v): never let a
+/// many-core machine drive the gate so low it parallelizes a trivially-narrow leaf (the
+/// 8v4/9cp "narrow is catastrophic" lesson). 32 = the lowest feature count Task-1's sweep
+/// ever saw a sign-stable win at (2-core, feat=30).
+const THRESHOLD_FLOOR: usize = 32;
+
+/// Ceiling for a core-scaled unified-fusion threshold (quick 260620-c5v): never let a
+/// 1–2 core machine drive the gate so high it effectively disables the fusion forever.
+/// 256 sits just above the highest crossover Task-1 measured (16-core subscan ~200–250).
+const THRESHOLD_CEILING: usize = 256;
+
+/// Slope of the additive-log core-scaling, in feature-counts per doubling of cores.
+/// Fitted to the clean Task-1 BFS crossover deltas (≈30 at 2 cores → ≈80 at 16 cores over
+/// log2-span 3 ⇒ ≈17 per log2 step). Applied to BOTH anchors so the relative shape is
+/// shared; the per-anchor offset (100 vs 130) shifts the whole curve.
+const THRESHOLD_LOG2_SLOPE: f64 = 17.0;
+
+/// The rayon global-pool size, queried EXACTLY ONCE (quick 260620-c5v). The unified
+/// threshold fns are called per-leaf on a hot path, so we cache rather than re-query.
+///
+/// Input source = [`rayon::current_num_threads`] (NOT
+/// [`std::thread::available_parallelism`]): `current_num_threads` returns the actual
+/// global rayon pool size the fork/join actually runs on, and it HONORS
+/// `RAYON_NUM_THREADS`. The Task-1 measurement sweep drove the pool with
+/// `RAYON_NUM_THREADS`, so reading the same value here makes the measured curve and the
+/// production default agree. `available_parallelism` reports the hardware count and would
+/// DIVERGE from the pool whenever `RAYON_NUM_THREADS` is set — silently breaking that
+/// agreement.
+fn rayon_cores() -> usize {
+    use std::sync::OnceLock;
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| rayon::current_num_threads().max(1))
+}
+
+/// Core-count-derived default for a unified-fusion gate threshold (quick 260620-c5v).
+///
+/// `anchor_at_16` is the hand-measured optimum at THIS machine's 16 logical cores (the
+/// shipped constants: 100 for BFS, 130 for subscan). Task-1 (`RAYON_NUM_THREADS` sweep,
+/// warm 3-run medians) found the win-crossover feature count RISES roughly logarithmically
+/// with core count for BOTH fusions (MATERIAL, >20% swing 2→16 cores): more cores ⇒ each
+/// rayon fork/join's sync overhead grows ⇒ the single-fork/join fusion needs more
+/// per-feature work to beat the two-step's double fork/join. So we shape the default as
+///
+/// ```text
+/// threshold = clamp( anchor_at_16 − SLOPE · log2(16 / cores),  FLOOR, CEILING )
+/// ```
+///
+/// which reproduces `anchor_at_16` EXACTLY at 16 cores (the hard no-regression invariant
+/// for this box — the one point the proxy sweep can fully trust), drops below it on
+/// fewer-core machines (fusion engages earlier), and rises above it on many-core machines
+/// (fusion engages later). Clamped to `[FLOOR, CEILING]` so neither extreme gets a
+/// pathological value. PROXY CAVEAT: the off-16-core shape was measured by capping the
+/// rayon pool on a 16-core box, which isolates parallelism but NOT a real low-core
+/// machine's smaller cache / lower bandwidth — so off-16 it is a heuristic, and the
+/// `LGBM_UNIFIED_*` env overrides remain the escape hatch. See the 260620-c5v
+/// SUMMARY/FINDINGS for the full crossover table.
+fn core_scaled_threshold(anchor_at_16: usize, cores: usize) -> usize {
+    let cores = cores.max(1) as f64;
+    // log2(16/cores): +ve below 16 cores (lower threshold), 0 at 16, −ve above (higher).
+    let delta = (16.0_f64 / cores).log2();
+    let raw = anchor_at_16 as f64 - THRESHOLD_LOG2_SLOPE * delta;
+    // Round to nearest, then clamp. `max(0)` guards the (clamped-away) negative case.
+    let rounded = raw.round().max(0.0) as usize;
+    rounded.clamp(THRESHOLD_FLOOR, THRESHOLD_CEILING)
+}
+
 /// The feature-count at/above which the directly-built (smaller/root) leaf's
 /// per-feature `{build histogram → fix_histogram → compact → scan}` runs inside ONE
 /// rayon region (the host f64 analog of the GPU `build_fix_scan_resident` fusion,
@@ -355,11 +421,17 @@ fn par_scan_threshold() -> usize {
 /// `LGBM_UNIFIED_BFS_THRESHOLD=0` to force the unified path on for the bit-exact parity
 /// proof; set a large value (or `usize::MAX`) to force the serial two-step path.
 /// See the 260620-a48 SUMMARY for the full A/B.
+///
+/// DEFAULT IS NOW CORE-DERIVED (quick 260620-c5v): the constant `100` was measured only at
+/// THIS box's 16 cores. The default is `core_scaled_threshold(100, rayon_cores())`, which
+/// reproduces `100` exactly at 16 cores (zero local regression) and scales the crossover
+/// down on fewer-core / up on more-core machines per the Task-1 measured curve. The
+/// `LGBM_UNIFIED_BFS_THRESHOLD` env var still takes ULTIMATE precedence.
 pub fn unified_bfs_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_BFS_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+        .unwrap_or_else(|| core_scaled_threshold(100, rayon_cores()))
 }
 
 /// The feature-count at/above which the subtract-derived (larger / use_subtract) child's
@@ -391,11 +463,18 @@ pub fn unified_bfs_threshold() -> usize {
 /// sign-stable gain AND no narrow regression). Set `LGBM_UNIFIED_SUBSCAN_THRESHOLD=0` to
 /// force the fused path on for the bit-exact parity proof; `usize::MAX` to force two-step.
 /// See the 260620-b97 SUMMARY for the full A/B.
+///
+/// DEFAULT IS NOW CORE-DERIVED (quick 260620-c5v): the constant `130` was measured only at
+/// THIS box's 16 cores. The default is `core_scaled_threshold(130, rayon_cores())`, which
+/// reproduces `130` exactly at 16 cores (zero local regression) and scales the crossover
+/// per the Task-1 measured curve (same additive-log shape as the BFS gate, offset to this
+/// larger child's higher anchor). The `LGBM_UNIFIED_SUBSCAN_THRESHOLD` env var still takes
+/// ULTIMATE precedence.
 pub fn unified_subscan_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_SUBSCAN_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(130)
+        .unwrap_or_else(|| core_scaled_threshold(130, rayon_cores()))
 }
 
 /// The compute backend seam (CMP-01).
@@ -2910,13 +2989,19 @@ mod core_scaled_threshold_tests {
     /// consulted when the env var is absent/unparseable.
     #[test]
     fn env_override_takes_ultimate_precedence() {
-        // Serialize env mutation; these two vars are only read here.
-        std::env::set_var("LGBM_UNIFIED_BFS_THRESHOLD", "777");
-        std::env::set_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD", "888");
+        // Serialize env mutation; these two vars are only read here. Edition-2024 env
+        // mutation is `unsafe` (process-global) — safe here: single-threaded test, vars
+        // set then immediately removed, exercised by no other test.
+        unsafe {
+            std::env::set_var("LGBM_UNIFIED_BFS_THRESHOLD", "777");
+            std::env::set_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD", "888");
+        }
         assert_eq!(unified_bfs_threshold(), 777);
         assert_eq!(unified_subscan_threshold(), 888);
-        std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
-        std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
+        unsafe {
+            std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
+            std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
+        }
         // With env cleared, the derived default is in the sane clamp band.
         let b = unified_bfs_threshold();
         let s = unified_subscan_threshold();
