@@ -215,6 +215,11 @@ fn fold_one_feature(bins: &BinColumn, leaf_rows: &[u32], ord_g: &[f32], ord_h: &
     }
 }
 
+// quick 260620-njg: a f64-pregather fold variant (read once-widened f64 ords instead of
+// recomputing f64::from(f32) per feature) was prototyped here and A/B'd via the throwaway
+// bench (bench_split_scan.rs njg_pregather_ab) — NULL (cold microbench win did not survive
+// to the warm end-to-end train-wall), so nothing shipped to the hot path. See FINDINGS.
+
 /// Build the concatenated stride-2 per-feature histogram buffer (feature `f` occupies
 /// `[slot_off[f], slot_off[f] + 2*num_bins[f])`). `parallel` (spike 005 / R4) selects
 /// rayon-over-features — each feature folds its OWN histogram Vec from the shared
@@ -1528,6 +1533,11 @@ impl CpuBackend {
                 ord_h.push(hessians[row as usize]);
             }
         });
+        // quick 260620-njg: the f64-pregather micro-lever was A/B'd here and is NULL —
+        // sign-stable +7-14% on the COLD isolated fold microbench did NOT survive to the
+        // warm end-to-end bench_train train-wall (full 3-run overlap, B +0.2-0.5% = noise),
+        // exactly the cold-overstates-warm rule. Not shipped (the f32 gather + per-feature
+        // widen stays). See 260620-njg-FINDINGS.md / bench_split_scan.rs njg_pregather_ab().
 
         // 2) Hoisted ascending-order validation ⇒ deterministic lowest-index error
         //    (matches the two-step / serial path's first-failure behavior). Records each

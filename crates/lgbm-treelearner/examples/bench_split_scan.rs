@@ -72,6 +72,114 @@ fn make_corpus(s: &Size) -> DenseCorpus {
     DenseCorpus { features, labels }
 }
 
+/// quick 260620-njg Task-2: isolated A/B of the f64-pregather fold lever.
+///
+/// Builds a synthetic leaf (rows x features, narrow u32 bins) and folds the whole
+/// feature set repeatedly, two ways:
+///   A = f32 ord + `f64::from(ord_g[k])` widen INSIDE the per-feature loop (current).
+///   B = pre-widened `Vec<f64>` ord (widened ONCE per leaf), read directly in the loop.
+/// Both produce byte-identical f64 histograms (asserted). Reports 3-run medians of the
+/// fold wall for each, isolating the conversion-elimination vs the cache-density penalty
+/// of the 2x-bytes f64 ord arrays. Throwaway — no production change.
+fn njg_pregather_ab() {
+    use std::hint::black_box;
+
+    let rows = 20_000usize;
+    let bins = 255usize;
+    // Sweep the gate-relevant widths; per-leaf the SAME ord arrays are folded by every
+    // feature, so the lever's effect scales with feature count.
+    for &features in &[60usize, 90, 120] {
+        // Synthetic narrow bin columns (u32, < bins) — one Vec<u32> per feature.
+        let cols: Vec<Vec<u32>> = (0..features)
+            .map(|f| {
+                (0..rows)
+                    .map(|row| {
+                        let h = row
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(f.wrapping_mul(40_503).wrapping_add(0x9E37_79B9));
+                        (h % bins) as u32
+                    })
+                    .collect()
+            })
+            .collect();
+        // Once-gathered ordered grad/hess (f32, spike-003) + the pregathered f64 variant.
+        let ord_g: Vec<f32> = (0..rows).map(|k| ((k % 97) as f32) * 0.013 - 0.6).collect();
+        let ord_h: Vec<f32> = (0..rows).map(|k| ((k % 31) as f32) * 0.007 + 1.0).collect();
+        let ord_g64: Vec<f64> = ord_g.iter().map(|&x| f64::from(x)).collect();
+        let ord_h64: Vec<f64> = ord_h.iter().map(|&x| f64::from(x)).collect();
+
+        let cells = 2 * bins;
+        const REPS: usize = 3;
+        const INNER: usize = 20; // fold the whole feature set INNER times per measured rep.
+
+        // ---- variant A: f32 ord + per-feature widen-in-loop.
+        let fold_a = || {
+            let mut acc = 0.0f64;
+            for col in &cols {
+                let mut h = vec![0.0f64; cells];
+                for (k, &bin) in col.iter().enumerate() {
+                    let b = bin as usize;
+                    h[b * 2] += f64::from(ord_g[k]);
+                    h[b * 2 + 1] += f64::from(ord_h[k]);
+                }
+                acc += h[0] + h[cells - 1];
+                black_box(&h);
+            }
+            acc
+        };
+        // ---- variant B: pre-widened f64 ord, read directly.
+        let fold_b = || {
+            let mut acc = 0.0f64;
+            for col in &cols {
+                let mut h = vec![0.0f64; cells];
+                for (k, &bin) in col.iter().enumerate() {
+                    let b = bin as usize;
+                    h[b * 2] += ord_g64[k];
+                    h[b * 2 + 1] += ord_h64[k];
+                }
+                acc += h[0] + h[cells - 1];
+                black_box(&h);
+            }
+            acc
+        };
+
+        // Bit-exact check: A and B must produce identical f64 (lossless widen).
+        assert_eq!(fold_a().to_bits(), fold_b().to_bits(), "njg A/B fold not bit-exact");
+
+        // Cold warmup (discarded), then 3 measured reps each; report medians.
+        black_box(fold_a());
+        black_box(fold_b());
+        let mut ta = [0.0f64; REPS];
+        let mut tb = [0.0f64; REPS];
+        for r in 0..REPS {
+            let t0 = Instant::now();
+            for _ in 0..INNER {
+                black_box(fold_a());
+            }
+            ta[r] = t0.elapsed().as_secs_f64() * 1e3;
+            let t1 = Instant::now();
+            for _ in 0..INNER {
+                black_box(fold_b());
+            }
+            tb[r] = t1.elapsed().as_secs_f64() * 1e3;
+        }
+        let med = |mut v: [f64; REPS]| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[REPS / 2]
+        };
+        let (ma, mb) = (med(ta), med(tb));
+        let delta = (ma - mb) / ma * 100.0;
+        println!(
+            "njg_ab feat={features} A(f32+widen)_med={ma:.3}ms B(f64-pregather)_med={mb:.3}ms \
+             B_vs_A={delta:+.2}%  A_runs={ta:?} B_runs={tb:?}"
+        );
+    }
+    println!(
+        "njg_ab NOTE: cold microbench overstates warm 3-7x; ship ONLY on a sign-stable \
+         bench_train/bench_real train-wall win, never on this isolated fold."
+    );
+}
+
 fn main() {
     #[cfg(feature = "rocm")]
     let backend = "ROCm-GPU(gfx1100,f32-mirror)";
@@ -230,6 +338,19 @@ fn main() {
             "NOTE: set LGBM_FUSION_PROF=1 (with LGBM_UNIFIED_BFS_THRESHOLD=0 \
              LGBM_UNIFIED_SUBSCAN_THRESHOLD=0) to run the 260620-dpk fixed-cost sweep."
         );
+    }
+
+    // ---- quick 260620-njg Task-2: throwaway isolated A/B of the f64-pregather lever.
+    // Task 1 showed BUILD (the fold) is ~66-70% of WORK, so the fold body is the only
+    // place a cheaper-work lever can land. The lever: drop the per-feature
+    // `f64::from(ord_g[k])` widening (recomputed num_features times per row) by
+    // pre-widening the once-gathered ord arrays to Vec<f64> at gather time. This A/B
+    // isolates EXACTLY that — two byte-identical fold loops over the SAME synthetic bin
+    // columns, differing only in (A) read f32 + widen-in-loop vs (B) read pre-widened
+    // f64. Bit-exact (f32->f64 widen is lossless ⇒ identical f64 addends in identical
+    // order); asserted. Gated on LGBM_NJG_AB=1 (throwaway, no hot-path plumbing).
+    if std::env::var("LGBM_NJG_AB").ok().as_deref() == Some("1") {
+        njg_pregather_ab();
     }
 
     // Explicit, numeric go/no-go line (threshold = 20% on the WIDE config).
