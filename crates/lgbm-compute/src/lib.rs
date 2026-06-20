@@ -1482,6 +1482,15 @@ impl Backend for CpuBackend {
 }
 
 /// quick 260620-a48: the host f64 analog of the GPU `build_fix_scan_resident` fusion.
+///
+/// quick 260620-dpk (LEVER DECISION): the obvious "reuse `ord_g`/`ord_h`/`ranges`/`out`
+/// scratch across leaves" lever (lever A) was profiled and RULED OUT — the per-leaf
+/// allocation bucket is ≤0.6 % of this path's fixed cost (≤0.3 % of `subtract_scan_impl`);
+/// the cost is ~99 % the rayon `par_iter` region (fork/join floor + the actual
+/// fold/fix/scan work), which is irreducible at the gate-decision granularity. So the
+/// per-leaf allocations are LEFT AS-IS (cheap, served warm from a hot arena every leaf);
+/// adding learner-threaded or thread-local scratch reuse would trade a stale-state
+/// tampering surface (T-dpk-01/03) for a sub-1 % gain. See 260620-dpk-FINDINGS.md.
 #[cfg(feature = "cpu")]
 impl CpuBackend {
     #[allow(clippy::too_many_arguments)]
