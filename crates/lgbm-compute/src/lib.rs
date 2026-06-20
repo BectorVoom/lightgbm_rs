@@ -2838,3 +2838,89 @@ mod bin_column_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod core_scaled_threshold_tests {
+    use super::{
+        core_scaled_threshold, unified_bfs_threshold, unified_subscan_threshold,
+        THRESHOLD_CEILING, THRESHOLD_FLOOR,
+    };
+
+    /// HARD no-regression invariant (quick 260620-c5v): at THIS machine's 16 cores the
+    /// derived default MUST reproduce the measured/shipped optima (BFS 100, SUBSCAN 130)
+    /// exactly — the anchor is the one point the proxy sweep can trust absolutely.
+    #[test]
+    fn anchor_reproduced_exactly_at_16_cores() {
+        assert_eq!(core_scaled_threshold(100, 16), 100);
+        assert_eq!(core_scaled_threshold(130, 16), 130);
+    }
+
+    /// The crossover RISES with core count (Task-1 measured, MATERIAL): fewer cores ⇒
+    /// fusion amortizes at fewer features ⇒ lower threshold; more cores ⇒ higher.
+    /// Values are the additive-log shape `anchor − 17·log2(16/cores)`, clamped.
+    #[test]
+    fn monotone_rising_with_cores_for_both_anchors() {
+        for anchor in [100usize, 130] {
+            let mut prev = 0usize;
+            for cores in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+                let t = core_scaled_threshold(anchor, cores);
+                assert!(
+                    t >= prev,
+                    "anchor {anchor}: threshold must not DECREASE as cores rise: \
+                     cores={cores} gave {t} < prev {prev}"
+                );
+                prev = t;
+            }
+        }
+    }
+
+    /// Below 16 cores the derived default is BELOW the 16-core anchor (fusion engages
+    /// earlier); above 16 cores it is ABOVE (fusion engages later).
+    #[test]
+    fn below_and_above_anchor_bracket_16() {
+        assert!(core_scaled_threshold(100, 2) < 100);
+        assert!(core_scaled_threshold(100, 8) < 100);
+        assert!(core_scaled_threshold(100, 128) > 100);
+        assert!(core_scaled_threshold(130, 4) < 130);
+        assert!(core_scaled_threshold(130, 128) > 130);
+    }
+
+    /// Clamps protect the extremes: a 128-core box never gets a pathologically high
+    /// threshold (fusion would never engage), and a 1-core box never gets an absurdly
+    /// tiny one (parallelizing a trivial leaf). Floor 32 / ceiling 256, justified from
+    /// the Task-1 curve (measured crossovers stayed within [~20, ~250]).
+    #[test]
+    fn clamped_to_floor_and_ceiling_at_extremes() {
+        for anchor in [100usize, 130] {
+            for cores in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 1024] {
+                let t = core_scaled_threshold(anchor, cores);
+                assert!(
+                    (THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&t),
+                    "anchor {anchor} cores {cores}: {t} escaped [{THRESHOLD_FLOOR},{THRESHOLD_CEILING}]"
+                );
+            }
+        }
+        // 1-core BFS anchor=100 hits the floor (100 − 17·4 = 32 → exactly the floor).
+        assert_eq!(core_scaled_threshold(100, 1), THRESHOLD_FLOOR);
+        // Cores=0 (degenerate / impossible from rayon) is treated as 1, never panics.
+        assert_eq!(core_scaled_threshold(100, 0), core_scaled_threshold(100, 1));
+    }
+
+    /// Env override still wins with ULTIMATE precedence — the derived default is only
+    /// consulted when the env var is absent/unparseable.
+    #[test]
+    fn env_override_takes_ultimate_precedence() {
+        // Serialize env mutation; these two vars are only read here.
+        std::env::set_var("LGBM_UNIFIED_BFS_THRESHOLD", "777");
+        std::env::set_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD", "888");
+        assert_eq!(unified_bfs_threshold(), 777);
+        assert_eq!(unified_subscan_threshold(), 888);
+        std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
+        std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
+        // With env cleared, the derived default is in the sane clamp band.
+        let b = unified_bfs_threshold();
+        let s = unified_subscan_threshold();
+        assert!((THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&b));
+        assert!((THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&s));
+    }
+}
