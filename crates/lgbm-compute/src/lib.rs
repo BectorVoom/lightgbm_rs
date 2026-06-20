@@ -1572,31 +1572,43 @@ impl CpuBackend {
             .map(|((f, &active), bins)| {
                 let cells = 2 * f.num_bin as usize;
                 // (a) BUILD: own private histogram, ascending leaf_rows, grad at bin<<1.
+                // quick 260620-njg: BUILD timed per-feature (the fold body — the f64-pregather
+                // micro-lever's target). time() is thread-safe (relaxed fetch_add) so summing
+                // across rayon tasks is correct; inert when the gate is off (parity untouched).
                 let mut hist = vec![0.0f64; cells];
-                fold_one_feature(bins, leaf_rows, &ord_g, &ord_h, &mut hist);
+                fusion_prof::time(&fusion_prof::BFS_BUILD_NS, || {
+                    fold_one_feature(bins, leaf_rows, &ord_g, &ord_h, &mut hist);
+                });
                 // (b) FIX: most_freq_bin reconstruct on RAW leaf sums (Pitfall 2). No-op
                 //     for most_freq_bin==0 (the C++ `if (most_freq_bin > 0)` guard).
-                fix_histogram_inline(&mut hist, f.most_freq_bin, sum_gradient, sum_hessian);
                 // (c) COMPACT: shift real-bin `c+offset` into `c`, zero the tail (D-09).
                 //     No-op for offset==0.
-                compact_histogram_inline(&mut hist, f.offset);
+                // quick 260620-njg: FIX+COMPACT timed as one sub-bucket (expected ~0 — the
+                // no-op guards dominate in the common case).
+                fusion_prof::time(&fusion_prof::BFS_FIXCOMPACT_NS, || {
+                    fix_histogram_inline(&mut hist, f.most_freq_bin, sum_gradient, sum_hessian);
+                    compact_histogram_inline(&mut hist, f.offset);
+                });
                 // (d) SCAN (only if spine-active): own SplitInfo from the disjoint hist.
+                // quick 260620-njg: SCAN timed per-feature (find_best_split).
                 let split = if active {
-                    Some(self.find_best_split(
-                        client,
-                        &hist,
-                        cfg,
-                        f.num_bin,
-                        f.offset,
-                        f.default_bin,
-                        f.most_freq_bin,
-                        f.skip_default_bin,
-                        f.na_as_missing,
-                        f.run_forward,
-                        sum_gradient,
-                        sum_hessian,
-                        num_data,
-                    )?)
+                    Some(fusion_prof::time(&fusion_prof::BFS_SCAN_NS, || {
+                        self.find_best_split(
+                            client,
+                            &hist,
+                            cfg,
+                            f.num_bin,
+                            f.offset,
+                            f.default_bin,
+                            f.most_freq_bin,
+                            f.skip_default_bin,
+                            f.na_as_missing,
+                            f.run_forward,
+                            sum_gradient,
+                            sum_hessian,
+                            num_data,
+                        )
+                    })?)
                 } else {
                     None
                 };

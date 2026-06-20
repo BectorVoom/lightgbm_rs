@@ -186,7 +186,9 @@ fn main() {
     // FINDINGS table can quantify ALLOC (lever-A-reducible) vs FORK/JOIN-floor fractions.
     if std::env::var("LGBM_FUSION_PROF").ok().as_deref() == Some("1") {
         println!("# --- 260620-dpk per-leaf fixed-cost decomposition (FORCED-ON unified) ---");
-        for feat in [20usize, 40, 60, 80] {
+        // quick 260620-njg: representative widths 60/90/120 feat (~20k rows) so the
+        // BUILD/FIX+COMPACT/SCAN WORK split is measured at the gate-relevant width.
+        for feat in [60usize, 90, 120] {
             let s = Size { name: "dpk", rows: 20_000, features: feat, bins: 255 };
             let corpus = make_corpus(&s);
             let cfg = TrainingBuilder::new()
@@ -207,6 +209,10 @@ fn main() {
             lgbm_compute::fusion_prof::BFS_GATHER_NS.store(0, Ordering::Relaxed);
             lgbm_compute::fusion_prof::BFS_ALLOC_NS.store(0, Ordering::Relaxed);
             lgbm_compute::fusion_prof::BFS_PAR_NS.store(0, Ordering::Relaxed);
+            // quick 260620-njg: reset the BUILD/FIX+COMPACT/SCAN sub-buckets too.
+            lgbm_compute::fusion_prof::BFS_BUILD_NS.store(0, Ordering::Relaxed);
+            lgbm_compute::fusion_prof::BFS_FIXCOMPACT_NS.store(0, Ordering::Relaxed);
+            lgbm_compute::fusion_prof::BFS_SCAN_NS.store(0, Ordering::Relaxed);
             lgbm_compute::fusion_prof::SUB_ALLOC_NS.store(0, Ordering::Relaxed);
             lgbm_compute::fusion_prof::SUB_PAR_NS.store(0, Ordering::Relaxed);
 

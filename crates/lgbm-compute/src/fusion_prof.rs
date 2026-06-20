@@ -23,6 +23,24 @@ pub static BFS_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 /// (3+4) FORK/JOIN + PARALLEL WORK: the `par_iter` region (fork/join floor + fold/fix/scan).
 pub static BFS_PAR_NS: AtomicU64 = AtomicU64::new(0);
 
+// --- quick 260620-njg: split the BFS_PAR work region into its three sub-stages so the
+//     dominant per-feature WORK sub-bucket is known before any "cheaper work" change.
+//     Each is timed PER FEATURE inside the `par_iter` closure via the thread-safe
+//     `time()` (relaxed fetch_add), so concurrent rayon tasks accumulate into the shared
+//     atomic; inert when `LGBM_FUSION_PROF` is unset (closure runs identically → parity
+//     untouched, proven FORCED-ON in the parity gate). These three sum to ~BFS_PAR_NS
+//     minus the fork/join floor.
+/// (3a) BUILD: the per-feature [`fold_one_feature`](crate::fold_one_feature) histogram fold
+/// (the once-gathered f32 ord read + per-bin f64 RMW). The f64-pregather micro-lever
+/// (QUICK-260620-njg) targets the `f64::from(ord_g[k])` widening inside this fold.
+pub static BFS_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+/// (3b) FIX+COMPACT: `fix_histogram_inline` + `compact_histogram_inline` (no-ops in the
+/// common `most_freq_bin==0` / `offset==0` case — expected ~0). (QUICK-260620-njg)
+pub static BFS_FIXCOMPACT_NS: AtomicU64 = AtomicU64::new(0);
+/// (3c) SCAN: the per-feature `find_best_split` split scan over the built histogram.
+/// (QUICK-260620-njg)
+pub static BFS_SCAN_NS: AtomicU64 = AtomicU64::new(0);
+
 // --- subtract_scan_impl (larger / subtract-derived child) buckets ---
 /// (2) ALLOCATIONS: the per-leaf `ranges`/`out` setup (lever-A-reducible).
 pub static SUB_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +76,9 @@ pub fn dump(label: &str) {
     let g = BFS_GATHER_NS.swap(0, Ordering::Relaxed);
     let ba = BFS_ALLOC_NS.swap(0, Ordering::Relaxed);
     let bp = BFS_PAR_NS.swap(0, Ordering::Relaxed);
+    let bbuild = BFS_BUILD_NS.swap(0, Ordering::Relaxed);
+    let bfix = BFS_FIXCOMPACT_NS.swap(0, Ordering::Relaxed);
+    let bscan = BFS_SCAN_NS.swap(0, Ordering::Relaxed);
     let sa = SUB_ALLOC_NS.swap(0, Ordering::Relaxed);
     let sp = SUB_PAR_NS.swap(0, Ordering::Relaxed);
     let bfs_tot = (g + ba + bp) as f64 / 1e6;
@@ -75,6 +96,26 @@ pub fn dump(label: &str) {
             g as f64 / 1e4 / bfs_tot,
             ba as f64 / 1e4 / bfs_tot,
             bp as f64 / 1e4 / bfs_tot
+        );
+    }
+    // quick 260620-njg: the BUILD/FIX+COMPACT/SCAN sub-buckets are summed PER-THREAD
+    // across the rayon tasks, so their sum (`work_tot`) overcounts the single-threaded
+    // `par` wall by ~num_threads — the meaningful diagnostic is their share of the WORK
+    // (which sub-stage dominates the per-feature compute), NOT their fraction of `par`.
+    let work_tot = (bbuild + bfix + bscan) as f64 / 1e6;
+    eprintln!(
+        "[fusion_prof:{label}] WORK (per-thread summed): build={:.3}ms fix+compact={:.3}ms scan={:.3}ms total={:.3}ms",
+        bbuild as f64 / 1e6,
+        bfix as f64 / 1e6,
+        bscan as f64 / 1e6,
+        work_tot
+    );
+    if work_tot > 0.0 {
+        eprintln!(
+            "[fusion_prof:{label}] WORK %: build={:.1} fix+compact={:.1} scan={:.1}",
+            bbuild as f64 / 1e4 / work_tot,
+            bfix as f64 / 1e4 / work_tot,
+            bscan as f64 / 1e4 / work_tot
         );
     }
     eprintln!(
