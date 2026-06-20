@@ -78,23 +78,55 @@ fn main() {
     let backend = "cpu-f64-anchor";
 
     // Standard regression GBDT, same config for both backends.
-    const ITERS: i32 = 50;
     const LEAVES: i32 = 31;
     // WARM-VS-COLD RULE: discard WARMUP iters before timing; report median of TRAIN_REPS.
     const WARMUP: usize = 2;
     const TRAIN_REPS: usize = 5;
+    // Sweep mode trains larger corpora (up to 512k rows); fewer iters keep the multi-
+    // restart A/B wall time bounded while still warm-amortizing. Default keeps 50.
+    let iters: i32 = if std::env::var("LGBM_BENCH_SWEEP").as_deref() == Ok("medocc") {
+        12
+    } else {
+        50
+    };
+    let iters = iters; // bind for the closure below
 
     // Sizes: small/medium are launch-bound on the GPU; the >=200k size is where the
     // GPU path stops being purely launch-bound (and where the CPU anchor goes
     // multi-threaded). Fewer iters at 200k to keep the run time reasonable.
-    let sizes = [
+    //
+    // SWEEP MODE (quick-260620-sqf): when `LGBM_BENCH_SWEEP=medocc` is set, replace
+    // the default sizes with the medium-width occupancy A/B grid — feature counts
+    // {30,60,100} × rows {50k,120k,256k,512k} bracketing the 256k row-partition gate.
+    // The A/B (P=1 vs row-partitioned) is driven externally via `LGBM_ROWPART_MIN`
+    // (the existing override at histogram.rs:731) so NO source change to the gate is
+    // needed for the measurement. Methodology (warm/median) is unchanged.
+    let sweep = std::env::var("LGBM_BENCH_SWEEP").ok();
+    let default_sizes = vec![
         Size { name: "small ", rows: 2_000, features: 12, bins: 32 },
         Size { name: "medium", rows: 20_000, features: 30, bins: 64 },
         Size { name: "large ", rows: 200_000, features: 40, bins: 128 },
     ];
+    let medocc_sizes: Vec<Size> = {
+        let mut v = Vec::new();
+        for &feat in &[30usize, 60, 100] {
+            for &rows in &[50_000usize, 120_000, 256_000, 512_000] {
+                // Leak a small static-ish name; bench example, fine to leak.
+                let name: &'static str =
+                    Box::leak(format!("f{feat}r{}k", rows / 1000).into_boxed_str());
+                v.push(Size { name, rows, features: feat, bins: 128 });
+            }
+        }
+        v
+    };
+    let sizes: Vec<Size> = match sweep.as_deref() {
+        Some("medocc") => medocc_sizes,
+        _ => default_sizes,
+    };
 
     println!(
-        "# lightgbm_rs GPU-vs-CPU bench  (backend: {backend}, iters: {ITERS}, leaves: {LEAVES}, warmup: {WARMUP}, reps: {TRAIN_REPS})"
+        "# lightgbm_rs GPU-vs-CPU bench  (backend: {backend}, iters: {iters}, leaves: {LEAVES}, warmup: {WARMUP}, reps: {TRAIN_REPS}, rowpart_min: {})",
+        std::env::var("LGBM_ROWPART_MIN").unwrap_or_else(|_| "default(256000)".into())
     );
     println!(
         "# RUN BOTH FEATURE CONFIGS FOR THE SIDE-BY-SIDE COMPARISON:\n\
@@ -111,7 +143,7 @@ fn main() {
         let corpus = make_corpus(s);
         let cfg = TrainingBuilder::new()
             .objective("regression")
-            .num_iterations(ITERS)
+            .num_iterations(iters)
             .num_leaves(LEAVES)
             .learning_rate(0.1)
             .min_data_in_leaf(20)
