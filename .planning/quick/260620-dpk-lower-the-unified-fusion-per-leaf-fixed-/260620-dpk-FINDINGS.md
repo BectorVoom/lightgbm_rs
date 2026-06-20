@@ -97,4 +97,56 @@ and leaves the thresholds unchanged on an honest NULL.
 
 ## Task 3 — gate crossover re-measurement
 
-_(filled in after Task 3)_
+Harness: `crates/lgbm/examples/bench_crossover.rs` (release, cubecl-cpu). A = serial
+two-step (`LGBM_UNIFIED_BFS_THRESHOLD=usize::MAX LGBM_UNIFIED_SUBSCAN_THRESHOLD=usize::MAX`),
+B = unified fusion on (both `=0`). 20k rows, 30 (or 20) iters, median of 3–5 reps,
+A/B interleaved per feature count to suppress cross-run drift.
+
+### Single clean wide sweep (run 1, 3 reps, monotone)
+
+| feat | A serial (ms) | B unified (ms) | delta |
+|-----:|--------------:|---------------:|------:|
+|   20 |     74.2      |    120.8       | +63 % |
+|   40 |    128.6      |    145.4       | +13 % |
+|   60 |    169.1      |    168.3       | −0.4 %|
+|   80 |    222.1      |    203.5       | −8.4 %|
+|   90 |    243.3      |    220.5       | −9.4 %|
+|  100 |    326.0      |    231.3       | −29 % |
+|  120 |    371.7      |    273.1       | −27 % |
+
+This single run *suggested* a crossover near 60–80 feat. But a single run cannot meet
+the project's adoption rule (a48/b97/c5v): **sign-stable WIN = no run overlap across
+3 independent runs**. The A column above is contaminated at high feat by background
+load (the box ran load-avg 5–11 during the campaign — multiple rust-analyzer / editor
+processes), which inflates A and manufactures an apparent B-win. The 3-run check below
+isolates the real signal.
+
+### 3-run sign-stability (interleaved A/B, 5 reps each)
+
+| feat | run1 delta | run2 delta | run3 delta | sign-stable? |
+|-----:|-----------:|-----------:|-----------:|:-------------|
+|   70 |  −39.8 %   |   −3.2 %   |  **+1.1 %**|  **NO** — flips (run1 = load artifact, runs 2/3 straddle 0) |
+|   80 |   −1.4 %   |   −1.9 %   |   −4.6 %   |  **NO** — all small, A/B distributions OVERLAP (within run spread) |
+|  100 |  **+2.6 %**|  −21.1 %   |   −8.2 %   |  **NO** — flips (run1 positive); marginal even at the existing anchor |
+|  120 |  −19.3 %   |  −17.6 %   |  −16.1 %   |  **YES** — all negative, tight, NO overlap → genuine WIN |
+
+### Verdict: **NULL** — thresholds UNCHANGED
+
+- The unified fusion's **sign-stable, no-overlap** train-wall win only materialises at
+  **≥120 features** on this 16-core box. At 70–100 feat the delta is within run-to-run
+  spread and **sign-flips on repetition** — not a win by the hard adoption rule.
+- **No fixed-cost reduction was implemented** (Task 1: allocation ≤0.6 %; lever A ruled
+  out; nothing else lowered the floor). The fused code is **byte-identical** to the c5v
+  HEAD, so there is no mechanism by which the break-even could have dropped below the
+  c5v-measured `unified_bfs_threshold=100` / `unified_subscan_threshold=130` anchors.
+- **Measured floor:** the rayon fork/join dispatch + per-leaf serial setup + run-to-run
+  scheduling variance dominate below ~120 feat, capping the gate at the current anchors.
+  This is exactly the "fork/join dispatch floor may be irreducible — NULL/PARTIAL is an
+  acceptable, expected outcome" the plan anticipated.
+
+**Decision: keep `unified_bfs_threshold = core_scaled_threshold(100, cores)` and
+`unified_subscan_threshold = core_scaled_threshold(130, cores)` unchanged; keep the c5v
+`core_scaled_threshold` formula (slope/floor/ceiling) unchanged. No manufactured win.**
+The 260620-dpk contribution is the negative result + the reusable `fusion_prof`
+instrument that proves the floor, so a future lever (e.g. a fundamentally different
+dispatch model) can be evaluated against a measured baseline rather than re-derived.
