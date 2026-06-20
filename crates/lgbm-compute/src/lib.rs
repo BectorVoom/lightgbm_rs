@@ -12,6 +12,7 @@
 //! point of the seam, and the `cmp01_containment` guard test enforces it.
 
 pub mod error;
+pub mod fusion_prof;
 pub mod gain;
 pub mod kernels;
 pub mod runtime;
@@ -1507,18 +1508,24 @@ impl CpuBackend {
         // 1) Gather the ordered gradients/hessians ONCE per leaf (identical across every
         //    feature — only the bin column differs; mirrors `build_leaf_histograms_raw`
         //    SPIKE 003). Values + order unchanged ⇒ bit-exact fold inputs.
+        //    quick 260620-dpk: ALLOC + GATHER buckets timed under the inert fusion_prof gate.
         let r = leaf_rows.len();
-        let mut ord_g: Vec<f32> = Vec::with_capacity(r);
-        let mut ord_h: Vec<f32> = Vec::with_capacity(r);
-        for &row in leaf_rows {
-            ord_g.push(gradients[row as usize]);
-            ord_h.push(hessians[row as usize]);
-        }
+        let (mut ord_g, mut ord_h) = fusion_prof::time(&fusion_prof::BFS_ALLOC_NS, || {
+            (Vec::<f32>::with_capacity(r), Vec::<f32>::with_capacity(r))
+        });
+        fusion_prof::time(&fusion_prof::BFS_GATHER_NS, || {
+            for &row in leaf_rows {
+                ord_g.push(gradients[row as usize]);
+                ord_h.push(hessians[row as usize]);
+            }
+        });
 
         // 2) Hoisted ascending-order validation ⇒ deterministic lowest-index error
         //    (matches the two-step / serial path's first-failure behavior). Records each
         //    feature's validated `[start, end)` so the parallel map is infallible.
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(all_feats.len());
+        // quick 260620-dpk: the `ranges` Vec alloc is part of the lever-A-reducible bucket.
+        let mut ranges: Vec<(usize, usize)> =
+            fusion_prof::time(&fusion_prof::BFS_ALLOC_NS, || Vec::with_capacity(all_feats.len()));
         for f in all_feats {
             let cells =
                 2usize
@@ -1545,7 +1552,11 @@ impl CpuBackend {
         //    into its OWN private buffer (cache-hot, no cross-region hand-off). Returns
         //    `(private_hist, Option<SplitInfo>)`; `par_iter` preserves input order so the
         //    serial assembly below stays feature-index-ordered (bit-exact argmax).
-        let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> = all_feats
+        // quick 260620-dpk: the par region (fork/join floor + the actual fold/fix/scan
+        // work) is the candidate-IRREDUCIBLE bucket — timed as one unit under the gate.
+        let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> =
+            fusion_prof::time(&fusion_prof::BFS_PAR_NS, || {
+        all_feats
             .par_iter()
             .zip(scan_active.par_iter())
             .zip(feature_bins.par_iter())
@@ -1582,7 +1593,8 @@ impl CpuBackend {
                 };
                 Ok((hist, split))
             })
-            .collect();
+            .collect()
+            });
 
         // 4) SERIAL ordered assembly: copy each private hist into its disjoint `buf`
         //    region (COMPLETE histogram for the subtract-larger child) and collect the
@@ -1644,7 +1656,9 @@ impl CpuBackend {
         //    (matches the two-step `subtract_histograms`' whole-buffer length check).
         //    Each feature's `[start, end)` is validated against parent/smaller/larger so
         //    the parallel map is infallible on the validated slices.
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(all_feats.len());
+        // quick 260620-dpk: `ranges` alloc is the lever-A-reducible bucket for this child.
+        let mut ranges: Vec<(usize, usize)> =
+            fusion_prof::time(&fusion_prof::SUB_ALLOC_NS, || Vec::with_capacity(all_feats.len()));
         for f in all_feats {
             let cells =
                 2usize
@@ -1683,7 +1697,10 @@ impl CpuBackend {
         //    private buffer (cache-hot, no cross-region hand-off). Returns
         //    `(private_region, Option<SplitInfo>)`; `par_iter` preserves input order so
         //    the serial assembly below stays feature-index-ordered (bit-exact argmax).
-        let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> = all_feats
+        // quick 260620-dpk: par region (fork/join floor + subtract+scan work) timed as one.
+        let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> =
+            fusion_prof::time(&fusion_prof::SUB_PAR_NS, || {
+        all_feats
             .par_iter()
             .zip(scan_active.par_iter())
             .zip(ranges.par_iter())
@@ -1718,7 +1735,8 @@ impl CpuBackend {
                 };
                 Ok((region, split))
             })
-            .collect();
+            .collect()
+            });
 
         // 3) SERIAL ordered assembly: copy each private region into its disjoint
         //    `larger_buf` region (COMPLETE histogram for the larger child) and collect

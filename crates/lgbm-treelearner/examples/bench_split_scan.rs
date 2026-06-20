@@ -179,6 +179,53 @@ fn main() {
         }
     }
 
+    // ---- quick 260620-dpk Task-1: per-leaf FIXED-COST decomposition sweep.
+    // Drives the FORCED-ON unified path (set LGBM_UNIFIED_BFS_THRESHOLD=0
+    // LGBM_UNIFIED_SUBSCAN_THRESHOLD=0 LGBM_FUSION_PROF=1) across 20/40/60/80 features
+    // and dumps the fusion_prof buckets (gather / alloc / par) per feature count so the
+    // FINDINGS table can quantify ALLOC (lever-A-reducible) vs FORK/JOIN-floor fractions.
+    if std::env::var("LGBM_FUSION_PROF").ok().as_deref() == Some("1") {
+        println!("# --- 260620-dpk per-leaf fixed-cost decomposition (FORCED-ON unified) ---");
+        for feat in [20usize, 40, 60, 80] {
+            let s = Size { name: "dpk", rows: 20_000, features: feat, bins: 255 };
+            let corpus = make_corpus(&s);
+            let cfg = TrainingBuilder::new()
+                .objective("regression")
+                .num_iterations(ITERS)
+                .num_leaves(LEAVES)
+                .learning_rate(0.1)
+                .min_data_in_leaf(20)
+                .seed(42)
+                .deterministic(true)
+                .build()
+                .expect("config builds");
+
+            // Cold warmup (discarded), then reset the fusion buckets so the dump reflects
+            // ONLY the measured warm window.
+            let cold = train(&cfg, &corpus).expect("train ok (cold dpk)");
+            std::hint::black_box(&cold);
+            lgbm_compute::fusion_prof::BFS_GATHER_NS.store(0, Ordering::Relaxed);
+            lgbm_compute::fusion_prof::BFS_ALLOC_NS.store(0, Ordering::Relaxed);
+            lgbm_compute::fusion_prof::BFS_PAR_NS.store(0, Ordering::Relaxed);
+            lgbm_compute::fusion_prof::SUB_ALLOC_NS.store(0, Ordering::Relaxed);
+            lgbm_compute::fusion_prof::SUB_PAR_NS.store(0, Ordering::Relaxed);
+
+            let t0 = Instant::now();
+            for _ in 0..WARM_REPS {
+                let b = train(&cfg, &corpus).expect("train ok (warm dpk)");
+                std::hint::black_box(&b);
+            }
+            let wall = t0.elapsed();
+            println!("dpk_feat={feat} warm_wall={:.3}ms", wall.as_secs_f64() * 1e3);
+            lgbm_compute::fusion_prof::dump(&format!("dpk_feat{feat}"));
+        }
+    } else {
+        eprintln!(
+            "NOTE: set LGBM_FUSION_PROF=1 (with LGBM_UNIFIED_BFS_THRESHOLD=0 \
+             LGBM_UNIFIED_SUBSCAN_THRESHOLD=0) to run the 260620-dpk fixed-cost sweep."
+        );
+    }
+
     // Explicit, numeric go/no-go line (threshold = 20% on the WIDE config).
     if let Some(pct) = wide_scan_pct {
         let go = pct >= 20.0;
