@@ -11,8 +11,11 @@ C++ LightGBM 4.6. These findings come from the train-speed perf campaign: locali
 histogram-build bottleneck and stacking bit-exact CPU wins, probing the GPU kernel's real
 bottleneck, and bounding what the GPU and quantization tracks can claim.
 
-Spike sessions wrapped: 2026-06-17 — spikes **001–013** (full campaign). The histogram
-BUILD dominates CPU train; nearly every win lives there.
+Spike sessions wrapped: 2026-06-17 — spikes **001–013** (full campaign); 2026-06-21 —
+spikes **014a/014b** (GPU wide-shape 1M×500 attribution + the p9v/qix/rdu/rsh host-setup
+levers, cumulative −68%). The histogram BUILD dominates CPU train; on the GPU wide shape
+the kernel is only ⅓ — redundant device upload + cache-hostile per-train host setup were
+the real costs.
 </context>
 
 <requirements>
@@ -36,6 +39,7 @@ BUILD dominates CPU train; nearly every win lives there.
 | GPU (ROCm) histogram kernel | references/gpu-histogram-kernel.md | Build is atomic/latency-bound, not bandwidth-bound — row-partition to ~8 wkgrps/CU is the ONE lever (007, ~1.35×); u8 device bins (006) and multi-feature packing (009) are evidenced NULLs |
 | GPU routing & quantization | references/gpu-routing-and-quantization.md | GPU crosses CPU ≈700k rows vs single-thread (001) — but moves to millions vs the multi-threaded anchor; int16 quantized hist is irreducibly approximate (008, ~3e-4 floor), opt-in mode only |
 | Histogram & learning-path memory layout | references/histogram-learning-memory-layout.md | Flatten + reuse the histogram pool (~7% large, bit-exact, shipped); keep the parallel-build per-thread accumulators (load-bearing) and the KB-scale bool matrix (sub-noise); per-leaf rows are already flat |
+| GPU wide-shape attribution & host-setup levers | references/gpu-wide-shape-attribution.md | At 1M×500 the histogram kernel is ≤⅓ of train (folded into "scan"; `build=0` is an artifact) — profile with the whole-train BUDGET (`LGBM_PHASE_PROF=1`). Four shipped bit-exact levers: upload-once-per-train (p9v −32%), native-width upload (qix ~5×/~4× mem), cache-friendly feature_infos (rdu ~8×) + binning (rsh ~2.3×) via transpose; cumulative 29.55→~9.5s (−68%). Measure before "fixing" a hypothesis (the to_vec-clones lever was a mis-attribution) |
 
 ## Cross-cutting rules (read these first)
 
@@ -71,6 +75,8 @@ harness (`gen_data.py`/`train.conf`) are preserved in `sources/`.
 - 011-parallel-build-scatter (INVALIDATED — load-bearing)
 - 012-reuse-pool-across-trees (VALIDATED + SHIPPED — reuse across trees)
 - 013-feature-splittable-arena (INVALIDATED — sub-noise)
+- 014a-coarse-phase-attribution (PARTIAL — GPU kernel folded into "scan"; <½ of wall-clock instrumented; overturns "kernel is the bottleneck")
+- 014b-gpu-launch-vs-compute-split (VALIDATED — whole-train BUDGET names the cost: redundant per-tree resident-bin upload, ≈ the kernel; led to 4 shipped levers)
 
-Full campaign 001–013 wrapped.
+Full campaign 001–013 wrapped (2026-06-17); 014a/014b + shipped p9v/qix/rdu/rsh levers wrapped (2026-06-21, GPU wide-shape 1M×500, cumulative −68%).
 </metadata>

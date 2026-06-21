@@ -22,6 +22,8 @@
 | 011 | parallel-build-scatter | standard | ❌ INVALIDATED (load-bearing) | Histogram memory layout |
 | 012 | reuse-pool-across-trees | standard | ✅ VALIDATED + SHIPPED | Histogram memory layout |
 | 013 | feature-splittable-arena | standard | ❌ INVALIDATED (sub-noise) | Learning-path allocation |
+| 014a | coarse-phase-attribution | standard | ⚠️ PARTIAL (overturns framing) | GPU wide-shape attribution |
+| 014b | gpu-launch-vs-compute-split | standard | ✅ VALIDATED (names the cost) | GPU wide-shape attribution |
 
 ## Key Findings (001–009, the perf campaign)
 
@@ -56,7 +58,27 @@
 - **Sweep status:** the learning-leaf `Vec<Vec<T>>` surface is exhausted. 001–009 remain
   for a future wrap-up.
 
+## Key Findings (014a/014b + p9v/qix/rdu/rsh — the GPU wide-shape thread, 2026-06-21)
+- **The GPU histogram kernel is NOT the 1M×500 bottleneck.** 014a: at ≥100 feat the
+  resident fusion folds build+fix+scan into one launch timed under "scan" (`build=0` is an
+  artifact); the growth-loop timers cover <½ of train and the blind fraction GROWS with
+  rows (55→69%). The kernel is ≤⅓ of wall-clock.
+- **Whole-train BUDGET profiler** (014b, `LGBM_PHASE_PROF=1`, `phase_prof.rs`) named the
+  rest: a redundant per-tree resident-bin re-upload (≈ the kernel) + per-train host setup.
+  Confirmed GPU-specific via a 16× CPU-vs-GPU A/B.
+- **Four shipped bit-exact levers** took 1M×500 iters=4 train **29.55→~9.5s (−68%)**:
+  p9v (upload once/train, −32%), qix (native-width upload, ~5× upload bucket + ~4× host
+  mem, generic `<B:Int>` kernels), rdu (cache-friendly `feature_infos`, ~8×), rsh
+  (cache-friendly binning via transpose-scatter, ~2.3×).
+- **Method lessons:** (1) measure before "fixing" a hypothesis — the "to_vec clones"
+  overhead was a mis-attribution (8MB clone = sub-ms; the real cost was cache-hostile
+  `feature_infos`); (2) row-major `Vec<Vec<f64>>` + per-feature column passes are
+  cache-hostile — transpose to one contiguous row pass (byte-identical); (3) single-thread
+  scatter into `num_features` L2-resident tails wins where spike-011's PARALLEL scatter lost.
+
 ## Shipped commits
 - `d9cbae4` — spike 010 (flat arena)
 - `5c8fa43` — spikes 012 (pool reuse) + 013 (feature_splittable not-worth-it)
 - `c490905` — spike 011 (revert + load-bearing NOTE)
+- 014 thread: `01e405d` p9v, `ff4a10b` qix, `bf467bd` rdu, `b917191` rsh (spikes:
+  `fe79da3` 014a, `c3ab6fd` 014b)
