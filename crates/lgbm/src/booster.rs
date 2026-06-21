@@ -173,16 +173,24 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
             ),
         });
     }
-    let mut columns = Vec::with_capacity(num_features);
-    for j in 0..num_features {
-        // Collect the column's raw values as bins (must be non-negative integers).
-        let mut bins = Vec::with_capacity(num_data);
-        for (i, row) in corpus.features.iter().enumerate() {
-            if row.len() != num_features {
-                return Err(LgbmError::InvalidCorpus {
-                    detail: format!("row {i} has {} cols, expected {num_features}", row.len()),
-                });
-            }
+    // quick-260621-rsh: ONE cache-friendly pass over rows (each `row` is contiguous),
+    // SCATTERING `row[j] as u32` into per-feature bin vectors — instead of `num_features`
+    // STRIDED column passes (`row[j]` jumped `num_features*8` bytes/read, ~⅓ of train
+    // wall-clock at 1M×500). Streaming reads (bandwidth-bound) + the ~`num_features*64B`
+    // hot Vec tails stay L2-resident (single-threaded ⇒ no spike-011 false-sharing). The
+    // HAPPY-PATH bins are byte-identical (same values, same per-feature row order) ⇒
+    // FeatureColumns byte-identical ⇒ bit-exact. Validation is now in row-major DISCOVERY
+    // order — same `LgbmError::InvalidCorpus` variant + same checks (only `is_err()` is
+    // asserted, booster.rs test, not the specific (feature,row)).
+    let mut cols_bins: Vec<Vec<u32>> =
+        (0..num_features).map(|_| Vec::with_capacity(num_data)).collect();
+    for (i, row) in corpus.features.iter().enumerate() {
+        if row.len() != num_features {
+            return Err(LgbmError::InvalidCorpus {
+                detail: format!("row {i} has {} cols, expected {num_features}", row.len()),
+            });
+        }
+        for (j, col) in cols_bins.iter_mut().enumerate() {
             let v = row[j];
             if v < 0.0 || v.fract() != 0.0 {
                 return Err(LgbmError::InvalidCorpus {
@@ -192,8 +200,12 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
                     ),
                 });
             }
-            bins.push(v as u32);
+            col.push(v as u32);
         }
+    }
+
+    let mut columns = Vec::with_capacity(num_features);
+    for (j, bins) in cols_bins.into_iter().enumerate() {
         // num_bin = max bin + 1; verify distinct values are exactly 0..num_bin-1.
         let max_bin = *bins.iter().max().unwrap();
         let num_bin = max_bin + 1;
