@@ -292,6 +292,15 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// `train_inner` via [`crate::resident_pool::fused_directly_built_eligible`]; `false`
     /// (default, ALWAYS on CpuBackend) takes the existing resident/host routing.
     fused_eligible: bool,
+    /// quick-260621-p9v (spike-014b lever): whether the per-train resident-bin device
+    /// upload has already run THIS train. The binned columns are immutable for the whole
+    /// train and `RocmBackend` is one instance per `train()` (its `resident_bins` cache
+    /// survives across trees — `reset_resident_pool` never clears it), so the upload only
+    /// needs to happen on the FIRST tree, not every tree (the per-tree re-upload was ~31%
+    /// of train wall-clock at 1M×500). Default `false`; set `true` after the upload in
+    /// `train_inner`; reset to `false` in [`with_features`](Self::with_features) (a new
+    /// feature set makes the cached device bins stale ⇒ must re-upload).
+    resident_bins_uploaded: bool,
     /// R3 (perf, 260614-p0n): reused per-feature `num_bin` descriptor for
     /// [`build_leaf_histogram_into`](Self::build_leaf_histogram_into). The feature
     /// set is FIXED per train (set once via [`with_features`](Self::with_features)),
@@ -449,6 +458,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             resident_eligible: false,
             // Default OFF: recomputed per train in `train_inner` (260608-t3t).
             fused_eligible: false,
+            // quick-260621-p9v: no upload yet; first tree of the train uploads once.
+            resident_bins_uploaded: false,
             // R3 (260614-p0n): filled lazily on the first leaf-histogram build.
             build_num_bins: std::cell::RefCell::new(Vec::new()),
             // Spike 012: built lazily on the first tree, reused across all trees.
@@ -823,14 +834,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // allocation on the CPU path (the bins are stored narrow now; widening for a
         // no-op upload was a measured small-row regression). The Rocm path is
         // byte-unchanged — it still receives the same u32 resident buffer.
-        if self.backend.wants_resident_bins() {
-            // Spike-014b: time the per-tree resident-bin upload (redundant: bins are
-            // immutable across the train, yet this re-allocs + re-uploads every tree).
+        // quick-260621-p9v (spike-014b lever): upload the resident bins ONCE per train,
+        // not every tree. The binned columns are immutable for the whole train and the
+        // backend's `resident_bins` cache persists across trees (`reset_resident_pool`
+        // never clears it), so the first tree's upload is reused byte-for-byte by every
+        // later tree. `with_features` re-arms the guard when the feature set changes.
+        if self.backend.wants_resident_bins() && !self.resident_bins_uploaded {
+            // Spike-014b: time the resident-bin upload (now fires on the first tree only).
             let _g = crate::phase_prof::guard(&crate::phase_prof::UPLOAD_NS);
             let upload_owned: Vec<Vec<u32>> =
                 features.iter().map(|f| f.bins.to_u32_vec()).collect();
             let upload_bins: Vec<&[u32]> = upload_owned.iter().map(Vec::as_slice).collect();
             self.backend.upload_resident_bins(self.client, &upload_bins);
+            self.resident_bins_uploaded = true;
         }
 
         // Spike 012: REUSE the pool across trees. Take the cached pool if its
@@ -3309,6 +3325,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// Attach the spine's per-feature columns (consumed/cloned in `train`).
     pub fn with_features(mut self, features: Vec<FeatureColumn>) -> Self {
         self.features = features;
+        // quick-260621-p9v: a new feature set makes the device-resident bin cache stale,
+        // so force the next train to re-upload (the once-per-train guard re-arms).
+        self.resident_bins_uploaded = false;
         self
     }
 
