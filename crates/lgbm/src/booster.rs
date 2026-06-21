@@ -963,7 +963,12 @@ fn train_inner_full(
     // The identity path builds its feature columns from the integer-binnable
     // corpus, then delegates to the shared column-based driver. The raw→bin→train
     // path (train_raw) supplies pre-binned columns to `train_inner_columns` directly.
-    let features = build_feature_columns(corpus)?;
+    // Spike-014b: time the once-per-train binning into the whole-train budget (the
+    // fixed-setup bucket; bench-repeated, amortizes in bin-once-train-many usage).
+    let features = lgbm_treelearner::phase_prof::time(
+        &lgbm_treelearner::phase_prof::BINNING_NS,
+        || build_feature_columns(corpus),
+    )?;
     let num_features = features.len();
     let feature_infos = feature_infos_from_rows(&corpus.features, num_features);
     train_inner_columns_full(

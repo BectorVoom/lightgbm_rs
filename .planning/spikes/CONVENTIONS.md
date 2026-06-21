@@ -58,6 +58,30 @@ back to an **isolated in-process microbench** of the one function/structure:
 `spike010_pool_alloc_ceiling` and `spike011_microbench` are the reference harnesses
 (in-crate, `#[ignore]`d; sources copied to each spike dir).
 
+## GPU whole-train attribution harness (spike 014)
+
+For "where does GPU train wall-clock actually go at scale?", the growth-loop
+`phase_prof` split (before/hist+split/partition) is **insufficient** — at ≥100 features
+the resident fusion folds the histogram kernel into "scan" (`build=0` is an artifact),
+and the three phases cover <½ of train wall-clock.
+
+1. **Use the `LGBM_PHASE_PROF=1` whole-train BUDGET** (spike-014b): counters
+   `BINNING/GRAD/LEARNER/SCORE` + `UPLOAD` drill-down in `phase_prof.rs`, wrapped at the
+   boosting/binning seam (`gbdt.rs`, `booster.rs`) NOT inside the growth loop. `LEARNER ⊇
+   growth-phases`, so `in_learner_other = LEARNER − phases` exposes per-tree GPU device
+   work (upload/resident/sync) the growth guards never saw.
+2. **Bench at the wide shape via `LGBM_BENCH_SWEEP=wide`** (`bench_gpu_vs_cpu.rs`):
+   feat=500 × rows {250k,500k,1M}, env-overridable `LGBM_BENCH_ROWS/FEAT/ITERS`. Lighter
+   warmup/reps (1/3) — the per-bucket RATIO is the deliverable, not a tight median.
+3. **Decompose fixed vs per-iteration with an iters A/B** (iters=1 vs 8): per-iter =
+   (t8−t1)/7; fixed setup (binning) = t1 − per-iter. Catches bench-repeated setup costs
+   that amortize in real bin-once-train-many usage.
+4. **A/B the CPU backend at the same shape** to prove a cost is GPU-specific
+   (`in_learner_other` was 16× higher on GPU ⇒ device transfer, not host orchestration).
+5. **Instrumentation must be behavior-neutral**: `phase_prof::time`/`guard` are
+   passthrough when the env gate is off; verify the bit-exact gate stays green
+   (`lgbm-treelearner --lib` + `lgbm-boosting --lib` + `oracle-harness`).
+
 ## Tools & Libraries
 
 - `cubecl` 0.10 LDS API: `SharedMemory::<Atomic<f32>>::new(COMPTIME_SIZE)`, `sync_cube()`,

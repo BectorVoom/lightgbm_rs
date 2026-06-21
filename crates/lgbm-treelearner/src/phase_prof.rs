@@ -16,6 +16,25 @@ pub static PARTITION_NS: AtomicU64 = AtomicU64::new(0);
 // subtract/compact glue), used to localize the hist-vs-split gap.
 pub static BUILD_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_NS: AtomicU64 = AtomicU64::new(0);
+// Spike-014b WHOLE-TRAIN BUDGET counters — the growth-loop phases above cover only
+// ~31–45% of GPU train wall-clock (spike-014a); these attribute the uninstrumented
+// majority. Wrapped at the boosting/binning seam, NOT nested inside the growth loop:
+//   BINNING  = once-per-train `build_feature_columns` (fixed setup; bench-repeated).
+//   GRAD     = per-iter objective `get_gradients` (grad/hess compute).
+//   LEARNER  = per-iter `learner.train_*` call — SUPERSET of BEFORE+HISTSPLIT+PARTITION;
+//              (LEARNER − those) = in-learner orchestration + per-tree GPU grad/hess
+//              upload + resident-pool/partition setup OUTSIDE the phase guards.
+//   SCORE    = per-iter `score_updater.update` (UpdateScore scatter).
+pub static BINNING_NS: AtomicU64 = AtomicU64::new(0);
+pub static GRAD_NS: AtomicU64 = AtomicU64::new(0);
+pub static LEARNER_NS: AtomicU64 = AtomicU64::new(0);
+pub static SCORE_NS: AtomicU64 = AtomicU64::new(0);
+// Spike-014b drill-down: the per-`train_inner` (= per-TREE) resident-bin device upload
+// (`wants_resident_bins` block, learner.rs) — two `[num_features × num_data]` u32 host
+// re-allocations + a host→device `create_from_slice`, redundantly repeated every tree
+// even though the binned columns are IMMUTABLE for the whole train. A subset of
+// `in_learner_other`; GPU-only (CpuBackend `wants_resident_bins()==false`).
+pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
 /// RAII timer: accumulates its lifetime into `c`. Inert when the env gate is off.
 pub struct Guard {
@@ -82,6 +101,28 @@ pub fn dump(label: &str) {
             build as f64 / 1e4 / tot,
             scan as f64 / 1e4 / tot,
             p as f64 / 1e4 / tot
+        );
+    }
+    // Spike-014b WHOLE-TRAIN BUDGET. `learner` is the per-iter tree-train call and is a
+    // SUPERSET of before+hist+split+partition; `in_learner_other = learner − that` is the
+    // previously-uninstrumented in-learner cost (per-tree GPU grad/hess upload, resident-
+    // pool / partition setup, host orchestration outside the growth-phase guards).
+    let binning = BINNING_NS.swap(0, Ordering::Relaxed);
+    let grad = GRAD_NS.swap(0, Ordering::Relaxed);
+    let learner = LEARNER_NS.swap(0, Ordering::Relaxed);
+    let score = SCORE_NS.swap(0, Ordering::Relaxed);
+    if binning + grad + learner + score > 0 {
+        let in_learner_other = learner.saturating_sub(b + h + p);
+        let upload = UPLOAD_NS.swap(0, Ordering::Relaxed);
+        eprintln!(
+            "[phase_prof:{label}] BUDGET: binning={:.3}ms grad={:.3}ms learner={:.3}ms (phases={:.3} in_learner_other={:.3} [of which resident_bin_upload={:.3}]) score={:.3}ms",
+            binning as f64 / 1e6,
+            grad as f64 / 1e6,
+            learner as f64 / 1e6,
+            (b + h + p) as f64 / 1e6,
+            in_learner_other as f64 / 1e6,
+            upload as f64 / 1e6,
+            score as f64 / 1e6,
         );
     }
 }

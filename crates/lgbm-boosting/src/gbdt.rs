@@ -669,12 +669,15 @@ impl<'a> Gbdt<'a> {
         // strided `rec[k]=score[num_data*k+i]` across classes (Pattern 4 — a
         // row-major layout would silently diverge), and multiclassova dispatches to
         // each per-class binary at offset `num_data*i`.
-        self.objective.get_gradients(
-            self.score_updater.scores(),
-            labels,
-            &mut gradients,
-            &mut hessians,
-        )?;
+        // Spike-014b: time per-iter grad/hess compute into the whole-train budget.
+        lgbm_treelearner::phase_prof::time(&lgbm_treelearner::phase_prof::GRAD_NS, || {
+            self.objective.get_gradients(
+                self.score_updater.scores(),
+                labels,
+                &mut gradients,
+                &mut hessians,
+            )
+        })?;
 
         // ---- (3) sampling (BST-03 bagging / BST-04 GOSS): draw the bag over the RNG ----
         // C++ `sample_strategy_->Bagging(iter_, …)` BEFORE the per-class tree loop.
@@ -913,8 +916,13 @@ impl<'a> Gbdt<'a> {
 
             // learner.train() builds + returns the partition for the bit-exact
             // training-path score scatter (C++ data_partition_).
-            let (mut tree, partition) =
-                learner.train_returning_partition(grad, hess, is_first_tree)?;
+            // Spike-014b: time the per-iter tree-train call (SUPERSET of the growth-loop
+            // phases) into the budget — (learner − phases) is the in-learner GPU
+            // upload / resident-pool / partition setup the phase guards never saw.
+            let (mut tree, partition) = lgbm_treelearner::phase_prof::time(
+                &lgbm_treelearner::phase_prof::LEARNER_NS,
+                || learner.train_returning_partition(grad, hess, is_first_tree),
+            )?;
 
             if tree.num_leaves > 1 {
                 // A real split this class → C++ `should_continue = true`
@@ -973,8 +981,14 @@ impl<'a> Gbdt<'a> {
                 // Shrinkage BEFORE UpdateScore.
                 tree.shrinkage(shrink_rate);
                 // UpdateScore: bit-exact training-path per-leaf scatter into score_.
-                self.score_updater
-                    .add_tree_train_path(learner, &tree, &partition, cur_tree_id);
+                // Spike-014b: time into the whole-train budget.
+                lgbm_treelearner::phase_prof::time(
+                    &lgbm_treelearner::phase_prof::SCORE_NS,
+                    || {
+                        self.score_updater
+                            .add_tree_train_path(learner, &tree, &partition, cur_tree_id)
+                    },
+                );
                 // AddBias AFTER UpdateScore — rewrites STORED tree values only
                 // (model text), NEVER score_ (Pitfall 5: no double-add).
                 let init = init_scores[cur_tree_id as usize];

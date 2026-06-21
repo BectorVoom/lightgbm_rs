@@ -824,6 +824,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // no-op upload was a measured small-row regression). The Rocm path is
         // byte-unchanged — it still receives the same u32 resident buffer.
         if self.backend.wants_resident_bins() {
+            // Spike-014b: time the per-tree resident-bin upload (redundant: bins are
+            // immutable across the train, yet this re-allocs + re-uploads every tree).
+            let _g = crate::phase_prof::guard(&crate::phase_prof::UPLOAD_NS);
             let upload_owned: Vec<Vec<u32>> =
                 features.iter().map(|f| f.bins.to_u32_vec()).collect();
             let upload_bins: Vec<&[u32]> = upload_owned.iter().map(Vec::as_slice).collect();
