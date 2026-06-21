@@ -716,7 +716,10 @@ impl<'a> Gbdt<'a> {
         // `label[i] - score_ptr[i]`). RenewTreeOutput runs BEFORE UpdateScore, so
         // it must see the pre-update score; snapshot it once (it is unchanged across
         // the K=1 single-output loop here).
-        let train_score_pre = self.score_updater.scores().to_vec();
+        let train_score_pre = lgbm_treelearner::phase_prof::time(
+            &lgbm_treelearner::phase_prof::SNAPSHOT_NS,
+            || self.score_updater.scores().to_vec(),
+        );
 
         // The per-tree shrinkage for THIS iteration's new tree. For the GBDT spine
         // this is `learning_rate`; for DART it is the DART-modified `shrinkage_rate_`
@@ -1041,7 +1044,10 @@ impl<'a> Gbdt<'a> {
                 // No tree was added → score_ is unchanged from before this round; the
                 // driver must NOT count this as an emitted iteration (`emitted=false`):
                 // no duplicate `iter_scores` / `iter_grad_hess` push, no advance.
-                score: self.score_updater.scores().to_vec(),
+                score: lgbm_treelearner::phase_prof::time(
+                &lgbm_treelearner::phase_prof::SNAPSHOT_NS,
+                || self.score_updater.scores().to_vec(),
+            ),
                 emitted: false,
             });
         }
@@ -1063,7 +1069,10 @@ impl<'a> Gbdt<'a> {
         Ok(IterSnapshot {
             gradients,
             hessians,
-            score: self.score_updater.scores().to_vec(),
+            score: lgbm_treelearner::phase_prof::time(
+                &lgbm_treelearner::phase_prof::SNAPSHOT_NS,
+                || self.score_updater.scores().to_vec(),
+            ),
             emitted: true,
         })
     }
@@ -1300,7 +1309,10 @@ impl<'a> Gbdt<'a> {
         Ok(IterSnapshot {
             gradients,
             hessians,
-            score: self.score_updater.scores().to_vec(),
+            score: lgbm_treelearner::phase_prof::time(
+                &lgbm_treelearner::phase_prof::SNAPSHOT_NS,
+                || self.score_updater.scores().to_vec(),
+            ),
             // RF averages a tree every round (no no-split pop) → always emitted.
             emitted: true,
         })

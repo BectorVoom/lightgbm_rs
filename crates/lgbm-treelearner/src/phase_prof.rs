@@ -29,6 +29,17 @@ pub static BINNING_NS: AtomicU64 = AtomicU64::new(0);
 pub static GRAD_NS: AtomicU64 = AtomicU64::new(0);
 pub static LEARNER_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCORE_NS: AtomicU64 = AtomicU64::new(0);
+// quick-260621-rdu: boosting-loop attribution. TRAIN_ONE_ITER wraps the whole
+// `gbdt.train_one_iter` call (⊇ GRAD + LEARNER + SCORE + snapshot/boost/alloc);
+// `loop_other = train − binning − Σtrain_one_iter` isolates the booster-loop tail
+// (metric eval / valid / accumulation). SNAPSHOT = the per-iter `scores().to_vec()`
+// clones; METRIC = the booster-loop `m.eval` over all rows.
+pub static TRAIN_ONE_ITER_NS: AtomicU64 = AtomicU64::new(0);
+pub static SNAPSHOT_NS: AtomicU64 = AtomicU64::new(0);
+pub static METRIC_NS: AtomicU64 = AtomicU64::new(0);
+// quick-260621-rdu: per-train model-metadata setup (`feature_infos_from_rows` min/max
+// over the raw matrix) — outside binning AND the boosting loop.
+pub static SETUP_NS: AtomicU64 = AtomicU64::new(0);
 // Spike-014b drill-down: the per-`train_inner` (= per-TREE) resident-bin device upload
 // (`wants_resident_bins` block, learner.rs) — two `[num_features × num_data]` u32 host
 // re-allocations + a host→device `create_from_slice`, redundantly repeated every tree
@@ -111,6 +122,26 @@ pub fn dump(label: &str) {
     let grad = GRAD_NS.swap(0, Ordering::Relaxed);
     let learner = LEARNER_NS.swap(0, Ordering::Relaxed);
     let score = SCORE_NS.swap(0, Ordering::Relaxed);
+    let toi = TRAIN_ONE_ITER_NS.swap(0, Ordering::Relaxed);
+    let snapshot = SNAPSHOT_NS.swap(0, Ordering::Relaxed);
+    let metric = METRIC_NS.swap(0, Ordering::Relaxed);
+    if binning + grad + learner + score + toi > 0 {
+        // quick-260621-rdu: in-train_one_iter overhead NOT in grad/learner/score/snapshot
+        // (boost_from_average, bagging, grad/hess Vec alloc, snapshot bookkeeping).
+        let in_iter_other = toi.saturating_sub(grad + learner + score + snapshot);
+        let setup = SETUP_NS.swap(0, Ordering::Relaxed);
+        eprintln!(
+            "[phase_prof:{label}] LOOP: train_one_iter={:.3}ms (grad={:.3} learner={:.3} score={:.3} snapshot={:.3} in_iter_other={:.3}) metric={:.3}ms feature_infos_setup={:.3}ms",
+            toi as f64 / 1e6,
+            grad as f64 / 1e6,
+            learner as f64 / 1e6,
+            score as f64 / 1e6,
+            snapshot as f64 / 1e6,
+            in_iter_other as f64 / 1e6,
+            metric as f64 / 1e6,
+            setup as f64 / 1e6,
+        );
+    }
     if binning + grad + learner + score > 0 {
         let in_learner_other = learner.saturating_sub(b + h + p);
         let upload = UPLOAD_NS.swap(0, Ordering::Relaxed);

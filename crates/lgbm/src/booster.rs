@@ -970,7 +970,10 @@ fn train_inner_full(
         || build_feature_columns(corpus),
     )?;
     let num_features = features.len();
-    let feature_infos = feature_infos_from_rows(&corpus.features, num_features);
+    let feature_infos = lgbm_treelearner::phase_prof::time(
+        &lgbm_treelearner::phase_prof::SETUP_NS,
+        || feature_infos_from_rows(&corpus.features, num_features),
+    );
     train_inner_columns_full(
         config,
         corpus.features.len() as i32,
@@ -1270,9 +1273,13 @@ fn train_inner_columns_full(
     let total_iters = config.num_iterations.max(0);
     let mut ran_iters = 0i32;
     for it in 0..total_iters {
-        let snap: IterSnapshot = gbdt
-            .train_one_iter(&mut learner, &labels, num_features)
-            .map_err(LgbmError::Boosting)?;
+        // quick-260621-rdu: time the whole train_one_iter (⊇ grad+learner+score+snapshot)
+        // so the booster-loop tail (metric/valid/accumulation) is isolated as loop_other.
+        let snap: IterSnapshot = lgbm_treelearner::phase_prof::time(
+            &lgbm_treelearner::phase_prof::TRAIN_ONE_ITER_NS,
+            || gbdt.train_one_iter(&mut learner, &labels, num_features),
+        )
+        .map_err(LgbmError::Boosting)?;
 
         // DEF-07-13-01: a NON-FIRST no-split bagged round is POPPED by
         // `train_one_iter` (C++ gbdt.cpp:440-447): no tree emitted, `self.iter` not
@@ -1331,7 +1338,11 @@ fn train_inner_columns_full(
         // Training metrics: history is metric_freq-gated (MET-02 unchanged).
         if do_eval && provide_train {
             for (mi, m) in metrics.iter().enumerate() {
-                let v = m.eval(cur_score, corpus_labels)?;
+                // quick-260621-rdu: time the per-iter training-metric eval over all rows.
+                let v = lgbm_treelearner::phase_prof::time(
+                    &lgbm_treelearner::phase_prof::METRIC_NS,
+                    || m.eval(cur_score, corpus_labels),
+                )?;
                 // A custom-metric (feval) key is resolved lazily from the closure
                 // (the placeholder "custom" set at history-setup is overwritten on
                 // the first eval with the user-supplied name) so the recorded
@@ -1478,16 +1489,22 @@ fn feature_names(num_features: usize) -> String {
 /// print without a decimal point (matching the capture's `[0:5] [0:2]`); the
 /// raw→bin→train path's continuous values print with their real value.
 fn feature_infos_from_rows(feature_rows: &[Vec<f64>], num_features: usize) -> String {
+    // quick-260621-rdu: ONE cache-friendly pass over the row-major matrix (each `row` is
+    // contiguous) accumulating per-feature min/max — instead of `num_features` strided
+    // COLUMN passes (`row[j]` jumped `num_features*8` bytes per read, ~24% of train
+    // wall-clock at 1M×500). Same `f64::min`/`f64::max` calls, only loop order changed;
+    // min/max are commutative+associative ⇒ BYTE-IDENTICAL per-feature bounds (the
+    // `feature_infos` model-text line is parity-checked).
+    let mut min = vec![f64::INFINITY; num_features];
+    let mut max = vec![f64::NEG_INFINITY; num_features];
+    for row in feature_rows {
+        for j in 0..num_features {
+            min[j] = min[j].min(row[j]);
+            max[j] = max[j].max(row[j]);
+        }
+    }
     (0..num_features)
-        .map(|j| {
-            let mut min = f64::INFINITY;
-            let mut max = f64::NEG_INFINITY;
-            for row in feature_rows {
-                min = min.min(row[j]);
-                max = max.max(row[j]);
-            }
-            format!("[{}:{}]", fmt_bound(min), fmt_bound(max))
-        })
+        .map(|j| format!("[{}:{}]", fmt_bound(min[j]), fmt_bound(max[j])))
         .collect::<Vec<_>>()
         .join(" ")
 }
