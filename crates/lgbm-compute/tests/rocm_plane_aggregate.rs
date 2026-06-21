@@ -12,8 +12,7 @@
 #![cfg(feature = "rocm")]
 
 use lgbm_compute::kernels::histogram::{
-    construct_histograms_cpu, construct_histograms_parallel_f32_on,
-    construct_histograms_parallel_f32_plane_on,
+    construct_histograms_cpu, construct_histograms_parallel_f32_plane_on,
 };
 use lgbm_compute::runtime::{cpu_client, probe_capabilities, rocm_client};
 
@@ -122,7 +121,11 @@ fn plane_large_leaf_drift_not_worse_than_baseline() {
     let hess = vec![1.0f32; n];
 
     let cpu = construct_histograms_cpu(&cc, &binned, &grad, &hess, num_bin).unwrap();
-    let base = construct_histograms_parallel_f32_on(&gc, &binned, &grad, &hess, num_bin).unwrap();
+    // Baseline = the plane launcher's `use_plane=false` arm (the byte-faithful twin of
+    // the deleted per-row global-atomic kernel).
+    let base =
+        construct_histograms_parallel_f32_plane_on(&gc, &binned, &grad, &hess, num_bin, false)
+            .unwrap();
     let plane =
         construct_histograms_parallel_f32_plane_on(&gc, &binned, &grad, &hess, num_bin, true).unwrap();
 
@@ -146,8 +149,8 @@ fn plane_large_leaf_drift_not_worse_than_baseline() {
     );
 }
 
-/// On EXACT-integer data the plane variant must EXACTLY equal the shipped baseline
-/// non-plane path (`construct_histograms_parallel_f32_on`) — both produce the same
+/// On EXACT-integer data the plane variant must EXACTLY equal the baseline non-plane
+/// path (the plane launcher's `use_plane=false` arm) — both produce the same
 /// per-bin integer sums, so this confirms the warp-aggregated path is a drop-in
 /// correctness equivalent of the per-row scatter (the A/B bench's two arms compute
 /// the same thing on integer inputs). NOT a 1e-6 GPU-vs-GPU float comparison: the
@@ -162,31 +165,14 @@ fn plane_equals_baseline_on_integer_data() {
     let grad: Vec<f32> = binned.iter().map(|&b| (b % 7) as f32 - 3.0).collect();
     let hess = vec![1.0f32; n];
 
-    let baseline = construct_histograms_parallel_f32_on(&gc, &binned, &grad, &hess, num_bin).unwrap();
+    // Baseline = the plane launcher's `use_plane=false` arm (byte-faithful twin of the
+    // deleted per-row global-atomic kernel).
+    let baseline =
+        construct_histograms_parallel_f32_plane_on(&gc, &binned, &grad, &hess, num_bin, false)
+            .unwrap();
     let plane =
         construct_histograms_parallel_f32_plane_on(&gc, &binned, &grad, &hess, num_bin, true).unwrap();
     for (i, (a, b)) in baseline.iter().zip(&plane).enumerate() {
         assert_eq!(*a, *b, "cell {i}: plane {b} != baseline {a} on integer data");
-    }
-}
-
-/// The `use_plane=false` arm of the plane launcher must EXACTLY equal the shipped
-/// `construct_histograms_parallel_f32_on` on integer data — proving the launcher's
-/// baseline arm is a byte-faithful twin of the production kernel (the A/B baseline
-/// arm is trustworthy as the reference point).
-#[test]
-fn plane_launcher_false_arm_matches_shipped_baseline() {
-    let gc = rocm_client();
-    let n = 20_000usize;
-    let num_bin = 64u32;
-    let binned: Vec<u32> = (0..n).map(|i| (i as u32) % num_bin).collect();
-    let grad: Vec<f32> = binned.iter().map(|&b| (b % 9) as f32 - 4.0).collect();
-    let hess = vec![1.0f32; n];
-
-    let shipped = construct_histograms_parallel_f32_on(&gc, &binned, &grad, &hess, num_bin).unwrap();
-    let false_arm =
-        construct_histograms_parallel_f32_plane_on(&gc, &binned, &grad, &hess, num_bin, false).unwrap();
-    for (i, (a, b)) in shipped.iter().zip(&false_arm).enumerate() {
-        assert_eq!(*a, *b, "cell {i}: use_plane=false arm {b} != shipped baseline {a}");
     }
 }
