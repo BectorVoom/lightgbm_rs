@@ -1935,24 +1935,19 @@ impl Backend for RocmBackend {
         ordered_hessians: &[f32],
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError> {
-        // GPU-fast path (kt8): parallel f32-atomic accumulation (one unit per row,
-        // all lanes busy) instead of the single-unit f64 fold. This moves the GPU
-        // path to the ~1e-6 ROCm gate (f32 atomics, nondeterministic add order) —
-        // by design the GPU's contract; the cpu anchor stays bit-exact.
+        // GPU parity seam: drives the LDS-privatized sub-histogram kernel
+        // (`construct_histograms_lds_f32_on`) — each cube accumulates into its own
+        // shared-memory (LDS) sub-histogram via intra-workgroup atomics, then merges
+        // into the global output with one global atomic per cell. Correct vs the naive
+        // scatter on integer data, within the ~1e-6 ROCm gate vs the cpu f64 anchor,
+        // and faster under contention (the old global-atomic kernel it replaced
+        // serialized on global-memory bin collisions).
         //
-        // NOTE (f8u, eo5 Finding #2): the LDS-privatized sub-histogram kernel
-        // (`construct_histograms_lds_f32_on`) is proven correct (exact vs naive on
-        // integer data, <1e-5 rel vs the f64 anchor) and ~4–4.6× faster under high
-        // contention on gfx1100, but is NOT wired here. Two reasons: (1) it would
-        // give this path yet another f32 accumulation order, and (2) the would-be
-        // gating test `learner_parity_resident_equals_host_tree_on_hip` is itself
-        // PRE-EXISTING FLAKY (~4/6 runs fail on the unchanged naive path — the naive
-        // atomic's nondeterministic f32 order puts leaf 11's output on the 1e-6
-        // knife-edge vs the resident chain; DEF-f8u-01), so non-regression cannot be
-        // cleanly verified. Wiring it live wants the resident/batched BUILD path
-        // LDS-ified too (one shared accumulation order) — the larger Finding #2
-        // follow-up. Until then the kernel ships as an available, tested primitive.
-        kernels::histogram::construct_histograms_parallel_f32_on(
+        // Swapping this seam from the old global-atomic kernel to the LDS path CHANGES
+        // the seam's f32 accumulation ORDER (LDS-then-merge vs straight global
+        // scatter); that is the GPU's ~1e-6 best-effort contract, not a bit-exact one.
+        // The CpuBackend f64 fold is the bit-exact hard merge gate and is unaffected.
+        kernels::histogram::construct_histograms_lds_f32_on(
             client,
             binned,
             ordered_gradients,

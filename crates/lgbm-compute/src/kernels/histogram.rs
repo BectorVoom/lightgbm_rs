@@ -385,91 +385,8 @@ pub fn construct_histograms_f32_on<R: cubecl::Runtime>(
 /// the result diverges from the cpu f64 ordered anchor at the ~1e-6 level (the
 /// ROCm gate the contract was designed for, D-03a) — NOT bit-exact. Feature-gated
 /// to `rocm` so the CPU-only build never emits atomic codegen.
-#[cfg(feature = "rocm")]
-#[cube(launch_unchecked)]
-pub fn construct_hist_kernel_atomic_f32(
-    binned: &Array<u32>,
-    grad: &Array<f32>,
-    hess: &Array<f32>,
-    out: &mut Array<Atomic<f32>>,
-) {
-    let idx = ABSOLUTE_POS;
-    // Bounds check: the launch rounds the unit count up to a multiple of the cube
-    // dim, so the tail units (idx >= len) must stay idle (manual §4 Safe Indexing).
-    if idx < binned.len() {
-        let ti = binned[idx] as usize * 2; // grad cell at bin<<1, hess at +1
-        out[ti].fetch_add(grad[idx]);
-        out[ti + 1].fetch_add(hess[idx]);
-    }
-}
-
-/// Host launcher for the parallel f32-atomic histogram (the GPU-fast path).
-///
-/// Same V5 boundary validation as [`construct_histograms_cpu`]; allocates a zeroed
-/// f32 histogram, launches one unit per row over `ceil(n / 256)` cubes of 256
-/// units, and widens the f32 result to f64 (the learner's pool is f64; the ~1e-6
-/// gate absorbs the f32→f64 gap). Generic over `R: Runtime` (runs on cubecl-hip).
-///
-/// # Errors
-/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
-#[cfg(feature = "rocm")]
-pub fn construct_histograms_parallel_f32_on<R: cubecl::Runtime>(
-    client: &cubecl::prelude::ComputeClient<R>,
-    binned: &[u32],
-    grad: &[f32],
-    hess: &[f32],
-    num_bin: u32,
-) -> Result<Vec<f64>, ComputeError> {
-    let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
-    let n = binned.len();
-    if n == 0 {
-        return Ok(vec![0.0f64; out_len]);
-    }
-    let h_bin = client.create_from_slice(u32::as_bytes(binned));
-    let h_grad = client.create_from_slice(f32::as_bytes(grad));
-    let h_hess = client.create_from_slice(f32::as_bytes(hess));
-    let zeros = vec![0.0f32; out_len];
-    let h_out = client.create_from_slice(f32::as_bytes(&zeros));
-
-    // One unit per row; cube dim 256 (8 × the gfx1100 wave32), cube count covers n.
-    let cube_dim = 256u32;
-    let cube_count = (n as u32).div_ceil(cube_dim);
-
-    // SAFETY: `h_bin`/`h_grad`/`h_hess` sized `n`, `h_out` sized `out_len` f32 cells,
-    // each outlives the launch. The kernel bounds-checks `idx < n`, and input
-    // validation guarantees every `binned[i] < num_bin` so `out[bin*2 + 1]` stays in
-    // the `out_len` allocation. All cubecl unsafe is confined here (CMP-01).
-    //
-    // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
-    // bounds-check codegen in the `2*n` scatter. Every device access is host-proven in
-    // range BEFORE upload:
-    //   - `binned[idx]` / `grad[idx]` / `hess[idx]` — `idx = ABSOLUTE_POS` is guarded by
-    //     the kernel's own `idx < binned.len()` (the launch rounds the unit count up, so
-    //     tail units stay idle); `h_bin`/`h_grad`/`h_hess` are all sized `n`;
-    //   - `out[bin*2]` / `out[bin*2 + 1]` — `validate_histogram_inputs` proves every
-    //     `binned[idx] < num_bin`, so `bin*2 + 1 < 2*num_bin = out_len` (`h_out` sized
-    //     `out_len`).
-    // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
-    // launch does NOT change numerics — only bounds-check codegen is removed; the
-    // f32-atomic scatter order is identical (the same nondeterministic ~1e-6 path).
-    unsafe {
-        construct_hist_kernel_atomic_f32::launch_unchecked(
-            client,
-            CubeCount::Static(cube_count, 1, 1),
-            CubeDim::new_1d(cube_dim),
-            ArrayArg::from_raw_parts(h_bin, n),
-            ArrayArg::from_raw_parts(h_grad, n),
-            ArrayArg::from_raw_parts(h_hess, n),
-            ArrayArg::from_raw_parts(h_out.clone(), out_len),
-        );
-    }
-
-    let bytes = client.read_one_unchecked(h_out);
-    Ok(f32::from_bytes(&bytes).iter().map(|&x| f64::from(x)).collect())
-}
-
 /// WARP-AGGREGATED f32-atomic histogram (quick-260619-p93) — a comptime-gated
-/// `_plane` VARIANT of [`construct_hist_kernel_atomic_f32`], NOT a replacement.
+/// `_plane` variant doing per-row f32-atomic scatter, NOT a replacement.
 ///
 /// The baseline kernel issues `2*n` GLOBAL atomic `fetch_add`s (one grad + one
 /// hess per row), so rows of a wave that share a destination `bin` serialize on
@@ -621,9 +538,8 @@ pub fn construct_hist_kernel_atomic_f32_plane(
 
 /// Host launcher for the warp-aggregated f32-atomic histogram (quick-260619-p93).
 ///
-/// A near-verbatim copy of [`construct_histograms_parallel_f32_on`] (same V5
-/// boundary checks, same zeroed-f32 alloc, same `ceil(n/256)` cube count of 256
-/// units, same f32→f64 widen on read-back) that launches
+/// Uses the same V5 boundary checks, zeroed-f32 alloc, `ceil(n/256)` cube count of
+/// 256 units, and f32→f64 widen on read-back as the LDS launcher, and launches
 /// [`construct_hist_kernel_atomic_f32_plane`] with the `use_plane` comptime flag.
 /// `use_plane == false` reproduces the shipped baseline arm BYTE-FAITHFULLY (so the
 /// A/B bench can use ONE launcher for both arms, isolating exactly the warp-
@@ -662,8 +578,8 @@ pub fn construct_histograms_parallel_f32_plane_on<R: cubecl::Runtime>(
     let cube_dim = 256u32;
     let cube_count = (n as u32).div_ceil(cube_dim);
 
-    // SAFETY: identical handle/length correspondence to
-    // `construct_histograms_parallel_f32_on` — `h_bin`/`h_grad`/`h_hess` sized `n`,
+    // SAFETY: identical handle/length correspondence to the LDS launcher —
+    // `h_bin`/`h_grad`/`h_hess` sized `n`,
     // `h_out` sized `out_len` f32 cells, each outliving the launch. The kernel
     // bounds-checks `idx < n` (the `active` predicate), and input validation
     // guarantees every `binned[i] < num_bin` so `out[bin*2 + 1]` (baseline arm) and
@@ -745,7 +661,7 @@ fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
 /// PARALLEL f32 histogram with LDS-PRIVATIZED sub-histograms — the contention-
 /// reducing GPU path (260609-f8u, eo5 Finding #2).
 ///
-/// The naive [`construct_hist_kernel_atomic_f32`] issues every row's grad/hess add
+/// A naive per-row global-atomic scatter issues every row's grad/hess add
 /// straight into the GLOBAL histogram, so rows sharing a bin (the common case)
 /// serialize on global-memory atomic contention. This kernel instead gives each
 /// CUBE its own sub-histogram in shared memory (LDS): all units in the cube
@@ -768,7 +684,7 @@ pub fn construct_hist_kernel_lds_f32(
 ) {
     // Per-cube private sub-histogram in shared memory (comptime-sized to the max).
     let sub = SharedMemory::<Atomic<f32>>::new(HIST_LDS_MAX);
-    // Positions are usize for indexing (mirrors construct_hist_kernel_atomic_f32's
+    // Positions are usize for indexing (the per-row global-atomic scatter's
     // `binned[idx] as usize`); the builtins are u32 so cast once.
     let cd = CUBE_DIM as usize;
     let lds = lds_len as usize;
@@ -826,7 +742,7 @@ pub fn construct_histograms_lds_f32_on<R: cubecl::Runtime>(
         return Err(ComputeError::Runtime {
             detail: format!(
                 "construct_histograms_lds: num_bin {num_bin} > 256 exceeds the LDS sub-hist cap \
-                 (use construct_histograms_parallel_f32_on instead)"
+                 (num_bin > 256 is unsupported by the LDS sub-hist path)"
             ),
         });
     }
