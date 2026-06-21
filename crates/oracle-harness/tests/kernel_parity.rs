@@ -1541,15 +1541,15 @@ mod hip {
         //     then build through the RocmBackend override (on-device gather). Both
         //     use the same RocmBackend instance so the resident cache is populated.
         let backend = RocmBackend::default();
-        backend.upload_resident_bins(&hip, &feature_bins);
-        // `build_leaf_histograms_raw` takes typed `BinColumn`s (u8-bins work, spike-004);
-        // `upload_resident_bins` still takes the `&[&[u32]]` columns above.
+        // quick-260621-qix: `upload_resident_bins` now takes typed `BinColumn`s (uploads
+        // at native width); `build_leaf_histograms_raw` takes the same typed columns.
         let cols: Vec<BinColumn> = vec![
             BinColumn::new(f0.clone(), num_bins[0]),
             BinColumn::new(f1.clone(), num_bins[1]),
             BinColumn::new(f2.clone(), num_bins[2]),
         ];
         let col_refs: Vec<&BinColumn> = cols.iter().collect();
+        backend.upload_resident_bins(&hip, &col_refs);
         let resident = backend
             .build_leaf_histograms_raw(
                 &hip,
@@ -1760,6 +1760,7 @@ mod hip {
         let mut host = build_leaf_histograms_resident_f32_on(
             &hip,
             upload_resident_columns(&hip, &feature_bins),
+            lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
             feature_bins.len(),
             num_data,
             &slot_off,
@@ -1784,6 +1785,7 @@ mod hip {
         let gpu = build_fix_compact_resident_readback_f64_on(
             &hip,
             upload_resident_columns(&hip, &feature_bins),
+            lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
             feature_bins.len(),
             num_data,
             &slot_off,
@@ -2057,6 +2059,7 @@ mod hip {
         let (hist_handle, len, fused_splits) = build_fix_scan_resident_f64_on(
             &hip,
             upload_resident_columns(&hip, &feature_bins),
+            lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
             feature_bins.len(),
             num_data,
             &slot_off,

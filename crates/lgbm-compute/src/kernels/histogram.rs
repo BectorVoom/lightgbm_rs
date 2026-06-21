@@ -972,8 +972,8 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
 /// anchor stays bit-exact). `#[cfg(feature="rocm")]`.
 #[cfg(feature = "rocm")]
 #[cube(launch_unchecked)]
-pub fn construct_leaf_hist_resident_kernel(
-    resident_bins: &Array<u32>,
+pub fn construct_leaf_hist_resident_kernel<B: Int>(
+    resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
     leaf_rows: &Array<u32>,
     ord_g: &Array<f32>,
     ord_h: &Array<f32>,
@@ -989,8 +989,9 @@ pub fn construct_leaf_hist_resident_kernel(
         let k = idx % r; // leaf-row position
         // Gather on device from the resident column: feature f, the leaf's k-th row.
         let row = leaf_rows[k] as usize;
-        let bin = resident_bins[f * num_data + row];
-        let cell = slot_off[f] as usize + bin as usize * 2;
+        // quick-260621-qix: native-width read widened to a u32 INDEX (value-faithful).
+        let bin = u32::cast_from(resident_bins[f * num_data + row]) as usize;
+        let cell = slot_off[f] as usize + bin * 2;
         out[cell].fetch_add(ord_g[k]);
         out[cell + 1].fetch_add(ord_h[k]);
     }
@@ -1013,6 +1014,8 @@ pub fn construct_leaf_hist_resident_kernel(
 pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
+    // quick-260621-qix: native element width of `resident_bins`.
+    width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
     slot_off: &[usize],
@@ -1034,6 +1037,7 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
     resident_raw_build_into(
         client,
         resident_bins,
+        width,
         num_features,
         num_data,
         slot_off,
@@ -1072,8 +1076,8 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
 #[cfg(feature = "rocm")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-pub fn construct_leaf_hist_resident_lds_kernel(
-    resident_bins: &Array<u32>,
+pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
+    resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
     leaf_rows: &Array<u32>,
     ord_g: &Array<f32>,
     ord_h: &Array<f32>,
@@ -1105,7 +1109,9 @@ pub fn construct_leaf_hist_resident_lds_kernel(
     let stride = CUBE_COUNT_Y as usize * cd;
     let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
     while k < r {
-        let bin = resident_bins[col + leaf_rows[k] as usize] as usize;
+        // quick-260621-qix: bin is read at native width B, widened to a u32 INDEX —
+        // byte-faithful to the prior u32 read (value identical, only storage narrower).
+        let bin = u32::cast_from(resident_bins[col + leaf_rows[k] as usize]) as usize;
         let ti = bin * 2;
         sub[ti].fetch_add(ord_g[k]);
         sub[ti + 1].fetch_add(ord_h[k]);
@@ -1570,6 +1576,8 @@ fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
 fn resident_raw_build_into<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
+    // quick-260621-qix: element width of `resident_bins` (dispatches the kernel `<B: Int>`).
+    width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
     slot_off: &[usize],
@@ -1621,19 +1629,32 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // launch_unchecked contract requires, and the launch does NOT change numerics —
         // only bounds-check codegen is removed; scatter order / f32-atomic accumulation
         // is identical.
-        unsafe {
-            construct_leaf_hist_resident_lds_kernel::launch_unchecked(
-                client,
-                CubeCount::Static(num_features as u32, p, 1),
-                CubeDim::new_1d(256),
-                ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
-                ArrayArg::from_raw_parts(h_rows, rows),
-                ArrayArg::from_raw_parts(h_g, rows),
-                ArrayArg::from_raw_parts(h_h, rows),
-                ArrayArg::from_raw_parts(h_slot, num_features + 1),
-                num_data,
-                ArrayArg::from_raw_parts(h_out, slot_len),
-            );
+        // quick-260621-qix: dispatch the matching `<B: Int>` monomorphization on the
+        // resident buffer's native width. ArrayArg element COUNT is width-independent
+        // (num_features*num_data); the launch generic pins the element TYPE. Only one
+        // match arm executes ⇒ the by-value handle moves are exclusive (sound).
+        macro_rules! launch_lds {
+            ($w:ty) => {
+                unsafe {
+                    construct_leaf_hist_resident_lds_kernel::launch_unchecked::<$w, R>(
+                        client,
+                        CubeCount::Static(num_features as u32, p, 1),
+                        CubeDim::new_1d(256),
+                        ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
+                        ArrayArg::from_raw_parts(h_rows, rows),
+                        ArrayArg::from_raw_parts(h_g, rows),
+                        ArrayArg::from_raw_parts(h_h, rows),
+                        ArrayArg::from_raw_parts(h_slot, num_features + 1),
+                        num_data,
+                        ArrayArg::from_raw_parts(h_out, slot_len),
+                    );
+                }
+            };
+        }
+        match width {
+            crate::ResidentBinWidth::U8 => launch_lds!(u8),
+            crate::ResidentBinWidth::U16 => launch_lds!(u16),
+            crate::ResidentBinWidth::U32 => launch_lds!(u32),
         }
     } else {
         // Naive fallback (a feature exceeds the 256-bin LDS cap).
@@ -1662,20 +1683,30 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
         // launch does NOT change numerics — only bounds-check codegen is removed; the
         // f32-atomic scatter order is identical (~1e-6 path).
-        unsafe {
-            construct_leaf_hist_resident_kernel::launch_unchecked(
-                client,
-                CubeCount::Static(cube_count, 1, 1),
-                CubeDim::new_1d(cube_dim),
-                ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
-                ArrayArg::from_raw_parts(h_rows, rows),
-                ArrayArg::from_raw_parts(h_g, rows),
-                ArrayArg::from_raw_parts(h_h, rows),
-                ArrayArg::from_raw_parts(h_slot, num_features),
-                num_data,
-                total,
-                ArrayArg::from_raw_parts(h_out, slot_len),
-            );
+        // quick-260621-qix: native-width dispatch (see the LDS branch note above).
+        macro_rules! launch_naive {
+            ($w:ty) => {
+                unsafe {
+                    construct_leaf_hist_resident_kernel::launch_unchecked::<$w, R>(
+                        client,
+                        CubeCount::Static(cube_count, 1, 1),
+                        CubeDim::new_1d(cube_dim),
+                        ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
+                        ArrayArg::from_raw_parts(h_rows, rows),
+                        ArrayArg::from_raw_parts(h_g, rows),
+                        ArrayArg::from_raw_parts(h_h, rows),
+                        ArrayArg::from_raw_parts(h_slot, num_features),
+                        num_data,
+                        total,
+                        ArrayArg::from_raw_parts(h_out, slot_len),
+                    );
+                }
+            };
+        }
+        match width {
+            crate::ResidentBinWidth::U8 => launch_naive!(u8),
+            crate::ResidentBinWidth::U16 => launch_naive!(u16),
+            crate::ResidentBinWidth::U32 => launch_naive!(u32),
         }
     }
 }
@@ -1978,6 +2009,8 @@ pub fn upload_resident_columns<R: cubecl::Runtime>(
 pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
+    // quick-260621-qix: native element width of `resident_bins`.
+    width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
     slot_off: &[usize],
@@ -1998,6 +2031,7 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     resident_raw_build_into(
         client,
         resident_bins,
+        width,
         num_features,
         num_data,
         slot_off,
@@ -2109,6 +2143,8 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
 pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
+    // quick-260621-qix: native element width of `resident_bins`.
+    width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
     slot_off: &[usize],
@@ -2123,6 +2159,7 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
     let (handle, len) = build_fix_compact_resident_f64_on(
         client,
         resident_bins,
+        width,
         num_features,
         num_data,
         slot_off,
@@ -2182,9 +2219,10 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 #[cfg(feature = "rocm")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-pub fn build_fix_scan_fused_kernel(
+pub fn build_fix_scan_fused_kernel<B: Int>(
     // Device-resident binned columns (feature-major, `f*num_data + row`) — INPUT.
-    resident_bins: &Array<u32>,
+    // quick-260621-qix: native bin width (u8/u16/u32).
+    resident_bins: &Array<B>,
     // The leaf's row indices (subset of 0..num_data) — INPUT.
     leaf_rows: &Array<u32>,
     // The leaf's grad/hess gathered host-side in leaf_rows order — INPUT (f32).
@@ -2242,8 +2280,9 @@ pub fn build_fix_scan_fused_kernel(
     let rows = ord_g.len();
     for k in 0..rows {
         let row = leaf_rows[k] as usize;
-        let bin = resident_bins[fi * num_data_stride + row];
-        let cell = base + bin as usize * 2;
+        // quick-260621-qix: native-width read widened to a u32 INDEX (value-faithful).
+        let bin = u32::cast_from(resident_bins[fi * num_data_stride + row]) as usize;
+        let cell = base + bin * 2;
         hist[cell] += f64::cast_from(ord_g[k]);
         hist[cell + 1] += f64::cast_from(ord_h[k]);
     }
@@ -2360,6 +2399,8 @@ pub fn build_fix_scan_fused_kernel(
 pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
+    // quick-260621-qix: native element width of `resident_bins`.
+    width: crate::ResidentBinWidth,
     num_features: usize,
     num_data_stride: usize,
     // Per-feature slot offsets ride on `feats` (`f.slot_off`); this slice is accepted
@@ -2555,38 +2596,51 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     // over every leaf-row × bin iteration with nothing to hide behind, whereas the atomic
     // kernels are atomic-contention / memory-latency bound and mask it. So launch_unchecked
     // is strongly justified for this kernel on perf grounds, not merely safe.
-    unsafe {
-        build_fix_scan_fused_kernel::launch_unchecked(
-            client,
-            CubeCount::Static(n as u32, 1, 1),
-            CubeDim::new_1d(1),
-            ArrayArg::from_raw_parts(resident_bins, num_features * num_data_stride),
-            ArrayArg::from_raw_parts(h_rows, rows),
-            ArrayArg::from_raw_parts(h_g, rows),
-            ArrayArg::from_raw_parts(h_h, rows),
-            ArrayArg::from_raw_parts(h_hist.clone(), slot_len),
-            ArrayArg::from_raw_parts(h_out.clone(), out_len),
-            ArrayArg::from_raw_parts(h_slot, n),
-            ArrayArg::from_raw_parts(h_numbin, n),
-            ArrayArg::from_raw_parts(h_offset, n),
-            ArrayArg::from_raw_parts(h_mfb, n),
-            ArrayArg::from_raw_parts(h_defbin, n),
-            ArrayArg::from_raw_parts(h_skip, n),
-            ArrayArg::from_raw_parts(h_rev, n),
-            ArrayArg::from_raw_parts(h_fwd, n),
-            ArrayArg::from_raw_parts(h_scan, n),
-            num_data_stride,
-            sum_gradient_raw,
-            sum_hessian_raw,
-            if use_l1 { 1u32 } else { 0u32 },
-            cfg.min_data_in_leaf,
-            cfg.min_sum_hessian_in_leaf,
-            cfg.lambda_l1,
-            cfg.lambda_l2,
-            min_gain_shift,
-            sum_hessian_bumped,
-            num_data,
-        );
+    // quick-260621-qix: dispatch the fused kernel's `<B: Int>` monomorphization on the
+    // resident buffer's native width (only the `resident_bins` ArrayArg type changes;
+    // every other arg is width-independent). Exactly one match arm runs ⇒ the by-value
+    // handle moves are exclusive.
+    macro_rules! launch_fused {
+        ($w:ty) => {
+            unsafe {
+                build_fix_scan_fused_kernel::launch_unchecked::<$w, R>(
+                    client,
+                    CubeCount::Static(n as u32, 1, 1),
+                    CubeDim::new_1d(1),
+                    ArrayArg::from_raw_parts(resident_bins, num_features * num_data_stride),
+                    ArrayArg::from_raw_parts(h_rows, rows),
+                    ArrayArg::from_raw_parts(h_g, rows),
+                    ArrayArg::from_raw_parts(h_h, rows),
+                    ArrayArg::from_raw_parts(h_hist.clone(), slot_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot, n),
+                    ArrayArg::from_raw_parts(h_numbin, n),
+                    ArrayArg::from_raw_parts(h_offset, n),
+                    ArrayArg::from_raw_parts(h_mfb, n),
+                    ArrayArg::from_raw_parts(h_defbin, n),
+                    ArrayArg::from_raw_parts(h_skip, n),
+                    ArrayArg::from_raw_parts(h_rev, n),
+                    ArrayArg::from_raw_parts(h_fwd, n),
+                    ArrayArg::from_raw_parts(h_scan, n),
+                    num_data_stride,
+                    sum_gradient_raw,
+                    sum_hessian_raw,
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    min_gain_shift,
+                    sum_hessian_bumped,
+                    num_data,
+                );
+            }
+        };
+    }
+    match width {
+        crate::ResidentBinWidth::U8 => launch_fused!(u8),
+        crate::ResidentBinWidth::U16 => launch_fused!(u16),
+        crate::ResidentBinWidth::U32 => launch_fused!(u32),
     }
 
     // Read back ONLY the SplitInfo cells; the histogram Handle stays resident.

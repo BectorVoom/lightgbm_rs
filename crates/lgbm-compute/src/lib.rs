@@ -828,7 +828,7 @@ pub trait Backend {
     fn upload_resident_bins(
         &self,
         _client: &ComputeClient<Self::Runtime>,
-        _feature_bins: &[&[u32]],
+        _feature_bins: &[&BinColumn],
     ) {
     }
 
@@ -1842,19 +1842,54 @@ fn compact_histogram_inline(hist: &mut [f64], offset: i32) {
     }
 }
 
-/// The device-resident binned dataset cached inside [`RocmBackend`] (260608-nn7
-/// L1). Holds the ONE concatenated feature-column bin buffer's device `Handle`
-/// (feature-major, length `num_features * num_data`) plus the dimensions needed to
-/// index it (`f * num_data + row`). `Handle` is cheaply clonable (ref-counted), so
-/// "residency" = hold this Handle across all per-leaf launches within one train.
+/// Element width of the device-resident bin buffer (quick-260621-qix). The buffer is
+/// uploaded at the NARROWEST uniform width covering every feature's `BinColumn` variant
+/// (widest variant present), so the resident-reading kernels dispatch the matching
+/// `<B: Int>` monomorphization. Mirrors the host `BinColumn` u8/u16/u32 axis (spike-004).
+#[cfg(feature = "rocm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentBinWidth {
+    U8,
+    U16,
+    U32,
+}
+
+/// The narrowest uniform width that holds every column = the WIDEST variant present
+/// (any U32 ⇒ U32; else any U16 ⇒ U16; else U8). A uniform width is required because the
+/// resident buffer is ONE concatenated `Array<B>`; narrower columns upcast into it.
+#[cfg(feature = "rocm")]
+pub fn resident_bin_width(cols: &[&BinColumn]) -> ResidentBinWidth {
+    let mut w = ResidentBinWidth::U8;
+    for c in cols {
+        let cw = match c {
+            BinColumn::U8(_) => ResidentBinWidth::U8,
+            BinColumn::U16(_) => ResidentBinWidth::U16,
+            BinColumn::U32(_) => ResidentBinWidth::U32,
+        };
+        w = match (w, cw) {
+            (ResidentBinWidth::U32, _) | (_, ResidentBinWidth::U32) => ResidentBinWidth::U32,
+            (ResidentBinWidth::U16, _) | (_, ResidentBinWidth::U16) => ResidentBinWidth::U16,
+            _ => ResidentBinWidth::U8,
+        };
+    }
+    w
+}
+
+/// The device-resident binned dataset cached inside [`RocmBackend`] (260608-nn7 L1):
+/// the ONE concatenated feature-column bin buffer's device `Handle` (feature-major,
+/// length `num_features * num_data`) + the dims to index it (`f * num_data + row`) +
+/// the native element `width`. `Handle` is cheaply clonable (ref-counted).
 #[cfg(feature = "rocm")]
 #[derive(Debug, Clone)]
 struct ResidentBins {
     /// Concatenated feature-major bin columns: feature `f`'s row `r` is at
-    /// `f * num_data + r`. Uploaded ONCE per train.
+    /// `f * num_data + r`. Uploaded ONCE per train, at native `width`.
     handle: cubecl::server::Handle,
     num_features: usize,
     num_data: usize,
+    /// Element width of `handle` (quick-260621-qix): the resident-reading kernels are
+    /// generic `<B: Int>` and dispatched on this.
+    width: ResidentBinWidth,
 }
 
 /// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
@@ -2039,7 +2074,7 @@ impl Backend for RocmBackend {
     fn upload_resident_bins(
         &self,
         client: &ComputeClient<Self::Runtime>,
-        feature_bins: &[&[u32]],
+        feature_bins: &[&BinColumn],
     ) {
         let num_features = feature_bins.len();
         if num_features == 0 {
@@ -2047,20 +2082,55 @@ impl Backend for RocmBackend {
             return;
         }
         let num_data = feature_bins[0].len();
-        // Concatenate every feature column feature-major into one host buffer, then
-        // upload ONCE. (All columns share num_data — the learner validates this.)
-        let mut concat: Vec<u32> = Vec::with_capacity(num_features * num_data);
-        for &col in feature_bins {
-            concat.extend_from_slice(col);
-        }
-        // `as_bytes` is `CubeElement::as_bytes` (the same call the histogram launchers
-        // use); the trait must be in scope to name it.
+        // quick-260621-qix: upload at the NARROWEST uniform width covering every column,
+        // not always u32 — cuts the host concat + host→device transfer ~4× on all-u8
+        // data (bins ≤256) and drops the learner's `to_u32_vec` widen. Narrower columns
+        // upcast into the uniform buffer; the value is a bin INDEX, byte-faithful across
+        // widths (the resident kernels read the matching `<B: Int>` monomorphization).
+        // `as_bytes` is `CubeElement::as_bytes` (the same call the histogram launchers use).
         use cubecl::prelude::CubeElement;
-        let handle = client.create_from_slice(u32::as_bytes(&concat));
+        let width = resident_bin_width(feature_bins);
+        let handle = match width {
+            ResidentBinWidth::U8 => {
+                let mut concat: Vec<u8> = Vec::with_capacity(num_features * num_data);
+                for &col in feature_bins {
+                    match col {
+                        BinColumn::U8(v) => concat.extend_from_slice(v),
+                        // Unreachable for a U8-uniform set, but keep total: upcast is lossless.
+                        BinColumn::U16(v) => concat.extend(v.iter().map(|&b| b as u8)),
+                        BinColumn::U32(v) => concat.extend(v.iter().map(|&b| b as u8)),
+                    }
+                }
+                client.create_from_slice(u8::as_bytes(&concat))
+            }
+            ResidentBinWidth::U16 => {
+                let mut concat: Vec<u16> = Vec::with_capacity(num_features * num_data);
+                for &col in feature_bins {
+                    match col {
+                        BinColumn::U8(v) => concat.extend(v.iter().map(|&b| u16::from(b))),
+                        BinColumn::U16(v) => concat.extend_from_slice(v),
+                        BinColumn::U32(v) => concat.extend(v.iter().map(|&b| b as u16)),
+                    }
+                }
+                client.create_from_slice(u16::as_bytes(&concat))
+            }
+            ResidentBinWidth::U32 => {
+                let mut concat: Vec<u32> = Vec::with_capacity(num_features * num_data);
+                for &col in feature_bins {
+                    match col {
+                        BinColumn::U8(v) => concat.extend(v.iter().map(|&b| u32::from(b))),
+                        BinColumn::U16(v) => concat.extend(v.iter().map(|&b| u32::from(b))),
+                        BinColumn::U32(v) => concat.extend_from_slice(v),
+                    }
+                }
+                client.create_from_slice(u32::as_bytes(&concat))
+            }
+        };
         *self.resident_bins.borrow_mut() = Some(ResidentBins {
             handle,
             num_features,
             num_data,
+            width,
         });
     }
 
@@ -2091,6 +2161,7 @@ impl Backend for RocmBackend {
             return kernels::histogram::build_leaf_histograms_resident_f32_on(
                 client,
                 resident.handle.clone(),
+                resident.width,
                 resident.num_features,
                 resident.num_data,
                 slot_off,
@@ -2191,6 +2262,7 @@ impl Backend for RocmBackend {
         let (handle, len) = kernels::histogram::build_fix_compact_resident_f64_on(
             client,
             resident.handle.clone(),
+            resident.width,
             resident.num_features,
             resident.num_data,
             slot_off,
@@ -2319,6 +2391,7 @@ impl Backend for RocmBackend {
         let (handle, len, splits) = kernels::histogram::build_fix_scan_resident_f64_on(
             client,
             resident.handle.clone(),
+            resident.width,
             resident.num_features,
             resident.num_data,
             slot_off,

@@ -842,9 +842,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         if self.backend.wants_resident_bins() && !self.resident_bins_uploaded {
             // Spike-014b: time the resident-bin upload (now fires on the first tree only).
             let _g = crate::phase_prof::guard(&crate::phase_prof::UPLOAD_NS);
-            let upload_owned: Vec<Vec<u32>> =
-                features.iter().map(|f| f.bins.to_u32_vec()).collect();
-            let upload_bins: Vec<&[u32]> = upload_owned.iter().map(Vec::as_slice).collect();
+            // quick-260621-qix: pass native BinColumn refs (NO u32 widen) — the backend
+            // uploads at the narrowest uniform width (u8/u16/u32), dropping the per-train
+            // 2GB `to_u32_vec` host alloc at the wide shape.
+            let upload_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
             self.backend.upload_resident_bins(self.client, &upload_bins);
             self.resident_bins_uploaded = true;
         }

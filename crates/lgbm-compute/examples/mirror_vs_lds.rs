@@ -190,6 +190,7 @@ fn main() {
                 let out = build_leaf_histograms_resident_f32_on(
                     &client,
                     resident_handle.clone(),
+                    lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 buffer
                     FEATS,
                     NUM_DATA,
                     &slot_off,
