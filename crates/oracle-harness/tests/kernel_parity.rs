@@ -1711,25 +1711,49 @@ mod hip {
         }
     }
 
-    /// 260608-oib Task 2 (step 1) — the DEVICE-RESIDENT build→fix→compact chain
-    /// (`build_fix_compact_resident_*`) must produce the SAME fixed+compacted f64
-    /// histogram as the host path: the resident RAW build
-    /// (`build_leaf_histograms_resident_f32_on`) widened to f64, then host
-    /// `fix_histogram` + `compact_histogram` per feature. Both share the IDENTICAL
-    /// f32-atomic RAW build (same `(feature, leaf-row)` atomic-add set) and the
-    /// fix+compact step is bit-exact (Task 1), so they match within the ~1e-6 ROCm
-    /// tolerance (`assert_within`). This proves the on-device chain is faithful — the
-    /// live split-from-Handle wiring is deferred (SUMMARY), but the resident chain
-    /// itself is validated end-to-end.
+    /// Phase 11 Plan 02 — the DEVICE-RESIDENT build→fix→compact chain
+    /// (`build_fix_compact_resident_readback_f64_on`), now driving the **u64
+    /// two's-complement fixed-point (S=2^30) resident LDS build** that Plan 11-01
+    /// shipped, RE-PINNED to a fresh **CPU f64 anchor** — NOT a second GPU launcher.
+    ///
+    /// ## Why this test was re-anchored (def-f8u-01)
+    /// Before Plan 11-01 this test compared the GPU `build_fix_compact_resident_*`
+    /// output against a "host reference" that was ITSELF a GPU launcher
+    /// (`build_leaf_histograms_resident_f32_on`). After Plan 11-01 BOTH arms became
+    /// u64-on-GPU ⇒ a GPU-vs-GPU comparison with NO deterministic anchor — a direct
+    /// def-f8u-01 violation ("never pin two nondeterministic GPU paths to each
+    /// other"). This version builds the reference from the bit-exact CPU f64 fold
+    /// `construct_histograms_cpu` (per feature, over the leaf's gathered
+    /// `(bin, grad, hess)`), then applies the SAME host `fix_histogram` +
+    /// `host_compact_histogram` the test already runs — so the GPU u64 path is pinned
+    /// to the CPU f64 anchor, never to another GPU launcher.
+    ///
+    /// ## Tightened fixed-point gate
+    /// The resident LDS sub-hist now accumulates in u64 fixed-point, so the residual
+    /// vs the f64 anchor is bounded, deterministic QUANTIZE-ROUNDING error (≤ ~1/2^30
+    /// per cell), NOT f32 catastrophic-cancellation error. Spike-018a/018b measured
+    /// `rel_vs_anchor ≈ 5.9e-9` on real hardware (and exact `0.0` in the cancelling
+    /// integer regime) — ~3600× tighter than the old f32-LDS path. We therefore pin
+    /// this test to a TIGHTENED `FIXEDPOINT_REL_GATE` well below the generous f32
+    /// envelope (`HIP_SANITY_REL = 1e-3`), so a real fixed-point regression cannot
+    /// slip. We do NOT reuse `assert_within` here — that helper's `HIP_SANITY_REL`
+    /// is calibrated for the f32 launchers.
+    ///
+    /// ## Determinism
+    /// Integer add is order-independent, so the u64 resident build is deterministic
+    /// BY CONSTRUCTION (unlike the f32 path, which was only incidentally deterministic
+    /// at single-cube). A sub-assert runs the build TWICE over identical inputs and
+    /// requires bit-equal read-back (`to_bits` compare) on every f64 output cell.
     #[test]
     fn kernel_parity_resident_build_fix_compact_equals_host_on_hip() {
         use lgbm_compute::kernels::histogram::{
-            build_fix_compact_resident_readback_f64_on, build_leaf_histograms_resident_f32_on,
+            build_fix_compact_resident_readback_f64_on, construct_histograms_cpu,
             upload_resident_columns,
         };
         use lgbm_treelearner::fix_histogram;
 
         let hip = rocm_client();
+        let cpu = cpu_client();
 
         // 3 features over 10 rows, different bin counts + non-trivial mfb/offset so
         // the fix (reconstruct) and compact (drop bin 0) both fire.
@@ -1756,56 +1780,100 @@ mod hip {
         let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
         let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
 
-        // ---- HOST reference: resident RAW build (readback+widen) then host fix+compact.
-        let mut host = build_leaf_histograms_resident_f32_on(
-            &hip,
-            upload_resident_columns(&hip, &feature_bins),
-            lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
-            feature_bins.len(),
-            num_data,
-            &slot_off,
-            slot_len,
-            &leaf_rows,
-            &gradients,
-            &hessians,
-        )
-        .expect("host resident RAW build"); // already widened f64 in the launcher
+        // ---- CPU f64 ANCHOR (def-f8u-01: the reference is the bit-exact CPU fold,
+        //      NOT a second GPU launcher). Per feature: gather the leaf rows'
+        //      (bin, grad, hess), fold with `construct_histograms_cpu` (the bit-exact
+        //      CPU f64 path), then apply the SAME host fix + compact the GPU chain
+        //      runs on device. This is the `cpu_anchor` gather idiom from
+        //      rocm_cuda_mirror.rs reused here for the resident leaf.
+        let mut anchor: Vec<f64> = vec![0.0; slot_len];
         for fpos in 0..num_bins.len() {
             let nb = num_bins[fpos];
             let cells = 2 * nb as usize;
-            let region = &mut host[slot_off[fpos]..slot_off[fpos] + cells];
+            let binned: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&r| feature_bins[fpos][r as usize])
+                .collect();
+            let g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+            let h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+            let raw = construct_histograms_cpu(&cpu, &binned, &g, &h, nb)
+                .expect("cpu f64 anchor fold");
+            let region = &mut anchor[slot_off[fpos]..slot_off[fpos] + cells];
+            region.copy_from_slice(&raw);
+            // SAME host fix + compact the on-device chain applies.
             fix_histogram(region, mfbs[fpos], sum_g, sum_h);
             host_compact_histogram(region, offsets[fpos]);
         }
 
-        // ---- GPU resident chain: build→fix→compact entirely on device, read back.
+        // ---- GPU resident chain: u64 fixed-point build→fix→compact on device, read back.
         let fix_feats: Vec<(usize, u32, i32, u32)> = (0..num_bins.len())
             .map(|fpos| (slot_off[fpos], num_bins[fpos], offsets[fpos], mfbs[fpos]))
             .collect();
-        let gpu = build_fix_compact_resident_readback_f64_on(
-            &hip,
-            upload_resident_columns(&hip, &feature_bins),
-            lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
-            feature_bins.len(),
-            num_data,
-            &slot_off,
-            slot_len,
-            &leaf_rows,
-            &gradients,
-            &hessians,
-            &fix_feats,
-            sum_g,
-            sum_h,
-        )
-        .expect("resident build_fix_compact readback");
+        let run_gpu = || {
+            build_fix_compact_resident_readback_f64_on(
+                &hip,
+                upload_resident_columns(&hip, &feature_bins),
+                lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
+                feature_bins.len(),
+                num_data,
+                &slot_off,
+                slot_len,
+                &leaf_rows,
+                &gradients,
+                &hessians,
+                &fix_feats,
+                sum_g,
+                sum_h,
+            )
+            .expect("resident build_fix_compact readback")
+        };
+        let gpu = run_gpu();
 
         assert_eq!(gpu.len(), slot_len, "resident chain length");
-        assert_eq!(host.len(), slot_len, "host chain length");
-        let gpu_f32: Vec<f32> = gpu.iter().map(|&x| x as f32).collect();
-        let host_f32: Vec<f32> = host.iter().map(|&x| x as f32).collect();
-        // Resident on-device build→fix→compact == host RAW build + host fix+compact
-        // within the f32-atomic RAW-build tolerance (the fix+compact step is bit-exact).
-        assert_within("resident_build_fix_compact_vs_host", &gpu_f32, &host_f32);
+        assert_eq!(anchor.len(), slot_len, "anchor chain length");
+
+        // ---- TIGHTENED fixed-point gate, pinned to the CPU f64 anchor.
+        // The u64 fixed-point residual is bounded quantize-rounding error, not f32
+        // cancellation. Spike-018a/018b measured ~5.9e-9 on hardware (exact in the
+        // cancelling regime). We pin to a gate well below the f32 envelope
+        // (`HIP_SANITY_REL = 1e-3`) so a real fixed-point regression cannot slip,
+        // with margin above the spike-measured max. rel = |gpu - anchor| / max(|anchor|, 1.0).
+        const FIXEDPOINT_REL_GATE: f64 = 1e-7;
+        let mut max_rel = 0.0f64;
+        for (i, (&g, &a)) in gpu.iter().zip(anchor.iter()).enumerate() {
+            let rel = (g - a).abs() / a.abs().max(1.0);
+            assert!(
+                rel <= FIXEDPOINT_REL_GATE,
+                "FIXED-POINT PARITY FAIL at cell {i}: gpu={g}, cpu_anchor={a}, \
+                 rel={rel:.3e} > FIXEDPOINT_REL_GATE={FIXEDPOINT_REL_GATE:.0e} — the u64 \
+                 resident build diverged from the CPU f64 anchor beyond quantize-rounding \
+                 error (spike-018a/018b measured ~5.9e-9). NOT the tolerated gap; a real \
+                 fixed-point regression."
+            );
+            max_rel = max_rel.max(rel);
+        }
+        eprintln!(
+            "resident u64 fixed-point build: max_rel_vs_cpu_f64_anchor={max_rel:.3e} \
+             (gate={FIXEDPOINT_REL_GATE:.0e}, spike-018 ref ~5.9e-9)"
+        );
+
+        // ---- DETERMINISM: two u64 resident builds over identical inputs must be
+        // bit-equal on every read-back f64 cell. Integer add is order-independent ⇒
+        // deterministic by construction (the f32 path was only incidentally so at
+        // single-cube). Pattern copied from examples/gpu_fixedpoint_i64.rs:181-182.
+        let gpu_again = run_gpu();
+        assert_eq!(gpu_again.len(), slot_len, "determinism: length drift");
+        for (i, (&a, &b)) in gpu.iter().zip(gpu_again.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "DETERMINISM FAIL at cell {i}: run1={a} (bits {:#018x}) != run2={b} \
+                 (bits {:#018x}) — the u64 fixed-point resident build is NOT bit-equal \
+                 across two runs",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
     }
 
     /// 260608-p90 Task 1E — the Handle-consuming fused split scan
