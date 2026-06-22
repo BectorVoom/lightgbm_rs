@@ -736,7 +736,7 @@ fn rowpart_target_cubes() -> u32 {
 /// Pure CPU logic otherwise — no per-call device handle — so it is unit-testable with a
 /// forced target.
 #[cfg(feature = "rocm")]
-fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
+pub fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
     let min_leaf = std::env::var("LGBM_ROWPART_MIN")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
