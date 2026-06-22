@@ -50,6 +50,21 @@ as BUILD profiler-share drop at 1M×50. Feasibility-gated on whether CubeCL's `P
 exposes `match_any`-style intra-warp bin matching. → spike
 `warp-aggregated-histogram-atomics`.
 
+## UPDATE 2026-06-22 — spike resolved (both warp levers now closed)
+
+- **Finding #2 (warp-aggregation): already CLOSED before this note.** quick-260619-p93
+  built + hardware-benched the `Plane` ballot+shuffle kernel → **NULL/NEGATIVE** (slower
+  5/6 cells; at 256 bins ~30 distinct bins/wave = nothing to amortize). Kept unwired.
+- **Finding #1 (per-warp replication): spike-017 → VALIDATED MODEST.** `gpu_lds_replication.rs`,
+  comptime `replicas`. **R8 (=1 replica/warp) sign-stable ~1.1× device-time** (1.06–1.29×,
+  2 process runs); R2/R4 null (win is all-or-nothing at the warp boundary). First positive
+  GPU build-kernel lever. Parity within ~1e-5. **Kept as evidence, NOT wired** — modest +
+  APU-only, CPU still beats GPU ~4× at wide. My earlier "capacity-limited at 255 bins"
+  worry was about HIGH R; R8 at 256 bins = 16 KB ≤ 64 KB, fine. Full:
+  `.planning/spikes/017-perwarp-lds-replication/README.md`.
+- **Findings #3 (int atomics, research Q2) + #5 (bank-conflict layout): still open**, but
+  lower priority given the routing reality (GPU is parity-maintenance, not a speed path).
+
 ## Sources
 
 - NVIDIA shared-atomics histograms — https://developer.nvidia.com/blog/gpu-pro-tip-fast-histograms-using-shared-atomics-maxwell/

@@ -32,6 +32,17 @@ The repeatable shape for "is kernel-change X faster on the GPU?":
 
 `gpu_bin_width.rs` (006) and `gpu_row_partition.rs` (007) are the reference harnesses.
 
+**In-kernel A/B via a comptime flag/factor (p93, 017).** To isolate EXACTLY one kernel
+codegen change, parameterize ONE `#[cube]` kernel by a `#[comptime]` arg whose baseline
+value is **byte-identical to production** (p93: `use_plane=false`; 017: `replicas=1`),
+and sweep it. cubecl JIT-specializes per distinct comptime value, so uploads / cube
+count / read-back are shared across arms and the delta is pure codegen. `SharedMemory`
+can be comptime-sized from the arg (`new(replicas * MAX)`, arg typed `usize`) so LDS
+footprint/occupancy scales honestly with the variant. For a noisy APU, the 3-round
+"speedup vs cold round-1" reading OVERSTATES (cold baseline) — use **interleaved median
++ p25/p75 over ~11 reps, ≥2 process restarts**, and require a SEP-WIN (variant p75 below
+baseline p25) before claiming a robust win (017 reference: `gpu_lds_replication.rs`).
+
 ## CPU data-layout micro-bench harness (spikes 010, 011)
 
 For "is data-structure change X faster on the CPU?", the **end-to-end `bench_train`
