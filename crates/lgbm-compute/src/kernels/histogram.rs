@@ -2259,7 +2259,42 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     sum_gradient: f64,
     sum_hessian: f64,
 ) -> Result<(cubecl::server::Handle, usize), ComputeError> {
-    // ---- 1. RESIDENT RAW build into an f32-atomic device buffer ----
+    // ---- 0. PHASE-11 OVERFLOW GUARD (SPEC item 4, spike-018 README:63,113-116) ----
+    // The u64 fixed-point build sums `round(v * 2^30)` (i64) across a bin's rows. The
+    // worst-case single-bin magnitude is `rows * max|v| * 2^30`; it MUST fit in i64 or
+    // the two's-complement add wraps to a WRONG value. Bound: i64@2^30 is safe to
+    // ~1e9 rows × |g| ≤ 8 (spike-018b). We bound `max|v|` by the actual leaf grad/hess
+    // (a one-pass scan of the rows we are about to accumulate) — NOT a clamp; on
+    // violation we return a typed error rather than silently overflow. The grad/hess are
+    // small in practice (regression residuals / Newton steps), so this never trips on
+    // sane data; it documents + enforces the contract for pathological extreme leaves.
+    {
+        let rows = leaf_rows.len() as f64;
+        let mut max_abs = 0.0f64;
+        for &r in leaf_rows {
+            let i = r as usize;
+            let g = gradients[i].abs() as f64;
+            let h = hessians[i].abs() as f64;
+            if g > max_abs {
+                max_abs = g;
+            }
+            if h > max_abs {
+                max_abs = h;
+            }
+        }
+        // 2^30 scale; compare against i64::MAX in f64 (exact enough — both sides are
+        // upper bounds and the margin to i64::MAX ≈ 9.2e18 is enormous for sane leaves).
+        let worst = rows * max_abs * 1_073_741_824.0_f64; // rows * max|v| * 2^30
+        if worst >= i64::MAX as f64 {
+            return Err(ComputeError::Runtime {
+                detail: "fixed-point histogram accumulation may overflow i64 at S=2^30 \
+                         (rows x |value| x 2^30 exceeds i64::MAX)"
+                    .to_string(),
+            });
+        }
+    }
+
+    // ---- 1. RESIDENT RAW build into a u64 fixed-point device buffer ----
     // LDS-privatized per-feature build when every feature ≤ 256 bins (naive fallback
     // otherwise) — the SAME `resident_raw_build_into` the readback launcher uses, so
     // the resident-pool chain and the host path share one accumulation structure.

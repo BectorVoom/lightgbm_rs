@@ -2230,11 +2230,28 @@ impl Backend for RocmBackend {
         mirror.resize_with(num_slots, || None);
     }
 
-    /// Build ONE leaf's histogram device-resident (build → widen → fix → compact) via
+    /// Build ONE leaf's histogram device-resident (build → dequant → fix → compact) via
     /// the oib `build_fix_compact_resident_f64_on` chain and STORE the returned
     /// `(Handle, len)` into mirror slot `slot` (dropping any prior Handle). Falls back
     /// to a typed error if the resident bin cache is empty (defensive — the learner
     /// always uploads before the growth loop when eligible).
+    ///
+    /// phase-11 (spike-018/019): the RAW histogram BUILD now accumulates grad/hess as
+    /// u64 TWO'S-COMPLEMENT FIXED-POINT (scale S = 2^30) via integer LDS atomics, NOT
+    /// f32 atomics. On RDNA the f32 `atomicAdd` lowers to a CAS retry loop that saturates
+    /// under contention; the integer `ds_add_u64` is a native single-instruction op,
+    /// giving a faster build (~1.3–1.7× in the wide large-leaf regime), a DETERMINISTIC
+    /// GPU histogram, AND ~3600× better accuracy (5.9e-9 vs f32 2.2e-5 rel-to-anchor;
+    /// exact in the cancelling regime). The `fix_compact_kernel` widen pass dequantizes
+    /// `(bits as i64)/2^30 → f64`; everything downstream (FixHistogram fold, compact,
+    /// subtract trick, scan) stays f64 and is UNCHANGED.
+    ///
+    /// Like `construct_histograms`, this is the GPU's ~1e-6 best-effort contract, NOT a
+    /// bit-exact one — the fixed-point accumulation order/quantization differs from the
+    /// host f64 fold (though it is MORE accurate than the prior f32-atomic path it
+    /// replaced). The CpuBackend f64 fold remains the bit-exact hard merge gate and is
+    /// unaffected. An overflow guard (`build_fix_compact_resident_f64_on`) enforces the
+    /// i64@2^30 bound (~1e9 rows × |g| ≤ 8) at the resident-build boundary.
     #[allow(clippy::too_many_arguments)]
     fn build_resident_leaf(
         &self,
