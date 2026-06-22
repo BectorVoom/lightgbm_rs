@@ -619,6 +619,16 @@ pub fn construct_histograms_parallel_f32_plane_on<R: cubecl::Runtime>(
 #[cfg(feature = "rocm")]
 const HIST_LDS_MAX: usize = 512;
 
+/// Fixed-point quantize scale S = 2^30 (phase-11, spike-018a). The resident LDS BUILD
+/// accumulates `round(value * S)` as a two's-complement i64 stored BITS-as-u64 via
+/// integer LDS atomics (`Atomic<u64>::fetch_add`), then `fix_compact_kernel` dequantizes
+/// `(bits as i64) / S` back to f64 in its widen pass. S = 2^30 keeps ≥ ~9 fractional
+/// bits while leaving the i64 magnitude safe to ~1e9 rows × |g| ≤ 8 (spike-018b). The
+/// build-side constant is f32 (the quantize multiplies the f32 `ord_g`/`ord_h`); the
+/// dequant-side `SCALE_F64` (in `fix_compact_kernel`) is the same value in f64.
+#[cfg(feature = "rocm")]
+const SCALE_F32: f32 = 1_073_741_824.0; // 2^30
+
 /// Row-partition (`grid_dim_y` analog) tuning — spike-007 (`.planning/spikes/007-*`).
 /// The LDS build launches one cube per feature; on a large leaf that is only
 /// `num_features` workgroups, starving the GPU (gfx1100 = 96 CUs). Splitting a feature's
@@ -1203,6 +1213,77 @@ pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
     }
     sync_cube();
     // 3. merge LDS → this feature's global slot.
+    let mut m = UNIT_POS as usize;
+    while m < feat_len {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
+/// u64 TWO'S-COMPLEMENT FIXED-POINT resident LDS build (phase-11, spike-018/019). A
+/// byte-for-byte twin of [`construct_leaf_hist_resident_lds_kernel`] above — IDENTICAL
+/// resident-column gather, `slot_off` sentinel `feat_len`, row-partition over
+/// `CUBE_POS_Y`/`CUBE_COUNT_Y`, per-feature LDS sub-hist, and LDS→global merge — with
+/// ONLY the accumulated CELL type + quantize/store/merge idiom swapped from f32 atomics
+/// to u64 integer atomics.
+///
+/// Each grad/hess value is quantized `round(value * S)` (S = `SCALE_F32` = 2^30) to an
+/// i64, whose BITS are stored as u64; a wrapping `Atomic<u64>::fetch_add` is exactly a
+/// two's-complement signed i64 add, so the bins sum correctly with NO bias offset (each
+/// bin sums a variable row count — a bias would be wrong, spike-018b). The dequant
+/// `(bits as i64) / S` happens later in `fix_compact_kernel`'s widen pass.
+///
+/// HARD CONSTRAINT (spike-018b, CONTEXT line 24): the cell type MUST be `Atomic<u64>`
+/// with `.store(0u64)` / `.fetch_add(qbits)`. NEVER `Atomic<i64>` — cubecl-hip 0.10
+/// lowers `Atomic<i64>::store` to `atomicExch(long long*)`, which HIP lacks (compiles,
+/// fails at runtime). LDS stays `HIST_LDS_MAX` cells (same element COUNT, 2× bytes =
+/// 4 KiB/cube, well within the 64 KiB budget). f64 atomics not needed — the wide i64
+/// accumulator IS the precision win (~3600× better than f32 atomics, spike-018a).
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
+    resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
+    leaf_rows: &Array<u32>,
+    ord_g: &Array<f32>,
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>, // length num_features + 1 (sentinel = slot_len)
+    num_data: usize,
+    out: &mut Array<Atomic<u64>>,
+) {
+    let f = CUBE_POS_X as usize; // ONE cube per feature
+    let base = slot_off[f] as usize;
+    let feat_len = slot_off[f + 1] as usize - base; // = 2*num_bin[f]
+    let r = ord_g.len();
+    let cd = CUBE_DIM as usize;
+
+    let sub = SharedMemory::<Atomic<u64>>::new(HIST_LDS_MAX);
+    // 1. zero this feature's active LDS cells (u64 zero — the additive identity bits).
+    let mut c = UNIT_POS as usize;
+    while c < feat_len {
+        sub[c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+    // 2. scatter THIS partition's strided rows into LDS (resident on-device gather),
+    //    quantizing each value to fixed-point i64-bits before the wrapping u64 atomic.
+    //    Row-partition byte-identical to the f32 twin (CubeCount = (num_features, P)).
+    let col = f * num_data;
+    let stride = CUBE_COUNT_Y as usize * cd;
+    let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
+    while k < r {
+        // bin INDEX read unchanged (native width B → u32 index); only the CELL type changed.
+        let bin = u32::cast_from(resident_bins[col + leaf_rows[k] as usize]) as usize;
+        let ti = bin * 2;
+        // quantize `round(v * 2^30)` → i64 → store its bits as u64 (build_u64_rp idiom).
+        let qg = u64::cast_from(i64::cast_from(f32::round(ord_g[k] * SCALE_F32)));
+        let qh = u64::cast_from(i64::cast_from(f32::round(ord_h[k] * SCALE_F32)));
+        sub[ti].fetch_add(qg);
+        sub[ti + 1].fetch_add(qh);
+        k += stride;
+    }
+    sync_cube();
+    // 3. merge LDS → this feature's global slot (wrapping u64 add == i64 two's-complement).
     let mut m = UNIT_POS as usize;
     while m < feat_len {
         out[base + m].fetch_add(sub[m].load());
