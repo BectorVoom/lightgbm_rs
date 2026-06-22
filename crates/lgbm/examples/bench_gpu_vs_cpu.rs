@@ -192,6 +192,7 @@ fn main() {
         // Reset any phase_prof counters the warmup accumulated so the per-phase split
         // below reflects only the timed reps. Inert unless LGBM_PHASE_PROF=1.
         lgbm_treelearner::phase_prof::dump("warmup-discard");
+        lgbm_compute::fusion_prof::dump_scan("warmup-discard");
 
         // ---- timed train (median of train_reps warm runs) ----
         let mut train_times = Vec::with_capacity(train_reps);
@@ -207,6 +208,8 @@ fn main() {
         // Per-phase wall-clock split accumulated over the timed reps (build/scan/partition).
         // The spike-014a deliverable: which phase dominates at the wide shape. Resets here.
         lgbm_treelearner::phase_prof::dump(s.name.trim());
+        // spike-015: per-leaf GPU scan round-trip decomposition (inert unless LGBM_SCAN_PROF=1).
+        lgbm_compute::fusion_prof::dump_scan(s.name.trim());
         let train_med = median(train_times);
         let rows_per_s = s.rows as f64 / train_med.as_secs_f64();
 

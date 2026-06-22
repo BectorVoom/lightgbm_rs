@@ -47,11 +47,83 @@ pub static SUB_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 /// (3+4) FORK/JOIN + PARALLEL WORK: the `par_iter` subtract+scan region.
 pub static SUB_PAR_NS: AtomicU64 = AtomicU64::new(0);
 
+// --- spike-015: per-leaf GPU scan round-trip buckets (`find_best_splits_fused_inner`).
+//     Independent gate `LGBM_SCAN_PROF=1` (separate from LGBM_FUSION_PROF) so the GPU
+//     scan decomposition can run without the CPU-fusion counters. Inert when unset. ---
+/// (1) MARSHAL: per-feature V5 validation + the 7 per-feature index arrays + leaf scalars.
+pub static SCAN_MARSHAL_NS: AtomicU64 = AtomicU64::new(0);
+/// (2) UPLOAD: the `create_from_slice` device uploads (h_out + 7 param arrays).
+pub static SCAN_UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+/// (3) LAUNCH+READBACK: the kernel launch + `read_one_unchecked` sync + decode loop.
+pub static SCAN_LAUNCH_NS: AtomicU64 = AtomicU64::new(0);
+/// (0) BUILD-DRAIN: optional forced read of the resident histogram handle BEFORE the
+/// scan launch (gated by `LGBM_SCAN_DRAIN=1`) — drains the async-queued f32-atomic build
+/// so its device-compute is attributed HERE instead of materializing inside the scan's
+/// readback sync. Diagnostic only (it removes build/scan overlap); off by default.
+pub static SCAN_DRAIN_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `LGBM_SCAN_DRAIN=1` is set (cached once) — forces a pre-scan build drain.
+#[inline]
+pub fn scan_drain_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_SCAN_DRAIN").map(|v| v == "1").unwrap_or(false))
+}
+
 /// Whether `LGBM_FUSION_PROF=1` is set (cached once).
 #[inline]
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("LGBM_FUSION_PROF").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Whether `LGBM_SCAN_PROF=1` is set (cached once) — the spike-015 GPU scan gate.
+#[inline]
+pub fn scan_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_SCAN_PROF").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Time `f` into `counter` (ns) under the `LGBM_SCAN_PROF` gate. Zero-overhead
+/// passthrough when off — the closure runs identically, so values/order are untouched.
+#[inline]
+pub fn time_scan<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    if !scan_enabled() {
+        return f();
+    }
+    let t = Instant::now();
+    let r = f();
+    counter.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
+
+/// Print the accumulated per-leaf GPU scan round-trip breakdown and reset. No-op when
+/// `LGBM_SCAN_PROF` is off.
+pub fn dump_scan(label: &str) {
+    if !scan_enabled() {
+        return;
+    }
+    let m = SCAN_MARSHAL_NS.swap(0, Ordering::Relaxed);
+    let u = SCAN_UPLOAD_NS.swap(0, Ordering::Relaxed);
+    let l = SCAN_LAUNCH_NS.swap(0, Ordering::Relaxed);
+    let d = SCAN_DRAIN_NS.swap(0, Ordering::Relaxed);
+    let tot = (m + u + l + d) as f64 / 1e6;
+    eprintln!(
+        "[scan_prof:{label}] build_drain={:.3}ms marshal={:.3}ms upload={:.3}ms launch+readback={:.3}ms total={:.3}ms",
+        d as f64 / 1e6,
+        m as f64 / 1e6,
+        u as f64 / 1e6,
+        l as f64 / 1e6,
+        tot
+    );
+    if tot > 0.0 {
+        eprintln!(
+            "[scan_prof:{label}] %: build_drain={:.1} marshal={:.1} upload={:.1} launch+readback={:.1}",
+            d as f64 / 1e4 / tot,
+            m as f64 / 1e4 / tot,
+            u as f64 / 1e4 / tot,
+            l as f64 / 1e4 / tot
+        );
+    }
 }
 
 /// Time `f` into `counter` (nanoseconds). Zero-overhead passthrough when the gate is off

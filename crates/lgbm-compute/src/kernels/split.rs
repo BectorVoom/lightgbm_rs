@@ -1171,6 +1171,12 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         });
     }
 
+    // spike-015: env-gated (`LGBM_SCAN_PROF=1`) per-leaf scan round-trip timers. Inert
+    // when off (the `Instant`s are still taken but never read — negligible, and parity
+    // is untouched since no value/order changes). Marshal starts here.
+    let _scan_prof = crate::fusion_prof::scan_enabled();
+    let _t_marshal = std::time::Instant::now();
+
     // Per-feature V5 validation + per-feature device-array assembly (BEFORE launch).
     let n = feats.len();
     let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
@@ -1241,6 +1247,15 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
+    // spike-015: marshal done; upload begins.
+    if _scan_prof {
+        crate::fusion_prof::SCAN_MARSHAL_NS.fetch_add(
+            _t_marshal.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let _t_upload = std::time::Instant::now();
+
     let out_len = n * 12;
     // The histogram buffer is the caller-supplied device Handle (resident path) or
     // the host-buf launcher's one-time upload — either way it describes `buf_len`
@@ -1255,6 +1270,27 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // spike-015: upload done.
+    if _scan_prof {
+        crate::fusion_prof::SCAN_UPLOAD_NS.fetch_add(
+            _t_upload.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    // spike-015 DIAGNOSTIC (LGBM_SCAN_DRAIN=1): force-drain the async-queued f32-atomic
+    // build by reading the resident histogram handle BEFORE the scan launch, so build
+    // device-compute is attributed to `build_drain` instead of materializing inside the
+    // scan's readback sync. Removes build/scan overlap → diagnostic only, off by default.
+    if _scan_prof && crate::fusion_prof::scan_drain_enabled() {
+        let t_drain = std::time::Instant::now();
+        let _ = client.read_one_unchecked(h_hist.clone());
+        crate::fusion_prof::SCAN_DRAIN_NS.fetch_add(
+            t_drain.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let _t_launch = std::time::Instant::now();
 
     // SAFETY: every handle is sized to its slice and outlives the launch. Cube `f`
     // (`CUBE_POS_X < n`) reads only `[slot_off[f], slot_off[f]+2*num_bin[f])` — each
@@ -1327,6 +1363,13 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         } else {
             out.push(SplitInfo::none());
         }
+    }
+    // spike-015: launch+readback+decode done.
+    if _scan_prof {
+        crate::fusion_prof::SCAN_LAUNCH_NS.fetch_add(
+            _t_launch.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(out)
 }
