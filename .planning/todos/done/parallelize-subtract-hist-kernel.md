@@ -8,6 +8,13 @@ run_with: /gsd-quick
 
 # Parallelize the GPU histogram-subtract kernel
 
+> **✅ DONE → quick-260622-k4g (2026-06-22), commit 6167c75.** Grid-stride parallelized
+> BOTH kernels; subtract device-time share ~31.6% → 2.19% (~14×), BIT-EXACT (f64+f32,
+> to_bits-equal), all gates green incl hip parity on hardware. SCOPE CORRECTION: the LIVE
+> GPU path runs the **f64** `subtract_hist_kernel` (not f32 as this todo/note said — f32's
+> only caller is a parity test); both were parallelized. No wall-clock win on the 8-CU APU
+> (expected). Closed. Full: `.planning/quick/260622-k4g-.../260622-k4g-SUMMARY.md`.
+
 ## Why
 
 CubeCL profiling ([[cubecl-profiling-gpu-kernel-decomposition]]) found `subtract_hist_kernel_f32`

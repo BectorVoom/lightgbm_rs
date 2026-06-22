@@ -45,7 +45,14 @@ CubeCL profiles each kernel separately: **build is ~53% of device-kernel time, a
 SUBTRACTION-trick kernel is a co-dominant ~32%** — invisible to phase_prof/scan_prof because
 they attributed at the wrong seam.
 
-## NEW LEVER: parallelize `subtract_hist_kernel_f32` (bit-exact, ~32% of device time)
+> **CORRECTION + RESOLVED (quick-260622-k4g):** the live GPU subtract path runs the **f64**
+> `subtract_hist_kernel` (via `subtract_resident`→`subtract_histograms_f64_from_handles_on`),
+> NOT the `_f32` mirror named below (f32's only caller is a parity test). cubecl-hip runs f64
+> on this APU, so the profiled ~32% kernel is the f64 one. Both were grid-stride parallelized
+> (commit 6167c75), bit-exact; subtract share dropped ~31.6% → 2.19% (~14×). The `_f32`-specific
+> wording below is superseded — the lever and the fix apply identically to the f64 kernel.
+
+## NEW LEVER: parallelize `subtract_hist_kernel` [f64 live; f32 mirror] (bit-exact, ~32% of device time)
 
 The kernel body is literally:
 ```rust
