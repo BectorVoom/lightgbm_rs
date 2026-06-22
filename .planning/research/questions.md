@@ -84,3 +84,9 @@ Resolving the W5-null root cause decides whether to even spike it.
   is the strongest single lever (~1.9× + accuracy + determinism); could compose with
   per-warp replication (spike-017). Disposition (wire it? major change + oracle parity
   re-pin) is pending a human decision.
+
+**Q2 follow-up (spike-019, sign-stable):** the speed magnitude is **~1.3–1.7×** (018b's
+1.9× was single-cube+simple-kernel inflated), REAL in heavy-atomic-load regimes (wide
+root/large leaves; determinant = total atomic load, not occupancy), COMPOSES with
+row-partition (survives P=16), null only at light load. Accuracy/determinism wins
+unconditional. Wiring de-risked on the measurement axis; decision pending.
