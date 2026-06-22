@@ -34,8 +34,9 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
 - `10-quantized-training` — opt-in approximate quantized-grad training (maps to deferred v2 requirement `QNT-01`). No formal VERIFICATION.
 - `11-gpu-fixedpoint-int-atomics` — **planned (3 plans, spike-validated).** Replace the ROCm histogram BUILD's f32 atomics with wide fixed-point u64 (S=2^30): ~1.3–1.7× faster (wide large-leaves) + ~3600× more accurate + deterministic, within the ~1e-6 gate. Validated by spikes 018/019 (research Q2 / finding #3). Revives the ROCm path as a speed+quality lever (does NOT change CPU routing). SPEC: `phases/11-gpu-fixedpoint-int-atomics/SPEC.md`.
   Plans:
-  - [ ] 11-01-PLAN.md — u64 two's-complement fixed-point resident build kernel + u64->f64 dequant at the fix-compact seam + overflow guard (wave 1)
-  - [ ] 11-02-PLAN.md — re-pin rocm resident parity to the CPU f64 anchor (tightened) + determinism assert (wave 2)
+
+  - [x] 11-01-PLAN.md — u64 two's-complement fixed-point resident build kernel + u64->f64 dequant at the fix-compact seam + overflow guard (wave 1)
+  - [x] 11-02-PLAN.md — re-pin rocm resident parity to the CPU f64 anchor (tightened) + determinism assert (wave 2)
   - [ ] 11-03-PLAN.md — device-time A/B confirming the integer build is not-slower in the wide regime (wave 2)
 
 ### 📋 Next milestone (not yet scoped)

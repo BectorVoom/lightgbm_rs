@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 11-01-PLAN.md
-last_updated: "2026-06-22T09:48:00.405Z"
+status: completed
+stopped_at: Completed 08-05-PLAN.md
+last_updated: "2026-06-22T09:55:40.689Z"
 last_activity: 2026-06-22 -- Completed 11-01 (u64 fixed-point resident histogram build)
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 5
-  completed_plans: 2
+  completed_plans: 3
   percent: 33
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 11 (gpu-fixedpoint-int-atomics) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Ready to execute (11-01 complete)
 Last activity: 2026-06-22 -- Completed 11-01 (u64 fixed-point resident histogram build)
 
@@ -498,6 +498,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 08 P08-07 | 19min | 3 tasks | 7 files |
 | Phase 08 P08-08 | 12min | 2 tasks | 4 files |
 | Phase 11 P01 | 35 | 3 tasks | 2 files |
+| Phase 11 P02 | 20min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -571,6 +572,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 08-08: cross-format parity proven — a real lightgbm 4.6 text model loads in lightgbm_rs and predicts within atol 1e-6 (D-10); Phase 8 (python-bindings) COMPLETE
 - [Phase ?]: Phase 11-01: ROCm resident histogram BUILD now uses u64 two's-complement fixed-point (S=2^30) integer LDS atomics (Atomic<u64>, never Atomic<i64>); dequant (bits as i64)/2^30->f64 confined to fix_compact_kernel; downstream f64 unchanged; i64@2^30 overflow guard at the resident-build boundary
 - [Phase ?]: Phase 11-01: resident_raw_build_into gained a fixed_point flag so the live u64 chain + the f32 readback oracle share one resident-build path; naive >256-bin fallback stays f32 (asserted unreachable when fixed_point)
+- [Phase ?]: Phase 11-02: resident u64 fixed-point build re-pinned to CPU f64 anchor at FIXEDPOINT_REL_GATE=1e-7 (measured max_rel=0.0, spike-018 ref ~5.9e-9) + 2-runs determinism; def-f8u-01 honored (no GPU-vs-GPU)
 
 ### Pending Todos
 
@@ -600,7 +602,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T09:47:53.554Z
+Last session: 2026-06-22T09:55:25.254Z
 Stopped at: Completed 08-05-PLAN.md
 Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md
 
