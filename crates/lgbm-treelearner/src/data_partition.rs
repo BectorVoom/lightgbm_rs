@@ -27,6 +27,26 @@ use lgbm_compute::BinColumn;
 // `ComputeClient` is re-exported by the compute seam (CMP-01) so this crate names
 // the Backend ops' client argument without ever depending on `cubecl` directly.
 use lgbm_compute::ComputeClientReexport as ComputeClient;
+use rayon::prelude::*;
+
+/// Static chunk size for the parallel reorder, mirroring C++ `ParallelPartitionRunner`'s
+/// `schedule(static, 512)` (`data_partition.hpp`). A contiguous ascending partition of the
+/// leaf's row slice so chunk order — and therefore the final `[all left | all right]`
+/// concatenation — is deterministic and byte-identical to the serial stable two-pass gather.
+const PAR_SPLIT_CHUNK: usize = 512;
+
+/// The leaf-row count at/above which `DataPartition::split` reorders the leaf's rows in
+/// parallel (rayon static-chunk + exclusive prefix-sum scatter). Below this, the EXISTING
+/// serial Backend path runs verbatim so small/medium leaves never pay rayon fork/join cost
+/// (the spike-005 regression class; C++ guards the analogous parallel runner with
+/// `if num_data_ >= 1024`). Override via `LGBM_PAR_SPLIT_THRESHOLD`; default 16384 — the same
+/// default + idiom as `par_build_threshold()`/`LGBM_PAR_THRESHOLD` in `lgbm-compute`.
+fn par_split_threshold() -> usize {
+    std::env::var("LGBM_PAR_SPLIT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16384)
+}
 
 /// The leaf-partition bookkeeping (`DataPartition`, `data_partition.hpp`).
 #[derive(Debug, Clone)]
@@ -122,32 +142,50 @@ impl DataPartition {
         let begin = self.leaf_begin[leaf_u] as usize;
         let count = self.leaf_count[leaf_u] as usize;
 
-        // Gather the leaf's per-row bins in the current `indices_` order so the
-        // Backend op's stable reorder is RELATIVE to this leaf's row order. The
-        // per-row bin READ widens via the accessor; the partition LOGIC is
-        // unchanged.
-        let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
-        let leaf_feature_bins: Vec<u32> = leaf_rows
-            .iter()
-            .map(|&row| feature_bins.bin(row as usize))
-            .collect();
+        // Leaf-row gate: large leaves take the deterministic rayon reorder; small/medium
+        // leaves run the EXISTING serial Backend path verbatim (the spike-005 fork/join
+        // regression class is avoided by construction). The two paths are bit-identical.
+        let split_point = if count >= par_split_threshold() {
+            self.split_numeric_parallel(
+                begin,
+                count,
+                feature_bins,
+                num_bin,
+                min_bin,
+                max_bin,
+                threshold,
+                most_freq_bin,
+            )?
+        } else {
+            // --- Serial path (unchanged behavior below the threshold) ---
+            // Gather the leaf's per-row bins in the current `indices_` order so the
+            // Backend op's stable reorder is RELATIVE to this leaf's row order. The
+            // per-row bin READ widens via the accessor; the partition LOGIC is
+            // unchanged.
+            let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
+            let leaf_feature_bins: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&row| feature_bins.bin(row as usize))
+                .collect();
 
-        // The Backend op owns the SplitInner routing + stable two-pass gather.
-        let (reordered_local, split_point) = backend.data_partition(
-            client,
-            &leaf_feature_bins,
-            num_bin,
-            min_bin,
-            max_bin,
-            threshold,
-            most_freq_bin,
-        )?;
+            // The Backend op owns the SplitInner routing + stable two-pass gather.
+            let (reordered_local, split_point) = backend.data_partition(
+                client,
+                &leaf_feature_bins,
+                num_bin,
+                min_bin,
+                max_bin,
+                threshold,
+                most_freq_bin,
+            )?;
 
-        // Map the op's local positions back to GLOBAL row ids and write them back
-        // into this leaf's slice of `indices_` (left rows first, then right).
-        for (slot, &local_pos) in reordered_local.iter().enumerate() {
-            self.indices[begin + slot] = leaf_rows[local_pos as usize];
-        }
+            // Map the op's local positions back to GLOBAL row ids and write them back
+            // into this leaf's slice of `indices_` (left rows first, then right).
+            for (slot, &local_pos) in reordered_local.iter().enumerate() {
+                self.indices[begin + slot] = leaf_rows[local_pos as usize];
+            }
+            split_point
+        };
 
         let left_count = split_point as i32;
         let right_count = count as i32 - left_count;
@@ -159,6 +197,155 @@ impl DataPartition {
         self.leaf_count[right_u] = right_count;
 
         Ok((left_count, right_count))
+    }
+
+    /// Deterministic rayon static-chunk + exclusive prefix-sum reorder of the leaf's
+    /// row slice `indices_[begin..begin+count]`, byte-identical to the serial stable
+    /// two-pass gather. Mirrors C++ `ParallelPartitionRunner` (`data_partition.hpp`):
+    /// static-chunk the rows, gather each chunk's left/right rows in ascending within-chunk
+    /// order, then prefix-sum-concatenate (`[all left | all right]`).
+    ///
+    /// Returns `split_point` (= total left-row count = the serial `split_point`).
+    ///
+    /// # Errors
+    /// Surfaces the SAME [`ComputeError`] for the SAME lowest-index offending row as the
+    /// serial Backend op (V5): the per-row bin bounds are validated BEFORE the parallel
+    /// region, walking rows in ascending leaf-relative order, so the error is independent
+    /// of thread scheduling (threat T-ia0-02).
+    #[allow(clippy::too_many_arguments)]
+    fn split_numeric_parallel(
+        &mut self,
+        begin: usize,
+        count: usize,
+        feature_bins: &BinColumn,
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<usize, ComputeError> {
+        // --- V5 boundary validation, identical to `data_partition_cpu_native` ---
+        // num_bin > 0 and threshold < num_bin first (the op's order), then the per-row
+        // bin check walking rows ASCENDING so the lowest-index offending row surfaces
+        // regardless of thread scheduling (threat T-ia0-02).
+        if num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "data_partition: num_bin must be > 0".to_string(),
+            });
+        }
+        if threshold >= num_bin {
+            return Err(ComputeError::Runtime {
+                detail: format!("data_partition: threshold {threshold} >= num_bin {num_bin}"),
+            });
+        }
+        // The leaf-relative row order; the per-row bin is read for the GLOBAL row id it
+        // currently holds. Validation walks this slice ascending (leaf-relative index =
+        // the `row` reported by the serial op, which sees the gathered leaf bins).
+        let leaf_rows = &self.indices[begin..begin + count];
+        for (row, &global) in leaf_rows.iter().enumerate() {
+            let b = feature_bins.bin(global as usize);
+            if b >= num_bin {
+                return Err(ComputeError::BinIndexOutOfRange {
+                    row,
+                    bin: b,
+                    num_bin,
+                });
+            }
+        }
+
+        // Routing decision (dense_bin.hpp:322-365), integer-only — identical to
+        // `data_partition_cpu_native`: th = threshold + min_bin (−1 if most_freq_bin == 0);
+        // out-of-[min,max] rows take the default direction (`most_freq_bin > threshold` ⇒ gt).
+        let min_b = min_bin as i32;
+        let max_b = max_bin as i32;
+        let thr = threshold as i32;
+        let mut th = thr + min_b;
+        if most_freq_bin == 0 {
+            th -= 1;
+        }
+        let default_to_right = most_freq_bin as i32 > thr;
+        let go_right = move |global: u32| -> bool {
+            let bin = feature_bins.bin(global as usize) as i32;
+            if bin < min_b || bin > max_b {
+                default_to_right
+            } else {
+                bin > th
+            }
+        };
+
+        // Phase 1: per static-chunk, gather this chunk's left (route==0) and right
+        // (route==1) GLOBAL row ids, each in ascending within-chunk order. Chunks are a
+        // contiguous ascending partition so their order is deterministic.
+        let per_chunk: Vec<(Vec<u32>, Vec<u32>)> = leaf_rows
+            .par_chunks(PAR_SPLIT_CHUNK)
+            .map(|chunk| {
+                let mut left: Vec<u32> = Vec::new();
+                let mut right: Vec<u32> = Vec::new();
+                for &global in chunk {
+                    if go_right(global) {
+                        right.push(global);
+                    } else {
+                        left.push(global);
+                    }
+                }
+                (left, right)
+            })
+            .collect();
+
+        // Phase 2: exclusive prefix-sum the per-chunk left/right counts to disjoint write
+        // offsets. total_left = sum of chunk left-counts = the serial split_point. Left
+        // rows occupy `[begin, begin+total_left)`, right rows `[begin+total_left, begin+count)`.
+        let total_left: usize = per_chunk.iter().map(|(l, _)| l.len()).sum();
+
+        let mut left_off = Vec::with_capacity(per_chunk.len());
+        let mut right_off = Vec::with_capacity(per_chunk.len());
+        let mut lacc = begin;
+        let mut racc = begin + total_left;
+        for (l, r) in &per_chunk {
+            left_off.push(lacc);
+            right_off.push(racc);
+            lacc += l.len();
+            racc += r.len();
+        }
+
+        // Phase 3: scatter each chunk's left/right ids into its prefix-summed disjoint
+        // region of `indices_` in parallel (no atomics — chunks write non-overlapping
+        // ranges). Because chunk order is ascending and within-chunk order is preserved,
+        // the final `[all left | all right]` is byte-identical to the serial stable gather.
+        //
+        // SAFETY: each chunk writes exactly `[left_off[c], left_off[c]+l.len())` and
+        // `[right_off[c], right_off[c]+r.len())`; the prefix sums make these regions
+        // pairwise disjoint and all within `[begin, begin+count)`, so the parallel raw
+        // writes never alias. The slice base pointer + length bound the writes.
+        let base: *mut u32 = self.indices.as_mut_ptr();
+        let indices_len = self.indices.len();
+        debug_assert!(begin + count <= indices_len);
+        struct SendPtr(*mut u32);
+        // SAFETY: the disjoint, in-bounds offsets above guarantee no aliasing across threads.
+        unsafe impl Sync for SendPtr {}
+        let base = SendPtr(base);
+        let base_ref = &base;
+        per_chunk
+            .par_iter()
+            .zip(left_off.par_iter())
+            .zip(right_off.par_iter())
+            .for_each(|(((l, r), &lo), &ro)| {
+                let p = base_ref.0;
+                for (k, &id) in l.iter().enumerate() {
+                    // SAFETY: lo+k < begin+total_left <= begin+count <= indices_len, disjoint.
+                    unsafe {
+                        *p.add(lo + k) = id;
+                    }
+                }
+                for (k, &id) in r.iter().enumerate() {
+                    // SAFETY: ro+k < begin+count <= indices_len, disjoint from all left + other chunks.
+                    unsafe {
+                        *p.add(ro + k) = id;
+                    }
+                }
+            });
+
+        Ok(total_left)
     }
 
     /// `DataPartition::Split` for a CATEGORICAL split — routes `leaf`'s rows by the
@@ -305,5 +492,109 @@ mod tests {
         assert_eq!(dp.indices_in_leaf(2), &[3, 7]);
         // Leaf 0 untouched.
         assert_eq!(dp.indices_in_leaf(0), &[0, 2, 4, 6]);
+    }
+
+    /// Bit-exact merge gate (quick 260622-ia0): the rayon static-chunk + exclusive
+    /// prefix-sum parallel reorder MUST write a byte-identical leaf slice to the serial
+    /// Backend path. Force BOTH paths on the SAME synthetic large leaf via the
+    /// `LGBM_PAR_SPLIT_THRESHOLD` env knob (0 = force-parallel, usize::MAX = force-serial)
+    /// and assert the `indices_in_leaf` slices are equal. Mirrors the shape of
+    /// `build_histograms_parallel_equals_serial` (scattered rows, deterministic
+    /// hash-generated bins). The partition order is load-bearing for the histogram
+    /// subtraction trick, so any byte drift here would break the f64 anchor.
+    #[test]
+    fn split_parallel_equals_serial() {
+        // Run a leaf large enough to cross the parallel chunk count, with scattered
+        // global row ids, scattered bins, and randomized-but-fixed split params.
+        let rows: u32 = 5000;
+        let num_bin: u32 = 257; // forces BinColumn::U16 — exercises a non-u8 width
+        let min_bin: u32 = 3;
+        let max_bin: u32 = 250;
+        let threshold: u32 = 97;
+        let most_freq_bin: u32 = 0; // exercises the `th -= 1` branch
+
+        // Deterministic hash-generated bins in [0, num_bin), per global row.
+        let bins: Vec<u32> = (0..rows)
+            .map(|r| {
+                let h = (r as u64).wrapping_mul(2_654_435_761).wrapping_add(11);
+                (h % num_bin as u64) as u32
+            })
+            .collect();
+        let feature_bins = BinColumn::new(bins, num_bin);
+
+        // Scattered (non-identity) leaf row order: seed leaf 0 to a permutation of all
+        // rows so the per-row order the reorder must preserve is non-trivial. We build a
+        // DataPartition then overwrite leaf 0's indices with a scattered permutation.
+        let scattered: Vec<u32> = {
+            // Fisher-Yates-ish deterministic shuffle via index hashing into a Vec.
+            let mut v: Vec<u32> = (0..rows).collect();
+            for i in (1..rows as usize).rev() {
+                let j = ((i as u64).wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1)
+                    % (i as u64 + 1)) as usize;
+                v.swap(i, j);
+            }
+            v
+        };
+
+        // SERIAL path: the existing Backend `data_partition` gather, driven exactly as the
+        // serial branch of `split` would (count below the default threshold). We invoke it
+        // directly (not via the env gate) to avoid mutating the process-global env, which
+        // would race with the other lib tests running in parallel.
+        let serial: Vec<u32> = {
+            let backend = CpuBackend;
+            let client = cpu_client();
+            let mut dp = DataPartition::new(rows as i32, 4);
+            for (slot, &row) in scattered.iter().enumerate() {
+                dp.indices[slot] = row;
+            }
+            let begin = 0usize;
+            let count = rows as usize;
+            let leaf_rows: Vec<u32> = dp.indices[begin..begin + count].to_vec();
+            let leaf_feature_bins: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&row| feature_bins.bin(row as usize))
+                .collect();
+            let (reordered_local, _split_point) = backend
+                .data_partition(
+                    &client,
+                    &leaf_feature_bins,
+                    num_bin,
+                    min_bin,
+                    max_bin,
+                    threshold,
+                    most_freq_bin,
+                )
+                .expect("serial partition ok");
+            for (slot, &local_pos) in reordered_local.iter().enumerate() {
+                dp.indices[begin + slot] = leaf_rows[local_pos as usize];
+            }
+            dp.indices[0..rows as usize].to_vec()
+        };
+
+        // PARALLEL path: the rayon static-chunk + exclusive prefix-sum reorder, invoked
+        // directly on the same scattered leaf.
+        let parallel: Vec<u32> = {
+            let mut dp = DataPartition::new(rows as i32, 4);
+            for (slot, &row) in scattered.iter().enumerate() {
+                dp.indices[slot] = row;
+            }
+            dp.split_numeric_parallel(
+                0,
+                rows as usize,
+                &feature_bins,
+                num_bin,
+                min_bin,
+                max_bin,
+                threshold,
+                most_freq_bin,
+            )
+            .expect("parallel partition ok");
+            dp.indices[0..rows as usize].to_vec()
+        };
+
+        assert_eq!(
+            serial, parallel,
+            "parallel reorder is NOT byte-identical to the serial stable gather"
+        );
     }
 }

@@ -13,6 +13,12 @@ lgbm-dataset = { path = "../lgbm-dataset" }
 lgbm-compute = { path = "../lgbm-compute" }
 lgbm-model = { path = "../lgbm-model" }
 thiserror = { workspace = true }
+# Parallel row-reorder in `DataPartition::split` (quick 260622-ia0): a deterministic
+# static-chunk + exclusive prefix-sum scatter that mirrors C++'s `ParallelPartitionRunner`
+# (`data_partition.hpp` `schedule(static, 512) if num_data_ >= 1024`). Same version
+# already used in-tree by `lgbm-compute`; gated on a leaf-row threshold so small leaves
+# stay serial. Bit-exact to the serial path (`split_parallel_equals_serial`).
+rayon = "1.10"
 
 [features]
 # Example-only (`bench_split_scan`): forward `--features rocm` down to the facade
