@@ -30,3 +30,37 @@ Can `rocprof` / `omniperf` give **reliable per-kernel attribution** for the kern
 validity. If the tooling can't separate launch/sync from kernel, the profile is
 untrustworthy and the follow-on decision (kernel fix vs. GPU→CPU routing) is
 unsupported.
+
+---
+
+## Q2 — Fixed-point integer LDS atomics for the BUILD kernel vs the ~1e-6 ROCm parity budget
+
+**Raised:** 2026-06-22 (explore: GPU BUILD-kernel atomic-contention speedup)
+**Context:** `.planning/notes/gpu-build-atomic-contention-research.md`
+
+Research finding #3 says integer/fixed-point atomic accumulation of the histogram
+bins is a **double win** on AMD: the L2/Infinity-Fabric int-atomic path is faster
+than f32 `atomicAdd`, AND integer adds are **order-independent (deterministic)** —
+which would actually *help* parity vs the current f32-atomic non-determinism.
+
+But: the GPU integer kernel was already **null (W5)** under the quantized-training
+phase (CPU-only int hist shipped; GPU int = null), and fixed-point introduces
+quantization error against the f32 anchor.
+
+**The question — does it pay off under a DIFFERENT goal (contention, not approximate
+training)?**
+
+- The ROCm path owes only **~1e-6** vs the CPU f64 anchor (not bit-exact). With
+  enough fractional bits (i64 fixed-point, generous scale), can exact-gradient
+  fixed-point accumulation stay inside that budget while gaining AMD int-atomic
+  speed + determinism?
+- Why exactly was the W5 GPU int kernel null — launch/lowering issue, or no
+  device-time win? Does that root cause also kill the contention use-case, or was
+  it specific to the quantized-training plumbing?
+- How does fixed-point int-atomic device-time compare to **warp-aggregated f32
+  atomics** (spike `warp-aggregated-histogram-atomics`)? Are they complementary
+  (int + warp-aggregate) or substitutes?
+
+**Why it matters:** if int-atomics clear the ~1e-6 budget, they attack contention
+AND non-determinism at once — potentially a cleaner lever than warp-aggregation.
+Resolving the W5-null root cause decides whether to even spike it.
