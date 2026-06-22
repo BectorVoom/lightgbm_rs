@@ -1140,6 +1140,7 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
         gradients,
         hessians,
         h_out.clone(),
+        false, // f32 readback oracle: keep f32 atomics + f32 readback (phase-11)
     );
 
     let bytes = client.read_one_unchecked(h_out);
@@ -1731,11 +1732,22 @@ fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
     (s, max_w)
 }
 
-/// Shared RESIDENT RAW-build launch into a caller-provided zeroed f32 `h_out`
+/// Shared RESIDENT RAW-build launch into a caller-provided zeroed `h_out`
 /// (slot_len cells): LDS per-feature path when every feature ≤ 256 bins, else the
 /// naive `construct_leaf_hist_resident_kernel`. Used by both
 /// [`build_leaf_histograms_resident_f32_on`] and the resident chain
 /// [`build_fix_compact_resident_f64_on`] so the LDS/naive decision lives in ONE place.
+///
+/// `fixed_point` selects the LDS BUILD cell type (phase-11):
+///   - `false` → f32 atomics ([`construct_leaf_hist_resident_lds_kernel`]); `h_out` is an
+///     f32 buffer the caller reads back / widens as f32 (the readback oracle path).
+///   - `true`  → u64 two's-complement fixed-point atomics
+///     ([`construct_leaf_hist_resident_lds_kernel_u64`]); `h_out` is a u64 buffer the
+///     caller dequantizes `(bits as i64)/2^30 → f64` (the live `fix_compact_kernel` path).
+/// The NAIVE >256-bin fallback ALWAYS stays f32 (CONTEXT Claude's-discretion); a caller
+/// that requests `fixed_point` MUST guarantee every feature ≤ 256 bins (the resident
+/// chain does — `max_bin ≤ 255` keeps `max_w ≤ HIST_LDS_MAX`), else the f32 naive write
+/// would be mis-dequantized. The `fixed_point` path asserts the LDS branch was taken.
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 fn resident_raw_build_into<R: cubecl::Runtime>(
@@ -1751,6 +1763,9 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
     gradients: &[f32],
     hessians: &[f32],
     h_out: cubecl::server::Handle,
+    // phase-11: true → u64 fixed-point LDS build; false → f32 atomics. Naive fallback is
+    // always f32, so callers with `fixed_point=true` must keep every feature ≤ 256 bins.
+    fixed_point: bool,
 ) {
     let rows = leaf_rows.len();
     if rows == 0 || num_features == 0 {
@@ -1798,31 +1813,74 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // resident buffer's native width. ArrayArg element COUNT is width-independent
         // (num_features*num_data); the launch generic pins the element TYPE. Only one
         // match arm executes ⇒ the by-value handle moves are exclusive (sound).
-        macro_rules! launch_lds {
+        // phase-11: the LDS per-feature path dispatches EITHER the u64 FIXED-POINT build
+        // kernel (`fixed_point`, the live `fix_compact_kernel` chain) OR the f32-atomic
+        // original (the readback oracle). Both kernels share an IDENTICAL signature
+        // (resident gather, row-partition, slot args) — only the `out` cell type differs
+        // (Atomic<u64> vs Atomic<f32>), matching the `h_out` buffer the caller allocated.
+        // The naive >256-bin fallback arm below ALWAYS stays f32; a `fixed_point` caller
+        // must keep every feature ≤ 256 bins (asserted) so the u64 LDS branch is taken.
+        macro_rules! launch_lds_u64 {
+            ($w:ty) => {
+                unsafe {
+                    construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
+                        client,
+                        CubeCount::Static(num_features as u32, p, 1),
+                        CubeDim::new_1d(256),
+                        ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
+                        ArrayArg::from_raw_parts(h_rows.clone(), rows),
+                        ArrayArg::from_raw_parts(h_g.clone(), rows),
+                        ArrayArg::from_raw_parts(h_h.clone(), rows),
+                        ArrayArg::from_raw_parts(h_slot.clone(), num_features + 1),
+                        num_data,
+                        ArrayArg::from_raw_parts(h_out.clone(), slot_len),
+                    );
+                }
+            };
+        }
+        macro_rules! launch_lds_f32 {
             ($w:ty) => {
                 unsafe {
                     construct_leaf_hist_resident_lds_kernel::launch_unchecked::<$w, R>(
                         client,
                         CubeCount::Static(num_features as u32, p, 1),
                         CubeDim::new_1d(256),
-                        ArrayArg::from_raw_parts(resident_bins, num_features * num_data),
-                        ArrayArg::from_raw_parts(h_rows, rows),
-                        ArrayArg::from_raw_parts(h_g, rows),
-                        ArrayArg::from_raw_parts(h_h, rows),
-                        ArrayArg::from_raw_parts(h_slot, num_features + 1),
+                        ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
+                        ArrayArg::from_raw_parts(h_rows.clone(), rows),
+                        ArrayArg::from_raw_parts(h_g.clone(), rows),
+                        ArrayArg::from_raw_parts(h_h.clone(), rows),
+                        ArrayArg::from_raw_parts(h_slot.clone(), num_features + 1),
                         num_data,
-                        ArrayArg::from_raw_parts(h_out, slot_len),
+                        ArrayArg::from_raw_parts(h_out.clone(), slot_len),
                     );
                 }
             };
         }
-        match width {
-            crate::ResidentBinWidth::U8 => launch_lds!(u8),
-            crate::ResidentBinWidth::U16 => launch_lds!(u16),
-            crate::ResidentBinWidth::U32 => launch_lds!(u32),
+        if fixed_point {
+            match width {
+                crate::ResidentBinWidth::U8 => launch_lds_u64!(u8),
+                crate::ResidentBinWidth::U16 => launch_lds_u64!(u16),
+                crate::ResidentBinWidth::U32 => launch_lds_u64!(u32),
+            }
+        } else {
+            match width {
+                crate::ResidentBinWidth::U8 => launch_lds_f32!(u8),
+                crate::ResidentBinWidth::U16 => launch_lds_f32!(u16),
+                crate::ResidentBinWidth::U32 => launch_lds_f32!(u32),
+            }
         }
     } else {
-        // Naive fallback (a feature exceeds the 256-bin LDS cap).
+        // Naive fallback (a feature exceeds the 256-bin LDS cap). ALWAYS f32 (phase-11):
+        // the u64 fixed-point kernel is LDS-only. A `fixed_point` caller dequantizes
+        // `h_out` as u64 downstream, so an f32 naive write here would be mis-decoded —
+        // guard the (can't-happen for max_bin ≤ 255) case loudly rather than corrupt.
+        assert!(
+            !fixed_point,
+            "resident_raw_build_into: fixed_point u64 build requires every feature ≤ 256 \
+             bins (max_w ≤ HIST_LDS_MAX); a feature exceeded the LDS cap so the f32 naive \
+             fallback fired, which the u64 dequant would mis-decode. Raise max_bin handling \
+             or keep the resident chain ≤ 256 bins (phase-11 spike-018)."
+        );
         let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
         let total = num_features * rows;
@@ -1911,18 +1969,22 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
 #[cfg(feature = "rocm")]
 #[cube(launch_unchecked)]
 pub fn fix_compact_kernel(
-    // f32 RAW histogram (construct-kernel output) — INPUT, read-only.
-    h_raw: &Array<f32>,
+    // phase-11: u64 FIXED-POINT RAW histogram (u64 build-kernel output) — INPUT, read-only.
+    // Each cell holds a two's-complement i64 (stored as u64 bits) = `round(value*2^30)`.
+    h_raw: &Array<u64>,
     // f64 fixed+compacted histogram — OUTPUT (caller zeroes it before launch).
     hist: &mut Array<f64>,
     slot_off: &Array<u32>,
     num_bin: &Array<i32>,
     offset: &Array<i32>,
     most_freq_bin: &Array<i32>,
-    // LEAF-LEVEL scalars (shared across the batch) — the RAW (un-bumped) totals.
+    // LEAF-LEVEL scalars (shared across the batch) — the RAW (un-bumped) f64 totals.
+    // These are HOST-side exact f64 sums, NEVER quantized — used as-is below.
     sum_gradient: f64,
     sum_hessian: f64,
 ) {
+    // phase-11 dequant scale S = 2^30 (matches the build-side SCALE_F32; f64 here).
+    const SCALE_F64: f64 = 1_073_741_824.0; // 2^30
     let f = CUBE_POS_X;
     let fi = f as usize;
     let base = slot_off[fi] as usize;
@@ -1930,15 +1992,16 @@ pub fn fix_compact_kernel(
     let mfb = most_freq_bin[fi];
     let off = offset[fi];
 
-    // ---- FOLDED WIDEN (260608-s2b Lever A; was widen_f32_to_f64_kernel) ----
-    // Widen THIS feature's whole region f32→f64 into the output BEFORE the fix/
-    // compact reads it. `f64::cast_from` is the same cast the standalone widen used,
-    // so the f64 cells the fix below folds over are bit-identical to the prior
-    // widen-then-fix-in-place path. Ascending bin order; covers both cells per bin.
+    // ---- FOLDED DEQUANT (phase-11; was the f32→f64 widen of 260608-s2b Lever A) ----
+    // Dequantize THIS feature's whole region u64-bits → i64 → f64/2^30 into the output
+    // BEFORE the fix/compact reads it (reproduces the host dequant from
+    // gpu_fixedpoint_i64.rs:191 cell-by-cell). The result is an f64 buffer with the SAME
+    // shape the prior f32 widen produced, so the FixHistogram fold + compact below are
+    // BYTE-UNCHANGED — they operate on the already-f64 `hist`. Ascending bin order.
     for w in 0..nb {
         let wbi = base + (w as usize) * 2;
-        hist[wbi] = f64::cast_from(h_raw[wbi]);
-        hist[wbi + 1] = f64::cast_from(h_raw[wbi + 1]);
+        hist[wbi] = f64::cast_from(i64::cast_from(h_raw[wbi])) / SCALE_F64;
+        hist[wbi + 1] = f64::cast_from(i64::cast_from(h_raw[wbi + 1])) / SCALE_F64;
     }
 
     // ---- FixHistogram (fix_histogram.rs:50-80, Dataset::FixHistogram) ----
@@ -2074,8 +2137,17 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
         mfb_a.push(most_freq_bin as i32);
     }
 
-    // f32 RAW INPUT + zeroed f64 OUTPUT (the folded kernel widens raw→out inline).
-    let h_raw = client.create_from_slice(f32::as_bytes(raw));
+    // phase-11: `fix_compact_kernel` now consumes a u64 FIXED-POINT RAW buffer and
+    // dequantizes `(bits as i64)/2^30 → f64` in its widen pass. This launcher receives
+    // an f32 RAW histogram (the test/oracle path builds it host-side), so quantize each
+    // cell `round(v*2^30) → i64 → bits-as-u64` here to match the live u64 build kernel —
+    // the dequant in-kernel inverts it (round-trip exact for integer-valued cells, ≤
+    // 1/2^30 abs error otherwise, well within the ~1e-6 ROCm gate). The fix/compact fold
+    // below is byte-unchanged; only the RAW cell encoding changed.
+    const SCALE_FC: f32 = 1_073_741_824.0; // 2^30 (matches SCALE_F32 / SCALE_F64)
+    let raw_q: Vec<u64> =
+        raw.iter().map(|&v| (v * SCALE_FC).round() as i64 as u64).collect();
+    let h_raw = client.create_from_slice(u64::as_bytes(&raw_q));
     let zeros64 = vec![0.0f64; raw.len()];
     let h_hist = client.create_from_slice(f64::as_bytes(&zeros64));
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
@@ -2191,8 +2263,13 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     // LDS-privatized per-feature build when every feature ≤ 256 bins (naive fallback
     // otherwise) — the SAME `resident_raw_build_into` the readback launcher uses, so
     // the resident-pool chain and the host path share one accumulation structure.
-    let zeros32 = vec![0.0f32; slot_len];
-    let h_raw = client.create_from_slice(f32::as_bytes(&zeros32));
+    // phase-11: u64 fixed-point RAW merge target (was f32). The u64 LDS build accumulates
+    // `round(v*2^30)` as two's-complement i64-bits; `fix_compact_kernel` dequantizes
+    // `(bits as i64)/2^30 → f64` in its widen pass. The grad/hess INPUTS (`h_g`/`h_h` in
+    // `resident_raw_build_into`) STAY f32 — the kernel quantizes them in-kernel; ONLY this
+    // merge target widened to u64. Same `slot_len` element COUNT, 2× bytes.
+    let zeros_u64 = vec![0u64; slot_len];
+    let h_raw = client.create_from_slice(u64::as_bytes(&zeros_u64));
     resident_raw_build_into(
         client,
         resident_bins,
@@ -2205,6 +2282,7 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         gradients,
         hessians,
         h_raw.clone(),
+        true, // u64 fixed-point build → dequantized in fix_compact_kernel (phase-11)
     );
 
     // ---- 2. (260608-s2b Lever A) Allocate the zeroed f64 OUTPUT. The standalone
