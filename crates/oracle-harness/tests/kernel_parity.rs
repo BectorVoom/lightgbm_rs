@@ -1876,6 +1876,172 @@ mod hip {
         }
     }
 
+    /// quick-260622-t4u — WR-05 (Phase 11, 11-VERIFICATION.md): the P>1 sibling of
+    /// `kernel_parity_resident_build_fix_compact_equals_host_on_hip`. The P=1 test above
+    /// uses a 10-row leaf, so `row_partition_count` returns 1 and the **multi-cube
+    /// row-partitioned additive merge** (each of P cubes builds a partial u64
+    /// sub-histogram, all atomic-merge into the same global slot) is NEVER anchor-checked.
+    /// This test self-forces P>1 via a >=256k-row leaf (design_decision approach B — NO
+    /// env mutation, so the OnceLock-cached target is irrelevant) and pins the u64
+    /// fixed-point read-back to the bit-exact CPU f64 anchor. Closes the WR-05 coverage gap.
+    ///
+    /// The P>1 multi-cube merge is integer-additive (order-independent) so we expect
+    /// near-bit-exact parity (`max_rel ~= 0`), gated at the SAME tightened
+    /// `FIXEDPOINT_REL_GATE = 1e-7` as the P=1 test. A `row_partition_count > 1` guard
+    /// asserts the headline regime was genuinely reached, so a refactor that silently
+    /// drops to P=1 fails loudly here.
+    #[test]
+    fn kernel_parity_resident_build_fix_compact_p_gt_1_equals_host_on_hip() {
+        use lgbm_compute::kernels::histogram::{
+            build_fix_compact_resident_readback_f64_on, construct_histograms_cpu,
+            row_partition_count, upload_resident_columns,
+        };
+        use lgbm_treelearner::fix_histogram;
+
+        let hip = rocm_client();
+        let cpu = cpu_client();
+
+        // 3 features (the existing test's spine: bins [4,3,5], mfb [2,0,1], offset [0,1,0])
+        // over a >=256k-row leaf so the DEFAULT row_partition_count yields P>1 with NO env
+        // mutation: target (8-CU APU) = 64, num_features = 3 < 64 ⇒ clamp(64/3,1,16) = 16.
+        let num_data = 300_000usize;
+        let num_bins: Vec<u32> = vec![4, 3, 5];
+        let mfbs: Vec<u32> = vec![2, 0, 1];
+        let offsets: Vec<i32> = vec![0, 1, 0];
+        // Deterministic per-feature bins via `row % num_bin` (every bin populated so the
+        // fix/compact passes still fire).
+        let f0: Vec<u32> = (0..num_data).map(|i| (i % 4) as u32).collect();
+        let f1: Vec<u32> = (0..num_data).map(|i| (i % 3) as u32).collect();
+        let f2: Vec<u32> = (0..num_data).map(|i| (i % 5) as u32).collect();
+        let feature_bins: Vec<&[u32]> = vec![&f0, &f1, &f2];
+
+        let mut slot_off = Vec::with_capacity(num_bins.len());
+        let mut acc = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(acc);
+            acc += 2 * nb as usize;
+        }
+        let slot_len = acc;
+
+        // ALL rows in the leaf ⇒ leaf_rows.len() = 300_000 >= ROWPART_MIN_LEAF (256_000).
+        let leaf_rows: Vec<u32> = (0..num_data as u32).collect();
+        // Small bounded deterministic g/h so the build's overflow guard
+        // (rows*max_abs*2^30 < i64::MAX) holds: 300k * 3.5 * 2^30 ~= 1.1e15 << 9.2e18.
+        let gradients: Vec<f32> = (0..num_data).map(|i| 0.25 + (i % 7) as f32 * 0.5).collect();
+        let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
+
+        // ---- P>1 GUARD: assert the multi-cube row-partitioned merge is genuinely
+        // exercised. Without this, the test could pass while silently testing P=1 (the
+        // exact WR-05 trap). Uses the now-`pub` rocm-gated heuristic.
+        let p = row_partition_count(feature_bins.len(), leaf_rows.len());
+        assert!(
+            p > 1,
+            "WR-05 GUARD: row_partition_count({}, {}) = {p} <= 1 — this test is MEANINGLESS \
+             at P=1 (it must exercise the multi-cube row-partitioned additive merge). A \
+             refactor silently dropped the row-partition path to a single cube; fix the \
+             heuristic or this test's sizing so P>1.",
+            feature_bins.len(),
+            leaf_rows.len()
+        );
+        eprintln!(
+            "resident u64 P>1 build: row_partition_count({}, {}) = {p} (P>1 multi-cube merge)",
+            feature_bins.len(),
+            leaf_rows.len()
+        );
+
+        // Leaf RAW totals over the leaf rows (un-bumped) — Pitfall 2.
+        let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
+        let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
+
+        // ---- CPU f64 ANCHOR (def-f8u-01: the reference is the bit-exact CPU fold, NOT a
+        //      second GPU launcher). Per feature: gather the leaf rows' (bin, grad, hess),
+        //      fold with `construct_histograms_cpu`, then apply the SAME host fix + compact
+        //      the GPU chain runs on device.
+        let mut anchor: Vec<f64> = vec![0.0; slot_len];
+        for fpos in 0..num_bins.len() {
+            let nb = num_bins[fpos];
+            let cells = 2 * nb as usize;
+            let binned: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&r| feature_bins[fpos][r as usize])
+                .collect();
+            let g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+            let h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+            let raw = construct_histograms_cpu(&cpu, &binned, &g, &h, nb)
+                .expect("cpu f64 anchor fold");
+            let region = &mut anchor[slot_off[fpos]..slot_off[fpos] + cells];
+            region.copy_from_slice(&raw);
+            // SAME host fix + compact the on-device chain applies.
+            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
+            host_compact_histogram(region, offsets[fpos]);
+        }
+
+        // ---- GPU resident chain: u64 fixed-point build→fix→compact on device, read back.
+        let fix_feats: Vec<(usize, u32, i32, u32)> = (0..num_bins.len())
+            .map(|fpos| (slot_off[fpos], num_bins[fpos], offsets[fpos], mfbs[fpos]))
+            .collect();
+        let run_gpu = || {
+            build_fix_compact_resident_readback_f64_on(
+                &hip,
+                upload_resident_columns(&hip, &feature_bins),
+                lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
+                feature_bins.len(),
+                num_data,
+                &slot_off,
+                slot_len,
+                &leaf_rows,
+                &gradients,
+                &hessians,
+                &fix_feats,
+                sum_g,
+                sum_h,
+            )
+            .expect("resident build_fix_compact readback (P>1)")
+        };
+        let gpu = run_gpu();
+
+        assert_eq!(gpu.len(), slot_len, "resident chain length");
+        assert_eq!(anchor.len(), slot_len, "anchor chain length");
+
+        // ---- TIGHTENED fixed-point gate, pinned to the CPU f64 anchor (SAME gate as the
+        // P=1 test). The P>1 multi-cube merge is integer-additive ⇒ order-independent, so
+        // the residual stays bounded quantize-rounding error, not f32 cancellation.
+        const FIXEDPOINT_REL_GATE: f64 = 1e-7;
+        let mut max_rel = 0.0f64;
+        for (i, (&g, &a)) in gpu.iter().zip(anchor.iter()).enumerate() {
+            let rel = (g - a).abs() / a.abs().max(1.0);
+            assert!(
+                rel <= FIXEDPOINT_REL_GATE,
+                "FIXED-POINT P>1 PARITY FAIL at cell {i}: gpu={g}, cpu_anchor={a}, \
+                 rel={rel:.3e} > FIXEDPOINT_REL_GATE={FIXEDPOINT_REL_GATE:.0e} — the u64 \
+                 multi-cube row-partitioned resident build (P={p}) diverged from the CPU f64 \
+                 anchor beyond quantize-rounding error. A real fixed-point / merge regression."
+            );
+            max_rel = max_rel.max(rel);
+        }
+        eprintln!(
+            "resident u64 P>1 fixed-point build: P={p}, max_rel_vs_cpu_f64_anchor={max_rel:.3e} \
+             (gate={FIXEDPOINT_REL_GATE:.0e}, spike-018 ref ~5.9e-9)"
+        );
+
+        // ---- DETERMINISM: two u64 P>1 resident builds over identical inputs must be
+        // bit-equal on every read-back f64 cell. Integer add is order-independent across
+        // the P cubes ⇒ deterministic by construction.
+        let gpu_again = run_gpu();
+        assert_eq!(gpu_again.len(), slot_len, "determinism: length drift");
+        for (i, (&a, &b)) in gpu.iter().zip(gpu_again.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "DETERMINISM FAIL at cell {i}: run1={a} (bits {:#018x}) != run2={b} \
+                 (bits {:#018x}) — the u64 fixed-point P>1 resident build is NOT bit-equal \
+                 across two runs",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
+    }
+
     /// 260608-p90 Task 1E — the Handle-consuming fused split scan
     /// (`find_best_splits_batched_fused_f64_from_handle_on`) must be BIT-IDENTICAL to
     /// the host-buf fused scan (`find_best_splits_batched_fused_f64_on`): for the SAME
