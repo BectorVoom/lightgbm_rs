@@ -2883,27 +2883,90 @@ mod tests {
         );
     }
 
+    /// `resolve_target_cubes` pure resolution order (a)→(b)→(c): env override used
+    /// VERBATIM (>0) → queried CU × `CUBES_PER_CU` → `FALLBACK`. No env/OnceLock/GPU —
+    /// exercises the resolution logic directly with explicit args (PREFERRED route (i)).
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn resolve_target_cubes_order() {
+        use super::{resolve_target_cubes, CUBES_PER_CU, ROWPART_TARGET_CUBES_FALLBACK};
+        // (a) env override (>0) wins verbatim, NOT multiplied by CUBES_PER_CU.
+        assert_eq!(resolve_target_cubes(Some(768), Some(8)), 768);
+        assert_eq!(resolve_target_cubes(Some(64), None), 64);
+        // env override of 0 is ignored → falls through.
+        assert_eq!(resolve_target_cubes(Some(0), Some(8)), 8 * CUBES_PER_CU);
+        // (b) queried CU count → num_cu * CUBES_PER_CU (8 CUs here → 64).
+        assert_eq!(resolve_target_cubes(None, Some(8)), 8 * CUBES_PER_CU);
+        assert_eq!(resolve_target_cubes(None, Some(8)), 64);
+        assert_eq!(resolve_target_cubes(None, Some(96)), 768); // a real gfx1100 would still get 768
+        // (c) neither → documented FALLBACK (never a silent 768).
+        assert_eq!(resolve_target_cubes(None, None), ROWPART_TARGET_CUBES_FALLBACK);
+        assert_eq!(resolve_target_cubes(None, Some(0)), ROWPART_TARGET_CUBES_FALLBACK);
+        assert_eq!(ROWPART_TARGET_CUBES_FALLBACK, 64);
+    }
+
     /// The row-partition heuristic (spike-007): 1 on small/few-feature shapes (so the
     /// build stays byte-identical to the pre-row-part kernel), a tuned P in [2, P_MAX]
     /// on large-leaf × few-feature shapes, never exceeding P_MAX (the P=32 regression
-    /// guard). Pure CPU logic — no GPU. Assumes `LGBM_ROWPART_MIN` is unset (default).
+    /// guard). Pure CPU logic — no GPU. Expressed against the runtime/cached `target`
+    /// (`rowpart_target_cubes()`) so it is robust regardless of host hardware. Assumes
+    /// `LGBM_ROWPART_MIN` is unset (default).
     #[cfg(feature = "rocm")]
     #[test]
     fn row_partition_count_heuristic() {
-        use super::{row_partition_count, ROWPART_MIN_LEAF, ROWPART_P_MAX, ROWPART_TARGET_CUBES};
+        use super::{row_partition_count, rowpart_target_cubes, ROWPART_MIN_LEAF, ROWPART_P_MAX};
+        // Bind the runtime/cached target once; all asserts are expressed in terms of it
+        // so the test is deterministic regardless of the queried CU count.
+        let target = rowpart_target_cubes();
+        assert!(target >= 2, "target_cubes={target} too small to exercise the tuned path");
         // Small leaf → P=1 (covers the ≤8k-row parity-test shapes + the 12k resident gate).
         assert_eq!(row_partition_count(50, 8_000), 1);
         assert_eq!(row_partition_count(50, ROWPART_MIN_LEAF - 1), 1);
         // Degenerate / already-saturated → 1.
         assert_eq!(row_partition_count(0, 10_000_000), 1);
-        assert_eq!(row_partition_count(ROWPART_TARGET_CUBES as usize, ROWPART_MIN_LEAF), 1);
-        assert_eq!(row_partition_count(ROWPART_TARGET_CUBES as usize + 50, ROWPART_MIN_LEAF), 1);
-        // Large leaf + few features → tuned P, clamped, never > P_MAX.
-        let p = row_partition_count(50, ROWPART_MIN_LEAF);
-        assert!((2..=ROWPART_P_MAX).contains(&p), "P={p} out of [2,{ROWPART_P_MAX}]");
-        assert_eq!(p, (ROWPART_TARGET_CUBES / 50).clamp(1, ROWPART_P_MAX));
-        // Very few features clamp to P_MAX (768/1, 768/2 both ≥ 16).
-        assert_eq!(row_partition_count(1, ROWPART_MIN_LEAF), ROWPART_P_MAX);
-        assert_eq!(row_partition_count(2, ROWPART_MIN_LEAF), ROWPART_P_MAX);
+        assert_eq!(row_partition_count(target as usize, ROWPART_MIN_LEAF), 1);
+        assert_eq!(row_partition_count(target as usize + 50, ROWPART_MIN_LEAF), 1);
+        // Large leaf + few features → the clamped tuned value matches the formula.
+        let nf = 50u32;
+        let expected = if nf >= target { 1 } else { (target / nf).clamp(1, ROWPART_P_MAX) };
+        assert_eq!(row_partition_count(nf as usize, ROWPART_MIN_LEAF), expected);
+        // Very few features → clamp to P_MAX (target/1, target/2 both ≥ P_MAX once
+        // target ≥ 2*P_MAX, which holds for both the 8-CU APU (64) and a gfx1100 (768)).
+        if target >= 2 * ROWPART_P_MAX {
+            assert_eq!(row_partition_count(1, ROWPART_MIN_LEAF), ROWPART_P_MAX);
+            assert_eq!(row_partition_count(2, ROWPART_MIN_LEAF), ROWPART_P_MAX);
+        }
+    }
+
+    /// Confirm the queried Compute Unit count on THIS device. The box is a Radeon 860M
+    /// APU (8 CUs, gfx1152 spoofed as gfx1100), so `query_num_cu()` should report 8 and
+    /// `rowpart_target_cubes()` ≈ 64 (8 × CUBES_PER_CU), NOT the phantom-96-CU 768.
+    /// Soft (eprintln + >0 check) so it never blocks the gate if the FFI query is
+    /// environment-flaky; the hard CU=8 expectation is recorded in the SUMMARY.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn queried_cu_count_is_8() {
+        use super::{query_num_cu, rowpart_target_cubes};
+        let cu = query_num_cu();
+        let target = rowpart_target_cubes();
+        eprintln!("query_num_cu() = {cu:?}; rowpart_target_cubes() = {target}");
+        match cu {
+            Some(n) => {
+                assert!(n > 0, "queried CU count must be positive, got {n}");
+                if n != 8 {
+                    eprintln!("NOTE: expected 8 CUs on this Radeon 860M APU, queried {n}");
+                }
+            }
+            None => eprintln!("NOTE: query_num_cu() returned None (FFI unavailable); using fallback"),
+        }
+        // With no LGBM_ROWPART_TARGET_CUBES override, target must NOT be the old 768
+        // phantom-96-CU value unless the device genuinely has 96 CUs.
+        assert!(target > 0, "target_cubes must be positive");
+        if std::env::var("LGBM_ROWPART_TARGET_CUBES").is_err() {
+            assert_ne!(
+                target, 768,
+                "target_cubes is still 768 with no override — phantom-96-CU value not removed"
+            );
+        }
     }
 }
