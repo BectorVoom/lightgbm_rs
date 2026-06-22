@@ -6,6 +6,13 @@ planted_date: 2026-06-22
 
 # Seed: f32 parallel-atomic on-device scan (ROCm)
 
+> **⚠️ INVALIDATED by spike-015 (2026-06-22).** This seed assumed the bottleneck was a
+> sequential-f64 build/scan switchable to f32. Spike-015 found the wide build ALREADY
+> runs parallel f32-atomic and the real cost is that build's atomic-contention compute
+> (86–92%), not precision. There is no "f32 scan path" lever to plant. Superseded by the
+> spike-015 forward lever (finer per-warp LDS sub-histogram privatization) + the routing
+> reality (CPU beats GPU ~4× on wide shapes). Kept for trail; do not promote.
+
 ## Idea
 
 Replace the GPU resident scan's **sequential-f64** build+scan

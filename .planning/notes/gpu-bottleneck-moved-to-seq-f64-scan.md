@@ -4,6 +4,15 @@ date: 2026-06-22
 context: gsd-explore — "investigate gpu kernel bottleneck on large data"
 ---
 
+> **⚠️ CORRECTED BY SPIKE-015 (2026-06-22).** The "sequential-f64 SCAN" diagnosis below
+> was a double inference error, falsified by reading the code + the `LGBM_SCAN_DRAIN`
+> re-attribution. The real wide-shape bottleneck is the **f32-atomic histogram BUILD**
+> (86–92%, grows with rows; the "scan=96%" was an async-readback artifact — the un-synced
+> build drains inside the scan's `read_one_unchecked`). The fused-f64 path is OFF by
+> default and the wide build already runs parallel f32-atomic. See
+> `.planning/spikes/015-parallel-f32-resident-build/README.md` for the corrected story.
+> The original text is kept below for the investigation trail.
+
 # GPU train bottleneck moved to the on-device sequential-f64 SCAN
 
 ## TL;DR

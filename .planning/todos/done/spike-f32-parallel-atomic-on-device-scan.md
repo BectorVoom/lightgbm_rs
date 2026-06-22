@@ -8,6 +8,12 @@ run_with: /gsd-spike
 
 # Spike: f32 parallel-atomic on-device scan (ROCm)
 
+> **✅ RESOLVED → executed as spike-015 (2026-06-22).** Outcome: premise INVALIDATED.
+> The wide build already runs parallel f32-atomic; the real bottleneck is that build's
+> atomic-contention compute (86–92%, grows with rows), not precision or the scan
+> round-trip. Full result:
+> `.planning/spikes/015-parallel-f32-resident-build/README.md`. This todo is closed.
+
 ## Hypothesis
 
 The GPU SCAN being 9.6× the CPU scan ([[gpu-bottleneck-moved-to-seq-f64-scan]]) is
