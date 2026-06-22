@@ -13,6 +13,11 @@
 //! the large-leaf gate so the small-shape contract is unaffected.
 //!
 //! Run: cargo test --release --features rocm -p lgbm-compute --test rocm_row_partition
+//!
+//! Phase 11 classification: this drives the NON-RESIDENT batched f32 launcher
+//! (`build_leaf_histograms_batched_f32_on`), which Plan 11-01 LEFT f32/UNCHANGED.
+//! Its existing 1e-5/5e-5 tolerances are confirmation-only here — NOT tightened and
+//! NOT relaxed (the fixed-point re-pin is the resident path, in oracle-harness Task 1).
 #![cfg(feature = "rocm")]
 
 use lgbm_compute::kernels::histogram::build_leaf_histograms_batched_f32_on;
