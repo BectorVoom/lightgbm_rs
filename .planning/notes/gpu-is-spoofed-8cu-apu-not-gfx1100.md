@@ -54,6 +54,10 @@ is roughly what that hardware class sustains — it was never a 96-CU discrete g
 3. If discrete-GPU performance matters, **re-benchmark on real gfx1100/gfx110x hardware**
    before trusting any GPU-vs-CPU routing conclusion; and **re-tune `ROWPART_TARGET_CUBES`
    to the actual CU count** (query `rocminfo` Compute Unit at runtime instead of hardcoding 96).
+   → **DONE (quick-260622-jcr):** `rowpart_target_cubes()` now queries the device at runtime
+   (HIP `multiProcessorCount × 8`, cached); the hardcoded 768 is gone. On this device it
+   resolves to 32 (HIP reports 4 WGPs). A/B was a wash (memory-bound iGPU) — the value is
+   correctness, not speed. The "re-benchmark on real discrete hardware" recommendation stands.
 
 ## Reproduce
 
