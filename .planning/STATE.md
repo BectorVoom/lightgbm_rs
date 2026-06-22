@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Awaiting next milestone
-stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-06-21T05:25:27.604Z"
-last_activity: 2026-06-21 — Milestone v1.0 completed and archived
+status: executing
+stopped_at: Completed 11-01-PLAN.md
+last_updated: "2026-06-22T09:48:00.405Z"
+last_activity: 2026-06-22 -- Completed 11-01 (u64 fixed-point resident histogram build)
 progress:
-  total_phases: 8
-  completed_phases: 8
-  total_plans: 55
-  completed_plans: 55
-  percent: 100
+  total_phases: 3
+  completed_phases: 1
+  total_plans: 5
+  completed_plans: 2
+  percent: 33
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** v1.0 shipped — planning next milestone (candidate: GPU large-data perf investigation; see `notes/gpu-large-data-bottleneck-framing.md`).
+**Current focus:** Phase 11 — gpu-fixedpoint-int-atomics
 
 ## Current Position
 
-Phase: Milestone v1.0 complete (archived → `milestones/v1.0-*`)
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-06-22 — Quick task 260622-k4g: grid-stride parallelized the GPU histogram-subtract kernel (was single-lane, ~32% of device time) → 2.19% (~14×), BIT-EXACT (f64 live + f32 mirror), all gates green incl hip parity on hardware. Found via CubeCL profiling (the only working GPU profiler on this gfx1152 APU)
+Phase: 11 (gpu-fixedpoint-int-atomics) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute (11-01 complete)
+Last activity: 2026-06-22 -- Completed 11-01 (u64 fixed-point resident histogram build)
 
 ## Deferred Items
 
@@ -497,6 +497,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 08 P08-06 | 35min | 3 tasks | 7 files |
 | Phase 08 P08-07 | 19min | 3 tasks | 7 files |
 | Phase 08 P08-08 | 12min | 2 tasks | 4 files |
+| Phase 11 P01 | 35 | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -568,6 +569,8 @@ Recent decisions affecting current work:
 - [Phase ?]: lgb.cv per-fold binning scope differs from real lightgbm; bit-exact cv parity needs a _core subset/reference capability (new Rust)
 - [Phase ?]: 08-08: PyO3 Booster persistence + pickle via __reduce__ routes unpickle through the validated lgbm-model loader (Security V5)
 - [Phase ?]: 08-08: cross-format parity proven — a real lightgbm 4.6 text model loads in lightgbm_rs and predicts within atol 1e-6 (D-10); Phase 8 (python-bindings) COMPLETE
+- [Phase ?]: Phase 11-01: ROCm resident histogram BUILD now uses u64 two's-complement fixed-point (S=2^30) integer LDS atomics (Atomic<u64>, never Atomic<i64>); dequant (bits as i64)/2^30->f64 confined to fix_compact_kernel; downstream f64 unchanged; i64@2^30 overflow guard at the resident-build boundary
+- [Phase ?]: Phase 11-01: resident_raw_build_into gained a fixed_point flag so the live u64 chain + the f32 readback oracle share one resident-build path; naive >256-bin fallback stays f32 (asserted unreachable when fixed_point)
 
 ### Pending Todos
 
@@ -597,7 +600,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-08T00:21:00.688Z
+Last session: 2026-06-22T09:47:53.554Z
 Stopped at: Completed 08-05-PLAN.md
 Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md
 
