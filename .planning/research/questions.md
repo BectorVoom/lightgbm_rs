@@ -64,3 +64,23 @@ training)?**
 **Why it matters:** if int-atomics clear the ~1e-6 budget, they attack contention
 AND non-determinism at once — potentially a cleaner lever than warp-aggregation.
 Resolving the W5-null root cause decides whether to even spike it.
+
+### Q2 — RESOLVED (spike-018, 2026-06-22)
+
+**VALIDATED STRONG — the parity gate opens AND there's a speed win, flipping the W5 framing.**
+`.planning/spikes/018-fixedpoint-int-atomics/README.md`.
+
+- **Parity (018a CPU probe):** wide i64 fixed-point @ S=2^30 is within ~1e-6 of the f64
+  anchor on all cases (EXACT in the cancelling regime), **~10^3–10^4× more accurate than
+  the f32 path**, and order-independent (deterministic). Opposite of spike-008 (int16 too
+  coarse); i32 overflows so i64 is required.
+- **W5-null root cause:** W5 benched packed-int at row-partitioned P=16 (LOW per-cube
+  contention) → null. At the wide P=1 (HIGH contention) regime, f32 `atomicAdd` on RDNA
+  is a CAS retry loop (`ds_cmpst`) that explodes; integer `ds_add_u64` is native
+  single-instruction. Both right per regime.
+- **Speed (018b GPU):** u64 two's-complement atomics (i64 blocked by a cubecl-hip 0.10
+  `atomicExch(long long*)` codegen gap) → **i64/f32 = 1.80×/2.06×, SEP-WIN, 2 process runs.**
+- **vs warp-aggregation (Q-implied) / spike-017:** orthogonal and complementary. Fixed-point
+  is the strongest single lever (~1.9× + accuracy + determinism); could compose with
+  per-warp replication (spike-017). Disposition (wire it? major change + oracle parity
+  re-pin) is pending a human decision.
