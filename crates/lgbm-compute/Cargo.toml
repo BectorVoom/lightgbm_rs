@@ -10,6 +10,13 @@ lgbm-core = { path = "../lgbm-core" }
 lgbm-dataset = { path = "../lgbm-dataset" }
 thiserror = { workspace = true }
 rayon = "1.10"
+# rocm-only, optional: direct FFI to query the device's actual Compute Unit count
+# (`hipGetDevicePropertiesR0600().multiProcessorCount`) so the row-partition
+# occupancy target derives from real hardware instead of a hardcoded phantom-96-CU
+# value. Already a transitive dep of cubecl-hip (lockfile 7.1.x); promoting it to a
+# DIRECT optional dep gated on `rocm` keeps the default cpu build from compiling or
+# linking it (SC#1). Its own build.rs auto-selects the right ROCm bindings.
+cubecl-hip-sys = { version = "7", optional = true }
 
 [features]
 # `cpu` (default) keeps the cubecl-cpu reference runtime always available — it is
@@ -17,7 +24,7 @@ rayon = "1.10"
 # CPU-only build needs no ROCm toolchain present (SC#1, CMP-03 prep).
 default = ["cpu"]
 cpu = []
-rocm = ["cubecl/hip"]
+rocm = ["cubecl/hip", "dep:cubecl-hip-sys"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }

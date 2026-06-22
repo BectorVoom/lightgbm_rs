@@ -2139,6 +2139,7 @@ name = "lgbm-compute"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "cubecl-hip-sys",
  "lgbm-core",
  "lgbm-dataset",
  "oracle-harness",

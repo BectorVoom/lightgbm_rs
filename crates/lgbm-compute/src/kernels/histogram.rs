@@ -632,16 +632,99 @@ const HIST_LDS_MAX: usize = 512;
 /// large-leaf f32 divergence the spike found (4e-7→~2e-5 rel) only appears above this gate.
 #[cfg(feature = "rocm")]
 const ROWPART_MIN_LEAF: usize = 256_000;
-/// ~8 workgroups × 96 CUs (gfx1100). Total target cubes across all features.
+/// Target cubes per Compute Unit — preserves spike-007's "~8 workgroups/CU" intent.
+/// `target_cubes = num_cu * CUBES_PER_CU` (queried at runtime, cached once).
 #[cfg(feature = "rocm")]
-const ROWPART_TARGET_CUBES: u32 = 768;
+const CUBES_PER_CU: u32 = 8;
+/// Documented safe small default for an APU-class device when EVERY CU-count query
+/// fails — explicitly NOT 768 (which was the phantom-96-CU value: `8 wkgrps × 96 CU`).
+/// 64 = `8 wkgrps × 8 CU`, matching the real 8-CU Radeon 860M APU on this box.
+#[cfg(feature = "rocm")]
+const ROWPART_TARGET_CUBES_FALLBACK: u32 = 64;
 /// Spike-007 sweet spot; clamp so we never over-partition into the P=32 regression.
 #[cfg(feature = "rocm")]
 const ROWPART_P_MAX: u32 = 16;
 
+/// Pure resolution of the row-partition target-cubes value, factored out so it is
+/// unit-testable without an env var, a OnceLock, or a GPU (mirrors the "pure CPU
+/// logic, no device handle" property of [`row_partition_count`]).
+///
+/// Resolution order (a)→(b)→(c):
+///   (a) explicit env override (`LGBM_ROWPART_TARGET_CUBES`, >0) — used VERBATIM as the
+///       literal target (NOT multiplied by `CUBES_PER_CU`); this is the A/B benching knob.
+///   (b) queried device CU count → `num_cu * CUBES_PER_CU`.
+///   (c) `ROWPART_TARGET_CUBES_FALLBACK` (never a silent 768).
+#[cfg(feature = "rocm")]
+fn resolve_target_cubes(env_override: Option<u32>, queried_cu: Option<u32>) -> u32 {
+    match (env_override, queried_cu) {
+        (Some(t), _) if t > 0 => t,
+        (_, Some(n)) if n > 0 => n.saturating_mul(CUBES_PER_CU),
+        _ => ROWPART_TARGET_CUBES_FALLBACK,
+    }
+}
+
+/// Query the device's actual Compute Unit count, or `None` if unavailable.
+///
+/// 1. First try cubecl's reported value
+///    (`rocm_client().properties().hardware.num_streaming_multiprocessors`):
+///    forward-compatible — returns `None` on cubecl-hip 0.10 today, but populated on
+///    cuda and possibly future hip. Used FIRST when `Some(n>0)`.
+/// 2. else FFI fallback: read `hipGetDevicePropertiesR0600().multiProcessorCount` for
+///    device ordinal 0 (matching `rocm_client`'s `AmdDevice::new(0)`).
+#[cfg(feature = "rocm")]
+fn query_num_cu() -> Option<u32> {
+    // (1) cubecl's forward-compatible value (None on cubecl-hip 0.10, populated on cuda).
+    if let Some(n) = crate::runtime::rocm_client()
+        .properties()
+        .hardware
+        .num_streaming_multiprocessors
+    {
+        if n > 0 {
+            return Some(n);
+        }
+    }
+
+    // (2) FFI fallback via cubecl-hip-sys, mirroring cubecl-hip/src/runtime.rs:65-94.
+    // SAFETY: `props` is zero-initialized then fully written by
+    // `hipGetDevicePropertiesR0600` on a HIP_SUCCESS return; `multiProcessorCount` is
+    // only read after the status is checked == HIP_SUCCESS, so we never read an
+    // uninitialized struct. Device ordinal 0 matches `rocm_client`'s `AmdDevice::new(0)`.
+    unsafe {
+        let mut props: cubecl_hip_sys::hipDeviceProp_tR0600 = std::mem::zeroed();
+        let status = cubecl_hip_sys::hipGetDevicePropertiesR0600(&mut props, 0);
+        if status == cubecl_hip_sys::hipError_t_hipSuccess && props.multiProcessorCount > 0 {
+            return Some(props.multiProcessorCount as u32);
+        }
+    }
+    None
+}
+
+/// The row-partition target-cubes value, queried at most ONCE per process and cached
+/// (`row_partition_count` runs per leaf, so the FFI CU-count query must not repeat —
+/// T-jcr-02). Resolution: env override → queried CU count × `CUBES_PER_CU` → FALLBACK
+/// (see [`resolve_target_cubes`] / [`query_num_cu`]).
+///
+/// Hardware note: this device is an 8-CU APU (Radeon 860M / gfx1152 spoofed as
+/// gfx1100), so the target ≈ 64 (8 × `CUBES_PER_CU`), NOT 768 (which assumed a phantom
+/// 96-CU gfx1100). Changing `P` alters the f32 partial-sum grouping (spike-007: `P≥2`
+/// widens GPU-vs-`P=1` divergence to ~2e-5, WITHIN the ~1e-6-best-effort ROCm gate — the
+/// GPU path was never bit-exact; the cpu f64 anchor is untouched).
+#[cfg(feature = "rocm")]
+fn rowpart_target_cubes() -> u32 {
+    static TARGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let env_override = std::env::var("LGBM_ROWPART_TARGET_CUBES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        resolve_target_cubes(env_override, query_num_cu())
+    })
+}
+
 /// Row partitions `P` for the LDS build: `clamp(target_cubes / num_features, 1, P_MAX)` on
-/// large leaves, else `1`. `LGBM_ROWPART_MIN` overrides the leaf threshold (benching). Pure
-/// CPU logic — no device handle — so it is unit-testable without a GPU.
+/// large leaves, else `1`. `LGBM_ROWPART_MIN` overrides the leaf threshold (benching). The
+/// `target_cubes` value is the runtime, CU-count-derived [`rowpart_target_cubes`] (cached).
+/// Pure CPU logic otherwise — no per-call device handle — so it is unit-testable with a
+/// forced target.
 #[cfg(feature = "rocm")]
 fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
     let min_leaf = std::env::var("LGBM_ROWPART_MIN")
@@ -651,11 +734,12 @@ fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
     if num_features == 0 || leaf_rows < min_leaf {
         return 1;
     }
+    let target = rowpart_target_cubes();
     let nf = num_features as u32;
-    if nf >= ROWPART_TARGET_CUBES {
+    if nf >= target {
         return 1;
     }
-    (ROWPART_TARGET_CUBES / nf).clamp(1, ROWPART_P_MAX)
+    (target / nf).clamp(1, ROWPART_P_MAX)
 }
 
 /// PARALLEL f32 histogram with LDS-PRIVATIZED sub-histograms — the contention-
