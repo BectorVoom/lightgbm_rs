@@ -19,9 +19,12 @@
 //!
 //! ## Determinism / launch shape
 //! The op is element-wise (each output cell is independent), so it is launched
-//! single-owner (`CubeDim::new_1d(1)`) to keep the cpu launch shape consistent
-//! with the other kernels (the CMP-04 gate selects `ReducePath::Sequential` on
-//! cpu). There is no reduction non-determinism here.
+//! across a real workgroup as a 1D grid-stride loop (`CubeDim::new_1d(256)` ×
+//! `CubeCount::Static(64,1,1)`): each thread owns disjoint indices
+//! `{ABSOLUTE_POS, ABSOLUTE_POS+stride, …}`, `stride = CUBE_COUNT_X * CUBE_DIM_X`.
+//! This is BIT-EXACT to the prior single-thread serial loop — no atomics, no
+//! reduction, no ordering, no contention — so the byte-identical result holds on
+//! cubecl-cpu AND cubecl-hip (CMP-04). There is no reduction non-determinism here.
 
 use cubecl::prelude::*;
 
@@ -29,27 +32,40 @@ use crate::error::ComputeError;
 use crate::runtime::ActiveRuntime;
 
 /// The element-wise `parent - child` fold (FeatureHistogram::Subtract, the
-/// default f64 path — the cpu anchor). Only unit 0 runs the fold (CubeDim 1).
+/// default f64 path — the cpu anchor). 1D grid-stride loop: each thread owns the
+/// disjoint indices `{ABSOLUTE_POS, ABSOLUTE_POS+stride, …}` with
+/// `stride = CUBE_COUNT_X * CUBE_DIM_X`. BIT-EXACT-by-construction vs the serial
+/// loop — every `out[i]` is an independent f64 subtract with no atomics, no
+/// reduction, and no cross-thread/cross-element ordering, so disjoint-thread
+/// execution yields the byte-identical result on any backend (CMP-04 cpu/hip
+/// parity holds). The `while i < parent.len()` bound guards every write, so the
+/// grid may over-cover any `len` (the launch over-provisions lanes).
 #[cube(launch)]
 pub fn subtract_hist_kernel(parent: &Array<f64>, child: &Array<f64>, out: &mut Array<f64>) {
-    if UNIT_POS == 0 {
-        for i in 0..parent.len() {
-            out[i] = parent[i] - child[i];
-        }
+    let stride = CUBE_COUNT_X as usize * CUBE_DIM_X as usize;
+    let mut i = ABSOLUTE_POS as usize;
+    let n = parent.len() as usize;
+    while i < n {
+        out[i] = parent[i] - child[i];
+        i += stride;
     }
 }
 
 /// The f32-cell mirror of [`subtract_hist_kernel`] for the no-f64 hip device
-/// (CMP-04). IDENTICAL element-wise `parent - child` structure — the ONLY
-/// difference is the cell type (`f32` vs `f64`), since hip cannot allocate f64
-/// (RESEARCH Pitfall 2/3). The capability gate (`has_f64 == false`) routes the
-/// hip launch here; cpu keeps the f64 kernel.
+/// (CMP-04). IDENTICAL 1D grid-stride structure — the ONLY difference is the cell
+/// type (`f32` vs `f64`), since hip cannot allocate f64 (RESEARCH Pitfall 2/3).
+/// Same bit-exact-by-construction property: independent f32 subtract per cell, no
+/// atomics/reduction/ordering, `while i < parent.len()` bounds every write. The
+/// capability gate (`has_f64 == false`) routes the hip launch here; cpu keeps the
+/// f64 kernel.
 #[cube(launch)]
 pub fn subtract_hist_kernel_f32(parent: &Array<f32>, child: &Array<f32>, out: &mut Array<f32>) {
-    if UNIT_POS == 0 {
-        for i in 0..parent.len() {
-            out[i] = parent[i] - child[i];
-        }
+    let stride = CUBE_COUNT_X as usize * CUBE_DIM_X as usize;
+    let mut i = ABSOLUTE_POS as usize;
+    let n = parent.len() as usize;
+    while i < n {
+        out[i] = parent[i] - child[i];
+        i += stride;
     }
 }
 
@@ -101,12 +117,14 @@ pub fn subtract_histograms_f64_on<R: cubecl::Runtime>(
 
     // SAFETY: `h_parent`/`h_child`/`h_out` were each allocated for exactly `n`
     // f64 elements (validated equal above) and outlive the launch; the kernel
-    // reads/writes only indices `0..n`. All cubecl unsafe is confined here (CMP-01).
+    // reads/writes only indices `0..n` (the grid over-covers but the
+    // `while i < parent.len()` bound guards every write). All cubecl unsafe is
+    // confined here (CMP-01).
     unsafe {
         subtract_hist_kernel::launch(
             client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
+            CubeCount::Static(64, 1, 1),
+            CubeDim::new_1d(256),
             ArrayArg::from_raw_parts(h_parent, n),
             ArrayArg::from_raw_parts(h_child, n),
             ArrayArg::from_raw_parts(h_out.clone(), n),
@@ -166,13 +184,14 @@ pub fn subtract_histograms_f64_from_handles_on<R: cubecl::Runtime>(
 
     // SAFETY: `parent`/`child`/`h_out` each describe exactly `len` f64 cells (the
     // caller guarantees the inputs; `h_out` is allocated for `len` here) and outlive
-    // the launch; the kernel reads/writes only indices `0..len`. All cubecl unsafe is
+    // the launch; the kernel reads/writes only indices `0..len` (the grid over-covers
+    // but the `while i < parent.len()` bound guards every write). All cubecl unsafe is
     // confined here (CMP-01).
     unsafe {
         subtract_hist_kernel::launch(
             client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
+            CubeCount::Static(64, 1, 1),
+            CubeDim::new_1d(256),
             ArrayArg::from_raw_parts(parent, len),
             ArrayArg::from_raw_parts(child, len),
             ArrayArg::from_raw_parts(h_out.clone(), len),
@@ -213,12 +232,14 @@ pub fn subtract_histograms_f32_on<R: cubecl::Runtime>(
 
     // SAFETY: identical handle/length correspondence to `subtract_histograms_cpu`
     // — three handles each sized `n` f32 cells (validated equal), outliving the
-    // launch; the kernel touches only `0..n`. cubecl `unsafe` confined here (CMP-01).
+    // launch; the kernel touches only `0..n` (the grid over-covers but the
+    // `while i < parent.len()` bound guards every write). cubecl `unsafe` confined
+    // here (CMP-01).
     unsafe {
         subtract_hist_kernel_f32::launch(
             client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1),
+            CubeCount::Static(64, 1, 1),
+            CubeDim::new_1d(256),
             ArrayArg::from_raw_parts(h_parent, n),
             ArrayArg::from_raw_parts(h_child, n),
             ArrayArg::from_raw_parts(h_out.clone(), n),
@@ -255,5 +276,67 @@ mod tests {
         let client = cpu_client();
         let got = subtract_histograms_cpu(&client, &[], &[]).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// The grid-stride parallel f64 kernel must be `to_bits()`-identical, cell by
+    /// cell, to a plain serial Rust `parent[i] - child[i]` reference — on a
+    /// representative length (25600 = 50 feat × 256 bins × 2) AND an odd length
+    /// (12345) that exercises the stride remainder (not a multiple of the grid).
+    #[test]
+    fn subtract_parallel_equals_serial_f64() {
+        let client = cpu_client();
+        for &len in &[25600usize, 12345usize] {
+            // Deterministic, varied (incl. negatives + fractions) inputs.
+            let parent: Vec<f64> = (0..len)
+                .map(|i| (i as f64) * 0.5 - 1234.5 + (i as f64).sin())
+                .collect();
+            let child: Vec<f64> = (0..len)
+                .map(|i| (i as f64) * 0.25 + 7.0 - (i as f64).cos())
+                .collect();
+
+            let serial: Vec<f64> = parent.iter().zip(&child).map(|(p, c)| p - c).collect();
+            let parallel = subtract_histograms_f64_on(&client, &parent, &child).unwrap();
+
+            assert_eq!(parallel.len(), len, "len {len}: output length");
+            for i in 0..len {
+                assert_eq!(
+                    parallel[i].to_bits(),
+                    serial[i].to_bits(),
+                    "len {len}, cell {i}: parallel {} vs serial {} not byte-identical",
+                    parallel[i],
+                    serial[i]
+                );
+            }
+        }
+    }
+
+    /// f32 mirror of [`subtract_parallel_equals_serial_f64`]: the grid-stride f32
+    /// kernel is `to_bits()`-identical to a plain serial f32 `parent - child` on
+    /// the representative (25600) and stride-remainder (12345) lengths.
+    #[test]
+    fn subtract_parallel_equals_serial_f32() {
+        let client = cpu_client();
+        for &len in &[25600usize, 12345usize] {
+            let parent: Vec<f32> = (0..len)
+                .map(|i| (i as f32) * 0.5 - 1234.5 + (i as f32).sin())
+                .collect();
+            let child: Vec<f32> = (0..len)
+                .map(|i| (i as f32) * 0.25 + 7.0 - (i as f32).cos())
+                .collect();
+
+            let serial: Vec<f32> = parent.iter().zip(&child).map(|(p, c)| p - c).collect();
+            let parallel = subtract_histograms_f32_on(&client, &parent, &child).unwrap();
+
+            assert_eq!(parallel.len(), len, "len {len}: output length");
+            for i in 0..len {
+                assert_eq!(
+                    parallel[i].to_bits(),
+                    serial[i].to_bits(),
+                    "len {len}, cell {i}: parallel {} vs serial {} not byte-identical",
+                    parallel[i],
+                    serial[i]
+                );
+            }
+        }
     }
 }
