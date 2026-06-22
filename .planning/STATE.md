@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-06-22T09:55:40.689Z"
-last_activity: 2026-06-22 -- Completed 11-01 (u64 fixed-point resident histogram build)
+stopped_at: Completed 11-03-PLAN.md
+last_updated: "2026-06-22T10:04:19.135Z"
+last_activity: 2026-06-22 -- Completed 11-03 (device-time A/B: live resident u64 build not slower than f32 twin in the wide regime, SPEC-3)
 progress:
   total_phases: 3
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 5
-  completed_plans: 3
-  percent: 33
+  completed_plans: 4
+  percent: 67
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 ## Current Position
 
-Phase: 11 (gpu-fixedpoint-int-atomics) — EXECUTING
-Plan: 3 of 3
-Status: Ready to execute (11-01 complete)
-Last activity: 2026-06-22 -- Completed 11-01 (u64 fixed-point resident histogram build)
+Phase: 11 (gpu-fixedpoint-int-atomics) — ALL PLANS COMPLETE (ready for verification)
+Plan: 3 of 3 (complete)
+Status: Phase 11 execution complete — 11-01/11-02/11-03 all shipped; SPEC-1/2/3/4 confirmed
+Last activity: 2026-06-22 -- Completed 11-03 (device-time A/B: live resident u64 build not slower than f32 twin in the wide regime, SPEC-3)
 
 ## Deferred Items
 
@@ -499,6 +499,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 08 P08-08 | 12min | 2 tasks | 4 files |
 | Phase 11 P01 | 35 | 3 tasks | 2 files |
 | Phase 11 P02 | 20min | 2 tasks | 2 files |
+| Phase 11 P03 | 25min | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -573,6 +574,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 11-01: ROCm resident histogram BUILD now uses u64 two's-complement fixed-point (S=2^30) integer LDS atomics (Atomic<u64>, never Atomic<i64>); dequant (bits as i64)/2^30->f64 confined to fix_compact_kernel; downstream f64 unchanged; i64@2^30 overflow guard at the resident-build boundary
 - [Phase ?]: Phase 11-01: resident_raw_build_into gained a fixed_point flag so the live u64 chain + the f32 readback oracle share one resident-build path; naive >256-bin fallback stays f32 (asserted unreachable when fixed_point)
 - [Phase ?]: Phase 11-02: resident u64 fixed-point build re-pinned to CPU f64 anchor at FIXEDPOINT_REL_GATE=1e-7 (measured max_rel=0.0, spike-018 ref ~5.9e-9) + 2-runs determinism; def-f8u-01 honored (no GPU-vs-GPU)
+- [Phase ?]: Phase 11 SPEC-3 confirmed via device-time A/B: live resident u64 fixed-point build is not slower than the f32 twin in the wide regime (~1.13-1.66x SEP-WINs), null/overlap in the light regime (8-CU APU spoofed, relative ratio only)
 
 ### Pending Todos
 
@@ -602,7 +604,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T09:55:25.254Z
+Last session: 2026-06-22T10:04:05.387Z
 Stopped at: Completed 08-05-PLAN.md
 Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md
 

@@ -37,7 +37,7 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
 
   - [x] 11-01-PLAN.md — u64 two's-complement fixed-point resident build kernel + u64->f64 dequant at the fix-compact seam + overflow guard (wave 1)
   - [x] 11-02-PLAN.md — re-pin rocm resident parity to the CPU f64 anchor (tightened) + determinism assert (wave 2)
-  - [ ] 11-03-PLAN.md — device-time A/B confirming the integer build is not-slower in the wide regime (wave 2)
+  - [x] 11-03-PLAN.md — device-time A/B confirming the integer build is not-slower in the wide regime (wave 2)
 
 ### 📋 Next milestone (not yet scoped)
 
