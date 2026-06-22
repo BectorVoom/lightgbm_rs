@@ -9,6 +9,14 @@ requires: ROCm GPU (#[cfg(feature=rocm)])
 
 # Anchor-check the u64 resident BUILD at P>1 (WR-05)
 
+> **RESOLVED 2026-06-22 (quick task 260622-t4u).** Added permanent test
+> `kernel_parity_resident_build_fix_compact_p_gt_1_equals_host_on_hip`
+> (`crates/oracle-harness/tests/kernel_parity.rs`): a 300k-row leaf forces the
+> DEFAULT heuristic to P>1 (no env dependence), asserts `row_partition_count > 1`,
+> parity ≤1e-7 vs the CPU f64 anchor, and `to_bits()` determinism. GPU-verified on
+> gfx1100: `row_partition_count(3,300000)=10`, `max_rel=0.000e0` (bit-exact),
+> determinism held. Commits 5a2b3fa + f5bf726. See `quick/260622-t4u-SUMMARY.md`.
+
 **The one real correctness hole in Phase 11.** The live-path parity gate
 `kernel_parity_resident_build_fix_compact_equals_host_on_hip` only exercises a
 **10-row, P=1 leaf**. But the headline feature of the phase is the multi-cube
