@@ -8,6 +8,14 @@ run_with: /gsd-quick or /gsd-plan-phase
 
 # Parallelize DataPartition::split
 
+> **✗ RESOLVED → executed as quick-260622-ia0, verdict NULL, REVERTED (2026-06-22).**
+> The rayon-parallel split was bit-exact but an end-to-end null: it contends with the
+> already-rayon-parallel histogram build for the same pool (train-wall noise, partition
+> phase bimodal). Reverted (commit 52d63b3). The 29%-serial root cause stands but the
+> capture needs a FUSE, not independent parallelization. Full evidence:
+> `.planning/quick/260622-ia0-parallelize-datapartition-split-with-ray/260622-ia0-SUMMARY.md`.
+> This todo is closed.
+
 ## Why
 
 Root-caused in [[wide-tall-two-backend-root-cause]]: at tall-narrow shapes (1M×50) the
