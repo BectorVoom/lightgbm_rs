@@ -70,6 +70,11 @@ rows. (Opposite of spike-008: int16 was too coarse; wide i64 is plenty.)
 - **Accuracy on hardware: i64 5.9e-9 vs f32 2.2e-5** (~3600×), matching 018a.
 - **Speed: i64/f32 = 1.80× (run1) / 2.06× (run2), both SEP-WIN** (i64 p75 < f32 p25;
   sign-stable across processes). f32 73–77ms[72..81], i64 37–40ms[36..43].
+  **⚠ CORRECTED by spike-019:** this 1.9× is INFLATED by the single-cube SIMPLE kernel
+  (direct `binned[i]`, no `leaf_rows` indirection). In the realistic resident `build_rp`
+  kernel the magnitude is **~1.3–1.7×** (still robust, sign-stable, occupancy-independent,
+  composes with row-partition). The win is REAL in high-atomic-load regimes (the wide
+  root/large leaves), null only at light load. See `019-int-atomic-contention-regime`.
 - **Determinism: i64 deterministic by construction.** (f32 showed bit-eq here too, but
   that's *incidental* to the single-cube stable scheduling — multi-cube f32 is NOT
   deterministic; i64 always is.)
