@@ -939,13 +939,51 @@ pub fn find_best_splits_batched_f64_on<R: cubecl::Runtime>(
     Ok(out)
 }
 
+/// Default scan cube width on rocm (spike-021). The fused split-scan was launched
+/// `CubeCount=(num_features,1,1) × CubeDim(1)` — one SINGLE-THREADED cube per feature,
+/// using 1 lane of each wave32 (~1/32 ALU utilization). Packing one feature per LANE
+/// (`CubeDim(W)`, `CubeCount=ceil(num_features/W)`) keeps each feature's scan sequential
+/// (bit-exact, no spike-016 reorder) but fills the wave. Measured on the wide shape
+/// (250k×500, gfx1152 8-CU APU, build drained so this is pure scan launch+readback):
+///   W=1 → 11.8s · W=32 → 5.74s (2.05×) · W=64 → 3.99s (2.96×) · W=128 → 3.33s (3.54×).
+/// W=64 = 1 cube/CU × 2 waves at 500 feats — the robust ~3× knee, not over-fit to
+/// W=128's APU-specific latency-hiding peak. APU-confounded magnitude; the SIGN is the
+/// deliverable (CONVENTIONS). Override with `LGBM_SCAN_CUBEDIM`.
+#[cfg(feature = "rocm")]
+const SCAN_CUBE_DIM_DEFAULT: u32 = 64;
+
+/// Scan cube width W (env `LGBM_SCAN_CUBEDIM`, default [`SCAN_CUBE_DIM_DEFAULT`]).
+/// W is the lanes-per-cube (`CubeDim::new_1d(W)`); `CubeCount = ceil(num_features / W)`.
+/// W=1 reproduces the original one-cube-per-feature launch byte-for-byte. Clamped to
+/// `[1, 256]` (a wavefront is 32/64 lanes; >256 just wastes a too-large cube). Parse
+/// failures or 0 fall back to the default — never a no-launch.
+#[cfg(feature = "rocm")]
+fn scan_cube_dim() -> u32 {
+    std::env::var("LGBM_SCAN_CUBEDIM")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&w| w > 0)
+        .map(|w| w.clamp(1, 256))
+        .unwrap_or(SCAN_CUBE_DIM_DEFAULT)
+}
+
+/// Non-rocm builds (cubecl-cpu oracle parity path) keep W=1 unconditionally — the
+/// occupancy lever is a GPU-only concern and the bit-exact gate must not depend on
+/// an env var.
+#[cfg(not(feature = "rocm"))]
+fn scan_cube_dim() -> u32 {
+    1
+}
+
 /// FUSED per-leaf batched best-split kernel (260608-mc5 THE COLLAPSE). ONE launch
-/// finds EVERY feature's best split for a leaf: cube `f` (`CUBE_POS_X`) scans only
-/// its `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of the concatenated f64
-/// histogram `hist` and writes only its 12-cell window `out[f*12 .. f*12+12]`
-/// (threat T-mc5-02). The per-feature scan is sequential, so the launch shape
-/// mirrors `construct_leaf_hist_batched_kernel`: `CubeCount::Static(num_feats,1,1)`,
-/// `CubeDim::new_1d(1)`.
+/// finds EVERY feature's best split for a leaf: lane `f` (`ABSOLUTE_POS`, guarded
+/// `< n_feats`) scans only its `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of
+/// the concatenated f64 histogram `hist` and writes only its 12-cell window
+/// `out[f*12 .. f*12+12]` (threat T-mc5-02). The per-feature scan is sequential; the
+/// launch packs one feature per LANE (`CubeCount=ceil(num_feats/W), CubeDim(W)`,
+/// spike-021 scan-occupancy lever). `W=1` reproduces the original one-cube-per-feature
+/// shape byte-for-byte; `W>1` only changes which thread runs each (still-sequential,
+/// bit-identical) per-feature scan.
 ///
 /// The leaf-level scalars (`use_l1` .. `num_data`) are identical across features
 /// (the leaf totals + cfg + the host-computed `min_gain_shift`), so they are passed
@@ -973,30 +1011,45 @@ pub fn find_best_splits_fused_kernel(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
+    // Number of features in the batch. The launch may round CubeCount up so the
+    // tail cube has lanes with `ABSOLUTE_POS >= n_feats`; those lanes must no-op.
+    n_feats: u32,
 ) {
-    let f = CUBE_POS_X;
-    let fi = f as usize;
-    split_scan_body(
-        hist,
-        slot_off[fi],
-        out,
-        f * 12u32,
-        num_bin[fi],
-        offset[fi],
-        default_bin[fi],
-        skip_default_bin[fi],
-        use_l1,
-        min_data_in_leaf,
-        min_sum_hessian_in_leaf,
-        lambda_l1,
-        lambda_l2,
-        min_gain_shift,
-        sum_gradient,
-        sum_hessian,
-        num_data,
-        rev_count[fi],
-        fwd_count[fi],
-    );
+    // Scan-occupancy lever (spike-021): the feature index is the GLOBAL lane index
+    // `ABSOLUTE_POS = CUBE_POS_X * CUBE_DIM + UNIT_POS`. With `CubeDim::new_1d(1)`
+    // this is byte-identical to the original one-cube-per-feature launch
+    // (`ABSOLUTE_POS == CUBE_POS_X`); with `CubeDim::new_1d(W)` it packs W features
+    // per cube, ONE per lane. Each lane runs the SAME sequential `split_scan_body`
+    // for its own feature over a DISJOINT histogram region — no shared state, no
+    // reorder (unlike spike-016's within-feature parallel scan) — so the per-feature
+    // f64 result is bit-identical regardless of W; only wave ALU utilization changes.
+    // `ABSOLUTE_POS` is `usize` in cubecl; cast to u32 so the `f * 12u32` window
+    // offset and the `f < n_feats` guard keep the original kernel's exact types.
+    let f = ABSOLUTE_POS as u32;
+    if f < n_feats {
+        let fi = f as usize;
+        split_scan_body(
+            hist,
+            slot_off[fi],
+            out,
+            f * 12u32,
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+            fwd_count[fi],
+        );
+    }
 }
 
 /// FUSED batched per-leaf best-split launcher (260608-mc5 THE MERGE + THE COLLAPSE),
@@ -1292,17 +1345,27 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     }
     let _t_launch = std::time::Instant::now();
 
-    // SAFETY: every handle is sized to its slice and outlives the launch. Cube `f`
-    // (`CUBE_POS_X < n`) reads only `[slot_off[f], slot_off[f]+2*num_bin[f])` — each
-    // validated `<= buf.len()` above — and writes only `out[f*12 .. f*12+12]` within
-    // the `n*12` allocation; the shared `split_scan_body` carries the same in-range /
-    // negative-`t` clamp guards as the single-feature kernel. All per-feature index
-    // arrays have exactly `n` elements. All cubecl unsafe is confined here (CMP-01).
+    // spike-021 scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
+    // (env `LGBM_SCAN_CUBEDIM`; rocm default W=64, W=1 = byte-identical to the
+    // original) is the cube width W; `CubeCount = ceil(n / W)`. The kernel indexes
+    // features by the
+    // global lane `ABSOLUTE_POS` and guards `f < n_feats`, so the tail cube's spare
+    // lanes no-op and the result is bit-identical to W=1 for every W.
+    let scan_w = scan_cube_dim();
+    let cube_count = (n as u32).div_ceil(scan_w);
+
+    // SAFETY: every handle is sized to its slice and outlives the launch. Lane `f`
+    // (`ABSOLUTE_POS`, guarded `< n_feats` in the kernel) reads only
+    // `[slot_off[f], slot_off[f]+2*num_bin[f])` — each validated `<= buf.len()` above
+    // — and writes only `out[f*12 .. f*12+12]` within the `n*12` allocation; the
+    // shared `split_scan_body` carries the same in-range / negative-`t` clamp guards
+    // as the single-feature kernel. All per-feature index arrays have exactly `n`
+    // elements. All cubecl unsafe is confined here (CMP-01).
     unsafe {
         find_best_splits_fused_kernel::launch(
             client,
-            CubeCount::Static(n as u32, 1, 1),
-            CubeDim::new_1d(1),
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(scan_w),
             ArrayArg::from_raw_parts(h_hist, buf_len),
             ArrayArg::from_raw_parts(h_out.clone(), out_len),
             ArrayArg::from_raw_parts(h_slot, n),
@@ -1321,6 +1384,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
             sum_gradient,
             sum_hessian_bumped,
             num_data,
+            n as u32,
         );
     }
 
