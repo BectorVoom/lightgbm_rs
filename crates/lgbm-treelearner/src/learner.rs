@@ -1590,6 +1590,40 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             );
             None
         };
+        // ---- FUSED-path exception to the Phase-12 scan deferral (subtract-empty-slot fix). ----
+        // On the FUSED directly-built path the smaller child's "scan" is ALSO its histogram
+        // BUILD+store: `scan_leaf_histogram`'s `build_fix_scan_resident` launch is the ONLY
+        // thing that puts the smaller Handle into `smaller_slot`. The Phase-12 co-pack deferral
+        // (below) moves the smaller scan PAST `subtract_resident` — fine for the resident
+        // scan-only path (its histogram is already built+resident), but on the fused path it
+        // leaves `smaller_slot` EMPTY when the larger child's `subtract_resident` derives
+        // `parent − smaller` → "subtract_resident: smaller slot is empty". Co-pack NEVER fires
+        // on the fused path anyway (its gate requires `!smaller_fused`), so deferring buys the
+        // fused path nothing. Restore the pre-Phase-12 (260608-t3t) order: run the smaller fused
+        // build+scan NOW, before the larger subtract, and reuse the records at the deferred site.
+        let smaller_records_early: Option<Vec<FeatureSplitRecord>> = if smaller_fused {
+            Some(self.scan_leaf_histogram(
+                features,
+                slot_off,
+                smaller_leaf,
+                smaller_splits,
+                pool.buffer_mut(smaller_slot),
+                best_split_per_leaf,
+                best_split_feature,
+                smaller_node_mask.as_deref(),
+                data_partition,
+                parent_splittable.as_deref(),
+                smaller_resident_slot,
+                smaller_fused,
+                smaller_unified,
+                None,
+                None,
+                gradients,
+                hessians,
+            )?)
+        } else {
+            None
+        };
         // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
         // OR build directly when no parent was retained. ----
         //
@@ -1861,27 +1895,34 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         // ---- SMALLER child scan (DEFERRED to here so it can co-pack with the larger
         // child). When co-packed, `smaller_precomputed` carries the co-packed results;
-        // otherwise this is the byte-unchanged single-slot resident / host scan. ----
-        let smaller_records = self.scan_leaf_histogram(
-            features,
-            slot_off,
-            smaller_leaf,
-            smaller_splits,
-            pool.buffer_mut(smaller_slot),
-            best_split_per_leaf,
-            best_split_feature,
-            smaller_node_mask.as_deref(),
-            data_partition,
-            parent_splittable.as_deref(),
-            smaller_resident_slot,
-            smaller_fused,
-            smaller_unified,
-            // quick 260620-b97: the directly-built smaller child is never subtract-unified.
-            None,
-            smaller_precomputed,
-            gradients,
-            hessians,
-        )?;
+        // otherwise this is the byte-unchanged single-slot resident / host scan. On the
+        // FUSED path the scan already ran EARLY (`smaller_records_early`, before the larger
+        // subtract — see the fix above), so reuse those records instead of re-launching the
+        // build+scan (which would also re-store the slot needlessly). ----
+        let smaller_records = if let Some(records) = smaller_records_early {
+            records
+        } else {
+            self.scan_leaf_histogram(
+                features,
+                slot_off,
+                smaller_leaf,
+                smaller_splits,
+                pool.buffer_mut(smaller_slot),
+                best_split_per_leaf,
+                best_split_feature,
+                smaller_node_mask.as_deref(),
+                data_partition,
+                parent_splittable.as_deref(),
+                smaller_resident_slot,
+                smaller_fused,
+                smaller_unified,
+                // quick 260620-b97: the directly-built smaller child is never subtract-unified.
+                None,
+                smaller_precomputed,
+                gradients,
+                hessians,
+            )?
+        };
 
         if larger_leaf >= 0 {
             let larger_slot = larger_slot_id.expect("non-root larger child must hold a pool slot");

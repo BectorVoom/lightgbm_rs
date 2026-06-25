@@ -1968,6 +1968,14 @@ mod hip {
     use lgbm_compute::runtime::rocm_client;
     use lgbm_compute::RocmBackend;
 
+    /// Serializes the force-env hip tests. Each sets a PROCESS-GLOBAL `LGBM_*_FORCE` env
+    /// var around its forced train, and cargo runs tests in parallel threads — so without
+    /// this lock one test's force var can leak into the OTHER test's eligibility check
+    /// (e.g. `LGBM_FUSED_FORCE` flipping the resident test onto the fused path). Held for
+    /// the whole test body so the env windows never overlap. `into_inner` tolerates a
+    /// poisoned lock (a prior panicking test) so a single failure does not cascade.
+    static FORCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build a deterministic pure-numeric-spine corpus: `num_features` numeric columns
     /// over `num_data` rows, each column with `num_bin` bins (most_freq_bin 0 → offset
     /// 1), a regression-style gradient, hessian 1.
@@ -2089,6 +2097,8 @@ mod hip {
 
     #[test]
     fn learner_parity_resident_equals_host_tree_on_hip() {
+        // Serialize the force-env window vs the fused test (shared process env vars).
+        let _force_guard = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let client = rocm_client();
         let (features, g, h) = spine_corpus(3000, 8, 48);
         let num_leaves = 31i32;
@@ -2109,12 +2119,13 @@ mod hip {
         let mut resident_learner =
             SerialTreeLearner::new(&resident_backend, &client, cfg(), num_leaves, max_depth)
                 .with_features(features.clone());
-        // SAFETY: single-threaded within this test; set→train→unset is sequential.
+        // SAFETY: the FORCE_ENV_LOCK guard serializes this env window vs the fused test.
+        // Capture the result and restore the env var BEFORE `.expect` so a failing train
+        // (Err) cannot leak `LGBM_RESIDENT_FORCE` into a sibling test.
         unsafe { std::env::set_var("LGBM_RESIDENT_FORCE", "1") };
-        let resident_tree = resident_learner
-            .train(&g, &h, true)
-            .expect("resident train ok");
+        let resident_result = resident_learner.train(&g, &h, true);
         unsafe { std::env::remove_var("LGBM_RESIDENT_FORCE") };
+        let resident_tree = resident_result.expect("resident train ok");
 
         // FORCED HOST path (same RocmBackend f32-atomic build, host routing).
         // `with_resident(false)` short-circuits at backend_supported==false (before the
@@ -2187,6 +2198,8 @@ mod hip {
     /// STOP (do NOT weaken the tol).
     #[test]
     fn learner_parity_fused_equals_host_tree_on_hip() {
+        // Serialize the force-env window vs the resident test (shared process env vars).
+        let _force_guard = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let client = rocm_client();
         let (features, g, h) = spine_corpus(3000, 8, 48);
         let num_leaves = 31i32;
@@ -2199,10 +2212,13 @@ mod hip {
         let mut fused_learner =
             SerialTreeLearner::new(&fused_backend, &client, cfg(), num_leaves, max_depth)
                 .with_features(features.clone());
-        // SAFETY: single-threaded within this test; set→train→unset is sequential.
+        // SAFETY: the FORCE_ENV_LOCK guard serializes this env window vs the resident test.
+        // Capture the result and restore the env var BEFORE `.expect` so a failing train
+        // (Err) cannot leak `LGBM_FUSED_FORCE` into a sibling test.
         unsafe { std::env::set_var("LGBM_FUSED_FORCE", "1") };
-        let fused_tree = fused_learner.train(&g, &h, true).expect("fused train ok");
+        let fused_result = fused_learner.train(&g, &h, true);
         unsafe { std::env::remove_var("LGBM_FUSED_FORCE") };
+        let fused_tree = fused_result.expect("fused train ok");
 
         // FORCED HOST path (same RocmBackend f32-atomic build, host routing).
         let host_backend = RocmBackend::with_resident(false);
