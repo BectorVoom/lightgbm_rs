@@ -1,0 +1,19 @@
+    Finished `release` profile [optimized] target(s) in 0.16s
+     Running `target/release/examples/bench_gpu_vs_cpu`
+
+# === Phase 12 co-pack ON/OFF A/B (LGBM_SIBLING_COPACK 0 vs 1) ===
+# HONEST FRAMING: the isolated scan A/B was ~2.0× (spike-024), which is the
+# launch+readback COMPONENT only — NOT the e2e number. Per spike-023's scan-sync
+# fraction, the e2e ceiling is ~10–15% at small/medium and ~1.5% at wide.
+# SC-3 = the scan_resident SYNC count ~halves (~59 -> ~30/tree) — structural, real.
+# SC-4 = median train is NOT-SLOWER and trends faster — SIGN-ONLY on this spoofed
+#        8-CU APU (judge SIGN; run >=2 PROCESSES for sign-stability; no pass/fail gate).
+# Wide is expected ~unaffected (~1.5%). CPU/GPU routing is unchanged.
+size         rows  feat  bins     syncs_off     syncs_on sync/tree     train_off     train_on  off/on  verdict
+small        2000    12    32             0            0       0.0    537.16ms   539.39ms   0.996  NOT-SLOWER (single-proc, sign-only)
+medium      20000    30    64          2950         1500      30.0    891.70ms   939.19ms   0.949  SLOWER? (single-proc noise — rerun >=2 procs)
+large      200000    40   128          2930         1490      29.8       2.54s      2.32s   1.092  trends-faster (single-proc, sign-only)
+# DIAGNOSIS: SC-3 (sync drop) is structural + counter-exact (syncs_on ~= syncs_off/2,
+#   ~30/tree vs ~59/tree). SC-4 (off/on >= 1) is SIGN-ONLY + Amdahl-capped (~10–15%
+#   small/medium, ~1.5% wide) — the isolated 2× is NOT the e2e number. Run >=2
+#   processes and judge the SIGN; the absolute magnitude is APU-confounded.
