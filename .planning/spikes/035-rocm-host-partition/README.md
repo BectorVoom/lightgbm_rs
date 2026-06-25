@@ -110,15 +110,21 @@ Flip `RocmBackend::prefers_host_partition()` → `true` unconditionally. This is
 lever with a genuine win **on this APU** (not just a "real on discrete gfx110x" deferral) —
 because the device partition round-trip is pure overhead on shared DDR5. **Wiring needs an
 oracle re-pin to the f64 anchor** (NOT a bit-exact swap — the GPU f32 build is ~1.9e-6
-nondeterministic regardless), and should FIRST fix the pre-existing broken hip train parity
-tests so the re-pin has a green gate. Route via `/gsd-quick` or `/gsd-plan-phase`.
+nondeterministic regardless). The pre-existing broken hip train parity tests that gate the re-pin
+are now FIXED (commit `8aed100`, debug `subtract-resident-empty-hip`) → green gate available.
+Route via `/gsd-quick` or `/gsd-plan-phase`.
 
 ### Caveats
 Spoofed 8-CU gfx1152 APU; absolute ms APU-confounded; SIGN + fractions only; 2 restarts. On
 discrete gfx110x the device round-trip crosses PCIe ⇒ the win is expected LARGER, but the
 host-gather residual also grows with rows — re-measure there. Wide is a wash, not a win.
 
-### Filed defect (separate)
-`learner_parity_{resident,fused}_equals_host_tree_on_hip` panic `subtract_resident: smaller
-slot is empty` on master (env-independent) — tiny-spine-corpus resident-path edge. Needs a fix
-before it can gate the spike-035 wire.
+### Filed defect (separate) → ✅ FIXED (commit `8aed100`)
+`learner_parity_{resident,fused}_equals_host_tree_on_hip` panicked `subtract_resident: smaller
+slot is empty` on master (env-independent). Debugged in session `subtract-resident-empty-hip`:
+NOT a tiny-corpus edge (my first guess) — root cause was Phase-12 co-pack DEFERRING the smaller
+child's scan past `subtract_resident`, but on the FUSED path that scan IS the smaller histogram
+build+store, so subtract ran before the histogram existed. Fix un-defers the smaller fused build
+for the fused case only (co-pack never touched it). Resident-test breakage was a knock-on
+`LGBM_FUSED_FORCE` env-leak through a panic (serialize + RAII-restore). Both tests 2/2 pass
+parallel+serial; bit-exact gate green. The spike-035 wire gate is now unblocked.
