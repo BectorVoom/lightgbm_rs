@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use lgbm_compute::gain::{get_leaf_gain, get_split_gains, GainConfig};
 use lgbm_compute::runtime::cpu_client;
-use lgbm_compute::{Backend, BatchedSplitFeature, CpuBackend};
+use lgbm_compute::{Backend, BatchedSplitFeature, BinColumn, CpuBackend};
 // The exact comparators are NOT re-exported from the crate root (lib.rs re-exports
 // only compare_within/abs_diff_within/Mismatch/ORACLE_TOL); import them via the
 // full module path.
@@ -1212,9 +1212,45 @@ fn kernel_parity_partition_exact_on_cpu() {
             got_split, split_point,
             "PARTITION `{name}`: split_point mismatch"
         );
+
+        // quick-260625-j1l (spike-029): route the SAME golden case through the
+        // NATIVE-WIDTH `data_partition_native` path with the bins carried as a narrow
+        // `BinColumn` (auto-selected by num_bin: U8 for ≤256, U16 for ≤65536). This is
+        // the narrow path that spike-029 wires; it MUST stay bit-exact to the golden.
+        let col = BinColumn::new(bins.clone(), num_bin);
+        let (nat_order, nat_split) = backend
+            .data_partition_native(&client, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+            .unwrap_or_else(|e| panic!("PARTITION `{name}`: data_partition_native failed: {e:?}"));
+        if let Err(m) = compare_exact_u32(&nat_order, &order) {
+            panic!("PARTITION `{name}` (native): reordered index array divergence: {m}");
+        }
+        assert_eq!(
+            nat_split, split_point,
+            "PARTITION `{name}` (native): split_point mismatch"
+        );
         n_cases += 1;
     }
     assert!(n_cases > 0, "partition fixture present but parsed zero cases");
+
+    // quick-260625-j1l: an explicit U16-band self-check so the U16 monomorph is
+    // exercised even if every golden `num_bin` is ≤256 (⇒ U8). Build the EXPECTED
+    // (order, split_point) via the u32-widened `data_partition` reference, then assert
+    // `data_partition_native` over the U16 `BinColumn` is byte-identical to it.
+    {
+        let bins_u16 = vec![0u32, 300, 64, 511, 7];
+        let num_bin = 512u32; // ⇒ BinColumn::U16
+        let (min_bin, max_bin, threshold, most_freq_bin) = (0u32, 511u32, 63u32, 0u32);
+        let (exp_order, exp_split) = backend
+            .data_partition(&client, &bins_u16, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+            .expect("u16 reference partition");
+        let col_u16 = BinColumn::new(bins_u16.clone(), num_bin);
+        assert!(matches!(col_u16, BinColumn::U16(_)), "expected U16 column");
+        let (got_order, got_split) = backend
+            .data_partition_native(&client, &col_u16, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+            .expect("u16 native partition");
+        assert_eq!(got_order, exp_order, "PARTITION u16-selfcheck: order mismatch");
+        assert_eq!(got_split, exp_split, "PARTITION u16-selfcheck: split mismatch");
+    }
 }
 
 // ===========================================================================
@@ -1614,6 +1650,10 @@ mod hip {
 
     #[test]
     fn kernel_parity_partition_exact_on_hip() {
+        // quick-260625-j1l (spike-029): also drive the NATIVE-WIDTH narrow path
+        // (`RocmBackend::data_partition_native` over a `BinColumn`) on hardware.
+        use lgbm_compute::{Backend, BinColumn, RocmBackend};
+
         let path = kernels_dir().join("partition.txt");
         let Ok(text) = std::fs::read_to_string(&path) else {
             eprintln!("hip parity(partition): SKIP — fixture {} not found.", path.display());
@@ -1621,6 +1661,7 @@ mod hip {
         };
 
         let hip = rocm_client();
+        let backend = RocmBackend::default();
         let mut lines = text.lines();
         let mut n = 0;
         while let Some(raw) = lines.next() {
@@ -1652,9 +1693,37 @@ mod hip {
                     .unwrap_or_else(|e| panic!("hip partition `{name}` failed: {e:?}"));
             assert_eq!(got_order, order, "HIP partition `{name}`: reordered array");
             assert_eq!(got_split, split_point, "HIP partition `{name}`: split_point");
+
+            // quick-260625-j1l (spike-029): the SAME golden case through the NATIVE-WIDTH
+            // upload (`data_partition_native` over a `BinColumn`, auto-selecting U8 for
+            // num_bin≤256, U16 for ≤65536). f64-free ⇒ assert BIT-EXACT (no tolerance).
+            let col = BinColumn::new(bins.clone(), num_bin);
+            let (nat_order, nat_split) = backend
+                .data_partition_native(&hip, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+                .unwrap_or_else(|e| panic!("hip partition `{name}` (native) failed: {e:?}"));
+            assert_eq!(nat_order, order, "HIP partition `{name}` (native): reordered array");
+            assert_eq!(nat_split, split_point, "HIP partition `{name}` (native): split_point");
             n += 1;
         }
         assert!(n > 0, "partition fixture parsed zero cases");
+
+        // quick-260625-j1l: explicit U16-band self-check on hardware — the U16 monomorph
+        // must route value-identically to the u32-widened `data_partition_on` reference.
+        {
+            let bins_u16 = vec![0u32, 300, 64, 511, 7];
+            let num_bin = 512u32; // ⇒ BinColumn::U16
+            let (min_bin, max_bin, threshold, most_freq_bin) = (0u32, 511u32, 63u32, 0u32);
+            let (exp_order, exp_split) =
+                data_partition_on(&hip, &bins_u16, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+                    .expect("hip u16 reference partition");
+            let col_u16 = BinColumn::new(bins_u16.clone(), num_bin);
+            assert!(matches!(col_u16, BinColumn::U16(_)), "expected U16 column");
+            let (got_order, got_split) = backend
+                .data_partition_native(&hip, &col_u16, num_bin, min_bin, max_bin, threshold, most_freq_bin)
+                .expect("hip u16 native partition");
+            assert_eq!(got_order, exp_order, "HIP partition u16-selfcheck: order");
+            assert_eq!(got_split, exp_split, "HIP partition u16-selfcheck: split");
+        }
     }
 
     /// nn7 (L1) parity gate: the DEVICE-RESIDENT leaf-histogram path (one-time column
