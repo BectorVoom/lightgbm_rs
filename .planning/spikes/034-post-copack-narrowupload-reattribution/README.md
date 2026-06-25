@@ -151,10 +151,19 @@ partition only **~9%**, scan-sync tiny. Neither lever targets this regime (024 p
 029 only touches the 9% partition) — confirmed. Still closed on this APU (031); re-run on
 discrete gfx110x.
 
-### Tooling note (parked)
-`LGBM_SCAN_DRAIN` no longer separates build-compute from scan on the resident+co-pack path
-(`build=0` in both modes, all resident shapes). The spike-023 drain hook needs re-wiring after
-Phase 12 if a future spike needs the build-vs-scan split inside resident `hist+split`.
+### Tooling note → ✅ FIXED (quick-260625-tw1)
+Spike-034 reported `LGBM_SCAN_DRAIN` inert on the resident+co-pack path. Root cause (found in
+tw1): the drain block existed ONLY in the single-leaf `find_best_splits_fused_inner`
+(`split.rs:1450`); Phase 12 made the default path the co-pack
+`find_best_splits_fused_siblings_from_handles_on`, which had no drain. ALSO: the re-attribution
+is read from the SCAN_PROF counters (`SCAN_DRAIN_NS` vs launch+readback under `LGBM_SCAN_PROF=1`),
+NOT phase_prof's `build` timer — so phase_prof `build=0` on the resident path was always expected
+and is NOT what DRAIN fixes. **Fixed (commit `128a4c2`):** drain block added to the co-pack
+siblings fn (drains both sibling handles). GPU-verified: with `LGBM_PHASE_PROF=1 LGBM_SCAN_PROF=1`,
+DRAIN OFF→ON moves `[scan_prof]` build_drain 0%→**97.5% medium / 98.6% large**, launch+readback
+98.8%/99.5%→2.4%/1.3% (`drainfix_{off,on}.log`). **Correct attribution invocation:**
+`LGBM_PHASE_PROF=1 LGBM_SCAN_PROF=1 LGBM_SCAN_DRAIN=1 … bench_gpu_vs_cpu`, read the `[scan_prof]`
+build_drain vs launch+readback split.
 
 ### Next-lever hypothesis (NOT built here — gates a future spike)
 The new launch-bound bottleneck (**partition 30–38%**) points at: **route partition to the HOST

@@ -77,8 +77,10 @@ See `.planning/notes/gpu-track-goal-crossover-at-scale.md` and
   built): **route partition to the HOST on the rocm backend** (the SHIPPED spike-027 fused-gather
   host partition — no device round-trip/sync), measuring the resident-build index re-upload
   tradeoff; ROI-gated (this APU loses to CPU overall; real payoff on discrete gfx110x).
-  **Tooling debt:** `LGBM_SCAN_DRAIN` no longer separates build-vs-scan on the resident+co-pack
-  path (`build=0` both modes) — re-wire it before any future build-vs-scan attribution.
+  **Tooling debt → FIXED (quick-260625-tw1, commit `128a4c2`):** the `LGBM_SCAN_DRAIN` build-drain
+  was missing on the co-pack path (Phase 12 routed through a separate siblings fn); restored +
+  GPU-verified (build_drain 0%→97.5/98.6% medium/large under `LGBM_SCAN_PROF=1 LGBM_SCAN_DRAIN=1`).
+  Correct invocation needs `LGBM_SCAN_PROF=1` too; read `SCAN_DRAIN_NS`, not phase_prof `build`.
 
 ## Spikes
 
