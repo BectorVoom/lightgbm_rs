@@ -206,6 +206,15 @@ is often a free, bit-exact reclaim (fold it into an existing pass with an early-
 precedent). This is the host-CPU analog of the GPU "re-attribute after every build change"
 rule.
 
+**The inverse also bites: a "WIRE pending" verdict may already be SHIPPED (spike-034).** The
+MANIFEST rows for 024/029 still read "WIRE = human call" / "WIREABLE", but both had been wired
+in later work (024 = Phase 12; 029 = quick-260625-j1l) that never updated the verdict text.
+Before acting on a "validated-but-unwired" verdict, **grep git log + read the live code** to
+confirm it isn't already in production — `git log --all -i --grep=<feature>` + check the call
+site. Then (a) re-point the stale verdict to SHIPPED, and (b) RE-PROFILE — a shipped lever has
+already moved the bottleneck (034: post-024 the launch-bound floor moved from scan-sync to
+partition). Verdict text in long campaigns lags the tree; trust the code, not the row.
+
 ## Don't refactor `.bin()` per-row matches into typed-slice loops (autovectorization trap, spike 033)
 
 `BinColumn::bin(row)` does a per-row enum `match` (U8/U16/U32). It is tempting to hoist the
