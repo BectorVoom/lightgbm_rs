@@ -138,6 +138,18 @@ a GPU kernel's cost. The shape:
   ~20 launches into ONE reused buffer + a single `read_one_unchecked`), interleaved
   `median[p25..p75]` over ≥9 reps, ≥2 process restarts; require a SEP-WIN (variant p75 < baseline
   p25); judge the SIGN only (spoofed 8-CU APU ⇒ absolute Mr/s is confounded, rocprof unsupported).
+- **`#[cube]` kernel authoring gotchas (024 — 3 rebuilds spent):** (1) launch SCALARS pass
+  **raw** (`nb`, `n as u32`), NOT wrapped in `ScalarArg`. (2) numeric casts inside a cube body
+  use `f64::cast_from(x)`, NOT `x as f64` (u32→f64 etc.). (3) the cube macro supports **neither**
+  a `macro_rules!` invocation in the body (`error: Unsupported macro`) **nor**, in some
+  signatures, a `#[cube]` helper fn (`f64: From<NativeExpand<f64>>`) — **inline the body
+  directly** (the 022b/024 precedent). (4) loop-carried mutables MUST init from a **plain
+  literal** — a scientific-notation `-1.0e30f64` sentinel trips the MLIR lowering
+  (`From<NativeExpand<f64>>`); use `0.0f64` when all values are ≥0 (like `split_scan_body`).
+- **Per-leaf launch/round-trip COUNTERS (023):** `phase_prof.rs` has `BUILD_RESIDENT_CNT`,
+  `SUBTRACT_RESIDENT_CNT`, `SCAN_RESIDENT_CNT` (= blocking readback syncs), `FUSED_CNT`, bumped
+  at the per-leaf Backend entry points, dumped as a `COUNTS:` line under `LGBM_PHASE_PROF=1`.
+  Use them to make the launch/sync floor empirical (parity-neutral; inert when the gate is off).
 - Reference baseline for GPU kernel parity/perf = AMD's ROCm fork `LightGBM-release-4.6.0.99/`
   (hipified CUDA), NOT mainline `LightGBM/` — see
   `.planning/notes/cubecl-vs-rocm-histogram-kernel-comparison.md`.
