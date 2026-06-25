@@ -844,6 +844,22 @@ pub trait Backend {
         false
     }
 
+    /// Whether the caller's `DataPartition::split` numeric branch should route a
+    /// leaf's rows on the HOST, directly off the narrow [`BinColumn`] (the
+    /// spike-027 fused u8-route path), instead of widening to `&[u32]` and calling
+    /// [`data_partition`](Backend::data_partition).
+    ///
+    /// `true` ⇒ the caller's `DataPartition::split` numeric branch should route a
+    /// leaf's rows on the HOST: ONE random gather + a ¼-width `u8` route scratch +
+    /// ONE `u32` scatter, producing a byte-identical `[left | right]` order to the
+    /// materialize-then-op (`data_partition`) path. [`CpuBackend`] is the bit-exact
+    /// host anchor and returns `true`. `RocmBackend` keeps the default `false` so
+    /// it routes on-device via its [`data_partition`](Backend::data_partition)
+    /// override (no host materialization stolen from the GPU upload path).
+    fn prefers_host_partition(&self) -> bool {
+        false
+    }
+
     // ===================================================================
     // 260608-p90: DEVICE-RESIDENT histogram-pool seam.
     //
@@ -1268,6 +1284,14 @@ impl Backend for CpuBackend {
             threshold,
             most_freq_bin,
         )
+    }
+
+    // CpuBackend is the bit-exact host anchor: route a leaf's rows on the HOST via
+    // the spike-027 fused u8-route path (DataPartition::split) instead of widening
+    // each leaf's bins to `&[u32]` and calling `data_partition`. Byte-identical
+    // [left | right] order. RocmBackend inherits the default false (on-device).
+    fn prefers_host_partition(&self) -> bool {
+        true
     }
 
     fn subtract_histograms(
