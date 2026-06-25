@@ -27,6 +27,7 @@ use cubecl::prelude::*;
 
 use crate::error::ComputeError;
 use crate::runtime::ActiveRuntime;
+use crate::BinColumn;
 
 /// Per-row routing map (the `SplitInner` decision, `MissingType::None` path).
 ///
@@ -42,8 +43,14 @@ use crate::runtime::ActiveRuntime;
 /// ```
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
-pub fn data_partition_kernel(
-    bins: &Array<u32>,
+pub fn data_partition_kernel<B: Int>(
+    // quick-260625-j1l (spike-029): the bin column is now NATIVE-WIDTH (u8/u16/u32),
+    // read via `u32::cast_from` to a u32 INDEX — value-identical to the prior `u32`
+    // monomorph (`u32::cast_from(x: u32)` is the identity cast), so the `<u32>` launch
+    // is byte-for-byte the previous kernel. The narrow widths upload 4× fewer bytes
+    // and read 4× less device memory. Exactly the qix histogram `<B: Int>` precedent
+    // (histogram.rs:1069, `u32::cast_from(resident_bins[...])`).
+    bins: &Array<B>,
     route: &mut Array<u32>,
     min_bin: i32,
     max_bin: i32,
@@ -73,7 +80,10 @@ pub fn data_partition_kernel(
         // threshold` (then lte) — dense_bin.hpp:336-339. Equivalent to
         // `most_freq_bin > threshold`.
         let default_to_right = most_freq_bin > threshold; // 1=gt, 0=lte
-        let bin = bins[i] as i32;
+        // quick-260625-j1l: widen the native-width bin to a u32 INDEX, then to i32 for
+        // the signed compares — value-identical to the prior `bins[i] as i32` on the
+        // `<u32>` monomorph (`u32::cast_from(x: u32)` is the identity).
+        let bin = u32::cast_from(bins[i]) as i32;
         // USE_MIN_BIN, no-missing: out-of-[minb,maxb] -> default direction.
         let is_default = bin < min_bin || bin > max_bin;
         let gt = bin > th; // in-range: bin > th -> gt, else lte
@@ -250,7 +260,10 @@ pub fn data_partition_on<R: cubecl::Runtime>(
     // outlive the launch; the kernel bounds-checks `idx < n` and writes only
     // indices `0..n`. All cubecl unsafe is confined here (CMP-01).
     unsafe {
-        data_partition_kernel::launch(
+        // quick-260625-j1l: explicit `<u32, R>` monomorph of the now-generic kernel.
+        // `u32::cast_from(x: u32)` is the identity cast, so this is byte-for-byte the
+        // prior non-generic launch (existing partition unit tests stay green).
+        data_partition_kernel::launch::<u32, R>(
             client,
             CubeCount::Static(cube_count, 1, 1),
             CubeDim::new_1d(cube_dim),
@@ -266,8 +279,15 @@ pub fn data_partition_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_route);
     let route = u32::from_bytes(&bytes);
 
-    // Stable two-pass gather: left rows (route==0) in original order, then right
-    // rows (route==1) in original order. split_point = left-row count.
+    Ok(gather_route(&route, n))
+}
+
+/// Stable two-pass gather of a per-row `route[]` into a `(reordered, split_point)`
+/// partition: left rows (`route==0`) in original order, then right rows
+/// (`route==1`) in original order; `split_point` = the left-row count. Shared by
+/// [`data_partition_on`] and [`data_partition_native_on`] so the gather tail is
+/// byte-identical across the widened and native-width upload paths.
+fn gather_route(route: &[u32], n: usize) -> (Vec<u32>, usize) {
     let mut reordered: Vec<u32> = Vec::with_capacity(n);
     for (i, &r) in route.iter().enumerate().take(n) {
         if r == 0 {
@@ -280,8 +300,102 @@ pub fn data_partition_on<R: cubecl::Runtime>(
             reordered.push(i as u32);
         }
     }
+    (reordered, split_point)
+}
 
-    Ok((reordered, split_point))
+/// **Native-width** host `data_partition` on ANY runtime — the spike-029 narrow
+/// upload. Identical routing + stable gather to [`data_partition_on`], but uploads
+/// the leaf's bins at their NATIVE [`BinColumn`] width (u8/u16/u32) instead of a
+/// u32-widened buffer: a U8 column uploads `count × 1` bytes (4× fewer) and launches
+/// the `::<u8>` kernel monomorph; U16 → `::<u16>`; U32 → `::<u32>`.
+///
+/// Returns a `(reordered, split_point)` BYTE-IDENTICAL to `data_partition_on` fed the
+/// same column widened to u32 — the u8/u16/u32 kernels read the same bin value via
+/// `u32::cast_from`, so the routing (and thus the gather) is value-identical. Bit-EXACT
+/// by construction (partition is f64-free).
+///
+/// # Errors
+/// Same V5 as [`data_partition_on`]: [`ComputeError::Runtime`] if `num_bin == 0` or
+/// `threshold >= num_bin`; [`ComputeError::BinIndexOutOfRange`] for any
+/// `bins.bin(i) >= num_bin`.
+#[allow(clippy::too_many_arguments)]
+pub fn data_partition_native_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    bins: &BinColumn,
+    num_bin: u32,
+    min_bin: u32,
+    max_bin: u32,
+    threshold: u32,
+    most_freq_bin: u32,
+) -> Result<(Vec<u32>, usize), ComputeError> {
+    use cubecl::prelude::CubeElement;
+
+    // --- V5 boundary validation (T-04-01 / T-j1l-01), reading each bin via the
+    // `BinColumn` widening accessor BEFORE the unsafe create_from_slice + launch. ---
+    if num_bin == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "data_partition: num_bin must be > 0".to_string(),
+        });
+    }
+    if threshold >= num_bin {
+        return Err(ComputeError::Runtime {
+            detail: format!("data_partition: threshold {threshold} >= num_bin {num_bin}"),
+        });
+    }
+    let n = bins.len();
+    for i in 0..n {
+        let bin = bins.bin(i);
+        if bin >= num_bin {
+            return Err(ComputeError::BinIndexOutOfRange {
+                row: i,
+                bin,
+                num_bin,
+            });
+        }
+    }
+
+    if n == 0 {
+        return Ok((Vec::new(), 0));
+    }
+
+    let zeros = vec![0u32; n];
+    let h_route = client.create_from_slice(u32::as_bytes(&zeros));
+
+    let cube_dim = 256u32;
+    let cube_count = (n as u32).div_ceil(cube_dim);
+
+    // SAFETY: `h_bins`/`h_route` each allocated for exactly `n` elements and outlive
+    // the launch; the kernel bounds-checks `i < n` and writes only indices `0..n`. The
+    // narrow upload is `n` elements of the native width (value-faithful — the bin is an
+    // index, byte-identical across widths). All cubecl unsafe is confined here (CMP-01).
+    macro_rules! launch_native {
+        ($w:ty, $slice:expr) => {{
+            let h_bins = client.create_from_slice(<$w>::as_bytes($slice));
+            unsafe {
+                data_partition_kernel::launch::<$w, R>(
+                    client,
+                    CubeCount::Static(cube_count, 1, 1),
+                    CubeDim::new_1d(cube_dim),
+                    ArrayArg::from_raw_parts(h_bins, n),
+                    ArrayArg::from_raw_parts(h_route.clone(), n),
+                    min_bin as i32,
+                    max_bin as i32,
+                    threshold as i32,
+                    most_freq_bin as i32,
+                );
+            }
+        }};
+    }
+    match bins {
+        BinColumn::U8(v) => launch_native!(u8, v),
+        BinColumn::U16(v) => launch_native!(u16, v),
+        BinColumn::U32(v) => launch_native!(u32, v),
+    }
+
+    let bytes = client.read_one_unchecked(h_route);
+    let route = u32::from_bytes(&bytes);
+
+    Ok(gather_route(&route, n))
 }
 
 #[cfg(test)]
@@ -315,6 +429,64 @@ mod tests {
     fn partition_rejects_bad_bin() {
         let client = cpu_client();
         let err = data_partition_cpu(&client, &[0, 9, 1], 3, 0, 2, 1, 3).unwrap_err();
+        assert!(matches!(err, ComputeError::BinIndexOutOfRange { .. }));
+    }
+
+    // quick-260625-j1l (spike-029): the native-width path must route BYTE-IDENTICALLY
+    // to the u32-widened `data_partition_on` — value-identical routing across the
+    // u8/u16/u32 monomorphs (`u32::cast_from`).
+
+    #[test]
+    fn partition_native_u8_matches_widened() {
+        let client = cpu_client();
+        let bins = vec![1u32, 5, 3, 7, 0, 4, 2, 6]; // num_bin=8 -> BinColumn::U8
+        let expected = data_partition_on(&client, &bins, 8, 0, 7, 3, 8).unwrap();
+        let col = BinColumn::new(bins.clone(), 8);
+        assert!(matches!(col, BinColumn::U8(_)));
+        let got = data_partition_native_on(&client, &col, 8, 0, 7, 3, 8).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(got.1, 4);
+        assert_eq!(got.0, vec![0, 2, 4, 6, 1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn partition_native_u16_matches_widened() {
+        let client = cpu_client();
+        // num_bin=512 -> BinColumn::U16. Representative split params.
+        let bins = vec![0u32, 300, 64, 511, 7];
+        let expected = data_partition_on(&client, &bins, 512, 0, 511, 63, 0).unwrap();
+        let col = BinColumn::new(bins.clone(), 512);
+        assert!(matches!(col, BinColumn::U16(_)));
+        let got = data_partition_native_on(&client, &col, 512, 0, 511, 63, 0).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn partition_native_u32_matches_widened() {
+        let client = cpu_client();
+        // num_bin > 65536 -> BinColumn::U32.
+        let bins = vec![0u32, 70_000, 100, 65_540, 9];
+        let expected = data_partition_on(&client, &bins, 70_001, 0, 70_000, 50, 0).unwrap();
+        let col = BinColumn::new(bins.clone(), 70_001);
+        assert!(matches!(col, BinColumn::U32(_)));
+        let got = data_partition_native_on(&client, &col, 70_001, 0, 70_000, 50, 0).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn partition_native_rejects_threshold_out_of_range() {
+        let client = cpu_client();
+        let col = BinColumn::new(vec![0, 1, 2], 3);
+        let err = data_partition_native_on(&client, &col, 3, 0, 2, 3, 3).unwrap_err();
+        assert!(matches!(err, ComputeError::Runtime { .. }));
+    }
+
+    #[test]
+    fn partition_native_rejects_bad_bin() {
+        let client = cpu_client();
+        // bin 9 >= num_bin 3; build a U32 column so the out-of-range value survives.
+        let col = BinColumn::U32(vec![0, 9, 1]);
+        let err = data_partition_native_on(&client, &col, 3, 0, 2, 1, 3).unwrap_err();
         assert!(matches!(err, ComputeError::BinIndexOutOfRange { .. }));
     }
 }
