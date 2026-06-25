@@ -97,7 +97,16 @@ fn make_corpus(s: &Size) -> DenseCorpus {
 }
 
 /// Median of a slice of durations (sorts a copy).
+///
+/// Returns the UPPER-middle element for an even-length input (the element at
+/// `len / 2`, not the mean of the two centers) — adequate for `reps >= 3` warm
+/// medians where the deliverable is the per-phase ratio, not a precise central
+/// tendency. Returns `Duration::ZERO` on empty input so an operator-tuned
+/// `reps == 0` cannot panic (IN-04).
 fn median(mut ds: Vec<Duration>) -> Duration {
+    if ds.is_empty() {
+        return Duration::ZERO;
+    }
     ds.sort();
     ds[ds.len() / 2]
 }
