@@ -206,6 +206,27 @@ is often a free, bit-exact reclaim (fold it into an existing pass with an early-
 precedent). This is the host-CPU analog of the GPU "re-attribute after every build change"
 rule.
 
+## Don't refactor `.bin()` per-row matches into typed-slice loops (autovectorization trap, spike 033)
+
+`BinColumn::bin(row)` does a per-row enum `match` (U8/U16/U32). It is tempting to hoist the
+match out of a hot loop and gather off a typed `&[T]` slice. **DON'T** — on x86 the tight
+typed loop auto-vectorizes into an AVX **gather** (`vpgatherdd`), which serializes
+cache-missing lanes WORSE than scalar independent loads do under out-of-order MLP. Measured
+**1.5–2× SLOWER** than the scalar `.bin()` path at scale, all sizes, 3 restarts
+(spike-033 `p0/p1 = 0.5–0.9×`). The per-row match defeats vectorization and is the FASTER
+codegen for a random gather. Keep `.bin()` in random-gather loops.
+
+## Software prefetch only pays when the gathered array ≫ LLC (spike 033)
+
+`_mm_prefetch`-ahead of a random gather is null-to-SLOWER until the gathered array vastly
+exceeds last-level cache — then it hides miss latency (spike-033: ~2–3× whole-op at 4M×U32,
+null/negative below). For this project that regime is **wide U16/U32 bin columns at
+multi-million rows** (high-cardinality features), NOT the production U8 default (dense column
+barely exceeds cache even at 4M rows ⇒ ~1.1× at a root split only). Optimal distance grows
+with array size (D≈16 dense → 128 at 4M×U32); T0≈NTA. Gate any prefetch wire on
+`width != U8 && leaf_rows ≥ ~2M`, or skip it — and weigh the x86-only-intrinsic portability
+cost on the must-build-everywhere CPU anchor.
+
 ## Wiring a spike into production — additive backend discriminator + stale-worktree integration
 
 - **Gate a backend-specific path on a default-false trait method overridden on ONE backend**, never
