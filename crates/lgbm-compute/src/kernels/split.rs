@@ -1052,6 +1052,118 @@ pub fn find_best_splits_fused_kernel(
     }
 }
 
+/// CO-PACKED 2-slot per-leaf best-split kernel (spike-024, Phase 12). ONE launch
+/// scans BOTH siblings of a split: the smaller child's histogram `hist_a` and the
+/// larger child's `hist_b`, over `2*n_feats` feature-slots. Global lane
+/// `g = ABSOLUTE_POS` (guarded `< 2*n_feats`): `g < n_feats` ⇒ sibling-A (smaller)
+/// feature `g` into `out[g*12..]`; `n_feats <= g < 2*n_feats` ⇒ sibling-B (larger)
+/// feature `g − n_feats` into `out[g*12..]`. So `out[0..n*12]` = sibling A and
+/// `out[n*12..2n*12]` = sibling B (the 12-cell-per-feature window, per sibling).
+///
+/// The per-feature param Arrays (`slot_off` .. `fwd_count`, length `n`) are SHARED
+/// between siblings — both children have the SAME dataset feature layout (same bins,
+/// same slot offsets, same iteration counts), indexed by the local feature index
+/// `fi`. The LEAF-LEVEL scalars are PER-SIBLING (`sum_gradient`/`sum_hessian`/
+/// `num_data`/`min_gain_shift` differ — the smaller child is built, the larger is
+/// subtract-derived). Each lane runs the SHARED [`split_scan_body`] over its
+/// sibling's DISJOINT histogram region — the SAME sequential reverse+forward scan as
+/// the single-slot kernel, no reorder (NOT spike-016) — so each feature's f64 result
+/// is BIT-IDENTICAL to two separate single-slot scans; co-packing only changes WHICH
+/// launch a feature's scan runs in, not its math.
+///
+/// `split_scan_body` takes ONE `hist: &Array<f64>` and cannot select between two
+/// Array refs into a binding (spike-024 gotcha), so the body is called in EACH arm
+/// with that sibling's histogram + that sibling's leaf scalars.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_kernel(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    // SHARED per-feature params (length n; both siblings share the dataset layout).
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // SHARED cfg scalars.
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    // PER-SIBLING leaf scalars (A = smaller, B = larger).
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    // Per-sibling feature count (n). The launch rounds CubeCount up so the tail cube
+    // has lanes with `g >= 2*n_feats`; those lanes must no-op.
+    n_feats: u32,
+) {
+    let g = ABSOLUTE_POS as u32;
+    let total = 2u32 * n_feats;
+    if g < total {
+        // Local feature index within the sibling; indexes the SHARED per-feature
+        // Arrays (length n) for both siblings.
+        let fi = if g < n_feats { g } else { g - n_feats } as usize;
+        // Branch on the sibling: call the SHARED split_scan_body in each arm with
+        // that sibling's histogram + leaf scalars, writing `out[g*12..]` (so A's n
+        // features land at out[0..n*12], B's at out[n*12..2n*12]).
+        if g < n_feats {
+            split_scan_body(
+                hist_a,
+                slot_off[fi],
+                out,
+                g * 12u32,
+                num_bin[fi],
+                offset[fi],
+                default_bin[fi],
+                skip_default_bin[fi],
+                use_l1,
+                min_data_in_leaf,
+                min_sum_hessian_in_leaf,
+                lambda_l1,
+                lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a,
+                num_data_a,
+                rev_count[fi],
+                fwd_count[fi],
+            );
+        } else {
+            split_scan_body(
+                hist_b,
+                slot_off[fi],
+                out,
+                g * 12u32,
+                num_bin[fi],
+                offset[fi],
+                default_bin[fi],
+                skip_default_bin[fi],
+                use_l1,
+                min_data_in_leaf,
+                min_sum_hessian_in_leaf,
+                lambda_l1,
+                lambda_l2,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b,
+                num_data_b,
+                rev_count[fi],
+                fwd_count[fi],
+            );
+        }
+    }
+}
+
 /// FUSED batched per-leaf best-split launcher (260608-mc5 THE MERGE + THE COLLAPSE),
 /// **generic over the runtime** `R`. Finds the best split for EVERY feature in
 /// `feats` in ONE launch of [`find_best_splits_fused_kernel`], returning one
@@ -1436,6 +1548,261 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         );
     }
     Ok(out)
+}
+
+/// CO-PACKED 2-slot resident best-split launcher (spike-024, Phase 12) — scans BOTH
+/// siblings of a split (the smaller child `hist_a_handle` and the larger child
+/// `hist_b_handle`) in ONE launch of [`find_best_splits_fused_siblings_kernel`] with
+/// ONE `read_one_unchecked` readback, returning `(vec_a, vec_b)` — one
+/// [`SplitInfo`] per input feature, in input order, per sibling.
+///
+/// This is the device-launch-structural win of spike-024: it replaces the TWO
+/// separate `find_best_splits_fused_inner` calls (two launches, two blocking
+/// readbacks / syncs) the fall-back uses with ONE launch + ONE sync. The per-feature
+/// V5 validation + device-array assembly is done ONCE (the feature/region layout is
+/// SHARED between siblings — both children have the same dataset feature layout). The
+/// `2*kEpsilon` bump + `min_gain_shift` are computed ONCE PER SIBLING with that
+/// sibling's RAW totals, exactly as the single-slot path computes them once. The
+/// 12-cell decode + accept-gate is the SAME as [`find_best_splits_fused_inner`],
+/// applied to BOTH halves (features `0..n` against `min_gain_shift_a`, features
+/// `n..2n` against `min_gain_shift_b`).
+///
+/// Bit-exact by construction: each feature's sequential scan is the SAME shared
+/// `split_scan_body` over the SAME disjoint region with that sibling's leaf scalars
+/// (no reorder); only WHICH launch it runs in changes vs two single-slot scans.
+///
+/// `hist_a_handle` / `hist_b_handle` each describe exactly `buf_len` f64 cells (the
+/// caller's shared `slot_len`). Empty `feats` → `Ok((vec![], vec![]))` with NO
+/// launch. Both sibling `sum_hessian`s are rejected once each (cnt_factor divides by
+/// the bumped sum_hessian). All cubecl `unsafe` is confined here (CMP-01).
+///
+/// # Errors
+/// As [`find_best_splits_batched_fused_f64_on`] (length / scope / deferred-branch
+/// typed errors), checked once on the SHARED `feats`; plus `!(sum_hessian > 0.0)`
+/// per sibling.
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_a_handle: cubecl::server::Handle,
+    hist_b_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    // (sum_gradient, sum_hessian, num_data) per sibling (A = smaller, B = larger).
+    a_totals: (f64, f64, i32),
+    b_totals: (f64, f64, i32),
+) -> Result<(Vec<SplitInfo>, Vec<SplitInfo>), ComputeError> {
+    // Empty batch: no launch (mirror the single-slot T-mc5-03 early return).
+    if feats.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    // Phase-4 scope (leaf-level, checked once on the shared cfg).
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_siblings: max_delta_step / path_smooth are Phase-7+ scope \
+                     (only the default 0.0 path is transcribed)"
+                .to_string(),
+        });
+    }
+    let (sum_gradient_a, sum_hessian_a, num_data_a) = a_totals;
+    let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
+    // Reject non-positive OR NaN sum_hessian once PER SIBLING (cnt_factor divides by
+    // the bumped sum_hessian). `!(x > 0.0)` is deliberately NaN-catching.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian_a > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_siblings: smaller-sibling sum_hessian must be > 0".to_string(),
+        });
+    }
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian_b > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_siblings: larger-sibling sum_hessian must be > 0".to_string(),
+        });
+    }
+
+    // Per-feature V5 validation + per-feature device-array assembly ONCE (the
+    // feature/region layout is SHARED between siblings).
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
+    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
+    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
+    for f in feats {
+        if f.na_as_missing {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                         implemented"
+                    .to_string(),
+            });
+        }
+        if f.num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(f.num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+            })?;
+        let end = f
+            .slot_off
+            .checked_add(cells)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "find_best_splits_siblings: slot_off + region overflows".to_string(),
+            })?;
+        if end > buf_len {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: buf_len,
+            });
+        }
+        let num_bin_i = f.num_bin as i32;
+        let rev_count = (num_bin_i - 1).max(0);
+        let fwd_count = if f.run_forward {
+            (num_bin_i - 1 - f.offset).max(0)
+        } else {
+            0
+        };
+        slot_off_a.push(f.slot_off as u32);
+        num_bin_a.push(num_bin_i);
+        offset_a.push(f.offset);
+        default_bin_a.push(f.default_bin as i32);
+        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
+        rev_count_a.push(rev_count);
+        fwd_count_a.push(fwd_count);
+    }
+
+    // LEAF-LEVEL scalars computed ONCE PER SIBLING — the 2*kEpsilon entry bump +
+    // min_gain_shift with each sibling's RAW totals, exactly as the single-slot path
+    // computes them once.
+    let two_eps = 2.0 * f64::from(K_EPSILON);
+    let use_l1 = cfg.use_l1();
+    let sum_hessian_a_bumped = sum_hessian_a + two_eps;
+    let min_gain_shift_a = crate::gain::get_leaf_gain(
+        use_l1,
+        sum_gradient_a,
+        sum_hessian_a_bumped,
+        cfg.lambda_l1,
+        cfg.lambda_l2,
+    ) + cfg.min_gain_to_split;
+    let sum_hessian_b_bumped = sum_hessian_b + two_eps;
+    let min_gain_shift_b = crate::gain::get_leaf_gain(
+        use_l1,
+        sum_gradient_b,
+        sum_hessian_b_bumped,
+        cfg.lambda_l1,
+        cfg.lambda_l2,
+    ) + cfg.min_gain_to_split;
+
+    // `out` packs A then B contiguously: 2*n features × 12 cells.
+    let out_len = 2 * n * 12;
+    let zeros = vec![0.0f64; out_len];
+    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
+    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
+    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
+    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
+    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // CubeCount over 2*n feature-slots (the lane mapping packs A then B).
+    let scan_w = scan_cube_dim();
+    let cube_count = (2 * n as u32).div_ceil(scan_w);
+
+    // SAFETY: both histogram handles describe `buf_len` f64 cells; every per-feature
+    // region `[slot_off, slot_off+2*num_bin)` is validated `<= buf_len` above; all
+    // per-feature index arrays have exactly `n` elements; lane `g` (guarded
+    // `< 2*n_feats`) reads only its sibling's validated region and writes only
+    // `out[g*12 .. g*12+12]` within the `2*n*12` allocation. All cubecl unsafe is
+    // confined here (CMP-01).
+    unsafe {
+        find_best_splits_fused_siblings_kernel::launch(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(scan_w),
+            ArrayArg::from_raw_parts(hist_a_handle, buf_len),
+            ArrayArg::from_raw_parts(hist_b_handle, buf_len),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            ArrayArg::from_raw_parts(h_slot, n),
+            ArrayArg::from_raw_parts(h_numbin, n),
+            ArrayArg::from_raw_parts(h_offset, n),
+            ArrayArg::from_raw_parts(h_defbin, n),
+            ArrayArg::from_raw_parts(h_skip, n),
+            ArrayArg::from_raw_parts(h_rev, n),
+            ArrayArg::from_raw_parts(h_fwd, n),
+            if use_l1 { 1u32 } else { 0u32 },
+            cfg.min_data_in_leaf,
+            cfg.min_sum_hessian_in_leaf,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            min_gain_shift_a,
+            sum_gradient_a,
+            sum_hessian_a_bumped,
+            num_data_a,
+            min_gain_shift_b,
+            sum_gradient_b,
+            sum_hessian_b_bumped,
+            num_data_b,
+            n as u32,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = f64::from_bytes(&bytes);
+
+    // Decode BOTH halves with the SAME 12-cell accept-gate as
+    // find_best_splits_fused_inner. Features `0..n` (sibling A, offset 0) against
+    // `min_gain_shift_a`; features `n..2n` (sibling B, offset n) against
+    // `min_gain_shift_b`. Each pushed in input order.
+    let decode_half = |feat_offset: usize, min_gain_shift: f64| -> Vec<SplitInfo> {
+        let penalty = 1.0f64;
+        let mut out = Vec::with_capacity(n);
+        for f in 0..n {
+            let base = (feat_offset + f) * 12;
+            let is_splittable = cells[base] != 0.0;
+            let raw_threshold = cells[base + 1] as u32;
+            let raw_gain = cells[base + 2];
+            let left_count = cells[base + 3] as i32;
+            let right_count = cells[base + 4] as i32;
+            let left_sum_gradient = cells[base + 5];
+            let left_sum_hessian = cells[base + 6];
+            let right_sum_gradient = cells[base + 7];
+            let right_sum_hessian = cells[base + 8];
+            let default_left = cells[base + 9] != 0.0;
+            let left_output = cells[base + 10];
+            let right_output = cells[base + 11];
+
+            if is_splittable && raw_gain > f64::NEG_INFINITY {
+                out.push(SplitInfo {
+                    threshold: raw_threshold,
+                    gain: (raw_gain - min_gain_shift) * penalty,
+                    left_count,
+                    right_count,
+                    left_sum_gradient,
+                    left_sum_hessian,
+                    right_sum_gradient,
+                    right_sum_hessian,
+                    left_output,
+                    right_output,
+                    default_left,
+                });
+            } else {
+                out.push(SplitInfo::none());
+            }
+        }
+        out
+    };
+
+    let vec_a = decode_half(0, min_gain_shift_a);
+    let vec_b = decode_half(n, min_gain_shift_b);
+    Ok((vec_a, vec_b))
 }
 
 /// **Native** host f64 best-split scan — the production cpu-anchor path (R2).
