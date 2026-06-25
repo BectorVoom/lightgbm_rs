@@ -1,11 +1,14 @@
 # Partition (row-routing) — memory-traffic & narrow-upload
 
-Implementation blueprint from spikes **026, 027, 028, 029, 032, 033** — the `DataPartition::split`
-(C++ `DataPartition::Split`, the per-leaf stable row-routing into `[left | right]`) optimization
-arc. Three wins SHIPPED (027 CPU fuse, 029 ROCm narrow-upload, 032 CPU one-gather fold), three
-NULLs/ROI-gated with root causes (026 parallelize, 028 double-buffer, 033 prefetch). The
-throughline: **partition is memory-bound; cut TRAFFIC, don't add cores — and after 032 the CPU
-host partition is effectively DONE (no remaining positive-ROI lever on this hardware).**
+Implementation blueprint from spikes **026, 027, 028, 029, 032, 033, 034, 035** — the
+`DataPartition::split` (C++ `DataPartition::Split`, the per-leaf stable row-routing into
+`[left | right]`) optimization arc. FOUR wins SHIPPED (027 CPU fuse, 029 ROCm narrow-upload, 032
+CPU one-gather fold, **035 rocm-routes-partition-on-host default-ON**), three NULLs/ROI-gated with
+root causes (026 parallelize, 028 double-buffer, 033 prefetch), and one re-attribution (034). The
+throughline: **partition is memory-bound; cut TRAFFIC, don't add cores.** After 032 the CPU host
+partition is effectively DONE; then 034 found that — once co-pack closed the scan-sync floor — the
+GPU's *device* partition round-trip became its #1 launch-bound phase (30–38%), and 035 SHIPPED the
+fix (route the rocm partition on the host by default) — the rare GPU lever that wins on the APU.
 
 ## Requirements
 
@@ -99,6 +102,44 @@ Bit-exact by construction: u8/u16/u32 read the same value via `u32::cast_from` �
 Even on the **shared-DDR5 APU the narrow upload wins** — `create_from_slice` still moves the bytes
 (see "What to Avoid": the "APU transfer is free" assumption is FALSE).
 
+### Route the rocm partition on the HOST by default (035, SHIPPED — quick-260626-a6t)
+
+**The biggest GPU-track partition win, and the one that wins on the APU itself.** Spike-034
+re-profiled after the co-pack (024) + narrow-upload (029) wires shipped and found the bottleneck
+MOVED: with the scan-sync floor closed by co-pack, the **device `data_partition_native` round-trip
+is now the #1 reclaimable launch-bound phase — 38% (medium) / 30% (large)** of GPU train (scan
+collapsed to 3–7%). At wide it's only ~9% (build dominates). So the device partition round-trip
+(host gather → upload → route kernel → blocking readback, ~30 per-split syncs/tree) is **pure
+overhead on shared DDR5**: both the device path AND the host fused path (027) land the result in
+host `indices_`, and the resident build reads host indices either way — so there is **NO index
+re-upload penalty** (the intuitive "tradeoff" is moot; read the code: `data_partition.rs:137-195`
++ `learner.rs` `indices_in_leaf`).
+
+Fix = make `RocmBackend::prefers_host_partition()` default **ON** (off-switch
+`LGBM_ROCM_HOST_PARTITION=0`), so the rocm path runs the SHIPPED 027 host fused partition. The
+029 device narrow-upload path becomes the off-switch fallback.
+
+```rust
+// crates/lgbm-compute/src/lib.rs — RocmBackend impl
+fn prefers_host_partition(&self) -> bool {
+    !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
+}
+```
+
+Measured (2 restarts, sign-stable): **~1.18–1.20× medium, ~1.22–1.23× large**; wide a WASH
+(±4% noise, no regression — partition only ~9% there). **Parity (def-f8u-01, load-bearing):** this
+is NOT a bit-exact swap — the GPU f32 atomic build is ~1.9e-6 nondeterministic regardless of
+partition path (host-vs-device max divergence 1.907e-6 = IDENTICAL to device-vs-device run-to-run
+noise; see `sources/035-rocm-host-partition/spike035_host_partition_parity.rs`, the 3-arm test).
+The valid gate is the anchor-pinned `hip::learner_parity_{resident,fused}_equals_host_tree_on_hip`
+(GPU tree vs cpu f64 anchor within ~1e-6), NOT a GPU-vs-GPU compare. CPU f64 anchor untouched.
+
+**Landmine that gated this wire:** those two hip parity tests were RED on master
+(`subtract_resident: smaller slot is empty`) — a latent fused-path bug from the Phase-12 co-pack
+deferral (see the scan-roundtrip reference / debug `subtract-resident-empty-hip`, fix `8aed100`).
+Fix it FIRST so the re-pin gate is green. ROI: rare GPU lever that genuinely wins on this 8-CU
+APU; larger still on discrete gfx110x (the device round-trip crosses PCIe there).
+
 ## What to Avoid
 
 - **Don't parallelize partition (026, NULL).** A cubecl-cpu scan+scatter (per-chunk count → host
@@ -149,8 +190,11 @@ Even on the **shared-DDR5 APU the narrow upload wins** — `create_from_slice` s
 Synthesized from spikes: 026 (parallelize=NULL, the bandwidth diagnosis), 027 (fuse-gather=SHIPPED
 1.3–2.7×, CPU), 028 (double-buffer=NULL), 029 (GPU narrow-upload=SHIPPED ~1.2–1.7×, bit-exact on GPU),
 032 (one-gather validation fold=SHIPPED ~1.14–1.41× U8, bit-exact), 033 (prefetch=PARTIAL/ROI-gated,
-don't-wire + the autovectorization landmine).
+don't-wire + the autovectorization landmine), 034 (post-co-pack re-attribution — device partition is
+now the #1 launch-bound phase 30–38%), 035 (route rocm partition on host=SHIPPED default-ON, ~1.18–1.23×
+launch-bound, wash wide, parity within ~1e-6).
 Source files in: `sources/026-cubecl-cpu-partition-scan-scatter/`, `sources/027-fused-gather-partition/`,
 `sources/028-doublebuffer-partition/`, `sources/029-gpu-narrow-upload-fuse/`,
-`sources/032-partition-validation-fold/`, `sources/033-partition-gather-prefetch/`.
-Shipped via quick tasks 260625-hw2 (027), 260625-j1l (029), 260625-qn9 (032).
+`sources/032-partition-validation-fold/`, `sources/033-partition-gather-prefetch/`,
+`sources/034-post-copack-narrowupload-reattribution/`, `sources/035-rocm-host-partition/`.
+Shipped via quick tasks 260625-hw2 (027), 260625-j1l (029), 260625-qn9 (032), 260626-a6t (035).

@@ -81,8 +81,39 @@ feat `g`; `g≥n` ⇒ sibling-B feat `g−n`), feature-per-lane W=64 (the 021 pa
   leaf-wise data dependency caps further cuts (each split needs its children's splits read back
   before selecting the next leaf). Only un-tried variant = depth-wise FRONTIER batching, which
   changes the growth policy (parity risk) for uncertain APU ROI.
-- **Re-profile after EVERY build change** — the bottleneck has moved repeatedly (014→015→023);
-  co-pack's e2e is bounded by whatever the current scan-sync fraction is.
+- **Re-profile after EVERY build change** — the bottleneck has moved repeatedly (014→015→023→**034**);
+  co-pack's e2e is bounded by whatever the current scan-sync fraction is. **Spike-034 confirmed it
+  moved a 4th time:** post-co-pack (024) + narrow-upload (029), the launch-bound bottleneck is no
+  longer the scan-sync floor (co-pack closed it → scan 3–7%) but the **device partition round-trip
+  (30–38%)** → fixed by routing partition on the host (035, SHIPPED — see `partition-memory-traffic.md`).
+  Wide stays build-dominated (unchanged). Co-pack itself verified live in production: scan_resident
+  syncs 59→30/tree, ~9–11% e2e at large.
+
+### LANDMINE — the co-pack scan deferral broke the FUSED subtract (debug `8aed100`)
+
+Phase-12 co-pack DEFERS the smaller child's scan past `subtract_resident` (so both siblings co-pack).
+That is safe for the resident scan-only path (its histogram is already built+resident) but on the
+**FUSED** directly-built path the smaller "scan" IS its histogram build+store (`build_fix_scan_resident`
+is the only thing that writes the smaller Handle into `smaller_slot`). So `subtract_resident`
+(parent − smaller) ran BEFORE the smaller histogram existed → `Compute(Runtime "subtract_resident:
+smaller slot is empty")`. Co-pack never fires on the fused path anyway (gate requires `!smaller_fused`),
+so the deferral bought it nothing and only broke it. **Fix:** when `smaller_fused`, run the smaller
+build+scan EARLY (before the larger subtract) and reuse the records at the deferred site — restore the
+pre-Phase-12 build→subtract order for the fused case only. (Latent: fused is OFF by default,
+`FUSED_MAX_NUM_DATA=-1`, only via `LGBM_FUSED_FORCE`; but it broke the hip parity tests and gated the
+035 wire.) Two force-env tests that flip `LGBM_*_FORCE` must also serialize + RAII-restore so a
+panicking train can't leak its force var into a sibling test.
+
+### Tooling: `LGBM_SCAN_DRAIN` needs `LGBM_SCAN_PROF=1` AND lives per-scan-fn (re-wired, quick-260625-tw1)
+
+The build-drain (read the resident hist Handle before the scan launch → attributes build-compute to
+`SCAN_DRAIN_NS` instead of the scan readback) is gated `_scan_prof && scan_drain_enabled()` — needs
+BOTH `LGBM_SCAN_PROF=1` and `LGBM_SCAN_DRAIN=1`, and the re-attribution is read from the SCAN_PROF
+counters, NOT phase_prof's `build` timer (whose `build=0` on the resident path is expected/unrelated).
+The drain block lived ONLY in the single-leaf scan fn; Phase-12 routed the default through the co-pack
+siblings fn which had no drain → it read inert. Re-added to the siblings fn (drains both handles);
+verified GPU re-attribution build_drain 0%→97.5/98.6% (medium/large). Correct invocation:
+`LGBM_PHASE_PROF=1 LGBM_SCAN_PROF=1 LGBM_SCAN_DRAIN=1 … bench_gpu_vs_cpu`.
 
 ## Constraints
 

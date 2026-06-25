@@ -1,7 +1,7 @@
 # Spike Wrap-Up Summary
 
-**Dates:** 2026-06-17 (001–013) · 2026-06-21 (014a/b + p9v/qix/rdu/rsh) · 2026-06-25 (015–022 build/scan kernel; 023/024 + 026–029 round-trip/partition; 030/031 build re-attribution; **022b/032/033 partition+within-scan close-out**)
-**Spikes processed:** 35 (001–033 incl. 014a/b, 022b; 025 superseded/not-built) across six wrap-up sessions
+**Dates:** 2026-06-17 (001–013) · 2026-06-21 (014a/b + p9v/qix/rdu/rsh) · 2026-06-25 (015–022 build/scan kernel; 023/024 + 026–029 round-trip/partition; 030/031 build re-attribution; **022b/032/033 partition+within-scan close-out**) · 2026-06-26 (**034/035 GPU partition re-attribution + route-on-host**)
+**Spikes processed:** 37 (001–035 incl. 014a/b, 022b; 025 superseded/not-built) across seven wrap-up sessions
 **Feature areas:** CPU histogram build · GPU histogram kernel · GPU routing & quantization · Histogram/learning memory layout · GPU wide-shape attribution · GPU build fixed-point atomics · GPU split-scan occupancy · GPU scan round-trip & co-pack · GPU build bottleneck re-attribution · Partition (row-routing) memory-traffic
 **Skill output:** `./.claude/skills/spike-findings-lightgbm_rs/`
 
@@ -240,3 +240,38 @@ GPU split-scan occupancy (022b → `references/gpu-split-scan-occupancy.md`)
 - 032 (spike): `905e31e`; 032 (wire): `6b6fb09` + `cc673d9` (quick-260625-qn9).
 - 033 (spike): `f8dc46d`.
 - CONVENTIONS: `1f3563f` (audit-the-wiring) + the 033 autovectorization/prefetch lessons (this wrap).
+
+## Session 7 (2026-06-26) — 034/035: re-attribute-then-act, the GPU partition routing win
+
+- **034 — re-profile after the wires; the bottleneck MOVED a 4th time (measurement).** With co-pack
+  (024) + narrow-upload (029) SHIPPED since the last full attribution (023), re-ran the whole-train
+  BUDGET + per-tree COUNTS + co-pack ON/OFF A/B (2 restarts, sign-stable). **Launch-bound regime
+  (small/med/large): the scan-sync floor is CLOSED** — co-pack confirmed live (scan_resident 59→30
+  syncs/tree, scan now 3.0% med / 7.0% large) — and the **device `data_partition_native` round-trip
+  is the NEW #1 reclaimable phase, 38% medium / 30% large**. **Wide/compute-bound: UNCHANGED**,
+  build-dominated ~91% (neither lever targets it, as predicted). Also corrected a tooling gap: the
+  `LGBM_SCAN_DRAIN` build-drain needs `LGBM_SCAN_PROF=1` AND lived only on the single-leaf scan fn
+  (Phase-12 routed the default through the co-pack siblings fn) → re-wired onto the siblings fn
+  (quick-260625-tw1), GPU-verified build_drain 0%→97.5/98.6%.
+- **035 — route the rocm partition on the HOST by default (VALIDATED + SHIPPED, quick-260626-a6t).**
+  The fix 034 pointed at. Both partition paths land in host `indices_` and the resident build reads
+  host indices either way ⇒ the device round-trip is **pure overhead on shared DDR5, no index
+  re-upload** (the intuitive tradeoff is moot). Flip `RocmBackend::prefers_host_partition()` to
+  default-ON (off-switch `LGBM_ROCM_HOST_PARTITION=0`) → run the SHIPPED 027 host fused path.
+  **~1.18–1.23× launch-bound (medium/large), wash wide** (no regression), 2 restarts sign-stable.
+  **Parity (def-f8u-01):** NOT a bit-exact swap — host-vs-device max divergence 1.907e-6 = IDENTICAL
+  to device-vs-device run-to-run noise (3-arm test); valid gate = anchor-pinned hip tests, not
+  GPU-vs-GPU. **The rare GPU lever that wins on the 8-CU APU itself** (most levers in this campaign
+  are discrete-only deferrals); larger on discrete gfx110x (device round-trip crosses PCIe).
+- **Gated by a debug fix (`8aed100`).** The anchor-pinned hip parity tests were RED on master
+  (`subtract_resident: smaller slot is empty`) — a latent FUSED-path bug: Phase-12 co-pack deferred
+  the smaller child's scan past `subtract_resident`, but on the fused path that scan IS the smaller
+  histogram build+store, so subtract ran before it existed. Un-deferred for the fused case only
+  (co-pack never touched the fused path). Method lesson reinforced: **re-profile after every wire,
+  and a "validated-not-wired" spike can ship same-session once you clear the gating defect.**
+
+### Commits (session 7)
+- 034 (spike): `34671e7` + CONVENTIONS `9acac58` (the "a WIRE-pending verdict may already be shipped" inverse rule).
+- 035 (spike): `73a2328`; 035 (wire): `da3032f` + docs `1815325` (quick-260626-a6t).
+- debug subtract_resident: fix `8aed100` + archive `26bd150`.
+- LGBM_SCAN_DRAIN re-wire: `128a4c2` + docs `872f5de` (quick-260625-tw1).
