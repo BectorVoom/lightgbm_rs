@@ -152,24 +152,21 @@ impl DataPartition {
                 most_freq_bin,
             )?
         } else {
-            // RocmBackend / any device backend: keep the materialize-then-op path
-            // verbatim so the leaf's rows route ON-DEVICE via `backend.data_partition`
-            // (no host specialization stolen from the GPU upload path).
-            //
-            // Gather the leaf's per-row bins in the current `indices_` order so the
-            // Backend op's stable reorder is RELATIVE to this leaf's row order. The
-            // per-row bin READ widens via the accessor; the partition LOGIC is
-            // unchanged.
+            // RocmBackend / any device backend: route the leaf's rows ON-DEVICE.
+            // quick-260625-j1l (spike-029): re-gather the leaf's bins at NATIVE width
+            // (`BinColumn::gather` preserves u8/u16/u32) and route via the additive
+            // `data_partition_native`. The CpuBackend default widens + delegates (so the
+            // non-fused cpu path stays byte-unchanged); RocmBackend overrides it to
+            // upload count×native-width bytes (4× fewer on all-u8 data) — bit-exact to
+            // the prior u32 widen (value-identical routing). The fused host path above
+            // (`prefers_host_partition`) is untouched.
             let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
-            let leaf_feature_bins: Vec<u32> = leaf_rows
-                .iter()
-                .map(|&row| feature_bins.bin(row as usize))
-                .collect();
+            let leaf_bins = feature_bins.gather(&leaf_rows);
 
             // The Backend op owns the SplitInner routing + stable two-pass gather.
-            let (reordered_local, split_point) = backend.data_partition(
+            let (reordered_local, split_point) = backend.data_partition_native(
                 client,
-                &leaf_feature_bins,
+                &leaf_bins,
                 num_bin,
                 min_bin,
                 max_bin,

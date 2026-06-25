@@ -617,6 +617,45 @@ pub trait Backend {
         most_freq_bin: u32,
     ) -> Result<(Vec<u32>, usize), ComputeError>;
 
+    /// **Native-width** sibling of [`data_partition`](Backend::data_partition)
+    /// (quick-260625-j1l / spike-029, ADDITIVE — the `data_partition(&[u32])`
+    /// signature and every caller are byte-unchanged).
+    ///
+    /// Takes the leaf's bins as a narrow [`BinColumn`] (u8/u16/u32) instead of a
+    /// u32-widened slice. The DEFAULT body simply WIDENS and delegates to
+    /// [`data_partition`](Backend::data_partition), so CpuBackend (and every backend
+    /// that does not override) is byte-identical to HEAD with ZERO edits. GPU backends
+    /// OVERRIDE this to upload the bins at their native width (4× fewer bytes on the
+    /// common all-u8 `max_bin≤255` case), which is bit-exact to the widened path
+    /// because the u8/u16/u32 route kernels read the same bin value via `u32::cast_from`.
+    ///
+    /// # Errors
+    /// Same V5 as [`data_partition`](Backend::data_partition): [`ComputeError::Runtime`]
+    /// if `num_bin == 0` or `threshold >= num_bin`; [`ComputeError::BinIndexOutOfRange`]
+    /// for any `bins.bin(i) >= num_bin`.
+    #[allow(clippy::too_many_arguments)]
+    fn data_partition_native(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        bins: &BinColumn,
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<(Vec<u32>, usize), ComputeError> {
+        // DEFAULT: widen (cold) and delegate — byte-identical to the prior u32 path.
+        self.data_partition(
+            client,
+            &bins.to_u32_vec(),
+            num_bin,
+            min_bin,
+            max_bin,
+            threshold,
+            most_freq_bin,
+        )
+    }
+
     /// Derive the larger child's histogram via the subtraction trick
     /// (`parent - child`), the kernel-layer MATH of `FeatureHistogram::Subtract`
     /// (`feature_histogram.hpp:99`). WHICH child is subtracted (the smaller
@@ -2092,6 +2131,34 @@ impl Backend for RocmBackend {
         most_freq_bin: u32,
     ) -> Result<(Vec<u32>, usize), ComputeError> {
         kernels::partition::data_partition_on(
+            client,
+            bins,
+            num_bin,
+            min_bin,
+            max_bin,
+            threshold,
+            most_freq_bin,
+        )
+    }
+
+    /// GPU override (quick-260625-j1l / spike-029): upload the leaf's bins at NATIVE
+    /// width (u8/u16/u32) instead of u32-widening — 4× fewer host→device bytes + a
+    /// narrow-reading route kernel on the common all-u8 (`max_bin≤255`) case. Bit-EXACT
+    /// to the default widening path (`data_partition`): the u8/u16/u32 route kernels read
+    /// the same bin value via `u32::cast_from`, so the route (and the stable gather) is
+    /// value-identical.
+    #[allow(clippy::too_many_arguments)]
+    fn data_partition_native(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        bins: &BinColumn,
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<(Vec<u32>, usize), ComputeError> {
+        kernels::partition::data_partition_native_on(
             client,
             bins,
             num_bin,
