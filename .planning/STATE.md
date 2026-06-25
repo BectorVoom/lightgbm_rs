@@ -2,16 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: completed
-stopped_at: Completed 11-03-PLAN.md
-last_updated: "2026-06-22T10:04:19.135Z"
-last_activity: 2026-06-22 -- Completed 11-03 (device-time A/B: live resident u64 build not slower than f32 twin in the wide regime, SPEC-3)
+current_phase: 12
+current_phase_name: gpu-sibling-scan-copack
+status: executing
+stopped_at: Completed 12-01-PLAN.md
+last_updated: "2026-06-25T01:56:32.286Z"
+last_activity: 2026-06-25
+last_activity_desc: Phase 12 execution started
 progress:
-  total_phases: 3
+  total_phases: 4
   completed_phases: 2
-  total_plans: 5
-  completed_plans: 4
-  percent: 67
+  total_plans: 8
+  completed_plans: 5
+  percent: 50
 ---
 
 # Project State
@@ -21,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 11 — gpu-fixedpoint-int-atomics
+**Current focus:** Phase 12 — gpu-sibling-scan-copack
 
 ## Current Position
 
-Phase: 11 (gpu-fixedpoint-int-atomics) — ALL PLANS COMPLETE (ready for verification)
-Plan: 3 of 3 (complete)
-Status: Phase 11 execution complete — 11-01/11-02/11-03 all shipped; SPEC-1/2/3/4 confirmed
-Last activity: 2026-06-22 -- Completed quick task 260622-t4u: permanent P>1 row-partitioned parity test for the live u64 fixed-point resident GPU BUILD (closes WR-05; GPU-verified bit-exact at P=10)
+Phase: 12 (gpu-sibling-scan-copack) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
+Last activity: 2026-06-25 — Phase 12 execution started
 
 ## Deferred Items
 
@@ -502,6 +505,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 11 P01 | 35 | 3 tasks | 2 files |
 | Phase 11 P02 | 20min | 2 tasks | 2 files |
 | Phase 11 P03 | 25min | 1 tasks | 1 files |
+| Phase 12 P01 | 35min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -577,6 +581,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 11-01: resident_raw_build_into gained a fixed_point flag so the live u64 chain + the f32 readback oracle share one resident-build path; naive >256-bin fallback stays f32 (asserted unreachable when fixed_point)
 - [Phase ?]: Phase 11-02: resident u64 fixed-point build re-pinned to CPU f64 anchor at FIXEDPOINT_REL_GATE=1e-7 (measured max_rel=0.0, spike-018 ref ~5.9e-9) + 2-runs determinism; def-f8u-01 honored (no GPU-vs-GPU)
 - [Phase ?]: Phase 11 SPEC-3 confirmed via device-time A/B: live resident u64 fixed-point build is not slower than the f32 twin in the wide regime (~1.13-1.66x SEP-WINs), null/overlap in the light regime (8-CU APU spoofed, relative ratio only)
+- [Phase ?]: Phase 12-01: co-pack sibling resident scans add a spine-equality guard (resident_eligible does not rule out per-node col-sampling), falling back to two scans when spines differ
+- [Phase ?]: Phase 12-01: CpuBackend inherits the scan_resident_siblings default error (no resident pool); the co-pack gate ANDs in resident_eligible so CpuBackend never reaches it
 
 ### Pending Todos
 
@@ -606,9 +612,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-22T10:04:05.387Z
-Stopped at: Completed 08-05-PLAN.md
-Resume file: .planning/phases/08-python-bindings/08-CONTEXT.md
+Last session: 2026-06-25T01:56:32.166Z
+Stopped at: Completed 12-01-PLAN.md
+Resume file: None
 
 ## Operator Next Steps
 
