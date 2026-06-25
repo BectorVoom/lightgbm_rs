@@ -134,35 +134,59 @@ impl DataPartition {
         let begin = self.leaf_begin[leaf_u] as usize;
         let count = self.leaf_count[leaf_u] as usize;
 
-        // Gather the leaf's per-row bins in the current `indices_` order so the
-        // Backend op's stable reorder is RELATIVE to this leaf's row order. The
-        // per-row bin READ widens via the accessor; the partition LOGIC is
-        // unchanged.
-        let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
-        let leaf_feature_bins: Vec<u32> = leaf_rows
-            .iter()
-            .map(|&row| feature_bins.bin(row as usize))
-            .collect();
+        let (left_count, right_count) = if backend.prefers_host_partition() {
+            // CpuBackend host anchor: spike-027 V1 fused u8-route path, IN PLACE on
+            // `self.indices[begin..begin+count]`. ONE random gather + a ¼-width u8
+            // route scratch + ONE u32 scatter — no leaf_rows clone, no u32-widened
+            // leaf_feature_bins, no local→row remap. Byte-identical [left | right]
+            // order to the materialize-then-op path below (same SplitInner
+            // MissingType::None decision as data_partition_cpu_native).
+            self.split_fused_host(
+                begin,
+                count,
+                feature_bins,
+                num_bin,
+                min_bin,
+                max_bin,
+                threshold,
+                most_freq_bin,
+            )?
+        } else {
+            // RocmBackend / any device backend: keep the materialize-then-op path
+            // verbatim so the leaf's rows route ON-DEVICE via `backend.data_partition`
+            // (no host specialization stolen from the GPU upload path).
+            //
+            // Gather the leaf's per-row bins in the current `indices_` order so the
+            // Backend op's stable reorder is RELATIVE to this leaf's row order. The
+            // per-row bin READ widens via the accessor; the partition LOGIC is
+            // unchanged.
+            let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
+            let leaf_feature_bins: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&row| feature_bins.bin(row as usize))
+                .collect();
 
-        // The Backend op owns the SplitInner routing + stable two-pass gather.
-        let (reordered_local, split_point) = backend.data_partition(
-            client,
-            &leaf_feature_bins,
-            num_bin,
-            min_bin,
-            max_bin,
-            threshold,
-            most_freq_bin,
-        )?;
+            // The Backend op owns the SplitInner routing + stable two-pass gather.
+            let (reordered_local, split_point) = backend.data_partition(
+                client,
+                &leaf_feature_bins,
+                num_bin,
+                min_bin,
+                max_bin,
+                threshold,
+                most_freq_bin,
+            )?;
 
-        // Map the op's local positions back to GLOBAL row ids and write them back
-        // into this leaf's slice of `indices_` (left rows first, then right).
-        for (slot, &local_pos) in reordered_local.iter().enumerate() {
-            self.indices[begin + slot] = leaf_rows[local_pos as usize];
-        }
+            // Map the op's local positions back to GLOBAL row ids and write them back
+            // into this leaf's slice of `indices_` (left rows first, then right).
+            for (slot, &local_pos) in reordered_local.iter().enumerate() {
+                self.indices[begin + slot] = leaf_rows[local_pos as usize];
+            }
 
-        let left_count = split_point as i32;
-        let right_count = count as i32 - left_count;
+            let left_count = split_point as i32;
+            let right_count = count as i32 - left_count;
+            (left_count, right_count)
+        };
 
         // left_leaf keeps `leaf`'s begin; right_leaf starts after the left rows.
         self.leaf_count[leaf_u] = left_count;
@@ -170,6 +194,109 @@ impl DataPartition {
         self.leaf_begin[right_u] = begin as i32 + left_count;
         self.leaf_count[right_u] = right_count;
 
+        Ok((left_count, right_count))
+    }
+
+    /// Spike-027 V1 fused u8-route host split, run IN PLACE on the leaf's slice
+    /// `self.indices[begin..begin+count]`. Returns `(left_count, right_count)`.
+    ///
+    /// Faithful port of `v1_fused_u8route` + `make_router` from the spike example
+    /// (`spike027_fused_gather_partition_ab.rs`): the routing decision is the SAME
+    /// `SplitInner` `MissingType::None` decision as `data_partition_cpu_native`
+    /// (`partition.rs`) / `dense_bin.hpp:322-365`, so the resulting `[left | right]`
+    /// order is BYTE-IDENTICAL to the materialize-then-op path.
+    #[allow(clippy::too_many_arguments)]
+    fn split_fused_host(
+        &mut self,
+        begin: usize,
+        count: usize,
+        feature_bins: &BinColumn,
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> Result<(i32, i32), ComputeError> {
+        // V5 boundary validation FIRST (matches the variants/fields the
+        // `backend.data_partition` path returns so callers see no behavior change),
+        // surfacing the LOWEST-index offending bin.
+        if num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "data_partition: num_bin must be > 0".to_string(),
+            });
+        }
+        if threshold >= num_bin {
+            return Err(ComputeError::Runtime {
+                detail: format!("data_partition: threshold {threshold} >= num_bin {num_bin}"),
+            });
+        }
+        // Per-row bin range check in ASCENDING leaf-position order. NOTE:
+        // `data_partition_cpu_native` validates the lowest GLOBAL-bins index (its
+        // input is the already-gathered leaf bins, so "row" == leaf position); here
+        // the leaf-row scan in ascending leaf position is the faithful per-leaf
+        // analog, reading each row's bin directly off the narrow `BinColumn` (no
+        // u32-widened leaf_feature_bins Vec).
+        for i in 0..count {
+            let row = self.indices[begin + i] as usize;
+            let b = feature_bins.bin(row);
+            if b >= num_bin {
+                return Err(ComputeError::BinIndexOutOfRange {
+                    row: i,
+                    bin: b,
+                    num_bin,
+                });
+            }
+        }
+
+        // Router (dense_bin.hpp:322-365) — identical to `make_router`:
+        let min_b = min_bin as i32;
+        let max_b = max_bin as i32;
+        let thr = threshold as i32;
+        let mut th = thr + min_b;
+        if most_freq_bin == 0 {
+            th -= 1;
+        }
+        let default_to_right = most_freq_bin as i32 > thr;
+        let go_right = |b: u32| -> bool {
+            let bin = b as i32;
+            if bin < min_b || bin > max_b {
+                default_to_right
+            } else {
+                bin > th
+            }
+        };
+
+        // pass 1: gather + route + count (the ONE random gather). `route` is the
+        // ¼-width u8 scratch (KEPT — the 2-gather V2 variant regresses).
+        let mut route = vec![0u8; count];
+        let mut left_count = 0usize;
+        for i in 0..count {
+            let row = self.indices[begin + i];
+            let gr = go_right(feature_bins.bin(row as usize));
+            route[i] = gr as u8;
+            left_count += (!gr) as usize;
+        }
+
+        // pass 2: scatter ROW ids directly into one output buffer — left rows
+        // (route==0) ascending into [0,left_count), right rows ascending into
+        // [left_count,count) — then copy back into the leaf slice in place.
+        let mut out = vec![0u32; count];
+        let mut l = 0usize;
+        let mut r = left_count;
+        for i in 0..count {
+            let row = self.indices[begin + i];
+            if route[i] == 0 {
+                out[l] = row;
+                l += 1;
+            } else {
+                out[r] = row;
+                r += 1;
+            }
+        }
+        self.indices[begin..begin + count].copy_from_slice(&out);
+
+        let left_count = left_count as i32;
+        let right_count = count as i32 - left_count;
         Ok((left_count, right_count))
     }
 
@@ -317,5 +444,152 @@ mod tests {
         assert_eq!(dp.indices_in_leaf(2), &[3, 7]);
         // Leaf 0 untouched.
         assert_eq!(dp.indices_in_leaf(0), &[0, 2, 4, 6]);
+    }
+
+    /// V0 serial reference (mirrors `v0_baseline` in the spike example): gather the
+    /// leaf's bins, run `data_partition_cpu_native`, remap local→row, write back.
+    /// Returns the rewritten leaf slice + `(left_count, right_count)`.
+    #[allow(clippy::too_many_arguments)]
+    fn serial_reference_slice(
+        leaf_rows: &[u32],
+        feature_bins: &BinColumn,
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        threshold: u32,
+        most_freq_bin: u32,
+    ) -> (Vec<u32>, i32, i32) {
+        use lgbm_compute::kernels::partition::data_partition_cpu_native;
+        let leaf_feature_bins: Vec<u32> = leaf_rows
+            .iter()
+            .map(|&r| feature_bins.bin(r as usize))
+            .collect();
+        let (reordered, split_point) = data_partition_cpu_native(
+            &leaf_feature_bins,
+            num_bin,
+            min_bin,
+            max_bin,
+            threshold,
+            most_freq_bin,
+        )
+        .expect("serial reference ok");
+        let out: Vec<u32> = reordered
+            .iter()
+            .map(|&local| leaf_rows[local as usize])
+            .collect();
+        let left = split_point as i32;
+        let right = leaf_rows.len() as i32 - left;
+        (out, left, right)
+    }
+
+    /// The fused host path (CpuBackend, `prefers_host_partition()==true`) must
+    /// produce a BYTE-IDENTICAL `[left | right]` indices slice — and the same
+    /// `(left_count, right_count)` — as the serial `data_partition_cpu_native`
+    /// reference, over a SCATTERED leaf (random gather), for both the
+    /// `most_freq_bin == 0` branch and a U8 `BinColumn` (the production narrow case).
+    #[test]
+    fn split_fused_equals_serial() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        assert!(
+            backend.prefers_host_partition(),
+            "CpuBackend must select the fused host path"
+        );
+
+        // Deterministic LCG (mirrors the spike example) for a scattered leaf + column.
+        let lcg = |seed: u64| {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            move || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u32
+            }
+        };
+
+        let n: usize = 2_000;
+        let num_bin = 64u32;
+        let min_bin = 0u32;
+        let max_bin = num_bin - 1;
+        let threshold = 31u32;
+
+        // A shuffled permutation of [0,n) ⇒ the leaf's rows are NOT in identity order
+        // (so the bin gather is random), exercising the scatter path.
+        let mut scattered: Vec<u32> = (0..n as u32).collect();
+        let mut next = lcg(0xBEEF);
+        for i in (1..n).rev() {
+            let j = (next() as usize) % (i + 1);
+            scattered.swap(i, j);
+        }
+
+        // Full-column bin values in [0,num_bin), skewed into the low half.
+        let mut nextv = lcg(0xC0FFEE);
+        let raw: Vec<u32> = (0..n)
+            .map(|_| {
+                let r = nextv();
+                if (r as f64 / u32::MAX as f64) < 0.6 {
+                    r % (num_bin / 2).max(1)
+                } else {
+                    r % num_bin
+                }
+            })
+            .collect();
+
+        // (a) most_freq_bin == 0 branch + (b) U8 column (num_bin<=256 ⇒ BinColumn::U8).
+        for &most_freq_bin in &[0u32, 5u32] {
+            let col = BinColumn::new(raw.clone(), num_bin);
+            assert!(matches!(col, BinColumn::U8(_)), "narrow U8 column");
+
+            // Build a DataPartition whose leaf 0 holds the scattered rows directly.
+            let mut dp = DataPartition::new(n as i32, 4);
+            dp.indices.copy_from_slice(&scattered);
+
+            let (l, r) = dp
+                .split(
+                    &backend,
+                    &client,
+                    0,
+                    1,
+                    &col,
+                    num_bin,
+                    min_bin,
+                    max_bin,
+                    threshold,
+                    most_freq_bin,
+                )
+                .expect("fused split ok");
+
+            let (ref_slice, ref_l, ref_r) = serial_reference_slice(
+                &scattered,
+                &col,
+                num_bin,
+                min_bin,
+                max_bin,
+                threshold,
+                most_freq_bin,
+            );
+
+            assert_eq!(
+                (l, r),
+                (ref_l, ref_r),
+                "(left,right) mismatch most_freq_bin={most_freq_bin}"
+            );
+            assert_eq!(
+                dp.indices_in_leaf(0),
+                &ref_slice[..ref_l as usize],
+                "left slice not byte-identical most_freq_bin={most_freq_bin}"
+            );
+            assert_eq!(
+                dp.indices_in_leaf(1),
+                &ref_slice[ref_l as usize..],
+                "right slice not byte-identical most_freq_bin={most_freq_bin}"
+            );
+            // The whole rewritten leaf region must match byte-for-byte.
+            assert_eq!(
+                &dp.indices()[0..n],
+                &ref_slice[..],
+                "full [left|right] slice not byte-identical most_freq_bin={most_freq_bin}"
+            );
+        }
     }
 }
