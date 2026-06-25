@@ -27,6 +27,38 @@ use std::time::{Duration, Instant};
 
 use lgbm::{train, DenseCorpus, TrainingBuilder};
 
+// ===========================================================================
+// Phase 12 (spike-024 / SC-3 + SC-4) — co-pack ON/OFF A/B
+// ===========================================================================
+//
+// Gated behind `LGBM_BENCH_COPACK_AB=1` (the default bench output is unchanged).
+// MUST be run under `LGBM_PHASE_PROF=1` so the `scan_resident` sync counter is
+// live, and `--features rocm` so the resident co-pack path actually fires (the
+// CpuBackend f64 anchor has no resident pool, so this section is GPU-only).
+//
+//   LGBM_BENCH_COPACK_AB=1 LGBM_PHASE_PROF=1 \
+//     cargo run --release --features rocm --example bench_gpu_vs_cpu
+//
+// HONEST FRAMING (load-bearing — do NOT misread):
+//   * SC-3 (structural, REAL): co-packing the two per-sibling resident scans into
+//     ONE 2-slot launch + ONE readback halves the per-tree `scan_resident` SYNC
+//     count (~59 -> ~30, spike-023 COUNTS). This is counter-exact and
+//     shape-independent — it is the deliverable.
+//   * SC-4 (e2e, SIGN-ONLY): the spike-024 ISOLATED scan A/B was ~2.0× — that is
+//     the launch+readback COMPONENT only and is NOT the e2e number. Per spike-023's
+//     scan-sync fraction of total train, the e2e ceiling is ~10–15% at small/medium
+//     and ~1.5% at wide. We report median train OFF vs ON and a NOT-SLOWER /
+//     trends-faster verdict; we DO NOT assert a pass/fail on the e2e ratio.
+//   * THIS BOX is a spoofed 8-CU APU (gfx1152, HSA-overridden) — absolute perf is
+//     APU-confounded. Judge SIGN only; run >=2 processes for sign-stability
+//     (CONVENTIONS.md device-time discipline: warm median, >=2 restarts).
+//   * Wide (1M×500) is expected ~unaffected (~1.5% sync fraction); routing unchanged.
+
+#[cfg(feature = "rocm")]
+const COPACK_OFF: &str = "0";
+#[cfg(feature = "rocm")]
+const COPACK_ON: &str = "1";
+
 /// A benchmark size: `rows` × `features`, each feature identity-binned into
 /// `bins` distinct integer values (`0..bins-1`, all present).
 struct Size {
@@ -68,6 +100,147 @@ fn make_corpus(s: &Size) -> DenseCorpus {
 fn median(mut ds: Vec<Duration>) -> Duration {
     ds.sort();
     ds[ds.len() / 2]
+}
+
+/// Run `warmup` discarded trains then `reps` timed trains on `corpus`/`cfg`,
+/// returning `(median_train_time, scan_resident_sync_count_per_train)`.
+///
+/// The `scan_resident` count is captured by swapping the `phase_prof`
+/// `SCAN_RESIDENT_CNT` atomic to 0 right before the FIRST timed rep and reading
+/// it after the LAST, then dividing by `reps` to get the per-train sync count
+/// (the per-tree count is `per_train / iters`). Inert (reads 0) unless
+/// `LGBM_PHASE_PROF=1`. GPU-only: the resident co-pack/scan path never fires on
+/// the CpuBackend anchor, so this helper is compiled only under `--features rocm`.
+#[cfg(feature = "rocm")]
+fn timed_run(
+    cfg: &lgbm::Config,
+    corpus: &DenseCorpus,
+    warmup: usize,
+    reps: usize,
+) -> (Duration, u64) {
+    use std::sync::atomic::Ordering;
+    // Warm-up (discarded) — amortize allocator/JIT/launch caches.
+    for _ in 0..warmup {
+        let _ = train(cfg, corpus).expect("warm-up train ok");
+    }
+    // Reset the sync counter AFTER warmup so we count only the timed reps.
+    lgbm_treelearner::phase_prof::SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
+
+    let mut times = Vec::with_capacity(reps);
+    let mut sink = 0.0f64;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let booster = train(cfg, corpus).expect("train ok");
+        times.push(t0.elapsed());
+        sink += booster.predict(&corpus.features[0..1])[0][0] as f64;
+    }
+    std::hint::black_box(sink);
+    let total_syncs = lgbm_treelearner::phase_prof::SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
+    let per_train = if reps > 0 { total_syncs / reps as u64 } else { 0 };
+    (median(times), per_train)
+}
+
+/// Phase 12 (SC-3 + SC-4) — co-pack ON/OFF A/B. Returns `true` when it ran (so
+/// `main` skips the default single-config bench). GPU-only.
+#[cfg(feature = "rocm")]
+fn run_copack_ab(sizes: &[Size], cfg_for: &dyn Fn(&Size) -> lgbm::Config, iters: i32, warmup: usize, reps: usize) {
+    println!("\n# === Phase 12 co-pack ON/OFF A/B (LGBM_SIBLING_COPACK 0 vs 1) ===");
+    println!(
+        "# HONEST FRAMING: the isolated scan A/B was ~2.0× (spike-024), which is the\n\
+         # launch+readback COMPONENT only — NOT the e2e number. Per spike-023's scan-sync\n\
+         # fraction, the e2e ceiling is ~10–15% at small/medium and ~1.5% at wide.\n\
+         # SC-3 = the scan_resident SYNC count ~halves (~59 -> ~30/tree) — structural, real.\n\
+         # SC-4 = median train is NOT-SLOWER and trends faster — SIGN-ONLY on this spoofed\n\
+         #        8-CU APU (judge SIGN; run >=2 PROCESSES for sign-stability; no pass/fail gate).\n\
+         # Wide is expected ~unaffected (~1.5%). CPU/GPU routing is unchanged."
+    );
+    if !std::env::var("LGBM_PHASE_PROF").map(|v| v == "1").unwrap_or(false) {
+        println!(
+            "# WARNING: LGBM_PHASE_PROF is not 1 — scan_resident sync counts will read 0.\n\
+             #          Re-run with: LGBM_BENCH_COPACK_AB=1 LGBM_PHASE_PROF=1 cargo run \\\n\
+             #            --release --features rocm --example bench_gpu_vs_cpu"
+        );
+    }
+    println!(
+        "{:<8} {:>8} {:>5} {:>5}  {:>12} {:>12} {:>9}  {:>12} {:>12} {:>7}  verdict",
+        "size",
+        "rows",
+        "feat",
+        "bins",
+        "syncs_off",
+        "syncs_on",
+        "sync/tree",
+        "train_off",
+        "train_on",
+        "off/on",
+    );
+
+    for s in sizes {
+        let corpus = make_corpus(s);
+        let cfg = cfg_for(s);
+
+        // OFF: byte-unchanged two-separate-scans path. The override reads the env
+        // per query (not memoized), so an in-process toggle is sufficient.
+        unsafe { std::env::set_var("LGBM_SIBLING_COPACK", COPACK_OFF) };
+        let (off_t, off_syncs) = timed_run(&cfg, &corpus, warmup, reps);
+
+        // ON: co-pack engages whenever the structural correctness gate holds.
+        unsafe { std::env::set_var("LGBM_SIBLING_COPACK", COPACK_ON) };
+        let (on_t, on_syncs) = timed_run(&cfg, &corpus, warmup, reps);
+
+        let off_s = off_t.as_secs_f64();
+        let on_s = on_t.as_secs_f64();
+        let ratio = if on_s > 0.0 { off_s / on_s } else { f64::NAN };
+        // Sync-count per tree (per-train / iters) — the ~59 -> ~30 SC-3 signal.
+        let on_per_tree = if iters > 0 { on_syncs as f64 / iters as f64 } else { 0.0 };
+        // Verdict: NOT-SLOWER when ON is within ~3% noise of OFF or faster;
+        // trends-faster when ON is faster beyond that noise band. SIGN-only.
+        let verdict = if ratio.is_nan() {
+            "n/a"
+        } else if ratio >= 1.03 {
+            "trends-faster"
+        } else if ratio >= 0.97 {
+            "NOT-SLOWER"
+        } else {
+            "SLOWER(noise? rerun)"
+        };
+
+        println!(
+            "{:<8} {:>8} {:>5} {:>5}  {:>12} {:>12} {:>9.1}  {:>10.2?} {:>10.2?} {:>7.3}  {}",
+            s.name.trim(),
+            s.rows,
+            s.features,
+            s.bins,
+            off_syncs,
+            on_syncs,
+            on_per_tree,
+            off_t,
+            on_t,
+            ratio,
+            verdict,
+        );
+    }
+    // Reset the override so we don't leak A/B state into any later run.
+    unsafe { std::env::remove_var("LGBM_SIBLING_COPACK") };
+    println!(
+        "# DIAGNOSIS: SC-3 (sync drop) is structural + counter-exact (syncs_on ~= syncs_off/2,\n\
+         #   ~30/tree vs ~59/tree). SC-4 (off/on >= 1) is SIGN-ONLY + Amdahl-capped (~10–15%\n\
+         #   small/medium, ~1.5% wide) — the isolated 2× is NOT the e2e number. Run >=2\n\
+         #   processes and judge the SIGN; the absolute magnitude is APU-confounded."
+    );
+}
+
+/// CPU-only stub: the resident co-pack path never fires on the f64 anchor, so the
+/// A/B is GPU-only. Mirrors the harness's `--features rocm` gating.
+#[cfg(not(feature = "rocm"))]
+fn run_copack_ab(_sizes: &[Size], _cfg_for: &dyn Fn(&Size) -> lgbm::Config, _iters: i32, _warmup: usize, _reps: usize) {
+    println!(
+        "\n# === Phase 12 co-pack ON/OFF A/B requested (LGBM_BENCH_COPACK_AB=1) ===\n\
+         # SKIPPED: this CPU-only build has no resident histogram pool, so the co-pack\n\
+         # scan path never fires (CpuBackend f64 anchor). Rebuild with --features rocm:\n\
+         #   LGBM_BENCH_COPACK_AB=1 LGBM_PHASE_PROF=1 cargo run --release \\\n\
+         #     --features rocm --example bench_gpu_vs_cpu"
+    );
 }
 
 fn main() {
@@ -157,6 +330,31 @@ fn main() {
         _ => default_sizes,
     };
 
+    // The training config is identical for every size (and for the co-pack A/B's
+    // OFF/ON arms — the ONLY variable is `LGBM_SIBLING_COPACK`).
+    let cfg_for = |_s: &Size| -> lgbm::Config {
+        TrainingBuilder::new()
+            .objective("regression")
+            .num_iterations(iters)
+            .num_leaves(LEAVES)
+            .learning_rate(0.1)
+            .min_data_in_leaf(20)
+            .seed(42)
+            .deterministic(true)
+            .build()
+            .expect("config builds")
+    };
+
+    // Phase 12 (SC-3 + SC-4): co-pack ON/OFF A/B. Gated behind LGBM_BENCH_COPACK_AB=1
+    // so the default bench output is unchanged. Covers the launch-bound small/medium
+    // regimes (where the win lands) plus a wide regime (showing ~0 effect) — whichever
+    // `sizes` the harness was configured with (default = small/medium/large;
+    // LGBM_BENCH_SWEEP=wide = 250k/500k/1M × 500).
+    if std::env::var("LGBM_BENCH_COPACK_AB").map(|v| v == "1").unwrap_or(false) {
+        run_copack_ab(&sizes, &cfg_for, iters, warmup, train_reps);
+        return;
+    }
+
     println!(
         "# lightgbm_rs GPU-vs-CPU bench  (backend: {backend}, iters: {iters}, leaves: {LEAVES}, warmup: {warmup}, reps: {train_reps}, rowpart_min: {})",
         std::env::var("LGBM_ROWPART_MIN").unwrap_or_else(|_| "default(256000)".into())
@@ -174,16 +372,7 @@ fn main() {
 
     for s in &sizes {
         let corpus = make_corpus(s);
-        let cfg = TrainingBuilder::new()
-            .objective("regression")
-            .num_iterations(iters)
-            .num_leaves(LEAVES)
-            .learning_rate(0.1)
-            .min_data_in_leaf(20)
-            .seed(42)
-            .deterministic(true)
-            .build()
-            .expect("config builds");
+        let cfg = cfg_for(s);
 
         // ---- WARM-UP (discarded): amortize allocator/JIT so the timed loop is warm.
         for _ in 0..warmup {
