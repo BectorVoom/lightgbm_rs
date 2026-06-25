@@ -1,8 +1,8 @@
 # Spike Wrap-Up Summary
 
-**Date:** 2026-06-17
-**Spikes processed:** 13 (001–013, full campaign — 010–013 wrapped first, 001–009 appended)
-**Feature areas:** CPU histogram build · GPU histogram kernel · GPU routing & quantization · Histogram/learning memory layout
+**Dates:** 2026-06-17 (001–013) · 2026-06-21 (014a/b + p9v/qix/rdu/rsh) · 2026-06-25 (015–022, GPU build/scan kernel campaign)
+**Spikes processed:** 22 (001–022) across three wrap-up sessions
+**Feature areas:** CPU histogram build · GPU histogram kernel · GPU routing & quantization · Histogram/learning memory layout · GPU wide-shape attribution · GPU build fixed-point atomics · GPU split-scan occupancy
 **Skill output:** `./.claude/skills/spike-findings-lightgbm_rs/`
 
 ## Processed Spikes
@@ -24,6 +24,14 @@
 | 013 | feature-splittable-arena | standard | ❌ INVALIDATED (sub-noise) | Learning-path allocation |
 | 014a | coarse-phase-attribution | standard | ⚠️ PARTIAL (overturns framing) | GPU wide-shape attribution |
 | 014b | gpu-launch-vs-compute-split | standard | ✅ VALIDATED (names the cost) | GPU wide-shape attribution |
+| 015 | parallel-f32-resident-build | standard | ⚠️ PARTIAL (bottleneck located) | GPU build — fixed-point atomics |
+| 016 | parallel-scan-reorder-parity | standard | ⚠️ PARTIAL (→ resolved by 022) | GPU split-scan occupancy |
+| 017 | perwarp-lds-replication | standard | ✅ VALIDATED modest ~1.1× (not wired) | GPU build — fixed-point atomics |
+| 018 | fixedpoint-int-atomics | standard | ✅ VALIDATED strong + SHIPPED | GPU build — fixed-point atomics |
+| 019 | int-atomic-contention-regime | standard | ✅ VALIDATED (corrects 018) | GPU build — fixed-point atomics |
+| 020 | perwarp-replication-on-u64 | standard | ⚠️ PARTIAL/null (don't wire) | GPU build — fixed-point atomics |
+| 021 | scan-feature-per-lane-occupancy | standard | ✅ VALIDATED + SHIPPED | GPU split-scan occupancy |
+| 022 | within-feature-parallel-scan-parity | standard | ✅ VALIDATED (gate resolved, ROI-gated) | GPU split-scan occupancy |
 
 ## Key Findings (001–009, the perf campaign)
 
@@ -76,9 +84,42 @@
   cache-hostile — transpose to one contiguous row pass (byte-identical); (3) single-thread
   scatter into `num_features` L2-resident tails wins where spike-011's PARALLEL scatter lost.
 
+## Key Findings (015–022 — the GPU build/scan KERNEL campaign, 2026-06-25)
+- **The wide bottleneck is the atomic-bound histogram BUILD** (015): post-014, with the
+  build-drain A/B (`LGBM_SCAN_DRAIN=1`) it is 86→92% of the scan-attributed wall and GROWS
+  with rows; the scan round-trip is ≤14% and shrinking; array-hoist (~0.1%) and switch-to-f32
+  (already done) are dead. Tooling (`LGBM_SCAN_PROF`/`DRAIN`) kept in-tree.
+- **The build win SHIPPED: f32 → u64 fixed-point integer atomics** (018/019). On RDNA, f32
+  `atomicAdd` is a CAS-retry loop (`ds_cmpst`) that serializes under contention; integer
+  `ds_add_u64` is native single-instruction. ~1.3–1.7× in the heavy-load regime (wide
+  root/large leaves), NULL at light load; **composes** with row-partition; **+3600× accuracy +
+  deterministic** (order-independent integer adds → bit-exact across runs/P). `Atomic<i64>` is
+  broken in cubecl-hip 0.10 → use `Atomic<u64>` two's-complement @ S=2^30.
+- **Per-warp LDS replication is a NULL** (017 f32 ~1.1× not-wired; 020 u64) — wins only at
+  P=16, **regresses ~0.90× at the production P=1 wide regime** (2× LDS halves occupancy; the
+  u64 switch already took the contention win). Don't wire.
+- **The split SCAN win SHIPPED: feature-per-lane occupancy** (021). The scan launched
+  `CubeDim(1)` = one single-threaded cube/feature (~1/32 wave ALU util). Repack to one feature
+  per LANE (`ABSOLUTE_POS` index + tail guard, `CubeDim(W)`, env `LGBM_SCAN_CUBEDIM` default
+  W=64) → **bit-exact** (each feature still sequential), isolated scan **~3×**, e2e **~1.27×**
+  (Amdahl-capped: the readback sync is still gated by the unchanged build).
+- **Within-feature parallel scan is PARITY-SAFE but ROI-gated** (016/022). Host probes resolved
+  the reorder risk: threshold stable; every `default_left` flip COSMETIC (max present-data leaf
+  Δ = 0.0; the gain gap is linear in default-bin mass so only empty bins flip). A tie-aware
+  argmax reproduces the same splits within ~1e-6. But post-021 the scan saturates the device at
+  wide, so it helps only NARROW (the GPU's weakest regime) — **don't wire**; deferred 022b = the
+  perf A/B. New method: the **host parity probe** (model the exact backend reorder order +
+  classify cosmetic-vs-real by present-data impact) — now a 008/016/022 convention.
+- **ROI reality (unchanged):** the spoofed 8-CU gfx1152 APU loses to the multi-threaded CPU
+  anchor at every shape — this whole kernel campaign is **ROCm-parity-track maintenance**, valid
+  for a real discrete gfx110x where the under-utilization removed is more wasteful.
+
 ## Shipped commits
 - `d9cbae4` — spike 010 (flat arena)
 - `5c8fa43` — spikes 012 (pool reuse) + 013 (feature_splittable not-worth-it)
 - `c490905` — spike 011 (revert + load-bearing NOTE)
 - 014 thread: `01e405d` p9v, `ff4a10b` qix, `bf467bd` rdu, `b917191` rsh (spikes:
   `fe79da3` 014a, `c3ab6fd` 014b)
+- 015–022 thread: 018/019 u64 fixed-point build (live, Phase-11); `eaf4094` 021
+  feature-per-lane scan (SHIPPED); `acf849c` 022 within-feature parity gate; spikes 015–020
+  documented (017/020 replication evidence kept rocm-gated, not wired).

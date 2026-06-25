@@ -125,6 +125,19 @@ a GPU kernel's cost. The shape:
 - `cubecl` 0.10 LDS API: `SharedMemory::<Atomic<f32>>::new(COMPTIME_SIZE)`, `sync_cube()`,
   per-cube atomics. `Array<u8>` compiles+runs on HIP (006). f64 ops run on gfx1100 despite
   `has_f64 == false` (used by the f64 anchor kernels).
+- **`Atomic<i64>` is broken on cubecl-hip 0.10** (018): `Atomic<i64>::store` lowers to
+  `atomicExch(long long*)`, which HIP lacks → compiles, fails at runtime. Use `Atomic<u64>`
+  two's-complement (store the i64 bits as u64; wrapping `fetch_add` == signed add; reinterpret on
+  readback). This is how the shipped u64 fixed-point build accumulates.
+- **cubecl topology-constant types (021):** the *linearised* builtins `ABSOLUTE_POS`, `CUBE_POS`,
+  `CUBE_COUNT` are **`usize`**; the per-axis ones (`CUBE_POS_X`, `UNIT_POS`, …) and sizes
+  (`CUBE_DIM`, `PLANE_DIM`) are **`u32`**. `let f = ABSOLUTE_POS as u32;` before u32 arithmetic.
+  `plane_inclusive_sum` lowers to a Hillis-Steele `__shfl_up` loop on HIP (model THAT order in
+  reorder-parity probes, not a pairwise tree).
+- **GPU device-time A/B discipline (017/018/019/020):** compute-throughput timing (accumulate
+  ~20 launches into ONE reused buffer + a single `read_one_unchecked`), interleaved
+  `median[p25..p75]` over ≥9 reps, ≥2 process restarts; require a SEP-WIN (variant p75 < baseline
+  p25); judge the SIGN only (spoofed 8-CU APU ⇒ absolute Mr/s is confounded, rocprof unsupported).
 - Reference baseline for GPU kernel parity/perf = AMD's ROCm fork `LightGBM-release-4.6.0.99/`
   (hipified CUDA), NOT mainline `LightGBM/` — see
   `.planning/notes/cubecl-vs-rocm-histogram-kernel-comparison.md`.

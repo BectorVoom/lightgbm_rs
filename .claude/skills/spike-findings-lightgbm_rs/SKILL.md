@@ -1,6 +1,6 @@
 ---
 name: spike-findings-lightgbm_rs
-description: Implementation blueprint from the lightgbm_rs train-speed perf campaign (spikes 001-013). Proven CPU histogram-build wins (once-gather, u8 bins, feature-parallel, pool flatten+reuse), GPU kernel findings (row-partition lever; u8/packing/quant nulls), GPU-vs-CPU routing, and the bit-exact + measurement rules. Auto-loaded during training-path performance work.
+description: Implementation blueprint from the lightgbm_rs train-speed perf campaign (spikes 001-022). Proven CPU histogram-build wins (once-gather, u8 bins, feature-parallel, pool flatten+reuse), the GPU build/scan kernel campaign (u64 fixed-point atomics SHIPPED, feature-per-lane scan SHIPPED; per-warp-replication & within-feature-scan parity-resolved-but-ROI-gated), GPU-vs-CPU routing, and the bit-exact + measurement rules. Auto-loaded during training-path performance work.
 ---
 
 <context>
@@ -15,7 +15,13 @@ Spike sessions wrapped: 2026-06-17 — spikes **001–013** (full campaign); 202
 spikes **014a/014b** (GPU wide-shape 1M×500 attribution + the p9v/qix/rdu/rsh host-setup
 levers, cumulative −68%). The histogram BUILD dominates CPU train; on the GPU wide shape
 the kernel is only ⅓ — redundant device upload + cache-hostile per-train host setup were
-the real costs.
+the real costs. 2026-06-25 — spikes **015–022** (the GPU build/scan KERNEL campaign):
+post-014 the wide bottleneck is the atomic-bound histogram BUILD → **u64 fixed-point
+integer atomics SHIPPED** (~1.3–1.7× + 3600× accuracy + deterministic); the per-leaf split
+SCAN was `CubeDim(1)` single-threaded-per-feature → **feature-per-lane (W=64) SHIPPED**
+(bit-exact, ~3× isolated). Per-warp LDS replication (017/020) and within-feature parallel
+scan (016/022) are parity-characterized but ROI-gated (the spoofed 8-CU APU loses to the
+CPU anchor everywhere — this track is ROCm-parity maintenance, not overall-fastest).
 </context>
 
 <requirements>
@@ -40,6 +46,8 @@ the real costs.
 | GPU routing & quantization | references/gpu-routing-and-quantization.md | GPU crosses CPU ≈700k rows vs single-thread (001) — but moves to millions vs the multi-threaded anchor; int16 quantized hist is irreducibly approximate (008, ~3e-4 floor), opt-in mode only |
 | Histogram & learning-path memory layout | references/histogram-learning-memory-layout.md | Flatten + reuse the histogram pool (~7% large, bit-exact, shipped); keep the parallel-build per-thread accumulators (load-bearing) and the KB-scale bool matrix (sub-noise); per-leaf rows are already flat |
 | GPU wide-shape attribution & host-setup levers | references/gpu-wide-shape-attribution.md | At 1M×500 the histogram kernel is ≤⅓ of train (folded into "scan"; `build=0` is an artifact) — profile with the whole-train BUDGET (`LGBM_PHASE_PROF=1`). Four shipped bit-exact levers: upload-once-per-train (p9v −32%), native-width upload (qix ~5×/~4× mem), cache-friendly feature_infos (rdu ~8×) + binning (rsh ~2.3×) via transpose; cumulative 29.55→~9.5s (−68%). Measure before "fixing" a hypothesis (the to_vec-clones lever was a mis-attribution) |
+| GPU build — fixed-point atomics & contention | references/gpu-build-fixedpoint-atomics.md | Wide build is LDS-atomic-contention bound (015, ~820 Mr/s, grows w/ rows). The ONE win: f32→**u64 fixed-point integer atomics** (018/019, SHIPPED) — ~1.3–1.7× in heavy-load regime (f32 atomicAdd = CAS-retry loop; integer ds_add_u64 native) + ~3600× accuracy + deterministic; composes with row-partition. Per-warp LDS replication (017 f32 ~1.1× / 020 u64) **regresses at production P=1 — NULL**. `Atomic<i64>` broken in cubecl-hip 0.10 (use u64 two's-complement) |
+| GPU split-scan — occupancy & within-feature parallelism | references/gpu-split-scan-occupancy.md | Post-u64 the per-leaf scan is ~half the cost; it was `CubeDim(1)` single-thread/feature. **Feature-per-lane (W=64) SHIPPED** (021, bit-exact, isolated scan ~3×, e2e ~1.27× Amdahl-capped by the build). Within-feature parallel scan (016/022) is **parity-SAFE within ~1e-6** (default_left flips cosmetic; gain gap linear in default-bin mass) but **ROI-gated** — only helps narrow, the GPU's weakest regime; don't wire. Re-profile after every build change (the bottleneck moves) |
 
 ## Cross-cutting rules (read these first)
 
@@ -77,6 +85,14 @@ harness (`gen_data.py`/`train.conf`) are preserved in `sources/`.
 - 013-feature-splittable-arena (INVALIDATED — sub-noise)
 - 014a-coarse-phase-attribution (PARTIAL — GPU kernel folded into "scan"; <½ of wall-clock instrumented; overturns "kernel is the bottleneck")
 - 014b-gpu-launch-vs-compute-split (VALIDATED — whole-train BUDGET names the cost: redundant per-tree resident-bin upload, ≈ the kernel; led to 4 shipped levers)
+- 015-parallel-f32-resident-build (PARTIAL/located — wide bottleneck = atomic-bound BUILD 86→92%, growing w/ rows; scan round-trip ≤14% & shrinking; `LGBM_SCAN_PROF`/`DRAIN` tooling)
+- 016-parallel-scan-reorder-parity (PARTIAL — threshold stable under reorder; default_left flips deferred → resolved by 022)
+- 017-perwarp-lds-replication (VALIDATED modest ~1.1× on f32, NOT wired — superseded by u64)
+- 018-fixedpoint-int-atomics (VALIDATED strong — u64 fixed-point atomics, the build win; SHIPPED)
+- 019-int-atomic-contention-regime (VALIDATED + corrects 018 — ~1.3–1.7× heavy-load, composes with row-partition)
+- 020-perwarp-replication-on-u64 (PARTIAL/null-leaning — wins only at P=16, REGRESSES at production P=1; DON'T WIRE)
+- 021-scan-feature-per-lane-occupancy (VALIDATED + SHIPPED — CubeDim(1)→W=64, bit-exact, isolated scan ~3× / e2e ~1.27×)
+- 022-within-feature-parallel-scan-parity (VALIDATED — parity GATE resolved PARITY-SAFE ~1e-6; all default_left flips cosmetic; ROI-gated, don't wire)
 
-Full campaign 001–013 wrapped (2026-06-17); 014a/014b + shipped p9v/qix/rdu/rsh levers wrapped (2026-06-21, GPU wide-shape 1M×500, cumulative −68%).
+Full campaign 001–013 wrapped (2026-06-17); 014a/014b + shipped p9v/qix/rdu/rsh levers wrapped (2026-06-21, GPU wide-shape 1M×500, cumulative −68%); 015–022 GPU build/scan KERNEL campaign wrapped (2026-06-25 — u64 fixed-point build + feature-per-lane scan SHIPPED; replication & within-feature scan parity-characterized but ROI-gated).
 </metadata>
