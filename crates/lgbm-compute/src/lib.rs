@@ -957,6 +957,37 @@ pub trait Backend {
         })
     }
 
+    /// CO-PACKED 2-slot resident scan (spike-024, Phase 12) — the co-packed analog of
+    /// [`scan_resident_leaf`]. Scans BOTH siblings of a split in ONE 2-slot launch over
+    /// their simultaneously-resident Handles (`smaller_slot` + `larger_slot`) with ONE
+    /// `read_one_unchecked` readback (the 024 sync-floor win: ≈59→≈30 syncs/tree),
+    /// returning `(smaller_splits, larger_splits)`. Bit-exact by construction — each
+    /// feature's sequential scan is the SAME as the two single-slot scans; only WHICH
+    /// launch it runs in changes. `feats` (the SHARED per-feature spine layout) and
+    /// `slot_len` are the same for both siblings; the leaf `totals` (raw
+    /// `(sum_gradient, sum_hessian, num_data)`) differ per sibling. Default: typed error.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] (unsupported / empty slot) on the default; propagates
+    /// the co-packed split-scan errors on RocmBackend.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_resident_siblings(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _smaller_slot: usize,
+        _larger_slot: usize,
+        _slot_len: usize,
+        _feats: &[BatchedSplitFeature],
+        _cfg: &GainConfig,
+        _smaller_totals: (f64, f64, i32),
+        _larger_totals: (f64, f64, i32),
+    ) -> Result<(Vec<SplitInfo>, Vec<SplitInfo>), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "scan_resident_siblings: device-resident pool not supported on this backend"
+                .to_string(),
+        })
+    }
+
     /// 260608-t3t: FUSED directly-built-leaf path — build + fix + compact + scan a
     /// leaf's per-feature histogram in ONE launch. Builds the leaf's histogram
     /// DEVICE-RESIDENT (sequential f64 fold ⇒ bit-exact), fixes+compacts it, and
@@ -2372,6 +2403,51 @@ impl Backend for RocmBackend {
         };
         kernels::split::find_best_splits_batched_fused_f64_from_handle_on(
             client, handle, slot_len, feats, cfg, sum_gradient, sum_hessian, num_data,
+        )
+    }
+
+    /// CO-PACKED 2-slot resident scan (spike-024, Phase 12) — borrows BOTH the
+    /// smaller and larger sibling Handles (simultaneously resident at the co-pack
+    /// point: the smaller slot survives `subtract_resident`, the larger is its
+    /// derived output) and runs ONE co-packed 2-slot launch + ONE readback, returning
+    /// `(smaller_splits, larger_splits)`. Errors if either slot is empty (defensive,
+    /// mirroring `scan_resident_leaf` / the two-Handle `subtract_resident` borrow).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_resident_siblings(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        cfg: &GainConfig,
+        smaller_totals: (f64, f64, i32),
+        larger_totals: (f64, f64, i32),
+    ) -> Result<(Vec<SplitInfo>, Vec<SplitInfo>), ComputeError> {
+        let (smaller_h, larger_h) = {
+            let mirror = self.resident_pool.borrow();
+            let smaller_h =
+                mirror.get(smaller_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                    ComputeError::Runtime {
+                        detail: "scan_resident_siblings: smaller slot is empty".to_string(),
+                    }
+                })?;
+            let larger_h = mirror.get(larger_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: "scan_resident_siblings: larger slot is empty".to_string(),
+                }
+            })?;
+            (smaller_h, larger_h)
+        };
+        kernels::split::find_best_splits_fused_siblings_from_handles_on(
+            client,
+            smaller_h,
+            larger_h,
+            slot_len,
+            feats,
+            cfg,
+            smaller_totals,
+            larger_totals,
         )
     }
 
