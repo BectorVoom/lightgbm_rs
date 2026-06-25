@@ -123,3 +123,39 @@
 - 015–022 thread: 018/019 u64 fixed-point build (live, Phase-11); `eaf4094` 021
   feature-per-lane scan (SHIPPED); `acf849c` 022 within-feature parity gate; spikes 015–020
   documented (017/020 replication evidence kept rocm-gated, not wired).
+
+---
+
+## Session 2026-06-25 (cont.) — spikes 023/024 + 026–029 (GPU scan round-trip + PARTITION arc)
+
+**Processed:** 6 spikes → 2 new reference files.
+
+| # | Name | Verdict | Feature area |
+|---|------|---------|--------------|
+| 023 | post-021-roundtrip-attribution | VALIDATED (measurement) | gpu-scan-roundtrip-copack |
+| 024 | batch-sibling-scans | VALIDATED ~2× isolated, WIRED phase 12 | gpu-scan-roundtrip-copack |
+| 026 | cubecl-cpu-partition-scan-scatter | PARTIAL/NULL | partition-memory-traffic |
+| 027 | fused-gather-partition | VALIDATED + SHIPPED (CPU, quick-260625-hw2) | partition-memory-traffic |
+| 028 | doublebuffer-partition | INVALIDATED/NULL | partition-memory-traffic |
+| 029 | gpu-narrow-upload-fuse | VALIDATED + SHIPPED (ROCm, quick-260625-j1l) | partition-memory-traffic |
+
+### Key findings
+- **Partition is memory-bandwidth-bound on shared DDR5** (026) — parallelizing it (rayon OR
+  cubecl-cpu) is NULL at scale; this reframes the reverted ia0 rayon (wall = DRAM bandwidth, not
+  build contention). The lever is to CUT TRAFFIC.
+- **Fuse the per-leaf bin gather + ¼-width u8 route scratch** (027) — 1.3–2.7× CPU, bit-exact,
+  biggest ~2.3× at U8; SHIPPED behind `prefers_host_partition()`. The ~29% tall-narrow partition
+  residual was the #1 remaining CPU-vs-C++ gap.
+- **Narrow the GPU per-split upload u32→native-width** (029) — ~1.2–1.7× rocm, bit-exact on the
+  GPU; SHIPPED via a generic-over-Int kernel + additive `data_partition_native`. Disproved the
+  "shared-DDR5 APU transfer is free" assumption — `create_from_slice` still moves the bytes.
+- **Two clean NULLs with root causes:** parallelize partition (026), double-buffer to drop the
+  copy-back (028 — copy-back is only 2–7% of the fused op; C++ copies back too).
+- **GPU scan round-trip regime-split** (023) + **sibling-scan co-pack** (024, ~2× isolated,
+  bit-exact, WIRED phase 12 behind `LGBM_SIBLING_COPACK`).
+
+### Shipped commits
+- 027: `8eb6c9e` (fused host split) + `f413e1d` (prefers_host_partition) — quick-260625-hw2.
+- 029: `4fe9025` (generic kernel) + `3b79e69` (data_partition_native + wire) + `9ab8cb6` (U8/U16
+  parity cells) — quick-260625-j1l.
+- 024: wired in phase 12 (`LGBM_SIBLING_COPACK`).

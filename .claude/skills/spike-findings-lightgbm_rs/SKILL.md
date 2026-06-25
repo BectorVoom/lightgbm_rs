@@ -22,6 +22,15 @@ SCAN was `CubeDim(1)` single-threaded-per-feature → **feature-per-lane (W=64) 
 (bit-exact, ~3× isolated). Per-warp LDS replication (017/020) and within-feature parallel
 scan (016/022) are parity-characterized but ROI-gated (the spoofed 8-CU APU loses to the
 CPU anchor everywhere — this track is ROCm-parity maintenance, not overall-fastest).
+2026-06-25 (cont.) — spikes **023/024** (GPU scan round-trip: regime-split attribution +
+**sibling-scan co-pack**, ~2× isolated bit-exact, WIRED phase 12) and **026–029** (the
+**PARTITION row-routing arc**): partition is memory-bandwidth-bound on shared DDR5, so
+parallelizing it (026 cubecl-cpu / the reverted ia0 rayon) is NULL — the lever is to CUT
+TRAFFIC. **Fuse the per-leaf bin gather + a ¼-width u8 route scratch SHIPPED on CPU** (027,
+1.3–2.7×, bit-exact, the #1 remaining CPU-vs-C++ gap), and **narrow the GPU per-split upload
+u32→native-width SHIPPED on ROCm** (029, ~1.2–1.7×, bit-exact on GPU — disproving "APU
+shared-memory transfer is free"). Dropping the copy-back via double-buffer is NULL (028, the
+copy-back is only 2–7%).
 </context>
 
 <requirements>
@@ -48,6 +57,8 @@ CPU anchor everywhere — this track is ROCm-parity maintenance, not overall-fas
 | GPU wide-shape attribution & host-setup levers | references/gpu-wide-shape-attribution.md | At 1M×500 the histogram kernel is ≤⅓ of train (folded into "scan"; `build=0` is an artifact) — profile with the whole-train BUDGET (`LGBM_PHASE_PROF=1`). Four shipped bit-exact levers: upload-once-per-train (p9v −32%), native-width upload (qix ~5×/~4× mem), cache-friendly feature_infos (rdu ~8×) + binning (rsh ~2.3×) via transpose; cumulative 29.55→~9.5s (−68%). Measure before "fixing" a hypothesis (the to_vec-clones lever was a mis-attribution) |
 | GPU build — fixed-point atomics & contention | references/gpu-build-fixedpoint-atomics.md | Wide build is LDS-atomic-contention bound (015, ~820 Mr/s, grows w/ rows). The ONE win: f32→**u64 fixed-point integer atomics** (018/019, SHIPPED) — ~1.3–1.7× in heavy-load regime (f32 atomicAdd = CAS-retry loop; integer ds_add_u64 native) + ~3600× accuracy + deterministic; composes with row-partition. Per-warp LDS replication (017 f32 ~1.1× / 020 u64) **regresses at production P=1 — NULL**. `Atomic<i64>` broken in cubecl-hip 0.10 (use u64 two's-complement) |
 | GPU split-scan — occupancy & within-feature parallelism | references/gpu-split-scan-occupancy.md | Post-u64 the per-leaf scan is ~half the cost; it was `CubeDim(1)` single-thread/feature. **Feature-per-lane (W=64) SHIPPED** (021, bit-exact, isolated scan ~3×, e2e ~1.27× Amdahl-capped by the build). Within-feature parallel scan (016/022) is **parity-SAFE within ~1e-6** (default_left flips cosmetic; gain gap linear in default-bin mass) but **ROI-gated** — only helps narrow, the GPU's weakest regime; don't wire. Re-profile after every build change (the bottleneck moves) |
+| GPU scan round-trip — attribution & sibling co-pack | references/gpu-scan-roundtrip-copack.md | Post-021 the GPU per-tree round-trip is REGIME-SPLIT (023): ~59 scan-readback SYNCS/tree (one per leaf-node, both siblings scanned separately) — the SYNC floor is the reclaimable residual launch-bound (small/medium), build-compute dominates+grows wide (96.5%@1M×500). Subtract trick already on-device (closed). **Sibling-scan co-pack (024) = ~2× isolated, bit-exact, WIRED phase 12** behind `LGBM_SIBLING_COPACK` (59→~30 syncs/tree; honest e2e ~10–15% small/medium, ~1.5% wide). Use `LGBM_SCAN_DRAIN` to de-alias build vs scan-sync; ROCm-parity-track |
+| Partition (row-routing) — memory-traffic & narrow-upload | references/partition-memory-traffic.md | Partition is MEMORY-BANDWIDTH-bound (shared DDR5) — **cut traffic, don't add cores**. SHIPPED: fuse the gather + ¼-width u8 route scratch (027, **1.3–2.7× CPU, bit-exact**, the #1 CPU-vs-C++ gap); narrow the GPU upload u32→native-width via generic-over-Int kernel + `data_partition_native` (029, **~1.2–1.7× rocm, bit-exact on GPU**). NULLs: parallelize partition (026 — rayon/cubecl-cpu both lose, bandwidth-bound; "APU transfer free" is FALSE); double-buffer to drop the copyback (028 — copyback only 2–7%, C++ copies back too). Backend gate via default-false trait methods (`prefers_host_partition`/`data_partition_native`), never a global |
 
 ## Cross-cutting rules (read these first)
 
@@ -93,6 +104,12 @@ harness (`gen_data.py`/`train.conf`) are preserved in `sources/`.
 - 020-perwarp-replication-on-u64 (PARTIAL/null-leaning — wins only at P=16, REGRESSES at production P=1; DON'T WIRE)
 - 021-scan-feature-per-lane-occupancy (VALIDATED + SHIPPED — CubeDim(1)→W=64, bit-exact, isolated scan ~3× / e2e ~1.27×)
 - 022-within-feature-parallel-scan-parity (VALIDATED — parity GATE resolved PARITY-SAFE ~1e-6; all default_left flips cosmetic; ROI-gated, don't wire)
+- 023-post-021-roundtrip-attribution (VALIDATED measurement — GPU per-tree round-trip is REGIME-SPLIT; ~59 scan-readback syncs/tree, SYNC floor reclaimable launch-bound, build dominates+grows wide 96.5%@1M×500; subtract trick already on-device; host partition grows to 23%)
+- 024-batch-sibling-scans (VALIDATED ~2× isolated + bit-exact — co-pack both siblings into ONE launch+readback; honest e2e ~10–15% small/medium, ~1.5% wide; WIRED phase 12 behind LGBM_SIBLING_COPACK)
+- 026-cubecl-cpu-partition-scan-scatter (PARTIAL/NULL — bit-exact cubecl-cpu scan+scatter loses to serial-native except cache-resident ~100k; partition is memory-bandwidth-bound on shared DDR5, parallelism null at scale; reframes the ia0 rayon null — wall is DRAM bandwidth not build contention)
+- 027-fused-gather-partition (VALIDATED + SHIPPED — fuse the gather + ¼-width u8 route scratch = 1.3–2.7× CPU, bit-exact, biggest ~2.3× at U8; the #1 remaining CPU-vs-C++ gap; quick-260625-hw2)
+- 028-doublebuffer-partition (INVALIDATED/NULL — copy-back is only 2.2–6.8% of the fused op; double-buffer to drop it is within noise + doubles partition memory + cross-leaf bookkeeping; C++ copies back too)
+- 029-gpu-narrow-upload-fuse (VALIDATED + SHIPPED — narrow the per-split GPU upload u32→native-width via generic-over-Int kernel + additive data_partition_native = ~1.2–1.7× rocm, bit-exact on GPU; "APU shared-DDR5 transfer is free" disproven; quick-260625-j1l)
 
-Full campaign 001–013 wrapped (2026-06-17); 014a/014b + shipped p9v/qix/rdu/rsh levers wrapped (2026-06-21, GPU wide-shape 1M×500, cumulative −68%); 015–022 GPU build/scan KERNEL campaign wrapped (2026-06-25 — u64 fixed-point build + feature-per-lane scan SHIPPED; replication & within-feature scan parity-characterized but ROI-gated).
+Full campaign 001–013 wrapped (2026-06-17); 014a/014b + shipped p9v/qix/rdu/rsh levers wrapped (2026-06-21, GPU wide-shape 1M×500, cumulative −68%); 015–022 GPU build/scan KERNEL campaign wrapped (2026-06-25 — u64 fixed-point build + feature-per-lane scan SHIPPED; replication & within-feature scan parity-characterized but ROI-gated); 023/024 + 026–029 wrapped (2026-06-25 — GPU scan round-trip attribution + sibling co-pack WIRED, and the PARTITION memory-traffic arc: fuse-gather SHIPPED CPU + narrow-upload SHIPPED ROCm, parallelize/double-buffer NULL).
 </metadata>

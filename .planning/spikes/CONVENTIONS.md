@@ -153,3 +153,44 @@ a GPU kernel's cost. The shape:
 - Reference baseline for GPU kernel parity/perf = AMD's ROCm fork `LightGBM-release-4.6.0.99/`
   (hipified CUDA), NOT mainline `LightGBM/` — see
   `.planning/notes/cubecl-vs-rocm-histogram-kernel-comparison.md`.
+
+## CPU / host isolated-A/B harness (026–029 — the partition arc)
+
+The repeatable shape for "is host-side change X faster?" — and unlike the GPU harness these are
+LEGITIMATE wall-clock (the 16-core CPU is real hardware; only the GPU is the spoofed APU):
+
+1. **Self-contained `crates/lgbm-compute/examples/spikeNNN_*.rs`** using the real `BinColumn` +
+   kernel/op types. Deterministic data via a small inline LCG (no `rand` dep; `Math.random` is
+   banned anyway). Model a SCATTERED leaf — shuffle the row indices so the `feature_bins.bin(row)`
+   gather is RANDOM (a deep leaf's rows aren't contiguous); a contiguous leaf understates the cost.
+2. **Sweep BOTH axes that move the regime:** size (1k→4M) AND skew (balanced vs 0.9 — serial
+   branch-prediction crushes skewed data, and real trees deepen INTO skew) AND bin width (U8 the
+   production narrow case vs U32). A win at one cell is not a win.
+3. **Decompose the op into sub-phase timers** (`LGBM_SPIKE_PROF`) to LOCALIZE the cost before
+   optimizing — 026 split marshal/count/scatter (found the scatter wall), 029 split host-gather /
+   upload / kernel+readback (found the upload is NOT free on shared DDR5). Optimize the dominant
+   phase, not the assumed one.
+4. **median over ~21–30 reps, ≥2 process restarts**, `std::hint::black_box` the result, warmup
+   discard. Report the ratio vs the production-faithful baseline (serial-native / current-path),
+   and a **byte-identity parity column** every cell (partition is f64-free ⇒ bit-EXACT, no tol).
+5. **Memory-bound diagnosis:** if a perf delta is FLAT across a granularity knob (chunk size in
+   026) it's fixed overhead / bandwidth, not compute — parallelism won't help. Shared DDR5 means
+   the 16 cores share one controller; cutting TRAFFIC (narrower types, fewer materializations)
+   beats adding cores. But transfer volume is NOT free even on an APU (029).
+
+## Wiring a spike into production — additive backend discriminator + stale-worktree integration
+
+- **Gate a backend-specific path on a default-false trait method overridden on ONE backend**, never
+  a global env/flag: `Backend::prefers_host_partition() { false }` (CpuBackend true, 027);
+  `Backend::data_partition_native(&BinColumn,…)` with a widening DEFAULT that delegates to the
+  existing op + a RocmBackend override (029). This is the same idiom as `wants_resident_bins` /
+  `resident_pool_supported`; it keeps every other backend byte-unchanged and avoids changing
+  existing signatures (low blast radius).
+- **Make device kernels generic-over-`Int` + `match width`-dispatch the launch** for native-width
+  uploads (the qix histogram precedent; 029 applied it to `data_partition_kernel`).
+- **`/gsd-quick` executor worktrees can branch off a STALE base** (observed twice: hw2, j1l — based
+  on an old commit predating recent merges). The fix: cherry-pick the executor's commits onto
+  master, hand-resolve conflicts (land the change in the CORRECT current-tree branch — e.g. the
+  device `else` of `prefers_host_partition`, not the pre-gate `split`), and **RE-RUN the full
+  bit-exact gate on the integrated master tree** (incl. the ROCm parity test on the GPU) — the
+  executor's green gate ran on the stale tree, not master.
