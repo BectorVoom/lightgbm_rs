@@ -3,7 +3,7 @@ spike: 035
 name: rocm-host-partition
 type: standard
 validates: "Given spike-034 found the device partition round-trip is now the #1 reclaimable launch-bound phase (30–38%) after co-pack closed the scan-sync floor, when the rocm backend routes partition on the HOST via the SHIPPED spike-027 fused u8-route path (LGBM_ROCM_HOST_PARTITION) instead of the per-split device round-trip, then launch-bound train falls without regressing wide and stays within the ~1e-6 GPU parity contract"
-verdict: VALIDATED
+verdict: VALIDATED + SHIPPED (quick-260626-a6t)
 related: [034, 027, 029, 023, 024]
 tags: [performance, gpu, rocm, partition, host-route, round-trip, parity, wire-candidate]
 ---
@@ -105,8 +105,13 @@ leaf_rows (large 11.2%, medium 3.0%, small 0.8%). Launch-bound = clear win; wide
   CPU f64 anchor (the bit-exact hard gate) untouched (rocm-only path); `lgbm-treelearner --lib`
   77/0 green.
 
-### Disposition: WIRE-CANDIDATE
-Flip `RocmBackend::prefers_host_partition()` → `true` unconditionally. This is the rare GPU
+### Disposition: ✅ SHIPPED (quick-260626-a6t, commit `da3032f`)
+`RocmBackend::prefers_host_partition()` now defaults ON (off-switch `LGBM_ROCM_HOST_PARTITION=0`),
+routing the rocm partition through the host fused path by default. Re-pin gate green: the
+anchor-pinned `hip::learner_parity_{resident,fused}_equals_host_tree_on_hip` pass with the new
+default; full rocm parity suite + CPU bit-exact merge gate green; CPU f64 anchor untouched.
+
+Original disposition (now done): flip `RocmBackend::prefers_host_partition()` → `true`. This is the rare GPU
 lever with a genuine win **on this APU** (not just a "real on discrete gfx110x" deferral) —
 because the device partition round-trip is pure overhead on shared DDR5. **Wiring needs an
 oracle re-pin to the f64 anchor** (NOT a bit-exact swap — the GPU f32 build is ~1.9e-6
