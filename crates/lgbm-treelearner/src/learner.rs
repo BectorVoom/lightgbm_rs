@@ -1650,6 +1650,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         larger_slot, parent_slot,
                         "the larger child reuses the moved parent slot (slot-id stable)"
                     );
+                    crate::phase_prof::bump(&crate::phase_prof::SUBTRACT_RESIDENT_CNT);
                     self.backend.subtract_resident(
                         self.client,
                         parent_slot,
@@ -1912,6 +1913,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // Handle is never consulted.
             return Ok(());
         }
+        crate::phase_prof::bump(&crate::phase_prof::BUILD_RESIDENT_CNT);
         let leaf_rows = data_partition.indices_in_leaf(leaf);
         let feature_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
         let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
@@ -2238,6 +2240,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 .collect();
             let scan_active: Vec<bool> =
                 spine_batch_index.iter().map(|idx| idx.is_some()).collect();
+            crate::phase_prof::bump(&crate::phase_prof::FUSED_CNT);
             self.backend.build_fix_scan_resident(
                 self.client,
                 slot,
@@ -2254,6 +2257,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 num_data_in_leaf,
             )?
         } else if let Some(slot) = resident_slot {
+            crate::phase_prof::bump(&crate::phase_prof::SCAN_RESIDENT_CNT);
             self.backend.scan_resident_leaf(
                 self.client,
                 slot,

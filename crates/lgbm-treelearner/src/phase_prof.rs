@@ -47,6 +47,31 @@ pub static SETUP_NS: AtomicU64 = AtomicU64::new(0);
 // `in_learner_other`; GPU-only (CpuBackend `wants_resident_bins()==false`).
 pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
+// Spike-023 GPU per-leaf LAUNCH/ROUND-TRIP COUNT counters. The 001–022 campaign
+// optimized per-kernel throughput; the un-attacked frontier is the per-leaf loop
+// STRUCTURE — how many device launches and how many blocking host round-trips
+// (`read_one_unchecked` syncs) a tree costs. These count the per-leaf Backend entry
+// points so the round-trip floor is EMPIRICAL (not inferred), and so 024's ceiling =
+// (scan round-trips) × (per-sync cost) is computable. Inert unless LGBM_PHASE_PROF=1.
+//   BUILD_RESIDENT = standalone device histogram builds (root + smaller children).
+//   SUBTRACT_RESIDENT = on-device parent−smaller derivations (larger children).
+//   SCAN_RESIDENT = fused per-leaf scan launches = blocking readback SYNCS (the
+//                   round-trip count 024 targets halving via sibling co-packing).
+//   FUSED = build_fix_scan_resident launches (the 260608-t3t collapse, OFF by default).
+pub static BUILD_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
+pub static SUBTRACT_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
+pub static FUSED_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Increment a count counter by 1. Inert (no-op) when the env gate is off, so it is
+/// parity-neutral and zero-overhead in the default build/tests.
+#[inline]
+pub fn bump(counter: &AtomicU64) {
+    if enabled() {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// RAII timer: accumulates its lifetime into `c`. Inert when the env gate is off.
 pub struct Guard {
     c: &'static AtomicU64,
@@ -140,6 +165,18 @@ pub fn dump(label: &str) {
             in_iter_other as f64 / 1e6,
             metric as f64 / 1e6,
             setup as f64 / 1e6,
+        );
+    }
+    // Spike-023 per-train LAUNCH/ROUND-TRIP COUNTS. `scan_resident` is the blocking
+    // host round-trip (sync) count; build+subtract+fused+scan ≈ total device launches.
+    let bld_cnt = BUILD_RESIDENT_CNT.swap(0, Ordering::Relaxed);
+    let sub_cnt = SUBTRACT_RESIDENT_CNT.swap(0, Ordering::Relaxed);
+    let scn_cnt = SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
+    let fus_cnt = FUSED_CNT.swap(0, Ordering::Relaxed);
+    if bld_cnt + sub_cnt + scn_cnt + fus_cnt > 0 {
+        let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt;
+        eprintln!(
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt}) | scan_roundtrips(syncs)={scn_cnt}"
         );
     }
     if binning + grad + learner + score > 0 {
