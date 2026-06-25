@@ -2349,11 +2349,22 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 subtract_inputs.is_none() && !unified_build && !fused_build,
                 "co-packed precomputed splits are mutually exclusive with the unified/fused/subtract paths"
             );
-            debug_assert_eq!(
-                splits.len(),
-                batched_feats.len(),
-                "co-packed splits must align with this leaf's spine batch"
-            );
+            // WR-01: the contract that the co-packed `splits` align slot-for-slot
+            // with THIS leaf's independently-re-derived `batched_feats` is
+            // load-bearing for numerical fidelity (CLAUDE.md non-negotiable #1) —
+            // a length skew (e.g. if a future gate is added to Pass-1 but not to
+            // the caller's `spine_batched_feats`) silently mis-maps splits onto the
+            // wrong features and ships a wrong-but-plausible tree. A `debug_assert!`
+            // is compiled out in `--release`, so this MUST be an always-on guard
+            // that fails loudly instead. (The membership/ordering is also pinned by
+            // the caller's `smaller_feats == larger_feats` gate; this length check
+            // is the cheap always-on tripwire for gate drift.)
+            if splits.len() != batched_feats.len() {
+                return Err(TreeLearnerError::LengthMismatch {
+                    expected: batched_feats.len(),
+                    actual: splits.len(),
+                });
+            }
             splits
         } else if let Some((parent_hist, smaller_hist)) = subtract_inputs.as_ref() {
             // quick 260620-b97: UNIFIED host subtract→scan for the larger child. ONE rayon
