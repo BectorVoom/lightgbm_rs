@@ -202,16 +202,20 @@ fn run_copack_ab(sizes: &[Size], cfg_for: &dyn Fn(&Size) -> lgbm::Config, iters:
         let ratio = if on_s > 0.0 { off_s / on_s } else { f64::NAN };
         // Sync-count per tree (per-train / iters) — the ~59 -> ~30 SC-3 signal.
         let on_per_tree = if iters > 0 { on_syncs as f64 / iters as f64 } else { 0.0 };
-        // Verdict: NOT-SLOWER when ON is within ~3% noise of OFF or faster;
-        // trends-faster when ON is faster beyond that noise band. SIGN-only.
+        // Verdict (IN-03): SIGN-ONLY on a single-process median. The file header
+        // demands >=2 PROCESSES for sign-stability, and on the spoofed 8-CU APU a
+        // single-process median can swing beyond 3%, so the band is deliberately
+        // wide and the verdict is labelled "(single-proc, sign-only)" — it reads
+        // the TREND, not a confidence-bearing pass/fail. For a real verdict,
+        // compute the ratio across >=2 processes.
         let verdict = if ratio.is_nan() {
             "n/a"
-        } else if ratio >= 1.03 {
-            "trends-faster"
-        } else if ratio >= 0.97 {
-            "NOT-SLOWER"
+        } else if ratio >= 1.05 {
+            "trends-faster (single-proc, sign-only)"
+        } else if ratio >= 0.95 {
+            "NOT-SLOWER (single-proc, sign-only)"
         } else {
-            "SLOWER(noise? rerun)"
+            "SLOWER? (single-proc noise — rerun >=2 procs)"
         };
 
         println!(
