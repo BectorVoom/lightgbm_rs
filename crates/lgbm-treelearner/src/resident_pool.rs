@@ -262,3 +262,27 @@ pub fn fused_directly_built_eligible(
     // `FUSED_MAX_NUM_DATA` provenance block for the measured table + the why.
     num_data <= FUSED_MAX_NUM_DATA
 }
+
+/// Phase 12 (spike-024) — the `LGBM_SIBLING_COPACK` co-pack override, mirroring the
+/// `LGBM_RESIDENT_FORCE` env idiom. Parsed ONCE per query:
+/// - `Some(false)` (`LGBM_SIBLING_COPACK=0`) → FORCE-OFF: the co-pack path never
+///   engages; the growth loop takes the byte-unchanged two-separate-scans path.
+/// - `Some(true)` (`LGBM_SIBLING_COPACK=1`) → FORCE-ON: co-pack engages whenever the
+///   STRUCTURAL correctness gate holds (both siblings on the resident scan-only path,
+///   both scannable, identical spine membership). The override bypasses ONLY a size
+///   threshold (there is none today — co-pack rides the resident size gate), NEVER the
+///   correctness gate.
+/// - `None` (unset / other) → the default heuristic: co-pack engages whenever the
+///   structural correctness gate holds.
+///
+/// Because there is no separate co-pack size threshold yet, `Some(true)` and `None`
+/// behave identically TODAY; the three-way shape mirrors `LGBM_RESIDENT_FORCE` so a
+/// future size gate can slot in without changing the call site, and `=0` always gives
+/// a byte-identical A/B off-path for benching.
+pub fn sibling_copack_override() -> Option<bool> {
+    match std::env::var("LGBM_SIBLING_COPACK").ok().as_deref() {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        _ => None,
+    }
+}

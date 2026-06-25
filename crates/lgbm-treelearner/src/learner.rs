@@ -1590,29 +1590,22 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             );
             None
         };
-        let smaller_records = self.scan_leaf_histogram(
-            features,
-            slot_off,
-            smaller_leaf,
-            smaller_splits,
-            pool.buffer_mut(smaller_slot),
-            best_split_per_leaf,
-            best_split_feature,
-            smaller_node_mask.as_deref(),
-            data_partition,
-            parent_splittable.as_deref(),
-            smaller_resident_slot,
-            smaller_fused,
-            smaller_unified,
-            // quick 260620-b97: the directly-built smaller child is never subtract-unified.
-            None,
-            gradients,
-            hessians,
-        )?;
-
         // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
         // OR build directly when no parent was retained. ----
+        //
+        // Phase 12 (spike-024): the larger child's BUILD/SUBTRACT (computing
+        // `larger_resident_slot` / `larger_unified` / `larger_subtract_inputs`) runs
+        // FIRST — BEFORE either sibling's scan — so the smaller-child resident scan can
+        // be DEFERRED past `subtract_resident` and CO-PACKED with the larger child into
+        // ONE `scan_resident_siblings` launch. The build/subtract ORDER is UNCHANGED
+        // (CONTEXT: "No build/subtract reordering needed"); only the smaller SCAN moves.
         let mut larger_records: Vec<FeatureSplitRecord> = Vec::new();
+        // Captured from the larger build/subtract so the co-pack decision (below) and
+        // the deferred scans can use them; `None`/default when there is no larger child.
+        let mut larger_resident_slot: Option<usize> = None;
+        let mut larger_unified = false;
+        let mut larger_subtract_inputs: Option<(Vec<f64>, Vec<f64>)> = None;
+        let larger_slot_id = larger_slot;
         if larger_leaf >= 0 {
             let larger_slot = larger_slot.expect("non-root larger child must hold a pool slot");
             // quick 260620-b97: the UNIFIED host subtract→scan path for the
@@ -1629,13 +1622,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // fused subtract→scan runs inside `scan_leaf_histogram`. The larger child has NO
             // parallel build to contend with (only the cheap serial subtract), so 9cp's
             // contention is structurally absent.
-            let larger_unified = !self.resident_eligible
+            larger_unified = !self.resident_eligible
                 && parent_slot.is_some()
                 && self.subtract_audit.is_none()
                 && features.len() >= lgbm_compute::unified_subscan_threshold();
-            // Owned (parent, smaller) scratch for the fused subtract, materialized at the
-            // seam (aliasing-safe: parent_slot == larger_slot) and consumed by the scan.
-            let mut larger_subtract_inputs: Option<(Vec<f64>, Vec<f64>)> = None;
             // 260608-p90 T2: when resident-eligible AND a parent was retained, derive the
             // larger child RESIDENT — `parent_slot` Handle − `smaller_slot` Handle →
             // `larger_slot` Handle, on device, NO read-back. The device mirror is keyed by
@@ -1644,7 +1634,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // `parent_slot` and no device move is needed (move_resident would be a no-op
             // for a slot-id-keyed mirror; the host move_ only rewires leaf→slot). The
             // derived larger child is NOT re-FixHistogram'd (non-negotiable #3).
-            let larger_resident_slot = if self.resident_eligible {
+            larger_resident_slot = if self.resident_eligible {
                 if let Some(parent_slot) = parent_slot {
                     debug_assert_eq!(
                         larger_slot, parent_slot,
@@ -1750,6 +1740,127 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 );
                 None
             };
+        }
+
+        // ---- Phase 12 (spike-024) CO-PACK eligibility (computed AFTER the larger
+        // build/subtract so BOTH sibling Handles are simultaneously resident). ----
+        // Co-pack fires ONLY when ALL hold:
+        //   - `resident_eligible` (the resident scan-only path; CpuBackend never here);
+        //   - the SMALLER child is on the resident scan-only path (`smaller_resident_slot
+        //     == Some(smaller_slot)`, NOT fused, NOT unified — its histogram is already
+        //     resident and is scanned, not fused-built);
+        //   - the LARGER child EXISTS and is on the resident SUBTRACT+scan-only path
+        //     (`larger_resident_slot == Some(larger_slot)`, NOT unified);
+        //   - BOTH siblings are SCANNABLE (`sum_h > 0`, `num_data > 0`) — otherwise that
+        //     sibling early-outs to `none()` in `scan_leaf_histogram`;
+        //   - both siblings have IDENTICAL spine membership (the co-packed kernel scans
+        //     ONE shared `feats`; if the per-node col-sampler masks differ the spines
+        //     differ ⇒ NOT co-packable);
+        //   - `LGBM_SIBLING_COPACK != Some(false)`.
+        // Any false case falls back to the BYTE-UNCHANGED two-separate-scans path.
+        let copack_override = crate::resident_pool::sibling_copack_override();
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let smaller_scannable =
+            smaller_splits.sum_hessians > 0.0 && smaller_splits.num_data_in_leaf > 0;
+        let smaller_resident_only =
+            smaller_resident_slot == Some(smaller_slot) && !smaller_fused && !smaller_unified;
+        // Build the SHARED spine batch for both siblings and require equality. When the
+        // spines match, this is the `feats` the co-packed kernel scans for BOTH.
+        let copack_feats: Option<Vec<BatchedSplitFeature>> = if self.resident_eligible
+            && copack_override != Some(false)
+            && smaller_resident_only
+            && smaller_scannable
+            && larger_leaf >= 0
+            && larger_resident_slot == larger_slot_id
+            && larger_slot_id.is_some()
+            && !larger_unified
+            && larger_splits.sum_hessians > 0.0
+            && larger_splits.num_data_in_leaf > 0
+        {
+            let smaller_feats = self.spine_batched_feats(
+                features,
+                slot_off,
+                smaller_leaf,
+                smaller_node_mask.as_deref(),
+                parent_splittable.as_deref(),
+            );
+            let larger_feats = self.spine_batched_feats(
+                features,
+                slot_off,
+                larger_leaf,
+                larger_node_mask.as_deref(),
+                parent_splittable.as_deref(),
+            );
+            // Identical spine membership (and non-empty) ⇒ co-packable with ONE shared
+            // `feats`. Differing per-node col-sampler masks ⇒ fall back.
+            if smaller_feats == larger_feats && !smaller_feats.is_empty() {
+                Some(smaller_feats)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (smaller_precomputed, larger_precomputed) = if let Some(feats) = copack_feats {
+            // ---- CO-PACKED scan: ONE 2-slot launch over BOTH resident Handles + ONE
+            // readback (the 024 sync-floor win: ≈59→≈30 syncs/tree). Bump
+            // `SCAN_RESIDENT_CNT` ONCE for the pair (one readback). The two returned
+            // vecs are distributed into the smaller/larger scans below via the
+            // `precomputed_batched_splits` param, which feeds the SHARED post-scan
+            // bookkeeping (records/argmax/feature_splittable) byte-identically to the
+            // two separate scans. ----
+            let larger_slot = larger_slot_id.expect("co-pack requires the larger slot");
+            crate::phase_prof::bump(&crate::phase_prof::SCAN_RESIDENT_CNT);
+            let (vec_a, vec_b) = self.backend.scan_resident_siblings(
+                self.client,
+                smaller_slot,
+                larger_slot,
+                pool.hist_len(),
+                &feats,
+                &self.cfg,
+                (
+                    smaller_splits.sum_gradients,
+                    smaller_splits.sum_hessians,
+                    smaller_splits.num_data_in_leaf,
+                ),
+                (
+                    larger_splits.sum_gradients,
+                    larger_splits.sum_hessians,
+                    larger_splits.num_data_in_leaf,
+                ),
+            )?;
+            (Some(vec_a), Some(vec_b))
+        } else {
+            (None, None)
+        };
+
+        // ---- SMALLER child scan (DEFERRED to here so it can co-pack with the larger
+        // child). When co-packed, `smaller_precomputed` carries the co-packed results;
+        // otherwise this is the byte-unchanged single-slot resident / host scan. ----
+        let smaller_records = self.scan_leaf_histogram(
+            features,
+            slot_off,
+            smaller_leaf,
+            smaller_splits,
+            pool.buffer_mut(smaller_slot),
+            best_split_per_leaf,
+            best_split_feature,
+            smaller_node_mask.as_deref(),
+            data_partition,
+            parent_splittable.as_deref(),
+            smaller_resident_slot,
+            smaller_fused,
+            smaller_unified,
+            // quick 260620-b97: the directly-built smaller child is never subtract-unified.
+            None,
+            smaller_precomputed,
+            gradients,
+            hessians,
+        )?;
+
+        if larger_leaf >= 0 {
+            let larger_slot = larger_slot_id.expect("non-root larger child must hold a pool slot");
             // 260608-t3t: the larger child is subtract-derived (parent − smaller),
             // NEVER fused-built — it reads its histogram via the resident subtract
             // Handle (or host buffer), so `fused_build = false`.
@@ -1772,6 +1883,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // scratch in `larger_subtract_inputs`; the build-unified flag stays false.
                 false,
                 larger_subtract_inputs.take(),
+                larger_precomputed,
                 gradients,
                 hessians,
             )?;
@@ -1944,6 +2056,82 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         Ok(())
     }
 
+    /// Phase 12 (spike-024): assemble the SPINE `BatchedSplitFeature` list for one
+    /// leaf — the EXACT Pass-1 gate-only pre-pass that `scan_leaf_histogram` runs
+    /// internally (col-sampler mask → parent-splittability gate → ADV-02 interaction
+    /// gate → not-categorical / not-monotone / not-extra-trees), in the IDENTICAL
+    /// order with the IDENTICAL predicates. Returns the spine features in ascending
+    /// fpos. Used by the co-pack path in `find_best_splits` to (a) verify both siblings
+    /// have the SAME spine membership before co-packing and (b) feed the SHARED `feats`
+    /// to the 2-slot `scan_resident_siblings` kernel. This MUST stay byte-identical to
+    /// `scan_leaf_histogram`'s Pass-1; any divergence would mis-map the co-packed
+    /// results (so co-pack only fires when the two are equal, and the eligibility gate
+    /// already guarantees a pure numeric spine — no categorical/monotone/extra-trees).
+    fn spine_batched_feats(
+        &self,
+        features: &[FeatureColumn],
+        slot_off: &[usize],
+        leaf: i32,
+        used_features: Option<&[i8]>,
+        parent_splittable: Option<&[bool]>,
+    ) -> Vec<BatchedSplitFeature> {
+        let interaction_allowed: Option<std::collections::HashSet<i32>> =
+            if self.constraints.interaction_constraints.is_empty() {
+                None
+            } else {
+                Some(self.interaction_allowed_features(leaf))
+            };
+        let monotone_active = self.monotone.borrow().is_some();
+        let mut batched_feats: Vec<BatchedSplitFeature> = Vec::with_capacity(features.len());
+        for (fpos, f) in features.iter().enumerate() {
+            if let Some(mask) = used_features {
+                if mask.get(fpos).copied().unwrap_or(1) == 0 {
+                    continue;
+                }
+            }
+            if let Some(ps) = parent_splittable {
+                if !ps.get(fpos).copied().unwrap_or(true) {
+                    continue;
+                }
+            }
+            if interaction_allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&f.real_feature_index))
+            {
+                continue;
+            }
+            if f.bin_type == BinType::Categorical {
+                continue;
+            }
+            let monotone_type = if monotone_active {
+                self.monotone
+                    .borrow()
+                    .as_ref()
+                    .map(|mc| mc.feature_monotone(f.real_feature_index))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if monotone_type != 0 {
+                continue;
+            }
+            if self.constraints.extra_trees {
+                continue;
+            }
+            batched_feats.push(BatchedSplitFeature {
+                slot_off: slot_off[fpos],
+                num_bin: f.num_bin,
+                offset: f.offset,
+                default_bin: f.default_bin,
+                most_freq_bin: f.most_freq_bin,
+                skip_default_bin: f.skip_default_bin(),
+                na_as_missing: f.na_as_missing(),
+                run_forward: f.run_forward(),
+            });
+        }
+        batched_feats
+    }
+
     /// Scan one leaf's per-feature CONCATENATED compacted+fixed histogram (already
     /// in the pool slot `buf`, built directly OR derived via subtraction), running
     /// `find_best_split` per feature and recording the cross-feature argmax into
@@ -2002,6 +2190,17 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `unified_build` and `subtract_inputs.is_some()` are mutually exclusive (a leaf is
         // either directly built or subtract-derived, never both).
         subtract_inputs: Option<(Vec<f64>, Vec<f64>)>,
+        // Phase 12 (spike-024): when `Some(splits)`, the per-spine-feature SplitInfos
+        // were ALREADY computed by a CO-PACKED `scan_resident_siblings` call in
+        // `find_best_splits` (this leaf is one of the two co-packed siblings), so the
+        // entire histogram-source dispatch below is SKIPPED and `splits` is used
+        // directly as `batched_splits`. The Pass-1 `batched_feats`/`spine_batch_index`
+        // assembly STILL runs (the post-scan loop indexes `batched_splits` by
+        // `spine_batch_index[fpos]`), and the caller guarantees this leaf's spine
+        // membership is IDENTICAL to the sibling's (so `splits` aligns with this
+        // leaf's `batched_feats` slot-for-slot). `None` keeps the existing per-leaf
+        // scan dispatch (resident / fused / unified / host) byte-unchanged.
+        precomputed_batched_splits: Option<Vec<SplitInfo>>,
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<FeatureSplitRecord>, TreeLearnerError> {
@@ -2137,7 +2336,26 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `batched_feats` order (Pass 1 pushed spine features in ascending fpos), so the
         // downstream `spine_batch_index[fpos]` lookup is byte-identical to the two-step
         // path. Only on CpuBackend + directly-built smaller leaf + above threshold.
-        let batched_splits = if let Some((parent_hist, smaller_hist)) = subtract_inputs.as_ref() {
+        let batched_splits = if let Some(splits) = precomputed_batched_splits {
+            // Phase 12 (spike-024): this leaf was scanned by a CO-PACKED
+            // `scan_resident_siblings` launch in `find_best_splits` (one launch + one
+            // readback for BOTH siblings). The caller computed `batched_feats` for the
+            // SHARED spine layout and verified this leaf's spine membership matches the
+            // sibling's, so `splits` is in EXACTLY this leaf's `batched_feats` order
+            // (ascending fpos). No source dispatch / no launch here — the SAME
+            // `split_scan_body` ran on device, only co-packed into one launch, so each
+            // entry is byte-identical to the single-slot resident scan it replaces.
+            debug_assert!(
+                subtract_inputs.is_none() && !unified_build && !fused_build,
+                "co-packed precomputed splits are mutually exclusive with the unified/fused/subtract paths"
+            );
+            debug_assert_eq!(
+                splits.len(),
+                batched_feats.len(),
+                "co-packed splits must align with this leaf's spine batch"
+            );
+            splits
+        } else if let Some((parent_hist, smaller_hist)) = subtract_inputs.as_ref() {
             // quick 260620-b97: UNIFIED host subtract→scan for the larger child. ONE rayon
             // region SUBTRACTS (parent − smaller per feature, NO fix — non-negotiable #3)
             // into `buf` (complete for downstream non-spine branches) AND scans the spine
