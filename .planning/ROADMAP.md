@@ -39,6 +39,16 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
   - [x] 11-02-PLAN.md — re-pin rocm resident parity to the CPU f64 anchor (tightened) + determinism assert (wave 2)
   - [x] 11-03-PLAN.md — device-time A/B confirming the integer build is not-slower in the wide regime (wave 2)
 
+- `12-gpu-sibling-scan-copack` — **planned (spike-validated).** Wire spike-024's
+  batch-sibling-scans co-pack: replace the TWO separate per-sibling resident scan
+  launches+readbacks (one per leaf-node, ~59 syncs/tree) with ONE co-packed 2-slot scan
+  launch + ONE readback per split (~30 syncs/tree). Isolated ~2.0× on the scan
+  launch+readback, bit-exact (each feature's sequential scan unchanged — no spike-016
+  reorder); honest e2e ~10–15% at small/medium, ~1.5% wide (per spike-023's scan-sync
+  fractions). Does NOT change CPU routing or the wide build path. Validated by spikes
+  023 (regime-split attribution) + 024 (isolated A/B). Evidence:
+  `crates/lgbm-compute/examples/spike024_sibling_scan_ab.rs`, `.planning/spikes/024-*/`.
+
 ### 📋 Next milestone (not yet scoped)
 
 Define via `/gsd-new-milestone`. Candidate themes: GPU large-data perf (locate the bottleneck — see `notes/gpu-large-data-bottleneck-framing.md`), quantized training (QNT-01), linear-tree leaves (LIN-01), text/binary/Arrow ingestion (ING-01..03).
