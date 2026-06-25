@@ -59,6 +59,40 @@ const COPACK_OFF: &str = "0";
 #[cfg(feature = "rocm")]
 const COPACK_ON: &str = "1";
 
+/// RAII guard for the `LGBM_SIBLING_COPACK` A/B override (WR-04).
+///
+/// `std::env::set_var`/`remove_var` are `unsafe` because they are not
+/// thread-safe; this guard keeps the env-toggle path but makes the reset
+/// panic-safe: on `Drop` the var is always removed, so an ON-arm panic before
+/// the explicit reset can never leak the `1` state forward into later sizes.
+///
+/// Note on thread-safety: `set_var` is still only sound here because the
+/// override is read by `sibling_copack_override()` on the main growth thread
+/// BEFORE any cubecl/rayon parallel region spawns workers that read the env.
+/// The guard does not change that invariant; it only fixes the panic-leak.
+#[cfg(feature = "rocm")]
+struct CopackEnvGuard;
+
+#[cfg(feature = "rocm")]
+impl CopackEnvGuard {
+    /// Set `LGBM_SIBLING_COPACK` to `value` and return a guard that removes it
+    /// on drop.
+    fn set(value: &str) -> Self {
+        // SAFETY: see the type-level note — only read on the main growth thread
+        // before parallel regions spawn.
+        unsafe { std::env::set_var("LGBM_SIBLING_COPACK", value) };
+        CopackEnvGuard
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl Drop for CopackEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same single-main-thread invariant as `set`.
+        unsafe { std::env::remove_var("LGBM_SIBLING_COPACK") };
+    }
+}
+
 /// A benchmark size: `rows` × `features`, each feature identity-binned into
 /// `bins` distinct integer values (`0..bins-1`, all present).
 struct Size {
@@ -189,13 +223,19 @@ fn run_copack_ab(sizes: &[Size], cfg_for: &dyn Fn(&Size) -> lgbm::Config, iters:
         let cfg = cfg_for(s);
 
         // OFF: byte-unchanged two-separate-scans path. The override reads the env
-        // per query (not memoized), so an in-process toggle is sufficient.
-        unsafe { std::env::set_var("LGBM_SIBLING_COPACK", COPACK_OFF) };
-        let (off_t, off_syncs) = timed_run(&cfg, &corpus, warmup, reps);
+        // per query (not memoized), so an in-process toggle is sufficient. The
+        // RAII guard (WR-04) guarantees the var is cleared even if `timed_run`
+        // panics, so ON-state can never leak forward into a later size.
+        let (off_t, off_syncs) = {
+            let _g = CopackEnvGuard::set(COPACK_OFF);
+            timed_run(&cfg, &corpus, warmup, reps)
+        };
 
         // ON: co-pack engages whenever the structural correctness gate holds.
-        unsafe { std::env::set_var("LGBM_SIBLING_COPACK", COPACK_ON) };
-        let (on_t, on_syncs) = timed_run(&cfg, &corpus, warmup, reps);
+        let (on_t, on_syncs) = {
+            let _g = CopackEnvGuard::set(COPACK_ON);
+            timed_run(&cfg, &corpus, warmup, reps)
+        };
 
         let off_s = off_t.as_secs_f64();
         let on_s = on_t.as_secs_f64();
@@ -233,7 +273,9 @@ fn run_copack_ab(sizes: &[Size], cfg_for: &dyn Fn(&Size) -> lgbm::Config, iters:
             verdict,
         );
     }
-    // Reset the override so we don't leak A/B state into any later run.
+    // Each arm's `CopackEnvGuard` already clears the override on drop (WR-04),
+    // so no state leaks past the loop; this final remove is a belt-and-braces
+    // reset in case the env was set before this function ran.
     unsafe { std::env::remove_var("LGBM_SIBLING_COPACK") };
     println!(
         "# DIAGNOSIS: SC-3 (sync drop) is structural + counter-exact (syncs_on ~= syncs_off/2,\n\
