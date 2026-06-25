@@ -1597,6 +1597,11 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         return Ok((Vec::new(), Vec::new()));
     }
 
+    // spike-015: env-gated (`LGBM_SCAN_PROF=1`) scan round-trip profiling. Bound here so the
+    // LGBM_SCAN_DRAIN co-pack analog below can gate identically to the single-leaf path
+    // (find_best_splits_fused_inner :1342). Inert when off (parity untouched).
+    let _scan_prof = crate::fusion_prof::scan_enabled();
+
     // Phase-4 scope (leaf-level, checked once on the shared cfg).
     if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
         return Err(ComputeError::Runtime {
@@ -1721,6 +1726,21 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // spike-015 DIAGNOSTIC (LGBM_SCAN_DRAIN=1) — co-pack analog (quick-260625-tw1): drain
+    // BOTH sibling resident histogram handles before the scan launch so each child's async
+    // f32-atomic build is attributed to SCAN_DRAIN_NS, not the scan readback. Phase-12 co-pack
+    // bypassed the single-leaf drain (split.rs:1450); this restores it on the production path.
+    // Gated identically (`_scan_prof && scan_drain_enabled()`) → off by default, parity-neutral.
+    if _scan_prof && crate::fusion_prof::scan_drain_enabled() {
+        let t_drain = std::time::Instant::now();
+        let _ = client.read_one_unchecked(hist_a_handle.clone());
+        let _ = client.read_one_unchecked(hist_b_handle.clone());
+        crate::fusion_prof::SCAN_DRAIN_NS.fetch_add(
+            t_drain.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
     // CubeCount over 2*n feature-slots (the lane mapping packs A then B).
     let scan_w = scan_cube_dim();
