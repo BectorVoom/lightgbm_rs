@@ -1605,6 +1605,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut larger_resident_slot: Option<usize> = None;
         let mut larger_unified = false;
         let mut larger_subtract_inputs: Option<(Vec<f64>, Vec<f64>)> = None;
+        // WR-03: set TRUE only on the resident `subtract_resident` success arm — i.e.
+        // the larger child was derived `parent − smaller` on device. The co-pack
+        // kernel was validated ONLY against the subtract-derived larger Handle layout,
+        // so the co-pack gate keys on THIS flag rather than overloading
+        // `larger_resident_slot == larger_slot_id` (which is also true for the
+        // direct-build resident arm — unreachable post-root today, but relying on an
+        // unreachable branch to keep the gate correct is fragile).
+        let mut larger_is_resident_subtract = false;
         let larger_slot_id = larger_slot;
         if larger_leaf >= 0 {
             let larger_slot = larger_slot.expect("non-root larger child must hold a pool slot");
@@ -1648,6 +1656,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         larger_slot,
                         pool.hist_len(),
                     )?;
+                    // WR-03: the larger child is now the on-device subtract-derived
+                    // Handle the co-pack kernel was validated against.
+                    larger_is_resident_subtract = true;
                 } else {
                     // No parent retained (cannot happen post-root in the spine) — build
                     // the larger child resident directly into its slot.
@@ -1771,6 +1782,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             && smaller_resident_only
             && smaller_scannable
             && larger_leaf >= 0
+            // WR-03: gate explicitly on "the larger child was derived by resident
+            // subtract" (the only layout the co-pack kernel was validated against)
+            // rather than the `larger_resident_slot == larger_slot_id` proxy, which
+            // is ALSO true for the (post-root unreachable) direct-build resident arm.
+            && larger_is_resident_subtract
             && larger_resident_slot == larger_slot_id
             && larger_slot_id.is_some()
             && !larger_unified
