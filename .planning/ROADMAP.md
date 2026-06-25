@@ -48,6 +48,11 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
   fractions). Does NOT change CPU routing or the wide build path. Validated by spikes
   023 (regime-split attribution) + 024 (isolated A/B). Evidence:
   `crates/lgbm-compute/examples/spike024_sibling_scan_ab.rs`, `.planning/spikes/024-*/`.
+  Plans: 3 plans
+
+  - [ ] 12-01-PLAN.md — 2-slot co-packed scan kernel + `scan_resident_siblings` backend method + growth-loop reorder (defer smaller scan past subtract, co-pack when resident-scan-eligible) + `LGBM_SIBLING_COPACK` gate (wave 1)
+  - [ ] 12-02-PLAN.md — oracle `kernel_parity` co-pack cell (co-pack == two scans byte-identical + rocm within ~1e-6 of CPU f64 anchor; cubecl-cpu W=1 byte-identical) + CPU merge-gate green (wave 2)
+  - [ ] 12-03-PLAN.md — `bench_gpu_vs_cpu` co-pack ON/OFF A/B: `scan_resident` sync count ~halved + e2e not-slower, honest reporting (wave 2)
 
 ### 📋 Next milestone (not yet scoped)
 
