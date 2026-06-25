@@ -1764,6 +1764,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         //     (`larger_resident_slot == Some(larger_slot)`, NOT unified);
         //   - BOTH siblings are SCANNABLE (`sum_h > 0`, `num_data > 0`) — otherwise that
         //     sibling early-outs to `none()` in `scan_leaf_histogram`;
+        //     WR-02: this scannability gate is the SINGLE SOURCE OF TRUTH for the
+        //     kernel's per-sibling `sum_hessian > 0` reject (split.rs
+        //     `find_best_splits_siblings`). Because a non-scannable leaf degrades to
+        //     `none()` here BEFORE co-pack is even considered, the kernel reject is
+        //     unreachable on the production path — co-pack is never LESS robust than
+        //     the two-scan fall-back it replaces. If this gate is ever relaxed, the
+        //     kernel reject MUST be downgraded to graceful `none()` degradation too,
+        //     or the whole tree would abort on a leaf that simply can't split.
         //   - both siblings have IDENTICAL spine membership (the co-packed kernel scans
         //     ONE shared `feats`; if the per-node col-sampler masks differ the spines
         //     differ ⇒ NOT co-packable);

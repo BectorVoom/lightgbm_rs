@@ -1609,6 +1609,16 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
     // Reject non-positive OR NaN sum_hessian once PER SIBLING (cnt_factor divides by
     // the bumped sum_hessian). `!(x > 0.0)` is deliberately NaN-catching.
+    //
+    // WR-02: this is a DEFENSIVE / unreachable boundary check, NOT the gate. The
+    // co-pack eligibility gate in the learner (`find_best_splits`) is the SINGLE
+    // SOURCE OF TRUTH for scannability: co-pack only fires when BOTH siblings already
+    // satisfy `sum_hessians > 0.0 && num_data_in_leaf > 0`, mirroring the per-leaf
+    // `scan_leaf_histogram` early-out to `none()`. So in the production co-pack path
+    // these rejects can never trip. They remain as a hard error only for the rare
+    // standalone/test caller of `find_best_splits_siblings`: a non-positive-hessian
+    // sibling there is a contract violation, not a "this leaf can't split" — the
+    // learner has already degraded such a leaf before ever reaching co-pack.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(sum_hessian_a > 0.0) {
         return Err(ComputeError::Runtime {
