@@ -1,0 +1,23 @@
+## 500 feat × 250000 rows × 256 bins  (P=1, wide regime)
+#   FULL       3110.9 ms   (804 Mr/s, 10.4 GB/s effective)
+#   NOATOMIC   3158.4 ms   (102% of FULL)  ← reads+quantize only
+#   CONST_GH   2849.9 ms   (92% of FULL)  ← no grad/hess read
+#   COAL_BIN    443.6 ms   (14% of FULL)  ← same bin array, COALESCED read
+#   SEQ_BIN     187.1 ms   (6% of FULL)  ← no bin array read at all
+#   REAL_ORDER (monotone 50% subset)   305.4 ms  (4093 Mr/s)  vs FULL 804 / COAL 5636 Mr/s
+#   ⇒ atomic ≈ 0%   grad/hess-read ≈ 8%   UNCOALESCED-pattern ≈ 86%   bin-bandwidth ≈ 8%
+
+## 500 feat × 1000000 rows × 256 bins  (P=1, wide regime)
+#   FULL      28898.1 ms   (346 Mr/s, 4.5 GB/s effective)
+#   NOATOMIC  29508.0 ms   (102% of FULL)  ← reads+quantize only
+#   CONST_GH  24712.9 ms   (86% of FULL)  ← no grad/hess read
+#   COAL_BIN   2035.1 ms   (7% of FULL)  ← same bin array, COALESCED read
+#   SEQ_BIN     829.8 ms   (3% of FULL)  ← no bin array read at all
+#   REAL_ORDER (monotone 50% subset)  1468.4 ms  (3405 Mr/s)  vs FULL 346 / COAL 4914 Mr/s
+#   ⇒ atomic ≈ 0%   grad/hess-read ≈ 14%   UNCOALESCED-pattern ≈ 93%   bin-bandwidth ≈ 4%
+
+# VERDICT KEY:
+#  NOATOMIC ≈ FULL (atomic share small)        ⇒ NOT atomic-bound (015 stale post-u64)
+#  CONST_GH ≪ FULL (grad/hess-read share big)  ⇒ MEMORY-bound on grad/hess ⇒ 031 GREEN
+#  SEQ_BIN  ≪ FULL but CONST_GH ≈ FULL         ⇒ random-gather LATENCY-bound instead
+#  effective GB/s near APU DDR5 peak (~60-100) ⇒ bandwidth-bound corroborated

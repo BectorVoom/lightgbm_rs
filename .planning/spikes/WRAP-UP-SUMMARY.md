@@ -159,3 +159,34 @@
 - 029: `4fe9025` (generic kernel) + `3b79e69` (data_partition_native + wire) + `9ab8cb6` (U8/U16
   parity cells) — quick-260625-j1l.
 - 024: wired in phase 12 (`LGBM_SIBLING_COPACK`).
+
+---
+
+## Session 2026-06-25 (cont.) — Build bottleneck RE-ATTRIBUTION (030/031)
+
+**Spikes processed:** 2 (030 VALIDATED measurement, 031 CLOSED-by-030/not-built)
+**Feature area:** GPU build — bottleneck re-attribution (new reference
+`references/gpu-build-bottleneck-reattribution.md`)
+**Idea:** "attack the learning speed of bottleneck in gpu" — the manifest's own rule is
+"re-profile after every build change"; the wide-build attribution (015, "atomic-bound") predated
+the u64 ship and was never re-run.
+
+### Key findings
+- **The wide GPU build is UNCOALESCED-BIN-GATHER-latency-bound (030, 86–95%)** — NOT atomic-bound
+  (u64 made the atomic free: NOATOMIC ≈ FULL ⇒ spike-015's "atomic-bound ~820 Mr/s" is STALE) and
+  NOT grad/hess-bandwidth-bound (8–14%). Proof: `COAL_BIN` reads the same 500 MB array / same
+  bytes SEQUENTIALLY and runs 8–20× faster; effective 4.5–10 GB/s ≪ DDR5 peak = a latency stall.
+- **The honesty caveat that capped the ROI (REAL_ORDER):** a random `leaf_rows` probe overstates
+  the penalty 5–10×. LightGBM's STABLE partition gives monotone-increasing `leaf_rows`, already at
+  **~70% of the coalesced ceiling** (4093/3405 vs 5636/4914 Mr/s). Residual coalescing headroom is
+  only **~1.4×** — and read-once-unamortizable (same wall as 028). ⇒ the build is effectively tuned
+  on the APU.
+- **031 closed without building it:** original premise (grad/hess reuse) invalidated by 030's
+  CONST_GH; the redirect (coalesce the bin read) is marginal and unamortizable per 030's own data.
+  Reopens only on **discrete gfx110x** — re-run `examples/spike030_build_roofline_ab.rs` there.
+- **New convention:** "remove-the-suspect" re-attribution (delete one cost per variant, pair
+  complementary deletions, report Mr/s, model the REAL access order). Added to CONVENTIONS.md.
+
+### Commits
+- 030: `ccd285f` (VALIDATED — probe + README + MANIFEST).
+- 031: `9eee58c` (CLOSED-by-030 + CONVENTIONS "remove-the-suspect" pattern).
