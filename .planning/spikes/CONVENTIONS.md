@@ -58,6 +58,22 @@ increasing subset (`(0..N).step_by(k)`), which already sits at ~70% of the coale
 Report **Mr/s** (reads/sec) so variants with different row counts compare fairly. Reference:
 `spike030_build_roofline_ab.rs`.
 
+**Measure divergence with a controlled identical-total-work ladder (spike 036).** Divergence
+is the ONE GPU micro-arch effect that IS cleanly sign-measurable on the spoofed 8-CU APU (it's
+a wavefront-SCHEDULER property — lockstep masking — not CU-count/memory-bound, the axes the spoof
+confounds). To prove a divergence delta is real (vs noise) at the magnitude you care about:
+build N arms that do **identical total work** (sum of per-lane loop trip counts equal across
+arms) and differ ONLY in how that work is **distributed across wavefront lanes** — `UNIFORM=K`,
+`DIV2=lane%2?0:2K`, `DIV4`, `DIV32` (interleaved `lane%n` keeps the imbalance within any 32/64
+group ⇒ wave-width-robust). Loop body = constant ALU/iter into a register sink written once
+(no memory, defeats DCE); trip count from a DEVICE ARRAY (compiler can't specialize). If
+wavefronts serialize to the slowest active lane, wall-clock scales 1:2:4:32 despite constant
+useful work (idle masked lanes = pure waste). Measured near-ideal (1.00/1.9/3.7/27×, 2
+restarts) ⇒ resolvable; a collapse →1 ⇒ not. **But measurable ≠ worth it** — 036 also found the
+production kernels are ALREADY branchless (`select`-everywhere, MLIR-forced) and the dominant
+build is divergence-free by construction, so this ladder is a GATE to run BEFORE a real divergence
+A/B, not a lever itself. Reference: `spike036_divergence_measurability.rs`.
+
 ## CPU data-layout micro-bench harness (spikes 010, 011)
 
 For "is data-structure change X faster on the CPU?", the **end-to-end `bench_train`

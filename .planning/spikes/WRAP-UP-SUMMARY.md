@@ -275,3 +275,43 @@ GPU split-scan occupancy (022b → `references/gpu-split-scan-occupancy.md`)
 - 035 (spike): `73a2328`; 035 (wire): `da3032f` + docs `1815325` (quick-260626-a6t).
 - debug subtract_resident: fix `8aed100` + archive `26bd150`.
 - LGBM_SCAN_DRAIN re-wire: `128a4c2` + docs `872f5de` (quick-260625-tw1).
+
+---
+
+## Session 8 wrap-up — 2026-06-26 (spike 036, the branch-divergence gate)
+
+**Spikes processed:** 1 (036). **Skill output:** new reference `references/gpu-branch-divergence.md`.
+
+**Idea:** "Optimize conditional branching in GPU kernels." Run as a GATE (user chose gate-first):
+is any divergent branch on a hot path AND is divergence even measurable on the spoofed APU?
+
+- **036 — branch-divergence inventory + critical-path/measurability gate (PARTIAL).** Two
+  findings of opposite sign.
+  - **Measurability = PASS, and it overturns a prior.** A controlled-divergence LADDER (4 arms,
+    IDENTICAL total work, only the intra-wave loop-trip-count distribution differs:
+    UNIFORM/DIV2/DIV4/DIV32) scaled **1.00 / 1.89–1.95× / 3.62–3.84× / 25.6–29.3×** (near-ideal
+    1:2:4:32, 2 restarts, every rung p25 ≫ UNIFORM p75). **Wavefront lockstep-masking is FAITHFUL
+    on the spoofed 8-CU gfx1152 APU** — divergence is the ONE GPU micro-arch effect that survives
+    the spoof and is cleanly sign-measurable (it's a scheduler property, not CU-count/memory-bound,
+    the confounded axes). A reusable carve-out from the "APU numbers are unmeasurable" caveat.
+  - **Critical-path = WEAK ⇒ DON'T-CHASE.** The kernels are ALREADY fully branchless
+    (`select`-everywhere — cubecl-cpu's MLIR lowering rejects in-loop conditional-store `if`
+    chains, so the divergence-elimination transform shipped as a side effect). The only live
+    data-dependent cross-lane divergence is the split-scan **loop-trip-count** imbalance — on the
+    **3–7% scan** phase (034), **zero** at the production all-256-bin cardinality, real only on
+    mixed-cardinality feature sets (honest e2e ceiling ≪1%). The dominant wide **build** is
+    uniform/divergence-free by construction (030); partition is branchless + host-routed (035);
+    the only heavily-divergent kernel (plane-atomic) is the p93 NULL/dead path.
+  - **Recommendation:** do not chase branch divergence as a general lever. 037 (scan trip-count) =
+    bounded mixed-cardinality curiosity only; 038 (break-vs-select) = likely don't-build (`done`
+    is intra-lane predication ⇒ no wave-max-trip reduction unless early-exit is correlated; + must
+    fork hip-only off the bit-exact `split_scan_body` anchor). The 030/031/033 bounded-don't-chase
+    shape.
+
+**Method lesson reinforced:** *gate measurability AND critical-path before optimizing.* The
+intuitive optimization ("convert branches to branchless") was already done; the intuitive blocker
+("APU can't measure warp effects") was false. Both halves had to be checked empirically — the
+controlled ladder (identical work, varied distribution) is the reusable instrument.
+
+### Commits (session 8)
+- 036 (spike): `359428d` (README inventory + ladder, harness, MANIFEST row).
