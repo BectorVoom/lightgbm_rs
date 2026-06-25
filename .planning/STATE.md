@@ -4,17 +4,17 @@ milestone: v1.0
 milestone_name: milestone
 current_phase: 12
 current_phase_name: gpu-sibling-scan-copack
-status: executing
+status: verifying
 stopped_at: Completed 12-02-PLAN.md
-last_updated: "2026-06-25T02:03:46.772Z"
+last_updated: "2026-06-25T02:17:00.463Z"
 last_activity: 2026-06-25
 last_activity_desc: Phase 12 execution started
 progress:
   total_phases: 4
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 8
-  completed_plans: 6
-  percent: 50
+  completed_plans: 7
+  percent: 75
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 12 (gpu-sibling-scan-copack) — EXECUTING
 Plan: 3 of 3
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-25 — Phase 12 execution started
 
 ## Deferred Items
@@ -507,6 +507,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 11 P03 | 25min | 1 tasks | 1 files |
 | Phase 12 P01 | 35min | 3 tasks | 4 files |
 | Phase 12 P02 | 25min | 2 tasks | 1 files |
+| Phase 12 P03 | 40min | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -586,6 +587,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 12-01: CpuBackend inherits the scan_resident_siblings default error (no resident pool); the co-pack gate ANDs in resident_eligible so CpuBackend never reaches it
 - [Phase ?]: Co-pack parity: byte-identical via assert_eq! + ~1e-6 pin to CPU f64 anchor (def-f8u-01), never a 2nd GPU path
 - [Phase ?]: W=1 byte-identity proven without rocm: co-pack launcher on cubecl-cpu is byte-identical to two single-slot scans
+- [Phase ?]: Phase 12-03: co-pack A/B gated behind LGBM_BENCH_COPACK_AB=1; in-process LGBM_SIBLING_COPACK toggle; SC-3 confirmed (scan_resident ~59->~30/tree, counter-exact), SC-4 sign-only (medium ~1.33x, large ~1.14x; wide unaffected; isolated 2x NOT claimed as e2e)
 
 ### Pending Todos
 
@@ -615,7 +617,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-25T02:03:46.763Z
+Last session: 2026-06-25T02:16:43.314Z
 Stopped at: Completed 12-02-PLAN.md
 Resume file: None
 
