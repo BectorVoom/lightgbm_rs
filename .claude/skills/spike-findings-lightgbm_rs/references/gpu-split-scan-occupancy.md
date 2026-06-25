@@ -1,10 +1,10 @@
 # GPU split-SCAN — occupancy & within-feature parallelization
 
-Implementation blueprint from spikes **021, 016, 022** (+ 015's decomposition tooling). After
-the u64 build win (see gpu-build-fixedpoint-atomics), the per-leaf split **SCAN** became the
+Implementation blueprint from spikes **021, 016, 022, 022b** (+ 015's decomposition tooling).
+After the u64 build win (see gpu-build-fixedpoint-atomics), the per-leaf split **SCAN** became the
 other ~half of the wide GPU per-leaf cost. The shipped win is a pure **occupancy repack**
-(feature-per-lane, bit-exact); deeper within-feature parallelization is **parity-resolved but
-ROI-gated**.
+(feature-per-lane, bit-exact); deeper within-feature parallelization is **parity-resolved (022)
+AND perf-disproven (022b) — DON'T WIRE**.
 
 ## Requirements
 
@@ -100,7 +100,12 @@ sweep). Host parity probes (no GPU): `spike016_scan_reorder_probe.rs`,
 
 Synthesized from spikes: 015 (scan/build decomposition + `LGBM_SCAN_PROF`/`DRAIN` tooling),
 016 (parallel-scan reorder parity — PARTIAL), 021 (feature-per-lane occupancy — SHIPPED),
-022 (within-feature parallel-scan parity gate — resolved safe, ROI-gated).
+022 (within-feature parallel-scan parity gate — resolved safe, ROI-gated), 022b (the deferred
+within-feature PERF A/B — cooperation beats the shipped 021 only at NARROW ≤256 feat where the
+GPU is least competitive vs CPU; at the WIDE F=512 production shape it is WASH-to-regression once
+the occupancy confound is controlled [cd64 K1 = the real baseline; cd256 under-occupies]; argmax
+mism=0, gainrel ≤9e-15 ⇒ confirms 022's parity finding on the real kernel — DON'T WIRE).
 Source files in: sources/016-parallel-scan-reorder-parity/, sources/021-scan-feature-per-lane-occupancy/,
-sources/022-within-feature-parallel-scan-parity/ (+ 015's probes in sources/015-parallel-f32-resident-build/).
+sources/022-within-feature-parallel-scan-parity/, sources/022b-within-feature-scan-perf-ab/
+(+ 015's probes in sources/015-parallel-f32-resident-build/).
 </content>

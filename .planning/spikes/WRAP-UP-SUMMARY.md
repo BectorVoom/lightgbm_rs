@@ -1,8 +1,8 @@
 # Spike Wrap-Up Summary
 
-**Dates:** 2026-06-17 (001–013) · 2026-06-21 (014a/b + p9v/qix/rdu/rsh) · 2026-06-25 (015–022, GPU build/scan kernel campaign)
-**Spikes processed:** 22 (001–022) across three wrap-up sessions
-**Feature areas:** CPU histogram build · GPU histogram kernel · GPU routing & quantization · Histogram/learning memory layout · GPU wide-shape attribution · GPU build fixed-point atomics · GPU split-scan occupancy
+**Dates:** 2026-06-17 (001–013) · 2026-06-21 (014a/b + p9v/qix/rdu/rsh) · 2026-06-25 (015–022 build/scan kernel; 023/024 + 026–029 round-trip/partition; 030/031 build re-attribution; **022b/032/033 partition+within-scan close-out**)
+**Spikes processed:** 35 (001–033 incl. 014a/b, 022b; 025 superseded/not-built) across six wrap-up sessions
+**Feature areas:** CPU histogram build · GPU histogram kernel · GPU routing & quantization · Histogram/learning memory layout · GPU wide-shape attribution · GPU build fixed-point atomics · GPU split-scan occupancy · GPU scan round-trip & co-pack · GPU build bottleneck re-attribution · Partition (row-routing) memory-traffic
 **Skill output:** `./.claude/skills/spike-findings-lightgbm_rs/`
 
 ## Processed Spikes
@@ -32,6 +32,17 @@
 | 020 | perwarp-replication-on-u64 | standard | ⚠️ PARTIAL/null (don't wire) | GPU build — fixed-point atomics |
 | 021 | scan-feature-per-lane-occupancy | standard | ✅ VALIDATED + SHIPPED | GPU split-scan occupancy |
 | 022 | within-feature-parallel-scan-parity | standard | ✅ VALIDATED (gate resolved, ROI-gated) | GPU split-scan occupancy |
+| 022b | within-feature-scan-perf-ab | standard | ✅ VALIDATED experiment (confirms DON'T WIRE) | GPU split-scan occupancy |
+| 023 | post-021-roundtrip-attribution | measurement | ✅ VALIDATED (regime-split) | GPU scan round-trip & co-pack |
+| 024 | batch-sibling-scans | standard | ✅ VALIDATED ~2× + WIRED phase 12 | GPU scan round-trip & co-pack |
+| 026 | cubecl-cpu-partition-scan-scatter | standard | ⚠️ PARTIAL/NULL (bandwidth-bound) | Partition memory-traffic |
+| 027 | fused-gather-partition | standard | ✅ VALIDATED + SHIPPED (CPU, 1.3–2.7×) | Partition memory-traffic |
+| 028 | doublebuffer-partition | standard | ❌ INVALIDATED/NULL | Partition memory-traffic |
+| 029 | gpu-narrow-upload-fuse | standard | ✅ VALIDATED + SHIPPED (ROCm, ~1.2–1.7×) | Partition memory-traffic |
+| 030 | wide-build-roofline-reattribution | measurement | ✅ VALIDATED (uncoalesced-gather) | GPU build bottleneck re-attribution |
+| 031 | crossfeature-gradhess-reuse | standard | ⛔ CLOSED by 030 (not built) | GPU build bottleneck re-attribution |
+| 032 | partition-validation-fold | standard | ✅ VALIDATED + SHIPPED (CPU, ~1.14–1.41× U8) | Partition memory-traffic |
+| 033 | partition-gather-prefetch | standard | ⚠️ PARTIAL — DON'T WIRE (ROI-gated) | Partition memory-traffic |
 
 ## Key Findings (001–009, the perf campaign)
 
@@ -190,3 +201,42 @@ the u64 ship and was never re-run.
 ### Commits
 - 030: `ccd285f` (VALIDATED — probe + README + MANIFEST).
 - 031: `9eee58c` (CLOSED-by-030 + CONVENTIONS "remove-the-suspect" pattern).
+
+---
+
+## Session 2026-06-25 (cont.) — Partition + within-scan close-out (022b/032/033)
+
+**Spikes processed:** 3 (032 VALIDATED+SHIPPED, 033 PARTIAL/don't-wire, 022b VALIDATED experiment)
+**Feature areas:** Partition (row-routing) memory-traffic (032/033 → `references/partition-memory-traffic.md`);
+GPU split-scan occupancy (022b → `references/gpu-split-scan-occupancy.md`)
+**Idea:** "attack the learning speed of bottleneck in gpu" → user redirected to the data partition
+(spike-027 follow-ons), then to the deferred prefetch lever; 022b folded in (was unprocessed).
+
+### Key findings
+- **032 — audit the shipped wiring, not just the spike that validated it (SHIPPED, quick-260625-qn9).**
+  Reading the live `split_fused_host` found it did TWO random gathers (a standalone per-row
+  validation loop + pass-1's route gather), not the ONE spike-027 measured — the 2nd re-misses
+  cache at scale = exactly the traffic 026→027 cut. Folded the range-check into pass-1 (gather `b`
+  once, check before any write ⇒ unmutated `indices` + same lowest-index error = bit-exact on
+  success AND error). **~1.14–1.41× at production U8 ≥1M rows, up to ~1.8× U32**, 3 restarts parity
+  OK; gate green (lgbm-treelearner 77/0 + oracle `raw_bin_train_parity` 2/0 vs lib_lightgbm 4.6).
+- **033 — prefetch is ROI-gated, DON'T WIRE.** `_mm_prefetch`-ahead of the random gather hides
+  miss-latency only when the bin column ≫ LLC: **~2–3× whole-op at 4M×U32 (bestD=128)**, but the
+  production-default **U8** width is dense enough that even 4M rows barely exceeds cache ⇒ ~1.1× at
+  a root split only, null-to-slower everywhere else. x86-only intrinsic. After 032 there's little
+  gather latency left to hide at U8. **Two reusable landmines → CONVENTIONS:** (a) don't refactor
+  `.bin()` per-row matches into a typed-`&[T]` loop — it auto-vectorizes to a slow AVX gather,
+  **1.5–2× SLOWER** than scalar; (b) prefetch only pays when the gathered array ≫ LLC.
+- **022b — the within-feature cooperative scan is perf-disproven (DON'T WIRE).** vs the SHIPPED 021
+  (cd64 K1), cooperation wins only NARROW (≤256 feat, 6×→2.2×) and is WASH-to-regression at the
+  WIDE F=512 production shape once the cd256 occupancy confound is removed. Confirms 022's parity
+  finding on the real kernel (argmax mism=0, gainrel ≤9e-15). Closes the deferred ROI question.
+- **Net: the CPU host partition is DONE.** 027 (fuse) + 032 (one-gather) shipped; 026/028/033/ia0
+  all NULL/ROI-gated. No remaining positive-ROI partition lever on this hardware; the GPU-track
+  on-device partition (host partition ~23% of GPU-train, never moved on-device) is the only
+  un-attacked structural cost — ROCm/discrete-GPU track only.
+
+### Commits
+- 032 (spike): `905e31e`; 032 (wire): `6b6fb09` + `cc673d9` (quick-260625-qn9).
+- 033 (spike): `f8dc46d`.
+- CONVENTIONS: `1f3563f` (audit-the-wiring) + the 033 autovectorization/prefetch lessons (this wrap).

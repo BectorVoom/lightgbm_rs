@@ -1,9 +1,11 @@
 # Partition (row-routing) — memory-traffic & narrow-upload
 
-Implementation blueprint from spikes **026, 027, 028, 029** — the `DataPartition::split`
+Implementation blueprint from spikes **026, 027, 028, 029, 032, 033** — the `DataPartition::split`
 (C++ `DataPartition::Split`, the per-leaf stable row-routing into `[left | right]`) optimization
-arc. Two wins SHIPPED (027 CPU, 029 ROCm), two NULLs with root causes (026, 028). The throughline:
-**partition is memory-bound; cut TRAFFIC, don't add cores.**
+arc. Three wins SHIPPED (027 CPU fuse, 029 ROCm narrow-upload, 032 CPU one-gather fold), three
+NULLs/ROI-gated with root causes (026 parallelize, 028 double-buffer, 033 prefetch). The
+throughline: **partition is memory-bound; cut TRAFFIC, don't add cores — and after 032 the CPU
+host partition is effectively DONE (no remaining positive-ROI lever on this hardware).**
 
 ## Requirements
 
@@ -52,6 +54,30 @@ if backend.prefers_host_partition() {
 `default_to_right = most_freq_bin > threshold`; `if bin < min_bin || bin > max_bin { default_to_right } else { bin > th }`.
 KEEP the **u8 route scratch** — the no-scratch 2-gather variant (V2) regresses to 0.79× at U32/4M.
 
+### Then fold the redundant validation gather into pass-1 (032, SHIPPED — CPU, quick-260625-qn9)
+
+**Reading the SHIPPED 027 wiring** found `split_fused_host` did TWO random gathers, not the ONE
+027 measured: a standalone per-row bin range-check loop (`feature_bins.bin(row)` for every leaf
+row) BEFORE pass-1's route gather. At scale the 2nd gather re-misses cache = exactly the traffic
+the arc fought to cut. Fold the range-check INTO pass-1 — gather `b` once, check `b >= num_bin`
+**before any `route`/`indices` write** (early-return leaves `self.indices` unmutated ⇒ same
+lowest-index `BinIndexOutOfRange`, bit-exact on success AND error), then `go_right(b)`:
+
+```rust
+for i in 0..count {
+    let row = self.indices[begin + i];
+    let b = feature_bins.bin(row as usize);
+    if b >= num_bin { return Err(ComputeError::BinIndexOutOfRange { row: i, bin: b, num_bin }); }
+    let gr = go_right(b);
+    route[i] = gr as u8; left += (!gr) as usize;
+}
+```
+
+Proven ~1.14–1.41× at production U8 ≥1M rows (up to ~1.8× U32), bit-exact (3 restarts, parity OK
+every cell). Keep the `num_bin==0` / `threshold>=num_bin` pre-checks. **Lesson: audit the shipped
+wiring vs the spike that "shipped" it** — a redundant pass added for parity/safety is often a free,
+bit-exact reclaim (the host analog of the GPU "re-attribute after every change" rule).
+
 ### Narrow the GPU upload (029, SHIPPED — ROCm)
 
 The device branch (`else` of `prefers_host_partition`) uploaded a u32-widened buffer per split.
@@ -92,6 +118,19 @@ Even on the **shared-DDR5 APU the narrow upload wins** — `create_from_slice` s
 - **Don't `cubecl-cpu`-ize a too-cheap op.** cubecl-cpu's per-launch dispatch+readback (~ms) swamps
   a few-ms op; it threads on the **CubeDim/UNIT axis** (`CubeDim(1)` runs serial — use ≥16). It lost
   to native here (corroborates 260608-mc5 / the unified-kernel-pref memory).
+- **Don't software-prefetch the gather at the production U8 width (033, PARTIAL/ROI-gated).**
+  `_mm_prefetch`-ahead of the random `feature_bins.bin(row)` gather is null-to-SLOWER until the bin
+  column ≫ LLC. U8 (1 B/row) only crosses at ~4M rows ⇒ ~1.05–1.16× whole-op at a ROOT split only,
+  null/negative for all smaller (deeper) leaves and all datasets <4M. The big 2–3× is U32-only
+  (≥4M) — a high-cardinality regime the `max_bin=255`→U8 default never reaches. Plus it's an
+  **x86-only intrinsic** (cfg + non-x86 fallback on a must-build-everywhere anchor). After 032 there
+  is little gather latency left to hide at U8. Revisit only for U16/U32 + multi-M-row workloads
+  (gate `width != U8 && leaf_rows ≥ ~2M`, tuned D ≈ 64–128).
+- **Don't refactor `.bin()` per-row matches into a typed-`&[T]` loop (033 autovectorization trap).**
+  The tight typed loop auto-vectorizes into a slow AVX gather (`vpgatherdd`) that serializes
+  cache-missing lanes WORSE than scalar independent loads under OoO MLP — **1.5–2× SLOWER** than the
+  scalar `.bin()` match at scale (all sizes, 3 restarts). The per-row enum match is the FASTER
+  codegen for a random gather. Keep `.bin()` in random-gather loops.
 
 ## Constraints
 
@@ -108,7 +147,10 @@ Even on the **shared-DDR5 APU the narrow upload wins** — `create_from_slice` s
 ## Origin
 
 Synthesized from spikes: 026 (parallelize=NULL, the bandwidth diagnosis), 027 (fuse-gather=SHIPPED
-1.3–2.7×, CPU), 028 (double-buffer=NULL), 029 (GPU narrow-upload=SHIPPED ~1.2–1.7×, bit-exact on GPU).
+1.3–2.7×, CPU), 028 (double-buffer=NULL), 029 (GPU narrow-upload=SHIPPED ~1.2–1.7×, bit-exact on GPU),
+032 (one-gather validation fold=SHIPPED ~1.14–1.41× U8, bit-exact), 033 (prefetch=PARTIAL/ROI-gated,
+don't-wire + the autovectorization landmine).
 Source files in: `sources/026-cubecl-cpu-partition-scan-scatter/`, `sources/027-fused-gather-partition/`,
-`sources/028-doublebuffer-partition/`, `sources/029-gpu-narrow-upload-fuse/`.
-Shipped via quick tasks 260625-hw2 (027) and 260625-j1l (029).
+`sources/028-doublebuffer-partition/`, `sources/029-gpu-narrow-upload-fuse/`,
+`sources/032-partition-validation-fold/`, `sources/033-partition-gather-prefetch/`.
+Shipped via quick tasks 260625-hw2 (027), 260625-j1l (029), 260625-qn9 (032).
