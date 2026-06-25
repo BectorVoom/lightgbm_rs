@@ -43,10 +43,33 @@ feat `g`; `g≥n` ⇒ sibling-B feat `g−n`), feature-per-lane W=64 (the 021 pa
 - **Honest e2e** (cold-isolated overstates warm, the 021 rule): co-pack halves the sync COUNT not
   the compute ⇒ reclaims ~½ the genuine scan-sync = **~10–15% small/medium, ~1.5% wide** (per 023's
   scan-sync fractions) — NOT 2× e2e.
-- **Wiring (done, phase 12):** a 2-slot production scan kernel (two histogram Handles, 2×n
-  SplitInfos, one readback) + a growth-loop reorder that defers the smaller-child scan past
-  `subtract_resident` (both Handles are co-resident there) + an oracle parity re-pin. Gated behind
-  `LGBM_SIBLING_COPACK`; the gate ANDs in `larger_is_resident_subtract`.
+- **Wiring (done, phase 12 — VERIFIED LIVE + DEFAULT-ON by quick task 260625-obl):** a 2-slot
+  production scan kernel (two histogram Handles, 2×n SplitInfos, one readback) + a growth-loop
+  reorder that defers the smaller-child scan past `subtract_resident` (both Handles are co-resident
+  there) + an oracle parity re-pin. **Call site:** `learner.rs:1839`
+  `self.backend.scan_resident_siblings(...)` inside the `copack_feats`-gated block (gate at
+  `learner.rs:1788`) → `RocmBackend::scan_resident_siblings` (`lib.rs:2507`) →
+  `find_best_splits_fused_siblings_from_handles_on` (`split.rs:1584`) →
+  `find_best_splits_fused_siblings_kernel` (`split.rs:1079`).
+- **Default-ON, NOT "behind a flag that must be set ON".** `LGBM_SIBLING_COPACK` is parsed by
+  `sibling_copack_override()` (`resident_pool.rs:282`) as a three-way override mirroring
+  `LGBM_RESIDENT_FORCE`: **`None` (unset) ⇒ co-pack engages** whenever the structural correctness
+  gate holds; **`=0` is the byte-identical OFF switch** (force the two-separate-scans path); `=1` is
+  force-on (identical to unset today — there is no separate co-pack size threshold yet). A future
+  reader must NOT misread "exists but unwired / needs the flag set ON" — the co-pack rides the
+  resident size gate and is live by default; you set `=0` only to get a clean A/B off-path.
+- The gate ANDs in `larger_is_resident_subtract` (the only layout the kernel was validated against —
+  WR-03, NOT the `larger_resident_slot == larger_slot_id` proxy) plus `resident_eligible`,
+  `copack_override != Some(false)`, `smaller_resident_only`, `smaller_scannable`, and IDENTICAL spine
+  membership (one shared `feats` for both siblings); any false case falls back BYTE-UNCHANGED.
+- **Verification anchors (the bit-exact gates, run in BOTH copack modes):** CPU —
+  `kernel_parity_sibling_copack_equals_two_scans_on_cpu` (cubecl-cpu W=1, 2-slot == two separate
+  single-slot scans, every SplitInfo field) + `raw_bin_train_matches_cpp_golden` (C++ golden RED-FLAG
+  sentinel, byte-idempotent across modes) + the `learner_parity_*` suite; ROCm —
+  `kernel_parity_split_within_tol_on_hip` (~1e-6 hip split) +
+  `kernel_parity_sibling_copack_equals_two_scans_on_hip` (pinned to the cubecl-cpu native anchor, NOT
+  GPU-vs-GPU — def-f8u-01). A committed-golden CHANGE is a HARD RED FLAG (co-pack is bit-exact by
+  construction), never auto-re-pin.
 
 ## What to Avoid
 
