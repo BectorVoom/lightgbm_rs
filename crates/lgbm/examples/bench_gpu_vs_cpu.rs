@@ -271,7 +271,6 @@ fn main() {
             .unwrap_or(8),
         _ => 50,
     };
-    let iters = iters; // bind for the closure below
 
     // Sizes: small/medium are launch-bound on the GPU; the >=200k size is where the
     // GPU path stops being purely launch-bound (and where the CPU anchor goes
