@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 12
 current_phase_name: gpu-sibling-scan-copack
 status: executing
-stopped_at: Completed 12-01-PLAN.md
-last_updated: "2026-06-25T01:56:32.286Z"
+stopped_at: Completed 12-02-PLAN.md
+last_updated: "2026-06-25T02:03:46.772Z"
 last_activity: 2026-06-25
 last_activity_desc: Phase 12 execution started
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 50
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 12 (gpu-sibling-scan-copack) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Ready to execute
 Last activity: 2026-06-25 — Phase 12 execution started
 
@@ -506,6 +506,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 11 P02 | 20min | 2 tasks | 2 files |
 | Phase 11 P03 | 25min | 1 tasks | 1 files |
 | Phase 12 P01 | 35min | 3 tasks | 4 files |
+| Phase 12 P02 | 25min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -583,6 +584,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 11 SPEC-3 confirmed via device-time A/B: live resident u64 fixed-point build is not slower than the f32 twin in the wide regime (~1.13-1.66x SEP-WINs), null/overlap in the light regime (8-CU APU spoofed, relative ratio only)
 - [Phase ?]: Phase 12-01: co-pack sibling resident scans add a spine-equality guard (resident_eligible does not rule out per-node col-sampling), falling back to two scans when spines differ
 - [Phase ?]: Phase 12-01: CpuBackend inherits the scan_resident_siblings default error (no resident pool); the co-pack gate ANDs in resident_eligible so CpuBackend never reaches it
+- [Phase ?]: Co-pack parity: byte-identical via assert_eq! + ~1e-6 pin to CPU f64 anchor (def-f8u-01), never a 2nd GPU path
+- [Phase ?]: W=1 byte-identity proven without rocm: co-pack launcher on cubecl-cpu is byte-identical to two single-slot scans
 
 ### Pending Todos
 
@@ -612,8 +615,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-25T01:56:32.166Z
-Stopped at: Completed 12-01-PLAN.md
+Last session: 2026-06-25T02:03:46.763Z
+Stopped at: Completed 12-02-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
