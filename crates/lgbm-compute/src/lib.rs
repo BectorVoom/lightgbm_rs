@@ -2056,16 +2056,13 @@ impl RocmBackend {
 impl Backend for RocmBackend {
     type Runtime = runtime::RocmRuntime;
 
-    // SPIKE-035 (env-gated experiment, default OFF = production-unchanged): route the
-    // rocm partition on the HOST via the shipped spike-027 fused u8-route path instead
-    // of the per-split device round-trip (`data_partition_native`). spike-034 found the
-    // device partition is now 30–38% of launch-bound train (the new #1 reclaimable phase
-    // after co-pack closed the scan-sync floor), and the build reads host `indices_`
-    // EITHER way (the device path reads its route back to host too) — so host partition
-    // adds no index re-upload, and is bit-exact (byte-identical [left|right] routing).
-    // `LGBM_ROCM_HOST_PARTITION=1` flips it on for the A/B. Wire = flip the default if it wins.
+    // spike-035 SHIPPED (quick-260626-a6t): route the rocm partition on the HOST via the shipped
+    // spike-027 fused path instead of the per-split device round-trip — ~1.18-1.23x launch-bound,
+    // wash at wide, parity within ~1e-6 (def-f8u-01; not a bit-exact swap). The device round-trip
+    // is pure overhead on shared DDR5 (the build reads host indices_ either way). Default ON;
+    // LGBM_ROCM_HOST_PARTITION=0 forces the old device round-trip for benching/rollback.
     fn prefers_host_partition(&self) -> bool {
-        matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("1"))
+        !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
     }
 
     fn construct_histograms(
