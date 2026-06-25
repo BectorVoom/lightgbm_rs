@@ -193,6 +193,19 @@ LEGITIMATE wall-clock (the 16-core CPU is real hardware; only the GPU is the spo
    the 16 cores share one controller; cutting TRAFFIC (narrower types, fewer materializations)
    beats adding cores. But transfer volume is NOT free even on an APU (029).
 
+## Audit the SHIPPED wiring, not just the spike that validated it (spike 032)
+
+A spike validates a design; the *production wiring* can quietly re-introduce the cost the
+spike removed. Spike-027 validated a ONE-random-gather fused partition, but the wired
+`split_fused_host` added a separate validation pass that does a SECOND full random gather
+over the leaf (`data_partition.rs:236-246`) — re-missing cache at scale, exactly the
+traffic 026→027 cut. Before spiking a *new* lever on a hot path, **re-read the live code
+and diff it against the spike that "shipped" it**; a redundant pass added for parity/safety
+is often a free, bit-exact reclaim (fold it into an existing pass with an early-return
+*before* any mutation = same error semantics; or relocate once-per-train, the 003b/r4o
+precedent). This is the host-CPU analog of the GPU "re-attribute after every build change"
+rule.
+
 ## Wiring a spike into production — additive backend discriminator + stale-worktree integration
 
 - **Gate a backend-specific path on a default-false trait method overridden on ONE backend**, never
