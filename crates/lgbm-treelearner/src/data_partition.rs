@@ -202,6 +202,15 @@ impl DataPartition {
     /// `SplitInner` `MissingType::None` decision as `data_partition_cpu_native`
     /// (`partition.rs`) / `dense_bin.hpp:322-365`, so the resulting `[left | right]`
     /// order is BYTE-IDENTICAL to the materialize-then-op path.
+    ///
+    /// Spike-032 V1 fold: the per-row bin range-check is folded INTO the single
+    /// pass-1 route gather — there is no separate validation pass. Pass-1 gathers
+    /// each leaf row's bin ONCE, range-checks it BEFORE writing the `route` scratch,
+    /// and routes off the same gathered `b`. The early-return on the first
+    /// out-of-range bin (in ascending leaf position) leaves `self.indices` UNMUTATED
+    /// — pass-1 only writes the local `route`/`left_count`, never `self.indices` —
+    /// so the lowest-index `BinIndexOutOfRange` error semantics are bit-identical to
+    /// the pre-fold two-gather path.
     #[allow(clippy::too_many_arguments)]
     fn split_fused_host(
         &mut self,
@@ -227,24 +236,6 @@ impl DataPartition {
                 detail: format!("data_partition: threshold {threshold} >= num_bin {num_bin}"),
             });
         }
-        // Per-row bin range check in ASCENDING leaf-position order. NOTE:
-        // `data_partition_cpu_native` validates the lowest GLOBAL-bins index (its
-        // input is the already-gathered leaf bins, so "row" == leaf position); here
-        // the leaf-row scan in ascending leaf position is the faithful per-leaf
-        // analog, reading each row's bin directly off the narrow `BinColumn` (no
-        // u32-widened leaf_feature_bins Vec).
-        for i in 0..count {
-            let row = self.indices[begin + i] as usize;
-            let b = feature_bins.bin(row);
-            if b >= num_bin {
-                return Err(ComputeError::BinIndexOutOfRange {
-                    row: i,
-                    bin: b,
-                    num_bin,
-                });
-            }
-        }
-
         // Router (dense_bin.hpp:322-365) — identical to `make_router`:
         let min_b = min_bin as i32;
         let max_b = max_bin as i32;
@@ -263,13 +254,24 @@ impl DataPartition {
             }
         };
 
-        // pass 1: gather + route + count (the ONE random gather). `route` is the
-        // ¼-width u8 scratch (KEPT — the 2-gather V2 variant regresses).
+        // pass 1: gather + RANGE-CHECK + route + count (the ONE random gather;
+        // spike-032 V1 fold). `route` is the ¼-width u8 scratch (KEPT — the 2-gather
+        // V2 variant regresses). The range-check returns BEFORE any write to `route`
+        // so an early-return on the first (lowest-index) bad bin leaves
+        // `self.indices` UNMUTATED — pass-1 never writes `self.indices`.
         let mut route = vec![0u8; count];
         let mut left_count = 0usize;
         for i in 0..count {
             let row = self.indices[begin + i];
-            let gr = go_right(feature_bins.bin(row as usize));
+            let b = feature_bins.bin(row as usize);
+            if b >= num_bin {
+                return Err(ComputeError::BinIndexOutOfRange {
+                    row: i,
+                    bin: b,
+                    num_bin,
+                });
+            }
+            let gr = go_right(b);
             route[i] = gr as u8;
             left_count += (!gr) as usize;
         }
