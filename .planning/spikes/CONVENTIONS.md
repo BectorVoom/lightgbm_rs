@@ -93,6 +93,33 @@ and the three phases cover <½ of train wall-clock.
    passthrough when the env gate is off; verify the bit-exact gate stays green
    (`lgbm-treelearner --lib` + `lgbm-boosting --lib` + `oracle-harness`).
 
+## Host parity probe — resolve a reorder/precision risk BEFORE a GPU kernel (spikes 008, 016, 022)
+
+When the question is "does numerical change X (a reorder, a quantization, a parallel scan)
+flip the chosen SPLIT → tree divergence?", a pure-host f64 probe answers it for a fraction of
+a GPU kernel's cost. The shape:
+
+1. **Replicate the production scan/argmax faithfully** (call the REAL `gain::*` functions, mirror
+   the gate ORDER + strict-`>` tie-break of `split_scan_body`), parameterized by the ONE thing
+   under test (the prefix-sum association: `seq` vs the candidate order).
+2. **Use the EXACT order the backend emits, not a proxy.** cubecl-hip `plane_inclusive_sum`
+   lowers to a Hillis-Steele `__shfl_up` loop (`cubecl-cpp/src/shared/warp.rs::reduce_inclusive`)
+   — model THAT, not a generic pairwise tree (016 used a proxy and could only get the magnitude).
+3. **Classify divergences by present-data IMPACT, not just count.** A flip is only REAL if it
+   changes the partition of PRESENT data (different threshold, or a *populated* bin rerouted).
+   Reroutes of missing values / empty default bins / equal-gain plateaus (gain reldiff ~1e-12)
+   are COSMETIC — same tree structure + leaf values within the hip ~1e-6 gate, the tie class the
+   hip split test is already tie-aware for (def-hip-split, 1832206).
+4. **Add a direct mechanism demo when random generation under-covers the key case** (022: the
+   random sweep never landed a populated-default near-tie, so a fixed-split mass-sweep proved the
+   gain gap is *linear in mass* ⇒ only an empty bin can flip). Don't conclude from a null the
+   sweep simply never exercised.
+5. **A green host gate is necessary, not sufficient** — it retires the f64-reorder risk; the GPU
+   f32-vs-f64 envelope is a separate, larger, already-documented residual that only *widens* the
+   cosmetic tie band. The host probe never needs the GPU to answer the parity question.
+
+`spike022_default_bin_parity_probe.rs` / `spike016_scan_reorder_probe.rs` are the references.
+
 ## Tools & Libraries
 
 - `cubecl` 0.10 LDS API: `SharedMemory::<Atomic<f32>>::new(COMPTIME_SIZE)`, `sync_cube()`,
