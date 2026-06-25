@@ -1,0 +1,39 @@
+    Finished `release` profile [optimized] target(s) in 0.15s
+     Running `target/release/examples/bench_gpu_vs_cpu`
+# lightgbm_rs GPU-vs-CPU bench  (backend: rocm(gfx1100), iters: 50, leaves: 31, warmup: 2, reps: 5, rowpart_min: default(256000))
+# RUN BOTH FEATURE CONFIGS FOR THE SIDE-BY-SIDE COMPARISON:
+#   CPU: cargo run --release --example bench_gpu_vs_cpu
+#   GPU: cargo run --release --features rocm --example bench_gpu_vs_cpu
+# (CPU column is the MULTI-THREADED f64 anchor; GPU build is atomic/latency-bound.)
+size        rows  feat  bins    train_median   train_rows/s
+[phase_prof:warmup-discard] before=0.117ms hist+split=1540.522ms (build=438.339 scan=795.993) partition=294.618ms total=1835.257ms
+[phase_prof:warmup-discard] %: before=0.0 hist+split=83.9 (build=23.9 scan=43.4) partition=16.1
+[phase_prof:warmup-discard] LOOP: train_one_iter=1841.217ms (grad=0.160 learner=1840.024 score=0.267 snapshot=0.338 in_iter_other=0.428) metric=1.842ms feature_infos_setup=0.059ms
+[phase_prof:warmup-discard] BUDGET: binning=0.276ms grad=0.160ms learner=1840.024ms (phases=1835.257 in_learner_other=4.767 [of which resident_bin_upload=0.037]) score=0.267ms
+[phase_prof:small] before=0.289ms hist+split=2211.615ms (build=458.229 scan=1385.934) partition=344.561ms total=2556.464ms
+[phase_prof:small] %: before=0.0 hist+split=86.5 (build=17.9 scan=54.2) partition=13.5
+[phase_prof:small] LOOP: train_one_iter=2571.150ms (grad=0.392 learner=2568.252 score=0.646 snapshot=0.845 in_iter_other=1.016) metric=4.653ms feature_infos_setup=0.223ms
+[phase_prof:small] BUDGET: binning=0.750ms grad=0.392ms learner=2568.252ms (phases=2556.464 in_learner_other=11.788 [of which resident_bin_upload=0.030]) score=0.646ms
+small       2000    12    32      514.75ms           3885
+[phase_prof:warmup-discard] before=0.100ms hist+split=1750.039ms (build=0.000 scan=357.957) partition=738.915ms total=2489.054ms
+[phase_prof:warmup-discard] %: before=0.0 hist+split=70.3 (build=0.0 scan=14.4) partition=29.7
+[phase_prof:warmup-discard] LOOP: train_one_iter=2525.903ms (grad=1.011 learner=2520.365 score=2.578 snapshot=1.022 in_iter_other=0.927) metric=14.505ms feature_infos_setup=1.455ms
+[phase_prof:warmup-discard] COUNTS: device_launches=8900 (build_resident=3000 subtract_resident=2900 scan_resident=3000 fused=0) | scan_roundtrips(syncs)=3000
+[phase_prof:warmup-discard] BUDGET: binning=5.925ms grad=1.011ms learner=2520.365ms (phases=2489.054 in_learner_other=31.311 [of which resident_bin_upload=0.849]) score=2.578ms
+[phase_prof:medium] before=0.260ms hist+split=3012.548ms (build=0.000 scan=145.237) partition=1767.025ms total=4779.833ms
+[phase_prof:medium] %: before=0.0 hist+split=63.0 (build=0.0 scan=3.0) partition=37.0
+[phase_prof:medium] LOOP: train_one_iter=4878.383ms (grad=2.583 learner=4863.671 score=6.952 snapshot=2.788 in_iter_other=2.390) metric=38.970ms feature_infos_setup=3.574ms
+[phase_prof:medium] COUNTS: device_launches=22250 (build_resident=7500 subtract_resident=7250 scan_resident=7500 fused=0) | scan_roundtrips(syncs)=7500
+[phase_prof:medium] BUDGET: binning=13.540ms grad=2.583ms learner=4863.671ms (phases=4779.833 in_learner_other=83.838 [of which resident_bin_upload=0.434]) score=6.952ms
+medium     20000    30    64         1.00s          19972
+[phase_prof:warmup-discard] before=0.186ms hist+split=3099.986ms (build=0.000 scan=304.698) partition=1246.262ms total=4346.435ms
+[phase_prof:warmup-discard] %: before=0.0 hist+split=71.3 (build=0.0 scan=7.0) partition=28.7
+[phase_prof:warmup-discard] LOOP: train_one_iter=4708.073ms (grad=7.182 learner=4655.892 score=29.512 snapshot=10.050 in_iter_other=5.437) metric=126.833ms feature_infos_setup=14.965ms
+[phase_prof:warmup-discard] COUNTS: device_launches=8840 (build_resident=2980 subtract_resident=2880 scan_resident=2980 fused=0) | scan_roundtrips(syncs)=2980
+[phase_prof:warmup-discard] BUDGET: binning=60.758ms grad=7.182ms learner=4655.892ms (phases=4346.435 in_learner_other=309.457 [of which resident_bin_upload=9.793]) score=29.512ms
+[phase_prof:large] before=0.407ms hist+split=7322.687ms (build=0.000 scan=713.426) partition=3143.959ms total=10467.053ms
+[phase_prof:large] %: before=0.0 hist+split=70.0 (build=0.0 scan=6.8) partition=30.0
+[phase_prof:large] LOOP: train_one_iter=11359.325ms (grad=17.011 learner=11230.701 score=73.227 snapshot=24.884 in_iter_other=13.502) metric=326.608ms feature_infos_setup=37.972ms
+[phase_prof:large] COUNTS: device_launches=22100 (build_resident=7450 subtract_resident=7200 scan_resident=7450 fused=0) | scan_roundtrips(syncs)=7450
+[phase_prof:large] BUDGET: binning=142.563ms grad=17.011ms learner=11230.701ms (phases=10467.053 in_learner_other=763.648 [of which resident_bin_upload=9.291]) score=73.227ms
+large     200000    40   128         2.36s          84782

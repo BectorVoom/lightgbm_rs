@@ -2056,6 +2056,18 @@ impl RocmBackend {
 impl Backend for RocmBackend {
     type Runtime = runtime::RocmRuntime;
 
+    // SPIKE-035 (env-gated experiment, default OFF = production-unchanged): route the
+    // rocm partition on the HOST via the shipped spike-027 fused u8-route path instead
+    // of the per-split device round-trip (`data_partition_native`). spike-034 found the
+    // device partition is now 30–38% of launch-bound train (the new #1 reclaimable phase
+    // after co-pack closed the scan-sync floor), and the build reads host `indices_`
+    // EITHER way (the device path reads its route back to host too) — so host partition
+    // adds no index re-upload, and is bit-exact (byte-identical [left|right] routing).
+    // `LGBM_ROCM_HOST_PARTITION=1` flips it on for the A/B. Wire = flip the default if it wins.
+    fn prefers_host_partition(&self) -> bool {
+        matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("1"))
+    }
+
     fn construct_histograms(
         &self,
         client: &ComputeClient<Self::Runtime>,
