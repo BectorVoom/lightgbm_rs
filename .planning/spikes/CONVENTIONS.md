@@ -43,6 +43,21 @@ footprint/occupancy scales honestly with the variant. For a noisy APU, the 3-rou
 + p25/p75 over ~11 reps, ≥2 process restarts**, and require a SEP-WIN (variant p75 below
 baseline p25) before claiming a robust win (017 reference: `gpu_lds_replication.rs`).
 
+**"Remove-the-suspect" re-attribution + model the REAL access order (spike 030).** To find
+WHICH cost dominates a kernel (not just "is X faster"), build N variants of the LIVE kernel
+that each DELETE one suspected cost while keeping the rest live; whichever deletion moves the
+clock IS the bottleneck. Defeat dead-code elimination by accumulating deleted-path loads into a
+register written once at the end. Pair complementary deletions to disambiguate (030: `SEQ_BIN`
+deletes the random gather AND the index read → ambiguous; adding `COAL_BIN` = same array/bytes
+read SEQUENTIALLY isolated the uncoalesced PATTERN from bandwidth). **Re-attribute after every
+build change** — 030 found the post-u64 build is uncoalesced-gather-bound, NOT the atomic-bound
+that spike-015 declared pre-u64 (the bottleneck moves; the old verdict goes stale).
+**Critical: model the production access ORDER, not a random permutation.** A random `leaf_rows`
+gather overstated the uncoalesced penalty **5–10×** vs the real STABLE-partition monotone-
+increasing subset (`(0..N).step_by(k)`), which already sits at ~70% of the coalesced ceiling.
+Report **Mr/s** (reads/sec) so variants with different row counts compare fairly. Reference:
+`spike030_build_roofline_ab.rs`.
+
 ## CPU data-layout micro-bench harness (spikes 010, 011)
 
 For "is data-structure change X faster on the CPU?", the **end-to-end `bench_train`
