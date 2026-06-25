@@ -987,6 +987,174 @@ fn kernel_parity_fused_equals_per_feature_and_native() {
 }
 
 // ===========================================================================
+// Phase-12 SIBLING CO-PACK parity (cubecl-cpu W=1 byte-identity half, SC-1).
+//
+// Productionizes the spike-024 byte-for-byte gate WITHOUT rocm: the co-packed
+// 2-slot sibling scan (`find_best_splits_fused_siblings_from_handles_on`, Plan 01)
+// must return SplitInfos byte-IDENTICAL to two separate single-slot scans
+// (`find_best_splits_batched_fused_f64_on`), per sibling, every `SplitInfo` field.
+//
+// This is bit-exact BY CONSTRUCTION (12-CONTEXT, "Parity"): each feature's
+// REVERSE+FORWARD sequential scan is the SAME `split_scan_body` over the SAME
+// disjoint per-feature region — co-packing only changes WHICH launch a feature's
+// scan runs in, never its math. On the cubecl-cpu runtime the kernel runs at W=1
+// (CONVENTIONS: "W=1 stays byte-identical"), so this proves the byte-identical
+// claim on the ALWAYS-available CPU runtime — no GPU needed for the bit-exact gate.
+//
+// The two siblings carry DIFFERENT leaf totals (smaller-built vs larger-subtract-
+// derived asymmetry, spike-024's two seeds) over the SAME feature layout (the
+// shared per-feature param arrays the 2-slot kernel consumes).
+// ===========================================================================
+#[test]
+fn kernel_parity_sibling_copack_equals_two_scans_on_cpu() {
+    use lgbm_compute::kernels::split::{
+        find_best_splits_batched_fused_f64_on, find_best_splits_fused_siblings_from_handles_on,
+        upload_f64_buffer,
+    };
+
+    let client = cpu_client();
+
+    // SHARED multi-feature layout (3 features, mixed num_bin/offset/run_forward so
+    // a REVERSE winner, a FORWARD winner, and a no-split feature are all covered —
+    // mirrors the from-handle cell's spine). Pre-fixed/compacted stride-2 f64 cells
+    // fed directly (the launcher scans an already-prepared histogram; no re-fix).
+    let feats = copack_feats();
+    let (buf_a, buf_b) = copack_two_histograms();
+    assert_eq!(buf_a.len(), buf_b.len(), "siblings share the feature layout (buf len)");
+
+    let cfg = copack_cfg();
+    // DIFFERENT leaf totals per sibling (smaller A vs larger-derived B).
+    let a_totals = (5.0f64, 40.0f64, 40i32);
+    let b_totals = (-3.0f64, 64.0f64, 64i32);
+
+    // (a) Co-packed 2-slot scan: two Handles -> one launch -> (co_a, co_b).
+    let h_a = upload_f64_buffer(&client, &buf_a);
+    let h_b = upload_f64_buffer(&client, &buf_b);
+    let (co_a, co_b) = find_best_splits_fused_siblings_from_handles_on(
+        &client,
+        h_a,
+        h_b,
+        buf_a.len(),
+        &feats,
+        &cfg,
+        a_totals,
+        b_totals,
+    )
+    .expect("co-packed sibling scan (cubecl-cpu W=1)");
+
+    // (b) Two SEPARATE single-slot scans of the same two histograms + per-sibling totals.
+    let single_a =
+        find_best_splits_batched_fused_f64_on(&client, &buf_a, &feats, &cfg, a_totals.0, a_totals.1, a_totals.2)
+            .expect("single-slot scan A");
+    let single_b =
+        find_best_splits_batched_fused_f64_on(&client, &buf_b, &feats, &cfg, b_totals.0, b_totals.1, b_totals.2)
+            .expect("single-slot scan B");
+
+    assert_eq!(co_a.len(), feats.len(), "co-pack A: one SplitInfo per feature");
+    assert_eq!(co_b.len(), feats.len(), "co-pack B: one SplitInfo per feature");
+
+    // EXACT per-feature SplitInfo equality (W=1, byte-identical-by-construction): the
+    // co-packed scan runs the SAME f64 kernel over the SAME input bits, only the launch
+    // differs. assert_eq! on the full SplitInfo (mirrors the from-handle exact compare).
+    for (i, (co, si)) in co_a.iter().zip(single_a.iter()).enumerate() {
+        assert_eq!(
+            co, si,
+            "sibling A feature {i}: co-pack scan != single-slot scan (must be byte-identical): \
+             copack={co:?} single={si:?}"
+        );
+    }
+    for (i, (co, si)) in co_b.iter().zip(single_b.iter()).enumerate() {
+        assert_eq!(
+            co, si,
+            "sibling B feature {i}: co-pack scan != single-slot scan (must be byte-identical): \
+             copack={co:?} single={si:?}"
+        );
+    }
+}
+
+/// SHARED co-pack test fixture — the per-feature layout BOTH siblings scan (the
+/// `feats` the 2-slot kernel consumes once). 3 features: a REVERSE-only winner, a
+/// FORWARD-allowed winner, and (with the chosen histograms) a no-split feature.
+/// Reused by the cubecl-cpu cell here and the `--features rocm` cell in `mod hip`.
+fn copack_feats() -> Vec<BatchedSplitFeature> {
+    vec![
+        // f0: num_bin 4, offset 0, REVERSE only (run_forward=false) -> 8 cells.
+        BatchedSplitFeature {
+            slot_off: 0,
+            num_bin: 4,
+            offset: 0,
+            default_bin: 0,
+            most_freq_bin: 2,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        },
+        // f1: num_bin 3, offset 1 (compacted), FORWARD allowed -> 6 cells.
+        BatchedSplitFeature {
+            slot_off: 8,
+            num_bin: 3,
+            offset: 1,
+            default_bin: 0,
+            most_freq_bin: 0,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: true,
+        },
+        // f2: num_bin 5, offset 0, FORWARD allowed -> 10 cells.
+        BatchedSplitFeature {
+            slot_off: 14,
+            num_bin: 5,
+            offset: 0,
+            default_bin: 0,
+            most_freq_bin: 1,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: true,
+        },
+    ]
+}
+
+/// The SHARED relaxed gain cfg for the co-pack cells (admissible splits, no
+/// L1/L2/path-smooth so the gate exercises real winners on both siblings).
+fn copack_cfg() -> GainConfig {
+    GainConfig {
+        min_data_in_leaf: 1,
+        min_sum_hessian_in_leaf: 1e-3,
+        max_delta_step: 0.0,
+        lambda_l1: 0.0,
+        lambda_l2: 0.0,
+        min_gain_to_split: 0.0,
+        path_smooth: 0.0,
+        ..Default::default()
+    }
+}
+
+/// The TWO concatenated stride-2 f64 histograms over the `copack_feats` layout
+/// (24 cells = 8 + 6 + 10). `buf_a` is the "smaller-built" sibling; `buf_b` the
+/// "larger-subtract-derived" sibling — DIFFERENT cell values (spike-024's two
+/// seeds) so the per-sibling scans produce distinct winners. Exactly-representable
+/// f64 (widen losslessly to/from f32 on the GPU). Reused by both co-pack cells.
+fn copack_two_histograms() -> (Vec<f64>, Vec<f64>) {
+    let buf_a: Vec<f64> = vec![
+        // f0 4 bins
+        2.0, 5.0, -1.0, 4.0, 3.0, 6.0, -2.0, 5.0,
+        // f1 3 bins
+        1.0, 3.0, 4.0, 7.0, -3.0, 4.0,
+        // f2 5 bins
+        0.5, 2.0, 1.5, 3.0, -1.0, 2.5, 2.0, 4.0, -0.5, 3.5,
+    ];
+    let buf_b: Vec<f64> = vec![
+        // f0 4 bins (larger sibling: different grad/hess mass)
+        -2.0, 8.0, 3.0, 7.0, -1.0, 9.0, 4.0, 8.0,
+        // f1 3 bins
+        2.0, 5.0, -4.0, 6.0, 1.0, 7.0,
+        // f2 5 bins
+        -1.5, 4.0, 0.5, 5.0, 2.0, 4.5, -2.0, 6.0, 1.5, 5.5,
+    ];
+    (buf_a, buf_b)
+}
+
+// ===========================================================================
 // 04-03 PARTITION parity. Drive Backend::data_partition over the golden bins +
 // routing and assert the reordered index array + split_point match exactly.
 // ===========================================================================
@@ -2362,5 +2530,164 @@ mod hip {
         assert!(saw_reverse, "test must exercise a REVERSE-winner feature");
         assert!(saw_forward, "test must exercise a FORWARD-winner feature");
         assert!(saw_no_split, "test must exercise a no-split feature");
+    }
+
+    /// Phase-12 SIBLING CO-PACK parity on REAL hip (SC-1). Two halves:
+    ///
+    /// (a) BYTE-IDENTICAL: the co-packed 2-slot sibling scan
+    ///     (`find_best_splits_fused_siblings_from_handles_on`, Plan 01) returns
+    ///     `(co_a, co_b)` byte-IDENTICAL (`assert_eq!`, every `SplitInfo` field) to two
+    ///     SEPARATE single-slot scans (`find_best_splits_batched_fused_f64_on`) of the
+    ///     same two histograms with each sibling's totals. This is the productionized
+    ///     spike-024 gate (B's two halves == A's two results, every cell). It is an
+    ///     EXACTNESS check, valid because BOTH paths run the SAME f64 kernel on the SAME
+    ///     input bits — co-packing only changes WHICH launch a feature scans in.
+    ///
+    /// (b) ~1e-6 ANCHOR (def-f8u-01): each co-pack `SplitInfo` is within the hip ~1e-6
+    ///     envelope (`assert_within` / `HIP_SANITY_REL`) of a CPU f64 anchor scan
+    ///     (`find_best_split_cpu_native` per feature, per sibling). The reference is the
+    ///     CPU f64 anchor — NEVER a second GPU path (def-f8u-01: never compare two
+    ///     nondeterministic GPU f32 paths to each other). This guards a silent per-sibling
+    ///     mis-decode (wrong half / wrong min_gain_shift) that a GPU-vs-GPU check would miss.
+    ///
+    /// The two siblings carry DIFFERENT leaf totals over the SAME feature layout (the
+    /// smaller-built vs larger-subtract-derived asymmetry, spike-024's two seeds).
+    #[test]
+    fn kernel_parity_sibling_copack_equals_two_scans_on_hip() {
+        use lgbm_compute::kernels::split::{
+            find_best_split_cpu_native, find_best_splits_batched_fused_f64_on,
+            find_best_splits_fused_siblings_from_handles_on, upload_f64_buffer,
+        };
+
+        let hip = rocm_client();
+
+        // SHARED layout + the two seed histograms + cfg (reused from the cubecl-cpu cell's
+        // top-level helpers so both cells exercise the identical fixture).
+        let feats = super::copack_feats();
+        let (buf_a, buf_b) = super::copack_two_histograms();
+        let cfg = super::copack_cfg();
+        // DIFFERENT leaf totals per sibling (smaller A vs larger-derived B).
+        let a_totals = (5.0f64, 40.0f64, 40i32);
+        let b_totals = (-3.0f64, 64.0f64, 64i32);
+
+        // ---- (a) BYTE-IDENTICAL: co-pack (co_a, co_b) == two single-slot scans. ----
+        let h_a = upload_f64_buffer(&hip, &buf_a);
+        let h_b = upload_f64_buffer(&hip, &buf_b);
+        let (co_a, co_b) = find_best_splits_fused_siblings_from_handles_on(
+            &hip,
+            h_a,
+            h_b,
+            buf_a.len(),
+            &feats,
+            &cfg,
+            a_totals,
+            b_totals,
+        )
+        .expect("hip co-packed sibling scan");
+
+        let single_a = find_best_splits_batched_fused_f64_on(
+            &hip, &buf_a, &feats, &cfg, a_totals.0, a_totals.1, a_totals.2,
+        )
+        .expect("hip single-slot scan A");
+        let single_b = find_best_splits_batched_fused_f64_on(
+            &hip, &buf_b, &feats, &cfg, b_totals.0, b_totals.1, b_totals.2,
+        )
+        .expect("hip single-slot scan B");
+
+        assert_eq!(co_a.len(), feats.len(), "co-pack A length");
+        assert_eq!(co_b.len(), feats.len(), "co-pack B length");
+        // EXACT per-feature equality: same f64 kernel over the same input bits, only the
+        // launch differs (the productionized spike-024 byte-for-byte gate).
+        for (i, (co, si)) in co_a.iter().zip(single_a.iter()).enumerate() {
+            assert_eq!(
+                co, si,
+                "hip sibling A feature {i}: co-pack != single-slot scan (must be byte-identical): \
+                 copack={co:?} single={si:?}"
+            );
+        }
+        for (i, (co, si)) in co_b.iter().zip(single_b.iter()).enumerate() {
+            assert_eq!(
+                co, si,
+                "hip sibling B feature {i}: co-pack != single-slot scan (must be byte-identical): \
+                 copack={co:?} single={si:?}"
+            );
+        }
+
+        // ---- (b) ~1e-6 ANCHOR (def-f8u-01): each co-pack SplitInfo within the hip ~1e-6
+        //         envelope of a CPU f64 anchor (find_best_split_cpu_native) — NEVER a GPU path. ----
+        // Decode each SplitInfo's continuous fields to f32 and compare to the f64 anchor
+        // collected to f32, via the established `assert_within` (ORACLE_TOL surfaced +
+        // HIP_SANITY_REL hard bound). Only finite-gain (splittable) winners are pinned;
+        // a no-split feature's fields are sentinel (gain = -inf), compared via finiteness.
+        let anchor_fields = |si: &lgbm_compute::SplitInfo| -> Vec<f32> {
+            vec![
+                si.gain as f32,
+                si.left_sum_gradient as f32,
+                si.left_sum_hessian as f32,
+                si.right_sum_gradient as f32,
+                si.right_sum_hessian as f32,
+                si.left_output as f32,
+                si.right_output as f32,
+            ]
+        };
+        let pin = |label: &str, co: &[lgbm_compute::SplitInfo], totals: (f64, f64, i32)| {
+            for (i, c) in co.iter().enumerate() {
+                let f = &feats[i];
+                let base = f.slot_off;
+                let cells = 2 * f.num_bin as usize;
+                // The anchor scans the SAME per-feature region from this sibling's buf.
+                let buf = if label.starts_with('A') { &buf_a } else { &buf_b };
+                let region = &buf[base..base + cells];
+                let anchor = find_best_split_cpu_native(
+                    region,
+                    &cfg,
+                    f.num_bin,
+                    f.offset,
+                    f.default_bin,
+                    f.most_freq_bin,
+                    f.skip_default_bin,
+                    f.na_as_missing,
+                    f.run_forward,
+                    totals.0,
+                    totals.1,
+                    totals.2,
+                )
+                .expect("CPU f64 anchor (find_best_split_cpu_native)");
+                // Splittability agreement (exact bool) — gates whether we pin the fields.
+                assert_eq!(
+                    c.gain.is_finite(),
+                    anchor.gain.is_finite(),
+                    "co-pack {label} feature {i}: splittability vs CPU f64 anchor"
+                );
+                if anchor.gain.is_finite() {
+                    assert_eq!(
+                        c.threshold, anchor.threshold,
+                        "co-pack {label} feature {i}: threshold vs CPU f64 anchor"
+                    );
+                    assert_eq!(
+                        c.default_left, anchor.default_left,
+                        "co-pack {label} feature {i}: default_left vs CPU f64 anchor"
+                    );
+                    assert_eq!(
+                        c.left_count, anchor.left_count,
+                        "co-pack {label} feature {i}: left_count vs CPU f64 anchor"
+                    );
+                    assert_eq!(
+                        c.right_count, anchor.right_count,
+                        "co-pack {label} feature {i}: right_count vs CPU f64 anchor"
+                    );
+                    // The continuous f64 fields, pinned within the hip ~1e-6 envelope
+                    // (assert_within: ORACLE_TOL surfaced for the ledger + HIP_SANITY_REL
+                    // hard-fails a real divergence). The anchor is the CPU f64 path.
+                    assert_within(
+                        &format!("sibling_copack/{label}/feat{i}"),
+                        &anchor_fields(c),
+                        &anchor_fields(&anchor),
+                    );
+                }
+            }
+        };
+        pin("A", &co_a, a_totals);
+        pin("B", &co_b, b_totals);
     }
 }
