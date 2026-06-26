@@ -14,3 +14,13 @@ __pycache__/
 crates/lgbm-python/python/lightgbm_rs/_core*.so
 *.pyc
 .pytest_cache/
+
+# Read-only upstream reference trees — used locally for parity/FP-trace debugging,
+# never part of the deliverable Rust crate (must never be committed/published).
+/LightGBM/
+/LightGBM-release-4.6.0.99/
+/cuml-main/
+
+# Local tooling caches
+/.serena/
+/.claude/worktrees/
