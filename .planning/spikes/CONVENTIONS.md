@@ -185,6 +185,47 @@ a GPU kernel's cost. The shape:
   (hipified CUDA), NOT mainline `LightGBM/` — see
   `.planning/notes/cubecl-vs-rocm-histogram-kernel-comparison.md`.
 
+## CubeCL autotune harness (037–040 — code from the SOURCE, not the manual)
+
+The repeatable shape for "let cubecl autotune pick a launch config" on the rocm backend.
+The `cubecl_manual/.../12_autotuning.md` is **idealized and internally inconsistent** — read
+the real 0.10 API in `~/.cargo/registry/.../cubecl-runtime-0.10.0/src/tune/` first.
+
+1. **The real 0.10 API (3 manual divergences):** (a) `TunableSet::new(key_gen, input_gen)`'s
+   FIRST closure is the **KeyGenerator** `for<'a> Fn(&I::At<'a>) -> AutotuneKey` — it returns
+   the **key type**, NOT a String (the manual returns `"axpy-tune"` — wrong). (b)
+   `LocalTuner::execute(id, client, set, inputs)`'s first arg is the cache-namespace **ID**
+   (`Display`, e.g. `"rocm:0"`), NOT the AutotuneKey — the key is generated INTERNALLY from
+   inputs. (c) the `AutotuneKey` trait alias requires `serde::{Serialize, DeserializeOwned}`
+   under the `std_io` cfg (always on linux ⇒ persistent cache active) — add a `serde` dep
+   (dev-only if the key lives in an example). `cubecl::tune::*` is the import path
+   (re-exported via cubecl-core `lib.rs:50`). `local_tuner!("name")` works; the static lives
+   at module scope. Inputs type = `Vec<cubecl::server::Handle>` (blanket `TuneInputs`).
+2. **Accumulating kernels need a fresh-output InputGenerator, NOT `CloneInputGenerator`**
+   (037/038). `Handle::clone` is a ref-count bump (NOT a buffer copy), so `CloneInputGenerator`
+   makes every benchmark rep `fetch_add` into the caller's REAL `out` ⇒ **N× corruption**
+   (measured 27×; N = the whole sample budget, not +1). Fix: a struct `impl InputGenerator`
+   whose `generate<'a>(&self,_k,inputs) -> <Vec<Handle> as TuneInputs>::At<'a>` returns a new
+   `Vec<Handle>` with the output handle replaced by a fresh zeroed buffer (the winner's FINAL
+   run uses the ORIGINAL inputs, so the real `out` is touched exactly once → `rel_err 0` by
+   grad-conservation). GAT gotcha: spell the return through `…::At<'a>` or E0195. Classify
+   kernels: OVERWRITE (store) = safe as-is; ACCUMULATE (build) = fresh-output; in-place RMW
+   (partition) = deep-COPY generator (but partition is host-routed on rocm per 035).
+3. **Key on the occupancy REGIME, not exact dims** (039). Per-leaf row counts never repeat ⇒
+   keying `AutotuneKey` on exact `rows` = a tuning STORM (every node a cold ~40ms tune;
+   25/25 cold = 975ms for ONE shallow tree). Key on `log2(rows)` (or size-bands) + feats +
+   bins: ~one tune per size-decade, 20/25 nodes free (~3× faster than exact), AND it still
+   captures the variant crossover (the choice tracks the regime, not the exact count). FIXED
+   (feats-only) is cheapest but mis-applies the root's variant to small leaves.
+4. **Selection is the spoof-robust axis** (037/040). Absolute Mr/s is APU-confounded, but the
+   tuner's RELATIVE within-device pick is sound: it independently re-derived spike-007's P=16
+   and (040) BEAT the shipped 8-CU `row_partition_count` heuristic ~10% (which under-partitions
+   to P=1 at the production 50-feat width). Read the winner from the persisted
+   `target/autotune/0.10.0/rocm_0/*.json.log` (`fastest_index` → PSET[idx]). Clear that dir to
+   force true cold tunes when measuring tuning cost. **Measure-don't-model**: autotune ≥ the
+   analytic heuristic at every cell, and self-calibrates across hardware (the portability win).
+   Reference harnesses: `spike037_autotune_hip_feasibility.rs` … `spike040_autotune_vs_heuristic.rs`.
+
 ## CPU / host isolated-A/B harness (026–029 — the partition arc)
 
 The repeatable shape for "is host-side change X faster?" — and unlike the GPU harness these are
