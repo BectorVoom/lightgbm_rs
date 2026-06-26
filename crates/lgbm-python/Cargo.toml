@@ -26,7 +26,7 @@ mimalloc = { version = "0.1", default-features = false }
 # Enabling it ONLY through maturin lets `cargo test` link libpython and run the
 # Rust units (08-05 D-08 coercion seam), while the wheel still builds as a
 # proper extension module.
-pyo3 = { version = "0.27", features = ["abi3-py39"] }
+pyo3 = { version = "0.27", features = ["abi3-py311"] }
 numpy = "0.27"
 # `dtype-categorical` makes the polars `DataType::Categorical`/`Enum` variants
 # available so the Arrow-stream ingest can faithfully route Categorical/Enum
@@ -50,7 +50,7 @@ polars = { version = "0.53", default-features = false, features = [
 [dev-dependencies]
 # `auto-initialize` boots a CPython interpreter for `cargo test` so the Rust
 # units can drive a live `PyDict`/`Python::attach` (the D-08 coercion paths).
-pyo3 = { version = "0.27", features = ["abi3-py39", "auto-initialize"] }
+pyo3 = { version = "0.27", features = ["abi3-py311", "auto-initialize"] }
 
 [lib]
 # The compiled extension module (`lightgbm_rs._core`, D-11/D-12). `rlib` is added

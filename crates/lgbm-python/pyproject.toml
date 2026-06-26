@@ -6,8 +6,8 @@ build-backend = "maturin"
 
 [project]
 name = "lightgbm-rs"
-# abi3-py39 floor (08-RESEARCH A4 / D-13): one stable-ABI wheel covers 3.9+.
-requires-python = ">=3.9"
+# abi3-py311 floor (08-RESEARCH A4 / D-13): one stable-ABI wheel covers 3.11+.
+requires-python = ">=3.11"
 description = "Pure-Rust LightGBM (CubeCL) — Python bindings mirroring the official lightgbm API"
 readme = "README.md"
 license = { text = "MIT" }
@@ -17,7 +17,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
-    "numpy>=1.17.0",
+    "numpy>=2.0.0",
     "scipy",
 ]
 dynamic = ["version"]
