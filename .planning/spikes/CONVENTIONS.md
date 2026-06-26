@@ -334,18 +334,28 @@ memory/throughput-bound AND the vectorized op covers the bottleneck.** Evidence:
 | SUBTRACT (041) | pure streaming load–sub–store | cpu **2.5–3.7×**, hip **1.06–1.29×**, bit-exact | load+store+compute all vectorize; memory-bound |
 | SCAN read (042) | dependent prefix-sum + divide + argmax | **null** (0.88–1.08×), bit-exact | only the load vectorizes; dependent chain dominates |
 | BUILD grad/hess (043) | gather-latency bound; grad/hess = 8–14% | null→**REGRESSION** at wide (0.83×) | load latency hidden behind gather; extract adds occupancy pressure |
+| fix_compact DEQUANT (044) | streaming `u64→f64` map (memory-bound) | cpu-f64-vec8 **2.52×**, hip-f64-vec2 **~1.1× weak** | right shape + bit-exact, but a FUSED minority fraction ⇒ sub-1% e2e; cpu fix path is native |
 
 Corollaries: (1) the win **scales with problem size** — bench at the WIDE shape, a small
 op is overhead-bound (041: cpu-f32 1.2× at 25.6k → 3.7× at 256k). (2) On hip sweep to the
-MAX `io_optimized` width — intermediate widths are magnitude-noisy on the APU. (3) A
-permuted gather (`bins[col+leaf_rows[k]]`) is **structurally un-vectorizable** (no `Vector`
+MAX `io_optimized` width — intermediate widths are magnitude-noisy on the APU. **hip caps f64
+at vec2** (128-bit load / 64-bit) vs f32-vec4, so f64 streaming maps have a lower ceiling (044).
+(3) A permuted gather (`bins[col+leaf_rows[k]]`) is **structurally un-vectorizable** (no `Vector`
 read gathers arbitrary `p`); only contiguous reads vectorize. (4) Vectorizing a
 NON-bottleneck isn't free — it competes for registers/occupancy and can REGRESS (043 wide).
 (5) `Atomic<u64>` is **unimplemented on cubecl-cpu** (panics) — u64-atomic kernels are hip-only.
+(6) `Vector` supports **cross-type casts** bit-exactly (`Vector<u64,N>→<i64,N>→<f64,N>`, 044) —
+covers type-converting streaming maps; divide-by-const needs a broadcast `Vector::<f64,N>::new(S)`,
+not `vec / const` (the `Div<$lit>` impl needs a literal token). (7) **The corollary that decides
+WIRING:** a correctly-shaped streaming map only pays e2e when it's a MAJORITY of the kernel's work
+AND on a path the backend runs through cubecl — subtract (041) wins because it IS its whole kernel;
+dequant (044) is bounded because it's a fused minority fraction. The histogram-pipeline frontier is
+now FULLY MAPPED: subtract WON (041, shipped), scan null (042), build immune (043), dequant bounded
+(044) — no un-probed Vector lever remains in the histogram path.
 
 **Production fit:** the clean win (041 subtract) lands on `subtract_hist_kernel` — the verbatim
 kernel the rocm RESIDENT subtract (`subtract_histograms_f64_from_handles_on`) + portable
 cuda/wgpu launch; the CPU anchor subtract is NATIVE (`subtract_histograms_cpu_native`) so it's
 untouched (merge gate safe). But subtract is a non-dominant phase (034: build dominates wide,
 partition 30–38% launch-bound) on an APU that loses to CPU ⇒ ROCm-parity-track, bounded e2e.
-Reference harnesses: `spike041_vector_subtract_ab.rs`, `spike042_…`, `spike043_…`.
+Reference harnesses: `spike041_vector_subtract_ab.rs`, `spike042_…`, `spike043_…`, `spike044_vector_dequant_ab.rs`.
