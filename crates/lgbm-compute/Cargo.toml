@@ -17,6 +17,14 @@ rayon = "1.10"
 # DIRECT optional dep gated on `rocm` keeps the default cpu build from compiling or
 # linking it (SC#1). Its own build.rs auto-selects the right ROCm bindings.
 cubecl-hip-sys = { version = "7", optional = true }
+# rocm-only, optional: serde now SHIPS (rocm-gated), no longer dev-only. The cubecl
+# `AutotuneKey` trait alias (used by `kernels::autotune::LaunchKey`) requires
+# `serde::{Serialize, DeserializeOwned}` whenever the persistent disk cache is active
+# (`std_io` cfg = std + linux/macos/windows, always on here), so serde is mandatory in
+# the crate that DEFINES the key (spike-037 carry-forward). `optional = true` + the
+# `rocm` feature gate keeps the default cpu build from compiling or linking serde-derive
+# on the hot path. serde 1.x is the canonical, pre-vetted crate already in the lockfile.
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 # `cpu` (default) keeps the cubecl-cpu reference runtime always available — it is
@@ -30,7 +38,7 @@ cpu = []
 # SAME kernel without forking it. The rocm-only `cubecl_hip_sys` CU-count FFI stays
 # gated on `rocm`, NOT `gpu`.
 gpu = []
-rocm = ["cubecl/hip", "dep:cubecl-hip-sys", "gpu"]
+rocm = ["cubecl/hip", "dep:cubecl-hip-sys", "dep:serde", "gpu"]
 # CUDA backend (cubecl-cuda / `cubecl::cuda::CudaRuntime`). `cuda`/`wgpu` are
 # sub-features of the already-vetted `cubecl 0.10.0` workspace dep — NO new
 # `[dependencies]` entry is added (no package-legitimacy gate applies).
@@ -43,8 +51,3 @@ wgpu = ["cubecl/wgpu", "gpu"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }
-# Spike 037/038/039 (autotune): the cubecl `AutotuneKey` trait alias requires
-# `serde::Serialize + DeserializeOwned` whenever the persistent disk cache is active
-# (`std_io` cfg = std + linux/macos/windows, which is always on here). Examples-only;
-# the production build (no examples) never pulls this.
-serde = { version = "1", features = ["derive"] }
