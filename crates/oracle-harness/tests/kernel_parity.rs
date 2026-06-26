@@ -2812,6 +2812,14 @@ mod hip {
     /// + the exported host `fix_histogram` + compact, built ONCE. The u64 fixed-point
     /// merge is integer-additive (order-independent across the P cubes) ⇒ bit-identical
     /// across `P`, gated at the tightened `FIXEDPOINT_REL_GATE = 1e-7`.
+    ///
+    /// SCOPE (IN-02): this gate FORCES each variant (`LGBM_AUTOTUNE_FORCE_P`, the direct
+    /// launch) — it pins every per-`P` KERNEL to the anchor, but it does NOT drive
+    /// `LocalTuner::execute` + `FreshOutGenerator` (the live default selection path). That
+    /// tuner path's numerics are covered by `build_tuner_grad_conservation_fresh_vs_clone`
+    /// (FreshOutGenerator correctness) and the default-on
+    /// `kernel_parity_fused_equals_per_feature_and_native`. "all-PSET" therefore means
+    /// "every candidate kernel", not "the tuner machinery".
     #[test]
     fn kernel_parity_resident_build_all_pset_p_equals_anchor_on_hip() {
         use lgbm_compute::kernels::histogram::{
@@ -3049,6 +3057,13 @@ mod hip {
     /// anchor) once, then for each `W` in `SCAN_WSET` forces `LGBM_SCAN_CUBEDIM=W`
     /// (`LGBM_AUTOTUNE=0` so the deterministic explicit-env fallback path runs) and asserts
     /// every feature's `SplitInfo` is byte-identical to the `W=1` result.
+    ///
+    /// SCOPE (IN-02): like the build gate, this FORCES each `W` via the explicit-env
+    /// fallback (`LGBM_AUTOTUNE=0` + `LGBM_SCAN_CUBEDIM`) — it pins every per-`W` KERNEL to
+    /// the `W=1` oracle, but it does NOT drive `LocalTuner::execute` (the live default
+    /// selection path). The default-on tuner path is covered by
+    /// `kernel_parity_fused_equals_per_feature_and_native`. "all-WSET" means "every
+    /// candidate width", not "the tuner machinery".
     #[test]
     fn kernel_parity_fused_scan_all_wset_w_equals_anchor_on_hip() {
         use lgbm_compute::kernels::split::find_best_splits_batched_fused_f64_on;
