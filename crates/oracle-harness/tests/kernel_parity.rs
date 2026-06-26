@@ -2926,6 +2926,121 @@ mod hip {
         }
     }
 
+    /// 13-04 PARITY GATE (build, f32 default path — WR-01): the DEFAULT (non-quantized) GPU
+    /// training histogram path is `Backend::build_leaf_histograms_raw` →
+    /// `build_leaf_histograms_resident_f32_on` → `resident_raw_build_into(.., fixed_point=false)`,
+    /// which now flows through the SAME default-on autotune funnel and lets the tuner pick any
+    /// `P` in `BUILD_PSET`. Unlike the u64 fixed-point merge (integer-additive ⇒ bit-identical
+    /// across `P`, gated at 1e-7 above), the f32 per-cube merge REORDERS f32 reductions, so the
+    /// chosen `P` perturbs the output by ~2e-5 (spike-007) and the f32 build is run-to-run
+    /// nondeterministic. That is within the project contract's documented ~1e-6 best-effort f32
+    /// gap (CLAUDE.md: "residual f32-vs-f64 accumulation gaps documented per phase"), NOT a
+    /// bit-exact swap — so this gate pins EVERY runtime-reachable `P` of the f32 RAW build to the
+    /// CPU f64 anchor at that best-effort envelope (def-f8u-01: anchor to the f64 CPU fold, never
+    /// GPU-vs-GPU). A future kernel change that widened f32 cross-`P` divergence would trip it.
+    #[test]
+    fn kernel_parity_resident_build_all_pset_f32_p_equals_anchor_on_hip() {
+        use lgbm_compute::kernels::histogram::{
+            build_leaf_histograms_resident_f32_on, construct_histograms_cpu,
+            upload_resident_columns,
+        };
+
+        // ---- PSET shape guards (same acceptance contract as the u64 gate).
+        assert!(!BUILD_PSET_MIRROR.is_empty(), "BUILD_PSET must be non-empty");
+        assert!(
+            BUILD_PSET_MIRROR.iter().any(|&p| p > 1),
+            "BUILD_PSET must exercise at least one P>1 (the multi-cube row-partitioned merge)"
+        );
+
+        let hip = rocm_client();
+        let cpu = cpu_client();
+
+        // Same >=256k-row, 3-spine-feature fixture as the u64 gate so the row-partitioned
+        // multi-cube f32 merge is genuinely exercised at each forced P>1.
+        let num_data = 300_000usize;
+        let num_bins: Vec<u32> = vec![4, 3, 5];
+        let f0: Vec<u32> = (0..num_data).map(|i| (i % 4) as u32).collect();
+        let f1: Vec<u32> = (0..num_data).map(|i| (i % 3) as u32).collect();
+        let f2: Vec<u32> = (0..num_data).map(|i| (i % 5) as u32).collect();
+        let feature_bins: Vec<&[u32]> = vec![&f0, &f1, &f2];
+
+        let mut slot_off = Vec::with_capacity(num_bins.len());
+        let mut acc = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(acc);
+            acc += 2 * nb as usize;
+        }
+        let slot_len = acc;
+
+        let leaf_rows: Vec<u32> = (0..num_data as u32).collect();
+        let gradients: Vec<f32> = (0..num_data).map(|i| 0.25 + (i % 7) as f32 * 0.5).collect();
+        let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
+
+        // ---- CPU f64 RAW anchor built ONCE (def-f8u-01): per feature fold the leaf rows'
+        //      (bin, grad, hess) with `construct_histograms_cpu` into the SAME slot layout.
+        //      The f32 helper returns the RAW build (no fix, no compact), so the anchor is
+        //      raw too — NO `fix_histogram` / `host_compact` here.
+        let mut anchor: Vec<f64> = vec![0.0; slot_len];
+        for fpos in 0..num_bins.len() {
+            let nb = num_bins[fpos];
+            let cells = 2 * nb as usize;
+            let binned: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&r| feature_bins[fpos][r as usize])
+                .collect();
+            let g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+            let h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+            let raw = construct_histograms_cpu(&cpu, &binned, &g, &h, nb)
+                .expect("cpu f64 raw anchor fold");
+            anchor[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&raw);
+        }
+
+        let run_gpu = || {
+            build_leaf_histograms_resident_f32_on(
+                &hip,
+                upload_resident_columns(&hip, &feature_bins),
+                lgbm_compute::ResidentBinWidth::U32,
+                feature_bins.len(),
+                num_data,
+                &slot_off,
+                slot_len,
+                &leaf_rows,
+                &gradients,
+                &hessians,
+            )
+            .expect("resident f32 raw build readback (forced P)")
+        };
+
+        // Best-effort f32 envelope: spike-007's documented f32 cross-`P` reduction-order gap
+        // is ~2e-5; `1e-4` keeps ~5x margin over that (positive-only sums, no cancellation)
+        // while still catching a >5x regression in cross-`P` divergence. NOT the u64 1e-7
+        // bit-exact gate — the f32 path is contractually best-effort.
+        const F32_BUILD_REL_GATE: f64 = 1e-4;
+        for &p in BUILD_PSET_MIRROR {
+            // FORCE this variant; the guard restores the prior env on drop / panic.
+            let _g = EnvVarGuard::set("LGBM_AUTOTUNE_FORCE_P", &p.to_string());
+            let gpu = run_gpu();
+            assert_eq!(gpu.len(), slot_len, "resident f32 chain length (P={p})");
+
+            let mut max_rel = 0.0f64;
+            for (i, (&gv, &av)) in gpu.iter().zip(anchor.iter()).enumerate() {
+                let rel = (gv - av).abs() / av.abs().max(1.0);
+                assert!(
+                    rel <= F32_BUILD_REL_GATE,
+                    "ALL-PSET f32 PARITY FAIL at P={p} cell {i}: gpu={gv}, cpu_anchor={av}, \
+                     rel={rel:.3e} > F32_BUILD_REL_GATE={F32_BUILD_REL_GATE:.0e} — the f32 \
+                     resident build at this forced P diverged from the CPU f64 anchor beyond \
+                     the documented best-effort f32 reduction-order envelope."
+                );
+                max_rel = max_rel.max(rel);
+            }
+            eprintln!(
+                "all-PSET f32 build: LGBM_AUTOTUNE_FORCE_P={p} max_rel_vs_cpu_f64_anchor={max_rel:.3e} \
+                 (gate={F32_BUILD_REL_GATE:.0e})"
+            );
+        }
+    }
+
     /// 13-04 PARITY GATE (scan): autotune may pick ANY `W` in `SCAN_WSET` at runtime, so
     /// EVERY scan width must be bit-exact. The feature-per-lane fused scan keeps each
     /// feature's prefix scan SEQUENTIAL (one feature per lane, spike-021/022), so widening

@@ -2178,6 +2178,18 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             //     safe (cold reps hit throwaway buffers), so the winner writes the real
             //     `h_out` exactly once. The set is rebuilt fresh (this call's dimensions);
             //     the persistent winner lives in BUILD_TUNER's LaunchKey state.
+            //
+            //     WR-01 determinism note: this funnel autotunes `P` for BOTH resident
+            //     classes. On the u64 `fixed_point` path the per-cube merge is integer-
+            //     additive ⇒ bit-identical across `P`. On the `!fixed_point` f32 path the
+            //     merge reorders f32 reductions, so the chosen `P` perturbs the histogram
+            //     output by ~2e-5 (spike-007) and the f32 build is therefore run-to-run
+            //     NONDETERMINISTIC (which `P` wins depends on cold-tune device timing) —
+            //     within the contract's documented ~1e-6 best-effort f32 gap, NOT bit-exact.
+            //     BOTH paths are anchor-pinned across all `P` by the 13-04 all-PSET gates in
+            //     `oracle-harness/tests/kernel_parity.rs` (u64 at 1e-7, f32 at the best-
+            //     effort envelope), so a future kernel change that widened f32 cross-`P`
+            //     divergence is caught.
             let num_bin = max_w / 2; // widest feature's bin count (the per-feature driver).
             let handles: Vec<cubecl::server::Handle> = vec![
                 resident_bins.clone(),
