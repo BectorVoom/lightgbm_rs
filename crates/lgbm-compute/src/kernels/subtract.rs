@@ -69,6 +69,61 @@ pub fn subtract_hist_kernel_f32(parent: &Array<f32>, child: &Array<f32>, out: &m
     }
 }
 
+/// SIMD-vectorized twin of [`subtract_hist_kernel`] / [`subtract_hist_kernel_f32`]
+/// over `Array<Vector<F, N>>` (spike-041, VALIDATED on cubecl-hip + cubecl-cpu).
+///
+/// IDENTICAL 1D grid-stride structure to the scalar kernels — the only difference is
+/// that each lane subtracts a whole `Vector<F, N>` (one SIMD load/sub/store per `N`
+/// cells) instead of a single cell, so the loop runs over `n_vec = n / N` vector
+/// units laid over the SAME byte buffer. `Vector<F, N>` implements element-wise `Sub`
+/// (`vector/ops.rs`), so `out[i] = parent[i] - child[i]` is **BIT-EXACT-by-construction**
+/// to the scalar kernel: every component is an independent `F` subtract, no float op
+/// is reordered, and there are no atomics, no reduction, and no cross-lane ordering
+/// (spike-041 confirmed `bit_exact=true` on every width × size × backend cell; see also
+/// CONVENTIONS "SIMD vectorization with `Vector<P,N>`" 313–351). The `N: Size` width is
+/// supplied as a RUNTIME `usize` positional launch arg right after `CubeDim`, and array
+/// lengths are passed in vector units (`n / N`). The `while i < n_vec` bound guards every
+/// write, so the grid may over-cover.
+///
+/// Callers gate this kernel behind an exact-divisibility check (`n % N == 0 && N > 1`)
+/// and fall back to the scalar kernels otherwise — there is NO tail handling here.
+/// Mixed-cardinality tail vectorization (a masked/scalar remainder for non-divisible
+/// lengths) is a possible follow-on, intentionally omitted to keep the wire minimal and
+/// the bit-exact merge gate trivially safe.
+#[cube(launch)]
+pub fn subtract_hist_kernel_vec<F: Float, N: Size>(
+    parent: &Array<Vector<F, N>>,
+    child: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    n_vec: usize,
+) {
+    let stride = CUBE_COUNT_X as usize * CUBE_DIM_X as usize;
+    let mut i = ABSOLUTE_POS as usize;
+    while i < n_vec {
+        out[i] = parent[i] - child[i];
+        i += stride;
+    }
+}
+
+/// Pick the SIMD vectorization width for a flat length `n` of `elem_size`-byte cells.
+///
+/// Returns the backend's widest `io_optimized_vector_sizes(elem_size)` width that is
+/// `> 1` AND exactly divides `n` (so the vectorized kernel needs no tail logic), else
+/// `1` — the sentinel meaning "use the scalar kernel". The iterator yields widths
+/// widest-first (hip f32 → `[4,2,1]`; cpu f64 → `[8,4,2,1]`); the production all-256-bin
+/// histogram shape (`2 * num_bin` divisible by the max width) takes the wide path, while
+/// mixed-cardinality / odd lengths fall back to scalar (spike-041 launch recipe).
+fn pick_vec_width<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    elem_size: usize,
+    n: usize,
+) -> usize {
+    match client.io_optimized_vector_sizes(elem_size).next() {
+        Some(w) if w > 1 && n % w == 0 => w,
+        _ => 1,
+    }
+}
+
 /// Host-side `subtract_histograms` on the cpu reference runtime.
 ///
 /// Computes `derived[i] = parent[i] - child[i]` over the `2 * num_bin` f64 cells
@@ -115,20 +170,41 @@ pub fn subtract_histograms_f64_on<R: cubecl::Runtime>(
     let zeros = vec![0.0f64; n];
     let h_out = client.create_from_slice(f64::as_bytes(&zeros));
 
+    // Width-gated SIMD dispatch (spike-041): vectorize when, and only when, the chosen
+    // `io_optimized` width divides `n` exactly (`vs > 1`); otherwise the proven scalar
+    // kernel. Both read/write the SAME byte buffers — `n` f64 cells whether viewed as
+    // scalar (`n` units) or as `n / vs` `Vector<f64, vs>` units — and `Vector::sub` is
+    // element-wise, so the result is bit-exact either way.
+    let vs = pick_vec_width(client, std::mem::size_of::<f64>(), n);
+
     // SAFETY: `h_parent`/`h_child`/`h_out` were each allocated for exactly `n`
     // f64 elements (validated equal above) and outlive the launch; the kernel
-    // reads/writes only indices `0..n` (the grid over-covers but the
-    // `while i < parent.len()` bound guards every write). All cubecl unsafe is
-    // confined here (CMP-01).
+    // reads/writes only indices `0..n` (the grid over-covers but the bound check
+    // guards every write). When vectorized, the same `n` f64 cells are addressed as
+    // `n / vs` `Vector<f64, vs>` units over the identical byte buffer (`n % vs == 0`).
+    // All cubecl unsafe is confined here (CMP-01).
     unsafe {
-        subtract_hist_kernel::launch(
-            client,
-            CubeCount::Static(64, 1, 1),
-            CubeDim::new_1d(256),
-            ArrayArg::from_raw_parts(h_parent, n),
-            ArrayArg::from_raw_parts(h_child, n),
-            ArrayArg::from_raw_parts(h_out.clone(), n),
-        );
+        if vs > 1 {
+            subtract_hist_kernel_vec::launch::<f64, R>(
+                client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                vs,
+                ArrayArg::from_raw_parts(h_parent, n / vs),
+                ArrayArg::from_raw_parts(h_child, n / vs),
+                ArrayArg::from_raw_parts(h_out.clone(), n / vs),
+                n / vs,
+            );
+        } else {
+            subtract_hist_kernel::launch(
+                client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(h_parent, n),
+                ArrayArg::from_raw_parts(h_child, n),
+                ArrayArg::from_raw_parts(h_out.clone(), n),
+            );
+        }
     }
 
     let bytes = client.read_one_unchecked(h_out);
@@ -182,20 +258,39 @@ pub fn subtract_histograms_f64_from_handles_on<R: cubecl::Runtime>(
     let zeros = vec![0.0f64; len];
     let h_out = client.create_from_slice(f64::as_bytes(&zeros));
 
+    // Width-gated SIMD dispatch (spike-041) on the resident hot path: vectorize when the
+    // chosen `io_optimized` width divides `len` exactly, else the proven scalar kernel.
+    // No read-back — the derived child's histogram stays on device either way.
+    let vs = pick_vec_width(client, std::mem::size_of::<f64>(), len);
+
     // SAFETY: `parent`/`child`/`h_out` each describe exactly `len` f64 cells (the
     // caller guarantees the inputs; `h_out` is allocated for `len` here) and outlive
     // the launch; the kernel reads/writes only indices `0..len` (the grid over-covers
-    // but the `while i < parent.len()` bound guards every write). All cubecl unsafe is
-    // confined here (CMP-01).
+    // but the bound check guards every write). When vectorized, the same `len` f64 cells
+    // are addressed as `len / vs` `Vector<f64, vs>` units over the identical byte buffer
+    // (`len % vs == 0`). All cubecl unsafe is confined here (CMP-01).
     unsafe {
-        subtract_hist_kernel::launch(
-            client,
-            CubeCount::Static(64, 1, 1),
-            CubeDim::new_1d(256),
-            ArrayArg::from_raw_parts(parent, len),
-            ArrayArg::from_raw_parts(child, len),
-            ArrayArg::from_raw_parts(h_out.clone(), len),
-        );
+        if vs > 1 {
+            subtract_hist_kernel_vec::launch::<f64, R>(
+                client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                vs,
+                ArrayArg::from_raw_parts(parent, len / vs),
+                ArrayArg::from_raw_parts(child, len / vs),
+                ArrayArg::from_raw_parts(h_out.clone(), len / vs),
+                len / vs,
+            );
+        } else {
+            subtract_hist_kernel::launch(
+                client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(parent, len),
+                ArrayArg::from_raw_parts(child, len),
+                ArrayArg::from_raw_parts(h_out.clone(), len),
+            );
+        }
     }
 
     Ok(h_out)
@@ -230,20 +325,39 @@ pub fn subtract_histograms_f32_on<R: cubecl::Runtime>(
     let zeros = vec![0.0f32; n];
     let h_out = client.create_from_slice(f32::as_bytes(&zeros));
 
+    // Width-gated SIMD dispatch (spike-041), mirroring `subtract_histograms_f64_on`:
+    // vectorize only when the chosen `io_optimized` f32 width divides `n` exactly,
+    // else the proven scalar f32 kernel. Same byte buffers, bit-exact either way.
+    let vs = pick_vec_width(client, std::mem::size_of::<f32>(), n);
+
     // SAFETY: identical handle/length correspondence to `subtract_histograms_cpu`
     // — three handles each sized `n` f32 cells (validated equal), outliving the
-    // launch; the kernel touches only `0..n` (the grid over-covers but the
-    // `while i < parent.len()` bound guards every write). cubecl `unsafe` confined
-    // here (CMP-01).
+    // launch; the kernel touches only `0..n` (the grid over-covers but the bound
+    // check guards every write). When vectorized, the same `n` f32 cells are addressed
+    // as `n / vs` `Vector<f32, vs>` units over the identical byte buffer (`n % vs == 0`).
+    // cubecl `unsafe` confined here (CMP-01).
     unsafe {
-        subtract_hist_kernel_f32::launch(
-            client,
-            CubeCount::Static(64, 1, 1),
-            CubeDim::new_1d(256),
-            ArrayArg::from_raw_parts(h_parent, n),
-            ArrayArg::from_raw_parts(h_child, n),
-            ArrayArg::from_raw_parts(h_out.clone(), n),
-        );
+        if vs > 1 {
+            subtract_hist_kernel_vec::launch::<f32, R>(
+                client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                vs,
+                ArrayArg::from_raw_parts(h_parent, n / vs),
+                ArrayArg::from_raw_parts(h_child, n / vs),
+                ArrayArg::from_raw_parts(h_out.clone(), n / vs),
+                n / vs,
+            );
+        } else {
+            subtract_hist_kernel_f32::launch(
+                client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(h_parent, n),
+                ArrayArg::from_raw_parts(h_child, n),
+                ArrayArg::from_raw_parts(h_out.clone(), n),
+            );
+        }
     }
 
     let bytes = client.read_one_unchecked(h_out);
@@ -337,6 +451,67 @@ mod tests {
                     serial[i]
                 );
             }
+        }
+    }
+
+    /// The VECTORIZED branch itself must be bit-exact. 256000 = 500 feat × 256 bin × 2
+    /// is divisible by every cpu f64 `io_optimized` width (8/4/2), so `pick_vec_width`
+    /// selects the SIMD `subtract_hist_kernel_vec` path here — and its `to_bits()` output
+    /// must match a plain serial `parent[i] - child[i]` on every cell (spike-041's
+    /// bit-exact-by-construction claim, asserted on the cpu client). The existing
+    /// 12345-length cases above already cover the non-divisible scalar fallback.
+    #[test]
+    fn subtract_vec_equals_serial_f64() {
+        let client = cpu_client();
+        let len = 256_000usize;
+        let parent: Vec<f64> = (0..len)
+            .map(|i| (i as f64) * 0.5 - 1234.5 + (i as f64).sin())
+            .collect();
+        let child: Vec<f64> = (0..len)
+            .map(|i| (i as f64) * 0.25 + 7.0 - (i as f64).cos())
+            .collect();
+
+        let serial: Vec<f64> = parent.iter().zip(&child).map(|(p, c)| p - c).collect();
+        let vectorized = subtract_histograms_f64_on(&client, &parent, &child).unwrap();
+
+        assert_eq!(vectorized.len(), len, "len {len}: output length");
+        for i in 0..len {
+            assert_eq!(
+                vectorized[i].to_bits(),
+                serial[i].to_bits(),
+                "len {len}, cell {i}: vectorized {} vs serial {} not byte-identical",
+                vectorized[i],
+                serial[i]
+            );
+        }
+    }
+
+    /// f32 mirror of [`subtract_vec_equals_serial_f64`]: 256000 is divisible by every cpu
+    /// f32 `io_optimized` width (16/8/4/2), so the vectorized branch runs and must be
+    /// `to_bits()`-identical to a serial f32 `parent - child` on every cell.
+    #[test]
+    fn subtract_vec_equals_serial_f32() {
+        let client = cpu_client();
+        let len = 256_000usize;
+        let parent: Vec<f32> = (0..len)
+            .map(|i| (i as f32) * 0.5 - 1234.5 + (i as f32).sin())
+            .collect();
+        let child: Vec<f32> = (0..len)
+            .map(|i| (i as f32) * 0.25 + 7.0 - (i as f32).cos())
+            .collect();
+
+        let serial: Vec<f32> = parent.iter().zip(&child).map(|(p, c)| p - c).collect();
+        let vectorized = subtract_histograms_f32_on(&client, &parent, &child).unwrap();
+
+        assert_eq!(vectorized.len(), len, "len {len}: output length");
+        for i in 0..len {
+            assert_eq!(
+                vectorized[i].to_bits(),
+                serial[i].to_bits(),
+                "len {len}, cell {i}: vectorized {} vs serial {} not byte-identical",
+                vectorized[i],
+                serial[i]
+            );
         }
     }
 }
