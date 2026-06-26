@@ -1994,6 +1994,20 @@ fn build_pset_tunable_set<R: cubecl::Runtime>(
 /// that requests `fixed_point` MUST guarantee every feature ≤ 256 bins (the resident
 /// chain does — `max_bin ≤ 255` keeps `max_w ≤ HIST_LDS_MAX`), else the f32 naive write
 /// would be mis-dequantized. The `fixed_point` path asserts the LDS branch was taken.
+///
+/// ROW-PARTITION `P` SELECTION (phase-13, 13-02 — LDS branch only): `P` is chosen by a
+/// three-way pick, DEFAULT-ON CubeCL autotune:
+///   1. `LGBM_AUTOTUNE_FORCE_P=k` → pin a single `P=k` launch (NO tuning) — the
+///      parity/debug seam (13-04 all-variants anchor gate).
+///   2. else autotune (default) → the [`BUILD_TUNER`] picks the measured-fastest `P`
+///      over [`BUILD_PSET`] per occupancy regime ([`LaunchKey`] = `size_band(rows)`),
+///      benchmark-safe via [`FreshOutGenerator`] (the build ACCUMULATES). Both live
+///      resident classes route here: the f32-resident build stays within the ~1e-6
+///      best-effort gate across `P`; the u64 fixed-point build is parity-neutral
+///      (order-independent integer merge). 13-04 gates both vs the CPU f64 anchor.
+///   3. else (`LGBM_AUTOTUNE=0`) → the [`row_partition_count`] heuristic + the existing
+///      direct launch, byte-for-byte unchanged (the documented cold-start / fallback
+///      bound). The NAIVE >256-bin path is NOT autotuned (single launch, unchanged).
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 fn resident_raw_build_into<R: cubecl::Runtime>(
@@ -2029,7 +2043,12 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // each. P=1 on small/medium leaves ⇒ byte-identical to the prior one-cube-per-feature
         // launch. The grid's y-dim carries P; each cube of feature f atomic-merges into the
         // same global slot (additive).
-        let p = row_partition_count(num_features, rows);
+        //
+        // phase-13 (13-02): `P` is now chosen by the three-way pick at the end of this
+        // block — `LGBM_AUTOTUNE_FORCE_P` (pin) → CubeCL autotune (default-on) →
+        // `row_partition_count` (the `LGBM_AUTOTUNE=0` cold-start / fallback bound). The
+        // `launch_lds_*` macros below take the partition `$p` explicitly so the FORCE_P /
+        // fallback DIRECT launches stay byte-identical to the prior heuristic launch.
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
         // SAFETY: resident_bins sized num_features*num_data; h_rows/h_g/h_h sized rows;
         // h_slot sized num_features+1; h_out sized slot_len. Cube (f,p) reads only its
@@ -2067,11 +2086,11 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // The naive >256-bin fallback arm below ALWAYS stays f32; a `fixed_point` caller
         // must keep every feature ≤ 256 bins (asserted) so the u64 LDS branch is taken.
         macro_rules! launch_lds_u64 {
-            ($w:ty) => {
+            ($w:ty, $p:expr) => {
                 unsafe {
                     construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
                         client,
-                        CubeCount::Static(num_features as u32, p, 1),
+                        CubeCount::Static(num_features as u32, $p, 1),
                         CubeDim::new_1d(256),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(h_rows.clone(), rows),
@@ -2085,11 +2104,11 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             };
         }
         macro_rules! launch_lds_f32 {
-            ($w:ty) => {
+            ($w:ty, $p:expr) => {
                 unsafe {
                     construct_leaf_hist_resident_lds_kernel::launch_unchecked::<$w, R>(
                         client,
-                        CubeCount::Static(num_features as u32, p, 1),
+                        CubeCount::Static(num_features as u32, $p, 1),
                         CubeDim::new_1d(256),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(h_rows.clone(), rows),
@@ -2102,18 +2121,82 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
                 }
             };
         }
-        if fixed_point {
-            match width {
-                crate::ResidentBinWidth::U8 => launch_lds_u64!(u8),
-                crate::ResidentBinWidth::U16 => launch_lds_u64!(u16),
-                crate::ResidentBinWidth::U32 => launch_lds_u64!(u32),
-            }
+        // The DIRECT (non-tuned) launch at a fixed `P` — the FORCE_P / `LGBM_AUTOTUNE=0`
+        // paths. Dispatches the u64-fixed-point vs f32 kernel and the native bin width
+        // exactly as before; only `$p` is threaded so the same code serves any chosen `P`.
+        macro_rules! direct_launch_at_p {
+            ($p:expr) => {{
+                let p_val: u32 = $p;
+                if fixed_point {
+                    match width {
+                        crate::ResidentBinWidth::U8 => launch_lds_u64!(u8, p_val),
+                        crate::ResidentBinWidth::U16 => launch_lds_u64!(u16, p_val),
+                        crate::ResidentBinWidth::U32 => launch_lds_u64!(u32, p_val),
+                    }
+                } else {
+                    match width {
+                        crate::ResidentBinWidth::U8 => launch_lds_f32!(u8, p_val),
+                        crate::ResidentBinWidth::U16 => launch_lds_f32!(u16, p_val),
+                        crate::ResidentBinWidth::U32 => launch_lds_f32!(u32, p_val),
+                    }
+                }
+            }};
+        }
+
+        // ---- phase-13 (13-02): three-way row-partition `P` selection ----
+        //
+        // SCOPE of the four `row_partition_count` call sites (non-silent, per the locked
+        // CONTEXT "autotune is the default; the heuristic is only the cold-start /
+        // cache-miss fallback bound" decision):
+        //   - HERE (`resident_raw_build_into`, this is the only WIRED site): the live
+        //     steady-state GPU build for BOTH resident classes — the f32-resident path
+        //     (`build_leaf_histograms_resident_f32_on`, reached via
+        //     `Backend::build_leaf_histograms_raw`) AND the u64 fixed-point device-
+        //     resident pool (`build_fix_compact_resident_f64_on`). Wiring this ONE funnel
+        //     puts EVERY steady-state GPU histogram build under autotune.
+        //   - `build_leaf_histograms_batched_f32_on` (~site 982): NOT wired. Production-
+        //     reachable ONLY as the cache-empty defensive COLD fallback in
+        //     `build_leaf_histograms_raw` (lib.rs), taken when `upload_resident_bins` was
+        //     never called (the learner structurally uploads resident bins before the GPU
+        //     growth loop, so steady-state training never reaches it). It uses a DIFFERENT
+        //     host-gather batched LDS kernel, so it IS the cold-start / cache-miss case the
+        //     locked decision designates for the heuristic — deliberately left on it.
+        //   - `construct_histograms_cuda_mirror_on` / `_resident_on` (~sites 1543/1692):
+        //     NOT wired — referenced only by tests/examples, never a production path.
+        if let Some(k) = force_row_partition() {
+            // (a) LGBM_AUTOTUNE_FORCE_P=k → pin a single P=k launch, NO tuning (the
+            //     parity/debug seam consumed by 13-04's all-variants anchor gate).
+            direct_launch_at_p!(k);
+        } else if autotune::autotune_enabled() {
+            // (b) DEFAULT (autotune on) → drive the launch through the CubeCL tuner over
+            //     BUILD_PSET. The FreshOutGenerator makes the ACCUMULATING build benchmark-
+            //     safe (cold reps hit throwaway buffers), so the winner writes the real
+            //     `h_out` exactly once. The set is rebuilt fresh (this call's dimensions);
+            //     the persistent winner lives in BUILD_TUNER's LaunchKey state.
+            let num_bin = max_w / 2; // widest feature's bin count (the per-feature driver).
+            let handles: Vec<cubecl::server::Handle> = vec![
+                resident_bins.clone(),
+                h_rows.clone(),
+                h_g.clone(),
+                h_h.clone(),
+                h_slot.clone(),
+                h_out.clone(),
+            ];
+            let set = std::sync::Arc::new(build_pset_tunable_set(
+                client.clone(),
+                width,
+                fixed_point,
+                num_features,
+                num_data,
+                rows,
+                num_bin,
+                slot_len,
+            ));
+            BUILD_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
         } else {
-            match width {
-                crate::ResidentBinWidth::U8 => launch_lds_f32!(u8),
-                crate::ResidentBinWidth::U16 => launch_lds_f32!(u16),
-                crate::ResidentBinWidth::U32 => launch_lds_f32!(u32),
-            }
+            // (c) LGBM_AUTOTUNE=0 → the EXISTING `row_partition_count` heuristic + direct
+            //     launch, byte-for-byte unchanged (the documented cold-start / fallback).
+            direct_launch_at_p!(row_partition_count(num_features, rows));
         }
     } else {
         // Naive fallback (a feature exceeds the 256-bin LDS cap). ALWAYS f32 (phase-11):
