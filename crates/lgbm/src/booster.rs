@@ -14,17 +14,28 @@
 use lgbm_boosting::objective::BoostObjective;
 use lgbm_boosting::{Gbdt, IterSnapshot};
 use lgbm_compute::gain::GainConfig;
-// Backend dispatch (switchable by the `rocm` feature). Default: the native-f64
-// CpuBackend (the bit-exact anchor). With `--features rocm`: the RocmBackend, which
-// runs the SAME f64 kernels on the local gfx1100 GPU.
-#[cfg(not(feature = "rocm"))]
-use lgbm_compute::runtime::cpu_client;
-#[cfg(not(feature = "rocm"))]
-use lgbm_compute::CpuBackend;
+// Backend dispatch (feature-switched). Default: the native-f64 CpuBackend (the
+// bit-exact anchor). With `--features rocm`: RocmBackend (SAME f64 kernels on the
+// local gfx1100 GPU). With `--features cuda`/`wgpu`: CudaBackend/WgpuBackend, which
+// dispatch the SAME runtime-generic GPU kernels. The cascade priority is
+// rocm > cuda > wgpu > cpu, so any combination of enabled features selects exactly
+// one backend (the `not(...)` guards make the arms mutually exclusive).
 #[cfg(feature = "rocm")]
 use lgbm_compute::runtime::rocm_client;
 #[cfg(feature = "rocm")]
 use lgbm_compute::RocmBackend;
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
+use lgbm_compute::runtime::cuda_client;
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
+use lgbm_compute::CudaBackend;
+#[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
+use lgbm_compute::runtime::wgpu_client;
+#[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
+use lgbm_compute::WgpuBackend;
+#[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
+use lgbm_compute::runtime::cpu_client;
+#[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
+use lgbm_compute::CpuBackend;
 use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::{BinMapper, MissingType};
 use lgbm_metric::{BinaryMetric, Metric, MultiLogloss};
@@ -1091,12 +1102,15 @@ fn train_inner_columns_full(
     // ---- the learner ----
     // Backend dispatch is feature-switched (see the gated imports above): the
     // default build trains on the native-f64 CpuBackend; `--features rocm` trains on
-    // the gfx1100 GPU via RocmBackend (same f64 kernels, bit-exact). The learner +
-    // GBDT loop below are generic over `B: Backend`, so only this construction site
-    // differs.
-    #[cfg(not(feature = "rocm"))]
+    // the gfx1100 GPU via RocmBackend (same f64 kernels, bit-exact); `--features
+    // cuda`/`wgpu` train via CudaBackend/WgpuBackend (the SAME runtime-generic GPU
+    // kernels). Priority rocm > cuda > wgpu > cpu — the `not(...)` cfg guards make the
+    // arms mutually exclusive so exactly one backend is selected for any feature
+    // combination. The learner + GBDT loop below are generic over `B: Backend`, so
+    // only this construction site differs.
+    #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
     let backend = CpuBackend;
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
     let client = cpu_client();
     // nn7 (L1): RocmBackend now carries interior-mutable device-resident state, so it
     // is constructed via Default (no longer a unit struct). One instance per train()
@@ -1106,6 +1120,16 @@ fn train_inner_columns_full(
     let backend = RocmBackend::default();
     #[cfg(feature = "rocm")]
     let client = rocm_client();
+    // CudaBackend/WgpuBackend are stateless unit structs (like CpuBackend) — they
+    // inherit the trait-default per-leaf host-gather path (no resident pool).
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+    let backend = CudaBackend;
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+    let client = cuda_client();
+    #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
+    let backend = WgpuBackend;
+    #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
+    let client = wgpu_client();
     let gain = GainConfig::from_config(config);
     let mut learner = SerialTreeLearner::new(
         &backend,
