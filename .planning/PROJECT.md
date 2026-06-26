@@ -12,7 +12,7 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 
 **v1.0 SHIPPED (2026-06-21)** — full single-machine C++ LightGBM parity in pure Rust, exposed via a Rust-native API and Python bindings on a switchable CubeCL CPU/ROCm backend. 8 phases, 55 plans, 69/69 v1 requirements satisfied, milestone audit PASSED. ~68.7k LOC (65.5k Rust + 3.2k Python) across 11 workspace crates. The serial tree learner is bit-exact vs real `lib_lightgbm` 4.6 on both committed corpora; the cubecl-cpu f64 anchor is the hard merge gate; cubecl-hip f32 runs on real gfx1100 within ~1e-6.
 
-Post-v1.0 work (running as quick tasks, **not** part of the v1.0 scope): a GPU/CPU training-speed perf campaign (spikes 001–013 + quick tasks) and an opt-in quantized-training mode (Phase 10 dir, maps to v2 `QNT-01`). Next planned investigation: locate the GPU large-data training bottleneck (see `.planning/notes/gpu-large-data-bottleneck-framing.md`).
+Post-v1.0 work (running as phases/quick tasks, **not** part of the v1.0 scope): a GPU/CPU training-speed perf campaign (spikes 001–040 + quick tasks), an opt-in quantized-training mode (Phase 10 dir, maps to v2 `QNT-01`), the GPU fixed-point int-atomics + sibling-scan co-pack kernel work (Phases 11–12), and **GPU launch-config autotuning (Phase 13, complete 2026-06-26)** — CubeCL `cubecl::tune` runtime autotuning replaces the hand-tuned/env GPU launch heuristics, default-on for rocm, self-tuning both the histogram-build row-partition `P` and the split-scan `CubeDim` width `W`; all-PSET/all-WSET parity pinned to the CPU f64 anchor on real ROCm, CPU merge gate untouched, durable value = portability (self-calibrates on discrete gfx110x / NVIDIA). Next planned investigation: locate the GPU large-data training bottleneck (see `.planning/notes/gpu-large-data-bottleneck-framing.md`).
 
 ## Requirements
 
@@ -96,4 +96,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-21 after v1.0 milestone — full single-machine C++ LightGBM parity shipped (8/8 phases, 55 plans, 69/69 v1 requirements, milestone audit PASSED)*
+*Last updated: 2026-06-26 after Phase 13 (gpu-autotune-launch-config) — GPU launch-config autotuning shipped default-on for rocm; CPU f64 anchor untouched. v1.0 milestone (2026-06-21): full single-machine C++ LightGBM parity shipped (8/8 phases, 55 plans, 69/69 v1 requirements, milestone audit PASSED)*
