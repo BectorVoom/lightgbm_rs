@@ -1986,6 +1986,119 @@ struct ResidentBins {
     width: ResidentBinWidth,
 }
 
+/// Define a minimal GPU backend (quick-260626-igc) that dispatches EXACTLY the four
+/// required `Backend` methods to the SAME runtime-generic kernels `RocmBackend` uses
+/// — `construct_histograms_lds_f32_on`, `find_best_split_f64_on`, `data_partition_on`,
+/// `subtract_histograms_f64_on`. No forked/portable kernels; every other `Backend`
+/// method inherits the trait default (exactly as `CpuBackend` leaves them). The body
+/// is the verbatim copy of `RocmBackend`'s four method bodies, minus the rocm-only
+/// resident-pool / CU-count-FFI overrides (out of the compile-only scope, decision #2).
+///
+/// `$name` is the unit-struct backend, `$rt` its `Backend::Runtime`. The macro is
+/// itself `#[cfg(any(feature = "cuda", feature = "wgpu"))]` so the default cpu build
+/// emits no `unused_macros` warning.
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+macro_rules! gpu_core_backend {
+    ($name:ident, $rt:ty) => {
+        /// A core GPU backend reusing the runtime-generic kernels (quick-260626-igc).
+        /// Unit struct (like `CpuBackend`); overrides only the four required methods.
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $name;
+
+        impl Backend for $name {
+            type Runtime = $rt;
+
+            fn construct_histograms(
+                &self,
+                client: &ComputeClient<Self::Runtime>,
+                binned: &[u32],
+                ordered_gradients: &[f32],
+                ordered_hessians: &[f32],
+                num_bin: u32,
+            ) -> Result<Vec<f64>, ComputeError> {
+                kernels::histogram::construct_histograms_lds_f32_on(
+                    client,
+                    binned,
+                    ordered_gradients,
+                    ordered_hessians,
+                    num_bin,
+                )
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn find_best_split(
+                &self,
+                client: &ComputeClient<Self::Runtime>,
+                hist: &[f64],
+                cfg: &GainConfig,
+                num_bin: u32,
+                offset: i32,
+                default_bin: u32,
+                most_freq_bin: u32,
+                skip_default_bin: bool,
+                na_as_missing: bool,
+                run_forward: bool,
+                sum_gradient: f64,
+                sum_hessian: f64,
+                num_data: i32,
+            ) -> Result<SplitInfo, ComputeError> {
+                kernels::split::find_best_split_f64_on(
+                    client,
+                    hist,
+                    cfg,
+                    num_bin,
+                    offset,
+                    default_bin,
+                    most_freq_bin,
+                    skip_default_bin,
+                    na_as_missing,
+                    run_forward,
+                    sum_gradient,
+                    sum_hessian,
+                    num_data,
+                )
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn data_partition(
+                &self,
+                client: &ComputeClient<Self::Runtime>,
+                bins: &[u32],
+                num_bin: u32,
+                min_bin: u32,
+                max_bin: u32,
+                threshold: u32,
+                most_freq_bin: u32,
+            ) -> Result<(Vec<u32>, usize), ComputeError> {
+                kernels::partition::data_partition_on(
+                    client,
+                    bins,
+                    num_bin,
+                    min_bin,
+                    max_bin,
+                    threshold,
+                    most_freq_bin,
+                )
+            }
+
+            fn subtract_histograms(
+                &self,
+                client: &ComputeClient<Self::Runtime>,
+                parent: &[f64],
+                child: &[f64],
+            ) -> Result<Vec<f64>, ComputeError> {
+                kernels::subtract::subtract_histograms_f64_on(client, parent, child)
+            }
+        }
+    };
+}
+
+#[cfg(feature = "cuda")]
+gpu_core_backend!(CudaBackend, runtime::CudaRuntime);
+
+#[cfg(feature = "wgpu")]
+gpu_core_backend!(WgpuBackend, runtime::WgpuRuntime);
+
 /// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
 /// to the cubecl-hip runtime running the **f64** kernels on the local gfx1100.
 ///
