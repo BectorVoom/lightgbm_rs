@@ -43,3 +43,8 @@ wgpu = ["cubecl/wgpu", "gpu"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }
+# Spike 037/038/039 (autotune): the cubecl `AutotuneKey` trait alias requires
+# `serde::Serialize + DeserializeOwned` whenever the persistent disk cache is active
+# (`std_io` cfg = std + linux/macos/windows, which is always on here). Examples-only;
+# the production build (no examples) never pulls this.
+serde = { version = "1", features = ["derive"] }
