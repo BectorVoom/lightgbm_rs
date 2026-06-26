@@ -1737,6 +1737,247 @@ fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
     (s, max_w)
 }
 
+// ===========================================================================
+// phase-13 (13-02) — CubeCL AUTOTUNE for the histogram-BUILD row-partition `P`.
+//
+// CONTEXT (LOCKED): autotune is the DEFAULT rocm selector for the resident-build
+// `P`; `row_partition_count` becomes only the documented cold-start / cache-miss /
+// `LGBM_AUTOTUNE=0` fallback bound (NOT the steady-state selector). spike-040 found
+// the heuristic under-partitions to P=1 at the 50-feature production width (~10%
+// slow on the 8-CU APU); autotune re-derives the measured-fastest P per occupancy
+// regime and self-calibrates on any future GPU.
+//
+// Three corrections this wiring honors (gpu-kernel-autotuning.md / spikes 037-039):
+//   - FRESH-OUTPUT InputGenerator (spike-038): the build kernel ACCUMULATES via
+//     `fetch_add`, so `CloneInputGenerator` (which shares the real `out` handle)
+//     corrupts it 27× during the cold benchmark reps. `FreshOutGenerator` hands each
+//     benchmark a throwaway zeroed `out` ⇒ the real `out` is touched exactly ONCE
+//     (the final clean winning run) ⇒ grad-conservation holds.
+//   - log2(rows) occupancy-regime AutotuneKey (spike-039): keying on EXACT `rows`
+//     is a per-leaf tuning STORM (every node a cold ~40ms tune). `LaunchKey.bucket =
+//     size_band(rows)` so every leaf in the same power-of-two decade shares a key.
+//   - serde-backed persistent cache (spike-037): the winner round-trips across
+//     processes via `target/autotune/<ver>/<device>/*.json.log`.
+//
+// The TunableSet is rebuilt FRESH each call (`Arc::new(build_pset_tunable_set(..))`,
+// NOT `LocalTuner::init`) because the per-call dimensions (`rows`/`num_features`/
+// `slot_len`) bake into the launch closures; `LocalTuner::init` memoizes by closure
+// TYPE-id and would freeze the FIRST call's dimensions forever. The persistent
+// winner still survives across calls — it lives in `BUILD_TUNER`'s key→fastest_index
+// state keyed by `LaunchKey`, and the BUILD_PSET registration order is fixed so
+// `fastest_index` maps to the same `P` regardless of which call rebuilt the set.
+// ===========================================================================
+
+#[cfg(feature = "rocm")]
+use crate::kernels::autotune::{self, LaunchKey};
+#[cfg(feature = "rocm")]
+use cubecl::tune::{local_tuner, InputGenerator, LocalTuner, Tunable, TunableSet, TuneInputs};
+
+/// The row-partition candidate set the BUILD tuner sweeps. Each entry `> ROWPART_P_MAX`
+/// is skipped (so this stays correct if the clamp ever rises). spike-040: the P4..P16
+/// curve is FLAT — the only job is to AVOID P1 at the production width — so the set is
+/// deliberately coarse (do not over-fine it into a slow cold tune). `1` stays in so the
+/// tuner can still pick it for small leaves where partitioning only adds merge overhead.
+#[cfg(feature = "rocm")]
+const BUILD_PSET: &[u32] = &[1, 4, 8, 16, 32];
+
+/// The BUILD cache namespace — `local_tuner!("build")` ⇒ `LocalTuner<LaunchKey, String>`.
+/// Holds the persistent key→fastest_index map (and mirrors it to disk via `std_io`).
+#[cfg(feature = "rocm")]
+static BUILD_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build");
+
+/// The `LGBM_AUTOTUNE_FORCE_P` debug/parity seam (consumed by 13-04's all-variants
+/// anchor gate). Reads the env FRESH on every call (mirrors `scan_cube_dim`, NOT
+/// `OnceLock`) so a parity test can pin a single `P` per-launch within one process.
+/// `Some(k)` clamps `k` to `[1, ROWPART_P_MAX]`; non-numeric / `0` / unset ⇒ `None`
+/// (fall through to autotune, then the heuristic) — NEVER a no-launch (T-13-02-01).
+#[cfg(feature = "rocm")]
+fn force_row_partition() -> Option<u32> {
+    std::env::var("LGBM_AUTOTUNE_FORCE_P")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&k| k > 0)
+        .map(|k| k.clamp(1, ROWPART_P_MAX))
+}
+
+/// Launch the EXISTING resident LDS build once at a fixed `P`, reading the ordered
+/// handle slice `[resident_bins, leaf_rows, ord_g, ord_h, slot_off, out]` (out at
+/// index 5). This is the single launcher the BUILD tuner's PSET variants call (one per
+/// `P`); it mirrors the `launch_lds_u64!` / `launch_lds_f32!` macros in
+/// [`resident_raw_build_into`] EXACTLY — same kernel, same `CubeCount(num_features, P, 1)`,
+/// same `CubeDim::new_1d(256)`, same arg order/sizes — only the handles arrive via a slice
+/// instead of named locals. Keep the two in sync (they intentionally launch byte-identical
+/// kernels; the macros serve the FORCE_P / `LGBM_AUTOTUNE=0` direct path, this serves the
+/// tuner closures which only have a `Vec<Handle>`).
+///
+/// `fixed_point` selects the u64 fixed-point twin (`out` is `Atomic<u64>`) vs the f32
+/// kernel; `width` dispatches the `<B: Int>` monomorphization on the resident buffer's
+/// native element width (quick-260621-qix). SAFETY: identical to the in-place macro
+/// launches — every device access is host-proven in range before upload (`leaf_rows` ⊂
+/// `[0, num_data)`, `resident_bins.len() == num_features*num_data`, `slot_off` sentinel,
+/// `out` sized `slot_len`), so `launch_unchecked` (dropping bounds-check codegen) is sound
+/// and numerically identical (NRW-01 / CMP-01). All cubecl unsafe is confined here.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn launch_build_at<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    width: crate::ResidentBinWidth,
+    fixed_point: bool,
+    num_features: usize,
+    num_data: usize,
+    rows: usize,
+    slot_len: usize,
+    inputs: &[cubecl::server::Handle],
+    p: u32,
+) {
+    macro_rules! at_p_u64 {
+        ($w:ty) => {
+            unsafe {
+                construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
+                    client,
+                    CubeCount::Static(num_features as u32, p, 1),
+                    CubeDim::new_1d(256),
+                    ArrayArg::from_raw_parts(inputs[0].clone(), num_features * num_data),
+                    ArrayArg::from_raw_parts(inputs[1].clone(), rows),
+                    ArrayArg::from_raw_parts(inputs[2].clone(), rows),
+                    ArrayArg::from_raw_parts(inputs[3].clone(), rows),
+                    ArrayArg::from_raw_parts(inputs[4].clone(), num_features + 1),
+                    num_data,
+                    ArrayArg::from_raw_parts(inputs[5].clone(), slot_len),
+                );
+            }
+        };
+    }
+    macro_rules! at_p_f32 {
+        ($w:ty) => {
+            unsafe {
+                construct_leaf_hist_resident_lds_kernel::launch_unchecked::<$w, R>(
+                    client,
+                    CubeCount::Static(num_features as u32, p, 1),
+                    CubeDim::new_1d(256),
+                    ArrayArg::from_raw_parts(inputs[0].clone(), num_features * num_data),
+                    ArrayArg::from_raw_parts(inputs[1].clone(), rows),
+                    ArrayArg::from_raw_parts(inputs[2].clone(), rows),
+                    ArrayArg::from_raw_parts(inputs[3].clone(), rows),
+                    ArrayArg::from_raw_parts(inputs[4].clone(), num_features + 1),
+                    num_data,
+                    ArrayArg::from_raw_parts(inputs[5].clone(), slot_len),
+                );
+            }
+        };
+    }
+    if fixed_point {
+        match width {
+            crate::ResidentBinWidth::U8 => at_p_u64!(u8),
+            crate::ResidentBinWidth::U16 => at_p_u64!(u16),
+            crate::ResidentBinWidth::U32 => at_p_u64!(u32),
+        }
+    } else {
+        match width {
+            crate::ResidentBinWidth::U8 => at_p_f32!(u8),
+            crate::ResidentBinWidth::U16 => at_p_f32!(u16),
+            crate::ResidentBinWidth::U32 => at_p_f32!(u32),
+        }
+    }
+}
+
+/// THE spike-038 FIX — an [`InputGenerator`] that hands each autotune BENCHMARK rep a
+/// FRESH zeroed `out` handle (slot index 5), leaving the caller's real `out` untouched
+/// until the final clean winning run. The build kernel ACCUMULATES (`fetch_add`), so a
+/// `CloneInputGenerator` (ref-count bump, same device buffer) would let every rep of
+/// every variant accumulate into the REAL `out` ⇒ N× corruption. The fresh buffer is
+/// `u64` zeros for the fixed-point build (`Atomic<u64>` cells) or `f32` zeros for the
+/// f32 build — sized `slot_len`, matching the `out` the caller allocated.
+#[cfg(feature = "rocm")]
+struct FreshOutGenerator<R: cubecl::Runtime> {
+    client: cubecl::prelude::ComputeClient<R>,
+    slot_len: usize,
+    fixed_point: bool,
+}
+
+#[cfg(feature = "rocm")]
+impl<R: cubecl::Runtime> InputGenerator<LaunchKey, Vec<cubecl::server::Handle>>
+    for FreshOutGenerator<R>
+{
+    // Spell the GAT return through `<Vec<Handle> as TuneInputs>::At<'a>` (E0195 guard):
+    // `Vec<Handle>: TuneInputs` has `At<'a> = Vec<Handle>`, but writing the concrete type
+    // here makes the closure-lifetime inference fail; mirror spike-038 exactly.
+    fn generate<'a>(
+        &self,
+        _key: &LaunchKey,
+        inputs: &<Vec<cubecl::server::Handle> as TuneInputs>::At<'a>,
+    ) -> <Vec<cubecl::server::Handle> as TuneInputs>::At<'a> {
+        let mut v = inputs.clone();
+        if self.fixed_point {
+            let zeros = vec![0u64; self.slot_len];
+            v[5] = self.client.create_from_slice(u64::as_bytes(&zeros));
+        } else {
+            let zeros = vec![0.0f32; self.slot_len];
+            v[5] = self.client.create_from_slice(f32::as_bytes(&zeros));
+        }
+        v
+    }
+}
+
+/// Build the BUILD-tuner [`TunableSet`] for ONE resident-build call: one `Tunable` per
+/// `P` in [`BUILD_PSET`] (each launching the existing LDS build at that `P` via
+/// [`launch_build_at`], reusing the SAME kernel + `CubeCount(num_features, P, 1)` +
+/// `CubeDim 256` the production path uses — only `P` varies), keyed by a `LaunchKey`
+/// `{ bucket: size_band(rows), feats: num_features, bins: num_bin }` (the occupancy
+/// regime, spike-039), with a [`FreshOutGenerator`] so the accumulating build is
+/// benchmark-safe (spike-038). Rebuilt fresh each call (the dimensions bake into the
+/// closures); the persistent winner lives in [`BUILD_TUNER`]'s key state, not here.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn build_pset_tunable_set<R: cubecl::Runtime>(
+    client: cubecl::prelude::ComputeClient<R>,
+    width: crate::ResidentBinWidth,
+    fixed_point: bool,
+    num_features: usize,
+    num_data: usize,
+    rows: usize,
+    num_bin: u32,
+    slot_len: usize,
+) -> TunableSet<LaunchKey, Vec<cubecl::server::Handle>, ()> {
+    let kg = move |_: &Vec<cubecl::server::Handle>| LaunchKey {
+        bucket: autotune::size_band(rows),
+        feats: num_features as u32,
+        bins: num_bin,
+    };
+    let mut set = TunableSet::new(
+        kg,
+        FreshOutGenerator {
+            client: client.clone(),
+            slot_len,
+            fixed_point,
+        },
+    );
+    for &p in BUILD_PSET {
+        if p > ROWPART_P_MAX {
+            continue;
+        }
+        let c = client.clone();
+        set = set.with(Tunable::new(
+            &format!("build_P{p}"),
+            move |inputs: Vec<cubecl::server::Handle>| {
+                launch_build_at(
+                    &c,
+                    width,
+                    fixed_point,
+                    num_features,
+                    num_data,
+                    rows,
+                    slot_len,
+                    &inputs,
+                    p,
+                );
+                Ok::<(), String>(())
+            },
+        ));
+    }
+    set
+}
+
 /// Shared RESIDENT RAW-build launch into a caller-provided zeroed `h_out`
 /// (slot_len cells): LDS per-feature path when every feature ≤ 256 bins, else the
 /// naive `construct_leaf_hist_resident_kernel`. Used by both
@@ -3165,6 +3406,177 @@ mod tests {
             assert_ne!(
                 target, 768,
                 "target_cubes is still 768 with no override — phantom-96-CU value not removed"
+            );
+        }
+    }
+
+    /// spike-038 grad-conservation — the BUILD-tuner load-bearing-generator proof.
+    ///
+    /// Driving the build over `BUILD_PSET` with the production [`super::FreshOutGenerator`]
+    /// (via [`super::build_pset_tunable_set`]) leaves the real `out` holding EXACTLY ONE
+    /// histogram: `Σ(grad cells) == feats · Σ(ord_g)` to `rel_err 0`. A `CloneInputGenerator`
+    /// control arm — same PSET, same kernels — instead lets every cold-benchmark rep
+    /// `fetch_add` into the REAL `out`, inflating the sum ≫1× (the accumulating-kernel
+    /// hazard the manual warns about). Both arms use a UNIQUE cache namespace so each
+    /// always cold-tunes (exercises the benchmark reps that expose the difference).
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn build_tuner_grad_conservation_fresh_vs_clone() {
+        use super::{build_pset_tunable_set, launch_build_at, LaunchKey, BUILD_PSET, ROWPART_P_MAX};
+        use crate::kernels::autotune;
+        use crate::runtime::rocm_client;
+        use cubecl::prelude::*;
+        use cubecl::server::Handle;
+        use cubecl::tune::{local_tuner, CloneInputGenerator, LocalTuner, Tunable, TunableSet};
+        use std::sync::Arc;
+
+        let rows: usize = 50_000;
+        let feats: usize = 8;
+        let num_data = rows;
+        let num_bin: u32 = 256;
+        let slot_len = feats * num_bin as usize * 2;
+
+        // Deterministic LCG bins + mixed-sign grads (a wrong fold is visible in the sum).
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        let bins: Vec<u32> = (0..feats * num_data).map(|_| next() % num_bin).collect();
+        let leaf_rows: Vec<u32> = (0..rows as u32).collect();
+        let ord_g: Vec<f32> = (0..rows).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let ord_h: Vec<f32> = vec![1.0f32; rows];
+        let slot_off: Vec<u32> = (0..=feats as u32).map(|f| f * (num_bin * 2)).collect();
+
+        let sum_g: f64 = ord_g.iter().map(|&x| f64::from(x)).sum();
+        let expected = feats as f64 * sum_g;
+
+        let client = rocm_client();
+        let d_bins = client.create_from_slice(u32::as_bytes(&bins));
+        let d_rows = client.create_from_slice(u32::as_bytes(&leaf_rows));
+        let d_g = client.create_from_slice(f32::as_bytes(&ord_g));
+        let d_h = client.create_from_slice(f32::as_bytes(&ord_h));
+        let d_slot = client.create_from_slice(u32::as_bytes(&slot_off));
+
+        let total_grad = |h: &Handle| -> f64 {
+            let bytes = rocm_client().read_one_unchecked(h.clone());
+            f32::from_bytes(&bytes).iter().step_by(2).map(|&x| f64::from(x)).sum()
+        };
+        let fresh_out = || client.create_from_slice(f32::as_bytes(&vec![0.0f32; slot_len]));
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // ---- Arm A: CloneInputGenerator control → CORRUPTED (accumulated across reps) ----
+        static CLONE_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build_test_clone");
+        let out_a = fresh_out();
+        {
+            let handles: Vec<Handle> = vec![
+                d_bins.clone(), d_rows.clone(), d_g.clone(), d_h.clone(), d_slot.clone(), out_a.clone(),
+            ];
+            let kg = move |_: &Vec<Handle>| LaunchKey {
+                bucket: autotune::size_band(rows),
+                feats: feats as u32,
+                bins: num_bin,
+            };
+            let mut set = TunableSet::<LaunchKey, Vec<Handle>, ()>::new(kg, CloneInputGenerator);
+            for &p in BUILD_PSET {
+                if p > ROWPART_P_MAX {
+                    continue;
+                }
+                let c = client.clone();
+                set = set.with(Tunable::new(&format!("build_P{p}"), move |inp: Vec<Handle>| {
+                    launch_build_at(
+                        &c, crate::ResidentBinWidth::U32, false, feats, num_data, rows, slot_len, &inp, p,
+                    );
+                    Ok::<(), String>(())
+                }));
+            }
+            CLONE_TUNER.execute(&format!("test_clone_{uniq}"), &client, Arc::new(set), handles);
+        }
+        let tg_a = total_grad(&out_a);
+
+        // ---- Arm B: FreshOutGenerator (the production builder) → CORRECT (touched once) ----
+        static FRESH_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build_test_fresh");
+        let out_b = fresh_out();
+        {
+            let handles: Vec<Handle> = vec![
+                d_bins.clone(), d_rows.clone(), d_g.clone(), d_h.clone(), d_slot.clone(), out_b.clone(),
+            ];
+            let set = build_pset_tunable_set(
+                client.clone(), crate::ResidentBinWidth::U32, false, feats, num_data, rows, num_bin, slot_len,
+            );
+            FRESH_TUNER.execute(&format!("test_fresh_{uniq}"), &client, Arc::new(set), handles);
+        }
+        let tg_b = total_grad(&out_b);
+        let rel_err_b = (tg_b - expected).abs() / expected.abs().max(1.0);
+        let ratio_a = tg_a / expected;
+        eprintln!(
+            "build_tuner grad-conservation: expected={expected:.1} cloneΣ={tg_a:.1} ({ratio_a:.2}×) \
+             freshΣ={tg_b:.1} (rel_err {rel_err_b:.2e})"
+        );
+        assert!(
+            rel_err_b < 1e-4,
+            "FreshOutGenerator arm must conserve grad (real `out` touched once): rel_err {rel_err_b:.2e}"
+        );
+        assert!(
+            ratio_a > 1.5,
+            "CloneInputGenerator control must inflate ≫1× (got {ratio_a:.2}×) — proves the \
+             fresh-output generator choice is load-bearing"
+        );
+    }
+
+    /// The u64 fixed-point build is an order-independent integer additive merge, so every
+    /// `P` in `BUILD_PSET` yields a BIT-IDENTICAL `out` — `P` is parity-neutral on the live
+    /// fixed-point resident path (13-04 anchors it to the CPU f64 reference). The f32 path
+    /// is NOT bit-identical across P (spike-007 ~2e-5, inside the ~1e-6 best-effort gate),
+    /// so only the u64 path is asserted bit-equal here.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn build_tuner_u64_bit_identical_across_p() {
+        use super::launch_build_at;
+        use crate::runtime::rocm_client;
+        use cubecl::prelude::*;
+        use cubecl::server::Handle;
+
+        let rows = 40_000usize;
+        let feats = 8usize;
+        let num_data = rows;
+        let num_bin = 256u32;
+        let slot_len = feats * num_bin as usize * 2;
+        let mut s: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        let bins: Vec<u32> = (0..feats * num_data).map(|_| next() % num_bin).collect();
+        let leaf_rows: Vec<u32> = (0..rows as u32).collect();
+        let ord_g: Vec<f32> = (0..rows).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let ord_h: Vec<f32> = vec![1.0f32; rows];
+        let slot_off: Vec<u32> = (0..=feats as u32).map(|f| f * (num_bin * 2)).collect();
+        let client = rocm_client();
+        let d_bins = client.create_from_slice(u32::as_bytes(&bins));
+        let d_rows = client.create_from_slice(u32::as_bytes(&leaf_rows));
+        let d_g = client.create_from_slice(f32::as_bytes(&ord_g));
+        let d_h = client.create_from_slice(f32::as_bytes(&ord_h));
+        let d_slot = client.create_from_slice(u32::as_bytes(&slot_off));
+        let run_at = |p: u32| -> Vec<u8> {
+            let out = client.create_from_slice(u64::as_bytes(&vec![0u64; slot_len]));
+            let inputs: Vec<Handle> = vec![
+                d_bins.clone(), d_rows.clone(), d_g.clone(), d_h.clone(), d_slot.clone(), out.clone(),
+            ];
+            launch_build_at(
+                &client, crate::ResidentBinWidth::U32, true, feats, num_data, rows, slot_len, &inputs, p,
+            );
+            rocm_client().read_one_unchecked(out).to_vec()
+        };
+        let p1 = run_at(1);
+        for &p in &[4u32, 8, 16] {
+            let pp = run_at(p);
+            assert_eq!(
+                p1, pp,
+                "u64 fixed-point build differs between P=1 and P={p} — must be parity-neutral"
             );
         }
     }
