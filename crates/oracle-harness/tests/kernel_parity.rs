@@ -2793,13 +2793,16 @@ mod hip {
         }
     }
 
-    /// The build-`P` candidate set the 13-02 autotuner sweeps (mirrors the non-`pub`
-    /// `histogram::BUILD_PSET`). `P = 32 > ROWPART_P_MAX (16)` is registered-skipped by
-    /// the tuner and clamped to 16 by `force_row_partition`, but we still FORCE every
-    /// declared variant here so the whole runtime-reachable set is anchor-pinned.
-    const BUILD_PSET_MIRROR: &[u32] = &[1, 4, 8, 16, 32];
-    /// The scan-`W` candidate set the 13-03 autotuner sweeps (mirrors `split::SCAN_WSET`).
-    const SCAN_WSET_MIRROR: &[u32] = &[32, 64, 128, 256];
+    /// WR-02: import the production candidate sets directly so the "every autotune
+    /// candidate is anchor-pinned" gate tracks the source of truth — a maintainer adding a
+    /// `P`/`W` in `histogram::BUILD_PSET` / `split::SCAN_WSET` now extends this sweep
+    /// automatically instead of silently leaving the new variant ungated (the old
+    /// hand-copied `*_MIRROR` consts could go stale with no compile error). `P = 32 >
+    /// ROWPART_P_MAX (16)` is registered-skipped by the tuner and clamped to 16 by
+    /// `force_row_partition`, but every declared variant is still FORCED here so the whole
+    /// runtime-reachable set is anchor-pinned.
+    use lgbm_compute::kernels::histogram::BUILD_PSET as BUILD_PSET_MIRROR;
+    use lgbm_compute::kernels::split::SCAN_WSET as SCAN_WSET_MIRROR;
 
     /// 13-04 PARITY GATE (build): autotune may pick ANY `P` in `BUILD_PSET` at runtime,
     /// so EVERY variant must be anchor-correct, not just the current default (def-f8u-01:

@@ -998,8 +998,13 @@ use cubecl::tune::{local_tuner, CloneInputGenerator, LocalTuner, Tunable, Tunabl
 /// (measure-don't-model). `W=1` is intentionally NOT in the set — it is the
 /// one-cube-per-feature degenerate the lever exists to AVOID; it stays reachable as the
 /// `LGBM_SCAN_CUBEDIM=1` / non-rocm bit-exact oracle.
+///
+/// `pub` so the 13-04 parity gate (`oracle-harness/tests/kernel_parity.rs`) imports the
+/// SAME source of truth it sweeps (WR-02): a hand-copied mirror would silently stop
+/// covering a newly-added `W`. Stays `#[cfg(feature = "rocm")]` so the default build is
+/// byte-unchanged.
 #[cfg(feature = "rocm")]
-const SCAN_WSET: &[u32] = &[32, 64, 128, 256];
+pub const SCAN_WSET: &[u32] = &[32, 64, 128, 256];
 
 /// The SINGLE-LEAF SCAN cache namespace — `local_tuner!("scan")` ⇒
 /// `LocalTuner<LaunchKey, String>`, distinct from the build tuner's `"build"` namespace

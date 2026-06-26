@@ -1778,8 +1778,13 @@ use cubecl::tune::{local_tuner, InputGenerator, LocalTuner, Tunable, TunableSet,
 /// curve is FLAT — the only job is to AVOID P1 at the production width — so the set is
 /// deliberately coarse (do not over-fine it into a slow cold tune). `1` stays in so the
 /// tuner can still pick it for small leaves where partitioning only adds merge overhead.
+///
+/// `pub` so the 13-04 parity gate (`oracle-harness/tests/kernel_parity.rs`) imports the
+/// SAME source of truth it sweeps (WR-02): a hand-copied mirror would silently stop
+/// covering a newly-added `P`. Stays `#[cfg(feature = "rocm")]` so the default build is
+/// byte-unchanged.
 #[cfg(feature = "rocm")]
-const BUILD_PSET: &[u32] = &[1, 4, 8, 16, 32];
+pub const BUILD_PSET: &[u32] = &[1, 4, 8, 16, 32];
 
 /// The BUILD cache namespace — `local_tuner!("build")` ⇒ `LocalTuner<LaunchKey, String>`.
 /// Holds the persistent key→fastest_index map (and mirrors it to disk via `std_io`).
