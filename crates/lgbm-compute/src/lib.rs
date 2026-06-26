@@ -899,6 +899,23 @@ pub trait Backend {
         false
     }
 
+    /// Whether this backend routes GPU launch-config selection (histogram-BUILD
+    /// row-partition `P` / split-SCAN `CubeDim` `W`) through the CubeCL runtime
+    /// tuner (`cubecl::tune`) instead of the hand-tuned / env-var heuristic
+    /// (`row_partition_count` / `LGBM_SCAN_CUBEDIM`).
+    ///
+    /// Default `false` keeps [`CpuBackend`] and every non-rocm backend
+    /// byte-unchanged — the f64 cpu anchor is the deterministic merge gate and is
+    /// NEVER autotuned. [`RocmBackend`] overrides it to delegate to
+    /// [`kernels::autotune::autotune_enabled`], so rocm is default-ON and
+    /// `LGBM_AUTOTUNE=0` falls back to the heuristic (phase 13). The rocm
+    /// free-function launch paths consult the SAME `autotune_enabled()` helper
+    /// directly (single source of truth), so this trait method is the discoverable
+    /// seam without introducing a divergent flag.
+    fn prefers_autotune_launch_config(&self) -> bool {
+        false
+    }
+
     // ===================================================================
     // 260608-p90: DEVICE-RESIDENT histogram-pool seam.
     //
@@ -2176,6 +2193,14 @@ impl Backend for RocmBackend {
     // LGBM_ROCM_HOST_PARTITION=0 forces the old device round-trip for benching/rollback.
     fn prefers_host_partition(&self) -> bool {
         !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
+    }
+
+    // phase 13: default-ON GPU launch-config autotune. Delegates to the single
+    // source of truth so the trait seam and the free-function launch paths
+    // (histogram-build P / split-scan W) agree; LGBM_AUTOTUNE=0 falls back to the
+    // heuristic cold-start bound.
+    fn prefers_autotune_launch_config(&self) -> bool {
+        crate::kernels::autotune::autotune_enabled()
     }
 
     fn construct_histograms(
