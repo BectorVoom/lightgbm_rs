@@ -1764,37 +1764,44 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     }
     let _t_launch = std::time::Instant::now();
 
-    // spike-021 scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
-    // (env `LGBM_SCAN_CUBEDIM`; rocm default W=64, W=1 = byte-identical to the
-    // original) is the cube width W; `CubeCount = ceil(n / W)`. The kernel indexes
-    // features by the
-    // global lane `ABSOLUTE_POS` and guards `f < n_feats`, so the tail cube's spare
-    // lanes no-op and the result is bit-identical to W=1 for every W.
-    let scan_w = scan_cube_dim();
-    let cube_count = (n as u32).div_ceil(scan_w);
+    // phase-13 (13-03): autotune-or-fallback selection of the scan width W.
+    //   (a) autotune default-ON UNLESS `LGBM_AUTOTUNE=0` OR an explicit
+    //       `LGBM_SCAN_CUBEDIM` override (the override always wins — it is the documented
+    //       escape hatch + the 13-04 all-W parity seam). The tuner drives the launch over
+    //       `SCAN_WSET`; its winner writes the real `h_out` (CloneInputGenerator → the
+    //       final winning run uses the ORIGINAL handles, OVERWRITE class spike-038).
+    //   (b) else → the EXISTING `scan_cube_dim()` direct launch, byte-for-byte unchanged
+    //       (covers `LGBM_AUTOTUNE=0`, an explicit `LGBM_SCAN_CUBEDIM`, and the non-rocm
+    //       `scan_cube_dim()==1` bit-exact oracle path).
+    #[cfg(feature = "rocm")]
+    let autotuned =
+        autotune::autotune_enabled() && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
+    #[cfg(not(feature = "rocm"))]
+    let autotuned = false;
 
-    // SAFETY: every handle is sized to its slice and outlives the launch. Lane `f`
-    // (`ABSOLUTE_POS`, guarded `< n_feats` in the kernel) reads only
-    // `[slot_off[f], slot_off[f]+2*num_bin[f])` — each validated `<= buf.len()` above
-    // — and writes only `out[f*12 .. f*12+12]` within the `n*12` allocation; the
-    // shared `split_scan_body` carries the same in-range / negative-`t` clamp guards
-    // as the single-feature kernel. All per-feature index arrays have exactly `n`
-    // elements. All cubecl unsafe is confined here (CMP-01).
-    unsafe {
-        find_best_splits_fused_kernel::launch(
-            client,
-            CubeCount::Static(cube_count, 1, 1),
-            CubeDim::new_1d(scan_w),
-            ArrayArg::from_raw_parts(h_hist, buf_len),
-            ArrayArg::from_raw_parts(h_out.clone(), out_len),
-            ArrayArg::from_raw_parts(h_slot, n),
-            ArrayArg::from_raw_parts(h_numbin, n),
-            ArrayArg::from_raw_parts(h_offset, n),
-            ArrayArg::from_raw_parts(h_defbin, n),
-            ArrayArg::from_raw_parts(h_skip, n),
-            ArrayArg::from_raw_parts(h_rev, n),
-            ArrayArg::from_raw_parts(h_fwd, n),
-            if use_l1 { 1u32 } else { 0u32 },
+    #[cfg(feature = "rocm")]
+    if autotuned {
+        // The widest feature's bin count drives the per-feature slot width (the scan key
+        // shape; bucket=0 since W tracks the feature/bin shape, not the row count).
+        let num_bins = num_bin_a.iter().copied().max().unwrap_or(0).max(0) as u32;
+        let handles: Vec<cubecl::server::Handle> = vec![
+            h_hist.clone(),
+            h_out.clone(),
+            h_slot.clone(),
+            h_numbin.clone(),
+            h_offset.clone(),
+            h_defbin.clone(),
+            h_skip.clone(),
+            h_rev.clone(),
+            h_fwd.clone(),
+        ];
+        let set = std::sync::Arc::new(scan_wset_tunable_set(
+            client.clone(),
+            n,
+            buf_len,
+            out_len,
+            num_bins,
+            use_l1,
             cfg.min_data_in_leaf,
             cfg.min_sum_hessian_in_leaf,
             cfg.lambda_l1,
@@ -1803,8 +1810,53 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
             sum_gradient,
             sum_hessian_bumped,
             num_data,
-            n as u32,
-        );
+        ));
+        SCAN_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
+    }
+
+    if !autotuned {
+        // spike-021 scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
+        // (env `LGBM_SCAN_CUBEDIM`; rocm default W=64, W=1 = byte-identical to the
+        // original) is the cube width W; `CubeCount = ceil(n / W)`. The kernel indexes
+        // features by the
+        // global lane `ABSOLUTE_POS` and guards `f < n_feats`, so the tail cube's spare
+        // lanes no-op and the result is bit-identical to W=1 for every W.
+        let scan_w = scan_cube_dim();
+        let cube_count = (n as u32).div_ceil(scan_w);
+
+        // SAFETY: every handle is sized to its slice and outlives the launch. Lane `f`
+        // (`ABSOLUTE_POS`, guarded `< n_feats` in the kernel) reads only
+        // `[slot_off[f], slot_off[f]+2*num_bin[f])` — each validated `<= buf.len()` above
+        // — and writes only `out[f*12 .. f*12+12]` within the `n*12` allocation; the
+        // shared `split_scan_body` carries the same in-range / negative-`t` clamp guards
+        // as the single-feature kernel. All per-feature index arrays have exactly `n`
+        // elements. All cubecl unsafe is confined here (CMP-01).
+        unsafe {
+            find_best_splits_fused_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(scan_w),
+                ArrayArg::from_raw_parts(h_hist, buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift,
+                sum_gradient,
+                sum_hessian_bumped,
+                num_data,
+                n as u32,
+            );
+        }
     }
 
     let bytes = client.read_one_unchecked(h_out);
@@ -2049,32 +2101,40 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         );
     }
 
-    // CubeCount over 2*n feature-slots (the lane mapping packs A then B).
-    let scan_w = scan_cube_dim();
-    let cube_count = (2 * n as u32).div_ceil(scan_w);
+    // phase-13 (13-03): autotune-or-fallback selection of the scan width W — the SAME
+    // guard as the single-leaf `find_best_splits_fused_inner`, here for the co-pack
+    // 2-slot sibling scan (the phase-12 production hot path). The sibling kernel is the
+    // SAME OVERWRITE class (each lane writes a fresh 12-cell window), so its tunable set
+    // also uses CloneInputGenerator; it runs under the SEPARATE `SCAN_SIBLINGS_TUNER`
+    // namespace so its cache never collides with the single-leaf scan's.
+    #[cfg(feature = "rocm")]
+    let autotuned =
+        autotune::autotune_enabled() && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
+    #[cfg(not(feature = "rocm"))]
+    let autotuned = false;
 
-    // SAFETY: both histogram handles describe `buf_len` f64 cells; every per-feature
-    // region `[slot_off, slot_off+2*num_bin)` is validated `<= buf_len` above; all
-    // per-feature index arrays have exactly `n` elements; lane `g` (guarded
-    // `< 2*n_feats`) reads only its sibling's validated region and writes only
-    // `out[g*12 .. g*12+12]` within the `2*n*12` allocation. All cubecl unsafe is
-    // confined here (CMP-01).
-    unsafe {
-        find_best_splits_fused_siblings_kernel::launch(
-            client,
-            CubeCount::Static(cube_count, 1, 1),
-            CubeDim::new_1d(scan_w),
-            ArrayArg::from_raw_parts(hist_a_handle, buf_len),
-            ArrayArg::from_raw_parts(hist_b_handle, buf_len),
-            ArrayArg::from_raw_parts(h_out.clone(), out_len),
-            ArrayArg::from_raw_parts(h_slot, n),
-            ArrayArg::from_raw_parts(h_numbin, n),
-            ArrayArg::from_raw_parts(h_offset, n),
-            ArrayArg::from_raw_parts(h_defbin, n),
-            ArrayArg::from_raw_parts(h_skip, n),
-            ArrayArg::from_raw_parts(h_rev, n),
-            ArrayArg::from_raw_parts(h_fwd, n),
-            if use_l1 { 1u32 } else { 0u32 },
+    #[cfg(feature = "rocm")]
+    if autotuned {
+        let num_bins = num_bin_a.iter().copied().max().unwrap_or(0).max(0) as u32;
+        let handles: Vec<cubecl::server::Handle> = vec![
+            hist_a_handle.clone(),
+            hist_b_handle.clone(),
+            h_out.clone(),
+            h_slot.clone(),
+            h_numbin.clone(),
+            h_offset.clone(),
+            h_defbin.clone(),
+            h_skip.clone(),
+            h_rev.clone(),
+            h_fwd.clone(),
+        ];
+        let set = std::sync::Arc::new(scan_wset_siblings_tunable_set(
+            client.clone(),
+            n,
+            buf_len,
+            out_len,
+            num_bins,
+            use_l1,
             cfg.min_data_in_leaf,
             cfg.min_sum_hessian_in_leaf,
             cfg.lambda_l1,
@@ -2087,8 +2147,52 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
             sum_gradient_b,
             sum_hessian_b_bumped,
             num_data_b,
-            n as u32,
-        );
+        ));
+        SCAN_SIBLINGS_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
+    }
+
+    if !autotuned {
+        // CubeCount over 2*n feature-slots (the lane mapping packs A then B).
+        let scan_w = scan_cube_dim();
+        let cube_count = (2 * n as u32).div_ceil(scan_w);
+
+        // SAFETY: both histogram handles describe `buf_len` f64 cells; every per-feature
+        // region `[slot_off, slot_off+2*num_bin)` is validated `<= buf_len` above; all
+        // per-feature index arrays have exactly `n` elements; lane `g` (guarded
+        // `< 2*n_feats`) reads only its sibling's validated region and writes only
+        // `out[g*12 .. g*12+12]` within the `2*n*12` allocation. All cubecl unsafe is
+        // confined here (CMP-01).
+        unsafe {
+            find_best_splits_fused_siblings_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(scan_w),
+                ArrayArg::from_raw_parts(hist_a_handle, buf_len),
+                ArrayArg::from_raw_parts(hist_b_handle, buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                num_data_a,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                num_data_b,
+                n as u32,
+            );
+        }
     }
 
     let bytes = client.read_one_unchecked(h_out);
