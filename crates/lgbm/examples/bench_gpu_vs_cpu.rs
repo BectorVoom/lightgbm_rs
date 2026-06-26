@@ -339,6 +339,14 @@ impl Drop for ScopedEnv {
 /// "results":[{"outcome":{"Ok":{"name":"build_P16","index":3,..}}},..]}}`.
 #[cfg(feature = "rocm")]
 fn read_autotune_build_picks() -> Vec<(String, u32)> {
+    // MAINTENANCE HAZARD (IN-03): this path is tightly coupled to the cubecl on-disk
+    // cache layout and degrades SILENTLY (→ "<none persisted>") on any drift:
+    //   - `0.10.0` is the cubecl crate version literal — bump it when the dep is upgraded;
+    //   - `rocm_0` is `cache_namespace_id() = "rocm:0"` with the `:` mangled to `_` by
+    //     cubecl's filename sanitizer;
+    //   - the `*.json.log` line shape parsed below is cubecl's, not ours.
+    // Bench-only diagnostic; never gates pass/fail. cubecl exposes no public constant for
+    // the version/namespace today, so this stays a hand-maintained literal.
     let dir = "target/autotune/0.10.0/rocm_0";
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
