@@ -285,6 +285,228 @@ fn run_copack_ab(sizes: &[Size], cfg_for: &dyn Fn(&Size) -> lgbm::Config, iters:
     );
 }
 
+// ===========================================================================
+// Phase 13 (13-04) — autotune-ON vs heuristic (LGBM_AUTOTUNE=0) e2e A/B
+// ===========================================================================
+//
+// Gated behind `LGBM_BENCH_AUTOTUNE_AB=1` (default bench output unchanged). GPU-only:
+// autotune drives the rocm launch-config (build row-partition `P` + scan `CubeDim`);
+// the CpuBackend f64 anchor has no GPU launch to tune.
+//
+//   LGBM_BENCH_AUTOTUNE_AB=1 \
+//     cargo run --release --features rocm --example bench_gpu_vs_cpu
+//
+// HONEST BOUND (load-bearing — do NOT misread as an absolute-speed record):
+//   * SIGN-ONLY: this is a spoofed 8-CU APU (gfx1152, HSA-overridden); absolute
+//     wall-clock is APU-confounded. We report median device-time for BOTH arms +
+//     the ratio t(heur)/t(auto) (>= 1 expected: autotune is NOT-SLOWER) and judge the
+//     SIGN only. Run >=2 PROCESS restarts for sign-stability. NO pass/fail gate.
+//   * The ~10% autotune win (spike-040) is on the GPU BUILD, which the 16-core CPU
+//     beats end-to-end on THIS box. The durable deliverable is the METHOD
+//     (measure-don't-model) + portability to real discrete GPUs (gfx110x / NVIDIA
+//     self-calibrate with zero re-tuning), NOT a local e2e train-time win here.
+//   * The heuristic `row_partition_count(50, n)` under-partitions to P=1 at the
+//     production 50-feature width (spike-040); autotune recovers a P != 1. We read
+//     the autotune-selected build P from the persisted cache to SHOW that recovery.
+
+/// Set an env var for the lifetime of the guard, removing it on drop (panic-safe). The
+/// autotune off-switch / pins are read FRESH per launch on the main growth thread before
+/// any cubecl/rayon parallel region, so an in-process toggle is sound (mirrors
+/// `CopackEnvGuard`).
+#[cfg(feature = "rocm")]
+struct ScopedEnv(&'static str);
+#[cfg(feature = "rocm")]
+impl ScopedEnv {
+    fn set(key: &'static str, val: &str) -> Self {
+        // SAFETY: single main-thread toggle before parallel regions spawn.
+        unsafe { std::env::set_var(key, val) };
+        ScopedEnv(key)
+    }
+}
+#[cfg(feature = "rocm")]
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        // SAFETY: same single-main-thread invariant as `set`.
+        unsafe { std::env::remove_var(self.0) };
+    }
+}
+
+/// Read the autotune-selected build row-partition `P`(s) from the persisted cache log
+/// (`target/autotune/0.10.0/rocm_0/*build*.json.log`). Returns `(key, P)` per cached
+/// entry, reading the WINNING tunable's `"name":"build_P{p}"` at `fastest_index` directly
+/// (more robust than index→PSET mapping). (Mirrors spike-040's `read_winner`.) Cache line
+/// shape: `{"key":{"key":{"bucket":B,"feats":F,"bins":N},..},"value":{"fastest_index":I,
+/// "results":[{"outcome":{"Ok":{"name":"build_P16","index":3,..}}},..]}}`.
+#[cfg(feature = "rocm")]
+fn read_autotune_build_picks() -> Vec<(String, u32)> {
+    let dir = "target/autotune/0.10.0/rocm_0";
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    // Pull the bin/feat/bucket key object: from `{"bucket":` to the first closing `}`.
+    let parse_key = |line: &str| -> String {
+        line.find("{\"bucket\":")
+            .and_then(|i| line[i..].find('}').map(|j| line[i..i + j + 1].to_string()))
+            .unwrap_or_else(|| "?".into())
+    };
+    // Find the winning `build_P{p}` name whose `"index":N` equals fastest_index.
+    let parse_winner_p = |line: &str| -> Option<u32> {
+        let fi: usize = line
+            .split("\"fastest_index\":")
+            .nth(1)?
+            .trim_start()
+            .split([',', '}'])
+            .next()?
+            .parse()
+            .ok()?;
+        // Scan each `"name":"build_P{p}",...,"index":{n}` result; match n == fi.
+        for seg in line.split("\"name\":\"build_P").skip(1) {
+            let p: u32 = seg.split('"').next()?.parse().ok()?;
+            if let Some(idx_str) = seg.split("\"index\":").nth(1) {
+                let idx: usize = idx_str.trim_start().split([',', '}']).next()?.parse().ok()?;
+                if idx == fi {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    };
+    for e in rd.flatten() {
+        // The BUILD tuner's on-disk cache file carries the local_tuner!("build") name;
+        // the scan tuners are "scan" / "scan_siblings" — filter to the build family.
+        let fname = e.file_name().to_string_lossy().to_string();
+        if !fname.contains("build") {
+            continue;
+        }
+        let Ok(txt) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        for line in txt.lines() {
+            if let Some(p) = parse_winner_p(line) {
+                out.push((parse_key(line), p));
+            }
+        }
+    }
+    out
+}
+
+/// Phase 13 (13-04): autotune-ON vs heuristic (`LGBM_AUTOTUNE=0`) e2e A/B at the
+/// production ~50-feature width. GPU-only; SIGN-ONLY reporting (see the section header
+/// for the honest bound). Returns having printed both medians, the ratio, and the
+/// autotune-recovered build `P`.
+#[cfg(feature = "rocm")]
+fn run_autotune_ab(warmup: usize, reps: usize) {
+    println!("\n# === Phase 13 autotune-ON vs heuristic A/B (LGBM_AUTOTUNE unset vs =0) ===");
+    println!(
+        "# HONEST BOUND: SIGN-ONLY on this spoofed 8-CU APU (absolute wall-clock confounded).\n\
+         # Expect t(heur)/t(auto) >= 1 (autotune NOT-SLOWER); run >=2 PROCESS restarts for\n\
+         # sign-stability; NO pass/fail gate. The ~10% win is on the GPU BUILD (which the\n\
+         # 16-core CPU beats e2e here) — the durable deliverable is the METHOD + portability\n\
+         # to discrete gfx110x/NVIDIA, not a local e2e number. The heuristic under-partitions\n\
+         # to P=1 at 50 feats (spike-040); autotune recovers a P != 1 (read from the cache)."
+    );
+
+    // Production-width train: 50 features, a >=256k-row leaf regime so the build
+    // row-partition `P` actually matters (below ROWPART_MIN_LEAF the heuristic is P=1
+    // regardless). Deterministic identity-binned corpus (reproducible across arms).
+    let s = Size { name: "prod50", rows: 300_000, features: 50, bins: 128 };
+    let corpus = make_corpus(&s);
+    const LEAVES: i32 = 31;
+    const ITERS: i32 = 12; // bounded wall-time; the per-arm median ratio is the signal.
+    let cfg = TrainingBuilder::new()
+        .objective("regression")
+        .num_iterations(ITERS)
+        .num_leaves(LEAVES)
+        .learning_rate(0.1)
+        .min_data_in_leaf(20)
+        .seed(42)
+        .deterministic(true)
+        .build()
+        .expect("config builds");
+
+    // ---- AUTO arm: autotune default-on. Clear the persisted cache first so the pick is
+    //      a FRESH cold tune we can read back (warm hits are ~µs; cold ~300–500ms/key).
+    let _ = std::fs::remove_dir_all("target/autotune");
+    // Belt-and-braces: ensure no stale LGBM_AUTOTUNE=0 leaks in from the environment.
+    unsafe { std::env::remove_var("LGBM_AUTOTUNE") };
+    let (auto_t, _auto_syncs) = timed_run(&cfg, &corpus, warmup, reps);
+    let picks = read_autotune_build_picks();
+
+    // ---- HEUR arm: LGBM_AUTOTUNE=0 → the `row_partition_count` heuristic (P=1 here).
+    let (heur_t, _heur_syncs) = {
+        let _g = ScopedEnv::set("LGBM_AUTOTUNE", "0");
+        timed_run(&cfg, &corpus, warmup, reps)
+    };
+
+    let auto_s = auto_t.as_secs_f64();
+    let heur_s = heur_t.as_secs_f64();
+    let ratio = if auto_s > 0.0 { heur_s / auto_s } else { f64::NAN };
+    let verdict = if ratio.is_nan() {
+        "n/a"
+    } else if ratio >= 1.03 {
+        "autotune FASTER (single-proc, sign-only)"
+    } else if ratio >= 0.97 {
+        "NOT-SLOWER (single-proc, sign-only)"
+    } else {
+        "SLOWER? (single-proc noise — rerun >=2 procs)"
+    };
+
+    println!(
+        "{:<8} {:>8} {:>5} {:>5}  {:>12} {:>12} {:>9}  verdict",
+        "size", "rows", "feat", "bins", "train_heur", "train_auto", "heur/auto",
+    );
+    println!(
+        "{:<8} {:>8} {:>5} {:>5}  {:>10.2?} {:>10.2?} {:>9.3}  {}",
+        s.name.trim(),
+        s.rows,
+        s.features,
+        s.bins,
+        heur_t,
+        auto_t,
+        ratio,
+        verdict,
+    );
+
+    // Show the autotune-recovered build P (the spike-040 P=1 under-partition recovery).
+    if picks.is_empty() {
+        println!(
+            "# autotune build pick: <none persisted> — the leaf regime may have stayed below\n\
+             #   ROWPART_MIN_LEAF (P=1 path) or the cache dir was unwritable. Increase rows/iters."
+        );
+    } else {
+        let recovered = picks.iter().any(|(_, p)| *p > 1);
+        for (key, p) in &picks {
+            println!("# autotune build pick: key={key} -> P{p}");
+        }
+        println!(
+            "# RECOVERY: autotune selected {} (heuristic = P1 at 50 feats, spike-040). {}",
+            if recovered { "a P != 1" } else { "P1" },
+            if recovered {
+                "It recovered the under-partition."
+            } else {
+                "No P>1 recovered this run (rerun; the P4-P16 curve is flat/noisy on the APU)."
+            }
+        );
+    }
+    println!(
+        "# DIAGNOSIS: judge the SIGN of heur/auto (>= 1 expected) across >=2 PROCESS restarts.\n\
+         #   Absolute magnitude is APU-confounded; the durable deliverable is the autotune\n\
+         #   SELECTION method + portability, not a local e2e speed record."
+    );
+}
+
+/// CPU-only stub: autotune drives the rocm GPU launch-config only, so the A/B is GPU-only.
+#[cfg(not(feature = "rocm"))]
+fn run_autotune_ab(_warmup: usize, _reps: usize) {
+    println!(
+        "\n# === Phase 13 autotune-ON vs heuristic A/B requested (LGBM_BENCH_AUTOTUNE_AB=1) ===\n\
+         # SKIPPED: this CPU-only build has no GPU launch-config to autotune (CpuBackend f64\n\
+         # anchor). Rebuild with --features rocm:\n\
+         #   LGBM_BENCH_AUTOTUNE_AB=1 cargo run --release --features rocm --example bench_gpu_vs_cpu"
+    );
+}
+
 /// CPU-only stub: the resident co-pack path never fires on the f64 anchor, so the
 /// A/B is GPU-only. Mirrors the harness's `--features rocm` gating.
 #[cfg(not(feature = "rocm"))]
@@ -406,6 +628,15 @@ fn main() {
     // LGBM_BENCH_SWEEP=wide = 250k/500k/1M × 500).
     if std::env::var("LGBM_BENCH_COPACK_AB").map(|v| v == "1").unwrap_or(false) {
         run_copack_ab(&sizes, &cfg_for, iters, warmup, train_reps);
+        return;
+    }
+
+    // Phase 13 (13-04): autotune-ON vs heuristic e2e A/B. Gated behind
+    // LGBM_BENCH_AUTOTUNE_AB=1 so the default bench output is unchanged. Uses its own
+    // production-width corpus (50 feat × 300k rows) so the build row-partition `P`
+    // actually matters; reports SIGN-ONLY + the autotune-recovered P (GPU-only).
+    if std::env::var("LGBM_BENCH_AUTOTUNE_AB").map(|v| v == "1").unwrap_or(false) {
+        run_autotune_ab(warmup, train_reps);
         return;
     }
 
