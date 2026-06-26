@@ -310,7 +310,7 @@ cost on the must-build-everywhere CPU anchor.
   bit-exact gate on the integrated master tree** (incl. the ROCm parity test on the GPU) — the
   executor's green gate ran on the stale tree, not master.
 
-## SIMD vectorization with `Vector<P,N>` ("Line") on cubecl 0.10 (spikes 041–043)
+## SIMD vectorization with `Vector<P,N>` ("Line") on cubecl 0.10 (spikes 041–045)
 
 **The type is `Vector<P: Scalar, N: Size>`, NOT `Line<T>`.** cubecl 0.10 has no `Line`
 (it's a later rename; the burn cubecl-book + context7 `main` docs show the new name). Read
@@ -335,6 +335,7 @@ memory/throughput-bound AND the vectorized op covers the bottleneck.** Evidence:
 | SCAN read (042) | dependent prefix-sum + divide + argmax | **null** (0.88–1.08×), bit-exact | only the load vectorizes; dependent chain dominates |
 | BUILD grad/hess (043) | gather-latency bound; grad/hess = 8–14% | null→**REGRESSION** at wide (0.83×) | load latency hidden behind gather; extract adds occupancy pressure |
 | fix_compact DEQUANT (044) | streaming `u64→f64` map (memory-bound) | cpu-f64-vec8 **2.52×**, hip-f64-vec2 **~1.1× weak** | right shape + bit-exact, but a FUSED minority fraction ⇒ sub-1% e2e; cpu fix path is native |
+| COALESCED-build + Vector (045) | reorder rows contiguous → vector-read grad/hess/bin → LDS scatter | **NET LOSS** (0.56–0.98× vs permuted); COAL_V **0.70–0.97× vs COAL_S** | reorder IS the same permuted gather (can't amortize, read-once); coalesced build is atomic-scatter-bound not load-bound ⇒ vector regresses |
 
 Corollaries: (1) the win **scales with problem size** — bench at the WIDE shape, a small
 op is overhead-bound (041: cpu-f32 1.2× at 25.6k → 3.7× at 256k). (2) On hip sweep to the
@@ -351,11 +352,23 @@ WIRING:** a correctly-shaped streaming map only pays e2e when it's a MAJORITY of
 AND on a path the backend runs through cubecl — subtract (041) wins because it IS its whole kernel;
 dequant (044) is bounded because it's a fused minority fraction. The histogram-pipeline frontier is
 now FULLY MAPPED: subtract WON (041, shipped), scan null (042), build immune (043), dequant bounded
-(044) — no un-probed Vector lever remains in the histogram path.
+(044) — no un-probed Vector lever remains in the histogram path. (8) **The coalesced-rewrite escape
+hatch is also CLOSED (045).** 043's one named lever — REORDER each leaf contiguous first so the
+build reads coalesced and Vector can apply — is a NET LOSS (0.56–0.98× vs the permuted build, 2
+restarts × 2 shapes): the reorder IS the same permuted gather (030's bottleneck), and it can't
+amortize (build reads each bin once-per-leaf, stable order changes every split — the spike-028
+read-once wall). AND Vector still regresses on the coalesced layout (COAL_V 0.70–0.97× vs COAL_S),
+because a coalesced build is **LDS-atomic-scatter-bound, not load-bound** — vectorizing the load
+attacks a non-bottleneck + the extract adds occupancy pressure (043's wide mechanism, now confirmed
+even when the gather is contiguous). Reopens only on discrete gfx110x (030: harsher permuted
+penalty there may let the reorder amortize). cube-macro gotchas (045): literal `Vector<_,2>` panics
+the macro (need generic `N:Size`); `N::value() as usize` in an unroll bound → runtime Vector index
+→ segfault (use `#[unroll] for j in 0..N::value()`); a reorder dest-stride ≠ source-stride is an
+easy OOB→segfault.
 
 **Production fit:** the clean win (041 subtract) lands on `subtract_hist_kernel` — the verbatim
 kernel the rocm RESIDENT subtract (`subtract_histograms_f64_from_handles_on`) + portable
 cuda/wgpu launch; the CPU anchor subtract is NATIVE (`subtract_histograms_cpu_native`) so it's
 untouched (merge gate safe). But subtract is a non-dominant phase (034: build dominates wide,
 partition 30–38% launch-bound) on an APU that loses to CPU ⇒ ROCm-parity-track, bounded e2e.
-Reference harnesses: `spike041_vector_subtract_ab.rs`, `spike042_…`, `spike043_…`, `spike044_vector_dequant_ab.rs`.
+Reference harnesses: `spike041_vector_subtract_ab.rs`, `spike042_…`, `spike043_…`, `spike044_vector_dequant_ab.rs`, `spike045_coalesced_build_vector_ab.rs`.
