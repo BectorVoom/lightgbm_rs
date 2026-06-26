@@ -54,6 +54,24 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
   - [x] 12-02-PLAN.md — oracle `kernel_parity` co-pack cell (co-pack == two scans byte-identical + rocm within ~1e-6 of CPU f64 anchor; cubecl-cpu W=1 byte-identical) + CPU merge-gate green (wave 2)
   - [x] 12-03-PLAN.md — `bench_gpu_vs_cpu` co-pack ON/OFF A/B: `scan_resident` sync count ~halved + e2e not-slower, honest reporting (wave 2)
 
+- `13-gpu-autotune-launch-config` — **planned (spike-validated 037–040).** Replace the
+  hand-tuned/env GPU launch-config heuristics with CubeCL runtime autotuning
+  (`cubecl::tune`), **default-on for all GPU (rocm) selection**. Autotunes BOTH GPU launch
+  knobs: the histogram-BUILD row-partition `P` (was `row_partition_count`, which spike-040
+  found under-partitions to P=1 at the production 50-feat width = ~10% slow on the 8-CU APU)
+  and the split-SCAN `CubeDim` (was `LGBM_SCAN_CUBEDIM`, spike-021). Wire = a default-on
+  rocm backend discriminator + a fresh-output `InputGenerator` (the accumulating build kernel
+  corrupts 27× under `CloneInputGenerator`, spike-038) + a `log2(rows)` occupancy-regime
+  AutotuneKey (exact-rows keying = a per-leaf tuning storm, spike-039). Selection is the
+  spoof-robust axis (relative within-device); ~10% local on the APU, durable payoff =
+  portability (self-calibrates on discrete gfx110x / NVIDIA). Does NOT change CPU routing or
+  the f64 anchor; stays within the ~1e-6 ROCm parity gate. Validated by spikes 037
+  (feasibility + 3 manual-API corrections), 038 (fresh-output correctness), 039 (key
+  granularity), 040 (beats the heuristic ~10%). Evidence:
+  `.claude/skills/spike-findings-lightgbm_rs/references/gpu-kernel-autotuning.md`,
+  `.planning/spikes/037..040/`, `crates/lgbm-compute/examples/spike0{37,38,39,40}_*.rs`.
+  Plans: TBD (gsd-plan-phase).
+
 ### 📋 Next milestone (not yet scoped)
 
 Define via `/gsd-new-milestone`. Candidate themes: GPU large-data perf (locate the bottleneck — see `notes/gpu-large-data-bottleneck-framing.md`), quantized training (QNT-01), linear-tree leaves (LIN-01), text/binary/Arrow ingestion (ING-01..03).
