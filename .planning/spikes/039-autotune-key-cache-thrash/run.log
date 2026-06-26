@@ -1,0 +1,13 @@
+# spike039 cache-thrash  feats=50  25 histogram-build nodes (≥12k rows)
+# distinct exact sizes = 25  (range 12514..200000)
+
+[EXACT  ] distinct keys = 25/25   cold-tune wall = 974.671648ms   warm-hit wall =       0ns   TOTAL = 974.671648ms
+[BUCKET ] distinct keys =  5/25   cold-tune wall = 325.105013ms   warm-hit wall =  53.539µs   TOTAL = 325.158552ms
+[FIXED  ] distinct keys =  1/25   cold-tune wall = 158.341419ms   warm-hit wall =  53.245µs   TOTAL = 158.394664ms
+
+# persisted winners (fastest variant per key):
+  spike039_autotune_key_cache_thrash-tune_impl-hist039_bucket.json.log  keys= 5  chose P16=3 P1=2  (p16-bench seen 5)
+  spike039_autotune_key_cache_thrash-tune_impl-hist039_exact.json.log  keys=25  chose P16=6 P1=19  (p16-bench seen 25)
+  spike039_autotune_key_cache_thrash-tune_impl-hist039_fixed.json.log  keys= 1  chose P16=1 P1=0  (p16-bench seen 1)
+
+VERDICT SIGNAL: EXACT cold≈distinct-sizes (storm); BUCKET cold≈#decades; FIXED cold=1.
