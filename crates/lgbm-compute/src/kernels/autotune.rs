@@ -44,7 +44,11 @@ impl cubecl::tune::AutotuneKey for LaunchKey {}
 
 impl Display for LaunchKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LaunchKey(b{},f{},b{})", self.bucket, self.feats, self.bins)
+        write!(
+            f,
+            "LaunchKey(bucket={},feats={},bins={})",
+            self.bucket, self.feats, self.bins
+        )
     }
 }
 
