@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 12
-current_phase_name: gpu-sibling-scan-copack
-status: verifying
-stopped_at: Completed 12-02-PLAN.md
-last_updated: "2026-06-25T02:17:00.463Z"
-last_activity: 2026-06-25
-last_activity_desc: "Completed quick task 260625-obl: VERIFIED spike-024 sibling-scan co-pack is live + default-on + bit-exact in both LGBM_SIBLING_COPACK modes (no golden changed); reconciled the records discrepancy"
+current_phase: 13
+current_phase_name: gpu-autotune-launch-config
+status: executing
+stopped_at: Completed 13-01-PLAN.md
+last_updated: "2026-06-26T11:41:56.952Z"
+last_activity: 2026-06-26
+last_activity_desc: Phase 13 execution started
 progress:
-  total_phases: 4
+  total_phases: 5
   completed_phases: 3
-  total_plans: 8
-  completed_plans: 7
-  percent: 75
+  total_plans: 12
+  completed_plans: 8
+  percent: 60
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 12 — gpu-sibling-scan-copack
+**Current focus:** Phase 13 — gpu-autotune-launch-config
 
 ## Current Position
 
-Phase: 12 (gpu-sibling-scan-copack) — EXECUTING
-Plan: 3 of 3
-Status: Phase complete — ready for verification
-Last activity: 2026-06-26 — Completed quick task 260626-o9d: raised the `lightgbm-rs` Python-binding floors — `numpy>=1.17.0`→`numpy>=2.0.0` and `requires-python ">=3.9"`→`">=3.11"` (pyproject.toml), plus the `pyo3` abi3 floor `abi3-py39`→`abi3-py311` (Cargo.toml dep + dev-dep, user-confirmed) so the wheel ABI tag becomes `cp311-abi3`; validated via `cargo verify-project` + `cargo metadata` (abi3-py311 real in pyo3 0.27.2), `.venv` Python 3.12 satisfies the floor. Prior: completed quick task 260626-igc: support CUDA and WGPU by reusing the ROCm GPU kernels — added `cuda`/`wgpu` compute backends to `lgbm-compute` (CudaBackend/WgpuBackend reuse the runtime-generic `#[cube]` kernels verbatim via a `gpu_core_backend!` macro; umbrella `gpu` feature; `CudaRuntime`/`WgpuRuntime` aliases + clients), surfaced through the `lgbm` booster cascade (rocm > cuda > wgpu > cpu); RocmBackend byte-untouched, no new deps. Compile-gated wiring only (no NVIDIA host); six-cell `cargo check` matrix all PASS — WGSL f32-atomic incompatibility is runtime-only, not a compile failure. Commits 3c158be + 7f00ba8. Prior: SHIPPED spike-035 (quick 260626-a6t, commit da3032f): the ROCm backend now defaults partition to the host fused path (off-switch LGBM_ROCM_HOST_PARTITION=0) — ~1.18–1.23× launch-bound, wash at wide, parity within ~1e-6; re-pin gate green on real gfx1100 (treelearner 77/0, oracle CPU + rocm 0 failed, CPU anchor untouched). This is the rare GPU lever that wins on the APU itself. Unblocked by the prior subtract_resident fix (8aed100). Prior: debug subtract-resident-empty-hip RESOLVED (commit 8aed100): fixed `subtract_resident: smaller slot is empty` on the FUSED resident path — Phase-12 co-pack deferred the smaller child's scan past subtract, but on the fused path that scan IS the histogram build+store, so subtract ran before it existed; un-deferred for the fused case only (co-pack never touched it) + serialized the force-env tests (RAII restore) for the knock-on env-leak. hip resident+fused parity 2/2 parallel+serial (was 0/2), bit-exact gate green, CPU anchor untouched. Unblocks the spike-035 wire gate. Prior: quick 260625-tw1 (LGBM_SCAN_DRAIN co-pack drain), spikes 034 (bottleneck moved to partition 30–38%) + 035 (route rocm partition to host ~1.18–1.23× launch-bound, WIRE-CANDIDATE)
+Phase: 13 (gpu-autotune-launch-config) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-06-26 — Phase 13 execution started
 
 Previous: 2026-06-25 — Completed quick task 260625-obl: VERIFIED spike-024 sibling-scan co-pack is live + default-on (LGBM_SIBLING_COPACK=0 is the off switch) + bit-exact in both modes (CPU + ROCm gates green, no golden changed); reconciled the "is it wired?" records discrepancy
 
@@ -518,6 +518,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 12 P01 | 35min | 3 tasks | 4 files |
 | Phase 12 P02 | 25min | 2 tasks | 1 files |
 | Phase 12 P03 | 40min | 1 tasks | 1 files |
+| Phase 13 P01 | 3min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -598,6 +599,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Co-pack parity: byte-identical via assert_eq! + ~1e-6 pin to CPU f64 anchor (def-f8u-01), never a 2nd GPU path
 - [Phase ?]: W=1 byte-identity proven without rocm: co-pack launcher on cubecl-cpu is byte-identical to two single-slot scans
 - [Phase ?]: Phase 12-03: co-pack A/B gated behind LGBM_BENCH_COPACK_AB=1; in-process LGBM_SIBLING_COPACK toggle; SC-3 confirmed (scan_resident ~59->~30/tree, counter-exact), SC-4 sign-only (medium ~1.33x, large ~1.14x; wide unaffected; isolated 2x NOT claimed as e2e)
+- [Phase 13]: 13-01: LaunchKey is one shared AutotuneKey shape (build bucket=size_band(rows), scan bucket=0); autotune_enabled() is the single source of truth the trait method delegates to
 
 ### Pending Todos
 
@@ -627,8 +629,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-25T02:16:43.314Z
-Stopped at: Completed 12-02-PLAN.md
+Last session: 2026-06-26T11:41:56.942Z
+Stopped at: Completed 13-01-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
