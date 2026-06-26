@@ -309,3 +309,43 @@ cost on the must-build-everywhere CPU anchor.
   device `else` of `prefers_host_partition`, not the pre-gate `split`), and **RE-RUN the full
   bit-exact gate on the integrated master tree** (incl. the ROCm parity test on the GPU) — the
   executor's green gate ran on the stale tree, not master.
+
+## SIMD vectorization with `Vector<P,N>` ("Line") on cubecl 0.10 (spikes 041–043)
+
+**The type is `Vector<P: Scalar, N: Size>`, NOT `Line<T>`.** cubecl 0.10 has no `Line`
+(it's a later rename; the burn cubecl-book + context7 `main` docs show the new name). Read
+from the SOURCE — `cubecl-core-0.10.0/src/frontend/container/vector/base.rs` + the canonical
+`src/runtime_tests/vector.rs`. Launch ABI:
+
+- kernel sig `&Array<Vector<F,N>>`, `N: Size` a generic param;
+- the `N` value is a RUNTIME `usize` positional arg inserted **right after `CubeDim`**,
+  before the kernel's own args: `k::launch_unchecked::<F,R>(client, count, dim, vector_size, …)`;
+- `ArrayArg::from_raw_parts(handle, n_elements / vector_size)` — length in **vector units**
+  over the SAME byte buffer; a bare `usize` kernel param is passed RAW (cf. production `num_data,`);
+- sweep widths from `client.io_optimized_vector_sizes(size_of::<F>())` (hip f32 → `[4,2,1]`;
+  cpu f32 → `[16,8,4,2,1]`, f64 → `[8,4,2,1]`); element read `v[i]`, `Vector` impls `Add/Sub/…`
+  element-wise so any element-wise op is **bit-exact** to scalar (no float reorder).
+
+**THE RULE (the campaign's one durable finding): `Vector<P,N>` pays ONLY where the kernel is
+memory/throughput-bound AND the vectorized op covers the bottleneck.** Evidence:
+
+| kernel | op shape | result | why |
+|--------|----------|--------|-----|
+| SUBTRACT (041) | pure streaming load–sub–store | cpu **2.5–3.7×**, hip **1.06–1.29×**, bit-exact | load+store+compute all vectorize; memory-bound |
+| SCAN read (042) | dependent prefix-sum + divide + argmax | **null** (0.88–1.08×), bit-exact | only the load vectorizes; dependent chain dominates |
+| BUILD grad/hess (043) | gather-latency bound; grad/hess = 8–14% | null→**REGRESSION** at wide (0.83×) | load latency hidden behind gather; extract adds occupancy pressure |
+
+Corollaries: (1) the win **scales with problem size** — bench at the WIDE shape, a small
+op is overhead-bound (041: cpu-f32 1.2× at 25.6k → 3.7× at 256k). (2) On hip sweep to the
+MAX `io_optimized` width — intermediate widths are magnitude-noisy on the APU. (3) A
+permuted gather (`bins[col+leaf_rows[k]]`) is **structurally un-vectorizable** (no `Vector`
+read gathers arbitrary `p`); only contiguous reads vectorize. (4) Vectorizing a
+NON-bottleneck isn't free — it competes for registers/occupancy and can REGRESS (043 wide).
+(5) `Atomic<u64>` is **unimplemented on cubecl-cpu** (panics) — u64-atomic kernels are hip-only.
+
+**Production fit:** the clean win (041 subtract) lands on `subtract_hist_kernel` — the verbatim
+kernel the rocm RESIDENT subtract (`subtract_histograms_f64_from_handles_on`) + portable
+cuda/wgpu launch; the CPU anchor subtract is NATIVE (`subtract_histograms_cpu_native`) so it's
+untouched (merge gate safe). But subtract is a non-dominant phase (034: build dominates wide,
+partition 30–38% launch-bound) on an APU that loses to CPU ⇒ ROCm-parity-track, bounded e2e.
+Reference harnesses: `spike041_vector_subtract_ab.rs`, `spike042_…`, `spike043_…`.
