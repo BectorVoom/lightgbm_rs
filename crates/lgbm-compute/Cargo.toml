@@ -24,7 +24,22 @@ cubecl-hip-sys = { version = "7", optional = true }
 # CPU-only build needs no ROCm toolchain present (SC#1, CMP-03 prep).
 default = ["cpu"]
 cpu = []
-rocm = ["cubecl/hip", "dep:cubecl-hip-sys"]
+# `gpu` is the umbrella feature every GPU backend turns on. It is what widens the
+# two LDS-construct items in `kernels/histogram.rs` (the `#[cube]` kernel + its
+# generic launcher) from rocm-only to "any GPU backend", so cuda/wgpu reuse the
+# SAME kernel without forking it. The rocm-only `cubecl_hip_sys` CU-count FFI stays
+# gated on `rocm`, NOT `gpu`.
+gpu = []
+rocm = ["cubecl/hip", "dep:cubecl-hip-sys", "gpu"]
+# CUDA backend (cubecl-cuda / `cubecl::cuda::CudaRuntime`). `cuda`/`wgpu` are
+# sub-features of the already-vetted `cubecl 0.10.0` workspace dep — NO new
+# `[dependencies]` entry is added (no package-legitimacy gate applies).
+cuda = ["cubecl/cuda", "gpu"]
+# WGPU backend (cubecl-wgpu / `cubecl::wgpu::WgpuRuntime`). NOTE (locked decision
+# #3): the f32-atomic LDS histogram kernel may not compile for the WGSL target
+# (WGSL has no f32 atomics); a `--features wgpu` check failure there is an accepted
+# discovered outcome, recorded — not worked around.
+wgpu = ["cubecl/wgpu", "gpu"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }

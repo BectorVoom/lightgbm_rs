@@ -29,6 +29,15 @@ mimalloc = ["dep:mimalloc"]
 # instead of the native CPU backend. Opt-in: the default build stays on the CPU
 # anchor and never references the HIP runtime. Forwards to lgbm-compute/rocm.
 rocm = ["lgbm-compute/rocm"]
+# Dispatch training compute to a CUDA GPU (cubecl-cuda). Opt-in; forwards to
+# lgbm-compute/cuda. Selected only when `rocm` is NOT also enabled (see booster.rs
+# cascade: rocm > cuda > wgpu > cpu).
+cuda = ["lgbm-compute/cuda"]
+# Dispatch training compute to a WGPU/WGSL target (cubecl-wgpu). Opt-in; forwards to
+# lgbm-compute/wgpu. NOTE (locked decision #3): the shared f32-atomic histogram
+# kernel may not lower to WGSL at runtime (no f32 atomics); the compile-gated wiring
+# still builds. Selected only when neither `rocm` nor `cuda` is enabled.
+wgpu = ["lgbm-compute/wgpu"]
 
 [dev-dependencies]
 oracle-harness = { path = "../oracle-harness" }

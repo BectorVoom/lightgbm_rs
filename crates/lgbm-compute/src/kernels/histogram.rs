@@ -616,7 +616,12 @@ pub fn construct_histograms_parallel_f32_plane_on<R: cubecl::Runtime>(
 /// specialize one kernel binary per bin count (LightGBM's `histogram{16,64,256}.cl`
 /// family approach), we allocate the fixed 256-bin max once (2 KiB ≪ the gfx1100
 /// 64 KiB LDS budget) and drive the active length with the runtime `lds_len`.
-#[cfg(feature = "rocm")]
+///
+/// Widened from `rocm` to the `gpu` umbrella (quick-260626-igc): the two LDS
+/// construct items (`construct_hist_kernel_lds_f32` + `construct_histograms_lds_f32_on`)
+/// that cuda/wgpu reuse reference this cap, so it must compile under any GPU backend.
+/// It is a plain `usize` const — no `cubecl_hip_sys`/`rocm_client` involvement.
+#[cfg(feature = "gpu")]
 const HIST_LDS_MAX: usize = 512;
 
 /// Fixed-point quantize scale S = 2^30 (phase-11, spike-018a). The resident LDS BUILD
@@ -767,7 +772,7 @@ pub fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
 /// Accumulation is f32 in nondeterministic order (same as the naive atomic path) ⇒
 /// the SAME ~1e-6 ROCm gate vs the cpu f64 anchor (NOT bit-exact). Feature-gated to
 /// `rocm`. The cpu f64 fold anchor ([`construct_hist_kernel`]) is untouched.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn construct_hist_kernel_lds_f32(
     binned: &Array<u32>,
@@ -823,7 +828,7 @@ pub fn construct_hist_kernel_lds_f32(
 /// # Errors
 /// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5), plus a
 /// [`ComputeError::Runtime`] when `num_bin > 256`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn construct_histograms_lds_f32_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     binned: &[u32],

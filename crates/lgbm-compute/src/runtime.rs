@@ -176,3 +176,51 @@ pub fn rocm_client() -> ComputeClient<cubecl::hip::HipRuntime> {
 /// runtime (CMP-01).
 #[cfg(feature = "rocm")]
 pub type RocmRuntime = cubecl::hip::HipRuntime;
+
+/// The active CubeCL runtime type for the `cuda` feature build (NVIDIA GPUs).
+///
+/// Re-exported behind this crate's seam so no upstream crate names a cubecl
+/// runtime (CMP-01). Mirrors [`RocmRuntime`].
+#[cfg(feature = "cuda")]
+pub type CudaRuntime = cubecl::cuda::CudaRuntime;
+
+/// Construct a compute client for the CUDA runtime (opt-in, NVIDIA GPUs).
+///
+/// Compiled only when the `cuda` feature is enabled, so the default build never
+/// references `cubecl::cuda` and needs no CUDA toolkit present. Binds
+/// [`cubecl::cuda::CudaRuntime`] + `CudaDevice::new(0)` (the first NVIDIA device),
+/// mirroring [`rocm_client`]'s `AmdDevice::new(0)`.
+///
+/// CudaBackend dispatches the SAME runtime-generic GPU kernels RocmBackend uses
+/// (`construct_histograms_lds_f32_on`, `find_best_split_f64_on`, `data_partition_on`,
+/// `subtract_histograms_f64_on`) — no forked kernels.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_client() -> ComputeClient<cubecl::cuda::CudaRuntime> {
+    cubecl::cuda::CudaRuntime::client(&cubecl::cuda::CudaDevice::new(0))
+}
+
+/// The active CubeCL runtime type for the `wgpu` feature build (WebGPU/WGSL).
+///
+/// Re-exported behind this crate's seam so no upstream crate names a cubecl
+/// runtime (CMP-01). Mirrors [`RocmRuntime`].
+#[cfg(feature = "wgpu")]
+pub type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
+
+/// Construct a compute client for the WGPU runtime (opt-in, WebGPU/WGSL targets).
+///
+/// Compiled only when the `wgpu` feature is enabled, so the default build never
+/// references `cubecl::wgpu`. Binds [`cubecl::wgpu::WgpuRuntime`] +
+/// `WgpuDevice::default()` (the default adapter), mirroring [`rocm_client`].
+///
+/// KNOWN RISK (locked decision #3): the shared LDS histogram kernel accumulates in
+/// f32 atomics, and the WGSL target has NO f32 atomics — so a `--features wgpu`
+/// build MAY fail to compile inside the f32-atomic kernel monomorphization. That is
+/// an accepted, documented outcome; the kernel is NOT swapped or given an
+/// f64/portable fallback to work around it. WgpuBackend dispatches the SAME
+/// runtime-generic kernels RocmBackend/CudaBackend use — no forked kernels.
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub fn wgpu_client() -> ComputeClient<cubecl::wgpu::WgpuRuntime> {
+    cubecl::wgpu::WgpuRuntime::client(&cubecl::wgpu::WgpuDevice::default())
+}
