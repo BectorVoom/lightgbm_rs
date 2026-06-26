@@ -74,7 +74,7 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
 
   - [x] 13-01-PLAN.md — autotune foundation: serde→real rocm-gated dep + `kernels::autotune` module (`LaunchKey`, `size_band` log2 bucketer, `autotune_enabled` off-switch, `cache_namespace_id`) + default-on `Backend::prefers_autotune_launch_config` seam (wave 1)
   - [x] 13-02-PLAN.md — autotune the histogram-build row-partition `P`: FreshOutGenerator + `BUILD_TUNER` + PSET, wired into `resident_raw_build_into` with `LGBM_AUTOTUNE=0` heuristic fallback + `LGBM_AUTOTUNE_FORCE_P` parity seam (wave 2)
-  - [ ] 13-03-PLAN.md — autotune the split-scan `CubeDim` `W`: `SCAN_TUNER` + WSET (CloneInputGenerator), wired into the fused split launcher with `scan_cube_dim()`/`LGBM_SCAN_CUBEDIM` fallback (wave 2)
+  - [x] 13-03-PLAN.md — autotune the split-scan `CubeDim` `W`: `SCAN_TUNER` + WSET (CloneInputGenerator), wired into the fused split launcher with `scan_cube_dim()`/`LGBM_SCAN_CUBEDIM` fallback (wave 2)
   - [ ] 13-04-PLAN.md — all-PSET/all-WSET oracle parity pinned to the CPU f64 anchor + e2e A/B (autotune ≥ heuristic, recovers P=1) + CPU merge-gate green + honest-bound SUMMARY (wave 3)
 
 ### 📋 Next milestone (not yet scoped)

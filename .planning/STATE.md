@@ -6,14 +6,14 @@ current_phase: 13
 current_phase_name: gpu-autotune-launch-config
 status: executing
 stopped_at: Completed 13-01-PLAN.md
-last_updated: "2026-06-26T11:56:57.783Z"
+last_updated: "2026-06-26T12:10:19.648Z"
 last_activity: 2026-06-26
 last_activity_desc: Phase 13 execution started
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 12
-  completed_plans: 9
+  completed_plans: 10
   percent: 60
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 13 (gpu-autotune-launch-config) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-06-26 — Phase 13 execution started
 
@@ -520,6 +520,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 12 P03 | 40min | 1 tasks | 1 files |
 | Phase 13 P01 | 3min | 3 tasks | 4 files |
 | Phase 13 P02 | 18min | 2 tasks | 1 files |
+| Phase 13 P03 | 4min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -603,6 +604,7 @@ Recent decisions affecting current work:
 - [Phase 13]: 13-01: LaunchKey is one shared AutotuneKey shape (build bucket=size_band(rows), scan bucket=0); autotune_enabled() is the single source of truth the trait method delegates to
 - [Phase ?]: 13-02: autotune is the default-on rocm selector for the histogram-build row-partition P; row_partition_count is the LGBM_AUTOTUNE=0 cold-start fallback
 - [Phase ?]: 13-02: accumulating GPU kernels under cubecl autotune need a fresh-output InputGenerator (spike-038); rebuild the TunableSet per call, not LocalTuner::init
+- [Phase 13]: 13-03: wired BOTH scan paths (single-leaf + co-pack siblings) for autotuned CubeDim W; separate local_tuner namespaces avoid LaunchKey collision
 
 ### Pending Todos
 
@@ -632,7 +634,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-26T11:56:40.230Z
+Last session: 2026-06-26T12:09:56.079Z
 Stopped at: Completed 13-01-PLAN.md
 Resume file: None
 
