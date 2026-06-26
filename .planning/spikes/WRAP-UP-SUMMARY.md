@@ -315,3 +315,69 @@ controlled ladder (identical work, varied distribution) is the reusable instrume
 
 ### Commits (session 8)
 - 036 (spike): `359428d` (README inventory + ladder, harness, MANIFEST row).
+
+---
+
+## Session 9 wrap-up — 2026-06-26 (spikes 037–040, the GPU-kernel-AUTOTUNING arc)
+
+**Spikes processed:** 4 (all VALIDATED). **Skill output:** new reference
+`references/gpu-kernel-autotuning.md`.
+
+**Idea:** "optimise gpu kernel by autotune" (the CubeCL `cubecl::tune` feature, per
+`cubecl_manual/.../12_autotuning.md`) — replace the hand-tuned/env-var launch-config
+heuristics (row-partition `P`, scan `CubeDim`) with a measured, cached, self-calibrating
+runtime tuner. NOTE: these 037/038 numbers are the AUTOTUNE track, distinct from the
+deferred divergence curiosities 036 happened to label "037/038".
+
+| # | Name | Type | Verdict | Feature area |
+|---|------|------|---------|--------------|
+| 037 | autotune-hip-feasibility | standard | ✅ VALIDATED | GPU kernel autotuning |
+| 038 | autotune-inplace-correctness | standard | ✅ VALIDATED | GPU kernel autotuning |
+| 039 | autotune-key-cache-thrash | standard | ✅ VALIDATED | GPU kernel autotuning |
+| 040 | autotune-vs-heuristic | comparison | ✅ VALIDATED (autotune wins) | GPU kernel autotuning |
+
+### Key findings
+- **037 — feasibility (kill Q1): autotune works END-TO-END on cubecl-hip 0.10.** Compile ✓,
+  run-on-device ✓, benchmark-both ✓, pick-winner ✓, in-proc cache hit ~6µs (~78,000× vs
+  490ms cold-tune), **persistent disk cache across processes** (~828µs cold-with-cache,
+  `target/autotune/0.10.0/rocm_0/*.json.log`). It independently re-derived spike-007's P=16.
+  **The `cubecl_manual` doc is WRONG on its 3 load-bearing points — code from the SOURCE:**
+  (1) the key-gen closure returns the `AutotuneKey` (not a String), (2) `execute`'s 1st arg
+  is the cache-namespace ID (not the key — the key is generated internally), (3) the key
+  needs `serde::{Serialize,DeserializeOwned}` under `std_io` (always on linux). Added `serde`
+  as a dev-dep (examples-only).
+- **038 — correctness (kill Q2): accumulating kernels corrupt 27× under
+  `CloneInputGenerator`.** `Handle::clone` is a ref-count bump, so every benchmark rep
+  `fetch_add`s into the caller's REAL `out` (the 27 = the whole sample budget, not a +1
+  bias). **Fix = a fresh-output `InputGenerator`** (the winner's final run uses the original
+  inputs ⇒ real `out` touched once ⇒ `rel_err 0` by grad-conservation). Classify kernels:
+  OVERWRITE safe-as-is / ACCUMULATE needs fresh-out / in-place-RMW needs deep-copy (partition
+  is host-routed on rocm, 035). GAT gotcha: spell `generate<'a>`'s return as
+  `<Vec<Handle> as TuneInputs>::At<'a>` or E0195.
+- **039 — keying granularity: exact `rows` is a tuning STORM.** 25/25 tree nodes cold, ZERO
+  reuse, 975ms for ONE shallow tree. `log2(rows)` bucketing → 5 keys, 20/25 free, ~3× faster,
+  AND it keeps the per-regime P16↔P1 crossover (FIXED feats-only is cheaper but mis-applies
+  the root's variant to small leaves). The variant choice tracks the occupancy REGIME, not
+  the exact count. Surprise: EXACT's P16/P1 split is itself run-to-run noisy (small leaves sit
+  near the selection tie) — a 2nd argument against over-fine keying.
+- **040 — comparison: autotune BEATS the shipped heuristic ~10% (not the predicted wash).**
+  `row_partition_count(50,n)` resolves `target_cubes = 8 CU × 8 = 64`, `MIN_LEAF = 256k`,
+  `clamp(64/50) = 1` ⇒ **P=1 for every leaf at the production 50-feature width** (the 8-CU
+  correction over-corrected from the phantom-96-CU P≈16, effectively disabling
+  row-partitioning). Rigorous P-sweep {1,4,8,16,32} (3 restarts, sign-stable): **P=1 is the
+  SLOWEST point at every size**; autotune picks P∈{4,8,16,32} and wins **2–16% (typ ~10%),
+  never loses**. **Surfaced a latent production mis-tuning** → recalibrate `row_partition_count`
+  OR adopt autotune (the robust + portability answer).
+
+### Net signal
+- Autotuning the rocm histogram kernel is **feasible and worthwhile** — all blocking risks
+  resolved. Wire behind a default-false backend discriminator, key on `(log2(rows), feats,
+  bins)`, use a fresh-output InputGenerator, read the winner from the persisted cache.
+- **Fix or replace `row_partition_count`** (the ~10% latent under-partition at the production
+  width). Autotune is the robust + portability answer (self-calibrates on discrete gfx110x /
+  NVIDIA with zero re-tuning). Honest bound: the ~10% is on the spoofed-APU GPU build, which
+  the 16-core CPU beats end-to-end here — the durable deliverable is the **method
+  (measure-don't-model)** + portability. CPU f64 anchor untouched (example-only + dev-dep).
+
+### Commits (session 9)
+- 037: `a94c8f3`; 038: `e33a04c`; 039: `9731a17`; 040: `1e397be`; CONVENTIONS: `8803d9f`.
