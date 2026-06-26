@@ -2759,4 +2759,270 @@ mod hip {
         pin("A", &co_a, a_totals);
         pin("B", &co_b, b_totals);
     }
+
+    /// RAII guard for an env var that FORCES a launch-config variant (the 13-04
+    /// all-variants parity sweep — `LGBM_AUTOTUNE_FORCE_P` for the build `P`,
+    /// `LGBM_SCAN_CUBEDIM` for the scan `W`). On `set` it records the prior value and
+    /// writes the new one; on `drop` it restores the prior value (removing the var if
+    /// it was previously unset). Panic-safe (T-13-04-01): a failing assertion inside
+    /// one P/W iteration restores the env on unwind, so the forced variant can never
+    /// leak into a sibling test.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: single-threaded oracle test. The forced var is read FRESH by the
+            // launch path (`force_row_partition` / `scan_cube_dim`) on this same thread
+            // before any cubecl/rayon parallel region spawns workers.
+            unsafe { std::env::set_var(key, value) };
+            EnvVarGuard { key, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: same single-main-thread invariant as `set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// The build-`P` candidate set the 13-02 autotuner sweeps (mirrors the non-`pub`
+    /// `histogram::BUILD_PSET`). `P = 32 > ROWPART_P_MAX (16)` is registered-skipped by
+    /// the tuner and clamped to 16 by `force_row_partition`, but we still FORCE every
+    /// declared variant here so the whole runtime-reachable set is anchor-pinned.
+    const BUILD_PSET_MIRROR: &[u32] = &[1, 4, 8, 16, 32];
+    /// The scan-`W` candidate set the 13-03 autotuner sweeps (mirrors `split::SCAN_WSET`).
+    const SCAN_WSET_MIRROR: &[u32] = &[32, 64, 128, 256];
+
+    /// 13-04 PARITY GATE (build): autotune may pick ANY `P` in `BUILD_PSET` at runtime,
+    /// so EVERY variant must be anchor-correct, not just the current default (def-f8u-01:
+    /// never GPU-vs-GPU). This pins the u64 fixed-point resident build at EACH forced
+    /// `P` (`LGBM_AUTOTUNE_FORCE_P=P`, which short-circuits the tuner) to the SAME CPU f64
+    /// anchor as the WR-05 P>1 test — `construct_histograms_cpu` (the bit-exact CPU fold)
+    /// + the exported host `fix_histogram` + compact, built ONCE. The u64 fixed-point
+    /// merge is integer-additive (order-independent across the P cubes) ⇒ bit-identical
+    /// across `P`, gated at the tightened `FIXEDPOINT_REL_GATE = 1e-7`.
+    #[test]
+    fn kernel_parity_resident_build_all_pset_p_equals_anchor_on_hip() {
+        use lgbm_compute::kernels::histogram::{
+            build_fix_compact_resident_readback_f64_on, construct_histograms_cpu,
+            upload_resident_columns,
+        };
+        use lgbm_treelearner::fix_histogram;
+
+        // ---- PSET shape guards (acceptance): the sweep must be non-empty AND exercise
+        // at least one multi-cube (P>1) row-partitioned merge, else the test is vacuous.
+        assert!(!BUILD_PSET_MIRROR.is_empty(), "BUILD_PSET must be non-empty");
+        assert!(
+            BUILD_PSET_MIRROR.iter().any(|&p| p > 1),
+            "BUILD_PSET must exercise at least one P>1 (the multi-cube row-partitioned merge)"
+        );
+
+        let hip = rocm_client();
+        let cpu = cpu_client();
+
+        // Clone the WR-05 P>1 fixture: 3 spine features over a >=256k-row leaf so the
+        // row-partitioned multi-cube merge is genuinely exercised at each forced P>1.
+        let num_data = 300_000usize;
+        let num_bins: Vec<u32> = vec![4, 3, 5];
+        let mfbs: Vec<u32> = vec![2, 0, 1];
+        let offsets: Vec<i32> = vec![0, 1, 0];
+        let f0: Vec<u32> = (0..num_data).map(|i| (i % 4) as u32).collect();
+        let f1: Vec<u32> = (0..num_data).map(|i| (i % 3) as u32).collect();
+        let f2: Vec<u32> = (0..num_data).map(|i| (i % 5) as u32).collect();
+        let feature_bins: Vec<&[u32]> = vec![&f0, &f1, &f2];
+
+        let mut slot_off = Vec::with_capacity(num_bins.len());
+        let mut acc = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(acc);
+            acc += 2 * nb as usize;
+        }
+        let slot_len = acc;
+
+        let leaf_rows: Vec<u32> = (0..num_data as u32).collect();
+        let gradients: Vec<f32> = (0..num_data).map(|i| 0.25 + (i % 7) as f32 * 0.5).collect();
+        let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
+
+        let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
+        let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
+
+        // ---- CPU f64 ANCHOR built ONCE (def-f8u-01): per feature gather the leaf rows'
+        //      (bin, grad, hess), fold with `construct_histograms_cpu`, apply the SAME
+        //      host fix + compact the GPU chain runs on device. NOT a second GPU launch.
+        let mut anchor: Vec<f64> = vec![0.0; slot_len];
+        for fpos in 0..num_bins.len() {
+            let nb = num_bins[fpos];
+            let cells = 2 * nb as usize;
+            let binned: Vec<u32> = leaf_rows
+                .iter()
+                .map(|&r| feature_bins[fpos][r as usize])
+                .collect();
+            let g: Vec<f32> = leaf_rows.iter().map(|&r| gradients[r as usize]).collect();
+            let h: Vec<f32> = leaf_rows.iter().map(|&r| hessians[r as usize]).collect();
+            let raw = construct_histograms_cpu(&cpu, &binned, &g, &h, nb)
+                .expect("cpu f64 anchor fold");
+            let region = &mut anchor[slot_off[fpos]..slot_off[fpos] + cells];
+            region.copy_from_slice(&raw);
+            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
+            host_compact_histogram(region, offsets[fpos]);
+        }
+
+        let fix_feats: Vec<(usize, u32, i32, u32)> = (0..num_bins.len())
+            .map(|fpos| (slot_off[fpos], num_bins[fpos], offsets[fpos], mfbs[fpos]))
+            .collect();
+        let run_gpu = || {
+            build_fix_compact_resident_readback_f64_on(
+                &hip,
+                upload_resident_columns(&hip, &feature_bins),
+                lgbm_compute::ResidentBinWidth::U32,
+                feature_bins.len(),
+                num_data,
+                &slot_off,
+                slot_len,
+                &leaf_rows,
+                &gradients,
+                &hessians,
+                &fix_feats,
+                sum_g,
+                sum_h,
+            )
+            .expect("resident build_fix_compact readback (forced P)")
+        };
+
+        const FIXEDPOINT_REL_GATE: f64 = 1e-7;
+        for &p in BUILD_PSET_MIRROR {
+            // FORCE this variant; the guard restores the prior env on drop / panic.
+            let _g = EnvVarGuard::set("LGBM_AUTOTUNE_FORCE_P", &p.to_string());
+            let gpu = run_gpu();
+            assert_eq!(gpu.len(), slot_len, "resident chain length (P={p})");
+
+            let mut max_rel = 0.0f64;
+            for (i, (&gv, &av)) in gpu.iter().zip(anchor.iter()).enumerate() {
+                let rel = (gv - av).abs() / av.abs().max(1.0);
+                assert!(
+                    rel <= FIXEDPOINT_REL_GATE,
+                    "ALL-PSET PARITY FAIL at P={p} cell {i}: gpu={gv}, cpu_anchor={av}, \
+                     rel={rel:.3e} > FIXEDPOINT_REL_GATE={FIXEDPOINT_REL_GATE:.0e} — the u64 \
+                     fixed-point resident build at this forced P diverged from the CPU f64 \
+                     anchor beyond quantize-rounding error."
+                );
+                max_rel = max_rel.max(rel);
+            }
+            eprintln!(
+                "all-PSET build: LGBM_AUTOTUNE_FORCE_P={p} max_rel_vs_cpu_f64_anchor={max_rel:.3e} \
+                 (gate={FIXEDPOINT_REL_GATE:.0e})"
+            );
+        }
+    }
+
+    /// 13-04 PARITY GATE (scan): autotune may pick ANY `W` in `SCAN_WSET` at runtime, so
+    /// EVERY scan width must be bit-exact. The feature-per-lane fused scan keeps each
+    /// feature's prefix scan SEQUENTIAL (one feature per lane, spike-021/022), so widening
+    /// `CubeDim W` reorders NOTHING within a feature ⇒ the per-feature `SplitInfo` is
+    /// bit-IDENTICAL across `W`. This computes the `W=1` reference (the byte-exact oracle
+    /// anchor) once, then for each `W` in `SCAN_WSET` forces `LGBM_SCAN_CUBEDIM=W`
+    /// (`LGBM_AUTOTUNE=0` so the deterministic explicit-env fallback path runs) and asserts
+    /// every feature's `SplitInfo` is byte-identical to the `W=1` result.
+    #[test]
+    fn kernel_parity_fused_scan_all_wset_w_equals_anchor_on_hip() {
+        use lgbm_compute::kernels::split::find_best_splits_batched_fused_f64_on;
+
+        assert!(!SCAN_WSET_MIRROR.is_empty(), "SCAN_WSET must be non-empty");
+
+        let hip = rocm_client();
+
+        // A leaf's CONCATENATED stride-2 f64 histogram over 3 spine features with
+        // different bin counts + offsets (so per-feature REVERSE/FORWARD ranges differ).
+        // Exactly-representable f64 values (reused from the handle-scan parity fixture).
+        let buf: Vec<f64> = vec![
+            2.0, 5.0, -1.0, 4.0, 3.0, 6.0, -2.0, 5.0, // f0: 4 bins, offset 0
+            1.0, 3.0, 4.0, 7.0, -3.0, 4.0, // f1: 3 bins, offset 1
+            0.5, 2.0, 1.5, 3.0, -1.0, 2.5, 2.0, 4.0, -0.5, 3.5, // f2: 5 bins, offset 0
+        ];
+        let mut feats: Vec<BatchedSplitFeature> = Vec::new();
+        feats.push(BatchedSplitFeature {
+            slot_off: 0,
+            num_bin: 4,
+            offset: 0,
+            default_bin: 0,
+            most_freq_bin: 2,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        });
+        feats.push(BatchedSplitFeature {
+            slot_off: 8,
+            num_bin: 3,
+            offset: 1,
+            default_bin: 0,
+            most_freq_bin: 0,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        });
+        feats.push(BatchedSplitFeature {
+            slot_off: 14,
+            num_bin: 5,
+            offset: 0,
+            default_bin: 0,
+            most_freq_bin: 1,
+            skip_default_bin: false,
+            na_as_missing: false,
+            run_forward: false,
+        });
+
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 1e-3,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let sum_gradient = 5.0f64;
+        let sum_hessian = 40.0f64;
+        let num_data = 40i32;
+
+        let scan = || {
+            find_best_splits_batched_fused_f64_on(
+                &hip, &buf, &feats, &cfg, sum_gradient, sum_hessian, num_data,
+            )
+            .expect("fused scan")
+        };
+
+        // ---- W=1 reference (the degenerate one-cube-per-feature scan = byte-exact oracle
+        //      anchor). LGBM_AUTOTUNE=0 + LGBM_SCAN_CUBEDIM=1 force the deterministic path.
+        let w1 = {
+            let _ga = EnvVarGuard::set("LGBM_AUTOTUNE", "0");
+            let _gw = EnvVarGuard::set("LGBM_SCAN_CUBEDIM", "1");
+            scan()
+        };
+        assert_eq!(w1.len(), feats.len(), "W=1 reference length");
+
+        for &w in SCAN_WSET_MIRROR {
+            let _ga = EnvVarGuard::set("LGBM_AUTOTUNE", "0");
+            let _gw = EnvVarGuard::set("LGBM_SCAN_CUBEDIM", &w.to_string());
+            let got = scan();
+            assert_eq!(got.len(), feats.len(), "scan length (W={w})");
+            for (i, (g, r)) in got.iter().zip(w1.iter()).enumerate() {
+                assert_eq!(
+                    g, r,
+                    "ALL-WSET SCAN PARITY FAIL at W={w} feature {i}: SplitInfo != W=1 reference \
+                     (must be byte-identical — each feature's scan stays sequential): \
+                     w{w}={g:?} w1={r:?}"
+                );
+            }
+            eprintln!("all-WSET scan: LGBM_SCAN_CUBEDIM={w} byte-identical to W=1 ({} feats)", feats.len());
+        }
+    }
 }
