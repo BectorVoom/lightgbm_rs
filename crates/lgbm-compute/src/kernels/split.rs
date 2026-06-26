@@ -975,6 +975,313 @@ fn scan_cube_dim() -> u32 {
     1
 }
 
+// ===================== phase-13 (13-03): SCAN-W autotune =====================
+//
+// CubeCL autotune for the split-SCAN `CubeDim` width `W`. The fused feature-per-lane
+// scan (spike-021) is BIT-EXACT across every `W` — each feature's scan stays
+// sequential (lane `f = ABSOLUTE_POS`, guarded `< n_feats`); `W` only changes which
+// lane runs each still-sequential per-feature scan, NOT the result (no spike-016
+// reorder). So the tuner is free to pick the measured-fastest `W` per occupancy
+// regime. Default-ON on rocm; `LGBM_AUTOTUNE=0` and an explicit `LGBM_SCAN_CUBEDIM`
+// both fall back to `scan_cube_dim()` (the documented bound + the 13-04 all-W parity
+// seam). Mirrors the 13-02 build-`P` machinery in `histogram.rs`.
+#[cfg(feature = "rocm")]
+use crate::kernels::autotune::{self, LaunchKey};
+#[cfg(feature = "rocm")]
+use cubecl::tune::{local_tuner, CloneInputGenerator, LocalTuner, Tunable, TunableSet};
+
+/// The scan-`W` candidate set the SCAN tuner sweeps (`CubeDim::new_1d(W)`,
+/// `CubeCount = ceil(n_slots / W)`). Each entry is clamped `[1, 256]` (a wavefront is
+/// 32/64 lanes; `>256` just wastes a too-large cube). spike-021 found `W=64` the robust
+/// ~3× knee on the 8-CU APU; the SET only needs to SPAN the occupancy regimes
+/// (`{32,64,128,256}`) so the tuner re-derives the per-GPU winner on any future GPU
+/// (measure-don't-model). `W=1` is intentionally NOT in the set — it is the
+/// one-cube-per-feature degenerate the lever exists to AVOID; it stays reachable as the
+/// `LGBM_SCAN_CUBEDIM=1` / non-rocm bit-exact oracle.
+#[cfg(feature = "rocm")]
+const SCAN_WSET: &[u32] = &[32, 64, 128, 256];
+
+/// The SINGLE-LEAF SCAN cache namespace — `local_tuner!("scan")` ⇒
+/// `LocalTuner<LaunchKey, String>`, distinct from the build tuner's `"build"` namespace
+/// (13-02). Holds the persistent key→fastest_index map (mirrored to disk via `std_io`).
+#[cfg(feature = "rocm")]
+static SCAN_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan");
+
+/// The CO-PACK 2-slot sibling-scan cache namespace (the phase-12 sibling-scan launcher).
+/// A SEPARATE tuner from [`SCAN_TUNER`] so the two kernel families never share a cache
+/// entry — their [`LaunchKey`] would otherwise collide on `(0, feats, bins)` yet
+/// benchmark different kernels. Each tuner caches its own winner over the SHARED
+/// [`SCAN_WSET`] (same `W` ordering ⇒ same `fastest_index`→`W` mapping).
+#[cfg(feature = "rocm")]
+static SCAN_SIBLINGS_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan_siblings");
+
+/// Launch the SINGLE-LEAF fused split-scan ([`find_best_splits_fused_kernel`]) once at a
+/// fixed `W`, reading the ordered handle slice
+/// `[hist, out, slot, numbin, offset, defbin, skip, rev, fwd]`. Mirrors the production
+/// launch site EXACTLY (same kernel, `CubeCount=ceil(n/W)`, `CubeDim(W)`, same arg
+/// order/sizes) — only the handles arrive via a slice instead of named locals. This is
+/// the single launcher the SCAN tuner's WSET variants call (one per `W`); keep it in
+/// sync with the in-place fallback launch in [`find_best_splits_fused_inner`].
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn launch_scan_at<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    w: u32,
+    n: usize,
+    buf_len: usize,
+    out_len: usize,
+    inputs: &[cubecl::server::Handle],
+    use_l1: bool,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) {
+    let cube_count = (n as u32).div_ceil(w);
+    // SAFETY: identical to the production in-place launch — every per-feature region is
+    // host-validated `<= buf_len`, the `out` window is within `out_len`, and all index
+    // arrays are sized `n`. All cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        find_best_splits_fused_kernel::launch(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(w),
+            ArrayArg::from_raw_parts(inputs[0].clone(), buf_len),
+            ArrayArg::from_raw_parts(inputs[1].clone(), out_len),
+            ArrayArg::from_raw_parts(inputs[2].clone(), n),
+            ArrayArg::from_raw_parts(inputs[3].clone(), n),
+            ArrayArg::from_raw_parts(inputs[4].clone(), n),
+            ArrayArg::from_raw_parts(inputs[5].clone(), n),
+            ArrayArg::from_raw_parts(inputs[6].clone(), n),
+            ArrayArg::from_raw_parts(inputs[7].clone(), n),
+            ArrayArg::from_raw_parts(inputs[8].clone(), n),
+            if use_l1 { 1u32 } else { 0u32 },
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            n as u32,
+        );
+    }
+}
+
+/// Build the SCAN-tuner [`TunableSet`] for ONE single-leaf split-scan call: one
+/// [`Tunable`] per `W` in [`SCAN_WSET`] (each launching [`find_best_splits_fused_kernel`]
+/// at that `W` via [`launch_scan_at`]), keyed
+/// `LaunchKey { bucket: 0, feats: n, bins: num_bins }`.
+///
+/// `bucket: 0` (NOT `size_band(rows)`): the scan width depends on the feature/bin SHAPE
+/// (how many sequential per-feature scans pack into a wave), NOT the per-leaf row count —
+/// so the key is STABLE across a train and the cache amortizes without a per-leaf tuning
+/// storm (spike-039). `num_bins` is the widest feature's bin count (the per-feature
+/// slot-width driver, matching 13-02's `bins`).
+///
+/// `CloneInputGenerator` is CORRECT here (spike-038 OVERWRITE class): the scan kernel
+/// WRITES each feature's 12-cell `out` window FRESH every run (a `store`, NOT the
+/// accumulating BUILD kernel's `fetch_add`), so re-running a benchmark rep on the shared
+/// `out` handle recomputes the IDENTICAL window. Do NOT "fix" this to a fresh-output
+/// generator — that is only needed for the accumulating build (`FreshOutGenerator`,
+/// histogram.rs). The set is rebuilt fresh per call (the dims bake into the closures);
+/// the persistent winner lives in [`SCAN_TUNER`]'s key state, not here.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn scan_wset_tunable_set<R: cubecl::Runtime>(
+    client: cubecl::prelude::ComputeClient<R>,
+    n: usize,
+    buf_len: usize,
+    out_len: usize,
+    num_bins: u32,
+    use_l1: bool,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) -> TunableSet<LaunchKey, Vec<cubecl::server::Handle>, ()> {
+    let kg = move |_: &Vec<cubecl::server::Handle>| LaunchKey {
+        bucket: 0,
+        feats: n as u32,
+        bins: num_bins,
+    };
+    let mut set = TunableSet::new(kg, CloneInputGenerator);
+    for &w in SCAN_WSET {
+        let w = w.clamp(1, 256);
+        let c = client.clone();
+        set = set.with(Tunable::new(
+            &format!("scan_W{w}"),
+            move |inputs: Vec<cubecl::server::Handle>| {
+                launch_scan_at(
+                    &c,
+                    w,
+                    n,
+                    buf_len,
+                    out_len,
+                    &inputs,
+                    use_l1,
+                    min_data_in_leaf,
+                    min_sum_hessian_in_leaf,
+                    lambda_l1,
+                    lambda_l2,
+                    min_gain_shift,
+                    sum_gradient,
+                    sum_hessian,
+                    num_data,
+                );
+                Ok::<(), String>(())
+            },
+        ));
+    }
+    set
+}
+
+/// Launch the CO-PACK 2-slot sibling split-scan
+/// ([`find_best_splits_fused_siblings_kernel`]) once at a fixed `W`, reading the ordered
+/// handle slice `[hist_a, hist_b, out, slot, numbin, offset, defbin, skip, rev, fwd]`.
+/// Mirrors the production co-pack launch site EXACTLY (`CubeCount=ceil(2n/W)`,
+/// `CubeDim(W)`). The two leaf-scalar SETS (A = smaller, B = larger sibling) are passed
+/// explicitly. Same OVERWRITE class as the single-leaf scan.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn launch_scan_siblings_at<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    w: u32,
+    n: usize,
+    buf_len: usize,
+    out_len: usize,
+    inputs: &[cubecl::server::Handle],
+    use_l1: bool,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+) {
+    // CubeCount over 2*n feature-slots (the lane mapping packs A then B).
+    let cube_count = (2 * n as u32).div_ceil(w);
+    // SAFETY: identical to the production co-pack launch — both histogram handles
+    // describe `buf_len` f64 cells, every per-feature region is host-validated, the `out`
+    // window is within `out_len = 2*n*12`, and all index arrays are sized `n`. cubecl
+    // unsafe confined here (CMP-01).
+    unsafe {
+        find_best_splits_fused_siblings_kernel::launch(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(w),
+            ArrayArg::from_raw_parts(inputs[0].clone(), buf_len),
+            ArrayArg::from_raw_parts(inputs[1].clone(), buf_len),
+            ArrayArg::from_raw_parts(inputs[2].clone(), out_len),
+            ArrayArg::from_raw_parts(inputs[3].clone(), n),
+            ArrayArg::from_raw_parts(inputs[4].clone(), n),
+            ArrayArg::from_raw_parts(inputs[5].clone(), n),
+            ArrayArg::from_raw_parts(inputs[6].clone(), n),
+            ArrayArg::from_raw_parts(inputs[7].clone(), n),
+            ArrayArg::from_raw_parts(inputs[8].clone(), n),
+            ArrayArg::from_raw_parts(inputs[9].clone(), n),
+            if use_l1 { 1u32 } else { 0u32 },
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift_a,
+            sum_gradient_a,
+            sum_hessian_a,
+            num_data_a,
+            min_gain_shift_b,
+            sum_gradient_b,
+            sum_hessian_b,
+            num_data_b,
+            n as u32,
+        );
+    }
+}
+
+/// Build the SCAN-tuner [`TunableSet`] for ONE co-pack 2-slot sibling-scan call: one
+/// [`Tunable`] per `W` in [`SCAN_WSET`] (each launching
+/// [`find_best_splits_fused_siblings_kernel`] at that `W` via [`launch_scan_siblings_at`]),
+/// keyed `LaunchKey { bucket: 0, feats: n, bins: num_bins }`. Same OVERWRITE class /
+/// `CloneInputGenerator` rationale as [`scan_wset_tunable_set`]; executed under the
+/// SEPARATE [`SCAN_SIBLINGS_TUNER`] namespace.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn scan_wset_siblings_tunable_set<R: cubecl::Runtime>(
+    client: cubecl::prelude::ComputeClient<R>,
+    n: usize,
+    buf_len: usize,
+    out_len: usize,
+    num_bins: u32,
+    use_l1: bool,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+) -> TunableSet<LaunchKey, Vec<cubecl::server::Handle>, ()> {
+    let kg = move |_: &Vec<cubecl::server::Handle>| LaunchKey {
+        bucket: 0,
+        feats: n as u32,
+        bins: num_bins,
+    };
+    let mut set = TunableSet::new(kg, CloneInputGenerator);
+    for &w in SCAN_WSET {
+        let w = w.clamp(1, 256);
+        let c = client.clone();
+        set = set.with(Tunable::new(
+            &format!("scan_sib_W{w}"),
+            move |inputs: Vec<cubecl::server::Handle>| {
+                launch_scan_siblings_at(
+                    &c,
+                    w,
+                    n,
+                    buf_len,
+                    out_len,
+                    &inputs,
+                    use_l1,
+                    min_data_in_leaf,
+                    min_sum_hessian_in_leaf,
+                    lambda_l1,
+                    lambda_l2,
+                    min_gain_shift_a,
+                    sum_gradient_a,
+                    sum_hessian_a,
+                    num_data_a,
+                    min_gain_shift_b,
+                    sum_gradient_b,
+                    sum_hessian_b,
+                    num_data_b,
+                );
+                Ok::<(), String>(())
+            },
+        ));
+    }
+    set
+}
+// ================== end phase-13 (13-03): SCAN-W autotune ====================
+
 /// FUSED per-leaf batched best-split kernel (260608-mc5 THE COLLAPSE). ONE launch
 /// finds EVERY feature's best split for a leaf: lane `f` (`ABSOLUTE_POS`, guarded
 /// `< n_feats`) scans only its `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of
