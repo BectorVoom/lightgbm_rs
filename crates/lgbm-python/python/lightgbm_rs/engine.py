@@ -293,6 +293,10 @@ def train(
             nm = names[i] if i < len(names) else f"valid_{i}"
             eval_sets.append((nm, np.ascontiguousarray(Xi, dtype=np.float64), np.asarray(yi, dtype=np.float64)))
 
+    if not callbacks and not eval_sets:
+        result = _core.train(params, train_set, num_boost_round=num_boost_round, fobj=fobj, feval=feval)
+        return _TrainedBooster(result, params, best_iteration=-1)
+
     best_booster: Optional[_core.Booster] = None
     best_iteration = -1
     last_booster: Optional[_core.Booster] = None
