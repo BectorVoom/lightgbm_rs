@@ -73,3 +73,27 @@ platform builds BEFORE pushing a real tag.
 ## Out of scope
 - GPU wheels (`--features cuda/rocm/wgpu`) — need a toolkit/hardware; not in this pipeline.
 - Linux aarch64 (cross-compile + bundler cross-availability unknown).
+
+## First real run (tag v0.0.4) + fixes (commit 2d088aa)
+
+Outcome of run 28287143278: **sdist ✓, macOS arm64 ✓, macOS x86_64 ✓, Windows ✓, linux ✗**.
+
+- **linux FAILED** — the predicted glibc risk materialized. The `tracel-llvm-bundler`
+  prebuilt `llvm-config` needs `GLIBC_2.34` + `GLIBCXX_3.4.29`, but `manylinux_2_28`
+  (glibc 2.28) is too old: `llvm-config: /lib64/libc.so.6: version 'GLIBC_2.34' not found`.
+  **Fix:** container → `manylinux_2_34` (AlmaLinux 9, glibc 2.34 + GCC 11 libstdc++) —
+  covers GLIBC_2.32/2.33/2.34 + GLIBCXX_3.4.29; PyPI accepts the manylinux_2_34 tag.
+- **Node 20 deprecation WARNINGS** on every job. **Fix:** bumped to Node-24 majors —
+  `checkout@v5`, `setup-python@v6`, `upload-artifact@v5`, `download-artifact@v5`
+  (upload/download kept same-major for guaranteed interop).
+
+macOS + Windows already build fine (the bundler's prebuilt LLVM is compatible there).
+
+### Still pending (yours)
+- The fix is committed locally — **push `master`** and re-run (manual `workflow_dispatch`
+  recommended) to confirm the linux job goes green.
+- The publish (`release`) job didn't run (it `needs` linux). Before it can publish you still
+  need the one-time **PyPI Trusted Publisher** setup above.
+- The `v0.0.4` tag builds wheels labelled `0.1.0` (version is `dynamic` from
+  `crates/lgbm-python/Cargo.toml`, not the tag). Bump that `version` to match before a real
+  publish tag, or PyPI will reject the upload.
