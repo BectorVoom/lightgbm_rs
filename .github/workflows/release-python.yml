@@ -57,36 +57,32 @@ jobs:
           rust-toolchain: "1.95.0"
           args: --release --out dist ${{ env.MANIFEST }}
           sccache: "true"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-x86_64
           path: dist
 
   macos:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-13 # Intel
-            target: x86_64
-          - runner: macos-14 # Apple Silicon
-            target: aarch64
+    # Apple Silicon (arm64) only. GitHub is retiring the Intel `macos-13` runner, so an
+    # x86_64 job hangs indefinitely waiting for an unavailable runner. Intel-Mac users
+    # install from the sdist (build-from-source). Cross-compiling x86_64 on this arm64
+    # runner was rejected: the tracel-llvm-bundler cross path is unverified/risky.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: Build wheels (macOS ${{ matrix.target }})
+      - name: Build wheels (macOS aarch64)
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: aarch64
           rust-toolchain: "1.95.0"
           args: --release --out dist ${{ env.MANIFEST }}
           sccache: "true"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
-          name: wheels-macos-${{ matrix.target }}
+          name: wheels-macos-aarch64
           path: dist
 
   windows:
@@ -104,7 +100,7 @@ jobs:
           rust-toolchain: "1.95.0"
           args: --release --out dist ${{ env.MANIFEST }}
           sccache: "true"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-windows-x64
           path: dist
@@ -118,7 +114,7 @@ jobs:
         with:
           command: sdist
           args: --out dist ${{ env.MANIFEST }}
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: dist
@@ -135,7 +131,7 @@ jobs:
       id-token: write # OIDC token for Trusted Publishing
     steps:
       - name: Collect all wheels + sdist
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: wheels-*
