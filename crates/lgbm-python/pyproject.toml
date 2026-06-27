@@ -29,6 +29,13 @@ pandas = ["pandas"]
 plotting = ["graphviz", "matplotlib"]
 
 [tool.maturin]
+# GPU wheels are opt-in via cargo features forwarded to `lgbm` (see Cargo.toml
+# `[features]`). The default build is CPU-only; build a CUDA wheel (NVIDIA host
+# with the CUDA toolkit, e.g. Colab/Kaggle) with:
+#   maturin build --release --features cuda
+# then Python `device_type="cuda"` dispatches to the CudaBackend. (rocm/wgpu
+# analogous.) CLI `--features` merge with the `pyo3/extension-module` below.
+#
 # The thin pure-Python package lives under python/; the compiled engine is
 # nested as `lightgbm_rs._core` (D-11/D-12).
 python-source = "python"

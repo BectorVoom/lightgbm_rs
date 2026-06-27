@@ -4,6 +4,17 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# GPU backends are opt-in and FORWARD to the `lgbm` crate's compile-time backend
+# selection (booster.rs cascade: rocm > cuda > wgpu > cpu). The default wheel is
+# CPU-only. Without this forwarding the extension module can NEVER include a GPU
+# backend, so Python `device_type="cuda"` has nothing to dispatch to.
+# Build a CUDA wheel with:  maturin build --release --features cuda
+default = []
+rocm = ["lgbm/rocm"]
+cuda = ["lgbm/cuda"]
+wgpu = ["lgbm/wgpu"]
+
 [dependencies]
 lgbm = { path = "../lgbm" }
 lgbm-core = { path = "../lgbm-core" }
