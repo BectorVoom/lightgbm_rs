@@ -949,7 +949,7 @@ pub fn find_best_splits_batched_f64_on<R: cubecl::Runtime>(
 /// W=64 = 1 cube/CU × 2 waves at 500 feats — the robust ~3× knee, not over-fit to
 /// W=128's APU-specific latency-hiding peak. APU-confounded magnitude; the SIGN is the
 /// deliverable (CONVENTIONS). Override with `LGBM_SCAN_CUBEDIM`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 const SCAN_CUBE_DIM_DEFAULT: u32 = 64;
 
 /// Scan cube width W (env `LGBM_SCAN_CUBEDIM`, default [`SCAN_CUBE_DIM_DEFAULT`]).
@@ -957,7 +957,7 @@ const SCAN_CUBE_DIM_DEFAULT: u32 = 64;
 /// W=1 reproduces the original one-cube-per-feature launch byte-for-byte. Clamped to
 /// `[1, 256]` (a wavefront is 32/64 lanes; >256 just wastes a too-large cube). Parse
 /// failures or 0 fall back to the default — never a no-launch.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 fn scan_cube_dim() -> u32 {
     std::env::var("LGBM_SCAN_CUBEDIM")
         .ok()
@@ -970,7 +970,7 @@ fn scan_cube_dim() -> u32 {
 /// Non-rocm builds (cubecl-cpu oracle parity path) keep W=1 unconditionally — the
 /// occupancy lever is a GPU-only concern and the bit-exact gate must not depend on
 /// an env var.
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(feature = "gpu"))]
 fn scan_cube_dim() -> u32 {
     1
 }
@@ -985,9 +985,9 @@ fn scan_cube_dim() -> u32 {
 // regime. Default-ON on rocm; `LGBM_AUTOTUNE=0` and an explicit `LGBM_SCAN_CUBEDIM`
 // both fall back to `scan_cube_dim()` (the documented bound + the 13-04 all-W parity
 // seam). Mirrors the 13-02 build-`P` machinery in `histogram.rs`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 use crate::kernels::autotune::{self, LaunchKey};
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 use cubecl::tune::{local_tuner, CloneInputGenerator, LocalTuner, Tunable, TunableSet};
 
 /// The scan-`W` candidate set the SCAN tuner sweeps (`CubeDim::new_1d(W)`,
@@ -1003,13 +1003,13 @@ use cubecl::tune::{local_tuner, CloneInputGenerator, LocalTuner, Tunable, Tunabl
 /// SAME source of truth it sweeps (WR-02): a hand-copied mirror would silently stop
 /// covering a newly-added `W`. Stays `#[cfg(feature = "rocm")]` so the default build is
 /// byte-unchanged.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub const SCAN_WSET: &[u32] = &[32, 64, 128, 256];
 
 /// The SINGLE-LEAF SCAN cache namespace — `local_tuner!("scan")` ⇒
 /// `LocalTuner<LaunchKey, String>`, distinct from the build tuner's `"build"` namespace
 /// (13-02). Holds the persistent key→fastest_index map (mirrored to disk via `std_io`).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 static SCAN_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan");
 
 /// The CO-PACK 2-slot sibling-scan cache namespace (the phase-12 sibling-scan launcher).
@@ -1017,7 +1017,7 @@ static SCAN_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan");
 /// entry — their [`LaunchKey`] would otherwise collide on `(0, feats, bins)` yet
 /// benchmark different kernels. Each tuner caches its own winner over the SHARED
 /// [`SCAN_WSET`] (same `W` ordering ⇒ same `fastest_index`→`W` mapping).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 static SCAN_SIBLINGS_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan_siblings");
 
 /// Launch the SINGLE-LEAF fused split-scan ([`find_best_splits_fused_kernel`]) once at a
@@ -1027,7 +1027,7 @@ static SCAN_SIBLINGS_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan_s
 /// order/sizes) — only the handles arrive via a slice instead of named locals. This is
 /// the single launcher the SCAN tuner's WSET variants call (one per `W`); keep it in
 /// sync with the in-place fallback launch in [`find_best_splits_fused_inner`].
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn launch_scan_at<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1096,7 +1096,7 @@ fn launch_scan_at<R: cubecl::Runtime>(
 /// generator — that is only needed for the accumulating build (`FreshOutGenerator`,
 /// histogram.rs). The set is rebuilt fresh per call (the dims bake into the closures);
 /// the persistent winner lives in [`SCAN_TUNER`]'s key state, not here.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn scan_wset_tunable_set<R: cubecl::Runtime>(
     client: cubecl::prelude::ComputeClient<R>,
@@ -1156,7 +1156,7 @@ fn scan_wset_tunable_set<R: cubecl::Runtime>(
 /// Mirrors the production co-pack launch site EXACTLY (`CubeCount=ceil(2n/W)`,
 /// `CubeDim(W)`). The two leaf-scalar SETS (A = smaller, B = larger sibling) are passed
 /// explicitly. Same OVERWRITE class as the single-leaf scan.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn launch_scan_siblings_at<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1224,7 +1224,7 @@ fn launch_scan_siblings_at<R: cubecl::Runtime>(
 /// keyed `LaunchKey { bucket: 0, feats: n, bins: num_bins }`. Same OVERWRITE class /
 /// `CloneInputGenerator` rationale as [`scan_wset_tunable_set`]; executed under the
 /// SEPARATE [`SCAN_SIBLINGS_TUNER`] namespace.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn scan_wset_siblings_tunable_set<R: cubecl::Runtime>(
     client: cubecl::prelude::ComputeClient<R>,
@@ -1778,13 +1778,13 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     //   (b) else → the EXISTING `scan_cube_dim()` direct launch, byte-for-byte unchanged
     //       (covers `LGBM_AUTOTUNE=0`, an explicit `LGBM_SCAN_CUBEDIM`, and the non-rocm
     //       `scan_cube_dim()==1` bit-exact oracle path).
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "gpu")]
     let autotuned =
         autotune::autotune_enabled() && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(feature = "gpu"))]
     let autotuned = false;
 
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "gpu")]
     if autotuned {
         // The widest feature's bin count drives the per-feature slot width (the scan key
         // shape; bucket=0 since W tracks the feature/bin shape, not the row count).
@@ -2112,13 +2112,13 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     // SAME OVERWRITE class (each lane writes a fresh 12-cell window), so its tunable set
     // also uses CloneInputGenerator; it runs under the SEPARATE `SCAN_SIBLINGS_TUNER`
     // namespace so its cache never collides with the single-leaf scan's.
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "gpu")]
     let autotuned =
         autotune::autotune_enabled() && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(feature = "gpu"))]
     let autotuned = false;
 
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "gpu")]
     if autotuned {
         let num_bins = num_bin_a.iter().copied().max().unwrap_or(0).max(0) as u32;
         let handles: Vec<cubecl::server::Handle> = vec![

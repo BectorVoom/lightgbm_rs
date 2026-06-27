@@ -243,7 +243,7 @@ pub fn subtract_histograms_cpu_native(
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] if `len == 0` (degenerate — no cells to subtract).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn subtract_histograms_f64_from_handles_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     parent: cubecl::server::Handle,

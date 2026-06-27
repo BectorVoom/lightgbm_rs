@@ -1120,14 +1120,15 @@ fn train_inner_columns_full(
     let backend = RocmBackend::default();
     #[cfg(feature = "rocm")]
     let client = rocm_client();
-    // CudaBackend/WgpuBackend are stateless unit structs (like CpuBackend) — they
-    // inherit the trait-default per-leaf host-gather path (no resident pool).
+    // CudaBackend/WgpuBackend are `GpuBackend<R>` aliases (quick-260627-qxl) carrying
+    // the SAME on-device resident histogram pool RocmBackend uses — `::default()`
+    // enables residency, reaching ROCm-parity speed.
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
-    let backend = CudaBackend;
+    let backend = CudaBackend::default();
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     let client = cuda_client();
     #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
-    let backend = WgpuBackend;
+    let backend = WgpuBackend::default();
     #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
     let client = wgpu_client();
     let gain = GainConfig::from_config(config);

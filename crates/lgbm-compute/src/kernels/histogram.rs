@@ -431,7 +431,7 @@ pub fn construct_histograms_f32_on<R: cubecl::Runtime>(
 /// chain, so the plane arm is expected to stay well inside the existing envelope.
 /// This kernel does NOT touch the CPU f64 anchor ([`construct_hist_kernel`] /
 /// [`construct_hist_kernel_f32`]) and widens no tolerance. `#[cfg(feature="rocm")]`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn construct_hist_kernel_atomic_f32_plane(
     binned: &Array<u32>,
@@ -554,7 +554,7 @@ pub fn construct_hist_kernel_atomic_f32_plane(
 ///
 /// # Errors
 /// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn construct_histograms_parallel_f32_plane_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     binned: &[u32],
@@ -631,7 +631,7 @@ const HIST_LDS_MAX: usize = 512;
 /// bits while leaving the i64 magnitude safe to ~1e9 rows × |g| ≤ 8 (spike-018b). The
 /// build-side constant is f32 (the quantize multiplies the f32 `ord_g`/`ord_h`); the
 /// dequant-side `SCALE_F64` (in `fix_compact_kernel`) is the same value in f64.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 const SCALE_F32: f32 = 1_073_741_824.0; // 2^30
 
 /// Row-partition (`grid_dim_y` analog) tuning — spike-007 (`.planning/spikes/007-*`).
@@ -645,19 +645,19 @@ const SCALE_F32: f32 = 1_073_741_824.0; // 2^30
 /// kernel). Well above the `RESIDENT_MIN_NUM_DATA=12_000` resident gate and the ≤8k-row
 /// parity-test shapes, so every existing parity test runs the unchanged `P=1` path — the
 /// large-leaf f32 divergence the spike found (4e-7→~2e-5 rel) only appears above this gate.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 const ROWPART_MIN_LEAF: usize = 256_000;
 /// Target cubes per Compute Unit — preserves spike-007's "~8 workgroups/CU" intent.
 /// `target_cubes = num_cu * CUBES_PER_CU` (queried at runtime, cached once).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 const CUBES_PER_CU: u32 = 8;
 /// Documented safe small default for an APU-class device when EVERY CU-count query
 /// fails — explicitly NOT 768 (which was the phantom-96-CU value: `8 wkgrps × 96 CU`).
 /// 64 = `8 wkgrps × 8 CU`, matching the real 8-CU Radeon 860M APU on this box.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 const ROWPART_TARGET_CUBES_FALLBACK: u32 = 64;
 /// Spike-007 sweet spot; clamp so we never over-partition into the P=32 regression.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 const ROWPART_P_MAX: u32 = 16;
 
 /// Pure resolution of the row-partition target-cubes value, factored out so it is
@@ -669,7 +669,7 @@ const ROWPART_P_MAX: u32 = 16;
 ///       literal target (NOT multiplied by `CUBES_PER_CU`); this is the A/B benching knob.
 ///   (b) queried device CU count → `num_cu * CUBES_PER_CU`.
 ///   (c) `ROWPART_TARGET_CUBES_FALLBACK` (never a silent 768).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 fn resolve_target_cubes(env_override: Option<u32>, queried_cu: Option<u32>) -> u32 {
     match (env_override, queried_cu) {
         (Some(t), _) if t > 0 => t,
@@ -686,6 +686,13 @@ fn resolve_target_cubes(env_override: Option<u32>, queried_cu: Option<u32>) -> u
 ///    cuda and possibly future hip. Used FIRST when `Some(n>0)`.
 /// 2. else FFI fallback: read `hipGetDevicePropertiesR0600().multiProcessorCount` for
 ///    device ordinal 0 (matching `rocm_client`'s `AmdDevice::new(0)`).
+///
+/// HIP-specific (the FFI fallback uses `cubecl_hip_sys`, a rocm-only dep), so this stays
+/// `#[cfg(feature = "rocm")]`. Non-rocm GPU backends (cuda/wgpu) use the
+/// [`ROWPART_TARGET_CUBES_FALLBACK`] heuristic via the `None`-returning twin below
+/// (quick-260627-qxl) — the resident pool is the parity win; CU-derived row-partition
+/// tuning is a perf refinement a CUDA build can add later by reading the cubecl-reported
+/// `num_streaming_multiprocessors` (populated on cuda).
 #[cfg(feature = "rocm")]
 fn query_num_cu() -> Option<u32> {
     // (1) cubecl's forward-compatible value (None on cubecl-hip 0.10, populated on cuda).
@@ -714,6 +721,15 @@ fn query_num_cu() -> Option<u32> {
     None
 }
 
+/// Non-rocm GPU twin (quick-260627-qxl): cuda/wgpu have no `cubecl_hip_sys`, so the
+/// CU-count query returns `None` and [`rowpart_target_cubes`] falls back to
+/// [`ROWPART_TARGET_CUBES_FALLBACK`]. Correct (the resident pool is the parity win);
+/// a CUDA build can later read `num_streaming_multiprocessors` for a tuned target.
+#[cfg(all(feature = "gpu", not(feature = "rocm")))]
+fn query_num_cu() -> Option<u32> {
+    None
+}
+
 /// The row-partition target-cubes value, queried at most ONCE per process and cached
 /// (`row_partition_count` runs per leaf, so the FFI CU-count query must not repeat —
 /// T-jcr-02). Resolution: env override → queried CU count × `CUBES_PER_CU` → FALLBACK
@@ -724,7 +740,7 @@ fn query_num_cu() -> Option<u32> {
 /// 96-CU gfx1100). Changing `P` alters the f32 partial-sum grouping (spike-007: `P≥2`
 /// widens GPU-vs-`P=1` divergence to ~2e-5, WITHIN the ~1e-6-best-effort ROCm gate — the
 /// GPU path was never bit-exact; the cpu f64 anchor is untouched).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 fn rowpart_target_cubes() -> u32 {
     static TARGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *TARGET.get_or_init(|| {
@@ -740,7 +756,7 @@ fn rowpart_target_cubes() -> u32 {
 /// `target_cubes` value is the runtime, CU-count-derived [`rowpart_target_cubes`] (cached).
 /// Pure CPU logic otherwise — no per-call device handle — so it is unit-testable with a
 /// forced target.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
     let min_leaf = std::env::var("LGBM_ROWPART_MIN")
         .ok()
@@ -914,7 +930,7 @@ pub fn construct_histograms_lds_f32_on<R: cubecl::Runtime>(
 ///
 /// f32 atomics + nondeterministic order ⇒ the ~1e-6 ROCm gate (cpu anchor stays
 /// bit-exact). `#[cfg(feature="rocm")]`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn construct_leaf_hist_batched_kernel(
     gathered_bins: &Array<u32>,
@@ -943,7 +959,7 @@ pub fn construct_leaf_hist_batched_kernel(
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] on a degenerate layout (mismatched lengths).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     feature_bins: &[&[u32]],
@@ -1069,7 +1085,7 @@ pub fn build_leaf_histograms_batched_f32_on<R: cubecl::Runtime>(
 /// `num_data` is the resident column stride (the full train row count) passed as a
 /// scalar launch arg. Same f32-atomic accumulation ⇒ the ~1e-6 ROCm gate (cpu
 /// anchor stays bit-exact). `#[cfg(feature="rocm")]`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn construct_leaf_hist_resident_kernel<B: Int>(
     resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
@@ -1108,7 +1124,7 @@ pub fn construct_leaf_hist_resident_kernel<B: Int>(
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] on a degenerate layout (mismatched lengths).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1173,7 +1189,7 @@ pub fn build_leaf_histograms_resident_f32_on<R: cubecl::Runtime>(
 /// LDS resident RAW build: one cube per feature, gathers bins from the resident
 /// column on device (`resident_bins[f*num_data + leaf_rows[k]]`). `slot_off` has
 /// `num_features + 1` entries (sentinel = slot_len).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
@@ -1245,7 +1261,7 @@ pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
 /// fails at runtime). LDS stays `HIST_LDS_MAX` cells (same element COUNT, 2× bytes =
 /// 4 KiB/cube, well within the 64 KiB budget). f64 atomics not needed — the wide i64
 /// accumulator IS the precision win (~3600× better than f32 atomics, spike-018a).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
@@ -1299,7 +1315,7 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
 
 /// LDS batched RAW build: one cube per feature, reads host-gathered bins
 /// (`gathered_bins[f*R + k]`). `slot_off` has `num_features + 1` entries (sentinel).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn construct_leaf_hist_batched_lds_kernel(
     gathered_bins: &Array<u32>, // [num_features * R], feature-major (f*R + k)
@@ -1382,7 +1398,7 @@ pub fn construct_leaf_hist_batched_lds_kernel(
 /// accumulate, then a single global atomic flush per cell. `slot_off` has
 /// `num_features + 1` entries (sentinel = slot_len) so cube `f` reads its feature's
 /// width `slot_off[f+1] - slot_off[f] = 2*num_bin[f]`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_hist_cuda_mirror_kernel(
@@ -1465,7 +1481,7 @@ pub fn construct_hist_cuda_mirror_kernel(
 /// - [`ComputeError::BinIndexOutOfRange`] if any leaf row's bin `>= num_bin`.
 /// - [`ComputeError::Runtime`] on a degenerate layout, an out-of-range data index,
 ///   or `num_bin > 256` (LDS cap).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_histograms_cuda_mirror_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1624,7 +1640,7 @@ pub fn construct_histograms_cuda_mirror_on<R: cubecl::Runtime>(
 /// - [`ComputeError::Runtime`] on a degenerate layout (`slot_off.len() != num_features`,
 ///   `num_features == 0` with a non-empty leaf), an out-of-range `data_index`, or
 ///   `num_bin > 256` (LDS cap).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_histograms_cuda_mirror_resident_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1726,7 +1742,7 @@ pub fn construct_histograms_cuda_mirror_resident_on<R: cubecl::Runtime>(
 /// Build the sentinel `slot_off` (`num_features + 1` entries, final = `slot_len`)
 /// and the max per-feature slot width. LDS is eligible iff the widest feature fits
 /// `HIST_LDS_MAX` (≤ 256 bins).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
     let mut s: Vec<u32> = Vec::with_capacity(slot_off.len() + 1);
     for &o in slot_off {
@@ -1768,9 +1784,9 @@ fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
 // `fastest_index` maps to the same `P` regardless of which call rebuilt the set.
 // ===========================================================================
 
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 use crate::kernels::autotune::{self, LaunchKey};
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 use cubecl::tune::{local_tuner, InputGenerator, LocalTuner, Tunable, TunableSet, TuneInputs};
 
 /// The row-partition candidate set the BUILD tuner sweeps. Each entry `> ROWPART_P_MAX`
@@ -1783,12 +1799,12 @@ use cubecl::tune::{local_tuner, InputGenerator, LocalTuner, Tunable, TunableSet,
 /// SAME source of truth it sweeps (WR-02): a hand-copied mirror would silently stop
 /// covering a newly-added `P`. Stays `#[cfg(feature = "rocm")]` so the default build is
 /// byte-unchanged.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub const BUILD_PSET: &[u32] = &[1, 4, 8, 16, 32];
 
 /// The BUILD cache namespace — `local_tuner!("build")` ⇒ `LocalTuner<LaunchKey, String>`.
 /// Holds the persistent key→fastest_index map (and mirrors it to disk via `std_io`).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 static BUILD_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build");
 
 /// The `LGBM_AUTOTUNE_FORCE_P` debug/parity seam (consumed by 13-04's all-variants
@@ -1796,7 +1812,7 @@ static BUILD_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build");
 /// `OnceLock`) so a parity test can pin a single `P` per-launch within one process.
 /// `Some(k)` clamps `k` to `[1, ROWPART_P_MAX]`; non-numeric / `0` / unset ⇒ `None`
 /// (fall through to autotune, then the heuristic) — NEVER a no-launch (T-13-02-01).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 fn force_row_partition() -> Option<u32> {
     std::env::var("LGBM_AUTOTUNE_FORCE_P")
         .ok()
@@ -1822,7 +1838,7 @@ fn force_row_partition() -> Option<u32> {
 /// `[0, num_data)`, `resident_bins.len() == num_features*num_data`, `slot_off` sentinel,
 /// `out` sized `slot_len`), so `launch_unchecked` (dropping bounds-check codegen) is sound
 /// and numerically identical (NRW-01 / CMP-01). All cubecl unsafe is confined here.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn launch_build_at<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1893,14 +1909,14 @@ fn launch_build_at<R: cubecl::Runtime>(
 /// every variant accumulate into the REAL `out` ⇒ N× corruption. The fresh buffer is
 /// `u64` zeros for the fixed-point build (`Atomic<u64>` cells) or `f32` zeros for the
 /// f32 build — sized `slot_len`, matching the `out` the caller allocated.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 struct FreshOutGenerator<R: cubecl::Runtime> {
     client: cubecl::prelude::ComputeClient<R>,
     slot_len: usize,
     fixed_point: bool,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 impl<R: cubecl::Runtime> InputGenerator<LaunchKey, Vec<cubecl::server::Handle>>
     for FreshOutGenerator<R>
 {
@@ -1932,7 +1948,7 @@ impl<R: cubecl::Runtime> InputGenerator<LaunchKey, Vec<cubecl::server::Handle>>
 /// regime, spike-039), with a [`FreshOutGenerator`] so the accumulating build is
 /// benchmark-safe (spike-038). Rebuilt fresh each call (the dimensions bake into the
 /// closures); the persistent winner lives in [`BUILD_TUNER`]'s key state, not here.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn build_pset_tunable_set<R: cubecl::Runtime>(
     client: cubecl::prelude::ComputeClient<R>,
@@ -2013,7 +2029,7 @@ fn build_pset_tunable_set<R: cubecl::Runtime>(
 ///   3. else (`LGBM_AUTOTUNE=0`) → the [`row_partition_count`] heuristic + the existing
 ///      direct launch, byte-for-byte unchanged (the documented cold-start / fallback
 ///      bound). The NAIVE >256-bin path is NOT autotuned (single launch, unchanged).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn resident_raw_build_into<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -2312,7 +2328,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
 /// folding in the SAME ascending order as the host yields a BIT-IDENTICAL buffer.
 ///
 /// `#[cfg(feature="rocm")]` — the CPU anchor keeps the host fix+compact unchanged.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn fix_compact_kernel(
     // phase-11: u64 FIXED-POINT RAW histogram (u64 build-kernel output) — INPUT, read-only.
@@ -2436,7 +2452,7 @@ pub fn fix_compact_kernel(
 ///
 /// # Errors
 /// As above (length / overflow validation, V5).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     raw: &[f32],
@@ -2549,7 +2565,7 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
 /// caches internally, exposed for the resident-chain oracle so it can feed a raw
 /// Handle to [`build_fix_compact_resident_f64_on`] without naming `cubecl` types.
 /// All columns must share `num_data` (caller guarantees). `#[cfg(feature="rocm")]`.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn upload_resident_columns<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     feature_bins: &[&[u32]],
@@ -2587,7 +2603,7 @@ pub fn upload_resident_columns<R: cubecl::Runtime>(
 /// # Errors
 /// [`ComputeError::Runtime`] on a degenerate layout; propagates the same V5
 /// validation as [`fix_compact_f64_on`] / the resident build launcher.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -2762,7 +2778,7 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
 ///
 /// # Errors
 /// Same as [`build_fix_compact_resident_f64_on`].
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -2840,7 +2856,7 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 /// `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2); the
 /// 2*kEpsilon-BUMPED `sum_hessian_bumped` + the host `min_gain_shift` feed the SCAN
 /// (the distinct operands, matching `find_best_splits_fused_kernel`).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_scan_fused_kernel<B: Int>(
@@ -3018,7 +3034,7 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
 /// [`ComputeError::Runtime`] / [`ComputeError::LengthMismatch`] on degenerate
 /// layout (mirrors the fused split launcher's per-feature V5 checks + the leaf-level
 /// `sum_hessian > 0` / `max_delta_step`/`path_smooth` default-path checks).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,

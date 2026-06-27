@@ -32,13 +32,14 @@ serde = { version = "1", features = ["derive"], optional = true }
 # CPU-only build needs no ROCm toolchain present (SC#1, CMP-03 prep).
 default = ["cpu"]
 cpu = []
-# `gpu` is the umbrella feature every GPU backend turns on. It is what widens the
-# two LDS-construct items in `kernels/histogram.rs` (the `#[cube]` kernel + its
-# generic launcher) from rocm-only to "any GPU backend", so cuda/wgpu reuse the
-# SAME kernel without forking it. The rocm-only `cubecl_hip_sys` CU-count FFI stays
-# gated on `rocm`, NOT `gpu`.
-gpu = []
-rocm = ["cubecl/hip", "dep:cubecl-hip-sys", "dep:serde", "gpu"]
+# `gpu` is the umbrella feature every GPU backend turns on. It widens the resident
+# histogram pool + LDS/scan kernels + the `cubecl::tune` autotune module (quick-260627-qxl)
+# from rocm-only to "any GPU backend", so cuda/wgpu reuse the SAME generic `GpuBackend<R>`
+# code without forking it. `dep:serde` moves here (from `rocm`) because the autotune
+# persistent disk cache derives Serialize/Deserialize on `LaunchKey` and is now shared by
+# every GPU backend. The rocm-only `cubecl_hip_sys` CU-count FFI stays gated on `rocm`.
+gpu = ["dep:serde"]
+rocm = ["cubecl/hip", "dep:cubecl-hip-sys", "gpu"]
 # CUDA backend (cubecl-cuda / `cubecl::cuda::CudaRuntime`). `cuda`/`wgpu` are
 # sub-features of the already-vetted `cubecl 0.10.0` workspace dep — NO new
 # `[dependencies]` entry is added (no package-legitimacy gate applies).

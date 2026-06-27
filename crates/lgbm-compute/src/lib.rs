@@ -1968,7 +1968,7 @@ fn compact_histogram_inline(hist: &mut [f64], offset: i32) {
 /// uploaded at the NARROWEST uniform width covering every feature's `BinColumn` variant
 /// (widest variant present), so the resident-reading kernels dispatch the matching
 /// `<B: Int>` monomorphization. Mirrors the host `BinColumn` u8/u16/u32 axis (spike-004).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentBinWidth {
     U8,
@@ -1979,7 +1979,7 @@ pub enum ResidentBinWidth {
 /// The narrowest uniform width that holds every column = the WIDEST variant present
 /// (any U32 ⇒ U32; else any U16 ⇒ U16; else U8). A uniform width is required because the
 /// resident buffer is ONE concatenated `Array<B>`; narrower columns upcast into it.
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 pub fn resident_bin_width(cols: &[&BinColumn]) -> ResidentBinWidth {
     let mut w = ResidentBinWidth::U8;
     for c in cols {
@@ -2001,7 +2001,7 @@ pub fn resident_bin_width(cols: &[&BinColumn]) -> ResidentBinWidth {
 /// the ONE concatenated feature-column bin buffer's device `Handle` (feature-major,
 /// length `num_features * num_data`) + the dims to index it (`f * num_data + row`) +
 /// the native element `width`. `Handle` is cheaply clonable (ref-counted).
-#[cfg(feature = "rocm")]
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone)]
 struct ResidentBins {
     /// Concatenated feature-major bin columns: feature `f`'s row `r` is at
@@ -2014,132 +2014,27 @@ struct ResidentBins {
     width: ResidentBinWidth,
 }
 
-/// Define a minimal GPU backend (quick-260626-igc) that dispatches EXACTLY the four
-/// required `Backend` methods to the SAME runtime-generic kernels `RocmBackend` uses
-/// — `construct_histograms_lds_f32_on`, `find_best_split_f64_on`, `data_partition_on`,
-/// `subtract_histograms_f64_on`. No forked/portable kernels; every other `Backend`
-/// method inherits the trait default (exactly as `CpuBackend` leaves them). The body
-/// is the verbatim copy of `RocmBackend`'s four method bodies, minus the rocm-only
-/// resident-pool / CU-count-FFI overrides (out of the compile-only scope, decision #2).
+
+/// The generic GPU backend (quick-260627-qxl) — dispatches every hot-path op to the
+/// runtime-generic f64/f32 CubeCL kernels, carrying the on-device resident histogram
+/// pool. Parameterized by the CubeCL [`Runtime`](cubecl::Runtime) `R` so ONE
+/// implementation serves ROCm/HIP (`RocmBackend`), CUDA (`CudaBackend`), and WGPU
+/// (`WgpuBackend`) — see the type aliases below. The ROCm GPU parity gate validates
+/// this shared code on hardware; CUDA/WGPU inherit correctness by construction (same
+/// code, different `R`). Previously this was the hand-written `RocmBackend` plus a
+/// 4-method `gpu_core_backend!` macro for a pool-less CudaBackend/WgpuBackend; qxl
+/// hoisted the FULL resident surface into this one generic so cuda/wgpu reach speed
+/// parity.
 ///
-/// `$name` is the unit-struct backend, `$rt` its `Backend::Runtime`. The macro is
-/// itself `#[cfg(any(feature = "cuda", feature = "wgpu"))]` so the default cpu build
-/// emits no `unused_macros` warning.
-#[cfg(any(feature = "cuda", feature = "wgpu"))]
-macro_rules! gpu_core_backend {
-    ($name:ident, $rt:ty) => {
-        /// A core GPU backend reusing the runtime-generic kernels (quick-260626-igc).
-        /// Unit struct (like `CpuBackend`); overrides only the four required methods.
-        #[derive(Debug, Clone, Copy, Default)]
-        pub struct $name;
-
-        impl Backend for $name {
-            type Runtime = $rt;
-
-            fn construct_histograms(
-                &self,
-                client: &ComputeClient<Self::Runtime>,
-                binned: &[u32],
-                ordered_gradients: &[f32],
-                ordered_hessians: &[f32],
-                num_bin: u32,
-            ) -> Result<Vec<f64>, ComputeError> {
-                kernels::histogram::construct_histograms_lds_f32_on(
-                    client,
-                    binned,
-                    ordered_gradients,
-                    ordered_hessians,
-                    num_bin,
-                )
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            fn find_best_split(
-                &self,
-                client: &ComputeClient<Self::Runtime>,
-                hist: &[f64],
-                cfg: &GainConfig,
-                num_bin: u32,
-                offset: i32,
-                default_bin: u32,
-                most_freq_bin: u32,
-                skip_default_bin: bool,
-                na_as_missing: bool,
-                run_forward: bool,
-                sum_gradient: f64,
-                sum_hessian: f64,
-                num_data: i32,
-            ) -> Result<SplitInfo, ComputeError> {
-                kernels::split::find_best_split_f64_on(
-                    client,
-                    hist,
-                    cfg,
-                    num_bin,
-                    offset,
-                    default_bin,
-                    most_freq_bin,
-                    skip_default_bin,
-                    na_as_missing,
-                    run_forward,
-                    sum_gradient,
-                    sum_hessian,
-                    num_data,
-                )
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            fn data_partition(
-                &self,
-                client: &ComputeClient<Self::Runtime>,
-                bins: &[u32],
-                num_bin: u32,
-                min_bin: u32,
-                max_bin: u32,
-                threshold: u32,
-                most_freq_bin: u32,
-            ) -> Result<(Vec<u32>, usize), ComputeError> {
-                kernels::partition::data_partition_on(
-                    client,
-                    bins,
-                    num_bin,
-                    min_bin,
-                    max_bin,
-                    threshold,
-                    most_freq_bin,
-                )
-            }
-
-            fn subtract_histograms(
-                &self,
-                client: &ComputeClient<Self::Runtime>,
-                parent: &[f64],
-                child: &[f64],
-            ) -> Result<Vec<f64>, ComputeError> {
-                kernels::subtract::subtract_histograms_f64_on(client, parent, child)
-            }
-        }
-    };
-}
-
-#[cfg(feature = "cuda")]
-gpu_core_backend!(CudaBackend, runtime::CudaRuntime);
-
-#[cfg(feature = "wgpu")]
-gpu_core_backend!(WgpuBackend, runtime::WgpuRuntime);
-
-/// The ROCm/HIP GPU backend (opt-in `rocm` feature) — dispatches every hot-path op
-/// to the cubecl-hip runtime running the **f64** kernels on the local gfx1100.
-///
-/// 260608-nn7 (L1): the backend now carries interior-mutable device state — a
+/// 260608-nn7 (L1): the backend carries interior-mutable device state — a
 /// `RefCell<Option<ResidentBins>>` cache of the binned feature columns uploaded ONCE
 /// per train. The learner holds `&B` (shared ref) and the trait methods take
 /// `&self`, so the cache MUST be behind interior mutability (RefCell), NOT a
 /// `&mut self` signature change. The single-threaded train loop makes the RefCell
-/// borrow safe. Because a `RefCell` is not `Copy`, this type no longer derives
-/// `Copy` (it did before nn7); `CpuBackend` stays the stateless unit struct.
-#[cfg(feature = "rocm")]
-#[derive(Debug)]
-pub struct RocmBackend {
+/// borrow safe. Because a `RefCell` is not `Copy`, this type does not derive
+/// `Copy`; `CpuBackend` stays the stateless unit struct.
+#[cfg(feature = "gpu")]
+pub struct GpuBackend<R: cubecl::Runtime> {
     /// The device-resident binned dataset, populated ONCE per train by
     /// [`upload_resident_bins`](Backend::upload_resident_bins) and read by the
     /// per-leaf [`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw)
@@ -2158,27 +2053,42 @@ pub struct RocmBackend {
     /// resident==host tree-equivalence test can grow the SAME f32-atomic-built tree
     /// through the host read-back/subtract/scan chain). `true` (the default) reports
     /// `resident_pool_supported() == true`; `false` forces the host path. Set only by
-    /// the test-only [`with_resident`](RocmBackend::with_resident) constructor.
+    /// the test-only [`with_resident`](GpuBackend::with_resident) constructor.
     resident_enabled: bool,
+    /// Ties the backend to its CubeCL runtime `R` without storing one (the client is
+    /// passed per-call). `fn() -> R` keeps the type `Send`/`Sync`/`Copy`-agnostic and
+    /// imposes no `R: …` auto-trait bound on the struct.
+    _runtime: std::marker::PhantomData<fn() -> R>,
 }
 
-#[cfg(feature = "rocm")]
-impl Default for RocmBackend {
+// Hand-written `Debug` so the `R` type parameter is NOT required to be `Debug`.
+#[cfg(feature = "gpu")]
+impl<R: cubecl::Runtime> std::fmt::Debug for GpuBackend<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuBackend")
+            .field("resident_enabled", &self.resident_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<R: cubecl::Runtime> Default for GpuBackend<R> {
     fn default() -> Self {
         Self {
             resident_bins: std::cell::RefCell::new(None),
             resident_pool: std::cell::RefCell::new(Vec::new()),
             // Production default: the device-resident pool is enabled.
             resident_enabled: true,
+            _runtime: std::marker::PhantomData,
         }
     }
 }
 
-#[cfg(feature = "rocm")]
-impl RocmBackend {
-    /// TEST-ONLY constructor (260608-p90): build a RocmBackend that REPORTS
+#[cfg(feature = "gpu")]
+impl<R: cubecl::Runtime> GpuBackend<R> {
+    /// TEST-ONLY constructor (260608-p90): build a backend that REPORTS
     /// `resident_pool_supported() == enabled`. The resident==host tree-equivalence
-    /// test grows the SAME corpus twice on a RocmBackend — once with `with_resident(true)`
+    /// test grows the SAME corpus twice on a `RocmBackend` — once with `with_resident(true)`
     /// (the resident chain) and once with `with_resident(false)` (forcing the host
     /// read-back/subtract/scan path) — and asserts the two trees match within ~1e-6.
     /// The same f32-atomic RAW build runs in both cases; only the build→fix→compact→
@@ -2189,13 +2099,32 @@ impl RocmBackend {
             resident_bins: std::cell::RefCell::new(None),
             resident_pool: std::cell::RefCell::new(Vec::new()),
             resident_enabled: enabled,
+            _runtime: std::marker::PhantomData,
         }
     }
 }
 
+/// The ROCm/HIP GPU backend (opt-in `rocm` feature) — `GpuBackend` bound to the
+/// cubecl-hip runtime running the f64 kernels on the local gfx-class GPU.
 #[cfg(feature = "rocm")]
-impl Backend for RocmBackend {
-    type Runtime = runtime::RocmRuntime;
+pub type RocmBackend = GpuBackend<runtime::RocmRuntime>;
+
+/// The CUDA GPU backend (opt-in `cuda` feature) — `GpuBackend` bound to the cubecl-cuda
+/// runtime (NVIDIA). Reaches ROCm-parity speed via the SAME resident histogram pool
+/// (quick-260627-qxl).
+#[cfg(feature = "cuda")]
+pub type CudaBackend = GpuBackend<runtime::CudaRuntime>;
+
+/// The WGPU/WGSL GPU backend (opt-in `wgpu` feature) — `GpuBackend` bound to the
+/// cubecl-wgpu runtime. NOTE (locked decision #3): the shared LDS histogram kernel
+/// accumulates in f32 atomics, which WGSL lacks — a `--features wgpu` build MAY fail to
+/// compile inside that kernel; that is the accepted, documented outcome (no fallback).
+#[cfg(feature = "wgpu")]
+pub type WgpuBackend = GpuBackend<runtime::WgpuRuntime>;
+
+#[cfg(feature = "gpu")]
+impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
+    type Runtime = R;
 
     // spike-035 SHIPPED (quick-260626-a6t): route the rocm partition on the HOST via the shipped
     // spike-027 fused path instead of the per-split device round-trip — ~1.18-1.23x launch-bound,

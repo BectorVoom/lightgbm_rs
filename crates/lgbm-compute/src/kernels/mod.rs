@@ -7,9 +7,10 @@
 //! histogram-subtraction math, A3 resolved in-scope).
 
 /// Shared CubeCL-autotune plumbing (phase 13) for the GPU launch-config knobs.
-/// rocm-gated: the default cpu build pulls no autotune codegen (the f64 anchor is
-/// never autotuned).
-#[cfg(feature = "rocm")]
+/// gpu-gated (quick-260627-qxl widened from rocm): the default cpu build pulls no
+/// autotune codegen (the f64 anchor is never autotuned), but every GPU backend
+/// (rocm/cuda/wgpu) reuses the runtime-generic `cubecl::tune` plumbing.
+#[cfg(feature = "gpu")]
 pub mod autotune;
 pub mod histogram;
 pub mod partition;
