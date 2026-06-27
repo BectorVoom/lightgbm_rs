@@ -39,23 +39,25 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: Build wheels (manylinux_2_28, x86_64)
+      - name: Build wheels (manylinux_2_34, x86_64)
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          # 2_28 (AlmaLinux 8, glibc 2.28) is modern enough for the prebuilt LLVM the
-          # cubecl-cpu `tracel-llvm-bundler` fetches at build time.
-          manylinux: "2_28"
+          # 2_34 (AlmaLinux 9, glibc 2.34 + GCC 11 libstdc++) — the prebuilt `llvm-config`
+          # the cubecl-cpu `tracel-llvm-bundler` fetches needs GLIBC_2.34 + GLIBCXX_3.4.29,
+          # so the older 2_28 (glibc 2.28) container fails to run it. PyPI accepts the
+          # resulting manylinux_2_34 tag.
+          manylinux: "2_34"
           # rust-toolchain.toml pins 1.95.0 (edition 2024); pass it explicitly so the
           # container's rustup selects it.
           rust-toolchain: "1.95.0"
           args: --release --out dist ${{ env.MANIFEST }}
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wheels-linux-x86_64
           path: dist
@@ -71,8 +73,8 @@ jobs:
           - runner: macos-14 # Apple Silicon
             target: aarch64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Build wheels (macOS ${{ matrix.target }})
@@ -82,7 +84,7 @@ jobs:
           rust-toolchain: "1.95.0"
           args: --release --out dist ${{ env.MANIFEST }}
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
@@ -90,8 +92,8 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           architecture: x64
@@ -102,7 +104,7 @@ jobs:
           rust-toolchain: "1.95.0"
           args: --release --out dist ${{ env.MANIFEST }}
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wheels-windows-x64
           path: dist
@@ -110,13 +112,13 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist ${{ env.MANIFEST }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wheels-sdist
           path: dist
@@ -133,7 +135,7 @@ jobs:
       id-token: write # OIDC token for Trusted Publishing
     steps:
       - name: Collect all wheels + sdist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           pattern: wheels-*
