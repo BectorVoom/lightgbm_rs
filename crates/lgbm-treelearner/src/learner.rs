@@ -1552,8 +1552,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // as `par_scan_threshold` — narrow leaves were catastrophic in 8v4/9cp). When
         // set, the standalone `build_leaf_histogram_into` below is SKIPPED; the build is
         // FUSED into `scan_leaf_histogram`'s one rayon region.
+        // quick-260627-o6i: AND in the explicit host-unified capability — a GPU backend
+        // WITHOUT a resident pool (CudaBackend/WgpuBackend) is `!resident_eligible` yet
+        // does NOT implement the host `build_fix_scan`, so gating on `!resident_eligible`
+        // alone routed it into the erroring default. Only CpuBackend returns true here.
         let smaller_unified =
-            !smaller_fused && !self.resident_eligible
+            self.backend.host_unified_fused_supported()
+                && !smaller_fused && !self.resident_eligible
                 && features.len() >= lgbm_compute::unified_bfs_threshold();
         let smaller_resident_slot = if smaller_fused {
             // No separate build — the fused scan builds+fixes+compacts+scans in 1 launch
@@ -1664,7 +1669,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // fused subtract→scan runs inside `scan_leaf_histogram`. The larger child has NO
             // parallel build to contend with (only the cheap serial subtract), so 9cp's
             // contention is structurally absent.
-            larger_unified = !self.resident_eligible
+            // quick-260627-o6i: AND in the host-unified capability (CpuBackend-only),
+            // same reason as `smaller_unified` — keep the erroring `subtract_scan`
+            // default off a non-resident GPU backend (CudaBackend/WgpuBackend).
+            larger_unified = self.backend.host_unified_fused_supported()
+                && !self.resident_eligible
                 && parent_slot.is_some()
                 && self.subtract_audit.is_none()
                 && features.len() >= lgbm_compute::unified_subscan_threshold();

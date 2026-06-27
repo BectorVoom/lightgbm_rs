@@ -899,6 +899,22 @@ pub trait Backend {
         false
     }
 
+    /// Whether this backend implements the CPU-only HOST unified fused paths
+    /// [`build_fix_scan`](Backend::build_fix_scan) and
+    /// [`subtract_scan`](Backend::subtract_scan). `false` (the default) means the
+    /// learner's `smaller_unified`/`larger_unified` gates skip those paths and route
+    /// through the standard `construct_histograms` + batched `find_best_split` instead.
+    /// Only [`CpuBackend`] — the host f64 anchor that overrides both — returns `true`.
+    ///
+    /// This is a SEPARATE capability from [`resident_pool_supported`](Backend::resident_pool_supported):
+    /// a GPU backend WITHOUT a resident pool (e.g. CudaBackend/WgpuBackend) is neither
+    /// resident NOR host-unified, so `!resident_pool_supported()` alone is NOT a
+    /// sufficient gate for the unified host path (quick-260627-o6i — it routed such a
+    /// backend into the erroring `build_fix_scan` default).
+    fn host_unified_fused_supported(&self) -> bool {
+        false
+    }
+
     // ===================================================================
     // 260608-p90: DEVICE-RESIDENT histogram-pool seam.
     //
@@ -1116,8 +1132,10 @@ pub trait Backend {
     ///
     /// Default: typed error — only [`CpuBackend`] overrides this (the unified path is the
     /// CPU-only host analog; RocmBackend keeps `build_fix_scan_resident`). The learner's
-    /// `unified_bfs` gate ANDs in `!resident_pool_supported()` so this is never reached on
-    /// a GPU backend.
+    /// `smaller_unified` gate ANDs in [`host_unified_fused_supported`](Backend::host_unified_fused_supported)
+    /// (CpuBackend-only) so this is never reached on a GPU backend — including one without
+    /// a resident pool (CudaBackend/WgpuBackend), for which `!resident_pool_supported()`
+    /// alone was insufficient (quick-260627-o6i).
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; on CpuBackend,
@@ -1168,8 +1186,10 @@ pub trait Backend {
     ///
     /// Default: typed error — only [`CpuBackend`] overrides this (the unified path is the
     /// CPU-only host analog; the resident/GPU larger child keeps `subtract_resident`). The
-    /// learner's `larger_unified` gate ANDs in `!resident_eligible` so this is never
-    /// reached on a GPU backend.
+    /// learner's `larger_unified` gate ANDs in [`host_unified_fused_supported`](Backend::host_unified_fused_supported)
+    /// (CpuBackend-only) so this is never reached on a GPU backend — including one without
+    /// a resident pool (CudaBackend/WgpuBackend), for which `!resident_eligible` alone was
+    /// insufficient (quick-260627-o6i).
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; on CpuBackend,
@@ -1330,6 +1350,14 @@ impl Backend for CpuBackend {
     // each leaf's bins to `&[u32]` and calling `data_partition`. Byte-identical
     // [left | right] order. RocmBackend inherits the default false (on-device).
     fn prefers_host_partition(&self) -> bool {
+        true
+    }
+
+    // CpuBackend is the only backend that overrides the host unified fused paths
+    // `build_fix_scan` / `subtract_scan` (the CPU-only f64 host analogs). The learner's
+    // `smaller_unified`/`larger_unified` gates AND this in so a GPU backend without a
+    // resident pool (CudaBackend/WgpuBackend) never routes into the erroring defaults.
+    fn host_unified_fused_supported(&self) -> bool {
         true
     }
 
