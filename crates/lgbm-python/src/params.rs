@@ -17,7 +17,8 @@
 //!    for `interaction_constraints`).
 //! 2. **Reject unimplemented (D-07)** — [`reject_unimplemented`] raises a clear
 //!    Python `ValueError` for any key (alias-resolved) in
-//!    [`lgbm_core::config::scope::OUT_OF_SCOPE_PARAMS`], or `device_type=gpu/cuda`,
+//!    [`lgbm_core::config::scope::OUT_OF_SCOPE_PARAMS`], or `device_type=gpu/cuda`
+//!    on a CPU-only wheel (accepted when a matching GPU backend is compiled in),
 //!    so a recognized-but-unported param NEVER silently trains a divergent model.
 //! 3. **Build (D-06)** — `Config::from_params` does the full alias resolution +
 //!    CHECK validation; truly-unknown keys (typos) pass through and only warn,
@@ -136,8 +137,9 @@ pub fn coerce_params_dict(params: &Bound<'_, PyDict>) -> PyResult<HashMap<String
 /// A key is rejected when its alias-resolved canonical name is in
 /// [`OUT_OF_SCOPE_PARAMS`] (distributed / GPU-OpenCL / linear-tree / quantized-
 /// grad — referenced from the single source of truth in `lgbm_core`, not
-/// re-typed here), OR it is `device_type` set to `gpu`/`cuda` (the CubeCL/ROCm
-/// backend is not wired to that knob in v1).
+/// re-typed here), OR it is `device_type` set to `gpu`/`cuda` while this wheel is
+/// CPU-only (a matching GPU backend compiled in via `--features cuda`/`rocm`/`wgpu`
+/// makes the corresponding `device_type` accepted).
 ///
 /// Truly-unknown keys (typos) are deliberately NOT rejected — they pass through
 /// to `Config::from_params`, which only warns, preserving C++ fidelity
@@ -157,11 +159,21 @@ pub fn reject_unimplemented(map: &HashMap<String, String>) -> PyResult<()> {
         }
         if canonical == "device_type" {
             let dev = value.trim().to_ascii_lowercase();
-            if dev == "gpu" || dev == "cuda" {
+            // A GPU device_type ("gpu"/"cuda") is accepted ONLY when this wheel was
+            // built with a matching CubeCL backend (cascade rocm > cuda > wgpu; see
+            // booster.rs). Backend selection is compile-time, so a GPU device_type on
+            // a GPU wheel dispatches to whichever backend was compiled in. The default
+            // CPU-only wheel rejects every GPU device_type, exactly as before — the
+            // feature gap was that lgbm-python never forwarded the GPU cargo features,
+            // so the extension module was permanently CPU-only.
+            let gpu_backend_built =
+                cfg!(feature = "rocm") || cfg!(feature = "cuda") || cfg!(feature = "wgpu");
+            let is_gpu_device = dev == "gpu" || dev == "cuda";
+            if is_gpu_device && !gpu_backend_built {
                 return Err(PyValueError::new_err(format!(
-                    "device_type=`{value}` is recognized by LightGBM but not implemented in \
-                     lightgbm_rs (the CubeCL/ROCm backend is not yet wired to this knob in v1; \
-                     only the CPU device is supported)."
+                    "device_type=`{value}` is recognized by LightGBM but this lightgbm_rs \
+                     wheel is CPU-only (no GPU backend compiled in). Rebuild with \
+                     `maturin --features cuda` (or rocm/wgpu) to enable the GPU backend."
                 )));
             }
         }
@@ -288,7 +300,9 @@ mod tests {
     }
 
     /// `reject_unimplemented` raises for OUT_OF_SCOPE params (and their aliases)
-    /// and for device_type=gpu/cuda, but passes truly-unknown typos through.
+    /// and for device_type=gpu/cuda on this CPU-only test build (no GPU feature),
+    /// but passes truly-unknown typos through. A GPU-feature build would accept the
+    /// matching device_type instead (covered by the Colab/Kaggle wheel build).
     #[test]
     fn reject_gate() {
         let mut m = HashMap::new();
