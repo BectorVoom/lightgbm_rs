@@ -1,281 +1,219 @@
 # Feature Research
 
-**Domain:** Gradient-boosting decision-tree library (pure-Rust port of Microsoft LightGBM, single-machine parity)
-**Researched:** 2026-06-05
-**Confidence:** HIGH (grounded directly in the C++ reference subsystems under `LightGBM/src/` and `LightGBM/include/`)
+**Domain:** On-device (whole-tree-on-GPU) histogram tree learner — porting official LightGBM's `CUDASingleGPUTreeLearner` to the lightgbm_rs CubeCL backend (milestone v1.1)
+**Researched:** 2026-06-28
+**Confidence:** HIGH (read directly from the reference source under `LightGBM/src/treelearner/cuda/` — file:line cited throughout; this is a faithful read of the algorithm to port, not a survey)
 
-> **Scope frame:** v1 = full single-machine parity with C++ LightGBM. "Table stakes" = features required to claim faithful single-machine parity (without them, a LightGBM user's workflow breaks or outputs diverge). "Differentiators" = capabilities that distinguish this port from a naive GBDT crate but are not strictly the day-one critical path. "Anti-features" = subsystems deliberately excluded from v1 (distributed, C ABI, CLI, raw CUDA/OpenCL, R). All findings cite the actual reference subsystem, not generic GBDT knowledge.
->
-> **Parity contract reminder:** every in-scope feature must reproduce C++ output to within 1e-12. That raises the effective complexity of *every* numeric feature one notch above what a from-scratch implementation would need, because bit-level reduction ordering and transform formulas must match exactly.
+> Note: this file supersedes the v1.0 feature-landscape research (preserved in git history) with the v1.1 milestone's algorithm spec.
+
+---
+
+## Executive Summary (read this first)
+
+Official LightGBM's CUDA learner grows the **entire leaf-wise tree on-device**. The host loop issues a fixed, small number of *large* kernels per split — build → subtract → find-best-per-leaf → find-best-across-leaves → partition — and the only host↔device traffic per split is **two tiny scalar buffers** (an 8-int "which leaf/feature/threshold won" packet and a 16-int "child counts/starts/sums" packet). Everything structural — the per-leaf row partition, the histogram pool, the smaller/larger child selection, the histogram-pointer rotation that powers the subtraction trick, and the seeding of the two child `LeafSplits` structs — happens **inside kernels with no host round-trip of bulk data**.
+
+This is the exact inversion of our current host-driven port (`crates/lgbm-treelearner/src/learner.rs`), which runs the same compute bodies but orchestrates them from the host with ~86 launches/tree and a host-resident `HistogramPool` + `DataPartition`. The compute kernels we already have (build, subtract, find_best_split/scan, data_partition) are **reusable**; what is new is the **on-device orchestration state** (`CUDADataPartition`, `CUDALeafSplits` device structs, the `hist_t**` pool, the `CUDABestSplitFinder` cross-leaf reduce, the `SplitTreeStructureKernel`).
+
+**The non-negotiable numerical caveat:** the reference stores histograms and does all gain/leaf-output math in **f64** (`hist_t = double`, `bin.h:33`), but the *hot per-row accumulation* defaults to **f32** (`gpu_use_dp=false`, `config.h:1131`). We must keep the CPU f64 fold bit-exact (anchor/merge gate) while keeping the new CUDA hot loops off f64 (consumer NVIDIA f64 = 1/32 f32 — spike-052 saw a 5.4× regression from one f64-fused kernel). The f64 used in the split-finder/leaf-splits is over **bins and scalars**, not over data rows — that is acceptable and is what the CPU anchor already matches.
+
+---
+
+## On-Device Data Structures (the state to port)
+
+These live resident on the device for the whole tree; the host holds only mirrors/scalars.
+
+| Structure | Owner / file:line | Shape | Role |
+|-----------|-------------------|-------|------|
+| `cuda_data_indices_` | `cuda_data_partition.hpp:354` | `data_size_t[num_data]` | Row indices permuted so each leaf's rows are contiguous. The partition itself. |
+| `cuda_leaf_data_start_` / `_end_` / `cuda_leaf_num_data_` | hpp:355-360 | `data_size_t[num_leaves]` | Per-leaf slice bounds into `cuda_data_indices_`. |
+| `cuda_data_index_to_leaf_index_` | hpp:369 | `int[num_data]` | Inverse map row→leaf; used only by `AddPredictionToScore` (and bagging). |
+| `cuda_hist_pool_` | hpp:362 | `hist_t*[num_leaves]` | Per-leaf **pointer** into the one big histogram arena. The subtraction trick rotates these pointers (no data copy). |
+| `cuda_hist_` (arena) | `cuda_histogram_constructor.hpp:166` | `hist_t[num_leaves * 2 * num_total_bin]` | One contiguous arena; grad+hess interleaved (`2*`). Smaller child gets slot `cuda_hist + 2*right_leaf_index*num_total_bin` (`cuda_data_partition.cu:829`). |
+| `CUDALeafSplitsStruct` (×2: smaller/larger) | `cuda_leaf_splits.hpp:21-32` | single struct each | The "current frontier" descriptor: `leaf_index`, `sum_of_gradients/hessians` (f64), `num_data_in_leaf`, `gain`, `leaf_value`, `data_indices_in_leaf*`, `hist_in_leaf*`. Seeded **on-device** by the split kernel. |
+| `cuda_leaf_best_split_info_` | `cuda_best_split_finder.hpp:213` | `CUDASplitInfo[num_leaves]` | One best split per existing leaf (persists across iters — only the two touched leaves are recomputed). |
+| `cuda_split_info_buffer_` | data_partition.hpp:379 | `int[16]` | The tiny D→H packet from `Split` (child counts/starts/sums). |
+| `cuda_best_split_info_buffer_` | best_split_finder.hpp:217 | `int[8]` | The tiny D→H packet from `FindBestFromAllSplits` (winning leaf/feature/threshold/default_left/num_cat). |
+| split scratch: `cuda_block_to_left_offset_`, `cuda_block_data_to_left/right_offset_`, `cuda_out_data_indices_in_leaf_` | hpp:367-375 | `[num_data]` / `[max_blocks+1]` | Per-block prefix-sum scratch for the stable partition scatter. |
+
+`CUDASplitInfo` (`cuda_split_info.hpp:16-101`) is the rich per-split record: `is_valid`, `gain`, `inner_feature_index`, `threshold`, `default_left`, and **both children's** `sum_gradients/hessians` (f64), `count`, `gain`, `value`, plus optional categorical `cat_threshold[]`.
+
+---
+
+## Step-Ordered Behavioral Spec — `Train()` (the core deliverable)
+
+Reference: `cuda_single_gpu_tree_learner.cpp:158-345`. Leaf-wise (best-first) growth, `num_leaves - 1` splits max.
+
+### Phase 0 — `BeforeTrain()` (once per tree, L97-152)
+1. If boosting not on GPU: copy `gradients_`/`hessians_` **H→D once** (L99-104). This is the only bulk H→D per tree.
+2. `cuda_data_partition_->BeforeTrain()` (L113): fills `cuda_data_indices_ = [0..num_data)` (or bagging subset), zeroes leaf arrays, sets leaf 0 to cover all rows (`cuda_data_partition.cpp:120-137`).
+3. `cuda_histogram_constructor_->BeforeTrain(grad, hess)` (L132): binds gradient/hessian device pointers (`cuda_histogram_constructor.cpp:76`).
+4. `cuda_smaller_leaf_splits_->InitValues(...)` (L133-143): **on-device** reduces root sum_gradients/sum_hessians, writes them back to host `leaf_sum_gradients_[0]`/`[0]` (the root sums are the one early D→H scalar). Sets root `hist_in_leaf` pointer.
+5. Host bookkeeping: `leaf_num_data_[0]=root_num_data`, `larger_leaf_splits_->InitValues()` (empty), `col_sampler_.ResetByTree()`, `best_split_finder_->BeforeTrain(...)`, `leaf_data_start_[0]=0`, `smaller_leaf_index_=0`, `larger_leaf_index_=-1` (L145-151).
+6. Back in `Train`: create `CUDATree`, set **root leaf output by hand** (not produced by a split) via `CalculateSplittedLeafOutput` and `SyncLeafOutputFromHostToCUDA` (L166-173).
+
+### Phase 1 — per-split loop, `for i in 0..num_leaves-1` (L174-336)
+Each iteration grows the tree by exactly one leaf (turns one leaf into two). The "smaller leaf" = the child with fewer rows from the *previous* split (root on iter 0); "larger leaf" = the sibling (−1 on iter 0).
+
+**Step 1 — Construct histogram for the smaller leaf only** (L181-188 → `cuda_histogram_constructor.cpp:117`)
+- Builds the histogram for `smaller_leaf_index_` **only**. Early-out if the leaf fails min_data/min_hessian gates (`.cpp:126-128`).
+- Reuses our existing build kernel body. f32 accumulation by default (`gpu_use_dp`), promoted into the f64 `hist_t` arena slot `cuda_hist_pool_[smaller]`.
+
+**Step 2 — Subtract for the larger leaf** (L211-217 → `cuda_histogram_constructor.cpp:133`)
+- `larger.hist = parent.hist − smaller.hist`, in place over the larger child's arena slot. No build for the larger child. On iter 0 (`larger_leaf_index_ == -1`) this is a no-op for the larger leaf.
+- The pointer rotation that makes "parent" available is done in Step 7's split kernel (below).
+
+**Step 3 — Select features by node** (L219 → `.cpp:558`)
+- Only active if interaction constraints or `feature_fraction_bynode < 1.0` (`select_features_by_node_`, L59). Copies per-node feature masks **H→D** (small). Otherwise a no-op.
+
+**Step 4 — Find best split per leaf** (L224-242 → `cuda_best_split_finder.cpp:324`)
+- Host computes `is_smaller_leaf_valid` / `is_larger_leaf_valid` from counts + min_data/min_hessian gates (`.cpp:337-340`).
+- Launches a kernel over **(leaf × feature-scan-task)**: `split_find_tasks_` is a flattened task list (≥1 per feature: forward/reverse/one-hot variants — `SplitFindTask`, best_split_finder.hpp:28-41). Each task scans one feature's histogram with prefix sums, computing best threshold + split gain in **f64** (gain math in `cuda_leaf_splits.hpp:74-140`).
+- `LaunchSyncBestSplitForLeafKernel` (`.cpp:350`) reduces per-task results into **one** `cuda_leaf_best_split_info_[leaf]` for each of the (up to two) touched leaves. Both leaves' best splits are computed in this single dispatch. Then one `SynchronizeCUDADevice`.
+
+**Step 5 — Find best leaf across ALL leaves** (L247-273 → `cuda_best_split_finder.cpp:355`)
+- `FindBestFromAllSplitsKernel<<<1,256>>>` reduces `cuda_leaf_best_split_info_[0..cur_num_leaves)` to the single global best leaf (`cuda_best_split_finder.cu:2161-2192`). Note: leaves untouched this iter keep their cached best split — only 2 were recomputed, but the reduce scans all.
+- `PrepareLeafBestSplitInfo<<<6,1>>>` packs an **8-int** buffer; copied **D→H**: `best_leaf_index_`, smaller/larger best feature/threshold/default_left, `num_cat_threshold_`.
+- Returns a **device pointer** into `cuda_leaf_best_split_info_` (`best_split_info`, `.cpp:380`) — the rich split record stays on device.
+
+**Step 6 — Stop check + host tree-structure update** (L276-303)
+- If `best_leaf_index_ == -1`: no positive-gain split → `break` (L276-279). (Matches our host learner's early-stop.)
+- Categorical: `ConstructBitsetForCategoricalSplit` builds the device bitset (L282-284).
+- Host updates the `CUDATree` node structure: `tree->Split(...)` / `SplitCategorical(...)` (L286-303). **This needs host-side metadata**: `RealFeatureIndex`, `RealThreshold`, `FeatureBinMapper`, `missing_type` — i.e. the host keeps the dataset bin-mapper metadata even though the data is on device. The `best_split_info` device pointer is passed through so the tree records child sums/values.
+
+**Step 7 — On-device partition (no bulk round-trip)** (L305-324 → `cuda_data_partition.cpp:139` / `.cu:946`)
+This is the heart of "whole tree on-device". Sub-steps:
+1. `CalcBlockDim(num_data_in_leaf)` — grid/block sizing (`.cu:276`).
+2. `GenDataToLeftBitVector` (`.cpp:194`): per-row, decide left/right from the column bin, threshold, `default_left`, and missing handling. Heavily templated over compile-time bools (`MIN_IS_MAX`, `MISSING_IS_ZERO`, `MISSING_IS_NA`, `MFB_IS_ZERO/NA`, `MAX_TO_LEFT`, `is_single_feature_in_column`) × `BIN_TYPE` (hpp:177-231). Numerical vs categorical (bitset) variants.
+3. `AggregateBlockOffsetKernel` (`.cu:970-986`): single-block prefix sum of per-block left/right counts → stable scatter offsets.
+4. `SplitInnerKernel` (`.cu:907`): scatter each row into the left or right region of `cuda_out_data_indices_in_leaf_` using the block prefix offsets (stable, order-preserving).
+5. `SplitTreeStructureKernel<<<4,5>>>` (`.cu:785`): the on-device bookkeeping kernel. With ~18 single-thread branches it:
+   - writes child `leaf_output` values (L802-804),
+   - **decides smaller vs larger child on-device** by comparing `cuda_leaf_num_data[left]` vs `[right]` (L825),
+   - **rotates the histogram pool pointers**: larger child inherits the parent's hist buffer (so next iter's subtract works), smaller child gets the fresh arena slot `cuda_hist + 2*right_leaf_index*num_total_bin` (L827-831, L895-898),
+   - **seeds both child `CUDALeafSplitsStruct`s** in place — sums (f64), counts, gain, value, `data_indices_in_leaf` pointer offset, `hist_in_leaf` pointer, `leaf_index` (L832-904),
+   - writes the **16-int** `cuda_split_info_buffer_` for the host (L806-822).
+6. Copy the 16-int buffer **D→H** (`.cu:1013`); host reads child `num_data`, `data_start`, and child sum_grad/sum_hess (packed as doubles at offset 8) into `leaf_num_data_[...]`, `leaf_data_start_[...]`, `leaf_sum_*[...]` (L1016-1031).
+7. `CopyDataIndicesKernel` (`.cu:1020`): copy the reordered slice back into `cuda_data_indices_` at the parent's `data_start` — the partition is now updated in place.
+
+**Step 8 — Host frontier bookkeeping for next iter** (L328-334)
+- Recompute `smaller_leaf_index_` / `larger_leaf_index_` from the host's `leaf_num_data_` mirror (L328-329). (This mirrors the device-side decision in Step 7.5 so the next iteration's launches target the right leaves.)
+
+### Phase 2 — finalize (L337-344)
+- `SynchronizeCUDADevice` (L337), optional `RenewDiscretizedTreeLeaves` (quantized only), `tree->ToHost()` pulls the finished tree structure D→H once (L343).
+
+---
+
+## Minimal Host↔Device Communication (the launch-bound budget)
+
+| Moment | Direction | Payload | Notes |
+|--------|-----------|---------|-------|
+| Per tree (BeforeTrain) | H→D | `grad[]`, `hess[]` (once) | Only bulk H→D; skipped if boosting already on GPU. |
+| Per tree (BeforeTrain) | D→H | root sum_grad/sum_hess (2 doubles) | From `InitValues`. |
+| Per split — Step 5 | D→H | **8 ints** | best leaf/feature/threshold/default_left/num_cat. |
+| Per split — Step 7 | D→H | **16 ints** (incl. 4 doubles packed) | child counts/starts/sums. |
+| Per split — Step 3 | H→D | per-node feature mask | **only** under interaction-constraints / `feature_fraction_bynode<1`. |
+| Per tree (finalize) | D→H | `CUDATree` structure | `tree->ToHost()`, once. |
+
+**Key insight for the planner:** steady-state per-split traffic is **24 ints** (two tiny packets), not bulk data. But these two D→H copies each carry a `SynchronizeCUDADevice` and **serialize the best-first dependency chain** (build→subtract→find→partition must complete before the next leaf is known). spike-051..054 confirmed on real NVIDIA the wall is **launch latency of this serial chain**, not throughput or sync cost — so the win comes from *fewer, larger launches per split*, exactly what this architecture delivers vs our ~86/tree host loop. The host still serializes per split; the gain is collapsing many small per-feature/per-phase launches into a handful of whole-frontier kernels and removing the host round-trip of indices/histograms.
 
 ---
 
 ## Feature Landscape
 
-### Table Stakes (Required for Single-Machine Parity)
+### Table Stakes (must port for behavioral parity)
 
-These are the features a LightGBM user assumes exist. Missing any of them means the port cannot load a model, reproduce a training run, or evaluate a standard config — i.e. parity fails.
+| Feature | Why Expected (reference) | Complexity | Notes |
+|---------|--------------------------|------------|-------|
+| On-device row partition (`cuda_data_indices_` + leaf slices) | The partition that lets all later kernels run resident | HIGH | Stable scatter via block prefix sums (`SplitInnerKernel`); reuses our `data_partition` fuse work. |
+| On-device histogram arena + `hist_t**` pool with pointer rotation | Subtraction trick without a copy; resident frontier | HIGH | New: our `HistogramPool` is host-side today. Larger child inherits parent buffer (`.cu:827-831`). |
+| Build-smaller / subtract-larger per split | The core histogram economy; only 1 build per split | MEDIUM | Compute bodies already exist; need on-device pool wiring. |
+| Per-leaf best-split scan over `split_find_tasks_` | Find best threshold+gain per feature, f64 gain math | MEDIUM | Reuses our find_best_split/scan kernel; gain math in `cuda_leaf_splits.hpp`. |
+| Cross-leaf best-leaf reduce (`FindBestFromAllSplits`) | Best-first growth picks the globally best leaf | MEDIUM | New on-device reduce + 8-int D→H packet. |
+| On-device `SplitTreeStructureKernel` (child seeding + smaller/larger pick + pool rotation) | Eliminates the host round-trip of child state | HIGH | The structural heart; 16-int D→H mirror for host. |
+| Host tree-structure mirror (`CUDATree` + bin-mapper metadata) | `tree->Split` needs RealFeature/RealThreshold/missing_type on host | LOW | Host keeps dataset metadata; only scalars cross. |
+| min_data_in_leaf / min_sum_hessian gates + "no positive gain" stop | Parity with serial learner stopping rules | LOW | Already in our host learner (`learner.rs`); replicate the gate placement (host-side validity flags). |
+| Coexistence / feature-gate with existing host-orchestrated path | PROJECT.md non-negotiable — ROCm + CPU routing untouched | MEDIUM | New learner is an alternate path, not a replacement. |
 
-#### Boosting / ensemble layer (`src/boosting/`)
-
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| **GBDT loop** (`gbdt.cpp` `TrainOneIter`, `Boosting`, `UpdateScore`) | The default `boosting=gbdt`; the spine everything else hangs off | HIGH | Owns models, score updaters, sample strategy, per-class trees, shrinkage, `boost_from_average`, early stopping. Build this first; all other boosting variants subclass it. |
-| **DART** (`dart.hpp`) | `boosting=dart`; common in tuned models | MEDIUM | Drops trees each iter (`drop_rate`, `max_drop`, `skip_drop`, `uniform_drop`, `xgboost_dart_mode`), renormalizes. Subclass of GBDT; needs drop RNG (`drop_seed`) to match exactly. |
-| **Random Forest** (`rf.hpp`) | `boosting=rf` | LOW–MEDIUM | GBDT with no shrinkage accumulation, averaged trees, mandatory bagging. Thin subclass; cheap once GBDT + bagging exist. |
-| **Bagging / row subsampling** (`bagging.hpp`, `sample_strategy.cpp`) | `bagging_fraction`/`bagging_freq`; ubiquitous in real configs | MEDIUM | Per-iteration row sampling with `bagging_seed`; also `pos_/neg_bagging_fraction` (binary) and `bagging_by_query` (ranking). RNG sequence must match C++ to keep parity. |
-| **GOSS sample strategy** (`goss.hpp`) | `data_sample_strategy=goss` (and legacy `boosting=goss`) | MEDIUM–HIGH | Keeps `top_rate` largest-|gradient| rows + samples `other_rate` of the rest with gradient amplification. **Depends on gradient magnitude sorting** each iteration — ordering and the amplification factor `(1-top_rate)/other_rate` must match bit-for-bit. |
-| **Score updater** (`score_updater.hpp`) | Internal accumulator for ensemble scores | LOW | Add-tree-into-score; a primary 1e-12 reduction-ordering risk on GPU. |
-| **Shrinkage / learning rate** (`Tree::Shrinkage`) | `learning_rate` | LOW | Per-tree leaf scaling; trivial but must apply in the same place as C++. |
-| **Early stopping** (`EvalAndCheckEarlyStopping`) | `early_stopping_round`, `first_metric_only`, `early_stopping_min_delta` | LOW–MEDIUM | Needs metric eval on validation sets; depends on Metric layer. |
-
-#### Tree learner (`src/treelearner/serial_tree_learner.cpp`)
-
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| **Histogram-based serial tree learner** | The core algorithm; defines LightGBM | VERY HIGH | `ConstructHistograms` → `FindBestSplitsFromHistograms` → `Split` loop. The single hardest, highest-risk subsystem for 1e-12 parity (histogram accumulation order, f64 vs f32). Everything else is comparatively easy. |
-| **Leaf-wise (best-first) growth** | LightGBM's signature vs level-wise | MEDIUM | `ArrayArgs::ArgMax` over leaf split candidates up to `num_leaves-1`; `max_depth` cap. Logic is simple; correctness rides on split-gain values. |
-| **Split-gain scan** (`feature_histogram.{cpp,hpp}` `FindBestThreshold`) | Decides every split | HIGH | Gain formula with `lambda_l1`, `lambda_l2`, `min_gain_to_split`, `min_sum_hessian_in_leaf`, `min_data_in_leaf`, `max_delta_step`, `path_smooth`. Exact formula + tie-breaking must match. |
-| **Data partition** (`data_partition.hpp`) | Row→leaf routing after each split | MEDIUM | Re-partitions row indices per split; feeds histogram subtraction trick. |
-| **Histogram subtraction trick** | Performance parity + identical FP path | MEDIUM | Larger child = parent − smaller child. Must be byte-identical to the direct path it replaces (it is *not* numerically identical to recomputing, so the choice itself is part of parity). |
-| **Categorical splits** (`SplitCategorical`, `FindBestThresholdCategorical`, `BinType::CategoricalBin`) | `categorical_feature`; LightGBM's native categorical handling is a headline feature | HIGH | One-vs-rest many-vs-many split on sorted category gradient stats; governed by `max_cat_threshold`, `cat_smooth`, `min_data_per_group`, `max_cat_to_onehot`, `cat_l2`. Distinct gain code path from numerical. |
-| **Numerical threshold splits + missing routing** | Default behavior | MEDIUM | Default-left/right based on `use_missing`, `zero_as_missing`, `MissingType`. Routing of NaN/zero must match. |
-| **Feature subsampling** (`col_sampler.hpp`) | `feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed` | LOW–MEDIUM | Per-tree and per-node column sampling; RNG must match. |
-| **`min_data_in_leaf` / `min_sum_hessian_in_leaf` / `min_gain_to_split`** | Standard regularizers | LOW | Constraint checks inside split finding. |
-| **`max_depth` + `num_leaves`** | Core capacity controls | LOW | Depth tracked during leaf-wise growth. |
-
-#### Objective functions (`src/objective/`, factory `objective_function.cpp`)
-
-Full registered set (verified from `CreateObjectiveFunction`). Common = appears in typical workflows; Rare = present for completeness.
-
-| Objective | Family | Frequency | Complexity | Notes |
-|-----------|--------|-----------|------------|-------|
-| `regression` (l2) | regression | **Common** | LOW | Default objective. Baseline grad/hess. |
-| `regression_l1` (l1/MAE) | regression | Common | LOW–MEDIUM | L1 uses approximate hessian; `RenewTreeOutput` refit. |
-| `huber` | regression | Rare | LOW | `alpha` param. |
-| `fair` | regression | Rare | LOW | `fair_c` param. |
-| `poisson` | regression | Rare | MEDIUM | log-link, `poisson_max_delta_step`. |
-| `quantile` | regression | Rare | MEDIUM | `alpha`; leaf-value renewal (quantile of residuals). |
-| `mape` | regression | Rare | MEDIUM | mean absolute percentage error. |
-| `gamma` | regression | Rare | LOW | deviance-based. |
-| `tweedie` | regression | Rare | MEDIUM | `tweedie_variance_power`. |
-| `binary` (logistic) | classification | **Common** | LOW–MEDIUM | `sigmoid`, `is_unbalance`, `scale_pos_weight`; `BoostFromScore` = log-odds init; `ConvertOutput`=sigmoid. |
-| `multiclass` (softmax) | classification | **Common** | MEDIUM | `num_class` trees per iter; softmax `ConvertOutput`. |
-| `multiclassova` (one-vs-all) | classification | Common | MEDIUM | `num_class` independent binary objectives. |
-| `cross_entropy` | classification | Rare | MEDIUM | continuous [0,1] labels. |
-| `cross_entropy_lambda` | classification | Rare | MEDIUM | alternative parameterization. |
-| `lambdarank` | ranking | Common (in ranking domain) | HIGH | Needs query/group boundaries, `lambdarank_truncation_level`, `lambdarank_norm`, `lambdarank_position_bias_regularization`, sigmoid; pairwise lambda gradients depend on per-query NDCG deltas (DCGCalculator). |
-| `rank_xendcg` | ranking | Rare | HIGH | Cross-entropy NDCG variant; stochastic, RNG-sensitive (`objective_seed`). |
-| `custom` (user-supplied grad/hess) | any | Common (Python users) | LOW | Objective passes through externally provided gradients; needed for Python API parity. |
-
-Cross-cutting objective machinery (table stakes regardless of which objective): `GetGradients`, `ConvertOutput` (sigmoid/softmax/exp links), `BoostFromScore` (`boost_from_average`), `reg_sqrt`. These three hooks must be exact for 1e-12.
-
-#### Metrics (`src/metric/`, factory `metric.cpp`)
-
-Full registered set (verified from `CreateMetric`):
-
-| Metric | Family | Frequency | Complexity | Notes |
-|--------|--------|-----------|------------|-------|
-| `l2`, `rmse`, `l1` | regression | **Common** | LOW | rmse = sqrt(l2). |
-| `quantile`, `huber`, `fair`, `poisson`, `mape`, `gamma`, `gamma_deviance`, `tweedie` | regression | Rare | LOW–MEDIUM | Mirror objective math. |
-| `binary_logloss` | binary | **Common** | LOW | Default for `binary`. |
-| `binary_error` | binary | Common | LOW | threshold 0.5. |
-| `auc` | binary | **Common** | MEDIUM | rank-based; tie handling must match. |
-| `average_precision` | binary | Rare | MEDIUM | |
-| `auc_mu` | multiclass | Rare | HIGH | multiclass AUC generalization; matrix-weighted. |
-| `multi_logloss` | multiclass | **Common** | LOW | |
-| `multi_error` | multiclass | Common | LOW | `multi_error_top_k`. |
-| `cross_entropy`, `cross_entropy_lambda`, `kullback_leibler` | xentropy | Rare | LOW–MEDIUM | |
-| `ndcg` | ranking | **Common (ranking)** | HIGH | `DCGCalculator` static gain/discount tables (`include/LightGBM/metric.h`); `eval_at` / `ndcg_eval_at` positions; per-query. |
-| `map` | ranking | Rare | MEDIUM–HIGH | `map_metric.hpp`; per-query average precision. |
-
-Metric infra (table stakes): multi-`metric` lists, per-`eval_at` cutoffs, query-group awareness, `metric_freq`, `is_provide_training_metric`. Static `DCGCalculator` tables must reproduce identical gains/discounts.
-
-#### Dataset / IO (`src/io/`)
-
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| **Binned columnar store** (`dataset.cpp`, `FeatureGroup`) | The in-memory model everything reads | HIGH | Dataset immutable after `FinishLoad`; feature grouping/bundling (EFB). |
-| **BinMapper** (`bin.cpp` `FindBin`) | Continuous→bin mapping defines every split threshold | VERY HIGH | `max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, sampling RNG (`data_random_seed`). **Binning must be bit-identical** or every downstream split diverges. Highest-leverage parity risk after histograms. |
-| **DenseBin / SparseBin** (`dense_bin.hpp`, `sparse_bin.hpp`) | Storage + `ConstructHistogram` | HIGH | The hottest kernels; templated over bit-width in C++. GPU-relevant. |
-| **Missing-value handling** (`MissingType`, `use_missing`, `zero_as_missing`) | NaN/zero semantics | MEDIUM | Must match default-direction logic in splits. |
-| **Categorical encoding** (`BinType::CategoricalBin`) | `categorical_feature` | MEDIUM | Category→bin mapping, low-frequency folding. |
-| **Exclusive Feature Bundling** (`enable_bundle`) | On by default; affects feature grouping → histogram layout | HIGH | Sparse features bundled into one group. Bundling decisions change histogram construction; must reproduce grouping to keep splits identical. |
-| **Model text format read/write** (`gbdt_model_text.cpp`, `tree.cpp`) | Load a C++-trained model and predict identically; save Rust-trained model | HIGH | Explicit project requirement. Must parse/emit exact LightGBM text schema (tree structure, leaf values, bin mappers, feature names, pandas categorical metadata). |
-| **Metadata** (`metadata.cpp`) | labels, weights, init_score, query/group boundaries | MEDIUM | Ranking + weighted training need these. |
-| **In-memory matrix ingestion** | Python/ndarray is the primary input | MEDIUM | Dense `mat`, CSR/CSC sparse construction (mirrors `LGBM_DatasetCreateFromMat/CSR/CSC` semantics but via Rust API, not C ABI). |
-
-> CSV / LibSVM / TSV file parsing (`parser.cpp`, `dataset_loader.cpp`) is **lower priority** — Python/ndarray input is primary. Treat text-file parsing as a differentiator, not table stakes (see below).
-
-#### Prediction (`src/boosting/gbdt_prediction.cpp`, `tree.cpp`)
-
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| **Raw score prediction** (`PredictRaw`) | Sum of tree outputs | LOW–MEDIUM | Iterate `models_`, sum `Tree::Predict`. |
-| **Transformed prediction** (`ConvertOutput`) | sigmoid/softmax outputs | LOW | Objective-dependent. |
-| **Leaf index prediction** (`predict_leaf_index`) | `pred_leaf` in Python | LOW | Returns leaf id per tree. |
-| **Feature contributions / TreeSHAP** (`tree.cpp` `TreeSHAP`, `UnwoundPathSum`) | `predict_contrib`; widely used for explainability | HIGH | Independent SHAP path-dependent algorithm over tree structure. **Depends on full Tree node/split/cover structure** being stored. Algorithmically intricate; exact float parity needed. |
-| **Prediction early stopping** (`prediction_early_stop.cpp`) | `pred_early_stop`, `_freq`, `_margin` | LOW–MEDIUM | Stop summing trees when margin is decisive. |
-| **`start_iteration` / `num_iteration` prediction** | Predict with a sub-range of trees | LOW | Slice of `models_`. |
-
-#### Config surface (`include/LightGBM/config.h`, `config_auto.cpp`)
-
-| Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| **Config struct (~110 in-scope hyperparameters)** | Compatibility: configs from existing users must be accepted | HIGH (breadth) | Single-machine in-scope fields enumerated in the appendix below. Includes core (`num_iterations`, `learning_rate`, `num_leaves`, `max_depth`), tree (`min_data_in_leaf`, `lambda_l1/l2`, `min_gain_to_split`, `max_bin`), sampling (bagging/feature/GOSS), objective/metric params (`alpha`, `sigmoid`, `tweedie_variance_power`, `num_class`...), DART, categorical, monotone, CEGB, prediction. |
-| **Parameter aliasing** | LightGBM accepts many aliases (`num_iteration`/`n_estimators`/`num_boost_round`) | MEDIUM | `config_auto.cpp` is auto-generated alias map; port as a data table, not hand logic. Python parity requires aliases. |
-| **Parameter validation** (`Config::Set`) | Reject invalid combos as C++ does | MEDIUM | `CHECK_*` constraints; mirror to Rust `Result`/`thiserror`. |
-
----
-
-### Differentiators (Distinguish This Port; Not Day-One Critical Path)
+### Differentiators (advanced; port after the core slice proves out)
 
 | Feature | Value Proposition | Complexity | Notes |
 |---------|-------------------|------------|-------|
-| **Monotone constraints** (`monotone_constraints.hpp`, `monotone_type`) | Domain-required in finance/risk; a headline LightGBM feature | MEDIUM–HIGH | `monotone_constraints`, `monotone_constraints_method` (basic/intermediate/advanced), `monotone_penalty`. Constrains split selection; intermediate/advanced track per-feature min/max bounds through the tree. In-scope for "full parity" but isolable. |
-| **Interaction constraints** (`interaction_constraints`) | Controls which features may co-occur in a tree path | MEDIUM | Restricts feature set per node based on path history. |
-| **Forced splits / forced bins** (`forcedsplits_filename`, `forcedbins_filename`) | Reproduce models trained with forced structure | MEDIUM | JSON-driven; needed only for configs that use them. |
-| **Extra trees** (`extra_trees`, `extra_seed`) | Randomized thresholds (ExtraTrees-style) | LOW–MEDIUM | Random split threshold instead of best; RNG must match. |
-| **Quantized / discretized gradient training** (`gradient_discretizer.{cpp,hpp}`, `use_quantized_grad`) | Faster training; recent LightGBM feature | HIGH | `num_grad_quant_bins`, `quant_train_renew_leaf`, `stochastic_rounding`. Adds an entire int-histogram code path (16/32-bit) parallel to the float path. **Depends on histogram learner** existing first; large surface; defer until float path is bit-exact. |
-| **Linear-tree leaves** (`linear_tree_learner.{cpp,h}`, `linear_tree`) | Piecewise-linear leaf models | HIGH | Fits a linear model per leaf (`linear_lambda`, `leaf_coeff`). Separate learner subclass + per-leaf least-squares. Isolable; many users never enable it. |
-| **CEGB (cost-effective gradient boosting)** (`cost_effective_gradient_boosting.hpp`) | Feature-cost-aware splitting | MEDIUM | `cegb_tradeoff`, `cegb_penalty_split`, per-feature/per-split penalties. Niche but part of full parity. |
-| **Refit / continue training** (`refit_decay_rate`, `task=refit`, `input_model`) | Update leaf values on new data; warm start | MEDIUM | `GBDTBase` leaf get/set hooks. Needed for `Booster.refit()` Python parity. |
-| **Feature importance** (`saved_feature_importance_type`) | split/gain importance reporting | LOW | Aggregate over trees; cheap once trees exist. |
-| **CubeCL CPU↔ROCm backend** | The actual product differentiator vs C++ (memory-safe, portable GPU) | VERY HIGH | Cross-cutting; not a "feature" in the catalog sense but the project's reason to exist. Histogram construction, best-split finding, data partition are the kernels. |
-| **`force_row_wise` / `force_col_wise` / `histogram_pool_size`** | Histogram build strategy + memory control | MEDIUM | Affects performance + the FP reduction path; must support both to match outputs under each setting. |
-| **Text-file ingestion (CSV/TSV/LibSVM)** (`parser.cpp`) | Convenience parity with C++ data loading | MEDIUM | De-prioritized (Python/ndarray primary), so it's a differentiator rather than table stakes for v1. |
+| Quantized-gradient path (`use_quantized_grad`) | The int16/u64 fixed-point fast path; aligns with our "no f64 hot loops" mandate | HIGH | Reference `cuda_gradient_discretizer_`, per-leaf bit-width selection (`GetHistBitsInLeaf`). Maps to v2 QNT-01 + our shipped Phase-10 quantized mode. |
+| Categorical splits on-device (bitset gen) | Full parity for categorical features | MEDIUM | `ConstructBitsetForCategoricalSplit`, `SplitCategorical`, `cat_threshold[]` in `CUDASplitInfo`. |
+| Bagging subset (`SetBaggingData` / `use_bagging_`) | Resident subset indices | MEDIUM | `cuda_data_index_to_leaf_index_` inverse map; restore order in `UpdateTrainScore`. |
+| `select_features_by_node_` (interaction constraints / feature_fraction_bynode) | Per-node feature sampling | MEDIUM | The only steady-state H→D in the loop; gate it off by default. |
+| On-device score update (`AddPredictionToScoreKernel`) + leaf renew | Keep scores resident between trees (boosting on GPU) | MEDIUM | `UpdateTrainScore`, `RenewDiscretizedTreeLeaves`, `FitByExistingTree`/refit. |
+| `gpu_use_dp` toggle (f64 hist accumulation) | Optional accuracy mode | LOW | Default false (f32). Our CPU anchor is the f64 reference already. |
 
----
+### Anti-Features (do NOT port / avoid)
 
-### Anti-Features (Deliberately NOT in v1)
-
-| Feature | Why Requested | Why Excluded from v1 | Alternative |
-|---------|---------------|----------------------|-------------|
-| **Distributed / network training** (`src/network/`, MPI/socket allreduce, `data_parallel_/feature_parallel_/voting_parallel_tree_learner`) | Scale to clusters | Large surface (collectives, topology, allreduce determinism); not needed to prove the architecture or single-machine parity | Defer to post-v1; design `TreeLearner` trait so a parallel impl can slot in later. |
-| **C ABI parity** (`c_api.cpp`, `c_api.h`, ~120 `LGBM_*` functions) | C/R/other-language clients | Rust-native + Python bindings cover v1 consumers; stable-ABI handle lifetime is its own project | Provide Rust-native API + PyO3 bindings; revisit C ABI only if external clients demand it. |
-| **CLI application** (`src/main.cpp`, `application.cpp`, `task=train/predict/convert_model`, config-file driven) | Command-line workflows | Not required for v1 compatibility goals; config-file parsing + I/O orchestration is large | Library-first; a thin CLI can wrap the Rust API later. |
-| **Raw CUDA backend** (`src/**/cuda/`, `.cu` kernels) | NVIDIA GPU speed | Superseded by CubeCL mandate; ROCm is the GPU test target | CubeCL kernels (CPU + ROCm) replace both CUDA and OpenCL. CUDA sources remain *reference* for kernel design only. |
-| **Raw OpenCL backend** (`gpu_tree_learner.cpp`, `ocl/*.cl`) | AMD/Intel GPU via OpenCL | Superseded by CubeCL | Same as above — `.cl` histogram kernels are design references for CubeCL. |
-| **R bindings** | R users | Out of scope per PROJECT.md | None in v1. |
-| **NVIDIA-CUDA-specific tuning** | Squeeze NVIDIA perf | ROCm is the mandated GPU target; tuning to CUDA hardware would fork the codebase | Tune CubeCL for ROCm; rely on portability for other backends. |
-| **`save_binary` / binary dataset format** (`save_binary`) | Faster reload of binned data | Nice-to-have, not parity-critical; can defer | Recompute binning from source data in v1; add binary cache later if needed. |
-| **Arrow ingestion** (`arrow.h`) | Zero-copy columnar input | Not required for v1; Python/ndarray covers input | Add later behind a feature flag. |
-
-> **Important:** the CUDA `.cu` and OpenCL `.cl` sources are anti-features *as build targets* but **primary references** for CubeCL kernel design (histogram construction, best-split finding, data partition). Do not delete them from the reference tree.
+| Feature | Why It Looks Tempting | Why Problematic | Alternative |
+|---------|----------------------|-----------------|-------------|
+| f64 hot-loop kernels (per-row accumulation in double) | "Matches the f64 `hist_t` storage exactly" | Consumer NVIDIA f64 = 1/32 f32; spike-052 measured **5.4× regression** from one f64-fused kernel | Keep f32 accumulation (default `gpu_use_dp=false`) + the u64 fixed-point build path; pin parity to the CPU f64 anchor, not to device f64. |
+| Per-`SplitInfo` device `cudaMalloc`/`new` for cat_threshold (`cuda_split_info.hpp:81-95`) | Faithful to reference | Per-split device heap alloc is slow + awkward in CubeCL | Pre-allocate cat-threshold vectors (`AllocateCatVectors`, `.cu:2196`) — the reference itself does this for the leaf array. |
+| Forcing `build_fix_scan` fusion on CUDA | "Fewer launches must be faster" | spike-052: 5.4× worse on real NVIDIA (it was the f64 kernel) | Fuse *orchestration* (whole-frontier kernels), not the f64 math path. |
+| Tuning build occupancy / row-partition `P` for CUDA | APU showed ~10% sensitivity | spike-053: refuted on real NVIDIA (P=1 optimal); APU signs don't transfer | Don't lift `BUILD_PSET` for CUDA; let autotune self-calibrate. |
+| Replacing the host-orchestrated / ROCm / CPU path | "One unified learner" | Breaks the bit-exact CPU merge gate + ROCm parity routing | Add as a feature-gated alternate path (PROJECT.md non-negotiable). |
+| Multi-stream micro-optimization first | Reference uses 4 streams | Sync-cost has no headroom (spike-052: ~0.14ms/sync, co-pack already banks it) | Get the single-stream on-device loop correct first; streams later if measured. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-Config struct + aliasing
-    └──gates──> everything (validated parameters drive all subsystems)
+On-device row partition (cuda_data_indices_ + leaf slices)
+    └──requires──> Stable block-prefix-sum scatter (SplitInnerKernel + AggregateBlockOffset)
 
-Dataset / BinMapper (binning)        [VERY HIGH risk]
-    └──requires──> DenseBin / SparseBin storage
-    └──requires──> Missing-value + categorical encoding
-    └──enables──> Exclusive Feature Bundling (EFB)
-    └──feeds──> Histogram construction
+On-device histogram arena + hist_t** pool
+    └──requires──> On-device row partition (leaf slices index the arena)
+    └──enables───> Build-smaller / subtract-larger economy
+                       └──requires──> SplitTreeStructureKernel pool-pointer rotation
 
-Histogram-based serial tree learner  [VERY HIGH risk — core]
-    ├──requires──> Dataset/Bin (ConstructHistogram)
-    ├──requires──> Split-gain scan (feature_histogram)
-    │                  └──requires──> categorical split path (separate)
-    │                  └──enhanced by──> monotone constraints
-    │                  └──enhanced by──> interaction constraints
-    │                  └──enhanced by──> CEGB penalties
-    ├──requires──> Data partition (row→leaf)
-    ├──requires──> Histogram subtraction trick
-    └──enhanced by──> feature subsampling (col_sampler)
+Cross-leaf best-leaf reduce (FindBestFromAllSplits)
+    └──requires──> Per-leaf best-split scan (cuda_leaf_best_split_info_[])
 
-GBDT loop
-    ├──requires──> ObjectiveFunction.GetGradients (grad/hess)
-    ├──requires──> TreeLearner.Train (one tree)
-    ├──requires──> Metric.Eval (for early stopping)
-    ├──requires──> ScoreUpdater
-    ├──requires──> boost_from_average (BoostFromScore)
-    └──subclassed by──> DART, RF
+SplitTreeStructureKernel (child seeding + smaller/larger pick + pool rotation)
+    └──requires──> On-device partition + histogram pool + CUDASplitInfo on device
+    └──produces──> the 16-int host mirror that drives the next iteration's launches
 
-Sample strategies
-    ├── Bagging ──requires──> RNG parity (bagging_seed)
-    └── GOSS    ──requires──> per-iteration gradient-magnitude SORT
-                              (depends on gradients already computed)
+Host CUDATree + bin-mapper metadata ──required-by──> tree->Split (RealThreshold/RealFeature)
 
-Ranking objectives (lambdarank / rank_xendcg)
-    ├──requires──> query/group boundaries (Metadata)
-    └──requires──> DCGCalculator (shared with ndcg/map metrics)
-
-Prediction
-    ├── raw/transformed ──requires──> trained models_ + ConvertOutput
-    ├── leaf index ──requires──> Tree structure
-    ├── SHAP/contrib ──requires──> full Tree node+cover structure
-    └── prediction early stop ──requires──> raw prediction loop
-
-Model text I/O
-    ├──requires──> Tree serialization
-    ├──requires──> BinMapper serialization
-    └──requires──> Config/feature metadata serialization
-
-Quantized gradient training  [defer]
-    └──requires──> float histogram learner FIRST (parallel int code path)
-
-Linear tree  [defer]
-    └──requires──> serial tree learner + per-leaf least-squares
+Quantized path ──enhances──> Build/subtract/find (separate int16/u64 kernels)
+Categorical splits ──requires──> bitset gen + cat_threshold vectors (pre-allocated)
+Bagging ──requires──> cuda_data_index_to_leaf_index_ inverse map
 ```
 
-### Dependency Notes (build-order implications)
-
-- **BinMapper before everything compute:** binning thresholds determine every split. If binning isn't bit-identical, no downstream parity is achievable. This is the first thing to lock, with its own oracle test against C++ `FindBin`.
-- **Histogram learner is the keystone:** the most complex and highest-FP-risk subsystem. GBDT, all objectives, all metrics are comparatively cheap; budget the bulk of effort here. The histogram-subtraction trick is a *correctness* dependency, not just performance — its FP result is what the model is defined against.
-- **GOSS depends on gradient ordering:** it sorts rows by |gradient| each iteration after `GetGradients`. Requires a deterministic sort matching C++ ties, and the amplification constant must match exactly. Build after GBDT + ObjectiveFunction.
-- **SHAP depends on Tree structure:** `TreeSHAP` walks node split features, thresholds, and per-node cover (hessian sums). The Tree model must persist this metadata even if only used at predict time. Build after Tree serialization and basic prediction.
-- **Ranking objectives + ndcg/map metrics share `DCGCalculator`:** build the DCG tables once; both consume them. Both also require query-group metadata, so Metadata must support `group_column`/query boundaries before ranking.
-- **Quantized-gradient and linear-tree are parallel code paths**, not extensions of the float learner — they roughly double the learner surface. Defer both until the float path passes the 1e-12 oracle, then port each against C++ with `use_quantized_grad`/`linear_tree` enabled.
-- **DART/RF are thin subclasses of GBDT** — cheap once GBDT + bagging exist, but DART's drop RNG (`drop_seed`) must match.
-- **`custom` objective is required for Python parity** (users pass their own grad/hess); it's nearly free (pass-through) but unlocks a large fraction of real Python workflows.
+### Dependency Notes
+- **Histogram pool requires the partition:** leaf slices (`cuda_leaf_data_start/num_data`) index both the row array and the arena slot; build the partition first.
+- **Subtraction trick requires the pool-pointer rotation:** the larger child must inherit the parent's buffer *before* Step 2's subtract — that rotation is done in the *previous* iteration's `SplitTreeStructureKernel` (`.cu:827-831`). Ordering is load-bearing.
+- **Host tree update requires host metadata:** even fully on-device, `tree->Split` needs `RealThreshold`/`RealFeatureIndex`/`missing_type` from the host bin-mapper (L297-303) — keep dataset metadata host-resident.
+- **Best-first stop:** `best_leaf_index_ == -1` is computed by the device reduce and surfaced via the 8-int packet — the host loop branches on it (L276).
 
 ---
 
 ## MVP Definition
 
-> "MVP" here means the smallest slice that demonstrates *faithful single-machine parity* on a real LightGBM workflow, not a reduced-feature product. v1 ultimately requires the full table-stakes set; the staging below is the recommended build order.
+### Launch With (v1.1 core slice)
+- [ ] On-device row partition + leaf slices (`cuda_data_indices_`, start/num_data) — without this nothing stays resident.
+- [ ] On-device histogram arena + `hist_t**` pool with the subtraction-trick pointer rotation — the resident frontier.
+- [ ] Build-smaller / subtract-larger per split, reusing existing build/subtract kernels.
+- [ ] Per-leaf best-split scan + cross-leaf best-leaf reduce (8-int D→H packet).
+- [ ] `SplitTreeStructureKernel` equivalent: on-device child seeding + smaller/larger selection + 16-int host mirror.
+- [ ] Numerical scope: **continuous features, no bagging, no quantization** — match the CPU f64 anchor (bit-exact merge gate) and hold CUDA to ~1e-6.
+- [ ] Feature-gated coexistence with the host-orchestrated / ROCm / CPU paths.
+- [ ] Real-CUDA (Kaggle) A/B vs official as the verification surface (target: materially below today's 3.9×@50f / 1.9×@500f).
 
-### Launch With (v1 core — the parity spine)
+### Add After Validation (v1.x)
+- [ ] Categorical splits on-device (bitset + pre-allocated cat_threshold) — trigger: core slice is bit-exact on continuous.
+- [ ] Bagging subset path (`SetBaggingData`, inverse leaf map) — trigger: GOSS/bagging configs needed on GPU.
+- [ ] On-device score update / boosting-on-GPU resident scores — trigger: per-tree H↔D of scores shows up in the profile.
+- [ ] `select_features_by_node_` (interaction constraints / feature_fraction_bynode).
 
-- [ ] **Config struct + aliasing + validation** — gates everything; must accept existing configs.
-- [ ] **Dataset + BinMapper + DenseBin/SparseBin** — bit-identical binning is the foundation of all parity.
-- [ ] **Missing-value handling + numerical splits** — correct default routing.
-- [ ] **Histogram-based serial tree learner** (construct, split-gain scan, data partition, subtraction trick, leaf-wise growth, `num_leaves`/`max_depth`/`min_data_in_leaf`/`lambda_l1/l2`/`min_gain_to_split`).
-- [ ] **GBDT loop** + ScoreUpdater + shrinkage + `boost_from_average`.
-- [ ] **Core objectives:** `regression`, `regression_l1`, `binary`, `multiclass`, `multiclassova`, `custom`.
-- [ ] **Core metrics:** `l1`, `l2`, `rmse`, `binary_logloss`, `binary_error`, `auc`, `multi_logloss`.
-- [ ] **Prediction:** raw, transformed, leaf index.
-- [ ] **Model text format read/write** — load a C++-trained model and predict identically (explicit requirement).
-- [ ] **Bagging + feature subsampling** — present in most real configs.
-- [ ] **Early stopping.**
-- [ ] **Oracle harness** comparing Rust vs C++ at 1e-12.
-
-### Add After Core Is Bit-Exact (still v1 — completes parity)
-
-- [ ] **GOSS** sample strategy (after gradients/sort are deterministic).
-- [ ] **DART** and **RF** boosting variants.
-- [ ] **Categorical splits + encoding** (`categorical_feature`, `max_cat_threshold`, `cat_smooth`...).
-- [ ] **Exclusive Feature Bundling** (`enable_bundle`).
-- [ ] **Remaining regression objectives:** `huber`, `fair`, `poisson`, `quantile`, `mape`, `gamma`, `tweedie`.
-- [ ] **Cross-entropy objectives** + `cross_entropy`/`kullback_leibler` metrics.
-- [ ] **Ranking:** `lambdarank`, `rank_xendcg` + `ndcg`, `map`, `average_precision`, `auc_mu` (DCGCalculator + query metadata).
-- [ ] **Monotone constraints** (basic → intermediate → advanced).
-- [ ] **SHAP / feature contributions** + prediction early stopping.
-- [ ] **Feature importance**, **refit/continue training**, **interaction constraints**, **forced splits/bins**, **extra trees**, **CEGB**.
-- [ ] **Python bindings** mirroring the official `lightgbm` API.
-
-### Future Consideration (post-v1)
-
-- [ ] **Quantized/discretized gradient training** (`use_quantized_grad`) — large parallel code path; defer until float path is locked.
-- [ ] **Linear-tree leaves** (`linear_tree`) — separate learner subclass.
-- [ ] **Text-file ingestion** (CSV/TSV/LibSVM) — Python/ndarray covers v1 input.
-- [ ] **Binary dataset cache** (`save_binary`), **Arrow ingestion**.
-- [ ] **Distributed training, C ABI, CLI, R bindings, raw CUDA/OpenCL** — explicit anti-features (see above).
+### Future Consideration (v2+)
+- [ ] Quantized-gradient on-device path (`use_quantized_grad`, int16/u64) — defer: large surface; maps to v2 QNT-01 and our existing CPU-only Phase-10 quantized mode.
+- [ ] `gpu_use_dp` f64-accumulation accuracy mode — defer: anchor already covers f64 reference.
+- [ ] Refit / `FitByExistingTree` / leaf renew on GPU — defer: not on the train-speed critical path.
+- [ ] Multi-stream overlap of the 4 reference streams — defer: measure first (sync has no headroom per spike-052).
 
 ---
 
@@ -283,86 +221,67 @@ Linear tree  [defer]
 
 | Feature | User Value | Implementation Cost | Priority |
 |---------|------------|---------------------|----------|
-| Config + aliasing + validation | HIGH | MEDIUM | P1 |
-| Dataset + BinMapper + Dense/Sparse bins | HIGH | HIGH | P1 |
-| Histogram serial tree learner | HIGH | HIGH | P1 |
-| GBDT loop + score updater + shrinkage | HIGH | HIGH | P1 |
-| Core objectives (l2/l1/binary/multiclass/custom) | HIGH | MEDIUM | P1 |
-| Core metrics (l2/rmse/l1/logloss/auc/multi_logloss) | HIGH | MEDIUM | P1 |
-| Raw/transformed/leaf prediction | HIGH | LOW | P1 |
-| Model text read/write | HIGH | HIGH | P1 |
-| Bagging + feature subsampling | HIGH | MEDIUM | P1 |
-| Early stopping | HIGH | LOW | P1 |
-| GOSS | MEDIUM | MEDIUM | P2 |
-| DART / RF | MEDIUM | LOW | P2 |
-| Categorical splits + EFB | HIGH | HIGH | P2 |
-| Remaining regression objectives | MEDIUM | MEDIUM | P2 |
-| Ranking (lambdarank/xendcg + ndcg/map) | MEDIUM | HIGH | P2 |
-| Monotone constraints | MEDIUM | MEDIUM | P2 |
-| SHAP / contributions | MEDIUM | HIGH | P2 |
-| Python bindings | HIGH | MEDIUM | P2 |
-| Feature importance / refit / interaction / forced / extra-trees / CEGB | LOW–MEDIUM | MEDIUM | P2 |
-| Quantized gradient training | LOW | HIGH | P3 |
-| Linear tree | LOW | HIGH | P3 |
-| Text-file ingestion | LOW | MEDIUM | P3 |
-| Distributed / C ABI / CLI / CUDA / OpenCL / R | (out of scope) | — | P3 (excluded) |
-
-**Priority key:** P1 = parity spine, must come first. P2 = completes full single-machine parity (all still required for v1). P3 = post-v1 / excluded.
+| On-device partition + leaf slices | HIGH | HIGH | P1 |
+| Histogram arena + pool pointer rotation | HIGH | HIGH | P1 |
+| Build-smaller / subtract-larger (reuse kernels) | HIGH | MEDIUM | P1 |
+| Per-leaf scan + cross-leaf reduce | HIGH | MEDIUM | P1 |
+| SplitTreeStructureKernel (on-device child seed) | HIGH | HIGH | P1 |
+| Feature-gated coexistence | HIGH | MEDIUM | P1 |
+| Categorical on-device | MEDIUM | MEDIUM | P2 |
+| Bagging subset | MEDIUM | MEDIUM | P2 |
+| On-device score update | MEDIUM | MEDIUM | P2 |
+| select_features_by_node | LOW | MEDIUM | P2 |
+| Quantized on-device path | MEDIUM | HIGH | P3 |
+| gpu_use_dp f64 mode | LOW | LOW | P3 |
+| Refit / leaf renew on GPU | LOW | MEDIUM | P3 |
 
 ---
 
-## Competitor Feature Analysis
+## Reuse Map (existing lightgbm_rs assets the planner can lean on)
 
-| Feature | C++ LightGBM (reference) | XGBoost / generic GBDT crates | This Port (v1 plan) |
-|---------|--------------------------|-------------------------------|---------------------|
-| Histogram tree learner | Yes (templated, OpenMP) | Yes | Yes — CubeCL kernels, bit-deterministic |
-| Native categorical splits | Yes (`SplitCategorical`) | Partial (XGBoost recent) | Yes (P2) |
-| GOSS | Yes | No | Yes (P2) |
-| DART | Yes | Yes | Yes (P2) |
-| Monotone constraints | Yes (3 methods) | Yes (XGBoost) | Yes (P2) |
-| SHAP/contrib | Yes (`TreeSHAP`) | Yes | Yes (P2) |
-| Ranking (lambdarank/ndcg) | Yes | Yes | Yes (P2) |
-| Quantized gradients | Yes | No | Defer (P3) |
-| GPU backend | CUDA + OpenCL | CUDA | CubeCL CPU+ROCm (differentiator) |
-| Memory safety | No (C++) | No | Yes (Rust) — core differentiator |
-| 1e-12 cross-backend determinism | Not guaranteed across devices | Not guaranteed | **Guaranteed contract** (core value) |
-| Distributed training | Yes | Yes | Out of scope (v1) |
+| Reference component | Existing asset to reuse | Gap to close |
+|---------------------|-------------------------|--------------|
+| `CUDAHistogramConstructor` build kernel | Our build kernel (Phase 4 + u64 fixed-point, spike-018) + `resident_pool.rs` | Wire it to write into a per-leaf arena slot chosen by an on-device pool, not a host pool. |
+| `SubtractHistogramForLeaf` | Our subtract kernel + `fix_histogram.rs` | Drive it off the on-device pool pointers (parent inherited by larger child). |
+| `FindBestSplitsForLeaf` (per-feature scan) | Our `find_best_split`/scan kernel (feature-per-lane, spike-021) + `split_info.rs` | Add the per-leaf validity gating + write into a persistent `cuda_leaf_best_split_info_[]`. |
+| `FindBestFromAllSplits` cross-leaf reduce | **New** | No host-side analog — the host `learner.rs` picks best leaf on host today. |
+| `CUDADataPartition::Split` | Our `data_partition.rs` (fused-gather + narrow-upload wins, spikes 027/029) | Move leaf bookkeeping + smaller/larger pick + child seeding **on-device** (`SplitTreeStructureKernel`); today it's host-side `DataPartition::split`. |
+| `CUDALeafSplitsStruct` | `leaf_splits.rs` (`LeafSplits`) | Promote to a device-resident struct seeded by the split kernel, not host-init each iter. |
+| `cuda_hist_pool_` (`hist_t**`) | `histogram_pool.rs` / `resident_pool.rs` (host-side flat arena) | Make the pool + pointer rotation device-resident. |
+| Host growth loop | `learner.rs::train_inner` (build→fix→compact→subtract→scan→partition per leaf) | Same algorithm; replace host orchestration with the few-large-kernel device loop. |
 
-The genuine differentiators vs the C++ reference are **memory safety**, a **portable CubeCL CPU↔ROCm backend** (replacing two separate CUDA/OpenCL codebases), and a **hard 1e-12 determinism contract on every backend** — not new ML capabilities. Everything else is parity.
+**Net new device-resident state to build:** the `hist_t**` pool rotation, the two persistent `CUDALeafSplitsStruct`s, the persistent `cuda_leaf_best_split_info_[num_leaves]`, the cross-leaf reduce, and the `SplitTreeStructureKernel` (child-seed + smaller/larger pick + 16-int mirror). Everything else is orchestration change around kernels we already have.
 
 ---
 
-## Appendix: In-Scope Config Surface (single-machine)
+## f64 / f32 Usage in the Reference (parity flags)
 
-From `include/LightGBM/config.h` (~110 fields after excluding distributed/GPU-vendor/CLI-only). Grouped for roadmap reference. Out-of-scope fields (`num_machines`, `local_listen_port`, `time_out`, `machine_list_filename`, `machines`, `gpu_platform_id`, `gpu_device_id`, `gpu_use_dp`, `num_gpu`, `is_parallel`, `is_data_based_parallel`, `convert_model*`, `tree_learner` distributed values) are excluded.
+| Location | Type | Hot loop? | Our stance |
+|----------|------|-----------|------------|
+| `hist_t` histogram storage (`bin.h:33`) | **f64** | storage, not a loop | Keep f64 *storage*; CPU anchor matches. |
+| Per-row histogram accumulation (`gpu_use_dp`, `config.h:1131` default false) | **f32** | YES (per data row) | Keep f32 (+ u64 fixed-point build). **Never** f64 here (spike-052: 5.4× regression). |
+| `CUDALeafSplitsStruct` sums, gain, value (`cuda_leaf_splits.hpp:21-32`) | **f64** | scalar | Acceptable — scalars per leaf, matches anchor. |
+| Split-gain math (`GetSplitGains`/`CalculateSplittedLeafOutput`, `cuda_leaf_splits.hpp:74-140`) | **f64** | over **bins**, not rows | Acceptable — bin-count loop, matches CPU f64 anchor; this is *why* the CPU anchor stays the bit-exact gate. |
+| `CUDASplitInfo` sums/gains (`cuda_split_info.hpp`) | **f64** | scalar | Acceptable. |
+| Quantized path (`int16` packed grad+hess, `int_hist_t`) | **int / u64 fixed-point** | YES | The fast hot path; aligns with "no f64 hot loops" mandate. Defer to v2. |
 
-- **Core:** `objective`, `boosting`, `data_sample_strategy`, `num_iterations`, `learning_rate`, `num_leaves`, `num_threads`, `device_type`, `seed`, `deterministic`.
-- **Tree / regularization:** `max_depth`, `min_data_in_leaf`, `min_sum_hessian_in_leaf`, `min_gain_to_split`, `lambda_l1`, `lambda_l2` (`reg_alpha`/`reg_lambda` aliases), `max_delta_step`, `path_smooth`, `histogram_pool_size`, `force_col_wise`, `force_row_wise`.
-- **Sampling:** `bagging_fraction`, `pos_bagging_fraction`, `neg_bagging_fraction`, `bagging_freq`, `bagging_seed`, `bagging_by_query`, `feature_fraction`, `feature_fraction_bynode`, `feature_fraction_seed`, `extra_trees`, `extra_seed`.
-- **GOSS:** `top_rate`, `other_rate`.
-- **DART:** `drop_rate`, `max_drop`, `skip_drop`, `xgboost_dart_mode`, `uniform_drop`, `drop_seed`.
-- **Categorical:** `min_data_per_group`, `max_cat_threshold`, `cat_l2`, `cat_smooth`, `max_cat_to_onehot`, `categorical_feature`.
-- **Constraints / CEGB:** `monotone_constraints`, `monotone_constraints_method`, `monotone_penalty`, `interaction_constraints`, `forcedsplits_filename`, `cegb_tradeoff`, `cegb_penalty_split`, `top_k`.
-- **Binning / dataset:** `max_bin`, `min_data_in_bin`, `bin_construct_sample_cnt`, `data_random_seed`, `is_enable_sparse`, `enable_bundle`, `use_missing`, `zero_as_missing`, `feature_pre_filter`, `pre_partition`, `header`, `label_column`, `weight_column`, `group_column`, `ignore_column`, `forcedbins_filename`, `precise_float_parser`, `two_round`, `save_binary`.
-- **Quantized / linear (defer):** `use_quantized_grad`, `num_grad_quant_bins`, `quant_train_renew_leaf`, `stochastic_rounding`, `linear_tree`, `linear_lambda`.
-- **Objective params:** `num_class`, `is_unbalance`, `scale_pos_weight`, `sigmoid`, `boost_from_average`, `reg_sqrt`, `alpha`, `fair_c`, `poisson_max_delta_step`, `tweedie_variance_power`, `lambdarank_truncation_level`, `lambdarank_norm`, `lambdarank_position_bias_regularization`, `objective_seed`.
-- **Metric:** `metric`, `metric_freq`, `is_provide_training_metric`, `eval_at`/`ndcg_eval_at`, `multi_error_top_k`, `early_stopping_round`, `early_stopping_min_delta`, `first_metric_only`.
-- **Prediction:** `start_iteration_predict`, `num_iteration_predict`, `predict_raw_score`, `predict_leaf_index`, `predict_contrib`, `predict_disable_shape_check`, `pred_early_stop`, `pred_early_stop_freq`, `pred_early_stop_margin`.
-- **Model I/O:** `input_model`, `output_model`, `saved_feature_importance_type`, `snapshot_freq`, `refit_decay_rate`, `verbosity`.
+**Bottom line for the planner:** the f64 in the reference is confined to histogram *storage* and *bin/scalar* gain math — exactly what our CPU f64 anchor already reproduces bit-exact. The only place f64 would land on a per-row hot loop is the accumulation, and the reference itself defaults that to f32. Port accordingly: f32 (+ u64 fixed-point) per-row accumulation, f64 bin/scalar gain math, CPU f64 fold remains the merge gate, CUDA held to ~1e-6.
 
 ---
 
 ## Sources
 
-- `LightGBM/src/objective/objective_function.cpp` — full objective registry (`CreateObjectiveFunction`).
-- `LightGBM/src/metric/metric.cpp` — full metric registry (`CreateMetric`).
-- `LightGBM/src/boosting/{gbdt.cpp,dart.hpp,rf.hpp,goss.hpp,bagging.hpp,score_updater.hpp,prediction_early_stop.cpp}` — boosting/sample strategies.
-- `LightGBM/src/treelearner/{serial_tree_learner.cpp,feature_histogram.{cpp,hpp},data_partition.hpp,col_sampler.hpp,monotone_constraints.hpp,cost_effective_gradient_boosting.hpp,gradient_discretizer.{cpp,hpp},linear_tree_learner.h}` — tree learning + variants.
-- `LightGBM/src/io/{dataset.cpp,bin.cpp,dense_bin.hpp,sparse_bin.hpp,tree.cpp,metadata.cpp}` — dataset/binning/SHAP/model I/O.
-- `LightGBM/include/LightGBM/{config.h,bin.h,boosting.h,tree.h}` — config surface, bin types, interfaces.
-- `LightGBM/src/io/tree.cpp` `TreeSHAP`/`UnwoundPathSum` — SHAP implementation.
-- `.planning/PROJECT.md`, `.planning/codebase/ARCHITECTURE.md`, `.planning/codebase/STRUCTURE.md` — scope boundaries and subsystem map.
+- `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp:97-345` (the growth loop) — HIGH (primary reference source, direct read)
+- `LightGBM/src/treelearner/cuda/cuda_data_partition.{hpp,cpp,cu}` (on-device partition, `SplitTreeStructureKernel` `.cu:785-1032`) — HIGH
+- `LightGBM/src/treelearner/cuda/cuda_best_split_finder.{hpp,cpp,cu}` (per-leaf scan + cross-leaf reduce `.cu:2161`) — HIGH
+- `LightGBM/src/treelearner/cuda/cuda_histogram_constructor.{hpp,cpp}` (arena + build/subtract drivers) — HIGH
+- `LightGBM/src/treelearner/cuda/cuda_leaf_splits.hpp` (`CUDALeafSplitsStruct` + f64 gain math) — HIGH
+- `LightGBM/include/LightGBM/cuda/cuda_split_info.hpp` (`CUDASplitInfo`) — HIGH
+- `LightGBM/include/LightGBM/bin.h:33` (`hist_t = double`), `config.h:1131` (`gpu_use_dp=false`) — HIGH
+- `crates/lgbm-treelearner/src/learner.rs` (existing host growth loop being replaced) — HIGH
+- `.claude/skills/spike-findings-lightgbm_rs/references/cuda-architectural-launch-bound.md` (spikes 051–054: launch-bound mechanism, f64/occupancy/fusion verdicts) — HIGH
+- `.planning/PROJECT.md` (v1.1 milestone goal + non-negotiables) — HIGH
 
 ---
-*Feature research for: pure-Rust LightGBM single-machine port*
-*Researched: 2026-06-05*
+*Feature research for: on-device CUDA single-GPU tree learner port (milestone v1.1)*
+*Researched: 2026-06-28*

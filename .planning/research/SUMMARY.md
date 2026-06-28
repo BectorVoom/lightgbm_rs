@@ -1,189 +1,168 @@
 # Project Research Summary
 
-**Project:** LightGBM-rs — Pure-Rust LightGBM port on CubeCL (CPU + AMD ROCm) with Python bindings
-**Domain:** Histogram-based gradient-boosting decision-tree library (faithful single-machine port of Microsoft LightGBM 4.6) with a switchable CPU/ROCm compute backend and a strict numerical-parity contract
-**Researched:** 2026-06-05
-**Confidence:** MEDIUM-HIGH (HIGH on stack/features/C++ subsystem mapping; MEDIUM on the achievability of literal 1e-12 parity on ROCm — the central project risk)
+**Project:** lightgbm_rs — milestone **v1.1 GPU Training-Speed: CUDA On-Device Tree Learner**
+**Domain:** On-device (whole-tree-on-GPU) histogram tree learner in CubeCL — porting LightGBM's `CUDASingleGPUTreeLearner` into the existing pure-Rust `Backend`/`SerialTreeLearner` architecture
+**Researched:** 2026-06-28
+**Confidence:** HIGH
+
+> Supersedes the stale 2026-06-05 v1.0 project summary (preserved in git history). This is the v1.1 milestone summary.
 
 ## Executive Summary
 
-This is a faithful re-implementation of LightGBM's single-machine training/prediction engine in pure Rust, structured as a Cargo workspace, with the C++ LightGBM 4.6 tree under `LightGBM/` as a read-only reference. The genuine novelty is not ML capability — every feature is parity — but three cross-cutting properties: **memory safety** (Rust), a **portable CubeCL CPU↔ROCm backend** that replaces LightGBM's two separate CUDA and OpenCL codebases, and a **bit-determinism contract** across backends. Experts build this layer-by-layer with an abstract seam at every subsystem boundary; the Rust port maps each C++ abstract-base-class + string factory onto an `enum` + `trait`, and collapses the C++ `#ifdef USE_CUDA` device branching into a single `Backend` trait boundary so the boosting/tree-learner logic is device-agnostic.
+This milestone is a **port of a known reference**, not new compute R&D. Spikes 051-054 (run on real NVIDIA via Kaggle) refuted every cheap GPU-histogram lever — occupancy/`P` tuning, kernel fusion, and sync reduction are all flat-to-catastrophic on real CUDA. The single remaining architectural lever is to stop driving tree growth from the host one leaf at a time (~8,570 small serial launches per 100-tree train, ~86/tree) and instead grow the whole tree on-device, mirroring official LightGBM's `CUDASingleGPUTreeLearner`. The crucial finding from the reference read: that learner is **also host-driven** — the host still runs the per-leaf best-first loop — but each step dispatches a *handful of large kernels over device-resident state* and reads back only two tiny scalar packets (an 8-int "which leaf/feature/threshold won" and a 16-int "child counts/starts/sums"). The win is **granularity, not location**: fewer/larger launches + extended resident state, not a persistent megakernel (which cubecl 0.10 does not support and the reference does not use).
 
-The single most important finding cuts across all four research dimensions and must shape every phase: **the headline "1e-12 absolute parity on ROCm" contract is, taken literally, almost certainly unachievable for any code path that touches GPU floating-point reductions or transcendental functions** (`exp`/`log`/`pow`/`sigmoid`). LightGBM's *own* `deterministic=true` mode does not reproduce results across compilers, CPU instruction sets (FMA/AVX), or machines — the maintainers state this explicitly — and a GPU is a more divergent environment than "a different CPU." Yet the architecture research found a powerful resolution: LightGBM already ships an **integer-quantized gradient histogram path** (`GradientDiscretizer`), and **integer addition is associative and exact**, so histogram accumulation — and therefore the *tree structure* (split feature, split bin, topology, RNG-selected rows/features) — can be made **bit-identical across CPU and ROCm by construction**, independent of reduction order, thread count, or whether the CubeCL Plane path or sequential path runs. The recommended resolution is a **tiered oracle**: Tier A (bit-exact structural/RNG/bin/split parity on *all* backends), Tier B (≤1e-12 numeric on the deterministic single-threaded CPU path), Tier C (documented relaxed tolerance, e.g. ~1e-6 relative, on ROCm numeric outputs, *always paired with a Tier A same-tree structural check* so "numbers differ slightly" can never hide "a different model was trained"). This tiering must be signed off as a Key Decision in PROJECT.md before any kernel work — otherwise the project has an unfalsifiable acceptance criterion that will be cited as a failed requirement at every milestone.
+The stack requires **no new crates and no new cubecl capability**: cubecl 0.10.0 (already pinned) provides every primitive needed — `sync_cube`, u64/i64/f32 atomics, `SharedMemory`, plane collectives, runtime-bound loops, and the resident-`Handle` pattern (already proven by `ResidentBins`/`resident_pool`). The work is net-new *device-resident orchestration state* (a `hist_t**` pool with pointer rotation for the subtraction trick, two persistent leaf-splits structs, a persistent per-leaf best-split buffer, a cross-leaf reduce, and an on-device `SplitTreeStructureKernel` that seeds children and picks smaller/larger on-device). The integration seam is **additive and default-off**: a new `Backend::grow_tree_on_device()` method gated by a default-false `on_device_growth_supported()` discriminator, routed by a decide-once-at-top early-return fork in `SerialTreeLearner::train_inner`. This protects the CPU f64 bit-exact anchor, the shipped ROCm host-driven path, and the existing host-CUDA path — all untouched until `LGBM_CUDA_ON_DEVICE=1`.
 
-The second cross-cutting theme is a **dependency-forced build order** that is non-negotiable because each layer must be bit-exact before anything above it can be validated: Config → BinMapper/Dataset → RNG → histogram tree-learner → GBDT loop → objectives/metrics → prediction → model text I/O → boosting/feature variants → Python bindings. Two foundations dominate risk — **binning** (`BinMapper::ValueToBin`, where one off-by-one mis-bins a row and cascades into a different tree) and the **histogram tree-learner** (the keystone, where FP summation order and the histogram-subtraction trick decide every split). A standalone, bit-exact port of LightGBM's hand-rolled 32-bit LCG `Random` (with `u32` wraparound and `f32` sampling) must precede any sampling code, since one wrong draw selects different rows and fails the oracle on iteration 1. Finally, **CubeCL is alpha (v0.10.0) with imminent breaking churn**; the mitigation is to isolate *all* CubeCL usage behind one `lgbm-compute` crate's `Backend` trait so an upgrade touches exactly one crate, pin every `cubecl-*` version exactly, commit `Cargo.lock`, and schedule upgrades as discrete tasks.
+The non-negotiables are numerical and procedural. The **CPU f64 fold stays the bit-exact merge gate**; the CUDA/ROCm paths are held to ~1e-6 **anchor-pinned to that f64 anchor, never GPU-vs-GPU** (two nondeterministic f32 atomic paths compared to each other are flaky by construction — def-f8u-01). No f64 per-row hot loops (consumer NVIDIA f64 = 1/32 f32; spike-052 measured a **5.4x regression** from one f64-fused kernel) — keep the u64 fixed-point build. The largest open risk is **empirical, not architectural**: the best-first loop still serializes per split, so the magnitude of the win (the closing `lgb_rs/official` ratio) is genuinely unknown and **must be measured on Kaggle** — `device_launches` dropping materially below 8,570 is a first-class DoD metric, not an assumption. Build order is ~5 anchor-gated vertical slices; scope is continuous features / no bagging / no quantization, with categorical, bagging, on-device scoring, and quantization explicit P2/P3 follow-ons.
 
 ## Key Findings
 
 ### Recommended Stack
 
-Pure Rust (edition 2024, toolchain ≥1.85), Cargo workspace, with all compute behind CubeCL. The numeric design is dominated by the parity contract: **f64 for every accumulation** (LightGBM accumulates histograms/scores in `double` even when gradients are `float`), a **custom columnar/bit-packed bin store** (ndarray cannot represent the 4/8/16-bit packed bin layout faithfully), and a **hand-written parser/writer for the LightGBM `.txt` model format** (bespoke line-oriented format with parity-critical field order and `%.17g`-style float formatting — serde cannot model it). See [STACK.md](STACK.md).
+cubecl **0.10.0** (already pinned in `Cargo.lock`) is sufficient — no upgrade, no new dependency. The reference architecture is host-driven with per-step launches over device-resident state, so cubecl's lack of a persistent-megakernel / cooperative-grid API and lack of a grid-wide barrier are **non-issues**: a kernel boundary *is* the grid barrier, exactly as the reference uses it. The one capability trap is f64: on CUDA `has_f64 == true`, which would silently route the `has_f64`-keyed `ReducePath` onto the slow f64 anchor kernel — the on-device CUDA build must explicitly select the **u64 fixed-point** integer build.
 
 **Core technologies:**
-- **`cubecl =0.10.0`** (pin exactly): single kernel source compiles to CPU/CUDA/HIP/wgpu; latest *stable* on crates.io (the book's `0.11.0` is unreleased `main`). Alpha — the #1 churn risk.
-- **`cubecl-hip` via the `hip`/`rocm` feature** (NOT wgpu): the dedicated ROCm runtime; supports **f64 in hardware**, which wgpu/WebGPU does not — a structural reason ROCm must not route through wgpu.
-- **f64 accumulators + custom bit-packed bin store**: hard requirements for 1e-12; raw gradients/labels stored at C++ width (`float` default), accumulated in f64.
-- **`pyo3 0.28.3` + `numpy 0.28.0` (lockstep minors) + `maturin 1.13.3`**: Python bindings; the official `lightgbm` package is pure-Python-over-ctypes, so the thin sklearn wrapper layer can be reimplemented in Python over a Rust `Booster`, minimizing PyO3 surface. Avoid `pyo3 0.28.0/0.28.1` (yanked).
-- **`thiserror 2.0.18`** at crate boundaries, **`anyhow 1.0.102`** at app/test/binding layers (never leak `anyhow` across the PyO3 boundary); **`proptest`/`criterion`/`approx`** for the oracle suite.
-- **Oracle source**: fixture-based via the official Python `lightgbm` package (canonical reference, decouples from C++ build); shell out to CLI for config-file cases; FFI to `lib_lightgbm.so` only to probe internal intermediates.
+- `cubecl` 0.10.0 — the compute seam; already provides `sync_cube`, atomics, plane ops, runtime loops, resident `Handle`s — no upgrade required (churns the verified parity surface for zero capability gain).
+- `cubecl-cuda` 0.10.0 (`CudaBackend = GpuBackend<CudaRuntime>`) — the real-NVIDIA target; inherits every kernel ROCm validates via the generic `GpuBackend<R>`.
+- `cubecl-hip` 0.10.0 (`RocmBackend`) — the local parity gate (spoofed 8-CU APU); bit-exact-to-anchor proofs run here before Kaggle confirms speed.
+- `cubecl-cpu` 0.10.0 — the **f64 bit-exact deterministic anchor / hard merge gate** — unchanged, do not touch.
+
+Open items to verify at plan time (do not assume): multi-stream support in cubecl 0.10 (the reference uses 4 streams — treat overlap as a *stretch*, not a dependency); idiomatic batched `client.read(vec![h])` readback of the tiny scalar packets; in-place `Handle` aliasing vs ping-pong double-buffering for the data->leaf map; coarse per-tree method vs per-leaf trait granularity.
 
 ### Expected Features
 
-v1 = full single-machine parity, not a reduced product; "table stakes" = what a LightGBM user's workflow assumes exists. Every numeric feature carries the parity tax (bit-level reduction order + exact transform formulas). See [FEATURES.md](FEATURES.md).
+The deliverable is a faithful step-ordered port of `CUDASingleGPUTreeLearner::Train()`: leaf-wise (best-first) growth, `num_leaves-1` splits, with per split a fixed small sequence — build-smaller -> subtract-larger -> per-leaf best-split scan -> cross-leaf best-leaf reduce -> on-device partition + tree-structure kernel. Steady-state per-split host<->device traffic is just **24 ints** (the two tiny packets). The compute kernel bodies (build, subtract, find-best scan, partition) already exist in `lgbm-rs`; what is new is the **on-device orchestration state**.
 
-**Must have (table stakes — the parity spine):**
-- Config struct (~110 in-scope hyperparameters) + alias map + validation — gates everything.
-- Dataset + BinMapper + Dense/Sparse bins — bit-identical binning is the foundation of all parity.
-- Histogram-based serial tree-learner (construct → split-gain scan → partition → leaf-wise growth) — the keystone; highest FP-parity risk.
-- GBDT loop + score updater + shrinkage + `boost_from_average` + early stopping.
-- Core objectives (`regression`, `regression_l1`, `binary`, `multiclass`, `multiclassova`, `custom`) and core metrics (`l1`/`l2`/`rmse`/`binary_logloss`/`binary_error`/`auc`/`multi_logloss`).
-- Prediction (raw / transformed / leaf index) + model text format read/write (load a C++-trained model, predict identically).
-- Bagging + feature subsampling.
+**Must have (table stakes, P1):**
+- On-device row partition (`cuda_data_indices_` + per-leaf slices) via stable block-prefix-sum scatter — without it nothing stays resident.
+- On-device histogram arena + `hist_t**` pool with subtraction-trick **pointer rotation** (larger child inherits parent's buffer) — today's pool is host-side.
+- Build-smaller / subtract-larger per split (reuses existing kernels).
+- Per-leaf best-split scan + **cross-leaf best-leaf reduce** (8-int D->H packet) — the reduce is net-new (host picks best leaf today).
+- On-device `SplitTreeStructureKernel` equivalent: child seeding + smaller/larger pick + 16-int host mirror — the structural heart.
+- Host tree-structure mirror (`CUDATree` + bin-mapper metadata stays host-resident for `tree->Split` RealThreshold/RealFeature).
+- min_data_in_leaf / min_sum_hessian gates + "no positive gain" stop (already in host learner).
+- Feature-gated coexistence with host-orchestrated / ROCm / CPU paths.
 
-**Should have (completes parity / differentiators, P2):**
-- GOSS, DART, RF; categorical splits + Exclusive Feature Bundling; remaining regression + cross-entropy objectives; ranking (`lambdarank`/`rank_xendcg` + `ndcg`/`map`, sharing `DCGCalculator`); monotone & interaction constraints; SHAP/contributions; feature importance; refit/continue; Python bindings mirroring the official API.
-- The real differentiators vs C++: memory safety, the portable CubeCL CPU↔ROCm backend, and the bit-determinism contract.
+**Should have (P2, after the core slice proves out):**
+- Categorical splits on-device (bitset gen + pre-allocated `cat_threshold`).
+- Bagging subset path (inverse leaf map).
+- On-device score update / boosting-on-GPU resident scores.
+- `select_features_by_node_` (interaction constraints / feature_fraction_bynode).
 
-**Defer (post-v1):**
-- Quantized/discretized gradient *training* as a user feature (the int path is reused internally for determinism — see below), linear-tree leaves, text-file ingestion (CSV/TSV/LibSVM), binary dataset cache, Arrow.
+**Defer (P3 / v2+):**
+- Quantized-gradient on-device path (`use_quantized_grad`, int16/u64) — large surface; maps to v2 QNT-01 and the shipped CPU-only Phase-10 mode.
+- `gpu_use_dp` f64-accumulation accuracy mode — the CPU anchor already covers the f64 reference.
+- Refit / `FitByExistingTree` / leaf renew on GPU.
+- Multi-stream overlap of the 4 reference streams — measure first; sync has no headroom (spike-052).
 
-**Explicit anti-features (excluded from v1):** distributed/network training, C ABI, CLI app, raw CUDA/OpenCL backends (kept as *design references* for CubeCL kernels, not build targets), R bindings, NVIDIA-specific tuning.
+**Anti-features (do NOT port):** f64 per-row hot-loop kernels (5.4x regression), per-`SplitInfo` device heap alloc, forcing `build_fix_scan` fusion on CUDA, occupancy/`P` tuning for CUDA, replacing the host/ROCm/CPU paths, multi-stream micro-optimization first.
 
 ### Architecture Approach
 
-A layered, acyclic Cargo workspace where dependencies flow strictly downward and **`lgbm-compute` is the only crate that names a CubeCL runtime** — everything above it talks to a `Backend` trait, so the boosting loop is device-agnostic and CPU-only testing is always possible. Kernels are written *once* generic over `R: Runtime`; `cpu.rs`/`rocm.rs` only pick the runtime. See [ARCHITECTURE.md](ARCHITECTURE.md).
+The integration is an **additive Backend seam, not a new learner trait**. A new `Backend::grow_tree_on_device()` method gated by a default-false `on_device_growth_supported()` discriminator (overridden only on `GpuBackend<R>`, opt-in via an `on_device_enabled` field + `LGBM_CUDA_ON_DEVICE` env) is routed by a decide-once-at-top early-return fork in `SerialTreeLearner::train_inner` — a sibling branch of the existing resident/host fork. A parallel `TreeLearner` trait is rejected: 20+ gbdt.rs call sites name `SerialTreeLearner` concretely, so a learner-level dispatch refactor would blast-radius into the exact CPU/ROCm paths the milestone must protect. The on-device path returns a plain-data, cubecl-free `OnDeviceTreeResult` (node arrays + final `row_leaf`) that the learner reconstitutes into the same `(Tree, DataPartition)` pair the boosting loop already consumes — keeping the boosting<->treelearner boundary byte-unchanged and per-iter scores bit-comparable for free.
 
-**Major components (downward dependency order):**
-1. **`lgbm-core`** — shared types, config enums, `thiserror` errors, reduction traits (depends on nothing; kept thin to avoid recompilation cascades).
-2. **`lgbm-data`** — BinMapper/binning (the determinism root), FeatureGroup, Dense/Sparse/MultiVal bins, Metadata, loader; immutable after load.
-3. **`lgbm-model`** — Tree storage + text/JSON model I/O (enables validating prediction parity independently of training).
-4. **`lgbm-compute`** — the backend boundary: `Backend` trait + `#[cube]` kernels (histogram, split scan, score update, grad/hess), CPU↔ROCm selection. **The CubeCL churn containment boundary.**
-5. **`lgbm-objective` / `lgbm-metric`** — grad/hess and eval kernels + DCG tables.
-6. **`lgbm-treelearner`** — serial learner orchestrating compute kernels; gradient discretizer; monotone/categorical splits.
-7. **`lgbm-boosting`** — GBDT/DART/RF loop, bagging/GOSS, score updater, early stopping.
-8. **`lgbm-api`** — Rust-native `Booster`/`Dataset`/`train`/`predict` facade; enum+match factories replace C++ string `Create*`.
-9. **`lgbm-python`** — PyO3 over the validated facade (cfg-gated; not in the default workspace build).
+**Major components (net-new device-resident state):**
+1. `hist_t**` histogram pool with pointer rotation — the resident frontier + subtraction-trick economy.
+2. Two persistent `CUDALeafSplitsStruct` (smaller/larger frontier descriptors) seeded on-device.
+3. Persistent `cuda_leaf_best_split_info_[num_leaves]` + cross-leaf argmax reduce.
+4. `SplitTreeStructureKernel` — on-device child seed + smaller/larger pick + 16-int host mirror.
+5. On-device `cuda_data_partition_` (row->leaf, stable scatter) — the true single-GPU partition (later slice; pays off on discrete PCIe, kept host-side on ROCm per spike-035).
 
-**The determinism architecture (the keystone design decision):** make **integer-quantized gradient accumulation the default compute path on every backend**. The `Backend` trait's histogram signatures take/return integers (`Buf<i32>` gradients → `Buf<i64>` histograms); because integer addition is associative and exact, CPU and ROCm produce the same bits by construction, and the histogram-subtraction trick stays exact. Float histograms exist only as a non-deterministic fast path that is *off* under the parity contract. Unavoidable float sums (final leaf outputs, score updates, metrics) use **f64 with fixed-shape pairwise reductions** (never floating atomic-add, whose order is nondeterministic). **Residual risk:** no source proves f64 transcendentals (exp/log) are bit-identical between a ROCm device math library and host libm; discretization (a rounding step) *may* absorb the last-ULP divergence, but this must be empirically validated, with the fallback of computing objective grad/hess on CPU and pushing only discretized integers to the GPU.
+Parity is **anchor-pinned, tie-aware, never bit-exact GPU-vs-GPU**: grow the corpus on `CpuBackend` (f64 anchor) and on-device, assert tree *topology* against the anchor with a mandatory tie-aware `default_left` assert (legal f32 near-tie flips accepted), leaf values within a ~1e-5 f32 envelope. The CPU merge gate suite stays the hard gate; real-CUDA validation is Kaggle-only (`boomvector`, reading the max-launches `phase_prof device_launches` dump).
 
 ### Critical Pitfalls
 
-The top theme is that parity is brittle and discontinuous — a 1-ULP difference in a gradient sum can flip a split and cascade into an entirely different tree — so parity must be validated at the granularity of bins → histograms → per-split gains → leaf outputs, never just final predictions. See [PITFALLS.md](PITFALLS.md).
+1. **Comparing two nondeterministic GPU f32 paths to each other** — flaky by construction (`learner_parity_resident...` failed ~4/6 runs on unchanged master, def-f8u-01). Pin **both** trees to the cpu f64 anchor; build `assert_on_device_tree_matches_cpu_anchor` in **Slice 0, before any kernel**.
+2. **f32 reduction-order flips split structure (default_left / equal-gain ties)** — a naive bit-exact assert hard-fails on ~34% of fixtures with empty default bins. Use the **tie-aware assert** (commit 1832206): a flip allowed only on a verified f32 tie (same threshold + left_count + f32-equal gains), non-tie flips still hard-fail. Land it in the same slice as the selection kernel.
+3. **f64 hot loops (consumer-NVIDIA 1/32 trap)** — `LGBM_FUSED_FORCE=1` (the f64 fused kernel) was **5.4x WORSE** on real CUDA (spike-052). Keep the **u64 fixed-point build**; audit every new kernel for f64 in gain math / leaf-output / score accumulation / fused build+scan. "No f64 in device hot loops" is a per-slice DoD item.
+4. **Trusting spoofed-APU lever signs for real CUDA** — the local "GPU" is a spoofed 8-CU APU that mis-predicted *every* lever in 051-054. **Correctness -> local (cpu anchor + APU ~1e-6); perf/routing -> Kaggle in-session A/B only.** Design correctness to stay local so Kaggle is needed only at perf checkpoints.
+5. **"On-device" but still launch-bound** — if the loop still fires a launch per frontier node, `device_launches` stays ~8,570 and the gap isn't closed. Make `device_launches` a **first-class success metric every slice**; batch the whole frontier, don't move state on-device while keeping per-node control.
 
-1. **Literal 1e-12-on-ROCm is unachievable for GPU reduction/transcendental paths** — resolve with the **tiered oracle** (A: bit-exact structural on all backends; B: ≤1e-12 on deterministic CPU; C: documented relaxed tolerance on ROCm + Tier A same-tree check). Sign off as a Key Decision in Phase 0, before any kernel work.
-2. **Non-bit-exact RNG port** — LightGBM's `Random` is a 32-bit LCG relying on `u32` wraparound, with `f32` `NextFloat` and a `std::set`-ordered `Sample` branch. Port standalone *first*, unit-test a 100k-draw sequence against C++ before any sampling code; verify call *order*, not just values.
-3. **FP summation order in histogram/leaf reductions** — always compare against the C++ reference built/run with `deterministic=true, force_row_wise=true, num_threads=1`; accumulate CPU sums in the same sequential f64 order; integerize the GPU path. Don't parallelize the reduction until parity is locked.
-4. **Histogram subtraction trick** — must reproduce *which* child is constructed directly vs derived (smaller-by-count child); integer subtraction makes it exact. Constructing both children directly diverges from the reference.
-5. **`BinMapper::ValueToBin` off-by-ones** — port the `(r+l-1)/2` + `<=` search and NaN/`±0`/on-boundary placement *literally* (not Rust's `binary_search`); snapshot `bin_upper_bound_` and edge-case bin indices. Match the float parser too.
-6. **Mis-configured oracle reference** — pin LightGBM version (4.6), compiler/flags (FMA/`-march`), `score_t`/`label_t` width, and the deterministic config as a checked-in manifest; generate multi-granularity goldens; stand up the harness *before* any CubeCL work.
-
-(Further: split-gain `kEpsilon` positions, default-bin-skip in the scan, transcendental divergence across libm/HIP, subnormal/FTZ on ROCm, CPU-runtime-vs-HIP divergence within CubeCL, categorical bitset encoding, PyO3 dtype/contiguity/GIL hazards, and Cargo.lock/toolchain pinning.)
+Plus: cubecl-0.10 gotchas (no global barrier, `Atomic<i64>` broken -> use u64 two's-complement, `wrapping_add` not an intrinsic, `plane_inclusive_sum` capped at plane width << 256-bin -> segmented LDS block-scan, `launch_unchecked` is unsafe); monolithic big-bang port (slice vertically); and breaking the existing CPU/ROCm/host-CUDA paths (feature-gate everything, preserve build-smaller-before-subtract ordering, run the full bit-exact suite every change).
 
 ## Implications for Roadmap
 
-Based on the research, the suggested phase structure follows the **dependency-forced build order** — each layer must be bit-exact before the next can be validated. Phase 0 is non-optional and unusually load-bearing because the oracle definition and RNG/lockfile foundations gate *all* later success criteria.
+Based on research, the milestone should be sequenced as **~5 anchor-gated vertical slices**, each end-to-end (grows a real tree, returns `(Tree, DataPartition)`, passes the anchor-pinned tie-aware gate, ships default-off behind `LGBM_CUDA_ON_DEVICE`), each with a Kaggle launch-count checkpoint. This is a deliberate counter to the monolithic-port pitfall: a one-shot port produces unlocalizable parity failures amid f32 tie noise.
 
-### Phase 0: Oracle Contract + Foundations
-**Rationale:** Every later phase's acceptance criterion depends on this. The 1e-12-on-ROCm contract must be re-tiered before anyone writes a kernel against an unfalsifiable target.
-**Delivers:** Tiered-oracle Key Decision (A/B/C) signed into PROJECT.md; pinned, containerized C++ reference build manifest (version 4.6, compiler/flags, `score_t` width, `deterministic=true force_row_wise=true num_threads=1` config); multi-granularity golden-snapshot harness; committed `Cargo.lock` + `rust-toolchain.toml`; `lgbm-core` (types, config enums, errors); standalone bit-exact `Random` LCG with a 100k-draw + `Sample(N,K)` conformance test.
-**Avoids:** Pitfalls 1, 2, 10, 15 (unachievable contract, RNG mismatch, mis-configured reference, dependency churn).
+### Phase / Slice 0: Scaffold the seam (no behavior change)
+**Rationale:** Isolate wiring risk from kernel risk; build the oracle before any kernel (Pitfall 1).
+**Delivers:** `on_device_growth_supported()` (default false) + `grow_tree_on_device()` (default typed error) + `OnDeviceTreeResult` + `on_device_eligible()` + the `train_inner` early-return fork + `reconstitute()` helper + `assert_on_device_tree_matches_cpu_anchor` oracle scaffold + the cubecl-0.10-gotcha checklist.
+**Addresses:** the feature-gated coexistence requirement.
+**Avoids:** Pitfalls 1, 5-gotchas, 7 (merge gate green; CPU/ROCm/host-CUDA all untouched — eligibility ANDs in a false discriminator).
 
-### Phase 1: Dataset + Binning (the determinism root)
-**Rationale:** Binning thresholds determine every split; if `BinMapper::find_bin` isn't bit-identical, no downstream parity is achievable.
-**Delivers:** `lgbm-data` — `BinMapper::ValueToBin` (literal `(r+l-1)/2`+`<=`), Dense/Sparse/MultiVal bins, FeatureGroup, Metadata, missing/categorical encoding; validated against `bin_upper_bound_` + edge-case (NaN/±0/on-boundary) golden snapshots.
-**Addresses:** Binned columnar store, BinMapper, missing-value handling (table stakes).
-**Avoids:** Pitfall 5 (binning off-by-ones), float-parser divergence.
+### Phase / Slice 1: Minimal proving slice (thinnest end-to-end on-device growth)
+**Rationale:** Prove the hardest uncertainty — does on-device growth + anchor-pinned parity + result reconstitution actually work on real CUDA, and does the launch chain collapse — at minimum kernel surface.
+**Delivers:** `grow_tree_on_device` for the narrowest viable tree (pure numeric spine, small `num_leaves` <=8, build->subtract->best-split frontier resident via a few large launches, **host partition reused** (shipped 027 fused path) + host `Tree::split` replay, ONE readback).
+**Uses:** existing u64 fixed-point build + feature-per-lane scan kernels; the resident-`Handle` pattern.
+**Implements:** the resident histogram pool + frontier build/subtract/scan.
+**Avoids:** Pitfalls 2 (tie-aware assert), 3 (u64 fixed-point), 6 (thin slice). **Proves Pitfall 8:** measured Kaggle `device_launches/tree` drop vs master.
 
-### Phase 2: Tree Model + Model Text I/O
-**Rationale:** Storing `Tree` and parsing/emitting the C++ model text lets prediction parity be validated *independently of training* — a cheap early win and an explicit project requirement.
-**Delivers:** `lgbm-model` — Tree nodes/splits/leaf outputs, `Tree::Predict`, hand-written `.txt` parser/writer with `%.17g` float formatting, JSON dump.
-**Addresses:** Model text read/write, raw/leaf prediction.
-**Research flag:** the `.txt` float-formatting + categorical-bitset serialization is fiddly; flag for `--research-phase`.
+### Phase / Slice 2: On-device best-split across the full frontier
+**Rationale:** Remove the per-leaf scan readbacks; grow to production `num_leaves`/`max_depth`.
+**Delivers:** cross-feature argmax over the whole leaf frontier on-device (resident best-split-per-leaf + 8-int packet).
+**Implements:** components 2-3 (persistent leaf-splits + best-split buffer + cross-leaf reduce).
+**Avoids:** Pitfall 2 (the tie-aware `default_left` assert lands here with the selection kernel); Pitfall 5 (segmented LDS block-scan, not bare plane-sum, for 256-bin scans).
 
-### Phase 3: Compute Backend (CPU-first, integer histograms)
-**Rationale:** The `Backend` trait and integer-histogram kernels are the determinism linchpin and the CubeCL-churn containment boundary; build and cross-validate CPU vs ROCm on kernels *in isolation* before wiring into training.
-**Delivers:** `lgbm-compute` — `Backend` trait, integer histogram construction, split-gain scan, score update, grad/hess; CPU runtime first, then HIP/ROCm as a second impl; capability-gating (`Plane::Ops`, f64, atomics) at startup; fixed-shape f64 reductions where integers don't apply.
-**Uses:** `cubecl =0.10.0` / `cubecl-hip` / `cubecl-cpu` (STACK.md).
-**Implements:** the determinism architecture (integer accumulation = bit-identical across backends).
-**Research flag:** HIGH — CubeCL alpha API churn, ROCm f64/atomic capability gaps, CPU-runtime-vs-HIP divergence (Pitfalls 9, 11, 12). Needs `--research-phase` and a ROCm validation gate.
+### Phase / Slice 3: On-device data partition (true single-GPU learner)
+**Rationale:** Eliminate the host partition round-trip — the part that pays off on discrete PCIe NVIDIA (kept host-side on ROCm per spike-035). The full `CUDASingleGPUTreeLearner` mirror.
+**Delivers:** resident `row_leaf` updated per split + on-device `SplitTreeStructureKernel`; only ONE readback at end of growth.
+**Implements:** components 4-5.
+**Avoids:** Pitfall 7 (preserve build-smaller-before-subtract ordering invariant).
 
-### Phase 4: Tree Learner + Split Finding
-**Rationale:** The keystone algorithm; the hardest FP-parity subsystem. Lock CPU summation order and split-gain math before kernelizing further.
-**Delivers:** `lgbm-treelearner` — serial learner orchestrating compute kernels, split-gain scan (`kEpsilon` positions, L1/L2/smoothing branches), data partition, histogram-subtraction trick (smaller-child selection), default-bin-skip, gradient discretizer, leaf-wise growth.
-**Addresses:** Histogram serial tree-learner, leaf-wise growth, numerical splits (table stakes).
-**Avoids:** Pitfalls 3, 4, 6, 7 (summation order, subtraction trick, split-gain constants, default-bin skip).
-**Research flag:** moderate — split-gain compile-time-flag matrix is a silent-divergence surface.
-
-### Phase 5: GBDT Loop + Core Objectives/Metrics + Bagging
-**Rationale:** First end-to-end 1e-12 path; the simplest boosting variant proves the spine before adding GOSS/DART/RF.
-**Delivers:** `lgbm-boosting` (GBDT loop, score updater, shrinkage, `boost_from_average`, early stopping, bagging + feature subsampling) + `lgbm-objective`/`lgbm-metric` core sets.
-**Addresses:** GBDT loop, core objectives/metrics, bagging, early stopping (table stakes).
-**Avoids:** Pitfall 8 (transcendentals — decide CPU-vs-GPU objective residency; default objectives on CPU/host libm).
-**Research flag:** moderate — transcendental (`exp`/`log`/`Pow`/`sigmoid`) parity and compounding drift over rounds.
-
-### Phase 6: Parity-Completing Variants
-**Rationale:** Each is a thin or isolable addition once the spine is bit-exact; ordered by RNG/structure dependency.
-**Delivers:** GOSS (after deterministic gradient sort), DART + RF (thin GBDT subclasses; DART needs `drop_seed`), categorical splits + EFB, remaining objectives/metrics, ranking (`lambdarank`/`ndcg`/`map` + DCGCalculator + query metadata), monotone/interaction constraints, SHAP/contributions, feature importance, refit.
-**Avoids:** Pitfall 13 (categorical bitset encoding).
-
-### Phase 7: Python Bindings
-**Rationale:** A translation layer over a validated `lgbm-api`; build last.
-**Delivers:** `lgbm-api` facade + `lgbm-python` (PyO3) mirroring the official `lightgbm` surface; sklearn wrappers reimplemented in Python over the Rust `Booster`.
-**Avoids:** Pitfall 14 (numpy copies/contiguity/GIL/dtype; handle both f32 and f64; `allow_threads` around training; return owned arrays).
+### Phase / Slice 4: Kaggle perf-validation + default-on routing + size gate
+**Rationale:** Pure routing/perf, deferred until the win is measured — never auto-engaged before proof (the audit-before-wire value).
+**Delivers:** Kaggle in-session A/B; `num_data` crossover/size gate from the measurement; flip `on_device_enabled` default for **CUDA only** (ROCm stays host-driven), keep the env off-switch.
+**Avoids:** Pitfall 4 (every perf claim is a stated-platform Kaggle A/B). **Milestone DoD:** a measured `device_launches` reduction below 8,570 + a closing `lgb_rs/official` ratio (today 3.90x@50f -> 1.93x@500f).
 
 ### Phase Ordering Rationale
-- **Dependency-forced order** (Config → BinMapper/Dataset → RNG → histogram learner → GBDT loop → objectives/metrics → prediction → model I/O → variants → Python): each layer must be bit-exact before anything above it can be validated, and the oracle harness grows with each layer rather than being deferred to the end.
-- **Binning and the histogram learner are isolated as their own phases** because they are the two highest-leverage parity risks; everything downstream inherits their bits.
-- **The compute backend is CPU-first and isolated in one crate** so most logic is validated without a GPU and CubeCL alpha churn touches exactly one crate.
-- **Variants (GOSS/DART/RF/categorical/ranking/constraints) come after the GBDT spine is green** because they are thin subclasses or isolable paths — cheap once the foundation holds — while quantized-gradient *training* and linear-tree are deferred post-v1 as parallel learner code paths.
+- **Dependency-driven:** the histogram pool requires the partition (leaf slices index both arena and rows); the subtraction trick requires the pool-pointer rotation; the cross-leaf reduce requires the per-leaf scan. Slice 0 -> 1 -> 2 -> 3 follows this chain while keeping each slice end-to-end.
+- **Risk-front-loaded:** Slice 0 de-risks wiring; Slice 1 attacks the single biggest uncertainty (does the launch collapse + parity reconstitution work on real CUDA) before expanding the resident frontier monotonically.
+- **Pitfall-driven:** oracle before kernels (P1), tie-aware assert with the selection kernel (P2), u64 fixed-point from the first build (P3), perf decisions deferred to Kaggle (P4), launch-count gated every slice (P8), feature-gate every slice (P7).
 
 ### Research Flags
 
-Phases likely needing `--research-phase` during planning:
-- **Phase 3 (Compute Backend):** HIGH — CubeCL is alpha with imminent breaking changes; ROCm f64/atomic capability gaps, FTZ/subnormal behavior, and CPU-runtime-vs-HIP divergence are sparsely documented and must be empirically validated on the local ROCm GPU.
-- **Phase 2 (Model Text I/O):** `.txt` float formatting (`%.17g`) and categorical-bitset serialization are exacting and under-documented.
-- **Phase 4 (Tree Learner)** and **Phase 5 (Objectives):** moderate — the split-gain compile-time-flag matrix and transcendental parity each hide silent-divergence surfaces worth a focused pass.
+Phases likely needing deeper research / a spike during planning:
+- **Slice 1 (build/orchestration):** verify cubecl 0.10 `Handle` in-place aliasing vs ping-pong double-buffering for the resident data->leaf map; confirm batched `client.read(vec![h])` readback semantics on cubecl-cuda. The on-device kernel decomposition is the milestone's genuine open work (ARCHITECTURE confidence MEDIUM here).
+- **Slice 2 (selection):** the 256-bin segmented LDS block-scan (plane-sum caps at plane width) is net-new kernel work, not a reuse.
+- **Slice 4 (perf):** the improvement *magnitude* is the genuine empirical unknown — the best-first loop still serializes per split; the win must be measured, not modeled. Multi-stream overlap (if cubecl 0.10 exposes it) is a stretch to spike only if launch-count reduction underdelivers.
 
-Phases with standard, well-mapped patterns (lighter research):
-- **Phase 0/1 (Foundations/Binning):** the C++ reference (`Random`, `BinMapper`) is read directly and ported literally — well-specified, not novel.
-- **Phase 6 (Variants):** thin subclasses of an already-validated spine, each with a clear C++ reference.
+Phases with standard / well-documented patterns (skip research-phase):
+- **Slice 0 (scaffold):** pure additive-discriminator wiring — the established `prefers_host_partition` / `resident_eligible` idiom, no new compute.
+- **Slice 3 partition routing & Slice 4 default-on gating:** clone the shipped `LGBM_RESIDENT_FORCE` size-gate + default-off precedent.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Crate versions verified against crates.io/PyPI/Context7 on 2026-06-05; only MEDIUM on CubeCL determinism/f64 behavior on ROCm (alpha software). |
-| Features | HIGH | Grounded directly in the C++ reference subsystems under `LightGBM/src` and `include/`; objective/metric registries verified from `Create*` factories. |
-| Architecture | MEDIUM-HIGH | HIGH on crate decomposition + C++ mapping + CubeCL primitives; MEDIUM on the cross-backend determinism strategy — integer-quantized approach is grounded in LightGBM's own `GradientDiscretizer`, but 1e-12 on ROCm must be empirically validated. |
-| Pitfalls | HIGH | HIGH on numerical/RNG/PyO3 pitfalls (verified against C++ source + issue tracker); MEDIUM on CubeCL/ROCm specifics (alpha, evolving docs). |
+| Stack | HIGH | cubecl 0.10.0 version + capability API verified against `Cargo.lock` and live `runtime::probe_capabilities`; no new deps; primitives in active production use. |
+| Features | HIGH | Step-ordered spec read directly from `LightGBM/src/treelearner/cuda/*` with file:line citations; a faithful read of the algorithm to port. |
+| Architecture | HIGH (integration) / MEDIUM (kernel decomposition) | Seam/routing/return mechanics read from real code; the on-device kernel decomposition is the milestone's open work to be proven in Slice 1. |
+| Pitfalls | HIGH | Grounded in this project's own spikes 015-054, def-f8u-01, hip-split-parity debug, and PROJECT.md non-negotiables — every pitfall already bit this codebase or follows from a committed constraint. |
 
-**Overall confidence:** MEDIUM-HIGH. The *port* is well-understood and well-referenced; the *risk* is concentrated entirely in whether ROCm can meet the parity bar, which the tiered-oracle + integer-histogram strategy is designed to make tractable but cannot guarantee without empirical validation on hardware.
+**Overall confidence:** HIGH
 
 ### Gaps to Address
-
-- **f64 transcendental parity (CPU↔ROCm):** No source proves bit-identical `exp`/`log` between ROCm device math and host libm. *Handle:* empirically test in Phase 3/5; if discretization doesn't absorb the divergence, fall back to CPU-resident objective grad/hess and push only discretized integers to the GPU.
-- **Literal 1e-12 on ROCm numeric outputs:** Likely unachievable for GPU reduction/transcendental paths. *Handle:* the tiered-oracle Key Decision in Phase 0 (Tier A bit-exact structural on all backends; Tier C documented relaxed tolerance + same-tree check on ROCm).
-- **CubeCL API stability:** Alpha v0.10.0 with an unreleased 0.11 already in the book. *Handle:* pin exactly, isolate behind `lgbm-compute`, commit `Cargo.lock`, schedule upgrades as discrete spikes at milestone boundaries.
-- **Reference `score_t` width:** `float` by default but `double` under a build flag; structural mismatch if assumed wrong. *Handle:* pin and document in the Phase 0 reference manifest; match the reference's actual typedef where it rounds.
-- **CubeCL CPU-runtime vs HIP divergence within the toolchain:** "kernel correct on CPU runtime" does not imply correct on ROCm. *Handle:* treat CPU-runtime parity and ROCm parity as separate test gates; run the oracle on both backends.
+- **Improvement magnitude is unknown** — the loop still serializes per split; the closing `lgb_rs/official` ratio is the genuine empirical open question. Handle: make `device_launches` + the ratio a first-class Kaggle-measured DoD metric, not an assumption (Slice 4 / per-slice checkpoint).
+- **cubecl 0.10 multi-stream support** — the reference uses 4 streams; unverified whether cubecl exposes them. Handle: treat overlap as a stretch, not a dependency — launch-count reduction is the proven lever.
+- **`Handle` in-place mutation/aliasing rules** — whether a kernel can take the same handle as input+output for the data->leaf map, or whether double-buffering is required. Handle: verify at Slice 1 plan time against cubecl source, not the manual.
+- **Per-leaf `Backend` trait vs coarse per-tree method granularity** — planner design decision; the coarse method is lower-risk for keeping the CPU anchor untouched.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- `LightGBM/src/{boosting,treelearner,objective,metric,io}/`, `include/LightGBM/{config.h,bin.h,meta.h,tree.h,utils/random.h}` — direct C++ reference: objective/metric registries, `Random` LCG, `BinMapper::ValueToBin`, `kEpsilon`, histogram-subtraction, `GradientDiscretizer`, model text format.
-- `.planning/codebase/{ARCHITECTURE,STRUCTURE,STACK,CONVENTIONS,CONCERNS,INTEGRATIONS,TESTING}.md` — mapped C++ subsystem boundaries, GPU-relevant flags, numerical-fidelity hazards.
-- crates.io / PyPI (2026-06-05) — `cubecl 0.10.0`, `pyo3 0.28.3` (0.28.0/0.28.1 yanked), `numpy 0.28.0`, `ndarray 0.17.2`, `proptest 1.11.0`, `criterion 0.8.2`, `thiserror 2.0.18`, `anyhow 1.0.102`, `maturin 1.13.3`.
-- Context7 `/tracel-ai/cubecl` (v0.10) — runtime-generic kernels, `Plane::Ops` feature query, `plane_sum`, comptime fallback, `Feature::Type(Elem::Float(FloatKind::F64))` capability check, feature→crate mapping.
-- LightGBM issues #6683 (cross-machine non-reproducibility), #3372 (compounding FP error), #6320 + Parameters docs (`deterministic`/`force_*_wise`).
-- PyO3 / rust-numpy docs — contiguity/`as_slice`, `allow_threads` GIL release, dtype handling.
+- `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp` + `cuda_data_partition.{hpp,cpp,cu}` + `cuda_best_split_finder.*` + `cuda_histogram_constructor.*` + `cuda_leaf_splits.hpp` + `cuda_split_info.hpp` — the on-device reference architecture and step-ordered `Train()` spec.
+- `crates/lgbm-compute/src/lib.rs` (Backend trait :495, discriminator idioms, `GpuBackend<R>` :2037, `ResidentBins`/`resident_pool`) — the additive seam + resident-Handle pattern.
+- `crates/lgbm-treelearner/src/learner.rs` + `resident_pool.rs` — the `train_inner` decide-once fork, `Tree::split` replay, `add_prediction_to_score`, the eligibility/size-gate idiom to clone.
+- `crates/lgbm-boosting/src/gbdt.rs:1289` + `score_updater.rs` — the `(Tree, DataPartition)` -> per-row score scatter contract the on-device path must preserve.
+- `Cargo.lock` (cubecl 0.10.0 lockstep) + `runtime.rs:108-130` (capability probe) — stack verification.
+- `.claude/skills/spike-findings-lightgbm_rs/references/cuda-architectural-launch-bound.md` (spikes 051-054, real-NVIDIA Kaggle) — launch-bound mechanism, f64-5.4x penalty, occupancy/fusion/sync refuted, on-device learner is the one lever.
+- `.claude/skills/spike-findings-lightgbm_rs/references/gpu-split-scan-occupancy.md` (spikes 016/021/022) — f32 reorder parity-safe, default_left tie-awareness, plane-sum vs 256-bin limit.
+- `.planning/PROJECT.md` — v1.1 milestone goal + non-negotiables.
 
 ### Secondary (MEDIUM confidence)
-- CubeCL book/README and `cubecl-hip(-sys)` releases — alpha "expect breaking changes," HIP build-script churn, ROCm 7.x version coupling.
-- f64-on-wgpu limitation (WebSearch + CubeCL platform notes); GPU-vs-CPU libm precision studies (LLVM GSoC 2025, ACM C-math-on-GPUs, arXiv 2408.05148); FTZ/denormal notes (NVIDIA, AMD ROCm blogs).
-
-### Tertiary (LOW confidence — needs validation)
-- Empirical 1e-12 achievability on ROCm for f64 reductions/transcendentals — *no source guarantees it; validate on hardware in Phase 3/5.*
+- MEMORY: `def-f8u-01-flaky-resident-hip-test.md` (anchor-pin GPU f32 to cpu anchor, fix d82611b); `hip-split-parity-preexisting-defect.md` (tie-aware assert, commit 1832206); `kaggle-cli-cuda-bench.md`; `gpu-is-spoofed-8cu-apu`; `partition-memory-traffic.md` / spike-035 (host-vs-device partition placement).
+- `.planning/spikes/052-cuda-launch-fusion/README.md` — the f64 fused-kernel 5.4x regression evidence + ~0.14ms/sync.
 
 ---
-*Research completed: 2026-06-05*
+*Research completed: 2026-06-28*
 *Ready for roadmap: yes*

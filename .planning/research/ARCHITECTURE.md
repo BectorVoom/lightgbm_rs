@@ -1,319 +1,392 @@
-# Architecture Research
+# Architecture Research — On-Device CUDA Tree Learner Integration (v1.1)
 
-**Domain:** Pure-Rust port of LightGBM (histogram-based gradient boosting) on a CubeCL compute backend, structured as a Cargo workspace, with strict 1e-12 cross-backend (CPU + ROCm) numerical parity.
-**Researched:** 2026-06-05
-**Confidence:** HIGH on crate decomposition and C++ mapping (grounded in `.planning/codebase/`), HIGH on CubeCL primitives (Context7 `/tracel-ai/cubecl` v0.10 + repo docs), MEDIUM on the cross-backend determinism strategy (the approach is grounded in LightGBM's own integer-quantized gradient path, but 1e-12 parity on ROCm must be empirically validated — no source guarantees it).
+**Domain:** GPU gradient-boosting tree learner (pure-Rust LightGBM port, CubeCL backends)
+**Researched:** 2026-06-28
+**Confidence:** HIGH (integration mechanics read directly from source); MEDIUM (on-device kernel decomposition — the milestone's open work)
 
-## Standard Architecture
+> Scope: this is an **integration** architecture study for the v1.1 milestone, not the
+> greenfield v1.0 one (preserved at `ARCHITECTURE.v1.0.md`). It answers "how does an
+> on-device, whole-tree growth loop (mirror C++ `CUDASingleGPUTreeLearner`) slot into the
+> existing `Backend` + `SerialTreeLearner` architecture WITHOUT breaking the CPU f64 anchor,
+> the ROCm resident path, or the existing host-driven CUDA path." Concrete file/trait/method
+> names are used throughout so the planner can wire against the real code.
 
-This is a layered, interface-driven gradient-boosting engine. The C++ reference uses an abstract-base-class + string `Create*` factory at every seam (`.planning/codebase/ARCHITECTURE.md`). The Rust port replaces each factory with an enum + trait, and replaces device `#ifdef` branching with a single `Backend` trait boundary. The decomposition below is a one-to-one mapping of the C++ subsystems onto Cargo crates, chosen so the dependency graph is acyclic and the compute backend is swappable without touching boosting/tree-learner logic.
+---
+
+## Standard Architecture (today, host-driven)
 
 ### System Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  BINDINGS                lgbm-python (PyO3)        [optional, top of stack] │
-│  mirrors lightgbm Python API → calls lgbm-api only                         │
-├──────────────────────────────────────────────────────────────────────────┤
-│  PUBLIC API              lgbm-api  (Booster, Dataset, train/predict)        │
-│  Rust-native facade; owns config enums; wires boosting + objective + metric │
-├───────────────┬───────────────────────┬────────────────────┬──────────────┤
-│               ▼                       ▼                    ▼               │
-│  ┌────────────────────┐  ┌──────────────────────┐  ┌────────────────────┐ │
-│  │  lgbm-boosting     │  │  lgbm-objective      │  │  lgbm-metric       │ │
-│  │  GBDT/DART/RF/GOSS │  │  grad/hess kernels   │  │  eval kernels      │ │
-│  │  score updater     │  │  [GPU-RELEVANT]      │  │  [GPU-RELEVANT]    │ │
-│  └─────────┬──────────┘  └──────────┬───────────┘  └─────────┬──────────┘ │
-│            │ Train(grad,hess)→Tree  │ GetGradients           │ Eval        │
-│            ▼                                                                │
-│  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  lgbm-treelearner   histogram build → split scan → partition → tree │  │
-│  │  serial learner; monotone/categorical; gradient discretizer  [GPU]  │  │
-│  └─────────┬──────────────────────────────────────────────────────────┘  │
-├────────────┼───────────────────────────────────────────────────────────────┤
-│            ▼ ConstructHistograms / score update                            │
-│  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  lgbm-compute   Backend trait + CubeCL kernels (histogram, split-   │  │
-│  │  gain scan, score update, grad/hess); CPU ↔ ROCm runtime selection  │  │
-│  │  generic over R: Runtime  (cubecl-cpu / cubecl-hip)                  │  │
-│  └─────────┬──────────────────────────────────────────────────────────┘  │
-├────────────┼───────────────────────────────────────────────────────────────┤
-│            ▼ binned columns, gradients/hessians as device buffers          │
-│  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  lgbm-data    Dataset, BinMapper, FeatureGroup, (Multi)Val Bin,     │  │
-│  │  Metadata, dataset loader (CSV/TSV/LibSVM). Immutable after load.   │  │
-│  └────────────────────────────────────────────────────────────────────┘  │
-├──────────────────────────────────────────────────────────────────────────┤
-│  lgbm-model   Tree (nodes/splits/leaf outputs), text+JSON model I/O        │
-│  lgbm-core    shared types: score_t/f64, ids, config enums, thiserror errs │
-└──────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  lgbm-boosting :: GBDT loop  (gbdt.rs:1289)                            │
+│    per iter:  grad/hess (host) ─► learner.train_returning_partition()  │
+│               ◄── (Tree, DataPartition)                                │
+│               score_updater.add_prediction_to_score(tree, part, score) │  ◄ host scatter
+├──────────────────────────────────────────────────────────────────────┤
+│  lgbm-treelearner :: SerialTreeLearner<'b, B: Backend>  (learner.rs)   │
+│    train_inner():                                                      │
+│      decide-once-at-top:  resident_eligible / fused_eligible           │  ◄ gating fork
+│      upload_resident_bins() once/train                                 │
+│      LEAF-WISE LOOP  (×(num_leaves-1)):                                │
+│        before_find_best_split ─► find_best_splits ─► argmax ─► split_inner
+│        find_best_splits:  build(smaller) ─► subtract(larger) ─► scan both
+│        split_inner:       DataPartition::split  +  Tree::split          │
+├──────────────────────────────────────────────────────────────────────┤
+│  lgbm-compute :: Backend trait  (lib.rs:495)   — the CMP-01 CubeCL seam │
+│    per-op methods + additive default methods + backend discriminators  │
+│    impls:  CpuBackend (unit)   |   GpuBackend<R> { resident_bins,       │
+│                                       resident_pool, resident_enabled } │
+│    aliases:  RocmBackend=GpuBackend<RocmRuntime> (rocm feat)            │
+│              CudaBackend=GpuBackend<CudaRuntime> (cuda feat)            │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Component Responsibilities
+**The problem this milestone attacks** (`cuda-architectural-launch-bound.md`, spikes 051–054):
+the LEAF-WISE LOOP is **host-orchestrated**. Even with the device-resident histogram pool
+(260608-p90), each node still issues a small `build` / `subtract` / `scan` launch gated by the
+best-first dependency chain → **~8,570 small serial launches / 100-tree train**, ~86/tree.
+On real NVIDIA this is **launch-latency-bound** (occupancy/fusion/sync all refuted). The one
+remaining lever is to keep the whole growth frontier on-device — fewer, bigger launches —
+mirroring `CUDASingleGPUTreeLearner`.
 
-| Crate | Responsibility (what it owns) | C++ reference subsystem |
-|-------|-------------------------------|-------------------------|
-| `lgbm-core` | Shared scalar types (`score_t`, `data_size_t`, bin ids), config **enums** (boosting/objective/metric/device parsed once), `thiserror` domain error types, deterministic-reduction utility traits. No heavy logic. | `include/LightGBM/meta.h`, `config.h`, `utils/` |
-| `lgbm-data` | Binned columnar store: `BinMapper::FindBin`, `FeatureGroup`, `DenseBin`/`SparseBin`/`MultiValBin`, `Metadata` (labels/weights/query boundaries), dataset loader (CSV/TSV/LibSVM, later Arrow). Immutable after `finish_load`. | `src/io/` (`bin.cpp`, `dataset.cpp`, `dataset_loader.cpp`, `dense_bin.hpp`, `metadata.cpp`), `include/.../{bin.h,dataset.h,feature_group.h}` |
-| `lgbm-model` | `Tree` model (nodes, thresholds, leaf outputs), `Tree::Predict`, text + JSON model serialize/deserialize (C++ format compatibility). | `src/io/tree.cpp`, `src/boosting/gbdt_model_text.cpp`, `include/.../tree.h` |
-| `lgbm-compute` | **The backend boundary.** `Backend` trait + CubeCL kernels: histogram construction, split-gain scan, score update, grad/hess application. Owns CubeCL `Runtime`/client lifetime and CPU↔ROCm selection. Generic over `R: Runtime`. | `src/treelearner/{ocl,cuda}/*`, `src/io/{dense,sparse}_bin.hpp::ConstructHistogram*`, `src/boosting/cuda/cuda_score_updater`, `src/cuda/cuda_algorithms` |
-| `lgbm-objective` | `ObjectiveFunction` trait + `get_gradients(score)→(grad,hess)`, `convert_output`, `boost_from_score`. Regression/binary/multiclass/ranking/xentropy families. Hot loops dispatch to `lgbm-compute`. | `src/objective/*.hpp`, `objective_function.cpp` |
-| `lgbm-metric` | `Metric` trait + `eval(score)→Vec<f64>`; DCG/NDCG tables. | `src/metric/*.hpp`, `dcg_calculator.cpp` |
-| `lgbm-treelearner` | Grow one tree: orchestrate histogram build (via compute), `find_best_splits` scan, `ArgMax` best-leaf pick, `data_partition`, monotone constraints, categorical splits, gradient discretizer. | `src/treelearner/serial_tree_learner.cpp`, `feature_histogram.{cpp,hpp}`, `data_partition.hpp`, `monotone_constraints.hpp`, `gradient_discretizer.{cpp,hpp}`, `col_sampler.hpp` |
-| `lgbm-boosting` | Outer GBDT loop: `train_one_iter`, `boosting()` (call objective), bagging/GOSS sample strategy, `ScoreUpdater`, shrinkage, early stopping, prediction. Variants GBDT/DART/RF. | `src/boosting/gbdt.cpp`, `dart.hpp`, `rf.hpp`, `goss.hpp`, `bagging.hpp`, `score_updater.hpp` |
-| `lgbm-api` | Rust-native facade: `Dataset`, `Booster`, `train`, `predict`. Parses config to enums (no stringly-typed factories), wires boosting + objective + metric + treelearner + chosen backend. `anyhow` at this app layer. | `src/c_api.cpp` semantics (not the C ABI itself — out of scope v1), `src/application/` |
-| `lgbm-python` | PyO3 module mirroring the `lightgbm` Python surface (`Dataset`, `Booster`, `train`, `cv`, sklearn estimators later). Thin; converts numpy/Arrow → `lgbm-api`. | `python-package/lightgbm/{basic,engine,sklearn}.py` |
+### Component Responsibilities (relevant to the seam)
 
-### Dependency direction (acyclic — strict downward)
+| Component | What it owns | File |
+|-----------|--------------|------|
+| `Backend` trait | The CMP-01 CubeCL isolation seam: per-op kernels + additive default methods + discriminators | `crates/lgbm-compute/src/lib.rs:495` |
+| `GpuBackend<R>` | Generic GPU backend; carries `resident_bins` + `resident_pool` device-handle mirrors behind `RefCell`; `RocmBackend`/`CudaBackend` are type aliases | `lib.rs:2037` |
+| `SerialTreeLearner` | The host growth loop (`train_inner`), the decide-once-at-top eligibility fork, returns `(Tree, DataPartition)` | `crates/lgbm-treelearner/src/learner.rs:658` |
+| `resident_pool` | The CONSERVATIVE fail-safe eligibility predicates + size gates + env overrides | `crates/lgbm-treelearner/src/resident_pool.rs` |
+| GBDT loop | Drives one `train_returning_partition` per iter, scatters leaf values to per-row scores | `crates/lgbm-boosting/src/gbdt.rs:1289` |
 
-```
-lgbm-python → lgbm-api
-lgbm-api    → lgbm-boosting, lgbm-objective, lgbm-metric, lgbm-treelearner, lgbm-data, lgbm-model, lgbm-core
-lgbm-boosting → lgbm-treelearner, lgbm-objective, lgbm-metric, lgbm-model, lgbm-data, lgbm-compute, lgbm-core
-lgbm-treelearner → lgbm-compute, lgbm-data, lgbm-model, lgbm-core
-lgbm-objective   → lgbm-compute, lgbm-data, lgbm-core
-lgbm-metric      → lgbm-compute, lgbm-data, lgbm-core
-lgbm-compute     → lgbm-data (binned buffers), lgbm-core, cubecl runtimes
-lgbm-data        → lgbm-core
-lgbm-model       → lgbm-core
-lgbm-core        → (nothing in workspace)
-```
+---
 
-Two rules keep this clean: (1) **`lgbm-compute` is the only crate that names a CubeCL runtime** — everything above it talks to the `Backend` trait, so the boosting loop is device-agnostic (this directly fixes the C++ anti-pattern of `#ifdef USE_CUDA` scattered through `UpdateScore`). (2) **`lgbm-core` depends on nothing** so error/types are shareable without cycles.
+## The Integration Decision (Question 1: the seam)
 
-## Recommended Project Structure
+**Recommendation: a NEW additive `Backend` method `grow_tree_on_device(...)` gated by a NEW
+default-false discriminator `on_device_growth_supported()`, routed by a decide-once-at-top fork
+in `SerialTreeLearner::train_inner` that returns early — NOT a new trait and NOT a parallel
+`TreeLearner` impl.**
 
-```
-Cargo.toml                  # [workspace] members = crates/*
-crates/
-├── lgbm-core/              # types, config enums, thiserror errors, reduction traits
-├── lgbm-data/              # BinMapper, FeatureGroup, Bin impls, Metadata, loader
-├── lgbm-model/             # Tree, model text/JSON I/O
-├── lgbm-compute/
-│   ├── src/backend.rs      # Backend trait (the device boundary)
-│   ├── src/cpu.rs          # CpuBackend  = ComputeBackend<CpuRuntime>
-│   ├── src/rocm.rs         # RocmBackend = ComputeBackend<HipRuntime>  (feature "rocm")
-│   └── src/kernels/        # #[cube] kernels, runtime-generic over R: Runtime
-│       ├── histogram.rs    #   ConstructHistogram (grad/hess accumulation)
-│       ├── split_scan.rs   #   prefix-scan split-gain over bins
-│       ├── score_update.rs #   add tree output into score buffer
-│       └── grad_hess.rs    #   objective gradient/hessian application
-├── lgbm-objective/         # ObjectiveFunction trait + families
-├── lgbm-metric/            # Metric trait + families, DCG tables
-├── lgbm-treelearner/       # serial learner, feature_histogram scan, data_partition,
-│                           # monotone, categorical, gradient_discretizer
-├── lgbm-boosting/          # GBDT/DART/RF, sample strategy, score updater
-├── lgbm-api/               # Booster, Dataset, train/predict facade
-└── lgbm-python/            # PyO3 (cfg-gated; not part of default workspace build)
-tests/
-└── oracle/                 # Rust-vs-C++ 1e-12 parity harness (runs on CPU and ROCm)
-```
+Three candidates weighed against the codebase's actual idioms:
 
-### Structure Rationale
+| Option | Verdict | Why |
+|--------|---------|-----|
+| (a) **New `Backend` method + discriminator** | **CHOSEN** | Exactly the established additive-default + discriminator idiom (`prefers_host_partition`, `resident_pool_supported`, `host_unified_fused_supported`, `data_partition_native`). Keeps the CMP-01 seam intact (all cubecl confined to lgbm-compute). Reuses the existing `train_inner` routing fork. `SerialTreeLearner` public API + the whole boosting loop are byte-unchanged. |
+| (b) New `TreeLearner` impl alongside `SerialTreeLearner` (e.g. `CudaSingleGpuTreeLearner`) | Rejected (for now) | There is no `TreeLearner` *trait* in the Rust port — `SerialTreeLearner` is a concrete struct the boosting loop names directly (`SerialTreeLearner::new`, 20+ call sites in gbdt.rs). A parallel learner forces a learner-level trait + dispatch refactor across lgbm-boosting — a large blast radius into the CPU/ROCm paths the milestone must protect. The C++ `CUDASingleGPUTreeLearner` is a separate class only because C++ uses the stringly-typed `CreateTreeLearner` factory; the Rust port deliberately collapsed that into one struct + a Backend seam. Stay with the seam. |
+| (c) A brand-new trait | Rejected | Redundant with `Backend`; re-creates the CMP-01 boundary the project already pays for once. |
 
-- **`crates/*` flat layout:** standard Cargo workspace; each crate is independently testable and the dependency edges are visible in each `Cargo.toml`.
-- **`lgbm-compute/src/kernels/` separate from `cpu.rs`/`rocm.rs`:** kernels are written **once** generic over `R: Runtime`; `cpu.rs`/`rocm.rs` only pick the runtime and own the client. This mirrors CubeCL's own `pub fn run<R: Runtime>(device)` idiom.
-- **`lgbm-python` excluded from default workspace members** (or behind a feature) so the core builds and tests without a Python toolchain; oracle parity does not depend on it.
-- **`lgbm-core` deliberately thin:** it is the only universal dependency, so keeping logic out of it prevents recompilation cascades.
+### Concrete shape (additive, default-safe)
 
-## Architectural Patterns
-
-### Pattern 1: Backend trait as the single device boundary
-
-**What:** One trait in `lgbm-compute` abstracts all GPU-relevant operations. Implemented twice (CPU, ROCm) but kernels are shared and generic over `R: Runtime`. Callers never see CubeCL types.
-**When to use:** Everywhere a `[GPU-RELEVANT]` op is invoked — histogram build, split scan, score update, grad/hess.
-**Trade-offs:** Trait calls add an indirection per *batch* (not per element), negligible. Forces all device data (`DeviceBuffer`) to live behind the trait, which is what we want for swappability.
+In `crates/lgbm-compute/src/lib.rs`, on `trait Backend`, add (all with CPU-safe defaults):
 
 ```rust
-// lgbm-compute/src/backend.rs
-pub trait Backend: Send + Sync {
-    type Buf<T: CubeElement>: DeviceBuffer<T>;
+/// Whether this backend can grow a whole tree ON DEVICE in one orchestrated call
+/// (mirror C++ CUDASingleGPUTreeLearner), bypassing the host per-leaf loop.
+/// Default false ⇒ CpuBackend + any backend that does not opt in keep the host loop.
+fn on_device_growth_supported(&self) -> bool { false }
 
-    fn upload<T: CubeElement>(&self, data: &[T]) -> Self::Buf<T>;
-    fn download<T: CubeElement>(&self, buf: &Self::Buf<T>) -> Vec<T>;
-
-    /// Accumulate (grad, hess) into per-bin histogram for a leaf's rows.
-    /// `hist_bits` selects 16/32-bit integer accumulator (determinism, below).
-    fn construct_histogram(
-        &self, feature: &BinnedColumn,
-        rows: Option<&Self::Buf<u32>>,      // None => all rows
-        int_grad_hess: &Self::Buf<i32>,     // quantized gradients
-        hist_bits: HistBits,
-        out: &mut Self::Buf<i64>,           // integer histogram bins
-    );
-
-    fn split_gain_scan(&self, hist: &Self::Buf<i64>, /* ... */) -> Vec<SplitInfo>;
-    fn update_score(&self, leaf_value: &[f64], partition: &Partition, score: &mut Self::Buf<f64>);
+/// Grow ONE tree fully on-device from device-resident bins + per-iter g/h, returning
+/// the grown tree's node arrays + the final per-row leaf assignment in ONE readback.
+/// Default: typed error (never reached — the eligibility gate ANDs in the discriminator).
+#[allow(clippy::too_many_arguments)]
+fn grow_tree_on_device(
+    &self,
+    client: &ComputeClient<Self::Runtime>,
+    feats: &[BatchedSplitFeature],   // per-feature dispatch params (already exists)
+    gradients: &[f32],
+    hessians: &[f32],
+    cfg: &GainConfig,
+    num_leaves: i32,
+    max_depth: i32,
+    min_data_in_leaf: i32,
+) -> Result<OnDeviceTreeResult, ComputeError> {
+    Err(ComputeError::Runtime { detail:
+        "grow_tree_on_device: on-device growth not supported on this backend".into() })
 }
-
-// lgbm-compute/src/rocm.rs — the ONLY place a runtime is named
-pub struct ComputeBackend<R: Runtime> { client: ComputeClient<R::Server, R::Channel>, has_plane: bool }
-pub type CpuBackend  = ComputeBackend<cubecl::cpu::CpuRuntime>;
-pub type RocmBackend = ComputeBackend<cubecl::hip::HipRuntime>;   // ROCm
 ```
 
-### Pattern 2: Runtime-generic kernels with comptime Plane fallback (CUDA-warp → CubeCL Plane)
+`OnDeviceTreeResult` is a new **plain-data, cubecl-free** struct in `lgbm-compute` (so it can
+cross the CMP-01 boundary): the grown tree's parallel node arrays (`split_feature`,
+`threshold_bin`, `left_child`, `right_child`, `leaf_value`, internal/leaf sums, `decision_type`,
+`default_left`) **plus** the final `row_leaf: Vec<i32>` (per-row leaf id). The learner converts
+this into a host `lgbm_model::Tree` + `DataPartition` (see Question 3).
 
-**What:** Write each kernel once, parameterized by a `#[comptime] use_plane: bool`. When the runtime reports `client.features().plane.contains(Plane::Ops)`, the kernel emits `plane_sum`/`plane_*` (compiles to AMD wavefront / NVIDIA warp / Vulkan subgroup ops); otherwise it falls back to a deterministic sequential reduction. This is exactly how the C++ CUDA learner's warp-shuffle reductions map onto CubeCL — verified against `/tracel-ai/cubecl` docs.
-**When to use:** Histogram block reductions and split-gain scans where the CUDA reference used `__shfl_*` warp ops.
-**Trade-offs:** The plane path and the sequential path can produce *different* float orderings — which is the determinism hazard (see below). The resolution is to make the histogram accumulators **integer**, where order does not matter, so both paths give identical results.
+The bins themselves do **not** travel in the signature — they ride the existing
+`upload_resident_bins()` / `ResidentBins` device cache (`lib.rs:2000`) already populated once per
+train. `grad`/`hess` upload once per tree inside the launcher (or via a tiny per-tree upload seam).
+
+---
+
+## Routing That Protects CPU + ROCm + Existing CUDA (Question 2)
+
+**Principle (project rule, restated in `partition-memory-traffic.md`): backend discriminators are
+default-false trait methods overridden on ONE backend — never a global env/flag.** The new path
+must be invisible until explicitly opted in.
+
+### Two-layer gate, mirroring `resident_eligible`
+
+1. **Backend capability** — `on_device_growth_supported()` overridden on `GpuBackend<R>` only.
+   Because `RocmBackend` and `CudaBackend` share `GpuBackend<R>`, distinguish them with a
+   **field-backed opt-in** exactly like the existing `resident_enabled` bool + `with_resident()`
+   constructor idiom (`lib.rs:2057`, `2097`):
+
+   ```rust
+   // GpuBackend<R> gains: on_device_enabled: bool  (Default = false)
+   //   + a with_on_device(true) constructor (test/bench) and an env opt-in.
+   fn on_device_growth_supported(&self) -> bool {
+       // OFF by default everywhere; opt-in only. Protects ROCm (keeps the shipped
+       // resident host-driven path) AND the existing host-CUDA path until proven.
+       self.on_device_enabled
+           && matches!(std::env::var("LGBM_CUDA_ON_DEVICE").as_deref(), Ok("1"))
+   }
+   ```
+
+   - **CPU:** trait default `false` → host loop, **bit-exact anchor untouched.**
+   - **ROCm:** `on_device_enabled` left `false` (its shipped path is the host-driven resident
+     pool + host partition, spike-035) → **untouched.**
+   - **Existing host-CUDA path:** default `false` → today's per-leaf launches still run until
+     `LGBM_CUDA_ON_DEVICE=1` is set → **untouched** by default. Same ship-default-off discipline
+     as the fused kernel (`FUSED_MAX_NUM_DATA = -1`, resident_pool.rs:195).
+
+2. **Workload eligibility** — a new `on_device_eligible(...)` predicate in `resident_pool.rs`
+   (or a sibling `on_device.rs`), **structurally identical to `resident_eligible`** (resident_pool.rs:99):
+   ANDs in `backend.on_device_growth_supported()`, then the SAME fail-safe rejects — pure numeric
+   spine only (no categorical / monotone / interaction / extra_trees / forced_splits /
+   non-default `max_delta_step`/`path_smooth`), `!capture_snapshots`. When in doubt → `false` →
+   byte-unchanged host path. Add a size gate (on-device wins only above some `num_data`) and an
+   `LGBM_CUDA_ON_DEVICE_FORCE` three-way override (`0`/`1`/unset), mirroring `LGBM_RESIDENT_FORCE`.
+
+### The routing fork (one place, decide-once-at-top)
+
+In `SerialTreeLearner::train_inner` (learner.rs ~680, where `resident_eligible` / `fused_eligible`
+are computed), add a THIRD decision and an **early return BEFORE the leaf-wise loop**:
 
 ```rust
-// lgbm-compute/src/kernels/histogram.rs
-#[cube(launch_unchecked)]
-fn reduce_into_bin<I: Int>(part: &Array<I>, out: &mut Array<I>, #[comptime] use_plane: bool) {
-    if use_plane {
-        out[UNIT_POS] = plane_sum(part[UNIT_POS]);   // AMD wavefront / NVIDIA warp / subgroup
-    } else {
-        let mut acc = I::new(0);
-        for i in 0..part.len() { acc += part[i]; }    // sequential (CPU runtime, plane_size = 1)
-    }
+let on_device = crate::on_device::on_device_eligible(
+    self.backend.on_device_growth_supported(), num_data, &features,
+    &self.constraints, capture_snapshots, &self.cfg);
+if on_device {
+    let result = self.grow_on_device(&features, gradients, hessians)?; // delegates to backend
+    let (tree, data_partition) = self.reconstitute(result, &features, num_data);
+    self.hist_pool = Some(pool);                 // keep the pool-reuse invariant
+    return Ok((tree, Vec::new(), ColSamplerTrace::default(), data_partition));
 }
-// host: let use_plane = client.features().plane.contains(Plane::Ops);
+// ... else: the existing host leaf-wise loop, byte-unchanged ...
 ```
 
-### Pattern 3: Histogram subtraction trick preserved, made deterministic
+This keeps `train` / `train_returning_partition` / `train_on_subset` and every gbdt.rs call site
+**signature-identical**. The on-device path is a sibling branch of the SAME function, exactly like
+the resident-vs-host split already inside `find_best_splits`.
 
-**What:** The larger child's histogram = parent − smaller child (C++ `use_subtract`). Subtraction of two *integer* histograms is exact and order-independent, so it carries no float-determinism cost. Keep this optimization; it halves histogram work.
-**When to use:** Every non-root split.
-**Trade-offs:** Requires the parent histogram to remain resident (a fixed-size histogram pool sized by `num_leaves × total_bins`), same as C++.
+---
 
-### Pattern 4: Enum + match factories (replace stringly-typed `Create*`)
+## What Moves On-Device & How the Result Returns (Question 3)
 
-**What:** Parse config strings to exhaustive enums once at `lgbm-api`, then `match` to construct boosting/objective/metric/learner. Compile-time exhaustiveness; typos caught at parse, not deep in a hot loop.
-**When to use:** All four C++ `Create*` seams.
-**Trade-offs:** Adding an objective touches one enum + one match arm (vs. registering a string). Acceptable and safer.
+### Device-resident state (mirror `CUDASingleGPUTreeLearner` members)
 
-## Data Flow
+| C++ member | Rust home | Status |
+|------------|-----------|--------|
+| `cuda_histogram_constructor_` (resident histograms) | `GpuBackend.resident_pool` handle mirror | **already exists** (260608-p90) |
+| binned dataset | `GpuBackend.resident_bins` (`ResidentBins`, feature-major) | **already exists** (260608-nn7) |
+| `cuda_data_partition_` (row→leaf, on-device split) | NEW resident `row_leaf` + per-leaf range handles inside the launcher | new |
+| `cuda_smaller/larger_leaf_splits_` (frontier sums) | NEW resident leaf-splits buffers | new |
+| `cuda_best_split_finder_` (frontier argmax) | NEW resident best-split-per-leaf buffer + on-device argmax | new |
+| growing `Tree` node arrays | accumulated device-side, read back ONCE | new |
 
-### Training flow (raw data → ensemble), with GPU-relevant stages flagged
+The growth loop (`build → subtract → best-split → partition`) runs device-side with the frontier
+resident; the host issues a **handful** of launches per tree instead of ~86.
 
-```
-[raw file / matrix]
-   ↓  lgbm-data: sample columns → BinMapper::find_bin → pack into FeatureGroups
-[Dataset: binned integer columns]            (CPU, one-time; immutable after finish_load)
-   ↓  lgbm-boosting: GBDT loop, per iteration:
-   │
-   ├─(1) get_gradients(score) ............ lgbm-objective   [GPU-RELEVANT: grad/hess kernel]
-   ├─(2) discretize gradients → int8 + scale  lgbm-treelearner::GradientDiscretizer  [det. linchpin]
-   ├─(3) bagging / GOSS subsample ........ lgbm-boosting (CPU; deterministic RNG by seed)
-   ├─(4) per tree, leaf-wise growth (num_leaves-1 splits):
-   │       a. construct_histogram(rows, int_grad_hess) .... lgbm-compute  [GPU-RELEVANT: hottest]
-   │       b. split_gain_scan(hist) ...................... lgbm-compute  [GPU-RELEVANT]
-   │       c. ArgMax best leaf ........................... lgbm-treelearner (small, CPU)
-   │       d. split + data_partition .................... lgbm-compute / lgbm-treelearner [GPU-RELEVANT]
-   ├─(5) renew leaf outputs, shrinkage ... lgbm-treelearner + lgbm-model
-   ├─(6) update_score(tree) ............. lgbm-compute   [GPU-RELEVANT: score reduction]
-   └─(7) eval metrics, early stop ....... lgbm-metric    [GPU-RELEVANT for big eval sets]
-   ↓
-[append Tree to ensemble]
-```
+### Result return — host-bit-comparable
 
-GPU-relevant stages (the candidate CubeCL kernels): **(1) gradient/hessian, (4a) histogram construction [hottest], (4b) split-gain scan, (4d) data partition, (6) score update, (7) metric eval.** Stages (3) and (4c) stay on CPU — small, branchy, and order-sensitive in ways better controlled host-side.
+The boosting layer needs exactly two host objects (gbdt.rs:1289 + score_updater.rs:123): a
+`lgbm_model::Tree` and a `DataPartition`, consumed by
+`add_prediction_to_score(tree, data_partition, score)` (learner.rs:3729), a pure host per-row
+leaf-value scatter. So the on-device path reconstitutes both:
 
-### Prediction flow
+- **Tree:** read back the node arrays once and replay them onto `lgbm_model::Tree` via the existing
+  `Tree::split` builder (learner.rs:3405) in leaf-creation order — O(num_leaves) cheap host work,
+  no per-row cost. The replayed Tree is structurally identical to what a host loop would emit.
+- **DataPartition:** read back the final `row_leaf` once and bucket rows per leaf into a
+  `DataPartition` (its `indices_in_leaf(leaf)` is all the score scatter reads). This is the single
+  device→host transfer that matters; everything else stayed resident.
 
-```
-[features] → lgbm-model: Tree::predict per tree → sum over ensemble (ordered, fixed) →
-lgbm-objective::convert_output (sigmoid/softmax) → [score]
-```
+**Per-iter scores stay bit-comparable for free:** the on-device path returns the SAME
+`(Tree, DataPartition)` and the host `add_prediction_to_score` scatter is reused verbatim, so the
+score update is identical-to-the-host-path within the f32 envelope. (Keeping the score vector on
+device is explicitly OUT of the minimal slice — it would change score-update numerics and widen the
+parity surface.)
 
-### State management
+> **Partition placement nuance (load-bearing).** `partition-memory-traffic.md` (spike-035) found the
+> device partition round-trip is pure overhead on shared memory and routed ROCm partition on the HOST
+> by default. The dominant CUDA cost is the **build→subtract→scan launch chain**, not partition. So
+> the first slices may keep the shipped host fused partition (027) and still bank most of the win;
+> moving partition fully on-device (true single-GPU learner) is a later slice that pays off on
+> discrete PCIe NVIDIA where the round-trip crosses the bus.
 
-- `Dataset` is **immutable** after load (matches C++ `FinishLoad`) — safe to share `&Dataset` across the loop and across backends.
-- Mutable training state lives in `lgbm-boosting` (`models`, `gradients`, `hessians`, score buffers) and `lgbm-treelearner` (`data_partition`, histogram pool, `leaf_splits`).
-- Device buffers (gradients, histograms, scores) live behind `Backend::Buf`; host mirrors only materialized when needed (e.g. ArgMax, final leaf outputs).
+---
 
-## Determinism Architecture (the critical constraint: 1e-12 on CPU **and** ROCm)
+## Parity Gating (Question 4) — anchor-pinned, NOT bit-exact
 
-Floating-point `+` is non-associative, so a parallel/warp reduction and a sequential reduction over the same values generally differ in the last bits. With naive f32 or even f64 atomic accumulation, ROCm histograms will **not** match a C++ CPU reference at 1e-12. The architecture must remove order-dependence from the accumulation hot paths. Strategy, in priority order:
+The on-device CUDA path uses **f32 atomic histogram builds**, which are ~1.9e-6 nondeterministic
+run-to-run (def-f8u-01, `partition-memory-traffic.md`). It **cannot** be bit-exact, and two
+nondeterministic GPU f32 paths must **never** be compared to each other at 1e-6 (def-f8u-01 MEMORY:
+"never compare two nondeterministic GPU f32 paths to each other").
 
-**1. Integer-quantized gradient accumulation (primary mechanism — grounded in LightGBM's own code).**
-LightGBM already ships a `GradientDiscretizer` (`src/treelearner/gradient_discretizer.{cpp,hpp}`, verified): per iteration it maps `(grad, hess)` to `int8` with a stored `grad_scale`/`hess_scale`, then histograms accumulate as **integers** (adaptive 16- or 32-bit bins via `SetNumBitsInHistogramBin`). **Integer addition is associative and exact**, so the histogram is *bit-identical* regardless of reduction order, thread count, or whether the Plane path or the sequential path runs. The split-gain scan then operates on integer sums scaled back by `grad_scale/hess_scale` at the end (one deterministic conversion). This is the single most important design decision: **make integer histogram accumulation the default compute path on every backend**, so CPU and ROCm produce the same bits by construction. The 16/32-bit adaptive width (chosen by data count per leaf) bounds overflow exactly as C++ does.
+**Structure the oracle exactly like `learner_parity_{resident,fused}_equals_host_tree_on_hip`:**
 
-**2. Deterministic bin boundaries.**
-`BinMapper::find_bin` must reproduce C++ bin edges bit-for-bit (same quantile algorithm, same tie-breaking, same `max_bin`). Binning is one-time and CPU-only, so this is a faithful-port problem, not a parallelism problem — but it is upstream of everything, so any deviation here fails parity before training starts. Validate binning in isolation against the oracle first.
+1. **Pin STRUCTURE to the cpu f64 anchor, not to another GPU run.** Grow the corpus twice: once on
+   `CpuBackend` (the bit-exact anchor) and once on-device; assert the tree TOPOLOGY
+   (`split_feature`, `threshold_bin`, `left_child`/`right_child`, leaf count) matches the anchor.
+2. **Leaf VALUES within an f32 envelope** (~1e-5, the def-f8u-01 bound), never bit-exact.
+3. **Tie-aware structural assert (mandatory).** Cross-feature argmax and `default_left` can legally
+   flip when the gain margin is within the f32 envelope — the `hip-split-parity` near-tie class,
+   fixed via a tie-aware assert (commit 1832206, `hip-split-parity-preexisting-defect` MEMORY). The
+   gate must accept either branch when the winning-vs-runner-up gain margin is within the envelope,
+   rather than demand exact topology. **Plan for this from the start** — naive exact topology goes
+   red on near-ties and wastes a debug cycle.
+4. **CPU merge gate untouched.** `cargo test -p oracle-harness -p lgbm-treelearner -p lgbm` stays
+   the hard gate; the on-device path is default-off so these run the CPU anchor unchanged.
+5. **Real-CUDA validation surface = Kaggle** (`kaggle-cli-cuda-bench`, user `boomvector`), the only
+   true discrete-NVIDIA signal (local GPU is a spoofed APU). Push to `master`, run the kernel, read
+   `phase_prof` `device_launches` (select the max-launches/timed dump, not the warmup — the 051
+   parse rule).
 
-**3. Ordered / fixed-shape reductions for the unavoidable float sums (scores, metrics, leaf outputs).**
-Some reductions cannot be integerized cheaply — final leaf-output computation, `ScoreUpdater` sums, and metric eval use f64. For these: (a) accumulate in **f64** always (never f32, even on GPU — confirm `cubecl-hip` exposes f64; if a kernel must stay f32, keep that sum on CPU); (b) use a **fixed-shape tree reduction** (deterministic pairwise) rather than atomic-add, so the addition order is a function of length only, identical across backends and thread counts; (c) never use floating `AtomicAdd` in a determinism-critical path — atomic float order is nondeterministic across runs and backends.
+---
 
-**4. Deterministic work decomposition.**
-Histogram tiling, partition layout, and plane (wavefront) size must be derived from data shape, not from device-reported occupancy, so the *set* of partial sums and their combination order is fixed. The CPU runtime runs with `plane_size = 1` and sequential cube scheduling (confirmed) — that gives a natural reference ordering; the GPU path must reduce to the *same value*, which integerization (mechanism 1) guarantees, and which fixed-shape f64 reduction (mechanism 3) guarantees where integers do not apply.
+## Suggested Build Order (Question 5) — vertical slices
 
-**5. Match the C++ deterministic mode.**
-LightGBM has a `deterministic` config flag and `force_row_wise/force_col_wise` controls. The oracle reference C++ must be run in its deterministic configuration, and the Rust port targets *that* output. Document the exact reference config in the oracle harness.
+Each slice is **end-to-end** (grows a real tree, returns `(Tree, DataPartition)`, passes the
+anchor-pinned gate) and ships **default-off** behind `LGBM_CUDA_ON_DEVICE`.
 
-**Net effect on the compute layer:** the `Backend` trait's histogram signatures take/return **integers** (`Buf<i32>` gradients, `Buf<i64>` histograms) as the default path, with float histograms only as a non-deterministic fast path that is *off* under the parity contract. This shapes every kernel in `lgbm-compute/src/kernels/`.
+### Slice 0 — Scaffold the seam (no behavior change)
+Add `on_device_growth_supported()` (default false) + `grow_tree_on_device()` (default typed error)
++ `OnDeviceTreeResult` + `on_device_eligible()` + the `train_inner` early-return fork + the
+`reconstitute()` helper (node-array→Tree replay, `row_leaf`→DataPartition). The `GpuBackend<R>`
+override still returns the typed error. **Merge gate green; CPU/ROCm/host-CUDA all untouched**
+(default-off, eligibility ANDs in a false discriminator). De-risks the wiring before any kernel.
 
-**Residual risk (honest):** No source proves f64 transcendental functions (exp/log in objectives like binary/poisson) are bit-identical between a ROCm device library and the host libm. If objective grad/hess diverge in the last ULP *before* discretization, discretization may absorb it (quantization is a rounding step) — but this must be **empirically validated**, and if it fails, the fallback is to compute objective grad/hess on CPU (host libm) and only push the already-discretized integers to the GPU. Flag this for early validation.
+### Slice 1 — MINIMAL PROVING SLICE (proves on-device growth on real CUDA)
+On `GpuBackend<R>`, implement `grow_tree_on_device` for the **narrowest viable tree**: pure numeric
+spine, small `num_leaves` (e.g. ≤8), the **build→subtract→best-split frontier resident** driven by a
+few large launches, **host partition reused** (the shipped 027 fused path) + **host `Tree::split`
+replay** from read-back per-split decisions. ONE readback of split decisions + final `row_leaf`.
+- **Proves:** the seam grows a structurally-anchor-pinned tree end-to-end on real CUDA; the per-node
+  build/subtract/scan launch chain collapses to O(depth) large launches; `device_launches/tree`
+  drops materially vs master (the Kaggle measurement).
+- **Gate:** anchor-pinned tie-aware structure + ~1e-5 leaf values; CPU merge gate green.
+- The smallest thing that attacks the 8,570-launch finding and validates parity + return
+  reconstitution at once. Keep `num_leaves` small so the readback/replay is trivial to verify.
 
-## Build Order (foundational → dependent)
+### Slice 2 — On-device best-split across the full frontier
+Move the cross-feature argmax over the whole leaf frontier on-device (resident best-split-per-leaf),
+removing the per-leaf scan readbacks. Grow to production `num_leaves`/`max_depth`.
 
-Driven by the dependency graph and by "what must be bit-exact before anything above it can be validated":
+### Slice 3 — On-device data partition (true single-GPU learner)
+Move row routing on-device (resident `row_leaf` updated per split), eliminating the host partition
+round-trip — the part that pays off on discrete PCIe NVIDIA. Now only ONE readback at end of growth
+(node arrays + `row_leaf`). The full `CUDASingleGPUTreeLearner` mirror.
 
-1. **`lgbm-core`** — types, config enums, error types, reduction traits. (No deps.)
-2. **`lgbm-data`** — `BinMapper`/binning first; this is the determinism root (mechanism 2). Validate bin boundaries against the oracle before proceeding. Then `FeatureGroup`, `Bin` impls, `Metadata`, loader.
-3. **`lgbm-model`** — `Tree` storage + text/JSON I/O. Enables loading a C++-trained model to validate *prediction* parity independently of training.
-4. **`lgbm-compute`** — `Backend` trait + CPU runtime first, with the **integer histogram** and split-scan kernels (determinism mechanism 1). Add the ROCm runtime as a second impl of the same trait; cross-validate CPU vs ROCm on the kernels in isolation before wiring into training.
-5. **`lgbm-objective`** + **`lgbm-metric`** — grad/hess and eval; can proceed in parallel once compute exists. (Objective grad/hess parity is a validation gate per residual-risk note.)
-6. **`lgbm-treelearner`** — serial learner orchestrating compute kernels; gradient discretizer; split finding; partition; then monotone + categorical.
-7. **`lgbm-boosting`** — GBDT loop first (simplest path to end-to-end 1e-12), then GOSS/bagging, then DART and RF.
-8. **`lgbm-api`** — facade wiring everything; the surface the oracle harness drives.
-9. **`lgbm-python`** — PyO3 last; it is a translation layer over a validated `lgbm-api`.
+### Slice 4 — Default-on routing + size gate + perf-harden
+Flip the size gate / `on_device_enabled` default for CUDA only (ROCm stays host-driven), set the
+`num_data` crossover from Kaggle A/B, keep the env off-switch. Honesty mandate: ship default-on ONLY
+where the real-CUDA A/B shows a sign-stable win (the fused-kernel default-off precedent).
 
-**The oracle harness** is built alongside step 2 (binning) and grows with each layer — every crate is validated against C++ as it lands, not at the end. Running the harness on **ROCm** is a gate at steps 4, 6, and 7.
+**Ordering rationale:** Slice 0 isolates wiring risk from kernel risk. Slice 1 proves the hardest
+uncertainty (does on-device growth + anchor-pinned parity + result reconstitution actually work on
+real CUDA) at minimum kernel surface. Slices 2–3 expand the resident frontier monotonically, each
+independently gated. Slice 4 is pure routing/perf, deferred until the win is measured — never
+auto-engaged before proof (the project's audit-before-wire value).
 
-## Anti-Patterns
+---
 
-### Anti-Pattern 1: Float atomic-add histogram accumulation
-**What people do:** Port the GPU histogram as `AtomicAdd<f32>`/`AtomicAdd<f64>` into bins, matching a naive CUDA tutorial.
-**Why it's wrong:** Atomic float order is nondeterministic across runs *and* differs from the CPU sequential reference — instant 1e-12 failure on ROCm.
-**Do this instead:** Integer-quantized gradients + integer histogram bins (associative, exact); subtract trick stays exact. Float only for the final scaled-back gain and leaf output.
+## Anti-Patterns (specific to this integration)
 
-### Anti-Pattern 2: Naming a CubeCL runtime above `lgbm-compute`
-**What people do:** Reach for `CudaRuntime`/`HipRuntime` inside the tree learner or boosting loop "just to launch one kernel."
-**Why it's wrong:** Recreates the C++ `#ifdef USE_CUDA`-in-hot-path coupling; makes CPU-only testing impossible and breaks backend swappability.
-**Do this instead:** Every device op goes through the `Backend` trait. The runtime type is named in exactly one file (`rocm.rs`/`cpu.rs`).
+### Anti-Pattern 1: A global env flag or runtime mode to switch learners
+**What people do:** add `if std::env::var("USE_ON_DEVICE")` deep in the loop, or a process-global
+learner mode.
+**Why wrong:** the project's hard rule is backend discriminators (default-false trait methods on one
+backend), never globals (`partition-memory-traffic.md` Constraints). A global would silently affect
+ROCm/CPU and break the decide-once-at-top discipline.
+**Do this instead:** `on_device_growth_supported()` discriminator + `on_device_eligible()` predicate
++ the single `train_inner` fork.
 
-### Anti-Pattern 3: 1:1 template-matrix translation of `ConstructHistogram`
-**What people do:** Mirror C++'s `<USE_INDICES, USE_HESSIAN, USE_QUANT_GRAD, HIST_BITS>` template explosion as Rust generics.
-**Why it's wrong:** Monomorphization blowup and unreadable kernels (flagged in `.planning/codebase/ARCHITECTURE.md`).
-**Do this instead:** A small set of parametric `#[cube]` kernels keyed by `#[comptime] hist_bits` and a runtime `use_indices` branch.
+### Anti-Pattern 2: Bit-exact GPU-vs-GPU parity asserts
+**What people do:** assert the on-device tree equals a host-GPU-grown tree cell-for-cell.
+**Why wrong:** both are nondeterministic f32 atomic builds (~1.9e-6); the assert is flaky by
+construction (def-f8u-01).
+**Do this instead:** pin STRUCTURE to the cpu f64 anchor, leaf values within ~1e-5, tie-aware.
 
-### Anti-Pattern 4: Device-reported occupancy driving reduction shape
-**What people do:** Size tiles/partials from `client` occupancy or warp count.
-**Why it's wrong:** Makes the *combination order* of partial sums hardware-dependent — different ROCm GPUs (or CPU) diverge.
-**Do this instead:** Derive tiling and reduction shape from data dimensions only; keep float reductions fixed-shape and pairwise.
+### Anti-Pattern 3: f64 hot loops in the new CUDA kernels
+**What people do:** reuse the f64 fused `build_fix_scan_resident` math on consumer NVIDIA.
+**Why wrong:** consumer NVIDIA f64 is 1/32 f32 — `LGBM_FUSED_FORCE=1` was **5.4× WORSE** on CUDA
+(spike-052). The fused f64 kernel tanks.
+**Do this instead:** keep the **u64 fixed-point** build path (spike-018) for the on-device histogram
+build.
+
+### Anti-Pattern 4: A parallel `TreeLearner` trait + boosting dispatch refactor
+**What people do:** introduce a learner-level trait to host `CudaSingleGpuTreeLearner` alongside
+`SerialTreeLearner`.
+**Why wrong:** 20+ gbdt.rs call sites name `SerialTreeLearner` concretely; a trait + dispatch
+refactor has a large blast radius across the CPU/ROCm paths the milestone must protect.
+**Do this instead:** the Backend seam + the in-`train_inner` early-return fork.
+
+---
 
 ## Integration Points
 
-### External (compute runtimes)
-
-| Runtime | Integration | Notes |
-|---------|-------------|-------|
-| `cubecl-cpu` | `CpuBackend = ComputeBackend<CpuRuntime>` | Reference ordering (plane_size 1, sequential). The CPU parity target and CI default. |
-| `cubecl-hip` (ROCm) | `RocmBackend = ComputeBackend<HipRuntime>`, behind `feature = "rocm"` | Mandated GPU test target. Plane API → AMD wavefront ops. Validate f64 + plane support via `client.features()` at startup. |
-| CubeCL `Plane` API | `plane_sum`/`plane_*` under `#[comptime] use_plane` | Maps CUDA warp shuffles → portable subgroup ops. Determinism comes from integerization, not from the plane op itself. |
-
-Backend selection: a `Device` enum in config (`Cpu` | `Rocm`) resolved once in `lgbm-api`; `feature = "rocm"` gates compiling the HIP runtime so a CPU-only build needs no ROCm toolchain. Both Cargo-feature (compile) and runtime (config) selection are supported, per the project constraint.
-
-### Internal boundaries
+### Internal Boundaries
 
 | Boundary | Communication | Notes |
 |----------|---------------|-------|
-| `lgbm-boosting ↔ lgbm-treelearner` | `train(grad, hess, is_first) -> Tree` | The tree-grow seam; device-agnostic. |
-| `lgbm-treelearner ↔ lgbm-compute` | `Backend` trait calls (histogram, split scan, partition) | Only place hot kernels are invoked. |
-| `lgbm-boosting ↔ lgbm-objective` | `get_gradients(score) -> (grad, hess)` | Objective owns grad/hess kernels; discretizer in treelearner consumes them. |
-| `* ↔ lgbm-compute (device buffers)` | `Backend::Buf<T>` opaque buffers | Host materialization only at ArgMax / leaf output / final read. |
-| `lgbm-python ↔ lgbm-api` | PyO3 over the Rust-native facade | No PyO3 type below `lgbm-api`. |
+| boosting ↔ treelearner | `train_returning_partition() -> (Tree, DataPartition)`; `add_prediction_to_score()` | **UNCHANGED.** On-device path returns the same pair. The seam is invisible above the learner. |
+| treelearner ↔ compute | new `Backend::grow_tree_on_device()` + `on_device_growth_supported()` | Additive; all cubecl confined to lgbm-compute (CMP-01). `OnDeviceTreeResult` is plain data. |
+| learner internal | `train_inner` early-return fork + `reconstitute()` | Sibling branch of the existing resident/host fork; pool-reuse + return-tuple invariants preserved. |
+| compute internal | `GpuBackend<R>` reuses `resident_bins` + `resident_pool`; adds resident frontier/partition state | ROCm shares the struct but keeps `on_device_enabled=false` → its shipped path is untouched. |
+
+### Feature-gate map
+- No new Cargo feature needed. On-device impl lives under the existing `#[cfg(feature = "gpu")]`
+  `GpuBackend<R>` block; CUDA-only opt-in is a runtime field/env (`on_device_enabled` +
+  `LGBM_CUDA_ON_DEVICE`), not a compile gate — so a `--features cuda` build still defaults to the
+  existing host-CUDA path until explicitly enabled.
+
+---
+
+## Scaling Considerations
+
+| Scale (num_data) | On-device routing |
+|------------------|-------------------|
+| tiny / small | host loop wins (launch-bound resident chain already loses < ~12k rows, resident_pool.rs:58). Size-gate the on-device path OFF here too. |
+| medium–large | the on-device frontier amortizes its few large launches; the 8,570→O(depth) launch collapse is the win. Crossover set from Kaggle A/B. |
+| wide (≥500 feat) | the lgb_rs/official gap already halves with width (3.90×@50f→1.93×@500f, spike-054) because per-launch ms rises and the launch-bound fraction shrinks; on-device still helps but build dominates — measure, don't assume. |
+
+---
 
 ## Sources
 
-- `.planning/codebase/ARCHITECTURE.md`, `STRUCTURE.md`, `INTEGRATIONS.md` — C++ reference subsystem boundaries, data flow, factories, GPU-relevant flags (HIGH).
-- `.planning/PROJECT.md` — constraints: 1e-12 cross-backend, CubeCL mandate, Plane API, deterministic reductions, crate-per-responsibility (HIGH).
-- CubeCL docs via Context7 `/tracel-ai/cubecl` (v0.10.0, May 2026) — runtime-generic kernels, `Plane::Ops` feature query, `plane_sum`, comptime fallback, monomorphized `#[cube]` traits, runtimes (`cubecl-cpu`/`cubecl-cuda`/`cubecl-hip`/`cubecl-wgpu`), CPU runtime plane_size 1 + sequential scheduling (HIGH).
-- LightGBM `src/treelearner/gradient_discretizer.hpp` (read directly) — int8 gradient discretization + adaptive 16/32-bit integer histogram bins; the basis of the integer-accumulation determinism strategy (HIGH for the mechanism's existence; MEDIUM that it yields 1e-12 on ROCm — requires empirical validation).
+- `crates/lgbm-compute/src/lib.rs` — `Backend` trait (:495), discriminator idioms
+  (`prefers_host_partition` :898, `resident_pool_supported` :935, `host_unified_fused_supported`
+  :914, `data_partition_native` :637), `GpuBackend<R>` (:2037), `RocmBackend`/`CudaBackend` aliases
+  (:2110/:2116), `ResidentBins` (:2000), `resident_pool` handle mirror (:2051). [HIGH]
+- `crates/lgbm-treelearner/src/learner.rs` — `train_inner` decide-once-at-top fork (:680–714), the
+  leaf-wise loop (:1024–1112), `find_best_splits` resident/host routing (:1404–1812), `Tree::split`
+  builder (:3405), `add_prediction_to_score` (:3729). [HIGH]
+- `crates/lgbm-treelearner/src/resident_pool.rs` — the conservative fail-safe eligibility predicate +
+  size gate + `LGBM_*_FORCE` override pattern to clone for `on_device_eligible`. [HIGH]
+- `crates/lgbm-boosting/src/gbdt.rs:1289` + `score_updater.rs:123` — the `(Tree, DataPartition)` →
+  per-row score scatter contract the on-device path must preserve. [HIGH]
+- `.claude/skills/spike-findings-lightgbm_rs/references/cuda-architectural-launch-bound.md` — the
+  launch-bound diagnosis, "on-device learner is the one architectural lever", the f64-on-CUDA /
+  u64-fixed-point / Kaggle-measurement rules. [HIGH]
+- `.claude/skills/spike-findings-lightgbm_rs/references/partition-memory-traffic.md` — the
+  additive-discriminator wiring idiom + def-f8u-01 anchor-pinned (not bit-exact) GPU parity approach
+  + the host-vs-device partition placement finding (spike-035). [HIGH]
+- MEMORY: def-f8u-01 (anchor-pin GPU f32 to cpu anchor), hip-split-parity near-tie tie-aware assert
+  (commit 1832206), kaggle-cli-cuda-bench. [HIGH]
+- `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp` — the C++ reference port target
+  (resident histogram/partition/best-split-finder members, on-device `Train()` loop). [HIGH]
 
 ---
-*Architecture research for: pure-Rust LightGBM port on CubeCL with cross-backend bit-determinism*
-*Researched: 2026-06-05*
+*Architecture research for: on-device CUDA tree learner integration (lightgbm_rs v1.1)*
+*Researched: 2026-06-28 — prior v1.0 study preserved at ARCHITECTURE.v1.0.md*

@@ -1,20 +1,16 @@
 # Stack Research
 
-**Domain:** Pure-Rust rewrite of LightGBM (gradient-boosted decision trees) with a switchable CPU / AMD ROCm compute backend via CubeCL, plus Python bindings. Hard constraint: 1e-12 absolute output parity vs C++ LightGBM 4.6 on every backend.
-**Researched:** 2026-06-05
-**Confidence:** HIGH for crate versions (verified against crates.io / Context7 / official docs, 2026-06-05). MEDIUM for CubeCL determinism/f64 behavior on ROCm (alpha software, version churn risk — see warnings). MEDIUM for Python-API mirroring effort estimate.
+**Domain:** On-device GPU decision-tree growth learner (CubeCL CUDA/ROCm), porting LightGBM's `CUDASingleGPUTreeLearner` into the existing pure-Rust `lgbm-rs` workspace (v1.1 GPU training-speed milestone).
+**Researched:** 2026-06-28
+**Confidence:** HIGH (cubecl version + capability API verified against `Cargo.lock` and the live `runtime::probe_capabilities`; reference architecture read directly from `LightGBM/src/treelearner/cuda/*`)
 
----
+> NOTE: This file is the **v1.1 milestone** stack research (CUDA on-device tree learner). The prior v1.0 whole-project stack research is preserved in git history at this same path.
 
-## Executive Summary (read this first)
+## TL;DR — the one architectural finding that governs everything
 
-1. **`cubecl = "0.10.0"` is correct and current.** 0.10.0 is the latest *published stable* (crates.io, released 2026-05-07; the entire 0.10 line before it was `0.10.0-pre.N` prereleases). There is **no 0.11 on crates.io yet** — the CubeCL *book* already shows `version = "0.11.0"` in examples, which is the unreleased `main` branch running ahead of the registry. Pin exactly and treat upgrades as breaking events.
-2. **AMD ROCm = the `cubecl-hip` crate via the `hip` (alias `rocm`) feature — NOT wgpu.** An earlier ambiguous source suggested routing ROCm through `wgpu`; that is wrong. CubeCL has a *dedicated* HIP runtime that compiles to AMD's HIP/ROCm C++ compiler, separate from the Vulkan-via-wgpu path. Use `hip` for the mandated ROCm test target.
-3. **CubeCL is officially in alpha.** This is the single largest risk to the project. Pin every CubeCL crate to an exact version, commit `Cargo.lock`, and budget for breaking API changes on each minor bump.
-4. **The 1e-12 oracle dominates the numeric design.** Use **f64 everywhere accumulation happens** (LightGBM's C++ uses `double` for histogram sums and scores even when gradients are `float`). f64 on GPU is the determinism risk: CUDA and HIP support f64 in hardware; **wgpu/WebGPU does not reliably support f64**, which is a second reason ROCm must go through `cubecl-hip`, not wgpu. Determinism requires *ordered/fixed-layout* reductions, not just f64 width.
-5. **Don't use `cubecl`'s built-in `plane_sum` for the oracle-critical reductions without a determinism wrapper.** `plane_sum` maps to CUDA `warpReduceSum` / HIP `__shfl` / wgpu `subgroupAdd`, whose summation *order* is implementation-defined. For 1e-12 parity you need a reduction whose addition order is fixed and identical to the C++ reference, or you must reproduce C++'s exact ordering. Plane ops are still useful where the result is bit-stable (e.g. ballots/counts) — see Architecture notes.
+**The official `CUDASingleGPUTreeLearner` is NOT a persistent megakernel and uses NO device-side global barrier and NO device-driven growth loop.** It is **host-driven**, exactly like today's `lgbm-rs` learner — the C++ host still runs the per-leaf `for` loop. The difference is *granularity*, not *location*: each growth step dispatches a **handful of large kernels over whole-frontier device-resident state** (leaf-splits struct, data-index→leaf map, the histogram pool), and the host reads back **only a few scalars** (best feature/threshold/gain/default-left) to decide the next leaf. Phases are overlapped with **4 CUDA streams**. (Evidence: `cuda_single_gpu_tree_learner.cpp:34-90` Init; `cuda_data_partition.cu` uses `cuda_streams_[0..3]`, `<<<grid,block>>>` launches + two-stage `AggregateBlockOffsetKernel0/1` reductions; `cuda_leaf_splits.hpp` holds a device `CUDALeafSplitsStruct`.)
 
----
+**Consequence for the stack: cubecl 0.10.0 — the version already pinned — is sufficient. No new crate and no new cubecl capability is required to match the reference architecture.** The milestone is *kernels + device-resident state extension + stop reading histograms back to host*, not a new compute primitive. The two genuine traps are numerical/capability, not architectural: (a) on CUDA `has_f64 == true` will tempt the existing f64 anchor kernel onto NVIDIA where f64 runs at 1/32 rate (spike-052: 5.4× slower) — the new path MUST stay on the u64 fixed-point build; (b) there is no grid barrier, so cross-leaf reductions are separate launches (which is what the reference does anyway).
 
 ## Recommended Stack
 
@@ -22,213 +18,130 @@
 
 | Technology | Version | Purpose | Why Recommended |
 |------------|---------|---------|-----------------|
-| Rust (edition 2024) | toolchain ≥ 1.85 | Implementation language | Mandated. Edition 2024 already in `Cargo.toml`. Note: `proptest 1.11` needs rustc ≥ 1.85, `numpy 0.28` needs ≥ 1.83 — edition 2024 implies a new enough toolchain. |
-| `cubecl` | `=0.10.0` | Compute kernel language + multi-backend runtime (CPU, CUDA, HIP/ROCm, wgpu) | Mandated. Latest *stable* on crates.io (2026-05-07). Single kernel source compiles to all backends; `Plane` API exposes warp/subgroup ops portably. **Pin exactly** — alpha, fast-moving. |
-| `cubecl-hip` (via `cubecl` `hip`/`rocm` feature) | matches `cubecl` 0.10.0 | AMD ROCm/HIP GPU runtime — the mandated GPU test target | Dedicated HIP runtime compiling to AMD's HIP C++ compiler. Supports f64 in hardware (unlike wgpu), required for the 1e-12 contract. |
-| `cubecl-cpu` (via `cubecl` `cpu` feature) | matches `cubecl` 0.10.0 | CPU runtime (LLVM/Rust-compiled, SIMD where available) | First-class CubeCL target. On CPU `PLANE_DIM == 1` (no warps), so plane-based kernels degrade to scalar — convenient for a deterministic CPU reference path. |
-| `serde` + `serde_json` | `serde 1.x` (latest 1.0.x), `serde_json 1.x` | Config (de)serialization, internal state | Standard. **Not** for the LightGBM model text format (see below) — that is a bespoke line-oriented format, hand-written parser/writer required. |
+| `cubecl` | **0.10.0** (pinned, `Cargo.lock`) | The compute seam; already provides every primitive the on-device learner needs | No upgrade required — `sync_cube`, `Atomic<u64/i64/f32>`, `SharedMemory`, plane ops, runtime-bound `for`/`while` loops, and the resident-`Handle` pattern are all in 0.10.0 and in production use in `kernels/histogram.rs`. Upgrading mid-milestone would churn the verified parity surface for no capability gain. |
+| `cubecl-cuda` | 0.10.0 (`cubecl/cuda` → `CudaRuntime`) | The real-NVIDIA backend this milestone targets | Already wired as `CudaBackend = GpuBackend<CudaRuntime>` (lib.rs:2116). The generic `GpuBackend<R>` means CUDA inherits every kernel ROCm validates. |
+| `cubecl-hip` | 0.10.0 (`cubecl/hip` → `RocmRuntime`) | The local parity-gate backend (spoofed 8-CU APU) | Hardware parity gate; bit-exact-to-anchor proofs run here before Kaggle CUDA confirms speed. |
+| `cubecl-cpu` | 0.10.0 (default `cpu`) | The f64 **bit-exact deterministic anchor** — the hard merge gate | Unchanged. The on-device learner is held to ~1e-6 against this; do not touch it. |
 
-### Numeric / Data Representation
+### Supporting Libraries (already in tree — no additions)
 
-| Technology | Version | Purpose | Why / Determinism note |
-|------------|---------|---------|------------------------|
-| **Custom columnar / binned store** | n/a (build it) | `Dataset`, `BinMapper`, `FeatureGroup`, `MultiValBin` | **Recommended over ndarray/nalgebra for the core.** LightGBM's data layout is bespoke: bit-packed bins (4/8/16-bit), feature groups, multi-val sparse bins. To match C++ binning *bit-for-bit* you must control memory layout directly. ndarray's dense `Array2<T>` cannot represent the packed bin layout faithfully. |
-| `f64` (not `f32`) for all accumulators | — | Histogram sums, gradient/hessian sums, leaf output, score updates | **Hard requirement for 1e-12.** C++ LightGBM accumulates histograms and scores in `double` even though `score_t`/`label_t` default to `float`. Mirror this exactly: store gradients/labels as the same width C++ uses (`float` by default per `meta.h`), but accumulate in `f64`. |
-| `bytemuck` | latest 1.x | Zero-copy reinterpret of packed bins / GPU byte buffers | CubeCL kernels exchange `&[u8]`; `bytemuck` gives safe `cast_slice` for the columnar store ↔ device transfer. |
-| `ndarray` | `0.17.2` | **Only** at the Python/NumPy boundary (predict I/O, feature matrices) | Use ndarray *narrowly* for interop with `rust-numpy` (which speaks `ndarray`), not as the internal training data structure. |
-| `nalgebra` | (avoid) | — | **Not needed.** LightGBM is not linear-algebra-heavy; the only dense LA is linear-tree leaf fitting (C++ uses Eigen). A small hand-rolled normal-equations solve, or `nalgebra` *scoped to that one module*, suffices. Do not adopt it project-wide. |
+| Library | Version | Purpose | When to Use |
+|---------|---------|---------|-------------|
+| `cubecl-hip-sys` | 7.1.5280200 | `rocm`-gated CU-count FFI for occupancy | ROCm only; irrelevant to CUDA (spike-053 refuted occupancy tuning on real NVIDIA). |
+| `serde` | 1.x (`gpu`-gated) | `AutotuneKey` Serialize/Deserialize for the persistent autotune cache | Already present; spike-051/053 say **do not** add occupancy autotuning for CUDA. |
+| `rayon` | 1.10 | Host-side parallelism (CPU anchor path) | Unchanged; not on the GPU growth path. |
 
-### Python Bindings
+**No new `[dependencies]` entry is needed.** Everything is a sub-feature of the already-vetted `cubecl 0.10.0` workspace dep (same rationale recorded at `Cargo.toml:43-46` for the `cuda` feature).
 
-| Technology | Version | Purpose | Why Recommended |
-|------------|---------|---------|-----------------|
-| `pyo3` | `0.28.3` | Rust↔CPython bindings | Latest stable (2026-04-02). Note 0.28.0/0.28.1 were **yanked** — use ≥ 0.28.2. ABI3/stable-ABI wheels supported. |
-| `numpy` (rust-numpy) | `0.28.0` | NumPy array interop (`PyArray`, `PyReadonlyArray`) | **Minor version MUST track PyO3's** — `numpy 0.28` is built for `pyo3 0.28`. This lockstep is the #1 binding-version pitfall. |
-| `maturin` | `1.13.3` | Build/publish the extension wheel | De-facto standard for PyO3 wheels; `maturin develop` for local iteration, `maturin build --release` for distribution. Configure via `pyproject.toml` + `[tool.maturin]`. |
+### CubeCL 0.10.0 device primitives — verified present and sufficient
 
-To mirror the official `lightgbm` Python API: expose `Dataset`, `Booster`, `train()`, `cv()`, and the `LGBMClassifier`/`LGBMRegressor`/`LGBMRanker` scikit-learn wrappers. The official package is **pure-Python over ctypes** (no compiled extension of its own), so its public surface is plain Python — you can reimplement the thin sklearn-wrapper layer *in Python* on top of your Rust `Booster`, and only push the hot train/predict/Dataset path into Rust via PyO3. This minimizes PyO3 surface and maximizes API fidelity.
+All confirmed in active use in `crates/lgbm-compute/src/kernels/` against cubecl 0.10.0:
 
-### Error Handling
+| Primitive | API (0.10.0) | Status | Role in the on-device learner |
+|-----------|--------------|--------|-------------------------------|
+| Intra-cube barrier | `sync_cube()` | ✅ `histogram.rs:814,826,1217…` | LDS histogram build; block-local prefix sums |
+| Integer atomics | `Atomic<u64>`, `Atomic<i64>`, `::fetch_add` | ✅ in use | u64 fixed-point histogram build (the no-f64 path) |
+| f32 atomics | `Atomic<f32>` + `AtomicUsage::Add` (probe-gated) | ✅ in use | f32 scatter build where supported |
+| Shared memory (LDS) | `SharedMemory::<T>::new(CONST)` | ✅ `histogram.rs:801` | privatized sub-histograms; block prefix sums for partition |
+| Plane/warp collectives | `plane_sum/ballot/any/broadcast/shuffle` | ✅ in use | warp-aggregated reductions; best-split argmax in a plane |
+| **Runtime-bound loops** | `for i in 0..n {}`, `while i < n {}`, runtime `n` | ✅ `partition.rs:346`, `subtract.rs:48`, `histogram.rs:810` | **data-dependent loop bounds inside a kernel work** (answers Q1) |
+| comptime specialization | `#[comptime] flag`, `#[cube(launch)]` / `launch_unchecked` | ✅ in use | feature-gated kernel variants |
+| Capability probe | `client.features().supports_type(f64)`, `.features().plane.contains(Plane::Ops)`, `.properties().atomic_type_usage(...)`, `.properties().hardware.plane_size_max` | ✅ `runtime.rs:108-130` | backend dispatch (f64 vs u64-fixed; plane size) |
+| Device-resident state | `cubecl::server::Handle` cached in `RefCell` across launches | ✅ `ResidentBins`, `resident_pool` (lib.rs:2009-2051) | **holds the whole growth-loop state on device** (answers Q4) |
 
-| Technology | Version | Purpose | Boundary pattern |
-|------------|---------|---------|------------------|
-| `thiserror` | `2.0.18` | Structured domain errors at library/crate boundaries | One `#[derive(Error)]` enum per crate (e.g. `DatasetError`, `BoostingError`, `BackendError`). `2.x` is current and stable; no API change needed vs 1.x for typical use. |
-| `anyhow` | `1.0.102` | Ergonomic propagation in app/test/binding layers | Use in the oracle harness, examples, and `main`. At the PyO3 boundary, convert your `thiserror` enums into `PyErr` (impl `From<MyError> for PyErr`) — do **not** leak `anyhow::Error` across the FFI boundary. |
+## The five capability questions, answered head-on
 
-### Testing / Oracle / Benchmarks
+### Q1 — Device-side dynamic control flow & data-dependent loop bounds: **FEASIBLE, already used**
+cubecl 0.10.0 lowers ordinary Rust `for i in 0..n` / `while i < n` (runtime `n`) and runtime `if` into device control flow; the project already ships such kernels (`subtract.rs:48` `while i < n`, `histogram.rs:810` `while c < lds`, `partition.rs:346` `for i in 0..n`). `#[unroll]` is opt-in for comptime-known bounds; without it, bounds stay dynamic. **Verdict: data-dependent intra-kernel loops are fine.** Caveat: divergent data-dependent branches cost warp divergence (the project's "don't chase divergence" gate notes it's cleanly measurable but off the dominant path) — design frontier kernels branch-light, mirroring the reference's bit-vector partition.
 
-| Technology | Version | Purpose | Why Recommended |
-|------------|---------|---------|-----------------|
-| `proptest` | `1.11.0` | Property-based testing (binning invariants, split-gain monotonicity, serialization round-trip) | Standard Rust property tester. Use to fuzz Dataset construction and model-format round-trips against invariants. |
-| `criterion` | `0.8.2` | Statistical benchmarks (histogram build, split scan, predict) | Standard. Bench CPU vs ROCm backends; track regressions. |
-| `approx` | latest 0.5.x | `assert_abs_diff_eq!` with `epsilon = 1e-12` | The literal oracle assertion macro. Cleaner than hand-rolled tolerance checks. |
-| Oracle harness → see below | — | Compare Rust output vs real C++ LightGBM at 1e-12 | **Recommended approach: shell out to the official Python `lightgbm` package** (or the CLI) to generate reference outputs/models, stored as fixtures, then compare. See rationale below. |
+### Q2 — Persistent / megakernel vs host launches: **host launches are correct, not a limitation**
+cubecl 0.10.0 exposes **no persistent-kernel / cooperative-grid-launch API**, and you do **not** need one: the reference `CUDASingleGPUTreeLearner` is itself host-driven with per-step launches. The current ~8,570-launches/train problem is **not** "host drives the loop" — it is "host drives the loop **per-feature, per-leaf, with histogram read-back**". The fix is **fewer, whole-frontier launches over resident state**, not a megakernel. **Verdict: keep the host growth loop; collapse per-feature/per-leaf launches into whole-frontier kernels. Do NOT attempt a single device-resident megakernel** — unsupported in 0.10.0 and unnecessary.
 
-**Oracle invocation — recommended approach (in priority order):**
+### Q3 — No global barrier; scratch; atomics; inter-workgroup sync: **multiple-launches idiom (matches reference)**
+Confirmed: cubecl 0.10.0 has `sync_cube()` (intra-cube only) and **no grid-wide barrier / cooperative-groups sync**. The idiom is the reference's: **device-resident state in `Handle`s persists across launches, and a kernel boundary IS the grid barrier.** Inter-workgroup reductions (leaf sums, prefix-sum offsets for the partition scatter) follow the reference — a block-level reduce kernel writes partials, a second small kernel combines them (`cuda_data_partition.cu` `AggregateBlockOffsetKernel0/1`). Device scratch = extra `Handle`s allocated once and reused. u32/u64 atomics: supported on CUDA and HIP. **Verdict: feasible; architecture is "resident state + a short DAG of launches per growth step."**
 
-1. **Fixture-based via Python `lightgbm` (RECOMMENDED).** In a `build.rs`-free test setup, run the real `lightgbm` PyPI package (the C++ lib under ctypes) to train models and dump predictions + model text files into `tests/fixtures/`. Rust tests load the fixtures and assert ≤ 1e-12. *Why:* decouples the oracle from the C++ build, gives reproducible golden files, and the Python package is the canonical reference API you're mirroring anyway.
-2. **Shell out to the `lightgbm` CLI** for cases needing exact CLI/config-file behavior. Capture stdout/model files; compare. *Why:* avoids FFI complexity; the CLI is a stable text interface.
-3. **FFI to `lib_lightgbm.so` via `bindgen`/`cc`** — *only if* you need to probe internal intermediate values (e.g. raw histogram sums) that neither the CLI nor Python expose. *Why last:* requires building the C++ lib (CMake ≥ 3.28, vendored submodules), adds a heavy native build dependency to the test pipeline, and the public surface usually suffices. Reserve for deep-dive parity debugging, not the default loop.
+### Q4 — Can the resident-handle pattern hold the whole growth-loop state? **YES — already proven, just extend it**
+The backend already caches device state across launches via interior-mutable `Handle`s: `ResidentBins` (binned dataset, uploaded once) and `resident_pool: RefCell<Vec<Option<Handle>>>` (per-leaf histogram pool mirror). The reference's on-device state is a small set of arrays — `CUDALeafSplitsStruct` (per-leaf sum_grad/sum_hess/data-start/count/best-split) + a `data_index_to_leaf_index` map + `data_indices` ordering + the histogram pool. **All of these are just more resident `Handle`s in the same `GpuBackend<R>` struct.** **Verdict: feasible with the existing pattern. The stack addition is a `ResidentGrowthState` (Handles for the data→leaf map, leaf-splits, data-index ordering) alongside `resident_bins`/`resident_pool`, populated once per tree and mutated in place by kernels.** Only tiny split-decision scalars are read back per step — use the idiomatic batched `client.read(vec![h])` (the memory note flags the per-handle N-read loop as a launch-bound anti-pattern).
 
-### Serialization — LightGBM Model Text Format
+### Q5 — cubecl-cuda vs cubecl-hip asymmetries that matter: **f64 is the big one**
 
-| Technology | Version | Purpose | Why Recommended |
-|------------|---------|---------|-----------------|
-| **Hand-written parser/writer** | n/a (build it) | Read/write LightGBM's `.txt` model format (and predict identically from a C++-trained model) | The model format is a **bespoke line-oriented key=value + per-tree block format**, not JSON/serde. C++ writes it manually in `gbdt_model_text.cpp`/`tree.cpp`. You must reproduce field order, float formatting, and precision exactly. serde cannot model this; write an explicit parser/serializer. |
-| `serde_json` | 1.x | The *separate* JSON dump (`dump_model`) | LightGBM also offers a JSON model dump (the C++ uses vendored `json11`). If you implement that, `serde_json` is fine since JSON structure is well-defined. The primary `.txt` format is the parity-critical one. |
-| Float formatting | — | Match C++ `%.17g`-style output | Parity of the *written* model requires matching C++'s float-to-string. Rust's default `{}`/`ryu` formatting differs from C++ `printf`. Plan a dedicated float-formatting routine (likely `%.17g` via a `format!`-equivalent) validated against fixtures. **Flagged as a real pitfall.** |
-
-### Development Tools
-
-| Tool | Purpose | Notes |
-|------|---------|-------|
-| `cargo` workspace | Multi-crate layout | Crate-per-responsibility: `lgbm-core` (Dataset/Bin), `lgbm-boosting` (GBDT/DART/RF/GOSS), `lgbm-treelearner`, `lgbm-objective`, `lgbm-metric`, `lgbm-backend` (CubeCL), `lgbm-io` (model text), `lgbm-py` (PyO3). |
-| `Cargo.lock` (committed) | Pin transitive deps | **Mandatory** given CubeCL alpha churn. Commit it for the lib too (not just bins). |
-| `cargo-nextest` | Faster test runs for the large oracle suite | Optional but recommended for fixture-heavy suites. |
-| ROCm toolkit | HIP backend builds/tests | `cubecl-hip` requires a local ROCm/HIP install to compile+run the AMD path. CI must have a ROCm GPU (matches the project's "tests validated on local ROCm GPU" constraint). |
+| Axis | cubecl-hip (gfx1100, local) | cubecl-cuda (NVIDIA, Kaggle) | Action |
+|------|------------------------------|------------------------------|--------|
+| **f64** | `has_f64 == false` → already off the f64 kernel | **`has_f64 == true`** → `ReducePath::reduce_type()` would pick the f64 anchor kernel | **CRITICAL: the new on-device build must NOT use the `has_f64` f64 kernel on CUDA.** Consumer NVIDIA f64 = 1/32 f32; spike-052 measured the f64 fused kernel **5.4× slower** on real NVIDIA. Keep the **u64 fixed-point** build (spike-018). The `has_f64`-keyed `ReducePath` is a foot-gun — the CUDA learner path must select the integer build explicitly, not inherit the anchor's f64 reduce type. |
+| **Plane/warp size** | wave32 (`plane_size_max == 32`) | warp = 32 | Symmetric at 32; already parameterized via `plane_size_max`. Don't hardcode. |
+| **u64/i64 atomics** | supported | supported | Symmetric — fixed-point build path is portable. |
+| **f32 atomics** | supported | supported | Symmetric. (WGSL/wgpu lacks them — out of scope, documented.) |
+| **Streams / async overlap** | single default stream per client | reference uses 4 streams | **VERIFY at plan time** whether cubecl 0.10.0 exposes multiple streams; if not, phase overlap is unavailable and the win comes purely from launch-count reduction (still the dominant lever per spike-054). Treat multi-stream overlap as a *stretch*, not a dependency. |
 
 ## Installation
 
-```toml
-# Cargo.toml (workspace root or lgbm-backend crate)
-[dependencies]
-# Compute — pin exactly (alpha, fast-moving). Pick features per build.
-cubecl = { version = "=0.10.0", default-features = false }
-
-# Numeric / interop
-bytemuck   = "1"
-ndarray    = "0.17.2"   # only at the NumPy boundary
-
-# Error handling
-thiserror  = "2.0.18"
-anyhow     = "1.0.102"  # app/test/binding layers only
-
-# Serialization (JSON dump path only; .txt format is hand-written)
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[features]
-# Backend selection is COMPILE-TIME via features that forward to cubecl.
-cpu  = ["cubecl/cpu"]
-rocm = ["cubecl/hip"]      # AMD ROCm — alias of cubecl's `hip` feature
-cuda = ["cubecl/cuda"]     # optional / dev convenience, not the mandated target
-wgpu = ["cubecl/wgpu"]     # NOT for the f64 oracle path — see warnings
-
-[dev-dependencies]
-proptest  = "1.11.0"
-criterion = "0.8.2"
-approx    = "0.5"
-```
-
-```toml
-# lgbm-py/Cargo.toml (Python bindings crate)
-[dependencies]
-pyo3  = { version = "0.28.3", features = ["extension-module", "abi3-py39"] }
-numpy = "0.28.0"          # MUST track pyo3 minor version
-```
-
-```toml
-# pyproject.toml
-[build-system]
-requires = ["maturin>=1.13,<2.0"]
-build-backend = "maturin"
-```
-
+No new packages. Build the CUDA backend with the existing feature:
 ```bash
-# Python dev loop
-pip install maturin==1.13.3
-maturin develop --release
+# local ROCm parity gate
+cargo test -p oracle-harness -p lgbm-treelearner -p lgbm --features rocm
+# CUDA backend compile (real-CUDA validation is via the Kaggle wheel, user boomvector)
+cargo build -p lgbm-compute --features cuda
 ```
-
-## Backend Selection: How It Works (compile-time, with a runtime-generic core)
-
-CubeCL backends are selected at **compile time via Cargo features** (`cpu`, `hip`/`rocm`, `cuda`, `wgpu`). There is no single binary that flips backends purely at runtime *by default*. The idiomatic pattern:
-
-- Write all kernels and host code **generic over the `Runtime` trait**: `fn build_histogram<R: Runtime>(client: &ComputeClient<R::Server, R::Channel>, ...)`.
-- Each enabled feature gives you a concrete runtime type (`CpuRuntime`, `HipRuntime`, `CudaRuntime`, `WgpuRuntime`).
-- To support "switchable at runtime," compile **multiple** runtimes in (enable several features) and `match` on a user config enum that dispatches to the monomorphized generic function per backend. This satisfies the project's "feature flag and/or runtime configuration" requirement: features gate which backends are *available*; a runtime enum picks among the compiled-in ones.
-
-`Plane` API surface (warp/subgroup ops), confirmed via Context7:
-- `plane_sum(x)` → CUDA `warpReduceSum` / HIP `__shfl`-based reduce / wgpu `subgroupAdd`.
-- Feature-gate at runtime with `client.features().plane.contains(Plane::Ops)` before using plane ops; fall back to a scalar loop otherwise (CPU has `PLANE_DIM == 1`).
-- Use `#[comptime] use_plane: bool` to monomorphize plane vs non-plane kernel variants without GPU-side branching.
 
 ## Alternatives Considered
 
 | Recommended | Alternative | When to Use Alternative |
 |-------------|-------------|-------------------------|
-| Custom columnar/binned store | `ndarray` `Array2` as core store | Never for the bin store — can't bit-pack. Fine as a *prediction input* adapter only. |
-| `cubecl-hip` (`hip` feature) for ROCm | `cubecl-wgpu` (Vulkan on AMD) | Only if you needed a portable Vulkan path AND could tolerate **no f64** — disqualified by the 1e-12 contract. HIP is the correct ROCm path. |
-| f64 accumulators | f32 accumulators | Never for the oracle path; f32 cannot hold 1e-12 parity on summed histograms. f32 only where C++ stores f32 (raw gradient/label storage). |
-| Hand-written `.txt` model parser | serde + a derive | Never — format isn't serde-shaped; field order/float formatting are parity-critical. |
-| Python-`lightgbm` fixtures for oracle | FFI to `lib_lightgbm.so` | Use FFI only to inspect internal intermediates not exposed by Python/CLI. |
-| `pyo3` + `numpy` lockstep | manual ctypes (like upstream) | Upstream is ctypes-over-C-ABI; we have no stable C ABI in v1, so PyO3 over the Rust API is correct. |
+| Host-driven loop + whole-frontier resident kernels (mirror reference) | Single persistent megakernel with device-side growth loop | **Never on cubecl 0.10.0** — no cooperative-grid/persistent-kernel API, and no grid barrier. Revisit only if a future cubecl exposes cooperative launch AND profiling shows launch latency still dominates after frontier-batching. |
+| u64 fixed-point on-device histogram build | f64 histogram build on CUDA | Never on consumer NVIDIA (1/32 f64). Only the cubecl-cpu anchor uses f64. |
+| Extend `GpuBackend<R>` resident state + one coarse `grow_one_tree_on_device` method | A separate `CudaOnDeviceLearner` bypassing the `Backend` trait | If the fine-grained per-leaf `Backend` ops become a straitjacket. Preferred: add a coarse per-tree trait method with a default impl that falls back to today's per-leaf orchestration (keeps CPU/ROCm byte-unchanged), and a `GpuBackend<R>` override that runs the resident frontier loop. |
+| Bit-vector partition + block-prefix-sum scatter (reference design) | The current host-routed `prefers_host_partition` path | Keep host-routed partition for **ROCm** (spike-035: shared-DDR5 APU makes the device round-trip pure overhead). For **CUDA discrete PCIe**, on-device partition is the milestone's point (eliminates the host round-trip the launch-bound analysis blames). |
 
-## What NOT to Use
+## What NOT to Use / NOT to Attempt
 
 | Avoid | Why | Use Instead |
 |-------|-----|-------------|
-| Raw CUDA / OpenCL / HIP C++ kernels | Project mandate excludes them; defeats portability | CubeCL kernels (`#[cube]`) over the `Runtime` trait |
-| `cubecl-wgpu` for the ROCm oracle path | wgpu/WebGPU lacks reliable f64; can't meet 1e-12 | `cubecl-hip` (`hip`/`rocm` feature) |
-| `cubecl 0.11.x` from the book examples | Not published on crates.io as of 2026-06-05 — book runs ahead of registry | `cubecl =0.10.0` (pinned) |
-| `pyo3 0.28.0` / `0.28.1` | **Yanked** on crates.io | `pyo3 0.28.3` (or ≥ 0.28.2) |
-| Mismatched `numpy` / `pyo3` minors | rust-numpy is built against a specific pyo3 minor; mismatch = compile errors | Keep both on `0.28.x` |
-| serde for the `.txt` model format | Format is bespoke line-oriented; serde can't reproduce field order/float formatting | Hand-written parser/writer |
-| f32 histogram accumulation | Breaks 1e-12 parity (non-associative + precision loss) | f64 accumulators, fixed reduction order |
-| Unordered `plane_sum` for oracle reductions | Warp/subgroup add order is implementation-defined → non-deterministic LSBs | Fixed-order reduction matching C++; reserve plane ops for bit-stable results |
-| `anyhow::Error` across the PyO3 boundary | Loses typed error info; awkward `PyErr` mapping | `thiserror` enums with `impl From<E> for PyErr` |
+| f64 hot loops in new CUDA kernels | 1/32 f32 rate on consumer NVIDIA; spike-052 = 5.4× regression | u64 fixed-point accumulation (spike-018); convert once at the end |
+| Inheriting the `has_f64`-keyed `ReducePath` on CudaBackend for the new build | `has_f64 == true` on CUDA silently routes to the slow f64 kernel | Explicitly select the integer build for the on-device CUDA path |
+| A persistent/cooperative megakernel | Unsupported in cubecl 0.10.0; reference doesn't use one | Few large host-launched kernels over resident state |
+| Assuming a grid-wide barrier exists | cubecl 0.10.0 has only `sync_cube()` (intra-cube) | Kernel boundary = grid barrier; two-stage reduce kernels for cross-block sums |
+| Build-occupancy / row-partition `P` autotuning for CUDA | spike-053 refuted it on real NVIDIA (P=1 optimal) | Leave autotune ROCm-only |
+| `read`-per-handle loops in the readback | Memory note: N-read loop masks a launch-bound win | `client.read(vec![handles])` batched readback of the tiny split scalars |
+| `plane_match_any` | Codebase's own note: **absent in cubecl 0.10.0** (`histogram.rs:407`) | Manual `plane_ballot` + `plane_shuffle` leader-election loop (the shipped idiom) |
+| Reading histograms back to host per leaf | This (not "host loop") is the source of the ~8,570 round-trips | Keep histograms resident (`resident_pool` already does for ROCm); extend to the CUDA frontier build |
 
 ## Stack Patterns by Variant
 
-**If targeting the mandated ROCm parity test:**
-- Build with `--features rocm` (→ `cubecl-hip`), require a local ROCm toolkit + AMD GPU.
-- Force f64 accumulators; use fixed-order reductions, not raw `plane_sum`, for histogram/score sums.
-- Because CPU and HIP share the same `#[cube]` source, validate CPU parity first (cheaper), then HIP.
+**If matching the reference architecture (recommended):**
+- Host runs the leaf-wise best-first loop; per step it launches: (1) whole-frontier histogram build into the resident pool (u64 fixed-point), (2) histogram-subtract for the larger child, (3) frontier best-split argmax kernel, (4) bit-vector partition + block-prefix-sum + scatter updating the resident data→leaf map. Read back only the winning split scalars.
+- Because cubecl has no grid barrier and no persistent kernel, and because this is exactly what the launch-bound analysis (spikes 051–054) prescribes.
 
-**If building the CPU reference path:**
-- Build with `--features cpu` (→ `cubecl-cpu`). `PLANE_DIM == 1` means plane kernels run scalar — a clean, deterministic reference to compare the GPU path against.
+**If multi-stream overlap is exposed in cubecl 0.10.0:**
+- Overlap partition (stream A) with the next leaf's build prep (stream B), as the reference does with `cuda_streams_[0..3]`.
+- Treat as stretch — the proven win is launch-count reduction, which is stream-independent.
 
-**If you need both backends switchable in one binary:**
-- Enable `cpu` + `rocm` features together; dispatch via a runtime `Backend` enum that calls the same `Runtime`-generic kernels.
-
-**If shipping Python wheels:**
-- Use `abi3-py39` for a single wheel across CPython 3.9+ (matches upstream's broad version support). `maturin build --release`.
+**If the per-leaf `Backend` trait becomes a straitjacket:**
+- Add a single coarse `grow_one_tree_on_device(...)` trait method, default impl = existing per-leaf orchestration (CPU anchor + ROCm host-routed paths byte-unchanged), `GpuBackend<R>` override = resident frontier loop. Mirrors the existing "default impl = byte-unchanged CPU path, GPU overrides" seam discipline.
 
 ## Version Compatibility
 
-| Package A | Compatible With | Notes |
-|-----------|-----------------|-------|
-| `cubecl =0.10.0` | `cubecl-hip` / `cubecl-cpu` / `cubecl-cuda` / `cubecl-wgpu` 0.10.0 | Forwarded via `cubecl` features; keep all CubeCL crates on the **same exact** version. |
-| `pyo3 0.28.x` | `numpy 0.28.0` | **Lockstep minor** required. |
-| `pyo3 0.28.x` | `maturin 1.13.x` | maturin 1.x supports current pyo3; `requires = "maturin>=1.13,<2.0"`. |
-| `proptest 1.11.0` | rustc ≥ 1.85 | Edition 2024 implies a new-enough toolchain. |
-| `numpy 0.28.0` | rustc ≥ 1.83 | Satisfied by edition-2024 toolchain. |
-| `thiserror 2.0.18` | `anyhow 1.0.102` | Independent; standard pairing, no conflict. |
+| Component | Pinned | Notes |
+|-----------|--------|-------|
+| `cubecl` + all sub-crates (`-cuda/-hip/-cpu/-core/-runtime`) | 0.10.0 (lockstep) | All cubecl crates move together; do not bump one. |
+| `cubecl-hip-sys` | 7.1.5280200 | ROCm-only; transitive + promoted optional. Irrelevant to CUDA. |
+| Rust edition | 2024 | Workspace-wide; unchanged. |
 
-## Determinism / 1e-12 Oracle — Explicit Callouts
+## Open items to verify at plan time (do not assume)
 
-- **Width:** f64 for every accumulation (histogram bins, gradient/hessian sums, leaf values, raw scores). Store raw gradients/labels at the C++ width (`float` by default per `meta.h`) so binning/quantization matches before accumulation.
-- **Order:** FP addition is non-associative. 1e-12 parity requires the *same addition order* as C++. On GPU this means avoiding implementation-defined warp/atomic reduction orders. Prefer deterministic tree-reductions with a fixed traversal, or replicate C++'s exact accumulation sequence. The project's own "bit-deterministic reductions" requirement is the correct framing — design it in, don't retrofit.
-- **f64 on GPU:** CUDA and HIP support f64 in hardware (slower, but present). **wgpu does not reliably** — a structural reason ROCm must use `cubecl-hip`. Verify f64 availability at runtime via `client.properties().feature_enabled(Feature::Type(Elem::Float(FloatKind::F64)))` before launching f64 kernels.
-- **Plane ops:** Safe for *count/ballot* style results that are order-independent; unsafe for *summation* where LSBs depend on order. Gate behind a determinism review per kernel.
-- **Model-format float formatting:** Matching C++'s `%.17g`-style text output is a parity surface in its own right — Rust's default float formatting differs. Validate against fixtures.
-
-## CubeCL Version-Churn Risk (flagged for roadmap)
-
-- CubeCL is **officially alpha**; the README states "not all platforms support the same features" and the project is pre-1.0.
-- The book already references an unreleased `0.11.0`, so a breaking minor is likely imminent. **Mitigation:** pin `=0.10.0`, commit `Cargo.lock`, isolate ALL CubeCL usage behind the `lgbm-backend` crate's own trait so an upgrade touches one crate, and schedule a "CubeCL upgrade" spike per roadmap milestone boundary.
+1. **Multi-stream support in cubecl 0.10.0** — the reference uses 4 streams; if cubecl exposes only one default stream per client, phase-overlap is off the table (acceptable; launch-count reduction is the real lever). Verify against `cubecl::server`/client API before scoping overlap work.
+2. **Idiomatic readback of small scalar sets** — confirm `client.read(vec![h])` vs `read_one_unchecked` semantics for the per-step split-decision struct (memory note flags the N-read-loop anti-pattern; verify the batched form on cubecl-cuda).
+3. **Resident `Handle` in-place mutation/aliasing** — confirm a kernel can take the same `Handle` as both input and output (in-place data→leaf map update) under cubecl 0.10.0 aliasing rules, or whether double-buffering (ping-pong Handles) is required (the reference double-buffers the index map).
+4. **Per-leaf `Backend` trait vs a coarse per-tree method** — planner design decision; the coarse method is lower-risk for keeping the CPU bit-exact anchor untouched.
 
 ## Sources
 
-- crates.io API (verified 2026-06-05): `cubecl` 0.10.0 (2026-05-07, latest stable; prior were `0.10.0-pre.N`); `pyo3` 0.28.3 (0.28.0/0.28.1 yanked); `numpy` (rust-numpy) 0.28.0; `ndarray` 0.17.2; `proptest` 1.11.0; `criterion` 0.8.2; `thiserror` 2.0.18; `anyhow` 1.0.102 — HIGH
-- PyPI (verified 2026-06-05): `maturin` 1.13.3 — HIGH
-- Context7 `/tracel-ai/cubecl` — Plane API (`plane_sum`, `features().plane.contains(Plane::Ops)`), comptime feature specialization, `Feature::Type(Elem::Float(FloatKind::F16/F64))` runtime checks — HIGH
-- GitHub `tracel-ai/cubecl` `crates/cubecl/Cargo.toml` — feature→crate mapping: `cpu`→cubecl-cpu, `cuda`→cubecl-cuda, `hip`(alias `rocm`)→cubecl-hip, `wgpu`/`wgpu-spirv`(`vulkan`)/`wgpu-msl`(`metal`)→cubecl-wgpu — HIGH
-- GitHub `tracel-ai/cubecl` README support table — CUDA/HIP/wgpu/CPU all "supported"; project "in alpha" — HIGH
-- CubeCL book `installation.md` — install pattern; book example pins `0.11.0` (ahead of registry) — MEDIUM (book on `main`)
-- `.planning/codebase/STACK.md` — C++ reference: `score_t/label_t = float` default (double-accumulation), bespoke bin layout, json11/manual model text, Eigen for linear trees — HIGH (direct repo analysis)
-- f64-on-wgpu limitation — WebSearch + CubeCL platform notes; wgpu/WebGPU f64 gap is well established, exact CubeCL behavior not byte-verified — MEDIUM
+- `Cargo.lock` (lines 649-810) — cubecl 0.10.0 + all sub-crate versions, pinned — HIGH
+- `crates/lgbm-compute/src/lib.rs` (Backend trait + `GpuBackend<R>` resident state, lines 486-2300) — existing resident-Handle pattern and trait-default seam — HIGH
+- `crates/lgbm-compute/src/kernels/histogram.rs` + `runtime.rs:108-130` — verified cubecl 0.10.0 device primitives (`sync_cube`, atomics, plane ops, runtime loops) and the capability-probe API — HIGH
+- `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp`/`.cu`, `cuda_data_partition.cu`, `cuda_leaf_splits.hpp` — reference on-device architecture: host-driven, few large kernels, device-resident leaf-splits struct, 4 streams, two-stage cross-block reduce — HIGH
+- `.claude/skills/spike-findings-lightgbm_rs/references/cuda-architectural-launch-bound.md` (spikes 051–054, real-NVIDIA Kaggle) — launch-bound mechanism, f64-on-NVIDIA 5.4× penalty, occupancy refuted, on-device learner is the one lever — HIGH
+- MEMORY: GPU-is-spoofed-8CU-APU; spike-035 ROCm host-partition; `client.read(vec![h])` readback idiom — MEDIUM/HIGH
 
 ---
-*Stack research for: pure-Rust LightGBM port with CubeCL CPU/ROCm backend + Python bindings, 1e-12 oracle*
-*Researched: 2026-06-05*
+*Stack research for: CUDA on-device tree learner (v1.1 GPU training-speed milestone)*
+*Researched: 2026-06-28*
