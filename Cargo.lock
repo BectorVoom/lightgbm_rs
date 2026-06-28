@@ -2116,6 +2116,7 @@ dependencies = [
  "lgbm-treelearner",
  "mimalloc",
  "oracle-harness",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

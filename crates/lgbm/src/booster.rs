@@ -486,8 +486,15 @@ pub fn build_feature_columns_from_raw_with_config(
     // bins) for the facade — matching the in-memory sample path. The BinMapper
     // builders take care of scaling internally.
     let pre_filter = false;
-    let mut columns = Vec::with_capacity(num_features);
-    for j in 0..num_features {
+    // spike-050: each feature's BinMapper construction + bin assignment is INDEPENDENT,
+    // so bin all features in parallel (matches C++ LightGBM's OpenMP-over-features
+    // binning). Single-threaded this was ~614ms at 500k×50 — the dominant cost of the
+    // Python `fit()` raw→bin→train path (binning was the unattributed bulk of spike-049's
+    // "Python marshalling ~25%"; numpy→Vec<Vec> marshalling itself is only ~43ms).
+    // Order-preserving: `map(j).collect()` keeps `columns[j]` == feature j, and each
+    // BinMapper is per-feature deterministic (fixed `data_random_seed`) ⇒ BIT-EXACT vs
+    // the serial path. Env A/B: LGBM_PAR_BIN=0 forces the serial path.
+    let bin_feature = |j: usize| -> FeatureColumn {
         // Read the raw column as a CONTIGUOUS slice (O2 — no per-row gather; the
         // column-major store already lays feature j out contiguously).
         let column: &[f64] = corpus.column(j);
@@ -529,7 +536,7 @@ pub fn build_feature_columns_from_raw_with_config(
         // carried so a categorical split can rebuild its cat_threshold bitset.
         let bin_to_category = mapper.bin_2_categorical_.clone();
 
-        columns.push(FeatureColumn {
+        FeatureColumn {
             bins: BinColumn::new(bins, num_bin),
             num_bin,
             offset: offset_for_most_freq_bin(most_freq_bin),
@@ -543,8 +550,16 @@ pub fn build_feature_columns_from_raw_with_config(
             real_feature_index: j as i32,
             bin_type,
             bin_to_category,
-        });
-    }
+        }
+    };
+
+    let par = std::env::var("LGBM_PAR_BIN").map(|v| v != "0").unwrap_or(true);
+    let columns: Vec<FeatureColumn> = if par {
+        use rayon::prelude::*;
+        (0..num_features).into_par_iter().map(bin_feature).collect()
+    } else {
+        (0..num_features).map(bin_feature).collect()
+    };
     Ok(columns)
 }
 
@@ -567,7 +582,14 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
     };
     let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
     let metrics = eval_metrics_for(first, config);
-    let features = build_feature_columns_from_raw_with_config(corpus, config)?;
+    // spike-050: the RAW→bin step on the Python/`train_raw` path (numpy fit). Wrap it
+    // in BINNING_NS so the phase_prof BUDGET attributes it — previously uninstrumented
+    // (the BINNING_NS wrap only covered the DenseCorpus path's build_feature_columns),
+    // which is why the Kaggle BUDGET showed binning=0 despite real per-feature binning.
+    let features = lgbm_treelearner::phase_prof::time(
+        &lgbm_treelearner::phase_prof::BINNING_NS,
+        || build_feature_columns_from_raw_with_config(corpus, config),
+    )?;
     train_inner_columns(
         config,
         corpus.num_data() as i32,

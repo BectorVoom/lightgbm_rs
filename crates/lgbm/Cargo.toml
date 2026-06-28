@@ -16,6 +16,9 @@ lgbm-boosting = { path = "../lgbm-boosting" }
 # (the trait/types + the CPU anchor only — the facade names no cubecl runtime).
 lgbm-compute = { path = "../lgbm-compute" }
 thiserror = { workspace = true }
+# spike-050: feature-parallel raw-corpus binning (per-feature BinMapper build + bin
+# assignment are independent). Same version as the sibling compute/treelearner crates.
+rayon = "1.10"
 # Optional drop-in global allocator (parity-neutral) for the bench harness and any
 # downstream binary that opts in via `--features mimalloc`. Off by default so the
 # library imposes no allocator on consumers.
