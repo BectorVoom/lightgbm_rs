@@ -253,7 +253,7 @@ perf/default-on rollout (the DoD) is last.
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 14. Scaffold + Oracle (Slice 0) | v1.1 | 3/3 | Complete   | 2026-06-28 |
+| 14. Scaffold + Oracle (Slice 0) | v1.1 | 3/3 | Complete    | 2026-06-28 |
 | 15. Minimal On-Device Growth (Slice 1) | v1.1 | 0/? | Not started | - |
 | 16. On-Device Frontier Best-Split (Slice 2) | v1.1 | 0/? | Not started | - |
 | 17. On-Device Data Partition (Slice 3) | v1.1 | 0/? | Not started | - |

@@ -95,6 +95,8 @@ on-device path rejects an out-of-range bin with `BinIndexOutOfRange`.
 
 ### WR-03: Tie-aware comparator's `default_left` tie assertion is tautological — it can never fail
 
+**Status: RESOLVED (commit 9609099).** The tie guard now keys on `split_gain` (the one node-level field the strict structural body does NOT pin bit-equal) via `SPLIT_GAIN_TIE_TOL = 1e-3` rel — the Tree-level lift of the kernel_parity.rs:1597 gain near-tie. A `default_left` flip whose recorded gain gap exceeds tolerance now hard-fails (genuinely reachable-as-failing); the misleading doc-comment was corrected. Re-verification status: passed; SC#3 now at binding-quality tie-awareness.
+
 **File:** `crates/oracle-harness/tests/learner_parity.rs:2142-2188`
 **Issue:** `assert_on_device_tree_matches_cpu_anchor` first calls
 `assert_tree_structure_and_leaves`, which asserts the FULL vectors
