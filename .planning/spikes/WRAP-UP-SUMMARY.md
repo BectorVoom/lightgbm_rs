@@ -421,3 +421,31 @@ deferred divergence curiosities 036 happened to label "037/038".
 - Attribute the Python marshalling ~25% (numpy→corpus pyo3) — likely the next easy win.
 - The architectural on-device monolithic tree-learner (the 53% GPU-phases long-pole) —
   milestone-sized.
+
+---
+
+## Session 11 — 2026-06-28 (Python-side binning attribution + parallel-binning fix)
+
+**Spikes processed:** 1 (050)
+**Reference updated:** `cuda-discrete-gpu-bottleneck.md` (added the Python-side binning recipe)
+**Shipped:** spike-050 feature-parallel binning (in-spike, bit-exact)
+
+| # | Name | Verdict | Feature Area |
+|---|------|---------|--------------|
+| 050 | python-marshalling-binning | ✅ VALIDATED + SHIPPED | Discrete-CUDA attribution |
+
+### Key findings
+- spike-049's "Python marshalling ~25%" is actually **single-threaded raw→bin BINNING**
+  (624ms serial @500k×50); the numpy→`Vec<Vec<f64>>` marshalling is only **43ms** (a
+  non-issue). The binning was hidden as `binning=0` because `train_raw`'s bin step was
+  never `BINNING_NS`-wrapped (now fixed).
+- **SHIPPED feature-parallel binning** (`into_par_iter` over features) — 6.5× (624→96ms
+  @16 cores), bit-exact vs the C++ golden (`raw_bin_train_matches_cpp_golden`).
+  `LGBM_PAR_BIN=0` serial gate. Reusable lesson: match C++'s OpenMP-over-features for any
+  per-feature host loop.
+
+### Campaign status
+Two of the three non-kernel CUDA-wall chunks now CLOSED: metric eval 26%→0
+(quick-260628-f57), binning 25%→6.5× (spike-050). `in_learner_other` 15% is a diffuse
+dead-end (spike-049). **The only major lever left is the GPU histogram phases (53%) —
+the architectural on-device monolithic tree-learner (milestone-sized).**

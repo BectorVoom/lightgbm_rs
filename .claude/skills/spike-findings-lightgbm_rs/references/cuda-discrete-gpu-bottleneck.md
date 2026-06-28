@@ -70,6 +70,25 @@ LightGBM CUDA — and the dominant chunk was NOT what the APU campaign predicted
   seeding, arg_max, hist-pool mgmt, tree finalization); root_fold/partition_new/
   scratch/CegbModel all negligible. **Do not scope a phase around `in_learner_other`.**
 
+## The Python-side 25% = single-threaded binning, not marshalling (spike-050, SHIPPED)
+The Python `fit()` path is `dense_any_to_rows` (numpy→`Vec<Vec<f64>>`) → `RawCorpus` →
+`lgbm::train_raw` → `build_feature_columns_from_raw_with_config` (raw→bin) → boosting loop.
+Measured at 500k×50 (host/CPU ⇒ local, no Kaggle):
+- numpy→`Vec<Vec<f64>>` marshalling = **43ms** — a NON-ISSUE, do not chase it.
+- raw→bin **serial = 624ms** — the real cost (was hidden as `binning=0`: the `BINNING_NS`
+  wrap only covered the DenseCorpus path, not `train_raw`; spike-050 wrapped it).
+- **FIX (shipped, bit-exact): feature-parallel binning** — the per-feature BinMapper
+  build + assignment are independent (C++ bins OpenMP-over-features), so:
+  ```rust
+  let bin_feature = |j: usize| -> FeatureColumn { /* build BinMapper(col j) + assign */ };
+  let columns = if par { (0..num_features).into_par_iter().map(bin_feature).collect() }
+                else   { (0..num_features).map(bin_feature).collect() };
+  ```
+  Order-preserving + fixed `data_random_seed` per feature ⇒ **bit-exact** (proved by
+  `raw_bin_train_matches_cpp_golden`). **6.5× (624→96ms @16 cores)**; `LGBM_PAR_BIN=0`
+  serial gate. Lesson: any per-feature host loop (binning, column transforms) should be
+  rayon-parallel — match C++'s OpenMP-over-features.
+
 ## Constraints
 - Kaggle CLI auth = ACCESS_TOKEN at `/home/user/.kaggle` (no kaggle.json file).
 - Kernel output download pulls the whole committed tree (slow, 2+ min); the log is
@@ -77,6 +96,7 @@ LightGBM CUDA — and the dominant chunk was NOT what the APU campaign predicted
 - A code change must be pushed to GitHub `master` before the kernel clones it.
 
 ## Origin
-Synthesized from spikes: 046, 048, 049 (047 skipped — Kaggle gave real numbers directly).
-Shipped fix: quick-260628-f57. Sources in: sources/046-python-path-phase-prof/,
-sources/048-kaggle-cuda-confirm/, sources/049-in-learner-other-attribution/.
+Synthesized from spikes: 046, 048, 049, 050 (047 skipped — Kaggle gave real numbers
+directly). Shipped fixes: quick-260628-f57 (metric eval), spike-050 (parallel binning).
+Sources in: sources/046-python-path-phase-prof/, sources/048-kaggle-cuda-confirm/,
+sources/049-in-learner-other-attribution/, sources/050-python-marshalling-binning/.
