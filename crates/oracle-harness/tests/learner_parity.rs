@@ -2405,4 +2405,45 @@ mod hip {
         let anchor = cpu_anchor_tree(&features, &g, &h, num_leaves, max_depth);
         assert_on_device_tree_matches_cpu_anchor(&tree, &anchor, "slice0-host-fallback");
     }
+
+    /// SC#2 / ODL-01 — the Plan-01 seam is a PROVABLE no-op so the default route is
+    /// untouched. On BOTH `CpuBackend` and a `GpuBackend` (`RocmBackend`):
+    /// (a) the `on_device_growth_supported()` discriminator is `false` (Slice 0, no
+    ///     kernel — Pitfall 2), and
+    /// (b) a direct `grow_tree_on_device(..)` returns `Ok(None)`.
+    /// The `GpuBackend<R>` `Ok(None)` is its EXPLICIT no-op override (not merely
+    /// inherited) — the proof the production fork's `Some`-branch is genuinely
+    /// unexercised until Slice 1. No env var is set, so no FORCE_ENV_LOCK is needed.
+    #[test]
+    fn learner_parity_on_device_seam_is_provable_noop_slice0() {
+        let (_features, g, h) = spine_corpus(256, 4, 16);
+        let num_leaves = 7i32;
+        let max_depth = -1i32;
+
+        let cpu_backend = CpuBackend;
+        let gpu_backend = RocmBackend::with_resident(false);
+
+        // (a) discriminator false on both backends.
+        assert!(
+            !cpu_backend.on_device_growth_supported(),
+            "CpuBackend on_device_growth_supported must be false in Slice 0"
+        );
+        assert!(
+            !gpu_backend.on_device_growth_supported(),
+            "GpuBackend on_device_growth_supported must be false in Slice 0 (one generic \
+             GpuBackend<R> impl shared by ROCm/CUDA/WGPU; no kernel until Slice 1)"
+        );
+
+        // (b) the seam is a no-op (Ok(None)) on both — CpuBackend via the trait
+        // default, GpuBackend<R> via its explicit override.
+        assert!(
+            matches!(cpu_backend.grow_tree_on_device(&g, &h, num_leaves, max_depth), Ok(None)),
+            "CpuBackend grow_tree_on_device must be a no-op (Ok(None)) in Slice 0"
+        );
+        assert!(
+            matches!(gpu_backend.grow_tree_on_device(&g, &h, num_leaves, max_depth), Ok(None)),
+            "GpuBackend grow_tree_on_device explicit override must be a no-op (Ok(None)) \
+             in Slice 0 — proves the default route is provably untouched"
+        );
+    }
 }
