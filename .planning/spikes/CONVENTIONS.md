@@ -372,3 +372,19 @@ cuda/wgpu launch; the CPU anchor subtract is NATIVE (`subtract_histograms_cpu_na
 untouched (merge gate safe). But subtract is a non-dominant phase (034: build dominates wide,
 partition 30–38% launch-bound) on an APU that loses to CPU ⇒ ROCm-parity-track, bounded e2e.
 Reference harnesses: `spike041_vector_subtract_ab.rs`, `spike042_…`, `spike043_…`, `spike044_vector_dequant_ab.rs`, `spike045_coalesced_build_vector_ab.rs`.
+
+## Real-discrete-GPU profiling (Kaggle) — spikes 046/048/049
+
+The local "GPU" is a spoofed 8-CU APU; **Kaggle is the only real-discrete-NVIDIA
+measurement path** (cubecl-cuda via `maturin build --release -F cuda`). Conventions:
+- **Profiling the Python path requires the spike-046 hook** — `phase_prof::dump("train")`
+  in `booster.rs::train_inner_columns_full` (env-gated `LGBM_PHASE_PROF=1`, parity-neutral).
+  Without it the shipped wheel emits zero attribution. The `dump()` was historically
+  bench-examples-only.
+- **Kaggle CLI** is authenticated as `boomvector` (ACCESS_TOKEN at `/home/user/.kaggle`,
+  no kaggle.json). Kernel `boomvector/lgb-rs-cuda-bench` git-clones master, so push code
+  first. Harness scripts live in `spikes/046-python-path-phase-prof/`.
+- **Absolute walls are NOT cross-session comparable** (Kaggle assigns T4/P100/T4×2 — saw
+  17/20/11s across sessions). Trust **in-session A/B deltas** only.
+- **Attribute backend-independent (CPU) components LOCALLY** — the `spike046_validate`
+  example takes `LGBM_VALIDATE_ROWS/ITERS`; only true GPU-device costs need a Kaggle cycle.

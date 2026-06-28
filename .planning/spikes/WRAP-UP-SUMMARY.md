@@ -381,3 +381,43 @@ deferred divergence curiosities 036 happened to label "037/038".
 
 ### Commits (session 9)
 - 037: `a94c8f3`; 038: `e33a04c`; 039: `9731a17`; 040: `1e397be`; CONVENTIONS: `8803d9f`.
+
+---
+
+## Session 10 — 2026-06-28 (Vector<P,N> frontier + first real-discrete-CUDA attribution)
+
+**Spikes processed:** 8 (041, 042, 043, 044, 045, 046, 048, 049; 047 skipped)
+**New references:** `vector-simd-histogram-kernels.md`, `cuda-discrete-gpu-bottleneck.md`
+**Shipped:** quick-260628-f57 (the metric-eval fix)
+
+| # | Name | Verdict | Feature Area |
+|---|------|---------|--------------|
+| 041 | line-feasibility-subtract | ✅ WON + SHIPPED (agx) | Vector<P,N> SIMD |
+| 042 | line-scan-pair-read | ❌ NULL | Vector<P,N> SIMD |
+| 043 | line-build-gradhess-input | ❌ NULL + wide regression | Vector<P,N> SIMD |
+| 044 | line-fixcompact-dequant | ⚠ feasible, ROI-bounded DON'T-WIRE | Vector<P,N> SIMD |
+| 045 | coalesced-build-vector | ❌ INVALIDATED (closes frontier) | Vector<P,N> SIMD |
+| 046 | python-path-phase-prof | ✅ VALIDATED (enabler) | Discrete-CUDA attribution |
+| 048 | kaggle-cuda-confirm | ✅ VALIDATED + SHIPPED fix | Discrete-CUDA attribution |
+| 049 | in-learner-other-attribution | ✅ VALIDATED (dead-end) | Discrete-CUDA attribution |
+
+### Key findings
+- **Vector<P,N> frontier CLOSED.** Rule: vectorize only memory-bound kernels where the
+  vectorized op covers the bottleneck. subtract WON (shipped agx); scan/build NULL
+  (dependent chain / permuted gather); dequant ROI-bounded; coalesced-rewrite invalidated.
+- **First real-discrete-CUDA attribution (Kaggle, the campaign was APU-only).** lgb_rs CUDA
+  ~5–6× official at 500k×50. Root cause #1 (26%, SHIPPED fix quick-260628-f57): host
+  per-iter training-metric eval (`booster.rs:1291 || valid.is_none()`, divergent from C++).
+  Confirmed metric 4489ms→0 on real hardware, parity-neutral.
+- **Post-fix wall map:** GPU hist phases 53% (architectural on-device-learner long-pole),
+  Python marshalling 25% (UNATTRIBUTED — next easy win), in_learner_other 15% (diffuse
+  DEAD END), rest 7%, metric 0%.
+- **Refuted on real hardware:** per-leaf sync-floor (286ms/1.7%), route-narrow-to-CPU
+  (CUDA beats CPU on Kaggle's few vCPUs), resident_reset (0.3ms/100 trees).
+- **Reusable:** spike-046 `phase_prof::dump("train")` hook makes the Python path
+  observable; Kaggle CLI harness in `spikes/046-*/`.
+
+### Open frontier (not yet spiked)
+- Attribute the Python marshalling ~25% (numpy→corpus pyo3) — likely the next easy win.
+- The architectural on-device monolithic tree-learner (the 53% GPU-phases long-pole) —
+  milestone-sized.
