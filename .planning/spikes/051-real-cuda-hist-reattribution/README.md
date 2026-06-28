@@ -131,7 +131,10 @@ drains at the **2890 scan syncs**, so `hist+split` conflates build-compute + sub
 sync-latency. The occupancy-*insensitivity* (Finding 1) disambiguates it: a compute-bound
 kernel on a big GPU would speed up with P; this one doesn't ⇒ it is **launch/sync-latency-bound**,
 not compute-throughput-bound. The narrow 50-feature shape makes each of the 8570 launches do
-tiny work, so per-launch dispatch + the 2890 round-trip syncs dominate. **And `fused=0`** —
+tiny work, so per-launch dispatch dominates. **[REFINED by spike-052: the readback SYNCS
+themselves are cheap (~0.14ms each, ~400ms total — `copack=0` doubles syncs for only +3.6%);
+the wall is the 8570 small SERIAL kernel launches (~0.72ms each), dependency-chained per node,
+NOT the syncs.]** **And `fused=0`** —
 the prototyped fusion (spike-024 sibling co-pack, `build_fix_scan` directly-built child) is
 **OFF on the production CUDA path**. Cutting launches/syncs via fusion (**spike-052**) is the
 real lever, and is testable next with existing toggles (`LGBM_SIBLING_COPACK=1`,
