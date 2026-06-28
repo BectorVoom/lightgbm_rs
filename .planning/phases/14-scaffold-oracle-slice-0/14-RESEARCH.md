@@ -349,7 +349,7 @@ assert_on_device_tree_matches_cpu_anchor(&tree, &anchor, "slice0-host-fallback")
 | A2 | Slice 0 keeps `on_device_growth_supported()` returning false on `GpuBackend<R>` (activation deferred to Slice 1) | Pitfall 2 / Open Q1 | If set true now, must verify ROCm/WGPU stay byte-unchanged via the env AND-gate (they do, but it widens the blast radius). |
 | A3 | The full bit-exact merge gate runs via `cargo test --workspace` (oracle-harness suites + per-crate tests) | Validation Architecture | If a narrower command is the canonical gate, the verification step name is wrong; verify with the planner/maintainer. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Should `on_device_growth_supported()` return true on `GpuBackend<R>` in Slice 0, or stay false until Slice 1?**
    - What we know: the discriminator is ANDed with `LGBM_CUDA_ON_DEVICE` (off by default), and the
@@ -358,6 +358,8 @@ assert_on_device_tree_matches_cpu_anchor(&tree, &anchor, "slice0-host-fallback")
      CUDA-specific without runtime-`R` discrimination.
    - Recommendation: **stay false in Slice 0** (no kernel to grow); exercise the seam via the oracle
      test's direct call + host-fallback. Flip to true (CUDA-only) in Slice 1 when a kernel lands.
+   - **RESOLVED (planning): stay false.** Adopted in Plan 14-01 Task 2b (`GpuBackend<R>` keeps
+     `on_device_growth_supported()` = false + `grow_tree_on_device` no-op override). Byte-safe under the env AND-gate.
 
 2. **Which lower-crate type carries the partition payload `P` (D-03 Option A)?**
    - What we know: `DataPartition` (treelearner) can't appear on `Backend`; `Tree` (model) can.
@@ -366,6 +368,9 @@ assert_on_device_tree_matches_cpu_anchor(&tree, &anchor, "slice0-host-fallback")
    - Recommendation: smallest additive type that the learner can turn into `DataPartition` in the fork;
      decide at plan time. In Slice 0 the seam returns `Ok(None)` so `P` is never constructed yet — only
      its *type* must be nameable.
+   - **RESOLVED (planning): named struct `LeafPartitionLayout` in `lgbm-dataset`** (fields mirror
+     `DataPartition`: `num_data:i32, indices:Vec<u32>, leaf_begin:Vec<i32>, leaf_count:Vec<i32>`).
+     Adopted in Plan 14-01 Task 1; `DataPartition::from_payload` reconstructs it in Plan 14-02.
 
 ## Environment Availability
 
