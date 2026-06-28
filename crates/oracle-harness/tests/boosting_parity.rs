@@ -148,6 +148,12 @@ fn multiclass_cell_builder(objective: &str) -> TrainingBuilder {
         .min_data_in_leaf(1)
         .boost_from_average(true)
         .num_class(MULTICLASS_NUM_CLASS)
+        // quick-260628-f57: training-metric eval_history is now opt-in (C++-faithful;
+        // booster.rs no longer force-evals it merely because there's no valid set). The
+        // capture generated per-round training multi_logloss, so request it explicitly —
+        // `assert_multi_logloss` reads the training `multi_logloss` history. Parity
+        // preserved: the goldens are unchanged.
+        .is_provide_training_metric(true)
         .seed(SPINE_SEED)
         .deterministic(true)
 }

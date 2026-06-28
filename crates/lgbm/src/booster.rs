@@ -1288,7 +1288,14 @@ fn train_inner_columns_full(
     );
 
     // eval history: training metrics (when is_provide_training_metric) + valid metrics.
-    let provide_train = config.is_provide_training_metric || valid.is_none();
+    // C++-faithful (quick-260628-f57): the training metric is computed ONLY when
+    // `is_provide_training_metric` is set, matching gbdt.cpp (default false ⇒ empty
+    // training history, even with no valid set). The old `|| valid.is_none()` clause
+    // forced a per-iter training-metric eval over all rows whenever there was no
+    // eval_set — a divergence from C++ AND ~26% of the CUDA train wall at 500k×50
+    // (spike-048). Callers that want training-metric history without a valid set must
+    // opt in via `is_provide_training_metric=true` (the C++ behavior).
+    let provide_train = config.is_provide_training_metric;
     let metric_freq = config.metric_freq.max(1);
     let mut train_eval_history: Vec<(String, Vec<f64>)> = metrics
         .iter()
@@ -1610,6 +1617,9 @@ mod tests {
             .min_data_in_leaf(1)
             .boost_from_average(true)
             .metric("l2,rmse")
+            // quick-260628-f57: training-metric history is now opt-in (C++-faithful),
+            // so request it explicitly (this test asserts training l2/rmse history).
+            .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
             .build()
@@ -1949,6 +1959,8 @@ mod tests {
             .min_data_in_leaf(1)
             .boost_from_average(true)
             .metric_freq(3)
+            // quick-260628-f57: opt in to training-metric history (now C++-faithful).
+            .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
             .build()
@@ -2221,6 +2233,8 @@ mod tests {
             .num_leaves(4)
             .min_data_in_leaf(1)
             .boost_from_average(false) // custom forces bfa OFF
+            // quick-260628-f57: opt in to training-metric history (now C++-faithful).
+            .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
             .build()
@@ -2290,6 +2304,8 @@ mod tests {
             .num_leaves(4)
             .min_data_in_leaf(1)
             .boost_from_average(false)
+            // quick-260628-f57: opt in to training-metric history (now C++-faithful).
+            .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
             .build()
