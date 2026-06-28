@@ -121,3 +121,28 @@ is confirmed on real NVIDIA hardware, parity-neutral to the trees.** `metric_fre
 is an immediate user-facing workaround; the durable fix is the `provide_train`
 change (with the test-contract caveat above).
 
+### FIX CONFIRMED end-to-end on the Python path (quick-260628-f57, kernel v7)
+
+After shipping the durable fix (commit `dd3e3be`, master), the CUDA wheel was
+rebuilt from master on Kaggle and re-run (`kaggle_confirm_fix.py`):
+
+```
+lgb_rs CUDA DEFAULT (metric_freq=1, FIX active): 11.309 s   metric_phase=0.000 ms
+lgb_rs CUDA metric_freq=200 (workaround)       : 11.227 s   metric_phase=0.000 ms
+default-vs-workaround delta: +0.082 s  (≈0)
+```
+
+- **`metric_phase=0.000ms` on the DEFAULT Python path** (was 4489ms run-v5 /
+  5359ms run-v6) — the per-iter training-metric eval is gone by default, matching
+  official LightGBM (empty `evals_result_` without `eval_set`).
+- **Default ≈ workaround (Δ 0.08s)** — the `metric_freq` workaround is no longer
+  needed; the fix delivers that win automatically.
+
+Chained proof: v6 showed *removing* the metric saves ~23%; v7 shows the shipped fix
+*removes it by default*. The ~23% CUDA win is now the default `LGBMClassifier.fit()`
+behavior. (v7's official-CUDA cell came back `nan` — the lean confirm script omitted
+the `USE_CUDA=ON` source-build fallback, so the image's CPU-only `lightgbm` errored
+on `device_type='cuda'`; the official reference is the run-v5 3.26s. Absolute walls
+are not cross-session comparable — Kaggle assigns different GPUs, 17/20/11s across
+v5/v6/v7 — so the in-session deltas above are the trustworthy evidence.)
+
