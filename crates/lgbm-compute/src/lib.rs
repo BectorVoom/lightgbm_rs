@@ -1215,6 +1215,69 @@ pub trait Backend {
                 .to_string(),
         })
     }
+
+    // ===================================================================
+    // ODL-01: CUDA on-device tree-learner seam (Phase 14 Slice 0).
+    //
+    // The additive `Backend` seam + discriminator that lets a backend grow an
+    // ENTIRE tree on-device and return the `(Tree, LeafPartitionLayout)` payload,
+    // bypassing the per-leaf host build/scan loop. In Slice 0 BOTH methods are a
+    // provable NO-OP on every backend: the discriminator defaults `false` and the
+    // seam defaults `Ok(None)` ("I did not grow it"), so the default CPU/ROCm tree
+    // path is byte-unchanged. Activation (a real kernel + a `true` discriminator)
+    // is Slice 1; the learner fork that consumes the seam is Plan 02.
+    // ===================================================================
+
+    /// Whether this backend can grow an entire tree ON-DEVICE (ODL-01).
+    ///
+    /// `false` (the default, mirroring [`resident_pool_supported`](Backend::resident_pool_supported))
+    /// means the learner's on-device eligibility gate (Plan 02) ANDs this in and
+    /// ALWAYS takes the byte-unchanged host/per-leaf path. [`CpuBackend`] inherits
+    /// the default. In Slice 0 `GpuBackend<R>` ALSO keeps `false`: that one generic
+    /// impl is shared by ROCm/CUDA/WGPU, so a `true` here would (wrongly) claim all
+    /// three support it — and no on-device kernel exists yet (activation is Slice 1).
+    fn on_device_growth_supported(&self) -> bool {
+        false
+    }
+
+    /// Grow an ENTIRE tree on-device and return its model + raw leaf-row layout (ODL-01).
+    ///
+    /// Returns `Ok(None)` = "I did not grow the tree on-device" — the caller falls
+    /// back to the standard host/per-leaf path. This is deliberately NOT a typed
+    /// `Err(NotSupported)`: D-03 keeps the default route error-noise-free, so an
+    /// unsupported backend is a quiet `None`, not an error the learner must filter.
+    ///
+    /// The args (`gradients`, `hessians`, `num_leaves`, `max_depth`) are the
+    /// forward-looking MINIMUM the learner already holds at the `train_inner` fork
+    /// point. Richer feature/bin inputs (the binned store, per-feature metadata)
+    /// arrive in Slice 1 as ADDITIVE parameters; this signature does not lock them out.
+    ///
+    /// The return type names ONLY lgbm-compute-reachable crates
+    /// (`lgbm_model::Tree` + `lgbm_dataset::LeafPartitionLayout`). It MUST NOT name
+    /// the treelearner crate's `DataPartition` — that would require importing
+    /// lgbm-treelearner here, which is the crate-cycle warning sign (treelearner →
+    /// compute → treelearner). The learner reconstructs its `DataPartition` from the lower-crate
+    /// `LeafPartitionLayout` payload in Plan 02.
+    ///
+    /// # cubecl-0.10 kernel checklist (Slice 1, when a real kernel lands here)
+    /// - NO global barrier across cubes — synchronize within a cube only.
+    /// - `Atomic<i64>` is broken on this cubecl — use u64 fixed-point atomics.
+    /// - `wrapping_add` is NOT a kernel intrinsic — avoid it in `#[cube]` code.
+    /// - a plane-sum reduction spans at most ONE plane width — no cross-plane sum.
+    /// - `launch_unchecked` is `unsafe` — uphold the launch-arg invariants by hand.
+    ///
+    /// # Errors
+    /// Returns [`ComputeError`] only once Slice 1 wires a real kernel that can fail
+    /// (device OOM, launch error). In Slice 0 it is infallible (`Ok(None)`).
+    fn grow_tree_on_device(
+        &self,
+        _gradients: &[f32],
+        _hessians: &[f32],
+        _num_leaves: i32,
+        _max_depth: i32,
+    ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
+        Ok(None)
+    }
 }
 
 /// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
@@ -2133,6 +2196,22 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
     // LGBM_ROCM_HOST_PARTITION=0 forces the old device round-trip for benching/rollback.
     fn prefers_host_partition(&self) -> bool {
         !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
+    }
+
+    // ODL-01 (Phase 14 Slice 0): explicit no-op override of the on-device
+    // tree-growth seam. `on_device_growth_supported` keeps the trait default
+    // `false` here (one generic GpuBackend<R> impl shared by ROCm/CUDA/WGPU — a
+    // `true` would claim all three; no kernel exists until Slice 1), and this
+    // override returns `Ok(None)` to PROVE (SC#2) the default tree path is
+    // provably untouched on the GPU backend, not merely inherited-by-default.
+    fn grow_tree_on_device(
+        &self,
+        _gradients: &[f32],
+        _hessians: &[f32],
+        _num_leaves: i32,
+        _max_depth: i32,
+    ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
+        Ok(None)
     }
 
     fn construct_histograms(

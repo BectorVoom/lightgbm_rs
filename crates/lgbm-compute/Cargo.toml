@@ -8,6 +8,11 @@ rust-version.workspace = true
 cubecl = { workspace = true, features = ["cpu"] }
 lgbm-core = { path = "../lgbm-core" }
 lgbm-dataset = { path = "../lgbm-dataset" }
+# lgbm-model path dep so the on-device tree-growth seam (`grow_tree_on_device`)
+# can name `lgbm_model::Tree` as its return type. VERIFIED acyclic: lgbm-model
+# depends only on lgbm-core + lgbm-dataset + thiserror (NOT on lgbm-compute), so
+# the lgbm-compute → lgbm-model edge introduces no crate cycle (D-03 Option A).
+lgbm-model = { path = "../lgbm-model" }
 thiserror = { workspace = true }
 rayon = "1.10"
 # rocm-only, optional: direct FFI to query the device's actual Compute Unit count
