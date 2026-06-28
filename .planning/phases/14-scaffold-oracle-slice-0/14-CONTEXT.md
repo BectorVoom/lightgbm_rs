@@ -52,6 +52,21 @@ selection (Slice 2), on-device partition (Slice 3), default-on rollout (Phase 19
   `train_inner`'s fork is `if let Some(t) = backend.grow_tree_on_device(..)? { return Ok(t) }`
   then falls through to the host path. `None` keeps the default path error-noise-free
   (preferred over a typed `Err(NotSupported)`).
+- **D-03-RESOLVED (2026-06-28, post-research + user decision — Option A):** The literal
+  `Result<Option<(Tree, DataPartition)>>` on the `Backend` trait is **INFEASIBLE** —
+  `DataPartition` lives in `lgbm-treelearner`, which already depends on `lgbm-compute`
+  (home of `Backend`), so naming it in a trait method creates a **circular crate
+  dependency** (RESEARCH.md §"D-03 Feasibility", `[VERIFIED]` from 3 Cargo.toml edges).
+  **Resolution (user-selected Option A):** the seam returns
+  **`Result<Option<(Tree, P)>>`** where `P` is a **lower-crate partition payload** — the
+  raw leaf-row index layout `DataPartition` already wraps, defined in `lgbm-core` or
+  `lgbm-dataset` (or plain `Vec<i32>` + leaf bounds). `lgbm-treelearner` reconstructs
+  `DataPartition` from `P` inside the `train_inner` fork. Add an `lgbm-model` dep to
+  `lgbm-compute` so `Tree` is nameable (acyclic — `lgbm-model` does not depend on
+  `lgbm-compute`). This honors D-01 (method on `Backend`), the `(tree, partition)` shape,
+  the `Ok(None)` default, and the additive-only constraint. **Planner:** pick the concrete
+  `P` type (recommend a named struct in `lgbm-core`/`lgbm-dataset` over bare `Vec<i32>`
+  for clarity); the exact seam signature cannot be written until `P` is named.
 
 ### Tie-aware `default_left` comparator timing
 - **D-04:** **Ship the tie-aware comparator NOW (dormant).** Slice 0 builds the full
