@@ -292,6 +292,18 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// `train_inner` via [`crate::resident_pool::fused_directly_built_eligible`]; `false`
     /// (default, ALWAYS on CpuBackend) takes the existing resident/host routing.
     fused_eligible: bool,
+    /// ODL-01 (Phase 14, D-05): whether THIS learner is eligible to grow whole
+    /// trees on-device. Computed ONCE at [`new`](Self::new) as
+    /// `backend.on_device_growth_supported() && cuda_on_device_env()` and read at
+    /// the TOP of `train_inner` to route the decide-once on-device fork. Unlike
+    /// [`resident_eligible`](Self::resident_eligible) (recomputed per train), this
+    /// is NOT recomputed in `train_inner` — on-device eligibility has no per-train,
+    /// size-dependent input the way resident does, so a per-train env re-read buys
+    /// nothing and adds a syscall per tree (D-05 INTENTIONAL divergence — do NOT
+    /// "normalize" this back into `train_inner`). ANDing the backend discriminator
+    /// means CpuBackend (false) — and GpuBackend<R> (false in Slice 0) — can NEVER
+    /// be eligible regardless of the env, so the host path is byte-unchanged.
+    on_device_eligible: bool,
     /// quick-260621-p9v (spike-014b lever): whether the per-train resident-bin device
     /// upload has already run THIS train. The binned columns are immutable for the whole
     /// train and `RocmBackend` is one instance per `train()` (its `resident_bins` cache
@@ -422,6 +434,16 @@ pub struct ColSamplerTrace {
     pub bynode_selected: Vec<Vec<i32>>,
 }
 
+/// ODL-01 (Phase 14, D-05): read the `LGBM_CUDA_ON_DEVICE` toggle ONCE at
+/// [`SerialTreeLearner::new`]. This is the INVERSE default of `autotune_enabled`
+/// (`!matches!(env::var(..), Ok("0"))`, ON unless `=0`): on-device growth is OFF
+/// unless the value is EXACTLY `"1"`. Any other value — unset, empty, `"0"`,
+/// `"true"`, malformed — yields `false`, guaranteeing the byte-unchanged merge
+/// gate when the env is unset (SC#1). No path/format/injection surface (T-14-02).
+fn cuda_on_device_env() -> bool {
+    matches!(std::env::var("LGBM_CUDA_ON_DEVICE").as_deref(), Ok("1"))
+}
+
 impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// Construct the learner over a `Backend` + its client and the gain/cap config.
     ///
@@ -458,6 +480,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             resident_eligible: false,
             // Default OFF: recomputed per train in `train_inner` (260608-t3t).
             fused_eligible: false,
+            // ODL-01 (D-05): cache the on-device eligibility ONCE here (NOT in
+            // train_inner). The AND-gate makes CpuBackend (discriminator false) —
+            // and GpuBackend<R> (false in Slice 0) — ineligible regardless of the
+            // env, so with `LGBM_CUDA_ON_DEVICE` unset every backend is false and
+            // the host path is byte-unchanged.
+            on_device_eligible: backend.on_device_growth_supported() && cuda_on_device_env(),
             // quick-260621-p9v: no upload yet; first tree of the train uploads once.
             resident_bins_uploaded: false,
             // R3 (260614-p0n): filled lazily on the first leaf-histogram build.
