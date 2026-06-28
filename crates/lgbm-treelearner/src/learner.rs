@@ -810,7 +810,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             trace.bytree_selected = valid_feature_indices.clone();
         }
 
-        let mut data_partition = DataPartition::new(num_data, self.num_leaves);
+        // spike-049: time the per-tree partition alloc (a component of in_learner_other).
+        let mut data_partition = crate::phase_prof::time(
+            &crate::phase_prof::PARTITION_NEW_NS,
+            || DataPartition::new(num_data, self.num_leaves),
+        );
         // The pool slot holds EVERY feature's compacted histogram CONCATENATED
         // (mirroring C++ `histogram_array_[feature_index]`, a contiguous per-leaf
         // buffer). `slot_off[fpos]` is feature `fpos`'s start cell in the slot; the
@@ -867,6 +871,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // host pool's reset_map, sized to the host pool's cache_size (== num_leaves).
         // No-op on CpuBackend (the default trait impl) and when ineligible.
         if self.resident_eligible {
+            // spike-049: time the per-tree GPU resident-pool reset (in_learner_other,
+            // GPU-only; no-op on CpuBackend so this guard never fires there).
+            let _g = crate::phase_prof::guard(&crate::phase_prof::RESIDENT_RESET_NS);
             self.backend
                 .reset_resident_pool(pool.cache_size(), slot_len);
         }
@@ -874,7 +881,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // Root leaf sums via the ordered f64 fold over ALL rows.
         let root_indices: Vec<u32> = (0..num_data as u32).collect();
         let mut smaller_leaf_splits = LeafSplits::new();
-        smaller_leaf_splits.init(gradients, hessians, &root_indices, &self.cfg);
+        // spike-049: time the per-tree root f64 fold over ALL rows (in_learner_other).
+        crate::phase_prof::time(&crate::phase_prof::ROOT_FOLD_NS, || {
+            smaller_leaf_splits.init(gradients, hessians, &root_indices, &self.cfg)
+        });
         let mut larger_leaf_splits = LeafSplits::new();
 
         // Guard the root cnt_factor = num_data / sum_hessian division.
@@ -895,6 +905,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         );
         let mut tree = root_tree(root_output, num_data);
 
+        // spike-049: time the per-tree scratch/constraint setup block (suspected
+        // dominant `residual` of in_learner_other — esp. CegbModel::new at num_data
+        // scale every tree even when CEGB is inactive). Guard drops after branch_features.
+        let _scratch_g = crate::phase_prof::guard(&crate::phase_prof::SCRATCH_NS);
         // best_split_per_leaf_ (flat Vec + ArgMax; NEVER a priority-queue/heap).
         let mut best_split_per_leaf: Vec<SplitInfo> =
             vec![SplitInfo::none(); self.num_leaves as usize];
@@ -934,6 +948,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         );
         // Interaction: per-leaf branch-feature list (empty when inactive).
         *self.branch_features.borrow_mut() = vec![Vec::new(); self.num_leaves as usize];
+        drop(_scratch_g); // spike-049: end of the scratch/constraint setup block.
 
         // Extra-trees: one `Random(extra_seed + inner_feature_index)` per feature,
         // persisted across leaf scans within this tree (C++

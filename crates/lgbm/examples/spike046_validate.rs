@@ -7,7 +7,16 @@
 use lgbm::{train, DenseCorpus, TrainingBuilder};
 
 fn main() {
-    let rows = 20_000usize;
+    // spike-049: rows/iters overridable so the SAME train() path can be profiled at
+    // the 500k×50 repro shape (LGBM_VALIDATE_ROWS=500000 LGBM_VALIDATE_ITERS=100).
+    let rows = std::env::var("LGBM_VALIDATE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000usize);
+    let iters = std::env::var("LGBM_VALIDATE_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20i32);
     let feats = 50usize;
     let bins = 32usize;
     let mut features: Vec<Vec<f64>> = Vec::with_capacity(rows);
@@ -35,7 +44,7 @@ fn main() {
     let corpus = DenseCorpus { features, labels };
     let cfg = TrainingBuilder::new()
         .objective("binary")
-        .num_iterations(20)
+        .num_iterations(iters)
         .num_leaves(31)
         .learning_rate(0.1)
         .seed(42)

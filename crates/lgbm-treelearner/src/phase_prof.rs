@@ -47,6 +47,24 @@ pub static SETUP_NS: AtomicU64 = AtomicU64::new(0);
 // `in_learner_other`; GPU-only (CpuBackend `wants_resident_bins()==false`).
 pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
+// Spike-049 drill-down: break `in_learner_other` (= learner − before − hist+split −
+// partition) into its per-tree setup components, to localize the remaining post-
+// metric-fix gap (spike-048). These are all OUTSIDE the growth-loop phase guards:
+//   ROOT_FOLD   = the per-tree root LeafSplits::init f64 fold over ALL rows
+//                 (grad/hess sum); single-threaded CPU, backend-independent.
+//   PARTITION_NEW = per-tree DataPartition::new (alloc + fill 0..num_data); CPU.
+//   RESIDENT_RESET = per-tree backend.reset_resident_pool (GPU device-handle mirror
+//                 reset + device-memory drop); no-op on CpuBackend, GPU-only cost.
+// (in_learner_other − these) = residual per-tree allocations / orchestration.
+pub static ROOT_FOLD_NS: AtomicU64 = AtomicU64::new(0);
+pub static PARTITION_NEW_NS: AtomicU64 = AtomicU64::new(0);
+pub static RESIDENT_RESET_NS: AtomicU64 = AtomicU64::new(0);
+// SCRATCH = the per-tree scratch/constraint setup block (best_split_per_leaf +
+// feature_splittable Vec<Vec> + best_cat_threshold + monotone/cegb/branch models).
+// Suspected dominant `residual`: CegbModel::new allocates at num_data scale every
+// tree even when CEGB is inactive (default).
+pub static SCRATCH_NS: AtomicU64 = AtomicU64::new(0);
+
 // Spike-023 GPU per-leaf LAUNCH/ROUND-TRIP COUNT counters. The 001–022 campaign
 // optimized per-kernel throughput; the un-attacked frontier is the per-leaf loop
 // STRUCTURE — how many device launches and how many blocking host round-trips
@@ -179,9 +197,26 @@ pub fn dump(label: &str) {
             "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt}) | scan_roundtrips(syncs)={scn_cnt}"
         );
     }
+    // Spike-049: in_learner_other sub-breakdown.
+    let root_fold = ROOT_FOLD_NS.swap(0, Ordering::Relaxed);
+    let partition_new = PARTITION_NEW_NS.swap(0, Ordering::Relaxed);
+    let resident_reset = RESIDENT_RESET_NS.swap(0, Ordering::Relaxed);
     if binning + grad + learner + score > 0 {
         let in_learner_other = learner.saturating_sub(b + h + p);
         let upload = UPLOAD_NS.swap(0, Ordering::Relaxed);
+        let scratch = SCRATCH_NS.swap(0, Ordering::Relaxed);
+        let residual = in_learner_other
+            .saturating_sub(root_fold + partition_new + resident_reset + upload + scratch);
+        eprintln!(
+            "[phase_prof:{label}] IN_LEARNER_OTHER={:.3}ms = root_fold={:.3} + partition_new={:.3} + scratch_setup={:.3} + resident_reset={:.3} + resident_bin_upload={:.3} + residual={:.3}",
+            in_learner_other as f64 / 1e6,
+            root_fold as f64 / 1e6,
+            partition_new as f64 / 1e6,
+            scratch as f64 / 1e6,
+            resident_reset as f64 / 1e6,
+            upload as f64 / 1e6,
+            residual as f64 / 1e6,
+        );
         eprintln!(
             "[phase_prof:{label}] BUDGET: binning={:.3}ms grad={:.3}ms learner={:.3}ms (phases={:.3} in_learner_other={:.3} [of which resident_bin_upload={:.3}]) score={:.3}ms",
             binning as f64 / 1e6,
