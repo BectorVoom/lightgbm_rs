@@ -1443,6 +1443,13 @@ fn train_inner_columns_full(
         feature_infos,
     );
 
+    // Spike-046: emit the per-phase BUDGET/LOOP/COUNTS attribution for the SHIPPED
+    // train path (the one the Python wheel drives). Inert unless LGBM_PHASE_PROF=1;
+    // until now `dump()` was only wired into the Rust bench examples, so the Python
+    // path was a profiling black box. Parity-neutral (prints to stderr + resets the
+    // accumulators; never touches train semantics).
+    lgbm_treelearner::phase_prof::dump("train");
+
     Ok(Booster {
         model,
         objective_kind,
