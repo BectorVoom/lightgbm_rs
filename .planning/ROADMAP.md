@@ -171,7 +171,7 @@ perf/default-on rollout (the DoD) is last.
 
 - The full merge gate is green AND byte-unchanged with LGBM_CUDA_ON_DEVICE unset.
 
-**Notes**: Pure additive-discriminator wiring (the established `prefers_host_partition` / `resident_eligible` idiom); no new compute, no new Cargo feature. Bake the cubecl-0.10-gotcha checklist (no global barrier, `Atomic<i64>` broken, `wrapping_add` not an intrinsic, plane-sum ≤ plane width, `launch_unchecked` unsafe) into this slice. Merge gate is the hard gate throughout.
+**Notes**: Pure additive-discriminator wiring (the established `prefers_host_partition` / `resident_eligible` idiom); no new compute, no new Cargo feature. Bake the cubecl-0.10-gotcha checklist (no global barrier, `Atomic<i64>` broken, `wrapping_add` not an intrinsic, plane-sum ≤ plane width, `launch_unchecked` unsafe) into this slice. Merge gate is the hard gate throughout. The pre-on-device CUDA baseline re-measured 2026-06-29 on a Kaggle Tesla T4 = official LightGBM ~4.46× faster @50f cold (3.36 s vs lgb-rs 14.98 s; 500k×50, 100 trees); Phase 14 is perf-neutral (no kernel), so this is the baseline Slice 1+ must beat.
 
 #### Phase 15: Minimal On-Device Growth (Slice 1)
 
