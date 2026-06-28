@@ -154,10 +154,10 @@ perf/default-on rollout (the DoD) is last.
   2. An additive `Backend::grow_tree_on_device` method + default-false `on_device_growth_supported()` discriminator exist, routed by a decide-once-at-top early-return fork in `SerialTreeLearner::train_inner`; the `GpuBackend<R>` override still returns the typed error/no-op so the default path is untouched.
   3. An `assert_on_device_tree_matches_cpu_anchor` oracle scaffold exists that pins tree STRUCTURE to the cpu f64 anchor (tie-aware `default_left`) with leaf values within a ~1e-5 f32 envelope — present BEFORE any kernel, never comparing two GPU paths to each other.
 
-**Plans**: 3 plans
+**Plans**: 1/3 plans executed
 **Wave 1**
 
-- [ ] 14-01-PLAN.md — LeafPartitionLayout payload + Backend grow_tree_on_device seam & discriminator (no-op)
+- [x] 14-01-PLAN.md — LeafPartitionLayout payload + Backend grow_tree_on_device seam & discriminator (no-op)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -253,7 +253,7 @@ perf/default-on rollout (the DoD) is last.
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 14. Scaffold + Oracle (Slice 0) | v1.1 | 0/? | Not started | - |
+| 14. Scaffold + Oracle (Slice 0) | v1.1 | 1/3 | In Progress|  |
 | 15. Minimal On-Device Growth (Slice 1) | v1.1 | 0/? | Not started | - |
 | 16. On-Device Frontier Best-Split (Slice 2) | v1.1 | 0/? | Not started | - |
 | 17. On-Device Data Partition (Slice 3) | v1.1 | 0/? | Not started | - |

@@ -9,7 +9,7 @@ Scoped by spikes 051–054 (real-NVIDIA Kaggle): the cheap GPU-histogram levers 
 
 ### Foundation (scaffold + oracle — Slice 0)
 
-- [ ] **ODL-01**: An additive `Backend::grow_tree_on_device` method + default-false `on_device_growth_supported()` discriminator routes GPU tree growth on-device, leaving CPU, ROCm, and the existing host-CUDA path byte-unchanged. Off by default behind `LGBM_CUDA_ON_DEVICE`.
+- [x] **ODL-01**: An additive `Backend::grow_tree_on_device` method + default-false `on_device_growth_supported()` discriminator routes GPU tree growth on-device, leaving CPU, ROCm, and the existing host-CUDA path byte-unchanged. Off by default behind `LGBM_CUDA_ON_DEVICE`.
 - [ ] **ODL-02**: An anchor-pinned oracle asserts the on-device tree's STRUCTURE is bit-exact to the cpu f64 anchor (tie-aware `default_left`), with leaf values within a ~1e-5 f32 envelope — never comparing two nondeterministic GPU paths to each other.
 
 ### On-Device Growth Loop (the core port)
@@ -60,7 +60,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ODL-01 | Phase 14 | Pending |
+| ODL-01 | Phase 14 | Complete |
 | ODL-02 | Phase 14 | Pending |
 | ODL-03 | Phase 15 | Pending |
 | ODL-04 | Phase 16 | Pending |
@@ -74,11 +74,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ODL-12 | Phase 19 | Pending |
 
 **Coverage:**
+
 - v1.1 requirements: 12 total
 - Mapped to phases: 12 ✓
 - Unmapped: 0 ✓
 
 **Phase → requirement rollup:**
+
 - Phase 14 (Scaffold + Oracle / Slice 0): ODL-01, ODL-02
 - Phase 15 (Minimal On-Device Growth / Slice 1): ODL-03, ODL-06, ODL-07
 - Phase 16 (On-Device Frontier Best-Split / Slice 2): ODL-04

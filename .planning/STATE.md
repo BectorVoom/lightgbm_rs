@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: "— GPU Training-Speed: CUDA On-Device Tree Learner`]"
 current_phase: 14
-current_phase_name: Slice 0
-status: planning
-stopped_at: Phase 14 context gathered
-last_updated: "2026-06-28T11:36:44.950Z"
+current_phase_name: scaffold-oracle-slice-0
+status: executing
+stopped_at: Completed 14-01-PLAN.md
+last_updated: "2026-06-28T21:28:48.414Z"
 last_activity: 2026-06-28
-last_activity_desc: Milestone v1.1 roadmap created (12/12 ODL requirements mapped across Phases 14–19)
+last_activity_desc: Phase 14 execution started
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 3
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 14 — Scaffold + Oracle (Slice 0), milestone v1.1 (CUDA on-device tree learner). Roadmap created 2026-06-28: 6 phases (14–19), 12/12 ODL requirements mapped.
+**Current focus:** Phase 14 — scaffold-oracle-slice-0
 
 ## Current Position
 
-Phase: 14 — Scaffold + Oracle (Slice 0) — roadmapped, not started
-Plan: —
-Status: Roadmap created (6 anchor-gated vertical slices, Phases 14–19); ready for `/gsd-plan-phase 14`
-Last activity: 2026-06-29 — Completed quick task 260629-88u: recorded the Phase 14 current-HEAD CUDA baseline (Kaggle T4: official LightGBM ~4.46× faster @50f cold, 3.36s vs 14.98s) into PROJECT.md, ROADMAP.md, and a phase BENCH-BASELINE note
+Phase: 14 (scaffold-oracle-slice-0) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
+Last activity: 2026-06-28 — Phase 14 execution started
 
 ## Deferred Items
 
@@ -529,6 +529,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 13 P02 | 18min | 2 tasks | 1 files |
 | Phase 13 P03 | 4min | 2 tasks | 1 files |
 | Phase 13 P04 | 8min | 2 tasks | 3 files |
+| Phase 14 P01 | 12min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -613,6 +614,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 13-02: autotune is the default-on rocm selector for the histogram-build row-partition P; row_partition_count is the LGBM_AUTOTUNE=0 cold-start fallback
 - [Phase ?]: 13-02: accumulating GPU kernels under cubecl autotune need a fresh-output InputGenerator (spike-038); rebuild the TunableSet per call, not LocalTuner::init
 - [Phase 13]: 13-03: wired BOTH scan paths (single-leaf + co-pack siblings) for autotuned CubeDim W; separate local_tuner namespaces avoid LaunchKey collision
+- [Phase 14]: D-03 resolved via Option A: LeafPartitionLayout POD payload in lgbm-dataset names the on-device seam's P without a treelearner crate cycle
 
 ### Pending Todos
 
@@ -642,9 +644,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-28T11:36:44.939Z
-Stopped at: Phase 14 context gathered
-Resume file: .planning/phases/14-scaffold-oracle-slice-0/14-CONTEXT.md
+Last session: 2026-06-28T21:28:48.404Z
+Stopped at: Completed 14-01-PLAN.md
+Resume file: None
 
 ## Operator Next Steps
 
