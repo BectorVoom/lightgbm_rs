@@ -388,3 +388,37 @@ measurement path** (cubecl-cuda via `maturin build --release -F cuda`). Conventi
   17/20/11s across sessions). Trust **in-session A/B deltas** only.
 - **Attribute backend-independent (CPU) components LOCALLY** — the `spike046_validate`
   example takes `LGBM_VALIDATE_ROWS/ITERS`; only true GPU-device costs need a Kaggle cycle.
+
+## Real-CUDA zero-code env-toggle probes + parse rules (spikes 051/052/054)
+
+The cheapest real-CUDA spike is one with **NO code push** — sweep existing env toggles on
+the *current* master and read `phase_prof`. This closed three hypotheses in three runs:
+- **Zero-code occupancy/fusion probes:** `LGBM_AUTOTUNE_FORCE_P=k` pins the build
+  row-partition P (unclamped, bypasses `ROWPART_P_MAX`); `LGBM_AUTOTUNE=0` forces the P=1
+  heuristic; `LGBM_FUSED_FORCE=1` forces the `build_fix_scan` fusion; `LGBM_SIBLING_COPACK=0`
+  disables the default-on scan co-pack. A driver that loops these per-arm (fresh subprocess
+  each — `phase_prof` atomics are process-global) localizes the bottleneck with one wheel build.
+- **Each arm runs ONE backend in its OWN subprocess** under `LGBM_PHASE_PROF=1`; capture
+  stdout (the `RESULT … train_time_s=`) + stderr (the dump). Driver pattern in
+  `spikes/051-*/spike051_kaggle.py` (reusable; inner bench inlined as a string ⇒ no git push).
+- **PARSE RULE — read the absolute-ms line, NOT the `%:` line.** Each fit emits TWO
+  `[phase_prof:train]` blocks: a **warmup** dump (`device_launches`≈445 — absorbs the cold
+  CUDA-context + kernel-JIT, several seconds) then the **timed** 100-tree dump
+  (`device_launches`=8570+). Select the **max-launches** record. And the dump has both an
+  absolute `before=… hist+split=4897ms …` line AND a `%: … hist+split=73.8` percentage line —
+  a naive `hist\+split=([\d.]+)` regex matches BOTH; key off the line *starting with*
+  `before=` for absolutes. (This bug made spike-051's first summary read percentages as ms.)
+- **Dedicated kernel per spike** (`boomvector/lgb-rs-cuda-spike0NN`) keeps runs parallel-safe
+  and leaves the shared `lgb-rs-cuda-bench` kernel untouched.
+- **Build official LightGBM with CUDA** for a reference ratio:
+  `pip install --no-binary lightgbm lightgbm -C cmake.define.USE_CUDA=ON` (source build,
+  several min; gate the import-probe first). Needed only when comparing vs official (054).
+- **FINDINGS (real NVIDIA, 500k×50, 100 trees):** build occupancy is NOT a lever (FORCE_P
+  flat-to-worse, P=1 optimal — the APU's P-sensitivity does not transfer); `LGBM_FUSED_FORCE=1`
+  is **5.4× WORSE** (the f64 fused mega-kernel tanks on consumer-NVIDIA 1/32 f64 — keep the
+  u64 fixed-point separate path; **avoid f64 hot loops in any new CUDA kernel**); readback
+  **syncs are cheap** (~0.14ms; `copack=0` doubles them for +3.6%); the wall is **8570 small
+  serial launches** gated by the best-first build→subtract→scan chain. The lgb_rs/official gap
+  **halves with feature width** (3.90×@50f → 1.93×@500f, launches constant) but never closes —
+  **the on-device multi-leaf learner is the universal architectural lever**; all cheap levers
+  are refuted on real hardware.
