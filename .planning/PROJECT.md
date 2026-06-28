@@ -22,7 +22,7 @@ Post-v1.0 work (running as phases/quick tasks, **not** part of the v1.0 scope): 
 - On-device multi-leaf growth loop — build → best-split → partition stay resident, driven by few large kernels (not ~86 host launches/tree)
 - On-device data partitioning per split (eliminate the host round-trip)
 - On-device best-split selection across the leaf frontier
-- Real-CUDA benchmark harness (Kaggle) as the verification surface — target materially closer to official than today's 3.9×@50f / 1.9×@500f
+- Real-CUDA benchmark harness (Kaggle) as the verification surface — target materially closer to official than today's 3.9×@50f / 1.9×@500f (re-measured on current HEAD on a Kaggle Tesla T4 on 2026-06-29 = official LightGBM ~4.46× faster @50f cold: 3.36 s vs 14.98 s; 500k×50, 100 trees, no warmup; the gap is unchanged from the spike-051..054 baseline, confirming the on-device learner remains the one architectural lever)
 - Coexistence with the existing host-orchestrated path (feature-gated / fallback) so ROCm + CPU routing stay untouched
 
 **Non-negotiables (carried from spikes 051–054):** CPU f64 anchor stays the bit-exact merge gate; CUDA/ROCm held to ~1e-6; NO f64 hot loops in new CUDA kernels (consumer-NVIDIA f64 = 1/32 f32 — keep the u64 fixed-point build path). Scoped by spikes 051–054 (real-NVIDIA, Kaggle): the cheap GPU-histogram levers (occupancy/fusion/sync-reduction) are all refuted — this on-device learner is the one remaining architectural lever. Reference port: `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp`.
