@@ -37,7 +37,7 @@ LightGBM CUDA — and the dominant chunk was NOT what the APU campaign predicted
 | Chunk | % wall | Lever |
 |---|---|---|
 | GPU histogram phases (build+scan+partition) | **53%** | architectural — on-device monolithic learner (official's `CUDASingleGPUTreeLearner`); the 09–13 campaign already tuned the kernels |
-| Python marshalling / pyo3 binding | **25%** | UNATTRIBUTED — likely the next *easy* win (numpy→corpus); separate subsystem |
+| Python "marshalling" (actually BINNING) | **25%** | ATTRIBUTED+FIXED (spike-050): single-threaded raw→bin (624ms@500k×50), NOT numpy marshalling (43ms). Feature-parallel rayon binning shipped — 6.5×, bit-exact |
 | `in_learner_other` (per-tree scaffolding) | 15% | DEAD END — diffuse, no single lever |
 | grad+score+snapshot+other | 7% | low |
 | metric eval | 0% | FIXED (was 26%) |
