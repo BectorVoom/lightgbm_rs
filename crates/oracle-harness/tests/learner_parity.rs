@@ -2045,6 +2045,23 @@ mod hip {
     /// mask it out for the strict-everything-else `decision_type` compare (D-04).
     const DEFAULT_LEFT_MASK: i8 = 2;
 
+    /// Relative tolerance for the `split_gain` near-tie predicate that gates a
+    /// `default_left` flip (WR-03 fix — the Tree-level lift of the SplitInfo gain
+    /// near-tie at `kernel_parity.rs:1597`). A genuine f32-vs-f64 near-tie flips
+    /// the missing-value direction precisely because the two competing
+    /// missing-direction gains were within f32 rounding of each other, so the
+    /// RECORDED `split_gain` of the chosen split differs only marginally between
+    /// the on-device tree and the f64 anchor. A real wrong-direction divergence
+    /// records a materially different gain and is REJECTED. `split_gain` is the
+    /// live discriminator here because it is the one node-level field the strict
+    /// structural body does NOT force bit-equal (it is predict-irrelevant
+    /// metadata), so this guard is genuinely reachable-as-failing — unlike a
+    /// guard keyed only on threshold + child counts, which the strict body
+    /// already pins equal. Conservative scaffold default; calibrate against real
+    /// kernel output when Phase 16 makes the assert binding. Dormant in Slice 0
+    /// (host fallback == anchor → identical gains, zero flips).
+    const SPLIT_GAIN_TIE_TOL: f64 = 1e-3;
+
     /// The two child row counts of internal `node`: an internal child (`>= 0`) uses
     /// `internal_count[child]`, a leaf child (`< 0`, i.e. `~leaf`) uses
     /// `leaf_count[~child]`. This is the per-node analog of the kernel_parity
@@ -2130,15 +2147,22 @@ mod hip {
     /// - categorical (bit0) + missing_type (bits2-3) stay STRICT — compared via
     ///   `decision_type & !DEFAULT_LEFT_MASK` (a mismatch is a real divergence);
     /// - a `default_left` flip is accepted ONLY on a genuine f32-vs-f64 near-tie,
-    ///   which at Tree level reduces to threshold (exact f64) + child row-count
-    ///   equality (split_gain is predict-irrelevant metadata; the winning split is
-    ///   physically identical). This lifts the per-`SplitInfo` near-tie acceptance at
-    ///   kernel_parity.rs:1597 to a per-NODE index.
+    ///   detected via the `split_gain` near-tie predicate ([`SPLIT_GAIN_TIE_TOL`]):
+    ///   a near-tie flips the missing direction because the two competing
+    ///   missing-direction gains were within f32 rounding, so the recorded
+    ///   `split_gain` differs only marginally. `split_gain` is the LIVE
+    ///   discriminator because it is the one node-level field the strict structural
+    ///   body does NOT pin bit-equal; threshold (exact f64) + child row-count
+    ///   equality are re-checked as CORROBORATING invariants (a near-tie reuses the
+    ///   physically-identical split). This lifts the per-`SplitInfo` near-tie
+    ///   acceptance at kernel_parity.rs:1597 to a per-NODE index.
     ///
-    /// A flip on a NON-tie node hard-fails (a real wrong-direction divergence stays
-    /// caught). The tie branch is DORMANT in Slice 0 (no kernel yet produces a flip)
-    /// but compiles and is reachable. The on-device tree is ALWAYS pinned to the cpu
-    /// f64 anchor — never a second GPU f32 path (def-f8u-01).
+    /// A flip whose `split_gain` gap exceeds tolerance hard-fails (a real
+    /// wrong-direction divergence stays caught — the guard is genuinely
+    /// reachable-as-failing, not tautological). The tie branch is DORMANT in
+    /// Slice 0 (no kernel yet produces a flip) but compiles and is reachable. The
+    /// on-device tree is ALWAYS pinned to the cpu f64 anchor — never a second GPU
+    /// f32 path (def-f8u-01).
     fn assert_on_device_tree_matches_cpu_anchor(
         on_device: &lgbm_model::Tree,
         anchor: &lgbm_model::Tree,
@@ -2163,25 +2187,35 @@ mod hip {
                  (on_device={od} anchor={an}) — a categorical/missing_type mismatch is a real \
                  structural divergence, not a tolerated tie"
             );
-            // default_left (bit1): accept a flip ONLY on a genuine f32-vs-f64 near-tie
-            // — at Tree level, threshold (exact f64) + child row counts equal (the
-            // physically-identical winning split). Both already hold from the shared
-            // bit-exact structural asserts above, so on a flip this confirms the tie;
-            // the branch is dormant in Slice 0.
+            // default_left (bit1): accept a flip ONLY on a genuine f32-vs-f64
+            // near-tie. The LIVE discriminator is split_gain — the one node-level
+            // field the strict structural body does NOT pin bit-equal, so this
+            // guard is genuinely reachable-as-failing (WR-03 fix). A near-tie flips
+            // the missing direction because the competing gains were within f32
+            // rounding, so the recorded gain gap is marginal; a real wrong-direction
+            // divergence records a materially different gain and HARD-FAILS here.
+            // threshold + child counts are re-checked as corroborating invariants.
             if (od & DEFAULT_LEFT_MASK) != (an & DEFAULT_LEFT_MASK) {
+                let g_od = on_device.split_gain[node] as f64;
+                let g_an = anchor.split_gain[node] as f64;
+                let gain_gap = (g_od - g_an).abs();
+                let gain_scale = g_od.abs().max(g_an.abs()).max(1.0);
+                let gain_near_tie = gain_gap <= SPLIT_GAIN_TIE_TOL * gain_scale;
                 let same_threshold = on_device.threshold[node] == anchor.threshold[node];
                 let same_child_counts =
                     child_row_counts(on_device, node) == child_row_counts(anchor, node);
                 assert!(
-                    same_threshold && same_child_counts,
+                    gain_near_tie && same_threshold && same_child_counts,
                     "{label} node {node}: default_left flip on a NON-tie split \
-                     (on_device={od} anchor={an}; same_threshold={same_threshold} \
-                     same_child_counts={same_child_counts}) — a real wrong-direction \
-                     divergence, NOT the tolerated f32-vs-f64 near-tie"
+                     (on_device={od} anchor={an}; gain_gap={gain_gap:.3e} \
+                     gain_scale={gain_scale:.3e} gain_near_tie={gain_near_tie} \
+                     same_threshold={same_threshold} same_child_counts={same_child_counts}) \
+                     — a real wrong-direction divergence, NOT the tolerated f32-vs-f64 near-tie"
                 );
                 eprintln!(
-                    "{label} node {node}: default_left tie accepted (threshold + child counts \
-                     identical) — documented f32-vs-f64 near-tie (D-04)"
+                    "{label} node {node}: default_left tie accepted (split_gain within \
+                     {SPLIT_GAIN_TIE_TOL:.0e} rel-tol; threshold + child counts identical) \
+                     — documented f32-vs-f64 near-tie (D-04)"
                 );
             }
         }
