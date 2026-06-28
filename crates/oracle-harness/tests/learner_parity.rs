@@ -2040,42 +2040,151 @@ mod hip {
     /// histogram-cell ~1e-6 GPU-vs-f64 contract is UNCHANGED (kernel_parity oracles).
     const ROCM_LEAF_VALUE_TOL: f64 = 1e-5;
 
+    /// C++ `#define kDefaultLeftMask (2)` (`tree.h:21`) — bit1 of `decision_type`.
+    /// Mirrors the `lgbm_model` private const; named locally so the comparator can
+    /// mask it out for the strict-everything-else `decision_type` compare (D-04).
+    const DEFAULT_LEFT_MASK: i8 = 2;
+
+    /// The two child row counts of internal `node`: an internal child (`>= 0`) uses
+    /// `internal_count[child]`, a leaf child (`< 0`, i.e. `~leaf`) uses
+    /// `leaf_count[~child]`. This is the per-node analog of the kernel_parity
+    /// `same_left_count` tie predicate (kernel_parity.rs:1597) — on a `default_left`
+    /// flip, equal child counts (with an equal threshold) prove the two branches
+    /// recorded the SAME physical split.
+    fn child_row_counts(tree: &lgbm_model::Tree, node: usize) -> (i32, i32) {
+        let count_of = |child: i32| -> i32 {
+            if child >= 0 {
+                tree.internal_count[child as usize]
+            } else {
+                tree.leaf_count[(!child) as usize]
+            }
+        };
+        (count_of(tree.left_child[node]), count_of(tree.right_child[node]))
+    }
+
+    /// Shared structural + leaf-envelope body for the two cpu-anchor comparators:
+    /// every BIT-EXACT field EXCEPT `decision_type` (which the two callers compare
+    /// differently — strict vs tie-aware on bit1), plus the per-leaf
+    /// `ROCM_LEAF_VALUE_TOL` envelope. Factored so the 8-field block is not
+    /// duplicated (Plan 14-03 Task 1).
+    fn assert_tree_structure_and_leaves(
+        candidate: &lgbm_model::Tree,
+        anchor: &lgbm_model::Tree,
+        label: &str,
+    ) {
+        assert_eq!(candidate.num_leaves, anchor.num_leaves, "{label} vs cpu-anchor: num_leaves");
+        assert_eq!(
+            candidate.split_feature, anchor.split_feature,
+            "{label} vs cpu-anchor: split_feature"
+        );
+        assert_eq!(candidate.threshold, anchor.threshold, "{label} vs cpu-anchor: threshold");
+        assert_eq!(candidate.left_child, anchor.left_child, "{label} vs cpu-anchor: left_child");
+        assert_eq!(candidate.right_child, anchor.right_child, "{label} vs cpu-anchor: right_child");
+        assert_eq!(candidate.leaf_count, anchor.leaf_count, "{label} vs cpu-anchor: leaf_count");
+        assert_eq!(
+            candidate.internal_count, anchor.internal_count,
+            "{label} vs cpu-anchor: internal_count"
+        );
+        assert_eq!(
+            candidate.leaf_value.len(),
+            anchor.leaf_value.len(),
+            "{label} vs cpu-anchor: leaf_value length"
+        );
+        let mut max_abs = 0.0f64;
+        for (i, (&gv, &av)) in candidate.leaf_value.iter().zip(anchor.leaf_value.iter()).enumerate()
+        {
+            let d = (gv - av).abs();
+            max_abs = max_abs.max(d);
+            assert!(
+                d <= ROCM_LEAF_VALUE_TOL,
+                "{label} leaf {i}: candidate={gv} cpu_anchor={av} abs_diff={d} > \
+                 {ROCM_LEAF_VALUE_TOL} (f32 leaf-accumulation envelope) — structural \
+                 fields are bit-exact, so this is a real value divergence; investigate"
+            );
+        }
+        let n_leaves = candidate.leaf_value.len();
+        eprintln!(
+            "{label}: {n_leaves} leaves match cpu f64 anchor (structure bit-exact, max leaf diff {max_abs:.3e})"
+        );
+    }
+
     /// Assert a GPU-built tree matches the deterministic cpu f64 anchor: structural
     /// fields BIT-EXACT (topology / split_feature / threshold / decision_type /
-    /// children / counts), leaf values within [`ROCM_LEAF_VALUE_TOL`].
+    /// children / counts), leaf values within [`ROCM_LEAF_VALUE_TOL`]. `decision_type`
+    /// is compared STRICTLY here (the resident/fused GPU build is bit-exact in
+    /// decision_type); the tie-aware variant is
+    /// [`assert_on_device_tree_matches_cpu_anchor`].
     fn assert_gpu_tree_matches_cpu_anchor(
         gpu: &lgbm_model::Tree,
         anchor: &lgbm_model::Tree,
         label: &str,
     ) {
-        assert_eq!(gpu.num_leaves, anchor.num_leaves, "{label} vs cpu-anchor: num_leaves");
-        assert_eq!(gpu.split_feature, anchor.split_feature, "{label} vs cpu-anchor: split_feature");
-        assert_eq!(gpu.threshold, anchor.threshold, "{label} vs cpu-anchor: threshold");
+        assert_tree_structure_and_leaves(gpu, anchor, label);
         assert_eq!(gpu.decision_type, anchor.decision_type, "{label} vs cpu-anchor: decision_type");
-        assert_eq!(gpu.left_child, anchor.left_child, "{label} vs cpu-anchor: left_child");
-        assert_eq!(gpu.right_child, anchor.right_child, "{label} vs cpu-anchor: right_child");
-        assert_eq!(gpu.leaf_count, anchor.leaf_count, "{label} vs cpu-anchor: leaf_count");
-        assert_eq!(gpu.internal_count, anchor.internal_count, "{label} vs cpu-anchor: internal_count");
+    }
+
+    /// Tie-aware generalization of [`assert_gpu_tree_matches_cpu_anchor`] (Plan 14-03,
+    /// ODL-02 / D-04). Structure is BIT-EXACT and leaves within `ROCM_LEAF_VALUE_TOL`
+    /// (the shared body), and `decision_type` is compared with bit1 (`default_left`)
+    /// treated TIE-AWARE per internal node:
+    /// - categorical (bit0) + missing_type (bits2-3) stay STRICT — compared via
+    ///   `decision_type & !DEFAULT_LEFT_MASK` (a mismatch is a real divergence);
+    /// - a `default_left` flip is accepted ONLY on a genuine f32-vs-f64 near-tie,
+    ///   which at Tree level reduces to threshold (exact f64) + child row-count
+    ///   equality (split_gain is predict-irrelevant metadata; the winning split is
+    ///   physically identical). This lifts the per-`SplitInfo` near-tie acceptance at
+    ///   kernel_parity.rs:1597 to a per-NODE index.
+    ///
+    /// A flip on a NON-tie node hard-fails (a real wrong-direction divergence stays
+    /// caught). The tie branch is DORMANT in Slice 0 (no kernel yet produces a flip)
+    /// but compiles and is reachable. The on-device tree is ALWAYS pinned to the cpu
+    /// f64 anchor — never a second GPU f32 path (def-f8u-01).
+    fn assert_on_device_tree_matches_cpu_anchor(
+        on_device: &lgbm_model::Tree,
+        anchor: &lgbm_model::Tree,
+        label: &str,
+    ) {
+        assert_tree_structure_and_leaves(on_device, anchor, label);
+        // decision_type: strict on every bit EXCEPT default_left (bit1).
+        let n_internal = anchor.decision_type.len();
         assert_eq!(
-            gpu.leaf_value.len(),
-            anchor.leaf_value.len(),
-            "{label} vs cpu-anchor: leaf_value length"
+            on_device.decision_type.len(),
+            n_internal,
+            "{label} vs cpu-anchor: decision_type length"
         );
-        let mut max_abs = 0.0f64;
-        for (i, (&gv, &av)) in gpu.leaf_value.iter().zip(anchor.leaf_value.iter()).enumerate() {
-            let d = (gv - av).abs();
-            max_abs = max_abs.max(d);
-            assert!(
-                d <= ROCM_LEAF_VALUE_TOL,
-                "{label} leaf {i}: gpu={gv} cpu_anchor={av} abs_diff={d} > \
-                 {ROCM_LEAF_VALUE_TOL} (f32 leaf-accumulation envelope) — structural \
-                 fields are bit-exact, so this is a real value divergence; investigate"
+        for node in 0..n_internal {
+            let od = on_device.decision_type[node];
+            let an = anchor.decision_type[node];
+            // categorical (bit0) + missing_type (bits2-3) MUST be exactly equal.
+            assert_eq!(
+                od & !DEFAULT_LEFT_MASK,
+                an & !DEFAULT_LEFT_MASK,
+                "{label} node {node}: decision_type (excluding default_left bit1) diverged \
+                 (on_device={od} anchor={an}) — a categorical/missing_type mismatch is a real \
+                 structural divergence, not a tolerated tie"
             );
+            // default_left (bit1): accept a flip ONLY on a genuine f32-vs-f64 near-tie
+            // — at Tree level, threshold (exact f64) + child row counts equal (the
+            // physically-identical winning split). Both already hold from the shared
+            // bit-exact structural asserts above, so on a flip this confirms the tie;
+            // the branch is dormant in Slice 0.
+            if (od & DEFAULT_LEFT_MASK) != (an & DEFAULT_LEFT_MASK) {
+                let same_threshold = on_device.threshold[node] == anchor.threshold[node];
+                let same_child_counts =
+                    child_row_counts(on_device, node) == child_row_counts(anchor, node);
+                assert!(
+                    same_threshold && same_child_counts,
+                    "{label} node {node}: default_left flip on a NON-tie split \
+                     (on_device={od} anchor={an}; same_threshold={same_threshold} \
+                     same_child_counts={same_child_counts}) — a real wrong-direction \
+                     divergence, NOT the tolerated f32-vs-f64 near-tie"
+                );
+                eprintln!(
+                    "{label} node {node}: default_left tie accepted (threshold + child counts \
+                     identical) — documented f32-vs-f64 near-tie (D-04)"
+                );
+            }
         }
-        let n_leaves = gpu.leaf_value.len();
-        eprintln!(
-            "{label}: {n_leaves} leaves match cpu f64 anchor (structure bit-exact, max leaf diff {max_abs:.3e})"
-        );
     }
 
     /// Grow the deterministic cpu f64 anchor tree for the spine corpus (the bit-exact
