@@ -4,17 +4,17 @@ milestone: v1.1
 milestone_name: "— GPU Training-Speed: CUDA On-Device Tree Learner`]"
 current_phase: 14
 current_phase_name: scaffold-oracle-slice-0
-status: executing
-stopped_at: Completed 14-01-PLAN.md
-last_updated: "2026-06-28T21:35:00.526Z"
+status: verifying
+stopped_at: Completed 14-03-PLAN.md
+last_updated: "2026-06-28T21:43:34.840Z"
 last_activity: 2026-06-28
 last_activity_desc: Phase 14 execution started
 progress:
   total_phases: 6
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 3
-  completed_plans: 2
-  percent: 0
+  completed_plans: 3
+  percent: 17
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 14 (scaffold-oracle-slice-0) — EXECUTING
 Plan: 3 of 3
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-28 — Phase 14 execution started
 
 ## Deferred Items
@@ -531,6 +531,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 13 P04 | 8min | 2 tasks | 3 files |
 | Phase 14 P01 | 12min | 2 tasks | 4 files |
 | Phase 14 P02 | 3min | 2 tasks | 2 files |
+| Phase 14 P03 | 18min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -616,6 +617,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 13-02: accumulating GPU kernels under cubecl autotune need a fresh-output InputGenerator (spike-038); rebuild the TunableSet per call, not LocalTuner::init
 - [Phase 13]: 13-03: wired BOTH scan paths (single-leaf + co-pack siblings) for autotuned CubeDim W; separate local_tuner namespaces avoid LaunchKey collision
 - [Phase 14]: D-03 resolved via Option A: LeafPartitionLayout POD payload in lgbm-dataset names the on-device seam's P without a treelearner crate cycle
+- [Phase 14]: Phase 14-03 oracle: default_left tie-aware comparator masks only bit1 (DEFAULT_LEFT_MASK), per-node tie gated on threshold + child_row_counts equality; host-fallback lives in oracle TEST only (D-01/D-02), production uses Ok(None) fall-through
 
 ### Pending Todos
 
@@ -645,8 +647,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-28T21:35:00.515Z
-Stopped at: Completed 14-01-PLAN.md
+Last session: 2026-06-28T21:43:34.829Z
+Stopped at: Completed 14-03-PLAN.md
 Resume file: None
 
 ## Operator Next Steps

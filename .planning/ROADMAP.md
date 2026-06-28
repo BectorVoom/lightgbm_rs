@@ -134,7 +134,7 @@ perf/default-on rollout (the DoD) is last.
 
 ### Phases (summary checklist)
 
-- [ ] **Phase 14: Scaffold + Oracle (Slice 0)** — Additive on-device seam + anchor-pinned tie-aware oracle, zero behavior change. Isolates wiring risk from kernel risk.
+- [x] **Phase 14: Scaffold + Oracle (Slice 0)** — Additive on-device seam + anchor-pinned tie-aware oracle, zero behavior change. Isolates wiring risk from kernel risk. (completed 2026-06-28)
 - [ ] **Phase 15: Minimal On-Device Growth (Slice 1)** — Thinnest continuous-feature tree grown end-to-end on real CUDA via few large launches; `hist_t**` subtraction-trick rotation; u64 fixed-point / no-f64 kernel constraint.
 - [ ] **Phase 16: On-Device Frontier Best-Split (Slice 2)** — Cross-leaf best-split selection on-device (removes per-leaf scan readbacks); tie-aware `default_left` assert lands here.
 - [ ] **Phase 17: On-Device Data Partition (Slice 3)** — On-device row partition + leaf-index update (Split kernel); the full single-GPU learner mirror.
@@ -154,7 +154,7 @@ perf/default-on rollout (the DoD) is last.
   2. An additive `Backend::grow_tree_on_device` method + default-false `on_device_growth_supported()` discriminator exist, routed by a decide-once-at-top early-return fork in `SerialTreeLearner::train_inner`; the `GpuBackend<R>` override still returns the typed error/no-op so the default path is untouched.
   3. An `assert_on_device_tree_matches_cpu_anchor` oracle scaffold exists that pins tree STRUCTURE to the cpu f64 anchor (tie-aware `default_left`) with leaf values within a ~1e-5 f32 envelope — present BEFORE any kernel, never comparing two GPU paths to each other.
 
-**Plans**: 2/3 plans executed
+**Plans**: 3/3 plans complete
 **Wave 1**
 
 - [x] 14-01-PLAN.md — LeafPartitionLayout payload + Backend grow_tree_on_device seam & discriminator (no-op)
@@ -165,7 +165,7 @@ perf/default-on rollout (the DoD) is last.
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 14-03-PLAN.md — tie-aware assert_on_device_tree_matches_cpu_anchor + live host-fallback oracle (SC#3) + seam no-op test (SC#2)
+- [x] 14-03-PLAN.md — tie-aware assert_on_device_tree_matches_cpu_anchor + live host-fallback oracle (SC#3) + seam no-op test (SC#2)
 
 **Cross-cutting constraints:**
 
@@ -253,7 +253,7 @@ perf/default-on rollout (the DoD) is last.
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 14. Scaffold + Oracle (Slice 0) | v1.1 | 2/3 | In Progress|  |
+| 14. Scaffold + Oracle (Slice 0) | v1.1 | 3/3 | Complete   | 2026-06-28 |
 | 15. Minimal On-Device Growth (Slice 1) | v1.1 | 0/? | Not started | - |
 | 16. On-Device Frontier Best-Split (Slice 2) | v1.1 | 0/? | Not started | - |
 | 17. On-Device Data Partition (Slice 3) | v1.1 | 0/? | Not started | - |
