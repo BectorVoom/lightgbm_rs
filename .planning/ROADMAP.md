@@ -77,6 +77,21 @@ Phase directories that exist on disk but were never part of the v1.0 milestone s
   - [x] 13-03-PLAN.md — autotune the split-scan `CubeDim` `W`: `SCAN_TUNER` + WSET (CloneInputGenerator), wired into the fused split launcher with `scan_cube_dim()`/`LGBM_SCAN_CUBEDIM` fallback (wave 2)
   - [x] 13-04-PLAN.md — all-PSET/all-WSET oracle parity pinned to the CPU f64 anchor + e2e A/B (autotune ≥ heuristic, recovers P=1) + CPU merge-gate green + honest-bound SUMMARY (wave 3)
 
+- `14-cuda-ondevice-tree-learner` — **proposed (spike-validated 051–054, milestone-sized).**
+  Mirror official LightGBM's `CUDASingleGPUTreeLearner`: grow the whole tree **on-device**
+  with few, large kernels, replacing the current host-driven per-leaf growth loop that issues
+  ~8,570 small serial launches/train (build→subtract→scan→partition per leaf-node). Spikes
+  051–054 (real-NVIDIA, Kaggle) **closed the cheap-win search** — build occupancy (051/053),
+  launch-fusion (052), and sync-reduction (052) are ALL refuted on real CUDA; the narrow-shape
+  ~5–6× gap vs official (and the residual ~1.9× even at 500 feat, 054) is **architectural**:
+  the launch-orchestration is the ceiling, not any single kernel. This is the ONE remaining
+  lever, the gap at every feature width. **High-uncertainty, milestone-sized — needs scoping
+  (discuss/new-milestone) before plan.** Non-negotiables carried from the campaign: CPU f64
+  anchor stays the bit-exact merge gate; ROCm/CUDA held to ~1e-6; no f64 hot loops in new CUDA
+  kernels (consumer-NVIDIA f64 = 1/32 f32 — keep the u64 fixed-point build path, spike-052).
+  Evidence: `.claude/skills/spike-findings-lightgbm_rs/references/cuda-architectural-launch-bound.md`,
+  `.planning/spikes/051..054/`. Reference port: `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp`.
+
 ### 📋 Next milestone (not yet scoped)
 
 Define via `/gsd-new-milestone`. Candidate themes: GPU large-data perf (locate the bottleneck — see `notes/gpu-large-data-bottleneck-framing.md`), quantized training (QNT-01), linear-tree leaves (LIN-01), text/binary/Arrow ingestion (ING-01..03).
