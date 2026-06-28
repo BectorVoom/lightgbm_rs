@@ -449,3 +449,43 @@ Two of the three non-kernel CUDA-wall chunks now CLOSED: metric eval 26%→0
 (quick-260628-f57), binning 25%→6.5× (spike-050). `in_learner_other` 15% is a diffuse
 dead-end (spike-049). **The only major lever left is the GPU histogram phases (53%) —
 the architectural on-device monolithic tree-learner (milestone-sized).**
+
+---
+
+# Spike Wrap-Up Summary — 2026-06-28 (session 2: the real-CUDA optimisation arc, 051–054)
+
+**Date:** 2026-06-28
+**Spikes processed:** 4 (051, 052, 053, 054)
+**Feature area:** Real-discrete-CUDA optimisation — the architectural launch-bound arc
+**Skill output:** `./.claude/skills/spike-findings-lightgbm_rs/` (append mode;
+new reference `references/cuda-architectural-launch-bound.md`)
+
+## Processed Spikes
+| # | Name | Type | Verdict | Feature Area |
+|---|------|------|---------|--------------|
+| 051 | real-cuda-hist-reattribution | standard | VALIDATED | real-CUDA launch-bound arc |
+| 052 | cuda-launch-fusion | standard | VALIDATED (lever refuted) | real-CUDA launch-bound arc |
+| 053 | cuda-build-launchconfig-autotune | standard | REFUTED (by 051) | real-CUDA launch-bound arc |
+| 054 | cuda-shape-crossover | standard | VALIDATED | real-CUDA launch-bound arc |
+
+## Key Findings
+- **The cheap-CUDA-win search is CLOSED — every lever refuted on real NVIDIA.** Attacked the
+  spike-049 "GPU histogram phases 53%" with THREE zero-code env-toggle Kaggle probes (no
+  master pushes — all existing toggles on current master).
+- **051 — build occupancy is NOT the bottleneck:** `LGBM_AUTOTUNE_FORCE_P {1..128}` flat-to-
+  worse, **P=1 optimal**, no BUILD_PSET-ceiling headroom ⇒ **053 REFUTED**. The spoofed-APU's
+  ~10% P-sensitivity (040) does NOT transfer. Cheap win: `LGBM_AUTOTUNE=0` ~4%.
+- **052 — launch fusion is catastrophic:** `LGBM_FUSED_FORCE=1` = **5.4× WORSE** (the
+  `build_fix_scan` mega-kernel is f64; consumer-NVIDIA f64 is 1/32 of f32). Readback syncs
+  are CHEAP (~0.14ms) ⇒ the wall is the **8570 small serial launches**, not sync latency.
+  New rule: NO f64 hot loops in cuda kernels (keep the u64 fixed-point path).
+- **054 — width mitigates but never closes the gap:** lgb_rs/official ratio HALVES
+  3.90×@50f → 1.93×@500f (launches constant 8900, ms/launch rises) — confirms launch-bound
+  on a 3rd axis — but lgb_rs CUDA **never beats official** (asymptotes ~2×).
+
+## Campaign status
+The narrow-shape ~5–6× lgb_rs-CUDA gap (and the residual ~2× at wide) is **ARCHITECTURAL**:
+a host-driven per-leaf growth loop (8570 launches) vs official's `CUDASingleGPUTreeLearner`
+(whole tree on-device). **The on-device multi-leaf tree learner is the ONE real lever —
+milestone-sized, the gap at every feature width.** All per-kernel tuning (001–054) is
+necessary-but-not-sufficient; the launch-orchestration architecture is the ceiling.
