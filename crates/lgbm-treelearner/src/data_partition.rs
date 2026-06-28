@@ -64,6 +64,22 @@ impl DataPartition {
         }
     }
 
+    /// ODL-01 (Phase 14, D-03 Option A): reconstruct a `DataPartition` from the
+    /// lower-crate [`lgbm_dataset::LeafPartitionLayout`] payload `P` returned by
+    /// `Backend::grow_tree_on_device`. A thin field-move — the payload mirrors the
+    /// four fields `DataPartition` wraps (identical shapes), so this never depends
+    /// on `lgbm-compute` (acyclic: treelearner already names both DataPartition and
+    /// lgbm_dataset). In Slice 0 the seam returns `Ok(None)`, so this is reachable
+    /// but not exercised at runtime yet — kept minimal until Slice 1 wires a kernel.
+    pub fn from_payload(p: lgbm_dataset::LeafPartitionLayout) -> Self {
+        Self {
+            num_data: p.num_data,
+            indices: p.indices,
+            leaf_begin: p.leaf_begin,
+            leaf_count: p.leaf_count,
+        }
+    }
+
     /// C++ `DataPartition::leaf_count(leaf)` — the GLOBAL row count in `leaf`.
     /// Drives the smaller-child selection (Pitfall 3).
     pub fn leaf_count(&self, leaf: i32) -> i32 {

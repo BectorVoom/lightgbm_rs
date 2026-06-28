@@ -690,6 +690,29 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         _is_first_tree: bool,
         capture_snapshots: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace, DataPartition), TreeLearnerError> {
+        // ODL-01 (Phase 14, D-02/D-05): the decide-once on-device routing fork. With
+        // `LGBM_CUDA_ON_DEVICE` unset, `on_device_eligible` is false on every Slice-0
+        // backend (the AND-gate's discriminator is false on CpuBackend AND GpuBackend<R>),
+        // so this block is DEAD and the host path below is byte-identical to master.
+        // When the seam DOES grow a tree (Slice 1+), `Some((tree, payload))` synthesizes
+        // the train_inner 4-tuple directly (empty snapshots + default ColSamplerTrace —
+        // production never captures here) and returns early. CRITICAL (D-02): production
+        // uses `Ok(None) ⇒ fall through` ONLY — there is NO `unwrap_or_else(host_grow)`
+        // host-fallback here; that stand-in belongs to Plan 03's oracle test, never the
+        // learner. On `Ok(None)` execution falls through UNCHANGED into the resident/host
+        // path below.
+        if self.on_device_eligible {
+            if let Some((tree, payload)) = self.backend.grow_tree_on_device(
+                gradients,
+                hessians,
+                self.num_leaves,
+                self.max_depth,
+            )? {
+                let part = DataPartition::from_payload(payload);
+                return Ok((tree, Vec::new(), ColSamplerTrace::default(), part));
+            }
+        }
+
         // R1: record whether this growth must emit D-06 snapshots. Read deep in
         // `scan_leaf_histogram` to gate the snapshot-only `per_bin_gains` re-scan.
         self.capture_snapshots = capture_snapshots;
