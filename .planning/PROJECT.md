@@ -14,6 +14,19 @@ For identical inputs and configuration, the Rust implementation must reproduce t
 
 Post-v1.0 work (running as phases/quick tasks, **not** part of the v1.0 scope): a GPU/CPU training-speed perf campaign (spikes 001–040 + quick tasks), an opt-in quantized-training mode (Phase 10 dir, maps to v2 `QNT-01`), the GPU fixed-point int-atomics + sibling-scan co-pack kernel work (Phases 11–12), and **GPU launch-config autotuning (Phase 13, complete 2026-06-26)** — CubeCL `cubecl::tune` runtime autotuning replaces the hand-tuned/env GPU launch heuristics, default-on for rocm, self-tuning both the histogram-build row-partition `P` and the split-scan `CubeDim` width `W`; all-PSET/all-WSET parity pinned to the CPU f64 anchor on real ROCm, CPU merge gate untouched, durable value = portability (self-calibrates on discrete gfx110x / NVIDIA). Next planned investigation: locate the GPU large-data training bottleneck (see `.planning/notes/gpu-large-data-bottleneck-framing.md`).
 
+## Current Milestone: v1.1 GPU Training-Speed — CUDA On-Device Tree Learner
+
+**Goal:** Close the architectural GPU training-speed gap vs official LightGBM by growing the whole tree on-device (mirror `CUDASingleGPUTreeLearner`) instead of the current host-driven per-leaf loop that issues ~8,570 small serial launches/train.
+
+**Target features:**
+- On-device multi-leaf growth loop — build → best-split → partition stay resident, driven by few large kernels (not ~86 host launches/tree)
+- On-device data partitioning per split (eliminate the host round-trip)
+- On-device best-split selection across the leaf frontier
+- Real-CUDA benchmark harness (Kaggle) as the verification surface — target materially closer to official than today's 3.9×@50f / 1.9×@500f
+- Coexistence with the existing host-orchestrated path (feature-gated / fallback) so ROCm + CPU routing stay untouched
+
+**Non-negotiables (carried from spikes 051–054):** CPU f64 anchor stays the bit-exact merge gate; CUDA/ROCm held to ~1e-6; NO f64 hot loops in new CUDA kernels (consumer-NVIDIA f64 = 1/32 f32 — keep the u64 fixed-point build path). Scoped by spikes 051–054 (real-NVIDIA, Kaggle): the cheap GPU-histogram levers (occupancy/fusion/sync-reduction) are all refuted — this on-device learner is the one remaining architectural lever. Reference port: `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp`.
+
 ## Requirements
 
 ### Validated
@@ -96,4 +109,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-26 after Phase 13 (gpu-autotune-launch-config) — GPU launch-config autotuning shipped default-on for rocm; CPU f64 anchor untouched. v1.0 milestone (2026-06-21): full single-machine C++ LightGBM parity shipped (8/8 phases, 55 plans, 69/69 v1 requirements, milestone audit PASSED)*
+*Last updated: 2026-06-28 — started milestone v1.1 (GPU Training-Speed — CUDA on-device tree learner), scoped by spikes 051–054 (real-NVIDIA Kaggle: cheap GPU-hist levers refuted, the on-device learner is the one architectural lever). v1.0 milestone (2026-06-21): full single-machine C++ LightGBM parity shipped (8/8 phases, 55 plans, 69/69 v1 requirements, milestone audit PASSED). Post-v1.0 perf phases 09–13 (GPU kernel campaign) complete.*

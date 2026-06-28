@@ -1,20 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-current_phase: 13
-status: verifying
-stopped_at: Completed 13-01-PLAN.md
-last_updated: "2026-06-26T12:28:11.421Z"
-last_activity: 2026-06-26
-last_activity_desc: Phase 13 complete
+milestone: v1.1
+milestone_name: GPU Training-Speed — CUDA On-Device Tree Learner
+status: planning
+last_updated: "2026-06-28T08:04:07.525Z"
+last_activity: 2026-06-28
 progress:
-  total_phases: 5
-  completed_phases: 4
-  total_plans: 12
-  completed_plans: 11
-  percent: 80
-current_phase_name: gpu-autotune-launch-config
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -28,12 +24,10 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 ## Current Position
 
-Phase: 13
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-06-28 — Quick task 260628-f57: made provide_train C++-faithful (removed ~26% per-iter training-metric waste, spike-048 fix); lgbm 41 + boosting_parity 75 + workspace all green
-
-Previous: 2026-06-25 — Completed quick task 260625-obl: VERIFIED spike-024 sibling-scan co-pack is live + default-on (LGBM_SIBLING_COPACK=0 is the off switch) + bit-exact in both modes (CPU + ROCm gates green, no golden changed); reconciled the "is it wired?" records discrepancy
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-06-28 — Milestone v1.1 started
 
 ## Deferred Items
 
