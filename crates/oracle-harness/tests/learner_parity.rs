@@ -2204,6 +2204,21 @@ mod hip {
         cpu_learner.train(g, h, true).expect("cpu anchor train ok")
     }
 
+    /// The D-01/D-02 host-fallback stand-in for the not-yet-existent on-device tree.
+    /// Lives in THIS TEST HARNESS ONLY — production NEVER falls back (the Plan-02
+    /// learner uses `Ok(None) ⇒ fall through`, no `unwrap_or_else(host_grow)`). It is
+    /// the same deterministic cpu f64 construction as [`cpu_anchor_tree`], so when the
+    /// Slice-0 seam returns `Ok(None)` the supplied tree trivially matches the anchor.
+    fn host_grow(
+        features: &[FeatureColumn],
+        g: &[f32],
+        h: &[f32],
+        num_leaves: i32,
+        max_depth: i32,
+    ) -> lgbm_model::Tree {
+        cpu_anchor_tree(features, g, h, num_leaves, max_depth)
+    }
+
     #[test]
     fn learner_parity_resident_equals_host_tree_on_hip() {
         // Serialize the force-env window vs the fused test (shared process env vars).
@@ -2360,5 +2375,34 @@ mod hip {
         let anchor = cpu_anchor_tree(&features, &g, &h, num_leaves, max_depth);
         assert_gpu_tree_matches_cpu_anchor(&fused_tree, &anchor, "fused");
         assert_gpu_tree_matches_cpu_anchor(&host_tree, &anchor, "host");
+    }
+
+    /// ODL-02 / SC#3 — the LIVE D-01 host-fallback oracle. Exercises the Plan-01
+    /// `grow_tree_on_device` seam end-to-end BEFORE any on-device kernel exists: the
+    /// seam returns `Ok(None)` in Slice 0, so `unwrap_or_else` supplies the host
+    /// stand-in tree ([`host_grow`], TEST-ONLY — D-02), and the tie-aware comparator
+    /// then pins it to the deterministic cpu f64 anchor and passes GREEN. This proves
+    /// the comparator + seam signature + plumbing are all wired and reachable now.
+    /// CRITICAL (def-f8u-01): the anchor is ALWAYS the cpu f64 tree — never a second
+    /// GPU f32 path.
+    #[test]
+    fn learner_parity_on_device_oracle_host_fallback_slice0() {
+        let backend = RocmBackend::with_resident(false);
+        let (features, g, h) = spine_corpus(3000, 8, 48);
+        let num_leaves = 31i32;
+        let max_depth = -1i32;
+
+        // D-01: obtain the on-device tree via the seam. Slice-0 returns Ok(None)
+        // (GpuBackend<R> explicit no-op override), so the unwrap_or_else host-fallback
+        // stand-in supplies the tree. This is the TEST's stand-in for the not-yet-
+        // existent on-device tree — never production behavior (D-02).
+        let tree = backend
+            .grow_tree_on_device(&g, &h, num_leaves, max_depth)
+            .expect("grow_tree_on_device seam ok")
+            .map(|(t, _payload)| t)
+            .unwrap_or_else(|| host_grow(&features, &g, &h, num_leaves, max_depth));
+
+        let anchor = cpu_anchor_tree(&features, &g, &h, num_leaves, max_depth);
+        assert_on_device_tree_matches_cpu_anchor(&tree, &anchor, "slice0-host-fallback");
     }
 }
