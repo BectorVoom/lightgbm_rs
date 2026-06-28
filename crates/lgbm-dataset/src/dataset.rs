@@ -69,6 +69,33 @@ pub struct EfbSamples {
     pub total_sample_cnt: i32,
 }
 
+/// The raw leaf-row index layout a device-grown tree returns (ODL-01).
+///
+/// This is the D-03-RESOLVED **Option A** "lower-crate partition payload `P`":
+/// a pure POD container mirroring the four fields `lgbm_treelearner::DataPartition`
+/// wraps (`data_partition.rs:33`) — `num_data`, `indices` (row ids grouped by
+/// leaf), `leaf_begin` (per-leaf start offset), `leaf_count` (per-leaf row count).
+///
+/// It lives in `lgbm-dataset` (a LOWER crate) so the on-device tree-growth seam
+/// `Backend::grow_tree_on_device` (lgbm-compute) can name the concrete `P`
+/// return type WITHOUT depending on `lgbm-treelearner` (which would be a crate
+/// cycle: treelearner → compute → treelearner). In Plan 02's `train_inner` fork,
+/// `lgbm-treelearner` reconstructs a real `DataPartition` from this payload
+/// (`DataPartition::from_payload`).
+///
+/// Pure data: NO methods, NO dependency on `lgbm-treelearner` or `lgbm-compute`.
+#[derive(Debug, Clone)]
+pub struct LeafPartitionLayout {
+    /// C++ `data_size_t num_data_` — total rows.
+    pub num_data: i32,
+    /// C++ `std::vector<data_size_t> indices_` — row ids grouped by leaf.
+    pub indices: Vec<u32>,
+    /// C++ `std::vector<data_size_t> leaf_begin_` — per-leaf start offset.
+    pub leaf_begin: Vec<i32>,
+    /// C++ `std::vector<data_size_t> leaf_count_` — per-leaf row count.
+    pub leaf_count: Vec<i32>,
+}
+
 impl Dataset {
     /// C++ `Dataset::Construct` (`dataset.cpp:325-441`), one-feature-per-group
     /// (no-bundle) variant — mirrors the single C++ `Dataset::Construct` with the

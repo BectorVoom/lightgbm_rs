@@ -22,7 +22,7 @@ pub mod multi_val_bin;
 
 pub use bin::{Bin, BinValue, create_dense_bin, create_sparse_bin};
 pub use bin_mapper::{BinMapper, BinType, MissingType};
-pub use dataset::{Dataset, FinishedDataset};
+pub use dataset::{Dataset, FinishedDataset, LeafPartitionLayout};
 pub use efb::{fast_feature_bundling, one_feature_per_group};
 pub use error::DatasetError;
 pub use feature_group::FeatureGroup;
