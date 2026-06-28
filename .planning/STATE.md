@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: GPU Training-Speed — CUDA On-Device Tree Learner
 status: planning
-last_updated: "2026-06-28T08:04:07.525Z"
+last_updated: "2026-06-28T09:00:00.000Z"
 last_activity: 2026-06-28
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,14 +20,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 13 — gpu-autotune-launch-config
+**Current focus:** Phase 14 — Scaffold + Oracle (Slice 0), milestone v1.1 (CUDA on-device tree learner). Roadmap created 2026-06-28: 6 phases (14–19), 12/12 ODL requirements mapped.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 14 — Scaffold + Oracle (Slice 0) — roadmapped, not started
 Plan: —
-Status: Defining requirements
-Last activity: 2026-06-28 — Milestone v1.1 started
+Status: Roadmap created (6 anchor-gated vertical slices, Phases 14–19); ready for `/gsd-plan-phase 14`
+Last activity: 2026-06-28 — Milestone v1.1 roadmap created (12/12 ODL requirements mapped across Phases 14–19)
 
 ## Deferred Items
 

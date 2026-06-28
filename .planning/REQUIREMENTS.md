@@ -60,24 +60,32 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ODL-01 | TBD | Pending |
-| ODL-02 | TBD | Pending |
-| ODL-03 | TBD | Pending |
-| ODL-04 | TBD | Pending |
-| ODL-05 | TBD | Pending |
-| ODL-06 | TBD | Pending |
-| ODL-07 | TBD | Pending |
-| ODL-08 | TBD | Pending |
-| ODL-09 | TBD | Pending |
-| ODL-10 | TBD | Pending |
-| ODL-11 | TBD | Pending |
-| ODL-12 | TBD | Pending |
+| ODL-01 | Phase 14 | Pending |
+| ODL-02 | Phase 14 | Pending |
+| ODL-03 | Phase 15 | Pending |
+| ODL-04 | Phase 16 | Pending |
+| ODL-05 | Phase 17 | Pending |
+| ODL-06 | Phase 15 | Pending |
+| ODL-07 | Phase 15 | Pending |
+| ODL-08 | Phase 18 | Pending |
+| ODL-09 | Phase 18 | Pending |
+| ODL-10 | Phase 18 | Pending |
+| ODL-11 | Phase 19 | Pending |
+| ODL-12 | Phase 19 | Pending |
 
 **Coverage:**
 - v1.1 requirements: 12 total
-- Mapped to phases: 0 (roadmapper fills)
-- Unmapped: 12 ⚠️ (until roadmap)
+- Mapped to phases: 12 ✓
+- Unmapped: 0 ✓
+
+**Phase → requirement rollup:**
+- Phase 14 (Scaffold + Oracle / Slice 0): ODL-01, ODL-02
+- Phase 15 (Minimal On-Device Growth / Slice 1): ODL-03, ODL-06, ODL-07
+- Phase 16 (On-Device Frontier Best-Split / Slice 2): ODL-04
+- Phase 17 (On-Device Data Partition / Slice 3): ODL-05
+- Phase 18 (Feature Coverage): ODL-08, ODL-09, ODL-10
+- Phase 19 (Perf-Validation + Default-On Rollout / DoD): ODL-11, ODL-12
 
 ---
 *Requirements defined: 2026-06-28 (milestone v1.1)*
-*Last updated: 2026-06-28 after initial definition*
+*Last updated: 2026-06-28 after roadmap creation (traceability filled — 12/12 mapped)*
