@@ -148,7 +148,10 @@ perf/default-on rollout (the DoD) is last.
   1. `LGBM_CUDA_ON_DEVICE` is OFF by default; CPU, ROCm, and the existing host-CUDA path grow byte-identical trees to before — the full bit-exact merge gate (`raw_bin_train_matches_cpp_golden`, `learner_parity`, lgbm/treelearner/compute suites) is green and unchanged.
   2. An additive `Backend::grow_tree_on_device` method + default-false `on_device_growth_supported()` discriminator exist, routed by a decide-once-at-top early-return fork in `SerialTreeLearner::train_inner`; the `GpuBackend<R>` override still returns the typed error/no-op so the default path is untouched.
   3. An `assert_on_device_tree_matches_cpu_anchor` oracle scaffold exists that pins tree STRUCTURE to the cpu f64 anchor (tie-aware `default_left`) with leaf values within a ~1e-5 f32 envelope — present BEFORE any kernel, never comparing two GPU paths to each other.
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 14-01-PLAN.md — LeafPartitionLayout payload + Backend grow_tree_on_device seam & discriminator (no-op)
+- [ ] 14-02-PLAN.md — cuda_on_device_env + on_device_eligible cache + train_inner routing fork + DataPartition::from_payload
+- [ ] 14-03-PLAN.md — tie-aware assert_on_device_tree_matches_cpu_anchor + live host-fallback oracle (SC#3) + seam no-op test (SC#2)
 **Notes**: Pure additive-discriminator wiring (the established `prefers_host_partition` / `resident_eligible` idiom); no new compute, no new Cargo feature. Bake the cubecl-0.10-gotcha checklist (no global barrier, `Atomic<i64>` broken, `wrapping_add` not an intrinsic, plane-sum ≤ plane width, `launch_unchecked` unsafe) into this slice. Merge gate is the hard gate throughout.
 
 #### Phase 15: Minimal On-Device Growth (Slice 1)
