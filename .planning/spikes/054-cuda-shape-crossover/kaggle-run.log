@@ -1,0 +1,1158 @@
+[{"stream_name":"stdout","time":0.760327493,"data":"\n"}
+,{"stream_name":"stdout","time":0.760420652,"data":"$ pip install -q -U numpy scipy scikit-learn maturin\n"}
+,{"stream_name":"stdout","time":4.585296425,"data":"     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 62.3/62.3 kB 2.9 MB/s eta 0:00:00\n"}
+,{"stream_name":"stdout","time":5.390638649,"data":"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16.7/16.7 MB 90.6 MB/s eta 0:00:00\n"}
+,{"stream_name":"stdout","time":5.691536473,"data":"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 35.3/35.3 MB 59.8 MB/s eta 0:00:00\n"}
+,{"stream_name":"stdout","time":5.792906107,"data":"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 9.1/9.1 MB 106.1 MB/s eta 0:00:00\n"}
+,{"stream_name":"stdout","time":5.903640209,"data":"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.6/10.6 MB 109.4 MB/s eta 0:00:00\n"}
+,{"stream_name":"stderr","time":22.211962216,"data":"ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.\n"}
+,{"stream_name":"stderr","time":22.212007198,"data":"bigframes 2.39.0 requires google-cloud-bigquery-storage\u003c3.0.0,\u003e=2.30.0, which is not installed.\n"}
+,{"stream_name":"stderr","time":22.212013532,"data":"numba 0.65.1 requires numpy\u003c2.5,\u003e=1.22, but you have numpy 2.5.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212018712,"data":"ydata-profiling 4.18.4 requires numba\u003c0.63,\u003e=0.60, but you have numba 0.65.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212023655,"data":"ydata-profiling 4.18.4 requires numpy\u003c2.4,\u003e=1.22, but you have numpy 2.5.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212028386,"data":"ydata-profiling 4.18.4 requires scipy\u003c1.17,\u003e=1.8, but you have scipy 1.18.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212033594,"data":"google-colab 1.0.0 requires jupyter-server==2.14.0, but you have jupyter-server 2.12.5 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212038662,"data":"google-colab 1.0.0 requires pandas==2.2.2, but you have pandas 2.3.3 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212043564,"data":"dask-cuda 26.2.0 requires cuda-core==0.3.*, but you have cuda-core 1.0.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212048075,"data":"dask-cuda 26.2.0 requires numba-cuda\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.21205282,"data":"dopamine-rl 4.1.2 requires gym\u003c=0.25.2, but you have gym 0.26.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.21205798,"data":"distributed-ucxx-cu12 0.48.0 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212062762,"data":"moviepy 1.0.3 requires decorator\u003c5.0,\u003e=4.0.2, but you have decorator 5.3.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212067918,"data":"cuml-cu12 26.2.0 requires numba\u003c0.62.0,\u003e=0.60.0, but you have numba 0.65.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212072896,"data":"cuml-cu12 26.2.0 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212078057,"data":"ucxx-cu12 0.48.0 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212114469,"data":"tensorflow 2.19.0 requires numpy\u003c2.2.0,\u003e=1.26.0, but you have numpy 2.5.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212117978,"data":"cudf-cu12 26.2.1 requires numba\u003c0.62.0,\u003e=0.60.0, but you have numba 0.65.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.212121494,"data":"cudf-cu12 26.2.1 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.2, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":22.21212617,"data":"sklearn-compat 0.1.5 requires scikit-learn\u003c1.9,\u003e=1.2, but you have scikit-learn 1.9.0 which is incompatible.\n"}
+,{"stream_name":"stdout","time":22.379909254,"data":"\n"}
+,{"stream_name":"stdout","time":22.379941128,"data":"$ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n"}
+,{"stream_name":"stderr","time":22.588018076,"data":"info: downloading installer\n"}
+,{"stream_name":"stderr","time":23.277936759,"data":"warn: It looks like you have an existing rustup settings file at:\n"}
+,{"stream_name":"stderr","time":23.277970134,"data":"warn: /root/.rustup/settings.toml\n"}
+,{"stream_name":"stderr","time":23.277973786,"data":"warn: Rustup will install the default toolchain as specified in the settings file,\n"}
+,{"stream_name":"stderr","time":23.277976644,"data":"warn: instead of the one inferred from the default host triple.\n"}
+,{"stream_name":"stderr","time":23.317884369,"data":"info: profile set to default\n"}
+,{"stream_name":"stderr","time":23.317922016,"data":"info: default host triple is x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stderr","time":23.318578253,"data":"info: syncing channel updates for stable-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stderr","time":23.618958652,"data":"info: latest update on 2026-05-28 for version 1.96.0 (ac68faa20 2026-05-25)\n"}
+,{"stream_name":"stderr","time":23.619002763,"data":"info: downloading 6 components\n"}
+,{"stream_name":"stderr","time":42.439169208,"data":"info: default toolchain set to stable-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stdout","time":42.439178174,"data":"\n"}
+,{"stream_name":"stdout","time":42.452039192,"data":"  stable-x86_64-unknown-linux-gnu installed - rustc 1.96.0 (ac68faa20 2026-05-25)\n"}
+,{"stream_name":"stdout","time":42.452073935,"data":"\n"}
+,{"stream_name":"stdout","time":42.452078642,"data":"\n"}
+,{"stream_name":"stdout","time":42.452081791,"data":"Rust is installed now. Great!\n"}
+,{"stream_name":"stdout","time":42.452084923,"data":"\n"}
+,{"stream_name":"stdout","time":42.452087834,"data":"To get started you may need to restart your current shell.\n"}
+,{"stream_name":"stdout","time":42.452090985,"data":"This would reload your PATH environment variable to include\n"}
+,{"stream_name":"stdout","time":42.452094136,"data":"Cargo's bin directory ($HOME/.cargo/bin).\n"}
+,{"stream_name":"stdout","time":42.452097208,"data":"\n"}
+,{"stream_name":"stdout","time":42.452099987,"data":"To configure your current shell, you need to source\n"}
+,{"stream_name":"stdout","time":42.452103032,"data":"the corresponding env file under $HOME/.cargo.\n"}
+,{"stream_name":"stdout","time":42.45210603,"data":"\n"}
+,{"stream_name":"stdout","time":42.452108926,"data":"This is usually done by running one of the following (note the leading DOT):\n"}
+,{"stream_name":"stdout","time":42.452112726,"data":". \"$HOME/.cargo/env\"            # For sh/bash/zsh/ash/dash/pdksh\n"}
+,{"stream_name":"stdout","time":42.452131552,"data":"source \"$HOME/.cargo/env.fish\"  # For fish\n"}
+,{"stream_name":"stdout","time":42.452148841,"data":"source \"~/.cargo/env.nu\"  # For nushell\n"}
+,{"stream_name":"stdout","time":42.452152974,"data":"source \"$HOME/.cargo/env.tcsh\"  # For tcsh\n"}
+,{"stream_name":"stdout","time":42.452158382,"data":". \"$HOME/.cargo/env.ps1\"        # For pwsh\n"}
+,{"stream_name":"stdout","time":42.452162042,"data":"source \"$HOME/.cargo/env.xsh\"   # For xonsh\n"}
+,{"stream_name":"stdout","time":42.468067019,"data":"\n"}
+,{"stream_name":"stdout","time":42.468091171,"data":"$ git clone https://github.com/BectorVoom/lightgbm_rs.git\n"}
+,{"stream_name":"stderr","time":42.484738016,"data":"Cloning into 'lightgbm_rs'...\n"}
+,{"stream_name":"stdout","time":44.327877924,"data":"\n"}
+,{"stream_name":"stdout","time":44.327933568,"data":"########## BUILD lightgbm_rs CUDA wheel ##########\n"}
+,{"stream_name":"stdout","time":44.327941506,"data":"\n"}
+,{"stream_name":"stdout","time":44.327964952,"data":"$ rm -rf lightgbm_rs/target/wheels/\n"}
+,{"stream_name":"stdout","time":44.330455662,"data":"\n"}
+,{"stream_name":"stdout","time":44.330478625,"data":"$ cd lightgbm_rs/crates/lgbm-python \u0026\u0026 maturin build --release -F cuda -j 2\n"}
+,{"stream_name":"stderr","time":44.342925011,"data":"info: syncing channel updates for 1.95.0-x86_64-unknown-linux-gnu\n"}
+,{"stream_name":"stderr","time":44.539338316,"data":"info: latest update on 2026-04-16 for version 1.95.0 (59807616e 2026-04-14)\n"}
+,{"stream_name":"stderr","time":44.539374477,"data":"info: downloading 6 components\n"}
+,{"stream_name":"stderr","time":61.416093011,"data":"    Updating crates.io index\n"}
+,{"stream_name":"stderr","time":68.432190251,"data":" Downloading crates ...\n"}
+,{"stream_name":"stderr","time":68.524559187,"data":"  Downloaded adler2 v2.0.1\n"}
+,{"stream_name":"stderr","time":68.538430181,"data":"  Downloaded android_system_properties v0.1.5\n"}
+,{"stream_name":"stderr","time":68.542903984,"data":"  Downloaded android-tzdata v0.1.1\n"}
+,{"stream_name":"stderr","time":68.54697989,"data":"  Downloaded anyhow v1.0.102\n"}
+,{"stream_name":"stderr","time":68.555955532,"data":"  Downloaded ciborium-ll v0.2.2\n"}
+,{"stream_name":"stderr","time":68.560337702,"data":"  Downloaded document-features v0.2.12\n"}
+,{"stream_name":"stderr","time":68.56587163,"data":"  Downloaded crossbeam-deque v0.8.6\n"}
+,{"stream_name":"stderr","time":68.571459326,"data":"  Downloaded embassy-futures v0.1.2\n"}
+,{"stream_name":"stderr","time":68.582589337,"data":"  Downloaded generic-array v0.14.7\n"}
+,{"stream_name":"stderr","time":68.593771062,"data":"  Downloaded jni-sys v0.4.1\n"}
+,{"stream_name":"stderr","time":68.602982158,"data":"  Downloaded liblzma v0.4.6\n"}
+,{"stream_name":"stderr","time":68.61684214900001,"data":"  Downloaded md5 v0.8.0\n"}
+,{"stream_name":"stderr","time":68.6287481,"data":"  Downloaded num v0.4.3\n"}
+,{"stream_name":"stderr","time":68.639205482,"data":"  Downloaded polars-error v0.53.0\n"}
+,{"stream_name":"stderr","time":68.64956731,"data":"  Downloaded schannel v0.1.29\n"}
+,{"stream_name":"stderr","time":68.661169645,"data":"  Downloaded streaming-iterator v0.1.9\n"}
+,{"stream_name":"stderr","time":68.673108751,"data":"  Downloaded want v0.3.1\n"}
+,{"stream_name":"stderr","time":68.680683184,"data":"  Downloaded walkdir v2.5.0\n"}
+,{"stream_name":"stderr","time":68.687767231,"data":"  Downloaded void v1.0.2\n"}
+,{"stream_name":"stderr","time":68.692611147,"data":"  Downloaded windows-implement v0.60.2\n"}
+,{"stream_name":"stderr","time":68.698016895,"data":"  Downloaded wgpu-core v29.0.3\n"}
+,{"stream_name":"stderr","time":68.723702773,"data":"  Downloaded wgpu-types v29.0.3\n"}
+,{"stream_name":"stderr","time":68.732612984,"data":"  Downloaded xattr v1.6.1\n"}
+,{"stream_name":"stderr","time":68.737915049,"data":"  Downloaded zerofrom-derive v0.1.7\n"}
+,{"stream_name":"stderr","time":68.741370634,"data":"  Downloaded zstd-safe v7.2.4\n"}
+,{"stream_name":"stderr","time":68.745541855,"data":"  Downloaded zeroize v1.8.2\n"}
+,{"stream_name":"stderr","time":68.749833939,"data":"  Downloaded wit-bindgen-rust v0.51.0\n"}
+,{"stream_name":"stderr","time":68.755805718,"data":"  Downloaded tar v0.4.46\n"}
+,{"stream_name":"stderr","time":68.76373228,"data":"  Downloaded webpki-roots v1.0.7\n"}
+,{"stream_name":"stderr","time":68.769902108,"data":"  Downloaded windows-targets v0.52.6\n"}
+,{"stream_name":"stderr","time":68.771998111,"data":"  Downloaded windows-threading v0.2.1\n"}
+,{"stream_name":"stderr","time":68.775349472,"data":"  Downloaded windows-targets v0.53.5\n"}
+,{"stream_name":"stderr","time":68.778381484,"data":"  Downloaded windows_i686_gnullvm v0.52.6\n"}
+,{"stream_name":"stderr","time":68.793860118,"data":"  Downloaded windows_aarch64_msvc v0.52.6\n"}
+,{"stream_name":"stderr","time":68.814031474,"data":"  Downloaded wasmparser v0.244.0\n"}
+,{"stream_name":"stderr","time":68.826754969,"data":"  Downloaded zerotrie v0.2.4\n"}
+,{"stream_name":"stderr","time":68.834652933,"data":"  Downloaded windows_x86_64_msvc v0.52.6\n"}
+,{"stream_name":"stderr","time":68.853103063,"data":"  Downloaded wit-bindgen v0.51.0\n"}
+,{"stream_name":"stderr","time":68.858408173,"data":"  Downloaded wasm-bindgen-macro-support v0.2.122\n"}
+,{"stream_name":"stderr","time":68.862134286,"data":"  Downloaded wasm-bindgen v0.2.122\n"}
+,{"stream_name":"stderr","time":68.867360574,"data":"  Downloaded wasm-encoder v0.244.0\n"}
+,{"stream_name":"stderr","time":68.873200354,"data":"  Downloaded windows_i686_msvc v0.53.1\n"}
+,{"stream_name":"stderr","time":68.893211076,"data":"  Downloaded wasip3 v0.4.0+wasi-0.3.0-rc-2026-01-06\n"}
+,{"stream_name":"stderr","time":68.900543626,"data":"  Downloaded wasip2 v1.0.3+wasi-0.2.9\n"}
+,{"stream_name":"stderr","time":68.907011613,"data":"  Downloaded winapi v0.3.9\n"}
+,{"stream_name":"stderr","time":68.96387329,"data":"  Downloaded unicode-normalization v0.1.25\n"}
+,{"stream_name":"stderr","time":68.969099543,"data":"  Downloaded windows-numerics v0.3.1\n"}
+,{"stream_name":"stderr","time":68.971209003,"data":"  Downloaded windows_aarch64_msvc v0.53.1\n"}
+,{"stream_name":"stderr","time":68.989432184,"data":"  Downloaded zerocopy-derive v0.8.50\n"}
+,{"stream_name":"stderr","time":69.001190071,"data":"  Downloaded wit-bindgen v0.57.1\n"}
+,{"stream_name":"stderr","time":69.017179343,"data":"  Downloaded zerovec v0.11.6\n"}
+,{"stream_name":"stderr","time":69.025589061,"data":"  Downloaded sysinfo v0.38.4\n"}
+,{"stream_name":"stderr","time":69.049191334,"data":"  Downloaded wit-parser v0.244.0\n"}
+,{"stream_name":"stderr","time":69.105556565,"data":"  Downloaded wgpu-hal v29.0.3\n"}
+,{"stream_name":"stderr","time":69.122448165,"data":"  Downloaded winnow v1.0.3\n"}
+,{"stream_name":"stderr","time":69.138861895,"data":"  Downloaded windows_i686_gnu v0.53.1\n"}
+,{"stream_name":"stderr","time":69.165692527,"data":"  Downloaded web-sys v0.3.99\n"}
+,{"stream_name":"stderr","time":69.299821567,"data":"  Downloaded serde_json v1.0.150\n"}
+,{"stream_name":"stderr","time":69.3202694,"data":"  Downloaded wit-component v0.244.0\n"}
+,{"stream_name":"stderr","time":69.413685411,"data":"  Downloaded zerocopy v0.8.50\n"}
+,{"stream_name":"stderr","time":69.444323757,"data":"  Downloaded windows_i686_gnu v0.52.6\n"}
+,{"stream_name":"stderr","time":69.470544315,"data":"  Downloaded windows_x86_64_gnu v0.52.6\n"}
+,{"stream_name":"stderr","time":69.494959367,"data":"  Downloaded windows-strings v0.5.1\n"}
+,{"stream_name":"stderr","time":69.497357998,"data":"  Downloaded windows-result v0.4.1\n"}
+,{"stream_name":"stderr","time":69.499393604,"data":"  Downloaded windows-sys v0.52.0\n"}
+,{"stream_name":"stderr","time":69.60581846,"data":"  Downloaded windows-link v0.2.1\n"}
+,{"stream_name":"stderr","time":69.607321988,"data":"  Downloaded windows-link v0.1.3\n"}
+,{"stream_name":"stderr","time":69.608873214,"data":"  Downloaded windows-interface v0.59.3\n"}
+,{"stream_name":"stderr","time":69.610447494,"data":"  Downloaded windows_x86_64_gnullvm v0.52.6\n"}
+,{"stream_name":"stderr","time":69.6228694,"data":"  Downloaded ring v0.17.14\n"}
+,{"stream_name":"stderr","time":69.688197879,"data":"  Downloaded rayon-core v1.13.0\n"}
+,{"stream_name":"stderr","time":69.69372746,"data":"  Downloaded yoke v0.8.3\n"}
+,{"stream_name":"stderr","time":69.699833441,"data":"  Downloaded xxhash-rust v0.8.15\n"}
+,{"stream_name":"stderr","time":69.702564698,"data":"  Downloaded xml-rs v0.8.28\n"}
+,{"stream_name":"stderr","time":69.706965758,"data":"  Downloaded writeable v0.6.3\n"}
+,{"stream_name":"stderr","time":69.709754896,"data":"  Downloaded wayland-sys v0.31.11\n"}
+,{"stream_name":"stderr","time":69.71175011,"data":"  Downloaded wasm-streams v0.4.2\n"}
+,{"stream_name":"stderr","time":69.717783031,"data":"  Downloaded wasm-metadata v0.244.0\n"}
+,{"stream_name":"stderr","time":69.723585527,"data":"  Downloaded wasm-bindgen-shared v0.2.122\n"}
+,{"stream_name":"stderr","time":69.725365586,"data":"  Downloaded wasm-bindgen-macro v0.2.122\n"}
+,{"stream_name":"stderr","time":69.727047905,"data":"  Downloaded wasm-bindgen-futures v0.4.72\n"}
+,{"stream_name":"stderr","time":69.728662531,"data":"  Downloaded windows_aarch64_gnullvm v0.52.6\n"}
+,{"stream_name":"stderr","time":69.740279996,"data":"  Downloaded wasi v0.11.1+wasi-snapshot-preview1\n"}
+,{"stream_name":"stderr","time":69.743362465,"data":"  Downloaded windows_i686_msvc v0.52.6\n"}
+,{"stream_name":"stderr","time":69.766929363,"data":"  Downloaded windows_i686_gnullvm v0.53.1\n"}
+,{"stream_name":"stderr","time":69.786347328,"data":"  Downloaded zstd-sys v2.0.16+zstd.1.5.7\n"}
+,{"stream_name":"stderr","time":69.81173175,"data":"  Downloaded windows_x86_64_gnu v0.53.1\n"}
+,{"stream_name":"stderr","time":69.839257085,"data":"  Downloaded windows_aarch64_gnullvm v0.53.1\n"}
+,{"stream_name":"stderr","time":69.856896106,"data":"  Downloaded windows_x86_64_gnullvm v0.53.1\n"}
+,{"stream_name":"stderr","time":69.874211792,"data":"  Downloaded windows_x86_64_msvc v0.53.1\n"}
+,{"stream_name":"stderr","time":69.892446328,"data":"  Downloaded reqwest v0.12.28\n"}
+,{"stream_name":"stderr","time":69.900268033,"data":"  Downloaded regex-syntax v0.8.10\n"}
+,{"stream_name":"stderr","time":69.910560983,"data":"  Downloaded polars-plan v0.53.0\n"}
+,{"stream_name":"stderr","time":69.938555207,"data":"  Downloaded zstd v0.13.3\n"}
+,{"stream_name":"stderr","time":69.944995352,"data":"  Downloaded zmij v1.0.21\n"}
+,{"stream_name":"stderr","time":69.947455858,"data":"  Downloaded zerovec-derive v0.11.3\n"}
+,{"stream_name":"stderr","time":69.949561323,"data":"  Downloaded wit-bindgen-rust-macro v0.51.0\n"}
+,{"stream_name":"stderr","time":69.95139703,"data":"  Downloaded regex v1.12.3\n"}
+,{"stream_name":"stderr","time":69.958850334,"data":"  Downloaded rayon v1.12.0\n"}
+,{"stream_name":"stderr","time":69.974168385,"data":"  Downloaded pyo3-ffi v0.27.2\n"}
+,{"stream_name":"stderr","time":69.983154388,"data":"  Downloaded polars-stream v0.53.0\n"}
+,{"stream_name":"stderr","time":70.020265518,"data":"  Downloaded polars-parquet v0.53.0\n"}
+,{"stream_name":"stderr","time":70.038156496,"data":"  Downloaded polars-io v0.53.0\n"}
+,{"stream_name":"stderr","time":70.059435196,"data":"  Downloaded zerofrom v0.1.8\n"}
+,{"stream_name":"stderr","time":70.06103105,"data":"  Downloaded yoke-derive v0.8.2\n"}
+,{"stream_name":"stderr","time":70.06277623,"data":"  Downloaded wit-bindgen-core v0.51.0\n"}
+,{"stream_name":"stderr","time":70.065123095,"data":"  Downloaded pyo3-macros-backend v0.27.2\n"}
+,{"stream_name":"stderr","time":70.069279217,"data":"  Downloaded pyo3 v0.27.2\n"}
+,{"stream_name":"stderr","time":70.117975805,"data":"  Downloaded prettyplease v0.2.37\n"}
+,{"stream_name":"stderr","time":70.122819184,"data":"  Downloaded portable-atomic v1.13.1\n"}
+,{"stream_name":"stderr","time":70.140658227,"data":"  Downloaded winapi-x86_64-pc-windows-gnu v0.4.0\n"}
+,{"stream_name":"stderr","time":70.317290088,"data":"  Downloaded polars-utils v0.53.0\n"}
+,{"stream_name":"stderr","time":70.32502962,"data":"  Downloaded polars-time v0.53.0\n"}
+,{"stream_name":"stderr","time":70.330403774,"data":"  Downloaded polars-lazy v0.53.0\n"}
+,{"stream_name":"stderr","time":70.3472256,"data":"  Downloaded wgpu v29.0.3\n"}
+,{"stream_name":"stderr","time":70.368012252,"data":"  Downloaded winapi-i686-pc-windows-gnu v0.4.0\n"}
+,{"stream_name":"stderr","time":70.544874486,"data":"  Downloaded unicode-ident v1.0.24\n"}
+,{"stream_name":"stderr","time":70.54888001,"data":"  Downloaded regex-automata v0.4.14\n"}
+,{"stream_name":"stderr","time":70.569352277,"data":"  Downloaded polars-expr v0.53.0\n"}
+,{"stream_name":"stderr","time":70.582858013,"data":"  Downloaded object v0.37.3\n"}
+,{"stream_name":"stderr","time":70.598218253,"data":"  Downloaded objc2 v0.6.4\n"}
+,{"stream_name":"stderr","time":70.614293136,"data":"  Downloaded numpy v0.27.1\n"}
+,{"stream_name":"stderr","time":70.619141227,"data":"  Downloaded unicode-width v0.2.2\n"}
+,{"stream_name":"stderr","time":70.627411468,"data":"  Downloaded unicode-segmentation v1.13.3\n"}
+,{"stream_name":"stderr","time":70.634812816,"data":"  Downloaded tracing v0.1.44\n"}
+,{"stream_name":"stderr","time":70.657041951,"data":"  Downloaded thiserror-impl v2.0.18\n"}
+,{"stream_name":"stderr","time":70.659233955,"data":"  Downloaded thiserror-impl v1.0.69\n"}
+,{"stream_name":"stderr","time":70.661091631,"data":"  Downloaded target-lexicon v0.13.5\n"}
+,{"stream_name":"stderr","time":70.663756924,"data":"  Downloaded polars-ops v0.53.0\n"}
+,{"stream_name":"stderr","time":70.680744686,"data":"  Downloaded object_store v0.13.2\n"}
+,{"stream_name":"stderr","time":70.693413949,"data":"  Downloaded objc2-metal v0.3.2\n"}
+,{"stream_name":"stderr","time":70.708274245,"data":"  Downloaded objc2-foundation v0.3.2\n"}
+,{"stream_name":"stderr","time":70.736860049,"data":"  Downloaded objc2-core-foundation v0.3.2\n"}
+,{"stream_name":"stderr","time":70.747184622,"data":"  Downloaded windows-future v0.3.2\n"}
+,{"stream_name":"stderr","time":70.749363254,"data":"  Downloaded windows-core v0.62.2\n"}
+,{"stream_name":"stderr","time":70.753469121,"data":"  Downloaded windows-collections v0.3.2\n"}
+,{"stream_name":"stderr","time":70.755400447,"data":"  Downloaded winapi-util v0.1.11\n"}
+,{"stream_name":"stderr","time":70.759632806,"data":"  Downloaded wgpu-naga-bridge v29.0.3\n"}
+,{"stream_name":"stderr","time":70.760980037,"data":"  Downloaded wgpu-core-deps-windows-linux-android v29.0.3\n"}
+,{"stream_name":"stderr","time":70.762501435,"data":"  Downloaded wgpu-core-deps-emscripten v29.0.3\n"}
+,{"stream_name":"stderr","time":70.763768557,"data":"  Downloaded wgpu-core-deps-apple v29.0.3\n"}
+,{"stream_name":"stderr","time":70.765138092,"data":"  Downloaded web-time v1.1.0\n"}
+,{"stream_name":"stderr","time":70.767664737,"data":"  Downloaded url v2.5.8\n"}
+,{"stream_name":"stderr","time":70.771435614,"data":"  Downloaded unicode_categories v0.1.1\n"}
+,{"stream_name":"stderr","time":70.774150406,"data":"  Downloaded tokio v1.52.3\n"}
+,{"stream_name":"stderr","time":70.838416174,"data":"  Downloaded tinystr v0.8.3\n"}
+,{"stream_name":"stderr","time":70.841211196,"data":"  Downloaded thiserror v2.0.18\n"}
+,{"stream_name":"stderr","time":70.849043658,"data":"  Downloaded thiserror v1.0.69\n"}
+,{"stream_name":"stderr","time":70.856087073,"data":"  Downloaded serde_urlencoded v0.7.1\n"}
+,{"stream_name":"stderr","time":70.861213285,"data":"  Downloaded objc2-io-kit v0.3.2\n"}
+,{"stream_name":"stderr","time":70.870041507,"data":"  Downloaded naga v29.0.3\n"}
+,{"stream_name":"stderr","time":70.90963626,"data":"  Downloaded linux-raw-sys v0.12.1\n"}
+,{"stream_name":"stderr","time":71.018241282,"data":"  Downloaded virtue v0.0.18\n"}
+,{"stream_name":"stderr","time":71.021642411,"data":"  Downloaded version_check v0.9.5\n"}
+,{"stream_name":"stderr","time":71.023429879,"data":"  Downloaded unty v0.0.4\n"}
+,{"stream_name":"stderr","time":71.024813272,"data":"  Downloaded untrusted v0.9.0\n"}
+,{"stream_name":"stderr","time":71.027235114,"data":"  Downloaded typenum v1.20.1\n"}
+,{"stream_name":"stderr","time":71.033338401,"data":"  Downloaded tracel-mlir-sys v20.1.4-7\n"}
+,{"stream_name":"stderr","time":71.0386377,"data":"  Downloaded tower-http v0.6.11\n"}
+,{"stream_name":"stderr","time":71.050975985,"data":"  Downloaded tokio-util v0.7.18\n"}
+,{"stream_name":"stderr","time":71.064338478,"data":"  Downloaded tinyvec v1.11.0\n"}
+,{"stream_name":"stderr","time":71.06825286,"data":"  Downloaded termcolor v1.4.1\n"}
+,{"stream_name":"stderr","time":71.070161776,"data":"  Downloaded shlex v1.3.0\n"}
+,{"stream_name":"stderr","time":71.072030768,"data":"  Downloaded sha2 v0.10.9\n"}
+,{"stream_name":"stderr","time":71.075458704,"data":"  Downloaded serde_stacker v0.1.14\n"}
+,{"stream_name":"stderr","time":71.080320642,"data":"  Downloaded serde_spanned v1.1.1\n"}
+,{"stream_name":"stderr","time":71.08197589,"data":"  Downloaded serde_derive v1.0.228\n"}
+,{"stream_name":"stderr","time":71.086366511,"data":"  Downloaded redox_users v0.5.2\n"}
+,{"stream_name":"stderr","time":71.088243097,"data":"  Downloaded num-bigint v0.4.6\n"}
+,{"stream_name":"stderr","time":71.094603197,"data":"  Downloaded ndarray v0.17.2\n"}
+,{"stream_name":"stderr","time":71.116922498,"data":"  Downloaded variadics_please v1.1.0\n"}
+,{"stream_name":"stderr","time":71.119601488,"data":"  Downloaded uuid v1.23.2\n"}
+,{"stream_name":"stderr","time":71.123676272,"data":"  Downloaded utf8_iter v1.0.4\n"}
+,{"stream_name":"stderr","time":71.12515692,"data":"  Downloaded unicode-xid v0.2.6\n"}
+,{"stream_name":"stderr","time":71.126905635,"data":"  Downloaded typed-arena v2.0.2\n"}
+,{"stream_name":"stderr","time":71.128754075,"data":"  Downloaded tynm v0.2.0\n"}
+,{"stream_name":"stderr","time":71.131436654,"data":"  Downloaded try-lock v0.2.5\n"}
+,{"stream_name":"stderr","time":71.133136017,"data":"  Downloaded tracing-core v0.1.36\n"}
+,{"stream_name":"stderr","time":71.142342366,"data":"  Downloaded tracing-attributes v0.1.31\n"}
+,{"stream_name":"stderr","time":71.146225612,"data":"  Downloaded tracel-tblgen-rs v20.1.4-7\n"}
+,{"stream_name":"stderr","time":71.151392572,"data":"  Downloaded tracel-mlir-rs-macros v20.1.4-7\n"}
+,{"stream_name":"stderr","time":71.157862526,"data":"  Downloaded tracel-mlir-rs v20.1.4-7\n"}
+,{"stream_name":"stderr","time":71.183560436,"data":"  Downloaded windows-sys v0.60.2\n"}
+,{"stream_name":"stderr","time":71.300749901,"data":"  Downloaded windows-sys v0.59.0\n"}
+,{"stream_name":"stderr","time":71.398267094,"data":"  Downloaded tracel-llvm-bundler v20.1.4-7\n"}
+,{"stream_name":"stderr","time":71.400319101,"data":"  Downloaded tracel-llvm v20.1.4-7\n"}
+,{"stream_name":"stderr","time":71.401522021,"data":"  Downloaded tower v0.5.3\n"}
+,{"stream_name":"stderr","time":71.42340955,"data":"  Downloaded toml_writer v1.1.1+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":71.425682476,"data":"  Downloaded toml_datetime v1.1.1+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":71.427425732,"data":"  Downloaded toml v1.1.2+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":71.435226044,"data":"  Downloaded tokio-rustls v0.26.4\n"}
+,{"stream_name":"stderr","time":71.438153577,"data":"  Downloaded security-framework v3.7.0\n"}
+,{"stream_name":"stderr","time":71.443625301,"data":"  Downloaded rustls-webpki v0.103.13\n"}
+,{"stream_name":"stderr","time":71.447886805,"data":"  Downloaded rustix v1.1.4\n"}
+,{"stream_name":"stderr","time":71.493137659,"data":"  Downloaded rmp v0.8.15\n"}
+,{"stream_name":"stderr","time":71.498225342,"data":"  Downloaded redox_syscall v0.5.18\n"}
+,{"stream_name":"stderr","time":71.502918764,"data":"  Downloaded recursive-proc-macro-impl v0.1.1\n"}
+,{"stream_name":"stderr","time":71.503810838,"data":"  Downloaded recursive v0.1.1\n"}
+,{"stream_name":"stderr","time":71.504973265,"data":"  Downloaded rawpointer v0.2.1\n"}
+,{"stream_name":"stderr","time":71.506207739,"data":"  Downloaded raw-window-metal v1.1.0\n"}
+,{"stream_name":"stderr","time":71.507725466,"data":"  Downloaded raw-window-handle v0.6.2\n"}
+,{"stream_name":"stderr","time":71.510292366,"data":"  Downloaded pyo3-build-config v0.27.2\n"}
+,{"stream_name":"stderr","time":71.512126231,"data":"  Downloaded profiling v1.0.18\n"}
+,{"stream_name":"stderr","time":71.513667337,"data":"  Downloaded proc-macro2 v1.0.106\n"}
+,{"stream_name":"stderr","time":71.517734285,"data":"  Downloaded presser v0.3.1\n"}
+,{"stream_name":"stderr","time":71.519874183,"data":"  Downloaded ppv-lite86 v0.2.21\n"}
+,{"stream_name":"stderr","time":71.528820885,"data":"  Downloaded potential_utf v0.1.5\n"}
+,{"stream_name":"stderr","time":71.530294624,"data":"  Downloaded portable-atomic-util v0.2.7\n"}
+,{"stream_name":"stderr","time":71.533079649,"data":"  Downloaded polars-ffi v0.53.0\n"}
+,{"stream_name":"stderr","time":71.53422019,"data":"  Downloaded ordered-float v5.3.0\n"}
+,{"stream_name":"stderr","time":71.536696457,"data":"  Downloaded once_cell v1.21.4\n"}
+,{"stream_name":"stderr","time":71.539893488,"data":"  Downloaded nom v8.0.0\n"}
+,{"stream_name":"stderr","time":71.54713972,"data":"  Downloaded windows-sys v0.61.2\n"}
+,{"stream_name":"stderr","time":71.644099841,"data":"  Downloaded ndk-sys v0.6.0+11769913\n"}
+,{"stream_name":"stderr","time":71.653893198,"data":"  Downloaded mio v1.2.1\n"}
+,{"stream_name":"stderr","time":71.664635234,"data":"  Downloaded unindent v0.2.4\n"}
+,{"stream_name":"stderr","time":71.666191692,"data":"  Downloaded type-map v0.5.1\n"}
+,{"stream_name":"stderr","time":71.667404698,"data":"  Downloaded tower-service v0.3.3\n"}
+,{"stream_name":"stderr","time":71.66853425,"data":"  Downloaded tower-layer v0.3.3\n"}
+,{"stream_name":"stderr","time":71.669919889,"data":"  Downloaded toml_parser v1.1.2+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":71.67308154,"data":"  Downloaded tokio-macros v2.7.0\n"}
+,{"stream_name":"stderr","time":71.674678581,"data":"  Downloaded tinyvec_macros v0.1.1\n"}
+,{"stream_name":"stderr","time":71.675799308,"data":"  Downloaded synstructure v0.13.2\n"}
+,{"stream_name":"stderr","time":71.677249567,"data":"  Downloaded sync_wrapper v1.0.2\n"}
+,{"stream_name":"stderr","time":71.67839717,"data":"  Downloaded syn v2.0.117\n"}
+,{"stream_name":"stderr","time":71.692426154,"data":"  Downloaded subtle v2.6.1\n"}
+,{"stream_name":"stderr","time":71.694145876,"data":"  Downloaded strum_macros v0.27.2\n"}
+,{"stream_name":"stderr","time":71.697375113,"data":"  Downloaded strsim v0.11.1\n"}
+,{"stream_name":"stderr","time":71.699125528,"data":"  Downloaded strength_reduce v0.2.4\n"}
+,{"stream_name":"stderr","time":71.700975642,"data":"  Downloaded streaming-decompression v0.1.2\n"}
+,{"stream_name":"stderr","time":71.703653546,"data":"  Downloaded static_assertions v1.1.0\n"}
+,{"stream_name":"stderr","time":71.705675186,"data":"  Downloaded stacker v0.1.24\n"}
+,{"stream_name":"stderr","time":71.708175096,"data":"  Downloaded stable_deref_trait v1.2.1\n"}
+,{"stream_name":"stderr","time":71.709369718,"data":"  Downloaded stable-vec v0.4.2\n"}
+,{"stream_name":"stderr","time":71.712464677,"data":"  Downloaded spirv v0.4.0+sdk-1.4.341.0\n"}
+,{"stream_name":"stderr","time":71.714240008,"data":"  Downloaded spin v0.10.0\n"}
+,{"stream_name":"stderr","time":71.717418548,"data":"  Downloaded socket2 v0.6.4\n"}
+,{"stream_name":"stderr","time":71.720053805,"data":"  Downloaded smallvec v1.15.1\n"}
+,{"stream_name":"stderr","time":71.722999776,"data":"  Downloaded slug v0.1.6\n"}
+,{"stream_name":"stderr","time":71.724215583,"data":"  Downloaded slotmap v1.1.1\n"}
+,{"stream_name":"stderr","time":71.727319816,"data":"  Downloaded slab v0.4.12\n"}
+,{"stream_name":"stderr","time":71.729140473,"data":"  Downloaded siphasher v1.0.3\n"}
+,{"stream_name":"stderr","time":71.730952102,"data":"  Downloaded simdutf8 v0.1.5\n"}
+,{"stream_name":"stderr","time":71.734048038,"data":"  Downloaded simd-adler32 v0.3.9\n"}
+,{"stream_name":"stderr","time":71.736500426,"data":"  Downloaded signal-hook-registry v1.4.8\n"}
+,{"stream_name":"stderr","time":71.738336411,"data":"  Downloaded signal-hook v0.4.4\n"}
+,{"stream_name":"stderr","time":71.741620964,"data":"  Downloaded shlex v2.0.1\n"}
+,{"stream_name":"stderr","time":71.74339822499999,"data":"  Downloaded serde v1.0.228\n"}
+,{"stream_name":"stderr","time":71.748196188,"data":"  Downloaded semver v1.0.28\n"}
+,{"stream_name":"stderr","time":71.751113713,"data":"  Downloaded security-framework-sys v2.17.0\n"}
+,{"stream_name":"stderr","time":71.754073037,"data":"  Downloaded sanitize-filename v0.6.0\n"}
+,{"stream_name":"stderr","time":71.755328446,"data":"  Downloaded rustls v0.23.40\n"}
+,{"stream_name":"stderr","time":71.772325132,"data":"  Downloaded rustc_version v0.4.1\n"}
+,{"stream_name":"stderr","time":71.774023541,"data":"  Downloaded rmp-serde v1.3.1\n"}
+,{"stream_name":"stderr","time":71.776626059,"data":"  Downloaded renderdoc-sys v1.1.0\n"}
+,{"stream_name":"stderr","time":71.777941937,"data":"  Downloaded rand v0.9.4\n"}
+,{"stream_name":"stderr","time":71.783335365,"data":"  Downloaded quick-xml v0.39.2\n"}
+,{"stream_name":"stderr","time":71.791866754,"data":"  Downloaded psm v0.1.31\n"}
+,{"stream_name":"stderr","time":71.796199853,"data":"  Downloaded polars-schema v0.53.0\n"}
+,{"stream_name":"stderr","time":71.797686619,"data":"  Downloaded polars-row v0.53.0\n"}
+,{"stream_name":"stderr","time":71.800507233,"data":"  Downloaded polars-parquet-format v0.1.0\n"}
+,{"stream_name":"stderr","time":71.804166782,"data":"  Downloaded oneshot v0.2.1\n"}
+,{"stream_name":"stderr","time":71.808905959,"data":"  Downloaded objc2-quartz-core v0.3.2\n"}
+,{"stream_name":"stderr","time":71.813252792,"data":"  Downloaded objc2-encode v4.1.0\n"}
+,{"stream_name":"stderr","time":71.815188803,"data":"  Downloaded nom v7.1.3\n"}
+,{"stream_name":"stderr","time":71.82235527,"data":"  Downloaded miniz_oxide v0.8.9\n"}
+,{"stream_name":"stderr","time":71.825864958,"data":"  Downloaded minimal-lexical v0.2.1\n"}
+,{"stream_name":"stderr","time":71.831978963,"data":"  Downloaded memchr v2.8.1\n"}
+,{"stream_name":"stderr","time":71.839225581,"data":"  Downloaded lz4-sys v1.11.1+lz4-1.10.0\n"}
+,{"stream_name":"stderr","time":71.864399671,"data":"  Downloaded liblzma-sys v0.4.6\n"}
+,{"stream_name":"stderr","time":71.926308891,"data":"  Downloaded serde_core v1.0.228\n"}
+,{"stream_name":"stderr","time":71.930763484,"data":"  Downloaded serde_bytes v0.11.19\n"}
+,{"stream_name":"stderr","time":71.932956452,"data":"  Downloaded scopeguard v1.2.0\n"}
+,{"stream_name":"stderr","time":71.93448631,"data":"  Downloaded same-file v1.0.6\n"}
+,{"stream_name":"stderr","time":71.936546815,"data":"  Downloaded rustversion v1.0.22\n"}
+,{"stream_name":"stderr","time":71.940322661,"data":"  Downloaded rustls-pki-types v1.14.1\n"}
+,{"stream_name":"stderr","time":71.943732175,"data":"  Downloaded rustls-native-certs v0.8.3\n"}
+,{"stream_name":"stderr","time":71.946744061,"data":"  Downloaded rustc-hash v2.1.2\n"}
+,{"stream_name":"stderr","time":71.948479689,"data":"  Downloaded rustc-hash v1.1.0\n"}
+,{"stream_name":"stderr","time":71.949662627,"data":"  Downloaded rustc-demangle v0.1.27\n"}
+,{"stream_name":"stderr","time":71.952088804,"data":"  Downloaded raw-cpuid v11.6.0\n"}
+,{"stream_name":"stderr","time":71.956898283,"data":"  Downloaded rand_distr v0.5.1\n"}
+,{"stream_name":"stderr","time":71.96147557,"data":"  Downloaded rand v0.10.1\n"}
+,{"stream_name":"stderr","time":71.966734732,"data":"  Downloaded quinn-proto v0.11.14\n"}
+,{"stream_name":"stderr","time":71.976323185,"data":"  Downloaded quinn v0.11.9\n"}
+,{"stream_name":"stderr","time":71.981197529,"data":"  Downloaded pyo3-macros v0.27.2\n"}
+,{"stream_name":"stderr","time":71.982951926,"data":"  Downloaded polars-mem-engine v0.53.0\n"}
+,{"stream_name":"stderr","time":71.989072449,"data":"  Downloaded polars-core v0.53.0\n"}
+,{"stream_name":"stderr","time":72.019129875,"data":"  Downloaded polars-arrow v0.53.0\n"}
+,{"stream_name":"stderr","time":72.047141691,"data":"  Downloaded polars v0.53.0\n"}
+,{"stream_name":"stderr","time":72.065659709,"data":"  Downloaded petgraph v0.8.3\n"}
+,{"stream_name":"stderr","time":72.092773774,"data":"  Downloaded paste v1.0.15\n"}
+,{"stream_name":"stderr","time":72.097174279,"data":"  Downloaded parking_lot_core v0.9.12\n"}
+,{"stream_name":"stderr","time":72.10012691,"data":"  Downloaded parking_lot v0.12.5\n"}
+,{"stream_name":"stderr","time":72.10373721,"data":"  Downloaded parking v2.2.1\n"}
+,{"stream_name":"stderr","time":72.105223761,"data":"  Downloaded option-ext v0.2.0\n"}
+,{"stream_name":"stderr","time":72.106419481,"data":"  Downloaded openssl-probe v0.2.1\n"}
+,{"stream_name":"stderr","time":72.108073749,"data":"  Downloaded num_cpus v1.17.0\n"}
+,{"stream_name":"stderr","time":72.111885034,"data":"  Downloaded num-traits v0.2.19\n"}
+,{"stream_name":"stderr","time":72.11541836,"data":"  Downloaded num-rational v0.4.2\n"}
+,{"stream_name":"stderr","time":72.117238054,"data":"  Downloaded num-iter v0.1.45\n"}
+,{"stream_name":"stderr","time":72.118575956,"data":"  Downloaded num-integer v0.1.46\n"}
+,{"stream_name":"stderr","time":72.121602494,"data":"  Downloaded ryu v1.0.23\n"}
+,{"stream_name":"stderr","time":72.126100653,"data":"  Downloaded range-alloc v0.1.5\n"}
+,{"stream_name":"stderr","time":72.127645329,"data":"  Downloaded rand_core v0.10.1\n"}
+,{"stream_name":"stderr","time":72.129719693,"data":"  Downloaded rand_core v0.9.5\n"}
+,{"stream_name":"stderr","time":72.131527289,"data":"  Downloaded rand_chacha v0.9.0\n"}
+,{"stream_name":"stderr","time":72.133051346,"data":"  Downloaded r-efi v6.0.0\n"}
+,{"stream_name":"stderr","time":72.139684557,"data":"  Downloaded r-efi v5.3.0\n"}
+,{"stream_name":"stderr","time":72.146129026,"data":"  Downloaded quote v1.0.45\n"}
+,{"stream_name":"stderr","time":72.149620631,"data":"  Downloaded quinn-udp v0.5.14\n"}
+,{"stream_name":"stderr","time":72.151920884,"data":"  Downloaded pyo3-polars v0.26.0\n"}
+,{"stream_name":"stderr","time":72.153803977,"data":"  Downloaded polars-compute v0.53.0\n"}
+,{"stream_name":"stderr","time":72.164862549,"data":"  Downloaded polars-arrow-format v0.2.1\n"}
+,{"stream_name":"stderr","time":72.168606372,"data":"  Downloaded num-complex v0.4.6\n"}
+,{"stream_name":"stderr","time":72.170591746,"data":"  Downloaded ntapi v0.4.3\n"}
+,{"stream_name":"stderr","time":72.176884184,"data":"  Downloaded libmimalloc-sys v0.1.49\n"}
+,{"stream_name":"stderr","time":72.198633963,"data":"  Downloaded libc v0.2.186\n"}
+,{"stream_name":"stderr","time":72.250909615,"data":"  Downloaded gimli v0.32.3\n"}
+,{"stream_name":"stderr","time":72.260846206,"data":"  Downloaded polars-dtype v0.53.0\n"}
+,{"stream_name":"stderr","time":72.262405797,"data":"  Downloaded polars-buffer v0.53.0\n"}
+,{"stream_name":"stderr","time":72.263684402,"data":"  Downloaded planus v1.1.1\n"}
+,{"stream_name":"stderr","time":72.267548969,"data":"  Downloaded pkg-config v0.3.33\n"}
+,{"stream_name":"stderr","time":72.269400699,"data":"  Downloaded pin-project-lite v0.2.17\n"}
+,{"stream_name":"stderr","time":72.277893312,"data":"  Downloaded phf_shared v0.12.1\n"}
+,{"stream_name":"stderr","time":72.279108872,"data":"  Downloaded phf v0.12.1\n"}
+,{"stream_name":"stderr","time":72.280755714,"data":"  Downloaded percent-encoding v2.3.2\n"}
+,{"stream_name":"stderr","time":72.281914263,"data":"  Downloaded num-derive v0.4.2\n"}
+,{"stream_name":"stderr","time":72.284167346,"data":"  Downloaded now v0.1.3\n"}
+,{"stream_name":"stderr","time":72.285925133,"data":"  Downloaded nb v0.1.3\n"}
+,{"stream_name":"stderr","time":72.287734574,"data":"  Downloaded mimalloc v0.1.52\n"}
+,{"stream_name":"stderr","time":72.288927225,"data":"  Downloaded memoffset v0.9.1\n"}
+,{"stream_name":"stderr","time":72.290494898,"data":"  Downloaded memmap2 v0.9.10\n"}
+,{"stream_name":"stderr","time":72.29278728,"data":"  Downloaded libm v0.2.16\n"}
+,{"stream_name":"stderr","time":72.30825421,"data":"  Downloaded khronos_api v3.1.0\n"}
+,{"stream_name":"stderr","time":72.33552655,"data":"  Downloaded js-sys v0.3.99\n"}
+,{"stream_name":"stderr","time":72.340998833,"data":"  Downloaded itertools v0.14.0\n"}
+,{"stream_name":"stderr","time":72.351844003,"data":"  Downloaded itertools v0.13.0\n"}
+,{"stream_name":"stderr","time":72.361241992,"data":"  Downloaded indexmap v2.14.0\n"}
+,{"stream_name":"stderr","time":72.366953683,"data":"  Downloaded idna v1.1.0\n"}
+,{"stream_name":"stderr","time":72.373746629,"data":"  Downloaded icu_properties_data v2.2.0\n"}
+,{"stream_name":"stderr","time":72.393536097,"data":"  Downloaded icu_collections v2.2.0\n"}
+,{"stream_name":"stderr","time":72.40150816,"data":"  Downloaded hyper-util v0.1.20\n"}
+,{"stream_name":"stderr","time":72.416158085,"data":"  Downloaded hyper v1.10.1\n"}
+,{"stream_name":"stderr","time":72.428397518,"data":"  Downloaded http v1.4.1\n"}
+,{"stream_name":"stderr","time":72.433278148,"data":"  Downloaded hashbrown v0.17.1\n"}
+,{"stream_name":"stderr","time":72.440737988,"data":"  Downloaded hashbrown v0.16.1\n"}
+,{"stream_name":"stderr","time":72.447944646,"data":"  Downloaded hashbrown v0.15.5\n"}
+,{"stream_name":"stderr","time":72.45475654,"data":"  Downloaded h2 v0.4.14\n"}
+,{"stream_name":"stderr","time":72.463832326,"data":"  Downloaded gpu-allocator v0.28.0\n"}
+,{"stream_name":"stderr","time":72.468236475,"data":"  Downloaded glow v0.17.0\n"}
+,{"stream_name":"stderr","time":72.474853912,"data":"  Downloaded futures-util v0.3.32\n"}
+,{"stream_name":"stderr","time":72.495575141,"data":"  Downloaded flate2 v1.1.9\n"}
+,{"stream_name":"stderr","time":72.502535497,"data":"  Downloaded cubecl-hip-sys v7.1.5280200\n"}
+,{"stream_name":"stderr","time":72.519469386,"data":"  Downloaded chrono-tz v0.10.4\n"}
+,{"stream_name":"stderr","time":72.541219365,"data":"  Downloaded nb v1.1.0\n"}
+,{"stream_name":"stderr","time":72.544064534,"data":"  Downloaded matrixmultiply v0.3.10\n"}
+,{"stream_name":"stderr","time":72.551297482,"data":"  Downloaded lru-slab v0.1.2\n"}
+,{"stream_name":"stderr","time":72.552406544,"data":"  Downloaded log v0.4.32\n"}
+,{"stream_name":"stderr","time":72.556130207,"data":"  Downloaded litrs v1.0.0\n"}
+,{"stream_name":"stderr","time":72.559857,"data":"  Downloaded litemap v0.8.2\n"}
+,{"stream_name":"stderr","time":72.563082658,"data":"  Downloaded ipnet v2.12.0\n"}
+,{"stream_name":"stderr","time":72.565475883,"data":"  Downloaded icu_provider v2.2.0\n"}
+,{"stream_name":"stderr","time":72.569106426,"data":"  Downloaded icu_properties v2.2.0\n"}
+,{"stream_name":"stderr","time":72.572373415,"data":"  Downloaded icu_normalizer_data v2.2.0\n"}
+,{"stream_name":"stderr","time":72.57540818,"data":"  Downloaded icu_normalizer v2.2.0\n"}
+,{"stream_name":"stderr","time":72.580204322,"data":"  Downloaded icu_locale_core v2.2.0\n"}
+,{"stream_name":"stderr","time":72.589460008,"data":"  Downloaded iana-time-zone v0.1.65\n"}
+,{"stream_name":"stderr","time":72.593143975,"data":"  Downloaded hyper-rustls v0.27.9\n"}
+,{"stream_name":"stderr","time":72.595210429,"data":"  Downloaded httparse v1.10.1\n"}
+,{"stream_name":"stderr","time":72.598571168,"data":"  Downloaded half v2.7.1\n"}
+,{"stream_name":"stderr","time":72.602107363,"data":"  Downloaded getrandom v0.4.2\n"}
+,{"stream_name":"stderr","time":72.606990625,"data":"  Downloaded getrandom v0.3.4\n"}
+,{"stream_name":"stderr","time":72.611418935,"data":"  Downloaded getrandom v0.2.17\n"}
+,{"stream_name":"stderr","time":72.615294249,"data":"  Downloaded futures-lite v2.6.1\n"}
+,{"stream_name":"stderr","time":72.617795654,"data":"  Downloaded futures-channel v0.3.32\n"}
+,{"stream_name":"stderr","time":72.620214437,"data":"  Downloaded futures v0.3.32\n"}
+,{"stream_name":"stderr","time":72.626347599,"data":"  Downloaded fs4 v0.13.1\n"}
+,{"stream_name":"stderr","time":72.630967584,"data":"  Downloaded fast-float2 v0.2.3\n"}
+,{"stream_name":"stderr","time":72.634253818,"data":"  Downloaded event-listener v5.4.1\n"}
+,{"stream_name":"stderr","time":72.636905444,"data":"  Downloaded ethnum v1.5.3\n"}
+,{"stream_name":"stderr","time":72.642194826,"data":"  Downloaded enumset_derive v0.15.0\n"}
+,{"stream_name":"stderr","time":72.64361823,"data":"  Downloaded entities v1.0.1\n"}
+,{"stream_name":"stderr","time":72.645203196,"data":"  Downloaded embedded-hal v1.0.0\n"}
+,{"stream_name":"stderr","time":72.647183191,"data":"  Downloaded embedded-hal v0.2.7\n"}
+,{"stream_name":"stderr","time":72.651053152,"data":"  Downloaded cudarc v0.19.7\n"}
+,{"stream_name":"stderr","time":72.67681033,"data":"  Downloaded ash v0.38.0+1.3.281\n"}
+,{"stream_name":"stderr","time":72.697198172,"data":"  Downloaded lz4 v1.28.1\n"}
+,{"stream_name":"stderr","time":72.699198163,"data":"  Downloaded lock_api v0.4.14\n"}
+,{"stream_name":"stderr","time":72.700923767,"data":"  Downloaded libredox v0.1.17\n"}
+,{"stream_name":"stderr","time":72.702000062,"data":"  Downloaded jobserver v0.1.34\n"}
+,{"stream_name":"stderr","time":72.704536892,"data":"  Downloaded jni-sys v0.3.1\n"}
+,{"stream_name":"stderr","time":72.705917372,"data":"  Downloaded indoc v2.0.7\n"}
+,{"stream_name":"stderr","time":72.709749891,"data":"  Downloaded humantime v2.3.0\n"}
+,{"stream_name":"stderr","time":72.711952708,"data":"  Downloaded http-body-util v0.1.3\n"}
+,{"stream_name":"stderr","time":72.714161406,"data":"  Downloaded home v0.5.12\n"}
+,{"stream_name":"stderr","time":72.715469087,"data":"  Downloaded hermit-abi v0.5.2\n"}
+,{"stream_name":"stderr","time":72.716724129,"data":"  Downloaded heck v0.5.0\n"}
+,{"stream_name":"stderr","time":72.718399326,"data":"  Downloaded gpu-descriptor v0.3.2\n"}
+,{"stream_name":"stderr","time":72.719557377,"data":"  Downloaded gl_generator v0.14.0\n"}
+,{"stream_name":"stderr","time":72.721666009,"data":"  Downloaded form_urlencoded v1.2.2\n"}
+,{"stream_name":"stderr","time":72.722785233,"data":"  Downloaded foldhash v0.2.0\n"}
+,{"stream_name":"stderr","time":72.724390284,"data":"  Downloaded foldhash v0.1.5\n"}
+,{"stream_name":"stderr","time":72.725989259,"data":"  Downloaded float8 v0.7.0\n"}
+,{"stream_name":"stderr","time":72.72816514,"data":"  Downloaded float4 v0.2.0\n"}
+,{"stream_name":"stderr","time":72.729832143,"data":"  Downloaded float-ord v0.3.2\n"}
+,{"stream_name":"stderr","time":72.731105785,"data":"  Downloaded fixedbitset v0.5.7\n"}
+,{"stream_name":"stderr","time":72.733493322,"data":"  Downloaded find-msvc-tools v0.1.9\n"}
+,{"stream_name":"stderr","time":72.735772013,"data":"  Downloaded filetime v0.2.29\n"}
+,{"stream_name":"stderr","time":72.73787108,"data":"  Downloaded fastrand v2.4.1\n"}
+,{"stream_name":"stderr","time":72.739714971,"data":"  Downloaded equivalent v1.0.2\n"}
+,{"stream_name":"stderr","time":72.741060299,"data":"  Downloaded deunicode v1.6.2\n"}
+,{"stream_name":"stderr","time":72.745309661,"data":"  Downloaded derive_more-impl v2.1.1\n"}
+,{"stream_name":"stderr","time":72.752659468,"data":"  Downloaded derive_more v2.1.1\n"}
+,{"stream_name":"stderr","time":72.76940858,"data":"  Downloaded cubecl-cpp v0.10.0\n"}
+,{"stream_name":"stderr","time":72.776000777,"data":"  Downloaded cubecl-core v0.10.0\n"}
+,{"stream_name":"stderr","time":72.790570725,"data":"  Downloaded comrak v0.39.1\n"}
+,{"stream_name":"stderr","time":72.803192911,"data":"  Downloaded compact_str v0.9.1\n"}
+,{"stream_name":"stderr","time":72.808059056,"data":"  Downloaded chrono v0.4.41\n"}
+,{"stream_name":"stderr","time":72.818290521,"data":"  Downloaded bumpalo v3.20.3\n"}
+,{"stream_name":"stderr","time":72.822559607,"data":"  Downloaded blake3 v1.8.5\n"}
+,{"stream_name":"stderr","time":72.833635406,"data":"  Downloaded bindgen v0.71.1\n"}
+,{"stream_name":"stderr","time":72.842812104,"data":"  Downloaded argminmax v0.6.3\n"}
+,{"stream_name":"stderr","time":72.848279457,"data":"  Downloaded aho-corasick v1.1.4\n"}
+,{"stream_name":"stderr","time":72.855933063,"data":"  Downloaded libloading v0.9.0\n"}
+,{"stream_name":"stderr","time":72.85905628,"data":"  Downloaded libloading v0.8.9\n"}
+,{"stream_name":"stderr","time":72.862083832,"data":"  Downloaded leb128fmt v0.1.0\n"}
+,{"stream_name":"stderr","time":72.863423373,"data":"  Downloaded khronos-egl v6.0.0\n"}
+,{"stream_name":"stderr","time":72.866027162,"data":"  Downloaded jni-sys-macros v0.4.1\n"}
+,{"stream_name":"stderr","time":72.86714049,"data":"  Downloaded itoa v1.0.18\n"}
+,{"stream_name":"stderr","time":72.869241793,"data":"  Downloaded inflections v1.1.1\n"}
+,{"stream_name":"stderr","time":72.870503,"data":"  Downloaded idna_adapter v1.2.2\n"}
+,{"stream_name":"stderr","time":72.871766543,"data":"  Downloaded ident_case v1.0.1\n"}
+,{"stream_name":"stderr","time":72.873001667,"data":"  Downloaded id-arena v2.3.0\n"}
+,{"stream_name":"stderr","time":72.874789408,"data":"  Downloaded iana-time-zone-haiku v0.1.2\n"}
+,{"stream_name":"stderr","time":72.884013239,"data":"  Downloaded hexf-parse v0.2.1\n"}
+,{"stream_name":"stderr","time":72.88493165,"data":"  Downloaded gpu-descriptor-types v0.2.0\n"}
+,{"stream_name":"stderr","time":72.885910099,"data":"  Downloaded glutin_wgl_sys v0.6.1\n"}
+,{"stream_name":"stderr","time":72.886982963,"data":"  Downloaded futures-sink v0.3.32\n"}
+,{"stream_name":"stderr","time":72.888197495,"data":"  Downloaded event-listener-strategy v0.5.4\n"}
+,{"stream_name":"stderr","time":72.889759249,"data":"  Downloaded errno v0.3.14\n"}
+,{"stream_name":"stderr","time":72.891658421,"data":"  Downloaded enumset v1.1.13\n"}
+,{"stream_name":"stderr","time":72.893878953,"data":"  Downloaded embedded-hal-async v1.0.0\n"}
+,{"stream_name":"stderr","time":72.895403476,"data":"  Downloaded embassy-time-driver v0.2.2\n"}
+,{"stream_name":"stderr","time":72.896917677,"data":"  Downloaded darling_core v0.23.0\n"}
+,{"stream_name":"stderr","time":72.90410272,"data":"  Downloaded darling_core v0.21.3\n"}
+,{"stream_name":"stderr","time":72.911370908,"data":"  Downloaded darling v0.23.0\n"}
+,{"stream_name":"stderr","time":72.918524387,"data":"  Downloaded cubecl-std v0.10.0\n"}
+,{"stream_name":"stderr","time":72.925149416,"data":"  Downloaded cubecl-runtime v0.10.0\n"}
+,{"stream_name":"stderr","time":72.933796311,"data":"  Downloaded cubecl-macros v0.10.0\n"}
+,{"stream_name":"stderr","time":72.939258121,"data":"  Downloaded cubecl-ir v0.10.0\n"}
+,{"stream_name":"stderr","time":72.942710594,"data":"  Downloaded cubecl-cpu v0.10.0\n"}
+,{"stream_name":"stderr","time":72.948100467,"data":"  Downloaded cubecl-common v0.10.0\n"}
+,{"stream_name":"stderr","time":72.954394513,"data":"  Downloaded crossbeam-channel v0.5.15\n"}
+,{"stream_name":"stderr","time":72.959972501,"data":"  Downloaded codespan-reporting v0.13.1\n"}
+,{"stream_name":"stderr","time":72.96979179,"data":"  Downloaded clang-sys v1.8.1\n"}
+,{"stream_name":"stderr","time":72.972936072,"data":"  Downloaded ciborium v0.2.2\n"}
+,{"stream_name":"stderr","time":72.976065392,"data":"  Downloaded cc v1.2.63\n"}
+,{"stream_name":"stderr","time":72.980116553,"data":"  Downloaded bytes v1.11.1\n"}
+,{"stream_name":"stderr","time":72.985854804,"data":"  Downloaded bytemuck v1.25.0\n"}
+,{"stream_name":"stderr","time":72.990207353,"data":"  Downloaded boxcar v0.2.14\n"}
+,{"stream_name":"stderr","time":72.992474852,"data":"  Downloaded block2 v0.6.2\n"}
+,{"stream_name":"stderr","time":72.995002011,"data":"  Downloaded bitflags v2.12.1\n"}
+,{"stream_name":"stderr","time":73.000623286,"data":"  Downloaded bincode v2.0.1\n"}
+,{"stream_name":"stderr","time":73.007631209,"data":"  Downloaded backtrace v0.3.76\n"}
+,{"stream_name":"stderr","time":73.014113657,"data":"  Downloaded async-trait v0.1.89\n"}
+,{"stream_name":"stderr","time":73.018787625,"data":"  Downloaded arrayvec v0.7.6\n"}
+,{"stream_name":"stderr","time":73.021429145,"data":"  Downloaded http-body v1.0.1\n"}
+,{"stream_name":"stderr","time":73.022631385,"data":"  Downloaded glob v0.3.3\n"}
+,{"stream_name":"stderr","time":73.024717313,"data":"  Downloaded futures-task v0.3.32\n"}
+,{"stream_name":"stderr","time":73.026229556,"data":"  Downloaded futures-macro v0.3.32\n"}
+,{"stream_name":"stderr","time":73.027579949,"data":"  Downloaded futures-io v0.3.32\n"}
+,{"stream_name":"stderr","time":73.028844367,"data":"  Downloaded futures-executor v0.3.32\n"}
+,{"stream_name":"stderr","time":73.030621303,"data":"  Downloaded futures-core v0.3.32\n"}
+,{"stream_name":"stderr","time":73.032383099,"data":"  Downloaded fnv v1.0.7\n"}
+,{"stream_name":"stderr","time":73.033506932,"data":"  Downloaded fallible-streaming-iterator v0.1.9\n"}
+,{"stream_name":"stderr","time":73.034650163,"data":"  Downloaded embassy-time v0.5.1\n"}
+,{"stream_name":"stderr","time":73.037231783,"data":"  Downloaded either v1.16.0\n"}
+,{"stream_name":"stderr","time":73.039047824,"data":"  Downloaded displaydoc v0.2.6\n"}
+,{"stream_name":"stderr","time":73.041850774,"data":"  Downloaded dispatch2 v0.3.1\n"}
+,{"stream_name":"stderr","time":73.045195382,"data":"  Downloaded dirs v6.0.0\n"}
+,{"stream_name":"stderr","time":73.046836112,"data":"  Downloaded digest v0.10.7\n"}
+,{"stream_name":"stderr","time":73.049311501,"data":"  Downloaded darling v0.21.3\n"}
+,{"stream_name":"stderr","time":73.056079764,"data":"  Downloaded cubecl-zspace v0.10.0\n"}
+,{"stream_name":"stderr","time":73.057930236,"data":"  Downloaded cubecl-wgpu v0.10.0\n"}
+,{"stream_name":"stderr","time":73.062757269,"data":"  Downloaded cubecl-opt v0.10.0\n"}
+,{"stream_name":"stderr","time":73.066934873,"data":"  Downloaded cubecl-macros-internal v0.10.0\n"}
+,{"stream_name":"stderr","time":73.068579084,"data":"  Downloaded cubecl-cuda v0.10.0\n"}
+,{"stream_name":"stderr","time":73.071771523,"data":"  Downloaded cubecl v0.10.0\n"}
+,{"stream_name":"stderr","time":73.073609064,"data":"  Downloaded crypto-common v0.1.7\n"}
+,{"stream_name":"stderr","time":73.074923215,"data":"  Downloaded crossbeam-utils v0.8.21\n"}
+,{"stream_name":"stderr","time":73.078280902,"data":"  Downloaded crossbeam-epoch v0.9.18\n"}
+,{"stream_name":"stderr","time":73.081414243,"data":"  Downloaded crc32fast v1.5.0\n"}
+,{"stream_name":"stderr","time":73.083825423,"data":"  Downloaded windows v0.62.2\n"}
+,{"stream_name":"stderr","time":73.434837235,"data":"  Downloaded core-foundation v0.10.1\n"}
+,{"stream_name":"stderr","time":73.437612567,"data":"  Downloaded chacha20 v0.10.0\n"}
+,{"stream_name":"stderr","time":73.440841676,"data":"  Downloaded cfg_aliases v0.2.1\n"}
+,{"stream_name":"stderr","time":73.442342003,"data":"  Downloaded cexpr v0.6.0\n"}
+,{"stream_name":"stderr","time":73.444997591,"data":"  Downloaded castaway v0.2.4\n"}
+,{"stream_name":"stderr","time":73.446740688,"data":"  Downloaded bytemuck_derive v1.10.2\n"}
+,{"stream_name":"stderr","time":73.448475305,"data":"  Downloaded bit-vec v0.9.1\n"}
+,{"stream_name":"stderr","time":73.450807897,"data":"  Downloaded bincode_derive v2.0.1\n"}
+,{"stream_name":"stderr","time":73.452046254,"data":"  Downloaded base64 v0.22.1\n"}
+,{"stream_name":"stderr","time":73.457659371,"data":"  Downloaded autocfg v1.5.1\n"}
+,{"stream_name":"stderr","time":73.459970948,"data":"  Downloaded atomic-waker v1.1.2\n"}
+,{"stream_name":"stderr","time":73.461450336,"data":"  Downloaded async-stream v0.3.6\n"}
+,{"stream_name":"stderr","time":73.464005787,"data":"  Downloaded async-channel v2.5.0\n"}
+,{"stream_name":"stderr","time":73.465670703,"data":"  Downloaded arrayref v0.3.9\n"}
+,{"stream_name":"stderr","time":73.46732991,"data":"  Downloaded ar_archive_writer v0.5.1\n"}
+,{"stream_name":"stderr","time":73.471786366,"data":"  Downloaded dlib v0.5.3\n"}
+,{"stream_name":"stderr","time":73.473077041,"data":"  Downloaded dirs-sys v0.5.0\n"}
+,{"stream_name":"stderr","time":73.474484889,"data":"  Downloaded derive-new v0.7.0\n"}
+,{"stream_name":"stderr","time":73.47572284,"data":"  Downloaded debug_unsafe v0.1.4\n"}
+,{"stream_name":"stderr","time":73.47711754,"data":"  Downloaded darling_macro v0.23.0\n"}
+,{"stream_name":"stderr","time":73.477992354,"data":"  Downloaded darling_macro v0.21.3\n"}
+,{"stream_name":"stderr","time":73.478867021,"data":"  Downloaded crunchy v0.2.4\n"}
+,{"stream_name":"stderr","time":73.479900633,"data":"  Downloaded crossbeam-queue v0.3.12\n"}
+,{"stream_name":"stderr","time":73.481452981,"data":"  Downloaded critical-section v1.2.0\n"}
+,{"stream_name":"stderr","time":73.483583555,"data":"  Downloaded cpufeatures v0.2.17\n"}
+,{"stream_name":"stderr","time":73.485327092,"data":"  Downloaded ciborium-io v0.2.2\n"}
+,{"stream_name":"stderr","time":73.486307221,"data":"  Downloaded cfg-if v1.0.4\n"}
+,{"stream_name":"stderr","time":73.487919031,"data":"  Downloaded caseless v0.2.2\n"}
+,{"stream_name":"stderr","time":73.489624447,"data":"  Downloaded bit-set v0.9.1\n"}
+,{"stream_name":"stderr","time":73.491467254,"data":"  Downloaded atoi_simd v0.17.0\n"}
+,{"stream_name":"stderr","time":73.49350702,"data":"  Downloaded array-init-cursor v0.2.1\n"}
+,{"stream_name":"stderr","time":73.494606151,"data":"  Downloaded dyn-clone v1.0.20\n"}
+,{"stream_name":"stderr","time":73.497044916,"data":"  Downloaded cubecl-hip v0.10.0\n"}
+,{"stream_name":"stderr","time":73.499752934,"data":"  Downloaded core-foundation-sys v0.8.7\n"}
+,{"stream_name":"stderr","time":73.504130639,"data":"  Downloaded ahash v0.8.12\n"}
+,{"stream_name":"stderr","time":73.507320999,"data":"  Downloaded addr2line v0.25.1\n"}
+,{"stream_name":"stderr","time":73.509773649,"data":"  Downloaded cpufeatures v0.3.0\n"}
+,{"stream_name":"stderr","time":73.511687425,"data":"  Downloaded convert_case v0.10.0\n"}
+,{"stream_name":"stderr","time":73.513800272,"data":"  Downloaded convert_case v0.8.0\n"}
+,{"stream_name":"stderr","time":73.515783151,"data":"  Downloaded constant_time_eq v0.4.2\n"}
+,{"stream_name":"stderr","time":73.518407805,"data":"  Downloaded constcat v0.6.1\n"}
+,{"stream_name":"stderr","time":73.519410158,"data":"  Downloaded concurrent-queue v2.5.0\n"}
+,{"stream_name":"stderr","time":73.521531362,"data":"  Downloaded allocator-api2 v0.2.21\n"}
+,{"stream_name":"stderr","time":73.524993603,"data":"  Downloaded block-buffer v0.10.4\n"}
+,{"stream_name":"stderr","time":73.526398751,"data":"  Downloaded async-stream-impl v0.3.6\n"}
+,{"stream_name":"stderr","time":73.74123791,"data":"🍹 Building a mixed python/rust project\n"}
+,{"stream_name":"stderr","time":73.973784256,"data":"🐍 Found CPython 3.12 at /usr/bin/python3\n"}
+,{"stream_name":"stderr","time":73.976110306,"data":"🔗 Found pyo3 bindings with abi3-py3.11 support\n"}
+,{"stream_name":"stderr","time":73.976132719,"data":"📡 Using build options bindings from pyproject.toml\n"}
+,{"stream_name":"stderr","time":74.835487951,"data":"   Compiling proc-macro2 v1.0.106\n"}
+,{"stream_name":"stderr","time":74.835520717,"data":"   Compiling quote v1.0.45\n"}
+,{"stream_name":"stderr","time":74.988841583,"data":"   Compiling unicode-ident v1.0.24\n"}
+,{"stream_name":"stderr","time":75.06424667,"data":"   Compiling libc v0.2.186\n"}
+,{"stream_name":"stderr","time":75.786408143,"data":"   Compiling syn v2.0.117\n"}
+,{"stream_name":"stderr","time":76.110865764,"data":"   Compiling version_check v0.9.5\n"}
+,{"stream_name":"stderr","time":76.323390327,"data":"   Compiling memchr v2.8.1\n"}
+,{"stream_name":"stderr","time":76.859355884,"data":"   Compiling jobserver v0.1.34\n"}
+,{"stream_name":"stderr","time":77.123014118,"data":"   Compiling autocfg v1.5.1\n"}
+,{"stream_name":"stderr","time":77.400769931,"data":"   Compiling find-msvc-tools v0.1.9\n"}
+,{"stream_name":"stderr","time":77.562797705,"data":"   Compiling shlex v2.0.1\n"}
+,{"stream_name":"stderr","time":77.673689377,"data":"   Compiling cc v1.2.63\n"}
+,{"stream_name":"stderr","time":79.068651691,"data":"   Compiling serde_core v1.0.228\n"}
+,{"stream_name":"stderr","time":81.042853813,"data":"   Compiling serde_derive v1.0.228\n"}
+,{"stream_name":"stderr","time":82.090942054,"data":"   Compiling libm v0.2.16\n"}
+,{"stream_name":"stderr","time":82.283380365,"data":"   Compiling cfg-if v1.0.4\n"}
+,{"stream_name":"stderr","time":83.180983537,"data":"   Compiling zmij v1.0.21\n"}
+,{"stream_name":"stderr","time":83.303801897,"data":"   Compiling num-traits v0.2.19\n"}
+,{"stream_name":"stderr","time":83.863068902,"data":"   Compiling zerocopy v0.8.50\n"}
+,{"stream_name":"stderr","time":84.100426446,"data":"   Compiling serde v1.0.228\n"}
+,{"stream_name":"stderr","time":84.298230886,"data":"   Compiling zerocopy-derive v0.8.50\n"}
+,{"stream_name":"stderr","time":85.630933976,"data":"   Compiling synstructure v0.13.2\n"}
+,{"stream_name":"stderr","time":86.139962338,"data":"   Compiling fnv v1.0.7\n"}
+,{"stream_name":"stderr","time":86.180483805,"data":"   Compiling zerofrom-derive v0.1.7\n"}
+,{"stream_name":"stderr","time":86.366025511,"data":"   Compiling yoke-derive v0.8.2\n"}
+,{"stream_name":"stderr","time":87.302853342,"data":"   Compiling zerofrom v0.1.8\n"}
+,{"stream_name":"stderr","time":87.347294764,"data":"   Compiling stable_deref_trait v1.2.1\n"}
+,{"stream_name":"stderr","time":87.380132966,"data":"   Compiling crossbeam-utils v0.8.21\n"}
+,{"stream_name":"stderr","time":87.395808436,"data":"   Compiling yoke v0.8.3\n"}
+,{"stream_name":"stderr","time":87.548525111,"data":"   Compiling bytemuck_derive v1.10.2\n"}
+,{"stream_name":"stderr","time":88.614671308,"data":"   Compiling equivalent v1.0.2\n"}
+,{"stream_name":"stderr","time":89.16241157,"data":"   Compiling zerovec-derive v0.11.3\n"}
+,{"stream_name":"stderr","time":90.042529832,"data":"   Compiling pin-project-lite v0.2.17\n"}
+,{"stream_name":"stderr","time":90.083362179,"data":"   Compiling bytes v1.11.1\n"}
+,{"stream_name":"stderr","time":90.611249035,"data":"   Compiling zerovec v0.11.6\n"}
+,{"stream_name":"stderr","time":92.769832375,"data":"   Compiling displaydoc v0.2.6\n"}
+,{"stream_name":"stderr","time":93.210380725,"data":"   Compiling futures-core v0.3.32\n"}
+,{"stream_name":"stderr","time":93.302804472,"data":"   Compiling itoa v1.0.18\n"}
+,{"stream_name":"stderr","time":93.408782459,"data":"   Compiling bytemuck v1.25.0\n"}
+,{"stream_name":"stderr","time":93.636932706,"data":"   Compiling mio v1.2.1\n"}
+,{"stream_name":"stderr","time":93.944811048,"data":"   Compiling socket2 v0.6.4\n"}
+,{"stream_name":"stderr","time":93.985772485,"data":"   Compiling futures-sink v0.3.32\n"}
+,{"stream_name":"stderr","time":94.03645709,"data":"   Compiling tinystr v0.8.3\n"}
+,{"stream_name":"stderr","time":94.170407832,"data":"   Compiling smallvec v1.15.1\n"}
+,{"stream_name":"stderr","time":94.313727971,"data":"   Compiling tokio v1.52.3\n"}
+,{"stream_name":"stderr","time":94.35295487,"data":"   Compiling log v0.4.32\n"}
+,{"stream_name":"stderr","time":94.462669172,"data":"   Compiling litemap v0.8.2\n"}
+,{"stream_name":"stderr","time":94.591209432,"data":"   Compiling target-lexicon v0.13.5\n"}
+,{"stream_name":"stderr","time":94.899665312,"data":"   Compiling once_cell v1.21.4\n"}
+,{"stream_name":"stderr","time":95.036738456,"data":"   Compiling writeable v0.6.3\n"}
+,{"stream_name":"stderr","time":95.15940336,"data":"   Compiling icu_locale_core v2.2.0\n"}
+,{"stream_name":"stderr","time":96.177271936,"data":"   Compiling half v2.7.1\n"}
+,{"stream_name":"stderr","time":96.677805089,"data":"   Compiling http v1.4.1\n"}
+,{"stream_name":"stderr","time":97.512433343,"data":"   Compiling zerotrie v0.2.4\n"}
+,{"stream_name":"stderr","time":97.726579934,"data":"   Compiling potential_utf v0.1.5\n"}
+,{"stream_name":"stderr","time":97.810347755,"data":"   Compiling crossbeam-epoch v0.9.18\n"}
+,{"stream_name":"stderr","time":98.327608446,"data":"   Compiling ring v0.17.14\n"}
+,{"stream_name":"stderr","time":98.443768283,"data":"   Compiling icu_properties_data v2.2.0\n"}
+,{"stream_name":"stderr","time":98.529191689,"data":"   Compiling parking_lot_core v0.9.12\n"}
+,{"stream_name":"stderr","time":98.641645641,"data":"   Compiling rand_core v0.10.1\n"}
+,{"stream_name":"stderr","time":98.671172981,"data":"   Compiling icu_normalizer_data v2.2.0\n"}
+,{"stream_name":"stderr","time":98.750551219,"data":"   Compiling either v1.16.0\n"}
+,{"stream_name":"stderr","time":98.753316193,"data":"   Compiling getrandom v0.4.2\n"}
+,{"stream_name":"stderr","time":98.865941433,"data":"   Compiling utf8_iter v1.0.4\n"}
+,{"stream_name":"stderr","time":98.937855529,"data":"   Compiling scopeguard v1.2.0\n"}
+,{"stream_name":"stderr","time":98.945825313,"data":"   Compiling slab v0.4.12\n"}
+,{"stream_name":"stderr","time":98.982116216,"data":"   Compiling rayon-core v1.13.0\n"}
+,{"stream_name":"stderr","time":99.067113635,"data":"   Compiling lock_api v0.4.14\n"}
+,{"stream_name":"stderr","time":99.06779883,"data":"   Compiling icu_collections v2.2.0\n"}
+,{"stream_name":"stderr","time":99.455726728,"data":"   Compiling crossbeam-deque v0.8.6\n"}
+,{"stream_name":"stderr","time":99.608887574,"data":"   Compiling icu_provider v2.2.0\n"}
+,{"stream_name":"stderr","time":100.084527658,"data":"   Compiling aho-corasick v1.1.4\n"}
+,{"stream_name":"stderr","time":103.30545282,"data":"   Compiling regex-syntax v0.8.10\n"}
+,{"stream_name":"stderr","time":103.650439159,"data":"   Compiling percent-encoding v2.3.2\n"}
+,{"stream_name":"stderr","time":103.75824576,"data":"   Compiling zeroize v1.8.2\n"}
+,{"stream_name":"stderr","time":103.857926263,"data":"   Compiling rustls-pki-types v1.14.1\n"}
+,{"stream_name":"stderr","time":104.216735978,"data":"   Compiling pyo3-build-config v0.27.2\n"}
+,{"stream_name":"stderr","time":105.635374925,"data":"   Compiling regex-automata v0.4.14\n"}
+,{"stream_name":"stderr","time":108.214926636,"data":"   Compiling http-body v1.0.1\n"}
+,{"stream_name":"stderr","time":108.294792297,"data":"   Compiling tracing-core v0.1.36\n"}
+,{"stream_name":"stderr","time":108.720244035,"data":"   Compiling getrandom v0.2.17\n"}
+,{"stream_name":"stderr","time":108.825404828,"data":"   Compiling generic-array v0.14.7\n"}
+,{"stream_name":"stderr","time":109.190807719,"data":"   Compiling bitflags v2.12.1\n"}
+,{"stream_name":"stderr","time":109.329188638,"data":"   Compiling httparse v1.10.1\n"}
+,{"stream_name":"stderr","time":109.500241387,"data":"   Compiling hashbrown v0.17.1\n"}
+,{"stream_name":"stderr","time":109.993293395,"data":"   Compiling futures-task v0.3.32\n"}
+,{"stream_name":"stderr","time":110.089156261,"data":"   Compiling untrusted v0.9.0\n"}
+,{"stream_name":"stderr","time":110.144144879,"data":"   Compiling futures-io v0.3.32\n"}
+,{"stream_name":"stderr","time":110.222978878,"data":"   Compiling futures-util v0.3.32\n"}
+,{"stream_name":"stderr","time":112.689638414,"data":"   Compiling indexmap v2.14.0\n"}
+,{"stream_name":"stderr","time":113.317619955,"data":"   Compiling tracing v0.1.44\n"}
+,{"stream_name":"stderr","time":113.473114691,"data":"   Compiling icu_normalizer v2.2.0\n"}
+,{"stream_name":"stderr","time":113.912645136,"data":"   Compiling parking_lot v0.12.5\n"}
+,{"stream_name":"stderr","time":113.946723653,"data":"   Compiling regex v1.12.3\n"}
+,{"stream_name":"stderr","time":114.405142894,"data":"   Compiling icu_properties v2.2.0\n"}
+,{"stream_name":"stderr","time":114.663474242,"data":"   Compiling rayon v1.12.0\n"}
+,{"stream_name":"stderr","time":115.739669672,"data":"   Compiling tokio-util v0.7.18\n"}
+,{"stream_name":"stderr","time":116.248773079,"data":"   Compiling foldhash v0.2.0\n"}
+,{"stream_name":"stderr","time":116.387190576,"data":"   Compiling allocator-api2 v0.2.21\n"}
+,{"stream_name":"stderr","time":116.706298437,"data":"   Compiling rustls v0.23.40\n"}
+,{"stream_name":"stderr","time":116.782073257,"data":"   Compiling atomic-waker v1.1.2\n"}
+,{"stream_name":"stderr","time":116.833468117,"data":"   Compiling try-lock v0.2.5\n"}
+,{"stream_name":"stderr","time":116.878382446,"data":"   Compiling typenum v1.20.1\n"}
+,{"stream_name":"stderr","time":117.060750946,"data":"   Compiling tower-service v0.3.3\n"}
+,{"stream_name":"stderr","time":117.098070252,"data":"   Compiling hashbrown v0.16.1\n"}
+,{"stream_name":"stderr","time":117.931851128,"data":"   Compiling want v0.3.1\n"}
+,{"stream_name":"stderr","time":117.961052257,"data":"   Compiling h2 v0.4.14\n"}
+,{"stream_name":"stderr","time":118.718789038,"data":"   Compiling idna_adapter v1.2.2\n"}
+,{"stream_name":"stderr","time":118.779440891,"data":"   Compiling rustls-webpki v0.103.13\n"}
+,{"stream_name":"stderr","time":119.753048551,"data":"   Compiling form_urlencoded v1.2.2\n"}
+,{"stream_name":"stderr","time":119.846607223,"data":"   Compiling futures-channel v0.3.32\n"}
+,{"stream_name":"stderr","time":119.999344674,"data":"   Compiling rustix v1.1.4\n"}
+,{"stream_name":"stderr","time":120.189818844,"data":"   Compiling pkg-config v0.3.33\n"}
+,{"stream_name":"stderr","time":120.618662298,"data":"   Compiling subtle v2.6.1\n"}
+,{"stream_name":"stderr","time":120.838993263,"data":"   Compiling liblzma-sys v0.4.6\n"}
+,{"stream_name":"stderr","time":121.070830127,"data":"   Compiling hyper v1.10.1\n"}
+,{"stream_name":"stderr","time":122.392457531,"data":"   Compiling idna v1.1.0\n"}
+,{"stream_name":"stderr","time":122.881390341,"data":"   Compiling sync_wrapper v1.0.2\n"}
+,{"stream_name":"stderr","time":122.928097577,"data":"   Compiling thiserror v2.0.18\n"}
+,{"stream_name":"stderr","time":123.100468009,"data":"   Compiling linux-raw-sys v0.12.1\n"}
+,{"stream_name":"stderr","time":123.39139727,"data":"   Compiling base64 v0.22.1\n"}
+,{"stream_name":"stderr","time":123.617863957,"data":"   Compiling tower-layer v0.3.3\n"}
+,{"stream_name":"stderr","time":123.721283691,"data":"   Compiling ipnet v2.12.0\n"}
+,{"stream_name":"stderr","time":124.066044787,"data":"   Compiling hyper-util v0.1.20\n"}
+,{"stream_name":"stderr","time":125.270100986,"data":"   Compiling tokio-rustls v0.26.4\n"}
+,{"stream_name":"stderr","time":125.452595259,"data":"   Compiling tower v0.5.3\n"}
+,{"stream_name":"stderr","time":125.855836185,"data":"   Compiling url v2.5.8\n"}
+,{"stream_name":"stderr","time":127.161587656,"data":"   Compiling block-buffer v0.10.4\n"}
+,{"stream_name":"stderr","time":127.235214998,"data":"   Compiling crypto-common v0.1.7\n"}
+,{"stream_name":"stderr","time":127.294050595,"data":"   Compiling webpki-roots v1.0.7\n"}
+,{"stream_name":"stderr","time":127.604926533,"data":"   Compiling unicode-segmentation v1.13.3\n"}
+,{"stream_name":"stderr","time":127.945334613,"data":"   Compiling anyhow v1.0.102\n"}
+,{"stream_name":"stderr","time":128.099096587,"data":"   Compiling ryu v1.0.23\n"}
+,{"stream_name":"stderr","time":128.193885247,"data":"   Compiling option-ext v0.2.0\n"}
+,{"stream_name":"stderr","time":128.230168128,"data":"   Compiling serde_json v1.0.150\n"}
+,{"stream_name":"stderr","time":128.324038045,"data":"   Compiling dirs-sys v0.5.0\n"}
+,{"stream_name":"stderr","time":128.483629767,"data":"   Compiling serde_urlencoded v0.7.1\n"}
+,{"stream_name":"stderr","time":129.132414308,"data":"   Compiling hyper-rustls v0.27.9\n"}
+,{"stream_name":"stderr","time":129.319458721,"data":"   Compiling digest v0.10.7\n"}
+,{"stream_name":"stderr","time":129.451025521,"data":"   Compiling xattr v1.6.1\n"}
+,{"stream_name":"stderr","time":129.65511858,"data":"   Compiling tower-http v0.6.11\n"}
+,{"stream_name":"stderr","time":129.953038463,"data":"   Compiling http-body-util v0.1.3\n"}
+,{"stream_name":"stderr","time":130.124275216,"data":"   Compiling filetime v0.2.29\n"}
+,{"stream_name":"stderr","time":130.238442375,"data":"   Compiling thiserror-impl v2.0.18\n"}
+,{"stream_name":"stderr","time":132.773760144,"data":"   Compiling num_cpus v1.17.0\n"}
+,{"stream_name":"stderr","time":133.611187917,"data":"   Compiling prettyplease v0.2.37\n"}
+,{"stream_name":"stderr","time":135.248122367,"data":"   Compiling ident_case v1.0.1\n"}
+,{"stream_name":"stderr","time":135.306394501,"data":"   Compiling cpufeatures v0.2.17\n"}
+,{"stream_name":"stderr","time":135.33979355,"data":"   Compiling same-file v1.0.6\n"}
+,{"stream_name":"stderr","time":135.410431857,"data":"   Compiling walkdir v2.5.0\n"}
+,{"stream_name":"stderr","time":135.616884525,"data":"   Compiling sha2 v0.10.9\n"}
+,{"stream_name":"stderr","time":135.869891114,"data":"   Compiling liblzma v0.4.6\n"}
+,{"stream_name":"stderr","time":136.833868477,"data":"   Compiling tar v0.4.46\n"}
+,{"stream_name":"stderr","time":137.545069383,"data":"   Compiling reqwest v0.12.28\n"}
+,{"stream_name":"stderr","time":139.814929602,"data":"   Compiling dirs v6.0.0\n"}
+,{"stream_name":"stderr","time":139.867564938,"data":"   Compiling constcat v0.6.1\n"}
+,{"stream_name":"stderr","time":139.902204772,"data":"   Compiling cfg_aliases v0.2.1\n"}
+,{"stream_name":"stderr","time":140.28544471,"data":"   Compiling xxhash-rust v0.8.15\n"}
+,{"stream_name":"stderr","time":140.788215077,"data":"   Compiling tracel-llvm-bundler v20.1.4-7\n"}
+,{"stream_name":"stderr","time":141.76822774,"data":"   Compiling convert_case v0.10.0\n"}
+,{"stream_name":"stderr","time":141.96403285,"data":"   Compiling object v0.37.3\n"}
+,{"stream_name":"stderr","time":142.106738033,"data":"   Compiling unicode-xid v0.2.6\n"}
+,{"stream_name":"stderr","time":142.170024839,"data":"   Compiling derive_more-impl v2.1.1\n"}
+,{"stream_name":"stderr","time":145.055440206,"data":"   Compiling pyo3-ffi v0.27.2\n"}
+,{"stream_name":"stderr","time":145.18624903,"data":"   Compiling pyo3-macros-backend v0.27.2\n"}
+,{"stream_name":"stderr","time":145.26321006,"data":"   Compiling strsim v0.11.1\n"}
+,{"stream_name":"stderr","time":145.483256374,"data":"   Compiling heck v0.5.0\n"}
+,{"stream_name":"stderr","time":145.618039474,"data":"   Compiling parking v2.2.1\n"}
+,{"stream_name":"stderr","time":145.739852984,"data":"   Compiling darling_core v0.23.0\n"}
+,{"stream_name":"stderr","time":151.125047284,"data":"   Compiling darling_core v0.21.3\n"}
+,{"stream_name":"stderr","time":153.653667255,"data":"   Compiling derive-new v0.7.0\n"}
+,{"stream_name":"stderr","time":153.996439294,"data":"   Compiling memoffset v0.9.1\n"}
+,{"stream_name":"stderr","time":154.198156781,"data":"   Compiling glob v0.3.3\n"}
+,{"stream_name":"stderr","time":154.450767109,"data":"   Compiling paste v1.0.15\n"}
+,{"stream_name":"stderr","time":154.574536373,"data":"   Compiling getrandom v0.3.4\n"}
+,{"stream_name":"stderr","time":154.758431739,"data":"   Compiling clang-sys v1.8.1\n"}
+,{"stream_name":"stderr","time":154.996589143,"data":"   Compiling darling_macro v0.21.3\n"}
+,{"stream_name":"stderr","time":155.189311532,"data":"   Compiling ar_archive_writer v0.5.1\n"}
+,{"stream_name":"stderr","time":159.529843384,"data":"   Compiling darling_macro v0.23.0\n"}
+,{"stream_name":"stderr","time":159.725339115,"data":"   Compiling pyo3 v0.27.2\n"}
+,{"stream_name":"stderr","time":159.909485378,"data":"   Compiling ciborium-io v0.2.2\n"}
+,{"stream_name":"stderr","time":159.946051093,"data":"   Compiling winnow v1.0.3\n"}
+,{"stream_name":"stderr","time":160.270449617,"data":"   Compiling rustversion v1.0.22\n"}
+,{"stream_name":"stderr","time":160.483061188,"data":"   Compiling adler2 v2.0.1\n"}
+,{"stream_name":"stderr","time":160.551404007,"data":"   Compiling gimli v0.32.3\n"}
+,{"stream_name":"stderr","time":162.960814275,"data":"   Compiling cpufeatures v0.3.0\n"}
+,{"stream_name":"stderr","time":163.14449439,"data":"   Compiling chacha20 v0.10.0\n"}
+,{"stream_name":"stderr","time":163.337076762,"data":"   Compiling addr2line v0.25.1\n"}
+,{"stream_name":"stderr","time":163.680100966,"data":"   Compiling miniz_oxide v0.8.9\n"}
+,{"stream_name":"stderr","time":164.34814171,"data":"   Compiling toml_parser v1.1.2+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":165.151688993,"data":"   Compiling ciborium-ll v0.2.2\n"}
+,{"stream_name":"stderr","time":166.309409913,"data":"   Compiling darling v0.23.0\n"}
+,{"stream_name":"stderr","time":166.343691985,"data":"   Compiling pyo3-macros v0.27.2\n"}
+,{"stream_name":"stderr","time":166.85726625,"data":"   Compiling psm v0.1.31\n"}
+,{"stream_name":"stderr","time":167.104851647,"data":"   Compiling darling v0.21.3\n"}
+,{"stream_name":"stderr","time":171.303417651,"data":"   Compiling cubecl-common v0.10.0\n"}
+,{"stream_name":"stderr","time":171.443834953,"data":"   Compiling concurrent-queue v2.5.0\n"}
+,{"stream_name":"stderr","time":171.591832664,"data":"   Compiling nom v8.0.0\n"}
+,{"stream_name":"stderr","time":174.538864798,"data":"   Compiling num-integer v0.1.46\n"}
+,{"stream_name":"stderr","time":174.877638978,"data":"   Compiling errno v0.3.14\n"}
+,{"stream_name":"stderr","time":174.957647174,"data":"   Compiling serde_spanned v1.1.1\n"}
+,{"stream_name":"stderr","time":175.032854019,"data":"   Compiling toml_datetime v1.1.1+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":175.313273816,"data":"   Compiling minimal-lexical v0.2.1\n"}
+,{"stream_name":"stderr","time":175.54937922,"data":"   Compiling portable-atomic v1.13.1\n"}
+,{"stream_name":"stderr","time":175.978717549,"data":"   Compiling fastrand v2.4.1\n"}
+,{"stream_name":"stderr","time":176.172335873,"data":"   Compiling rustc-demangle v0.1.27\n"}
+,{"stream_name":"stderr","time":176.827060792,"data":"   Compiling indoc v2.0.7\n"}
+,{"stream_name":"stderr","time":177.085359292,"data":"   Compiling unindent v0.2.4\n"}
+,{"stream_name":"stderr","time":177.233317653,"data":"   Compiling signal-hook v0.4.4\n"}
+,{"stream_name":"stderr","time":177.312027738,"data":"   Compiling toml_writer v1.1.1+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":177.480431439,"data":"   Compiling toml v1.1.2+spec-1.1.0\n"}
+,{"stream_name":"stderr","time":184.567076333,"data":"   Compiling backtrace v0.3.76\n"}
+,{"stream_name":"stderr","time":184.720453643,"data":"   Compiling futures-lite v2.6.1\n"}
+,{"stream_name":"stderr","time":185.596357754,"data":"   Compiling nom v7.1.3\n"}
+,{"stream_name":"stderr","time":186.935302486,"data":"   Compiling signal-hook-registry v1.4.8\n"}
+,{"stream_name":"stderr","time":187.782362351,"data":"   Compiling tynm v0.2.0\n"}
+,{"stream_name":"stderr","time":188.366372545,"data":"   Compiling event-listener v5.4.1\n"}
+,{"stream_name":"stderr","time":188.572099489,"data":"   Compiling rand_core v0.9.5\n"}
+,{"stream_name":"stderr","time":188.731287695,"data":"   Compiling enumset_derive v0.15.0\n"}
+,{"stream_name":"stderr","time":190.264831049,"data":"   Compiling ciborium v0.2.2\n"}
+,{"stream_name":"stderr","time":190.960892286,"data":"   Compiling rand v0.10.1\n"}
+,{"stream_name":"stderr","time":191.641878282,"data":"   Compiling derive_more v2.1.1\n"}
+,{"stream_name":"stderr","time":191.876453606,"data":"   Compiling sanitize-filename v0.6.0\n"}
+,{"stream_name":"stderr","time":192.00171951,"data":"   Compiling spin v0.10.0\n"}
+,{"stream_name":"stderr","time":192.135934267,"data":"   Compiling float8 v0.7.0\n"}
+,{"stream_name":"stderr","time":192.325614863,"data":"   Compiling ppv-lite86 v0.2.21\n"}
+,{"stream_name":"stderr","time":192.61545432,"data":"   Compiling libloading v0.8.9\n"}
+,{"stream_name":"stderr","time":192.7322998,"data":"   Compiling serde_bytes v0.11.19\n"}
+,{"stream_name":"stderr","time":192.741571949,"data":"   Compiling stacker v0.1.24\n"}
+,{"stream_name":"stderr","time":192.903556977,"data":"   Compiling slotmap v1.1.1\n"}
+,{"stream_name":"stderr","time":192.984266251,"data":"   Compiling ahash v0.8.12\n"}
+,{"stream_name":"stderr","time":193.076562253,"data":"   Compiling bindgen v0.71.1\n"}
+,{"stream_name":"stderr","time":193.191788379,"data":"   Compiling oneshot v0.2.1\n"}
+,{"stream_name":"stderr","time":193.292525405,"data":"   Compiling float4 v0.2.0\n"}
+,{"stream_name":"stderr","time":193.66653403,"data":"   Compiling web-time v1.1.0\n"}
+,{"stream_name":"stderr","time":194.054747203,"data":"   Compiling embassy-futures v0.1.2\n"}
+,{"stream_name":"stderr","time":196.173197498,"data":"   Compiling itertools v0.13.0\n"}
+,{"stream_name":"stderr","time":197.080463062,"data":"   Compiling rand_chacha v0.9.0\n"}
+,{"stream_name":"stderr","time":197.453615476,"data":"   Compiling castaway v0.2.4\n"}
+,{"stream_name":"stderr","time":197.887208241,"data":"   Compiling enumset v1.1.13\n"}
+,{"stream_name":"stderr","time":198.237334996,"data":"   Compiling event-listener-strategy v0.5.4\n"}
+,{"stream_name":"stderr","time":198.588278707,"data":"   Compiling cexpr v0.6.0\n"}
+,{"stream_name":"stderr","time":199.962462758,"data":"   Compiling cubecl-macros-internal v0.10.0\n"}
+,{"stream_name":"stderr","time":200.039826418,"data":"   Compiling cubecl-runtime v0.10.0\n"}
+,{"stream_name":"stderr","time":200.323482326,"data":"   Compiling variadics_please v1.1.0\n"}
+,{"stream_name":"stderr","time":200.603015735,"data":"   Compiling polars-utils v0.53.0\n"}
+,{"stream_name":"stderr","time":200.64731966,"data":"   Compiling siphasher v1.0.3\n"}
+,{"stream_name":"stderr","time":200.78443098,"data":"   Compiling float-ord v0.3.2\n"}
+,{"stream_name":"stderr","time":200.81572148,"data":"   Compiling cubecl-macros v0.10.0\n"}
+,{"stream_name":"stderr","time":200.909640057,"data":"   Compiling static_assertions v1.1.0\n"}
+,{"stream_name":"stderr","time":200.952785418,"data":"   Compiling rustc-hash v2.1.2\n"}
+,{"stream_name":"stderr","time":201.016708219,"data":"   Compiling simdutf8 v0.1.5\n"}
+,{"stream_name":"stderr","time":201.069813217,"data":"   Compiling tinyvec_macros v0.1.1\n"}
+,{"stream_name":"stderr","time":201.108233693,"data":"   Compiling shlex v1.3.0\n"}
+,{"stream_name":"stderr","time":201.333021586,"data":"   Compiling polars-error v0.53.0\n"}
+,{"stream_name":"stderr","time":201.701310985,"data":"   Compiling tinyvec v1.11.0\n"}
+,{"stream_name":"stderr","time":202.474148759,"data":"   Compiling compact_str v0.9.1\n"}
+,{"stream_name":"stderr","time":203.164726582,"data":"   Compiling cubecl-ir v0.10.0\n"}
+,{"stream_name":"stderr","time":206.343768746,"data":"   Compiling phf_shared v0.12.1\n"}
+,{"stream_name":"stderr","time":206.504286116,"data":"   Compiling async-channel v2.5.0\n"}
+,{"stream_name":"stderr","time":206.759595317,"data":"   Compiling rand v0.9.4\n"}
+,{"stream_name":"stderr","time":207.929678266,"data":"   Compiling cubecl-zspace v0.10.0\n"}
+,{"stream_name":"stderr","time":208.105112829,"data":"   Compiling raw-cpuid v11.6.0\n"}
+,{"stream_name":"stderr","time":208.507544466,"data":"   Compiling uuid v1.23.2\n"}
+,{"stream_name":"stderr","time":208.847958493,"data":"   Compiling argminmax v0.6.3\n"}
+,{"stream_name":"stderr","time":210.347759695,"data":"   Compiling num-complex v0.4.6\n"}
+,{"stream_name":"stderr","time":210.767045542,"data":"   Compiling memmap2 v0.9.10\n"}
+,{"stream_name":"stderr","time":210.951392018,"data":"   Compiling num-derive v0.4.2\n"}
+,{"stream_name":"stderr","time":211.399096509,"data":"   Compiling polars-schema v0.53.0\n"}
+,{"stream_name":"stderr","time":211.476916707,"data":"   Compiling polars-buffer v0.53.0\n"}
+,{"stream_name":"stderr","time":211.556712338,"data":"   Compiling cudarc v0.19.7\n"}
+,{"stream_name":"stderr","time":211.706763868,"data":"   Compiling inflections v1.1.1\n"}
+,{"stream_name":"stderr","time":211.747327258,"data":"   Compiling chrono-tz v0.10.4\n"}
+,{"stream_name":"stderr","time":211.879836325,"data":"   Compiling md5 v0.8.0\n"}
+,{"stream_name":"stderr","time":218.857143414,"data":"   Compiling phf v0.12.1\n"}
+,{"stream_name":"stderr","time":218.958219186,"data":"   Compiling tracel-tblgen-rs v20.1.4-7\n"}
+,{"stream_name":"stderr","time":219.113467926,"data":"   Compiling unicode-normalization v0.1.25\n"}
+,{"stream_name":"stderr","time":219.4934838,"data":"   Compiling num-bigint v0.4.6\n"}
+,{"stream_name":"stderr","time":221.338816123,"data":"   Compiling chrono v0.4.41\n"}
+,{"stream_name":"stderr","time":221.680267483,"data":"   Compiling polars-arrow v0.53.0\n"}
+,{"stream_name":"stderr","time":221.75731474,"data":"   Compiling deunicode v1.6.2\n"}
+,{"stream_name":"stderr","time":221.887615095,"data":"   Compiling foldhash v0.1.5\n"}
+,{"stream_name":"stderr","time":222.058099774,"data":"   Compiling hashbrown v0.15.5\n"}
+,{"stream_name":"stderr","time":223.036960859,"data":"   Compiling slug v0.1.6\n"}
+,{"stream_name":"stderr","time":223.252833816,"data":"   Compiling num-rational v0.4.2\n"}
+,{"stream_name":"stderr","time":224.181249513,"data":"   Compiling caseless v0.2.2\n"}
+,{"stream_name":"stderr","time":224.764299076,"data":"   Compiling cubecl-core v0.10.0\n"}
+,{"stream_name":"stderr","time":227.377720494,"data":"   Compiling tracel-mlir-rs-macros v20.1.4-7\n"}
+,{"stream_name":"stderr","time":227.522858967,"data":"   Compiling tracel-mlir-sys v20.1.4-7\n"}
+,{"stream_name":"stderr","time":227.801978396,"data":"   Compiling num-iter v0.1.45\n"}
+,{"stream_name":"stderr","time":227.864732379,"data":"   Compiling strum_macros v0.27.2\n"}
+,{"stream_name":"stderr","time":229.579160682,"data":"   Compiling streaming-iterator v0.1.9\n"}
+,{"stream_name":"stderr","time":229.844514681,"data":"   Compiling typed-arena v2.0.2\n"}
+,{"stream_name":"stderr","time":229.913836066,"data":"   Compiling unicode_categories v0.1.1\n"}
+,{"stream_name":"stderr","time":230.026189091,"data":"   Compiling ethnum v1.5.3\n"}
+,{"stream_name":"stderr","time":230.7976121,"data":"   Compiling entities v1.0.1\n"}
+,{"stream_name":"stderr","time":230.951044572,"data":"   Compiling dyn-clone v1.0.20\n"}
+,{"stream_name":"stderr","time":231.015456642,"data":"   Compiling fixedbitset v0.5.7\n"}
+,{"stream_name":"stderr","time":231.368557048,"data":"   Compiling petgraph v0.8.3\n"}
+,{"stream_name":"stderr","time":235.958684581,"data":"   Compiling comrak v0.39.1\n"}
+,{"stream_name":"stderr","time":237.759384695,"data":"   Compiling num v0.4.3\n"}
+,{"stream_name":"stderr","time":238.399834785,"data":"   Compiling type-map v0.5.1\n"}
+,{"stream_name":"stderr","time":238.657297406,"data":"   Compiling convert_case v0.8.0\n"}
+,{"stream_name":"stderr","time":238.906128412,"data":"   Compiling libloading v0.9.0\n"}
+,{"stream_name":"stderr","time":239.026632128,"data":"   Compiling polars-compute v0.53.0\n"}
+,{"stream_name":"stderr","time":239.105481878,"data":"   Compiling stable-vec v0.4.2\n"}
+,{"stream_name":"stderr","time":239.281747833,"data":"   Compiling debug_unsafe v0.1.4\n"}
+,{"stream_name":"stderr","time":240.994558241,"data":"   Compiling atoi_simd v0.17.0\n"}
+,{"stream_name":"stderr","time":241.219960923,"data":"   Compiling cubecl-opt v0.10.0\n"}
+,{"stream_name":"stderr","time":252.18337863,"data":"   Compiling lgbm-core v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-core)\n"}
+,{"stream_name":"stderr","time":252.979119085,"data":"   Compiling fast-float2 v0.2.3\n"}
+,{"stream_name":"stderr","time":253.142574257,"data":"   Compiling strength_reduce v0.2.4\n"}
+,{"stream_name":"stderr","time":253.304347167,"data":"   Compiling boxcar v0.2.14\n"}
+,{"stream_name":"stderr","time":253.460054103,"data":"   Compiling polars-dtype v0.53.0\n"}
+,{"stream_name":"stderr","time":255.312423208,"data":"   Compiling cubecl-cuda v0.10.0\n"}
+,{"stream_name":"stderr","time":255.402990093,"data":"   Compiling lgbm-dataset v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-dataset)\n"}
+,{"stream_name":"stderr","time":257.033225281,"data":"   Compiling tracel-mlir-rs v20.1.4-7\n"}
+,{"stream_name":"stderr","time":283.235449625,"data":"   Compiling cubecl-cpu v0.10.0\n"}
+,{"stream_name":"stderr","time":283.370226868,"data":"   Compiling itertools v0.14.0\n"}
+,{"stream_name":"stderr","time":284.538205819,"data":"   Compiling polars-core v0.53.0\n"}
+,{"stream_name":"stderr","time":294.160265195,"data":"   Compiling cubecl-cpp v0.10.0\n"}
+,{"stream_name":"stderr","time":298.376141529,"data":"   Compiling tracel-llvm v20.1.4-7\n"}
+,{"stream_name":"stderr","time":298.411479232,"data":"   Compiling polars-row v0.53.0\n"}
+,{"stream_name":"stderr","time":304.519467738,"data":"   Compiling cubecl-std v0.10.0\n"}
+,{"stream_name":"stderr","time":304.777818798,"data":"   Compiling sysinfo v0.38.4\n"}
+,{"stream_name":"stderr","time":307.988568768,"data":"   Compiling cubecl v0.10.0\n"}
+,{"stream_name":"stderr","time":319.359319878,"data":"   Compiling lgbm-model v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-model)\n"}
+,{"stream_name":"stderr","time":320.835721239,"data":"   Compiling matrixmultiply v0.3.10\n"}
+,{"stream_name":"stderr","time":320.94224809,"data":"   Compiling polars-ops v0.53.0\n"}
+,{"stream_name":"stderr","time":321.056724064,"data":"   Compiling lgbm-compute v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-compute)\n"}
+,{"stream_name":"stderr","time":328.545116135,"data":"   Compiling lgbm-metric v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-metric)\n"}
+,{"stream_name":"stderr","time":329.683538571,"data":"   Compiling libmimalloc-sys v0.1.49\n"}
+,{"stream_name":"stderr","time":329.848336626,"data":"   Compiling polars v0.53.0\n"}
+,{"stream_name":"stderr","time":330.078823829,"data":"   Compiling thiserror v1.0.69\n"}
+,{"stream_name":"stderr","time":330.218836976,"data":"   Compiling rawpointer v0.2.1\n"}
+,{"stream_name":"stderr","time":330.256256554,"data":"   Compiling home v0.5.12\n"}
+,{"stream_name":"stderr","time":336.717089966,"data":"   Compiling lgbm-objective v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-objective)\n"}
+,{"stream_name":"stderr","time":337.445662897,"data":"   Compiling lgbm-treelearner v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-treelearner)\n"}
+,{"stream_name":"stderr","time":338.546893771,"data":"   Compiling numpy v0.27.1\n"}
+,{"stream_name":"stderr","time":409.649496586,"data":"   Compiling polars-io v0.53.0\n"}
+,{"stream_name":"stderr","time":411.32835463,"data":"   Compiling thiserror-impl v1.0.69\n"}
+,{"stream_name":"stderr","time":412.346672822,"data":"   Compiling polars-ffi v0.53.0\n"}
+,{"stream_name":"stderr","time":412.652949353,"data":"   Compiling lgbm-boosting v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm-boosting)\n"}
+,{"stream_name":"stderr","time":413.436370352,"data":"   Compiling ndarray v0.17.2\n"}
+,{"stream_name":"stderr","time":419.932397268,"data":"   Compiling mimalloc v0.1.52\n"}
+,{"stream_name":"stderr","time":419.965123432,"data":"   Compiling lgbm v0.1.0 (/kaggle/working/lightgbm_rs/crates/lgbm)\n"}
+,{"stream_name":"stderr","time":443.890311115,"data":"   Compiling pyo3-polars v0.26.0\n"}
+,{"stream_name":"stderr","time":527.163829865,"data":"   Compiling lgbm-python v0.0.5 (/kaggle/working/lightgbm_rs/crates/lgbm-python)\n"}
+,{"stream_name":"stderr","time":697.621206759,"data":"    Finished `release` profile [optimized] target(s) in 10m 23s\n"}
+,{"stream_name":"stderr","time":699.114696424,"data":"📦 Built wheel for abi3 Python ≥ 3.11 to /kaggle/working/lightgbm_rs/target/wheels/lightgbm_rs-0.0.5-cp311-abi3-manylinux_2_34_x86_64.whl\n"}
+,{"stream_name":"stdout","time":699.123267574,"data":"\n"}
+,{"stream_name":"stdout","time":699.12329054,"data":"$ pip install $(ls lightgbm_rs/target/wheels/*.whl | head -n 1) --force-reinstall\n"}
+,{"stream_name":"stdout","time":700.170747071,"data":"Processing ./lightgbm_rs/target/wheels/lightgbm_rs-0.0.5-cp311-abi3-manylinux_2_34_x86_64.whl\n"}
+,{"stream_name":"stdout","time":700.695813061,"data":"Collecting numpy\u003e=2.0.0 (from lightgbm-rs==0.0.5)\n"}
+,{"stream_name":"stdout","time":700.697788879,"data":"  Using cached numpy-2.5.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)\n"}
+,{"stream_name":"stdout","time":701.006846425,"data":"Collecting scipy (from lightgbm-rs==0.0.5)\n"}
+,{"stream_name":"stdout","time":701.008686204,"data":"  Using cached scipy-1.18.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (62 kB)\n"}
+,{"stream_name":"stdout","time":701.048792705,"data":"Using cached numpy-2.5.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (16.7 MB)\n"}
+,{"stream_name":"stdout","time":701.080807872,"data":"Using cached scipy-1.18.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (35.3 MB)\n"}
+,{"stream_name":"stdout","time":703.293113386,"data":"Installing collected packages: numpy, scipy, lightgbm-rs\n"}
+,{"stream_name":"stdout","time":703.293200418,"data":"  Attempting uninstall: numpy\n"}
+,{"stream_name":"stdout","time":703.299245666,"data":"    Found existing installation: numpy 2.5.0\n"}
+,{"stream_name":"stdout","time":703.344315674,"data":"    Uninstalling numpy-2.5.0:\n"}
+,{"stream_name":"stdout","time":703.357205364,"data":"      Successfully uninstalled numpy-2.5.0\n"}
+,{"stream_name":"stdout","time":705.456523115,"data":"  Attempting uninstall: scipy\n"}
+,{"stream_name":"stdout","time":705.478570245,"data":"    Found existing installation: scipy 1.18.0\n"}
+,{"stream_name":"stdout","time":705.573584664,"data":"    Uninstalling scipy-1.18.0:\n"}
+,{"stream_name":"stdout","time":705.589752003,"data":"      Successfully uninstalled scipy-1.18.0\n"}
+,{"stream_name":"stderr","time":710.623970639,"data":"ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.\n"}
+,{"stream_name":"stderr","time":710.624007577,"data":"bigframes 2.39.0 requires google-cloud-bigquery-storage\u003c3.0.0,\u003e=2.30.0, which is not installed.\n"}
+,{"stream_name":"stderr","time":710.62402939,"data":"numba 0.65.1 requires numpy\u003c2.5,\u003e=1.22, but you have numpy 2.5.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624035947,"data":"ydata-profiling 4.18.4 requires numba\u003c0.63,\u003e=0.60, but you have numba 0.65.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624041626,"data":"ydata-profiling 4.18.4 requires numpy\u003c2.4,\u003e=1.22, but you have numpy 2.5.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624047546,"data":"ydata-profiling 4.18.4 requires scipy\u003c1.17,\u003e=1.8, but you have scipy 1.18.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624052797,"data":"google-colab 1.0.0 requires jupyter-server==2.14.0, but you have jupyter-server 2.12.5 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.62405742,"data":"google-colab 1.0.0 requires pandas==2.2.2, but you have pandas 2.3.3 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624061965,"data":"dask-cuda 26.2.0 requires cuda-core==0.3.*, but you have cuda-core 1.0.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.62406649,"data":"dask-cuda 26.2.0 requires numba-cuda\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624071227,"data":"dopamine-rl 4.1.2 requires gym\u003c=0.25.2, but you have gym 0.26.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624077551,"data":"distributed-ucxx-cu12 0.48.0 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624095495,"data":"moviepy 1.0.3 requires decorator\u003c5.0,\u003e=4.0.2, but you have decorator 5.3.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624100388,"data":"cuml-cu12 26.2.0 requires numba\u003c0.62.0,\u003e=0.60.0, but you have numba 0.65.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624104718,"data":"cuml-cu12 26.2.0 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624109469,"data":"ucxx-cu12 0.48.0 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624113297,"data":"tensorflow 2.19.0 requires numpy\u003c2.2.0,\u003e=1.26.0, but you have numpy 2.5.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.62411723,"data":"cudf-cu12 26.2.1 requires numba\u003c0.62.0,\u003e=0.60.0, but you have numba 0.65.1 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624121791,"data":"cudf-cu12 26.2.1 requires numba-cuda[cu12]\u003c0.23.0,\u003e=0.22.2, but you have numba-cuda 0.30.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":710.624127733,"data":"sklearn-compat 0.1.5 requires scikit-learn\u003c1.9,\u003e=1.2, but you have scikit-learn 1.9.0 which is incompatible.\n"}
+,{"stream_name":"stdout","time":710.624196806,"data":"Successfully installed lightgbm-rs-0.0.5 numpy-2.5.0 scipy-1.18.0\n"}
+,{"stream_name":"stdout","time":710.74773309,"data":"\n"}
+,{"stream_name":"stdout","time":710.747764326,"data":"########## BUILD official LightGBM (CUDA) ##########\n"}
+,{"stream_name":"stdout","time":710.747769348,"data":"\n"}
+,{"stream_name":"stdout","time":710.747773638,"data":"$ python3 -c \"import lightgbm as lgb,numpy as np;lgb.LGBMClassifier(device_type='cuda',num_leaves=2,n_estimators=1).fit(np.zeros((10,2)),np.zeros(10))\"\n"}
+,{"stream_name":"stderr","time":717.879635573,"data":"[LightGBM] [Fatal] CUDA Tree Learner was not enabled in this build.\n"}
+,{"stream_name":"stderr","time":717.879666039,"data":"Please recompile with CMake option -DUSE_CUDA=1\n"}
+,{"stream_name":"stderr","time":717.883976689,"data":"Traceback (most recent call last):\n"}
+,{"stream_name":"stderr","time":717.883990675,"data":"  File \"\u003cstring\u003e\", line 1, in \u003cmodule\u003e\n"}
+,{"stream_name":"stderr","time":717.883995751,"data":"  File \"/usr/local/lib/python3.12/dist-packages/lightgbm/sklearn.py\", line 1560, in fit\n"}
+,{"stream_name":"stderr","time":717.884375454,"data":"    super().fit(\n"}
+,{"stream_name":"stderr","time":717.884384046,"data":"  File \"/usr/local/lib/python3.12/dist-packages/lightgbm/sklearn.py\", line 1049, in fit\n"}
+,{"stream_name":"stderr","time":717.884635784,"data":"    self._Booster = train(\n"}
+,{"stream_name":"stderr","time":717.884643451,"data":"                    ^^^^^^\n"}
+,{"stream_name":"stderr","time":717.88464765,"data":"  File \"/usr/local/lib/python3.12/dist-packages/lightgbm/engine.py\", line 297, in train\n"}
+,{"stream_name":"stderr","time":717.884839081,"data":"    booster = Booster(params=params, train_set=train_set)\n"}
+,{"stream_name":"stderr","time":717.884946639,"data":"              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stderr","time":717.884968355,"data":"  File \"/usr/local/lib/python3.12/dist-packages/lightgbm/basic.py\", line 3660, in __init__\n"}
+,{"stream_name":"stderr","time":717.885539334,"data":"    _safe_call(\n"}
+,{"stream_name":"stderr","time":717.885547436,"data":"  File \"/usr/local/lib/python3.12/dist-packages/lightgbm/basic.py\", line 313, in _safe_call\n"}
+,{"stream_name":"stderr","time":717.885734812,"data":"    raise LightGBMError(_LIB.LGBM_GetLastError().decode(\"utf-8\"))\n"}
+,{"stream_name":"stderr","time":717.885743043,"data":"lightgbm.basic.LightGBMError: CUDA Tree Learner was not enabled in this build.\n"}
+,{"stream_name":"stderr","time":717.885746431,"data":"Please recompile with CMake option -DUSE_CUDA=1\n"}
+,{"stream_name":"stdout","time":717.886061134,"data":"[LightGBM] [Warning] There are no meaningful features which satisfy the provided configuration. Decreasing Dataset parameters min_data_in_bin or min_data_in_leaf and re-constructing Dataset might resolve this warning.\n"}
+,{"stream_name":"stdout","time":717.886068824,"data":"[LightGBM] [Warning] Using sparse features with CUDA is currently not supported.\n"}
+,{"stream_name":"stdout","time":717.886072051,"data":"[LightGBM] [Warning] Contains only one class\n"}
+,{"stream_name":"stdout","time":717.886075039,"data":"[LightGBM] [Info] Number of positive: 0, number of negative: 10\n"}
+,{"stream_name":"stdout","time":718.939461587,"data":"\n"}
+,{"stream_name":"stdout","time":718.939515671,"data":"$ pip uninstall -y lightgbm\n"}
+,{"stream_name":"stdout","time":719.876204225,"data":"Found existing installation: lightgbm 4.6.0\n"}
+,{"stream_name":"stdout","time":719.881146241,"data":"Uninstalling lightgbm-4.6.0:\n"}
+,{"stream_name":"stdout","time":719.914307824,"data":"  Successfully uninstalled lightgbm-4.6.0\n"}
+,{"stream_name":"stdout","time":719.971740856,"data":"\n"}
+,{"stream_name":"stdout","time":719.971767861,"data":"$ pip install --no-binary lightgbm lightgbm -C cmake.define.USE_CUDA=ON\n"}
+,{"stream_name":"stdout","time":721.152122375,"data":"Collecting lightgbm\n"}
+,{"stream_name":"stdout","time":721.18493799,"data":"  Downloading lightgbm-4.6.0.tar.gz (1.7 MB)\n"}
+,{"stream_name":"stdout","time":721.244887247,"data":"     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.7/1.7 MB 29.8 MB/s eta 0:00:00\n"}
+,{"stream_name":"stdout","time":721.513953204,"data":"  Installing build dependencies: started\n"}
+,{"stream_name":"stdout","time":725.034968839,"data":"  Installing build dependencies: finished with status 'done'\n"}
+,{"stream_name":"stdout","time":725.035555616,"data":"  Getting requirements to build wheel: started\n"}
+,{"stream_name":"stdout","time":725.344118177,"data":"  Getting requirements to build wheel: finished with status 'done'\n"}
+,{"stream_name":"stdout","time":725.347002006,"data":"  Installing backend dependencies: started\n"}
+,{"stream_name":"stdout","time":730.368949032,"data":"  Installing backend dependencies: finished with status 'done'\n"}
+,{"stream_name":"stdout","time":730.36981786,"data":"  Preparing metadata (pyproject.toml): started\n"}
+,{"stream_name":"stdout","time":730.692297632,"data":"  Preparing metadata (pyproject.toml): finished with status 'done'\n"}
+,{"stream_name":"stdout","time":730.698010864,"data":"Requirement already satisfied: numpy\u003e=1.17.0 in /usr/local/lib/python3.12/dist-packages (from lightgbm) (2.5.0)\n"}
+,{"stream_name":"stdout","time":730.704308622,"data":"Requirement already satisfied: scipy in /usr/local/lib/python3.12/dist-packages (from lightgbm) (1.18.0)\n"}
+,{"stream_name":"stdout","time":730.716731505,"data":"Building wheels for collected packages: lightgbm\n"}
+,{"stream_name":"stdout","time":730.717899664,"data":"  Building wheel for lightgbm (pyproject.toml): started\n"}
+,{"stream_name":"stdout","time":1587.218878888,"data":"  Building wheel for lightgbm (pyproject.toml): finished with status 'done'\n"}
+,{"stream_name":"stdout","time":1587.448590089,"data":"  Created wheel for lightgbm: filename=lightgbm-4.6.0-py3-none-linux_x86_64.whl size=81684919 sha256=08ce2a55bc365203113bf431abb034ffce9173c2f4d82431b62b593f8cc7607e\n"}
+,{"stream_name":"stdout","time":1587.449004953,"data":"  Stored in directory: /root/.cache/pip/wheels/cb/83/4f/255634f94c01f16556323cbf2c4f92981396f889463f14acd6\n"}
+,{"stream_name":"stdout","time":1587.453307731,"data":"Successfully built lightgbm\n"}
+,{"stream_name":"stdout","time":1589.400135495,"data":"Installing collected packages: lightgbm\n"}
+,{"stream_name":"stdout","time":1590.64280064,"data":"Successfully installed lightgbm-4.6.0\n"}
+,{"stream_name":"stdout","time":1590.887550052,"data":"\n"}
+,{"stream_name":"stdout","time":1590.887581193,"data":"$ rm -rf lightgbm_rs/target/autotune ~/.cache/cubecl 2\u003e/dev/null || true\n"}
+,{"stream_name":"stdout","time":1590.891790935,"data":"\n"}
+,{"stream_name":"stdout","time":1590.891812765,"data":"===== ARM rs feats=50 =====\n"}
+,{"stream_name":"stdout","time":1613.549567355,"data":"--- stdout ---\n"}
+,{"stream_name":"stdout","time":1613.549626069,"data":"RESULT rs feats=50 train_time_s=13.103\n"}
+,{"stream_name":"stdout","time":1613.549634484,"data":"\n"}
+,{"stream_name":"stdout","time":1613.549639803,"data":"--- stderr (phase_prof) ---\n"}
+,{"stream_name":"stdout","time":1613.549645064,"data":"[phase_prof:train] before=0.039ms hist+split=4483.757ms (build=0.000 scan=1294.047) partition=126.748ms total=4610.545ms\n"}
+,{"stream_name":"stdout","time":1613.549650759,"data":"[phase_prof:train] %: before=0.0 hist+split=97.3 (build=0.0 scan=28.1) partition=2.7\n"}
+,{"stream_name":"stdout","time":1613.549656261,"data":"[phase_prof:train] LOOP: train_one_iter=4811.415ms (grad=22.752 learner=4768.028 score=9.056 snapshot=6.548 in_iter_other=5.031) metric=0.000ms feature_infos_setup=0.000ms\n"}
+,{"stream_name":"stdout","time":1613.549665742,"data":"[phase_prof:train] COUNTS: device_launches=445 (build_resident=150 subtract_resident=145 scan_resident=150 fused=0) | scan_roundtrips(syncs)=150\n"}
+,{"stream_name":"stdout","time":1613.549669567,"data":"[phase_prof:train] IN_LEARNER_OTHER=157.483ms = root_fold=4.335 + partition_new=2.010 + scratch_setup=0.036 + resident_reset=0.013 + resident_bin_upload=33.228 + residual=117.862\n"}
+,{"stream_name":"stdout","time":1613.549673271,"data":"[phase_prof:train] BUDGET: binning=898.205ms grad=22.752ms learner=4768.028ms (phases=4610.545 in_learner_other=157.483 [of which resident_bin_upload=33.228]) score=9.056ms\n"}
+,{"stream_name":"stdout","time":1613.549676958,"data":"[phase_prof:train] before=0.241ms hist+split=5065.515ms (build=0.000 scan=285.860) partition=3196.327ms total=8262.082ms\n"}
+,{"stream_name":"stdout","time":1613.549680798,"data":"[phase_prof:train] %: before=0.0 hist+split=61.3 (build=0.0 scan=3.5) partition=38.7\n"}
+,{"stream_name":"stdout","time":1613.549684327,"data":"[phase_prof:train] LOOP: train_one_iter=11786.412ms (grad=485.619 learner=10898.578 score=193.399 snapshot=143.829 in_iter_other=64.986) metric=0.000ms feature_infos_setup=0.000ms\n"}
+,{"stream_name":"stdout","time":1613.549688063,"data":"[phase_prof:train] COUNTS: device_launches=8900 (build_resident=3000 subtract_resident=2900 scan_resident=3000 fused=0) | scan_roundtrips(syncs)=3000\n"}
+,{"stream_name":"stdout","time":1613.54969169,"data":"[phase_prof:train] IN_LEARNER_OTHER=2636.496ms = root_fold=91.188 + partition_new=34.603 + scratch_setup=0.807 + resident_reset=0.315 + resident_bin_upload=36.060 + residual=2473.522\n"}
+,{"stream_name":"stdout","time":1613.549731062,"data":"[phase_prof:train] BUDGET: binning=953.123ms grad=485.619ms learner=10898.578ms (phases=8262.082 in_learner_other=2636.496 [of which resident_bin_upload=36.060]) score=193.399ms\n"}
+,{"stream_name":"stdout","time":1613.549738289,"data":"\n"}
+,{"stream_name":"stdout","time":1613.550649281,"data":"\n"}
+,{"stream_name":"stdout","time":1613.550672048,"data":"===== ARM off feats=50 =====\n"}
+,{"stream_name":"stdout","time":1624.108519992,"data":"--- stdout ---\n"}
+,{"stream_name":"stdout","time":1624.108573916,"data":"RESULT off feats=50 train_time_s=3.363\n"}
+,{"stream_name":"stdout","time":1624.108581243,"data":"\n"}
+,{"stream_name":"stdout","time":1624.108586454,"data":"\n"}
+,{"stream_name":"stdout","time":1624.108590981,"data":"$ rm -rf lightgbm_rs/target/autotune ~/.cache/cubecl 2\u003e/dev/null || true\n"}
+,{"stream_name":"stdout","time":1624.111635889,"data":"\n"}
+,{"stream_name":"stdout","time":1624.111657558,"data":"===== ARM rs feats=200 =====\n"}
+,{"stream_name":"stdout","time":1669.40267135,"data":"--- stdout ---\n"}
+,{"stream_name":"stdout","time":1669.402726791,"data":"RESULT rs feats=200 train_time_s=27.580\n"}
+,{"stream_name":"stdout","time":1669.402734738,"data":"\n"}
+,{"stream_name":"stdout","time":1669.402739328,"data":"--- stderr (phase_prof) ---\n"}
+,{"stream_name":"stdout","time":1669.402743946,"data":"[phase_prof:train] before=0.020ms hist+split=4113.387ms (build=0.000 scan=1261.935) partition=143.245ms total=4256.651ms\n"}
+,{"stream_name":"stdout","time":1669.402748902,"data":"[phase_prof:train] %: before=0.0 hist+split=96.6 (build=0.0 scan=29.6) partition=3.4\n"}
+,{"stream_name":"stdout","time":1669.402753709,"data":"[phase_prof:train] LOOP: train_one_iter=4921.805ms (grad=22.838 learner=4876.414 score=10.578 snapshot=6.676 in_iter_other=5.300) metric=0.000ms feature_infos_setup=0.000ms\n"}
+,{"stream_name":"stdout","time":1669.402758717,"data":"[phase_prof:train] COUNTS: device_launches=445 (build_resident=150 subtract_resident=145 scan_resident=150 fused=0) | scan_roundtrips(syncs)=150\n"}
+,{"stream_name":"stdout","time":1669.402763309,"data":"[phase_prof:train] IN_LEARNER_OTHER=619.762ms = root_fold=5.193 + partition_new=2.289 + scratch_setup=0.070 + resident_reset=0.018 + resident_bin_upload=132.579 + residual=479.613\n"}
+,{"stream_name":"stdout","time":1669.40276827,"data":"[phase_prof:train] BUDGET: binning=3514.265ms grad=22.838ms learner=4876.414ms (phases=4256.651 in_learner_other=619.762 [of which resident_bin_upload=132.579]) score=10.578ms\n"}
+,{"stream_name":"stdout","time":1669.402773247,"data":"[phase_prof:train] before=0.279ms hist+split=9072.743ms (build=0.000 scan=574.966) partition=3026.642ms total=12099.664ms\n"}
+,{"stream_name":"stdout","time":1669.402778067,"data":"[phase_prof:train] %: before=0.0 hist+split=75.0 (build=0.0 scan=4.8) partition=25.0\n"}
+,{"stream_name":"stdout","time":1669.402782704,"data":"[phase_prof:train] LOOP: train_one_iter=22597.470ms (grad=477.509 learner=21702.028 score=210.207 snapshot=145.801 in_iter_other=61.925) metric=0.000ms feature_infos_setup=0.000ms\n"}
+,{"stream_name":"stdout","time":1669.402787625,"data":"[phase_prof:train] COUNTS: device_launches=8900 (build_resident=3000 subtract_resident=2900 scan_resident=3000 fused=0) | scan_roundtrips(syncs)=3000\n"}
+,{"stream_name":"stdout","time":1669.402792418,"data":"[phase_prof:train] IN_LEARNER_OTHER=9602.364ms = root_fold=91.627 + partition_new=41.210 + scratch_setup=0.908 + resident_reset=0.457 + resident_bin_upload=135.776 + residual=9332.386\n"}
+,{"stream_name":"stdout","time":1669.402797439,"data":"[phase_prof:train] BUDGET: binning=3575.795ms grad=477.509ms learner=21702.028ms (phases=12099.664 in_learner_other=9602.364 [of which resident_bin_upload=135.776]) score=210.207ms\n"}
+,{"stream_name":"stdout","time":1669.402802417,"data":"\n"}
+,{"stream_name":"stdout","time":1669.40291366,"data":"\n"}
+,{"stream_name":"stdout","time":1669.402925092,"data":"===== ARM off feats=200 =====\n"}
+,{"stream_name":"stdout","time":1698.990335845,"data":"--- stdout ---\n"}
+,{"stream_name":"stdout","time":1698.990388006,"data":"RESULT off feats=200 train_time_s=11.293\n"}
+,{"stream_name":"stdout","time":1698.990404622,"data":"\n"}
+,{"stream_name":"stdout","time":1698.990407277,"data":"\n"}
+,{"stream_name":"stdout","time":1698.990409885,"data":"$ rm -rf lightgbm_rs/target/autotune ~/.cache/cubecl 2\u003e/dev/null || true\n"}
+,{"stream_name":"stdout","time":1698.993429443,"data":"\n"}
+,{"stream_name":"stdout","time":1698.993448273,"data":"===== ARM rs feats=500 =====\n"}
+,{"stream_name":"stdout","time":1791.916107856,"data":"--- stdout ---\n"}
+,{"stream_name":"stdout","time":1791.916162923,"data":"RESULT rs feats=500 train_time_s=58.128\n"}
+,{"stream_name":"stdout","time":1791.916169918,"data":"\n"}
+,{"stream_name":"stdout","time":1791.916175158,"data":"--- stderr (phase_prof) ---\n"}
+,{"stream_name":"stdout","time":1791.91617969,"data":"[phase_prof:train] before=0.013ms hist+split=5050.432ms (build=0.000 scan=1130.475) partition=148.320ms total=5198.766ms\n"}
+,{"stream_name":"stdout","time":1791.916184516,"data":"[phase_prof:train] %: before=0.0 hist+split=97.1 (build=0.0 scan=21.7) partition=2.9\n"}
+,{"stream_name":"stdout","time":1791.916189013,"data":"[phase_prof:train] LOOP: train_one_iter=6749.536ms (grad=23.783 learner=6701.678 score=10.833 snapshot=5.909 in_iter_other=7.333) metric=0.000ms feature_infos_setup=0.000ms\n"}
+,{"stream_name":"stdout","time":1791.916193832,"data":"[phase_prof:train] COUNTS: device_launches=445 (build_resident=150 subtract_resident=145 scan_resident=150 fused=0) | scan_roundtrips(syncs)=150\n"}
+,{"stream_name":"stdout","time":1791.91620191,"data":"[phase_prof:train] IN_LEARNER_OTHER=1502.912ms = root_fold=4.682 + partition_new=3.462 + scratch_setup=0.103 + resident_reset=0.026 + resident_bin_upload=338.235 + residual=1156.403\n"}
+,{"stream_name":"stdout","time":1791.916205412,"data":"[phase_prof:train] BUDGET: binning=8725.344ms grad=23.783ms learner=6701.678ms (phases=5198.766 in_learner_other=1502.912 [of which resident_bin_upload=338.235]) score=10.833ms\n"}
+,{"stream_name":"stdout","time":1791.916208582,"data":"[phase_prof:train] before=0.275ms hist+split=18228.111ms (build=0.000 scan=1169.911) partition=2951.905ms total=21180.291ms\n"}
+,{"stream_name":"stdout","time":1791.916211819,"data":"[phase_prof:train] %: before=0.0 hist+split=86.1 (build=0.0 scan=5.5) partition=13.9\n"}
+,{"stream_name":"stdout","time":1791.916214823,"data":"[phase_prof:train] LOOP: train_one_iter=46044.632ms (grad=473.525 learner=45158.113 score=218.201 snapshot=134.717 in_iter_other=60.076) metric=0.000ms feature_infos_setup=0.000ms\n"}
+,{"stream_name":"stdout","time":1791.916218035,"data":"[phase_prof:train] COUNTS: device_launches=8900 (build_resident=3000 subtract_resident=2900 scan_resident=3000 fused=0) | scan_roundtrips(syncs)=3000\n"}
+,{"stream_name":"stdout","time":1791.916221113,"data":"[phase_prof:train] IN_LEARNER_OTHER=23977.822ms = root_fold=92.526 + partition_new=68.171 + scratch_setup=1.654 + resident_reset=0.420 + resident_bin_upload=356.322 + residual=23458.730\n"}
+,{"stream_name":"stdout","time":1791.916229632,"data":"[phase_prof:train] BUDGET: binning=8928.125ms grad=473.525ms learner=45158.113ms (phases=21180.291 in_learner_other=23977.822 [of which resident_bin_upload=356.322]) score=218.201ms\n"}
+,{"stream_name":"stdout","time":1791.91623317,"data":"\n"}
+,{"stream_name":"stdout","time":1791.916291912,"data":"\n"}
+,{"stream_name":"stdout","time":1791.916303967,"data":"===== ARM off feats=500 =====\n"}
+,{"stream_name":"stdout","time":1863.88144553,"data":"--- stdout ---\n"}
+,{"stream_name":"stdout","time":1863.8814945,"data":"RESULT off feats=500 train_time_s=30.061\n"}
+,{"stream_name":"stdout","time":1863.881501843,"data":"\n"}
+,{"stream_name":"stdout","time":1863.881507578,"data":"\n"}
+,{"stream_name":"stdout","time":1863.881526342,"data":"\n"}
+,{"stream_name":"stdout","time":1863.881530477,"data":"==================== SPIKE-054 SHAPE CROSSOVER (real CUDA, 500k rows) ====================\n"}
+,{"stream_name":"stdout","time":1863.88153457,"data":" feats  rs_wall  off_wall  ratio   t1iter   phases  launches ms/launch\n"}
+,{"stream_name":"stdout","time":1863.881538494,"data":"----------------------------------------------------------------------\n"}
+,{"stream_name":"stdout","time":1863.8815513,"data":"    50   13.103     3.363   3.90    11786     8262      8900     0.928\n"}
+,{"stream_name":"stdout","time":1863.881554266,"data":"   200   27.580    11.293   2.44    22597    12100      8900     1.360\n"}
+,{"stream_name":"stdout","time":1863.88155671,"data":"   500   58.128    30.061   1.93    46045    21180      8900     2.380\n"}
+,{"stream_name":"stdout","time":1863.881559146,"data":"\n"}
+,{"stream_name":"stdout","time":1863.88156144,"data":"--- read-out ---\n"}
+,{"stream_name":"stdout","time":1863.881563887,"data":"  ratio(rs/official) DROPS as feats rise =\u003e narrow gap is architectural; route wide to CUDA\n"}
+,{"stream_name":"stdout","time":1863.8815668,"data":"  ms/launch RISES with feats (more work/launch) but launches ~constant =\u003e\n"}
+,{"stream_name":"stdout","time":1863.881569352,"data":"    launch-bound FRACTION shrinks at width (confirms 051/052 launch-bound diagnosis)\n"}
+,{"stream_name":"stderr","time":1865.857593627,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":1865.857620504,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":1866.076081085,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":1866.076106062,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":1866.66187521,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":1867.863675785,"data":"[NbConvertApp] Writing 304012 bytes to __results__.html\n"}
+]
