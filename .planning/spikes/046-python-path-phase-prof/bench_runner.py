@@ -20,6 +20,10 @@ from sklearn.datasets import make_classification
 
 which = sys.argv[1]
 device_type = sys.argv[2]
+# Optional argv[3]: metric_freq override (spike-048 A/B — isolates the per-iter
+# training-metric eval cost. metric_freq=N_ESTIMATORS => eval only on the last
+# iter, i.e. ~1 eval instead of 100. Default 1 = current behavior.)
+metric_freq = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 
 # Match the reported repro EXACTLY: 500k samples, 50 features, 100 trees.
 N_SAMPLES = 500_000
@@ -37,6 +41,7 @@ params = dict(
     num_leaves=31,
     learning_rate=0.1,
     n_estimators=100,
+    metric_freq=metric_freq,
     verbose=-1,
 )
 
@@ -58,4 +63,4 @@ model = lgb.LGBMClassifier(**params)
 model.fit(X, y)
 elapsed = time.time() - start
 
-print(f"RESULT {which} {device_type} train_time_s={elapsed:.3f}", flush=True)
+print(f"RESULT {which} {device_type} mfreq={metric_freq} train_time_s={elapsed:.3f}", flush=True)
