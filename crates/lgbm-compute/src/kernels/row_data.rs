@@ -346,8 +346,100 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
         layout: &FeaturePartitionLayout,
         row_ptr_bit_type: u32,
     ) -> Result<Self, ComputeError> {
-        let _ = (client, columns, layout, row_ptr_bit_type);
-        todo!("15-03: GetSparseDataPartitioned — per-partition CSR re-lay (partition-local bins) over the 3×3 width matrix")
+        let (num_rows, num_columns) = validate_columns(columns)?;
+        // Pitfall 2: reject an unsupported CSR row-pointer width BEFORE building or
+        // uploading anything — NEVER a silent widen (T-15-PTR). Supported: {16, 32, 64}.
+        if !matches!(row_ptr_bit_type, 16 | 32 | 64) {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "unsupported row_ptr_bit_type {row_ptr_bit_type} (expected 16/32/64)"
+                ),
+            });
+        }
+        let bit_type = columns.iter().map(column_bit_width).max().unwrap_or(8);
+
+        // T-15-PART: overflow-check both length products before any device alloc.
+        let total = num_columns.checked_mul(num_rows).ok_or_else(|| ComputeError::Runtime {
+            detail: format!(
+                "GetSparseDataPartitioned: num_columns {num_columns} * num_rows {num_rows} \
+                 overflows usize"
+            ),
+        })?;
+        let row_ptr_len = layout
+            .num_feature_partitions
+            .checked_mul(num_rows + 1)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!(
+                    "GetSparseDataPartitioned: num_partitions {} * (num_rows+1) {} overflows \
+                     usize",
+                    layout.num_feature_partitions,
+                    num_rows + 1
+                ),
+            })?;
+
+        // Build the per-partition CSR. The value buffer mirrors the dense row-major
+        // partition-local layout, but each stored bin is made PARTITION-LOCAL by adding
+        // `column_hist_offsets[col]` — i.e. `global_bin - partition_hist_start` (Pitfall 4,
+        // the single most error-prone line). `row_ptr` is the per-partition CSR offset
+        // table (for this fully-dense relay, row `r` of partition `p` starts at
+        // `r * ncol_p` — `ncol_p` nnz per row).
+        let mut vals: Vec<u32> = Vec::with_capacity(total);
+        let mut row_ptr: Vec<usize> = Vec::with_capacity(row_ptr_len);
+        for p in 0..layout.num_feature_partitions {
+            let lo = layout.feature_partition_column_index_offsets[p];
+            let hi = layout.feature_partition_column_index_offsets[p + 1];
+            let ncol_p = hi - lo;
+            for row in 0..num_rows {
+                for (local_col, column) in columns[lo..hi].iter().enumerate() {
+                    let c = lo + local_col;
+                    // partition-local bin = raw + column_hist_offsets[c]
+                    //                     = global_bin - partition_hist_offsets[p].
+                    vals.push(column.bin(row) + layout.column_hist_offsets[c] as u32);
+                }
+            }
+            for r in 0..=num_rows {
+                row_ptr.push(r * ncol_p);
+            }
+        }
+        debug_assert_eq!(vals.len(), total);
+        debug_assert_eq!(row_ptr.len(), row_ptr_len);
+
+        // The `InitSparseData<BIN_TYPE, PTR_TYPE>` 3×3 dispatch (§13): one explicit arm
+        // per supported `{8,16,32} × {16,32,64}` combination. `bit_type` is derived
+        // ∈ {8,16,32} and `row_ptr_bit_type` was validated ∈ {16,32,64} above, so the
+        // catch-all is unreachable — but it keeps the match exhaustive and re-asserts
+        // Pitfall 2 (never a silent widen).
+        let (data_handle, row_ptr_handle) = match (bit_type, row_ptr_bit_type) {
+            (8, 16) => init_sparse_data::<R, u8, u16>(client, &vals, &row_ptr)?,
+            (8, 32) => init_sparse_data::<R, u8, u32>(client, &vals, &row_ptr)?,
+            (8, 64) => init_sparse_data::<R, u8, u64>(client, &vals, &row_ptr)?,
+            (16, 16) => init_sparse_data::<R, u16, u16>(client, &vals, &row_ptr)?,
+            (16, 32) => init_sparse_data::<R, u16, u32>(client, &vals, &row_ptr)?,
+            (16, 64) => init_sparse_data::<R, u16, u64>(client, &vals, &row_ptr)?,
+            (32, 16) => init_sparse_data::<R, u32, u16>(client, &vals, &row_ptr)?,
+            (32, 32) => init_sparse_data::<R, u32, u32>(client, &vals, &row_ptr)?,
+            (32, 64) => init_sparse_data::<R, u32, u64>(client, &vals, &row_ptr)?,
+            (b, p) => {
+                return Err(ComputeError::Runtime {
+                    detail: format!(
+                        "unsupported (bit_type={b}, row_ptr_type={p}) — expected \
+                         {{8,16,32}}×{{16,32,64}}"
+                    ),
+                })
+            }
+        };
+
+        Ok(Self {
+            layout: layout.clone(),
+            is_sparse: true,
+            bit_type,
+            row_ptr_bit_type,
+            num_rows,
+            num_columns,
+            data_handle,
+            row_ptr_handle,
+            _runtime: PhantomData,
+        })
     }
 
     /// Read the re-laid store's LOGICAL global bin at `(row, column)` back from
@@ -489,16 +581,93 @@ fn validate_columns(columns: &[BinColumn]) -> Result<(usize, usize), ComputeErro
         });
     }
     let num_rows = columns[0].len();
-    for (i, c) in columns.iter().enumerate() {
+    for c in columns {
         if c.len() != num_rows {
             return Err(ComputeError::LengthMismatch {
                 expected: num_rows,
                 actual: c.len(),
             });
         }
-        let _ = i;
     }
     Ok((num_rows, num_columns))
+}
+
+/// Bin-store element type for the 3×3 `InitSparseData<BIN_TYPE, …>` dispatch
+/// (`BIN_TYPE ∈ {u8, u16, u32}`). The bin is an INDEX, byte-faithful when narrowed.
+trait StoreInt: CubeElement + Copy {
+    fn from_u32_lossy(v: u32) -> Self;
+}
+impl StoreInt for u8 {
+    fn from_u32_lossy(v: u32) -> Self {
+        v as u8
+    }
+}
+impl StoreInt for u16 {
+    fn from_u32_lossy(v: u32) -> Self {
+        v as u16
+    }
+}
+impl StoreInt for u32 {
+    fn from_u32_lossy(v: u32) -> Self {
+        v
+    }
+}
+
+/// CSR row-pointer element type for the 3×3 `InitSparseData<…, PTR_TYPE>` dispatch
+/// (`PTR_TYPE ∈ {u16, u32, u64}`). [`PtrInt::MAX`] is the largest offset the width holds,
+/// used to assert the chosen width fits the actual nnz before upload (T-15-PTR).
+trait PtrInt: CubeElement + Copy {
+    const MAX: usize;
+    fn from_usize_lossy(v: usize) -> Self;
+}
+impl PtrInt for u16 {
+    const MAX: usize = u16::MAX as usize;
+    fn from_usize_lossy(v: usize) -> Self {
+        v as u16
+    }
+}
+impl PtrInt for u32 {
+    const MAX: usize = u32::MAX as usize;
+    fn from_usize_lossy(v: usize) -> Self {
+        v as u32
+    }
+}
+impl PtrInt for u64 {
+    const MAX: usize = u64::MAX as usize;
+    fn from_usize_lossy(v: usize) -> Self {
+        v as u64
+    }
+}
+
+/// Upload one `(BIN_TYPE, PTR_TYPE)` cell of the sparse CSR store: narrow the
+/// partition-local bin values to `B` and the row pointers to `P`, then upload each ONCE
+/// (D-09 alloc-once). Asserts every row-pointer offset fits `P` BEFORE upload so a
+/// too-narrow width can never truncate an offset into an OOB read (T-15-PTR). Pure safe
+/// `create_from_slice` round-trip — no kernel launch, no `unsafe` (CMP-01).
+///
+/// # Errors
+/// [`ComputeError`] if any row-pointer offset exceeds `P::MAX`.
+fn init_sparse_data<R: cubecl::Runtime, B: StoreInt, P: PtrInt>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    vals_u32: &[u32],
+    row_ptr_usize: &[usize],
+) -> Result<(Handle, Option<Handle>), ComputeError> {
+    for &rp in row_ptr_usize {
+        if rp > P::MAX {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "row_ptr offset {rp} exceeds chosen row_ptr_type capacity {} \
+                     (would truncate → OOB)",
+                    P::MAX
+                ),
+            });
+        }
+    }
+    let vb: Vec<B> = vals_u32.iter().map(|&x| B::from_u32_lossy(x)).collect();
+    let pb: Vec<P> = row_ptr_usize.iter().map(|&x| P::from_usize_lossy(x)).collect();
+    let data_handle = client.create_from_slice(B::as_bytes(&vb));
+    let row_ptr_handle = client.create_from_slice(P::as_bytes(&pb));
+    Ok((data_handle, Some(row_ptr_handle)))
 }
 
 /// Upload a `u32`-valued buffer to the device at the selected `bit_type` width, narrowing
