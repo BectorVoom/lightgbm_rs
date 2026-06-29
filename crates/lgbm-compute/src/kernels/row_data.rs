@@ -70,8 +70,89 @@ pub fn divide_cuda_feature_groups(
     num_bin_per_column: &[usize],
     shared_hist_size: usize,
 ) -> FeaturePartitionLayout {
-    let _ = (num_bin_per_column, shared_hist_size);
-    todo!("15-02: DivideCUDAFeatureGroups — pack columns under shared_hist_size/2, spill large-bin columns to own partition")
+    // D-02 / §13: `max_num_bin_per_partition = shared_hist_size / 2`. Each histogram
+    // entry is a `(grad, hess)` pair, so the SMEM budget in *bins* is half the entry
+    // capacity — the `/2` is the parity-load-bearing detail (Pitfall 1). `6144` is the
+    // design-doc DP value (A1); per §17 the grouping has NO float-parity impact (it only
+    // decides shared-vs-global spill), so this is plain host `usize` math.
+    let budget = shared_hist_size / 2;
+    let n = num_bin_per_column.len();
+
+    // `prefix[c]` = global bin offset where column `c` begins (running prefix sum).
+    // Bin counts are bounded (a column has at most `max_bin` bins), so a `saturating_add`
+    // is the conservative guard here; the device-buffer length products that can actually
+    // overflow are `checked_mul`-guarded at the re-lay boundary (T-15-PART).
+    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.push(0usize);
+    for &b in num_bin_per_column {
+        let last = *prefix.last().expect("prefix is seeded with 0");
+        prefix.push(last.saturating_add(b));
+    }
+
+    // Walk columns in order, packing into partitions. `(lo, hi, is_large)` per partition.
+    let mut partitions: Vec<(usize, usize, bool)> = Vec::new();
+    let mut partition_start: Option<usize> = None;
+    for c in 0..n {
+        let b = num_bin_per_column[c];
+        if b > budget {
+            // A column whose own bin count exceeds the budget becomes its OWN large-bin
+            // partition (Pitfall 1). Close the current accumulating partition first so the
+            // small run preceding a large column is not silently merged into it.
+            if let Some(start) = partition_start.take() {
+                partitions.push((start, c, false));
+            }
+            partitions.push((c, c + 1, true));
+        } else {
+            match partition_start {
+                None => partition_start = Some(c),
+                Some(start) => {
+                    // Close + reopen iff including column `c` would exceed the budget.
+                    if prefix[c + 1] - prefix[start] > budget {
+                        partitions.push((start, c, false));
+                        partition_start = Some(c);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(start) = partition_start.take() {
+        partitions.push((start, n, false));
+    }
+
+    // Build the §13 accessor tables from the partition runs.
+    let mut feature_partition_column_index_offsets = Vec::with_capacity(partitions.len() + 1);
+    let mut partition_hist_offsets = Vec::with_capacity(partitions.len() + 1);
+    let mut column_hist_offsets = vec![0usize; n];
+    feature_partition_column_index_offsets.push(0);
+    partition_hist_offsets.push(0);
+    let mut num_large_bin_partition = 0usize;
+    let mut max_num_column_per_partition = 0usize;
+    for &(lo, hi, is_large) in &partitions {
+        feature_partition_column_index_offsets.push(hi);
+        partition_hist_offsets.push(prefix[hi]);
+        if is_large {
+            num_large_bin_partition += 1;
+        }
+        let ncol = hi - lo;
+        if ncol > max_num_column_per_partition {
+            max_num_column_per_partition = ncol;
+        }
+        // `column_hist_offsets[c]` is PARTITION-LOCAL: it resets to 0 at each partition
+        // start (`prefix[c] - prefix[lo]`), Pitfall 4.
+        for c in lo..hi {
+            column_hist_offsets[c] = prefix[c] - prefix[lo];
+        }
+    }
+
+    FeaturePartitionLayout {
+        feature_partition_column_index_offsets,
+        column_hist_offsets,
+        partition_hist_offsets,
+        max_num_column_per_partition,
+        num_feature_partitions: partitions.len(),
+        num_large_bin_partition,
+        shared_hist_size,
+    }
 }
 
 /// `CUDARowData` — the on-device row-wise binned matrix + its

@@ -122,32 +122,31 @@ fn dense_bin_parity_all_widths() {
 #[test]
 fn feature_partition_layout() {
     // shared_hist_size 6144 -> budget (max_num_bin_per_partition) = 3072.
-    // Columns: [1000, 1000, 1000] pack (3000 <= 3072 would overflow at the 3rd;
-    // the 3rd opens a new partition), and a 4th column of 4000 > 3072 spills to its
-    // OWN large-bin partition.
+    // Columns [1000, 1000, 1000] pack into ONE partition (cumulative 3000 <= 3072 fits),
+    // and a 4th column of 4000 > 3072 spills to its OWN large-bin partition.
     let num_bin_per_column = vec![1000usize, 1000, 1000, 4000];
     let layout = divide_cuda_feature_groups(&num_bin_per_column, 6144);
 
     assert_eq!(layout.shared_hist_size, 6144);
-    // Hand-computed: partition 0 = {col0, col1} (2000 <= 3072), partition 1 = {col2}
-    // (3000 > 3072 starts a new partition), partition 2 = {col3} large-bin spill.
-    assert_eq!(layout.num_feature_partitions, 3, "partition count");
+    // Hand-computed (budget = 6144/2 = 3072): partition 0 = {col0, col1, col2} (3000 <=
+    // 3072 all fit), partition 1 = {col3} large-bin spill (4000 > 3072).
+    assert_eq!(layout.num_feature_partitions, 2, "partition count");
     assert_eq!(
         layout.feature_partition_column_index_offsets,
-        vec![0, 2, 3, 4],
+        vec![0, 3, 4],
         "partition i owns columns [off[i], off[i+1])"
     );
-    // column_hist_offsets are partition-local: col0@0, col1@1000 (partition 0);
-    // col2@0 (partition 1); col3@0 (partition 2).
+    // column_hist_offsets are partition-local: col0@0, col1@1000, col2@2000 (partition 0);
+    // col3@0 (partition 1).
     assert_eq!(
         layout.column_hist_offsets,
-        vec![0, 1000, 0, 0],
+        vec![0, 1000, 2000, 0],
         "per-column partition-local bin offsets"
     );
     // partition_hist_offsets are the global bin offsets per partition begin.
     assert_eq!(
         layout.partition_hist_offsets,
-        vec![0, 2000, 3000, 7000],
+        vec![0, 3000, 7000],
         "global partition begin offsets"
     );
     // The 4000-bin column exceeds the 3072 budget -> exactly one large-bin partition.
