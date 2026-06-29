@@ -81,6 +81,21 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
 ) -> Result<BinColumn, ComputeError> {
     use cubecl::prelude::CubeElement;
 
+    // --- CR-02: enforce the SAFETY invariant the kernel launch relies on. The kernel
+    // reads `in_col[used_indices[local]]` from a device buffer uploaded from `column`
+    // (length `column.len()`), but the per-element index check below bounds indices by
+    // `num_data` — an INDEPENDENT public parameter. If `num_data > column.len()`, an
+    // index in `[column.len(), num_data)` would pass validation yet produce an
+    // out-of-bounds device read. Validate the source-buffer relationship at the boundary,
+    // BEFORE any launch, so the `SAFETY` comment's `num_data == n_in` is enforced rather
+    // than assumed. ---
+    if column.len() != num_data {
+        return Err(ComputeError::LengthMismatch {
+            expected: num_data,
+            actual: column.len(),
+        });
+    }
+
     // --- V5 / T-15-IDX boundary validation: every used index must be in
     // `[0, num_data)` BEFORE any unsafe launch (the `partition.rs:233-241`
     // per-index precedent). The C++ raw-pointer subset table has no bounds check;
