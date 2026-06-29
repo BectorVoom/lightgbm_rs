@@ -27,6 +27,7 @@
 use cubecl::prelude::*;
 
 use crate::error::ComputeError;
+use crate::kernels::random::draw_next_float_on;
 use crate::BinColumn;
 
 /// `COPY_SUBROW_BLOCK_SIZE` (§3) — one block of selected rows per launch tile.
@@ -159,19 +160,72 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
     Ok(result)
 }
 
-/// On-device bagging draw: reproduce the host `[in-bag asc] ++ [OOB desc]` layout
-/// (D-05) — per-block `Random::new(bagging_seed + block)`, `next_float() as f64 <
-/// bagging_fraction` routes in-bag (left, ascending) else OOB (right), then the OOB
-/// tail is reversed. Returns `(bag_data_indices, bag_data_cnt)`.
+/// On-device bagging draw: reproduce the host `[in-bag asc] ++ [OOB desc]` index
+/// layout (D-05) bit-for-bit. One device RNG task per `BAGGING_RAND_BLOCK`-row block
+/// (seeded `bagging_seed + block`) draws the per-row `NextFloat` stream via the
+/// Phase-14 [`draw_next_float_on`] launcher; the route is then computed host-side —
+/// `(draw as f64) < bagging_fraction` sends a row in-bag (left, ascending) else OOB
+/// (right) — and the OOB tail is reversed so the layout reads `[in-bag asc] ++
+/// [OOB desc]`. Returns the `bag_data_indices` layout.
+///
+/// ## Seed-supply seam (Pitfall 5 — iteration-0 anchor only)
+/// `seeds[b] = bagging_seed + b` reproduces the host draw at iteration 0 (each block
+/// `Random` constructed once from `bagging_seed + block`). Multi-iteration training
+/// advances per-block RNG state across iterations; carrying that continuity needs the
+/// host to SUPPLY the per-block state — an explicit Phase-21 seam, NOT this phase.
+///
+/// ## Anchor discipline (D-05 / D-08)
+/// The draw stream is anchored to the inline HOST `bag_data_indices` reference, never
+/// GPU-vs-GPU (def-f8u-01). The f32 `NextFloat` is promoted to f64 BEFORE the `<
+/// bagging_fraction` compare (Pitfall 6) — matching the C++ `NextFloat() < fraction`.
 ///
 /// # Errors
-/// [`ComputeError`] on a runtime/launch failure.
+/// [`ComputeError`] on a runtime/launch failure (e.g. draw-output sizing overflow,
+/// guarded inside [`draw_next_float_on`]).
 pub fn bagging_draw_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     num_data: i32,
     bagging_seed: i32,
     bagging_fraction: f64,
 ) -> Result<Vec<i32>, ComputeError> {
-    let _ = (client, num_data, bagging_seed, bagging_fraction);
-    todo!("15-04: on-device bagging draw — per-block RNG route + OOB-tail reverse (D-05)")
+    let nd = num_data.max(0);
+    if nd == 0 {
+        return Ok(Vec::new());
+    }
+
+    // One block (and one device RNG task) per BAGGING_RAND_BLOCK rows; seed each
+    // block `bagging_seed + block` (iteration-0 convention, see the seed-supply
+    // seam). `BAGGING_RAND_BLOCK` is a LOCAL const — never imported from
+    // `lgbm-boosting` (crate cycle).
+    // Explicit ceil-div (NOT `i32::div_ceil`, which collides with the cubecl prelude
+    // `DivCeil` trait under `unstable_name_collisions`); mirrors the host reference's
+    // `(nd + BLOCK - 1) / BLOCK`.
+    let n_blocks = (nd + BAGGING_RAND_BLOCK - 1) / BAGGING_RAND_BLOCK;
+    let seeds: Vec<u32> = (0..n_blocks).map(|b| (bagging_seed + b) as u32).collect();
+
+    // Each task draws BAGGING_RAND_BLOCK consecutive NextFloats, row-major: row `i`'s
+    // draw is `draws[block*1024 + i%1024] == draws[i]` (block == i/1024), so the flat
+    // stream is directly row-indexed. f32-exact via the shared `Random` recurrence.
+    let draws = draw_next_float_on(client, &seeds, BAGGING_RAND_BLOCK as u32)?;
+
+    // Host-side route (Open Question 2 — simplest, fully anchored): promote the f32
+    // draw to f64 (Pitfall 6) and compare `< bagging_fraction`, filling in-bag left
+    // (ascending) / OOB right, then reverse the OOB tail → `[in-bag asc] ++ [OOB desc]`
+    // (mirrors `sample_strategy` + the `threading.h:152-155` one-buffer reverse).
+    let nd_usize = nd as usize;
+    let mut buf = vec![0i32; nd_usize];
+    let mut left = 0usize;
+    let mut right = nd_usize;
+    for (i, &draw_f32) in draws.iter().enumerate().take(nd_usize) {
+        let draw = f64::from(draw_f32);
+        if draw < bagging_fraction {
+            buf[left] = i as i32;
+            left += 1;
+        } else {
+            right -= 1;
+            buf[right] = i as i32;
+        }
+    }
+    buf[left..nd_usize].reverse();
+    Ok(buf)
 }
