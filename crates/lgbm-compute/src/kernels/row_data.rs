@@ -356,8 +356,6 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
                 ),
             });
         }
-        let bit_type = columns.iter().map(column_bit_width).max().unwrap_or(8);
-
         // T-15-PART: overflow-check both length products before any device alloc.
         let total = num_columns.checked_mul(num_rows).ok_or_else(|| ComputeError::Runtime {
             detail: format!(
@@ -403,6 +401,19 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
         }
         debug_assert_eq!(vals.len(), total);
         debug_assert_eq!(row_ptr.len(), row_ptr_len);
+
+        // CR-01: the SPARSE store holds PARTITION-LOCAL bins (`raw + column_hist_offsets[c]`,
+        // above), whose magnitude can reach the partition budget (`max_num_bin_per_partition
+        // = shared_hist_size / 2`) — far beyond any single column's RAW bin width. Sizing
+        // `bit_type` from the raw per-column width (the old `column_bit_width().max()`) lets
+        // `StoreInt::from_u32_lossy` TRUNCATE a partition-local value (e.g. `2816 as u8 → 0`)
+        // when ≥2 narrow columns pack into one partition. Size the store width to the MAXIMUM
+        // partition-local value ACTUALLY STORED instead (mirrors the C++ `CUDARowData`
+        // row-data width selection, sized by the partition bin range), so the narrowing can
+        // never truncate. The DENSE path is unaffected — it stores raw bins (each fits its own
+        // width) and re-adds the offset at read time.
+        let max_local_bin = vals.iter().copied().max().unwrap_or(0);
+        let bit_type = bit_type_for_value(max_local_bin);
 
         // The `InitSparseData<BIN_TYPE, PTR_TYPE>` 3×3 dispatch (§13): one explicit arm
         // per supported `{8,16,32} × {16,32,64}` combination. `bit_type` is derived
@@ -557,6 +568,21 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
         Err(ComputeError::Runtime {
             detail: format!("column {column} belongs to no partition"),
         })
+    }
+}
+
+/// Select the narrowest bin-store width ∈ {8, 16, 32} that holds `max_value` without
+/// truncation (CR-01). Used by the SPARSE re-lay, whose stored bins are partition-local
+/// (`raw + column_hist_offsets[c]`) and can exceed any single column's raw bin width —
+/// so the store must be sized by the partition-local bin RANGE, not the raw column width,
+/// or [`StoreInt::from_u32_lossy`] would silently truncate.
+fn bit_type_for_value(max_value: u32) -> u32 {
+    if max_value <= u32::from(u8::MAX) {
+        8
+    } else if max_value <= u32::from(u16::MAX) {
+        16
+    } else {
+        32
     }
 }
 
