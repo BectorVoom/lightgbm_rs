@@ -6,7 +6,7 @@ current_phase: 15
 current_phase_name: on-device-device-dataset-row-subset-gather
 status: executing
 stopped_at: Phase 15 context gathered
-last_updated: "2026-06-29T21:36:18.523Z"
+last_updated: "2026-06-29T21:56:37.778Z"
 last_activity: 2026-06-29
 last_activity_desc: Phase 15 execution started
 progress:
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 15 (on-device-device-dataset-row-subset-gather) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-06-29 — Phase 15 execution started
@@ -553,6 +553,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 14 P02 | 3min | 2 tasks | 2 files |
 | Phase 14 P03 | 18min | 3 tasks | 1 files |
 | Phase 15 P01 | 8min | 3 tasks | 6 files |
+| Phase 15 P02 | 7min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -641,6 +642,7 @@ Recent decisions affecting current work:
 - [Phase 14]: Phase 14-03 oracle: default_left tie-aware comparator masks only bit1 (DEFAULT_LEFT_MASK), per-node tie gated on threshold + child_row_counts equality; host-fallback lives in oracle TEST only (D-01/D-02), production uses Ok(None) fall-through
 - [Phase ?]: Phase-15 device-dataset modules registered ungated (cpu f64 anchor runs them, D-08), not gpu-gated
 - [Phase ?]: Sparse 3x3 width matrix exercised via explicit row_ptr_bit_type param + nnz-as-number synthesizer (no 2^32-nnz materialization)
+- [Phase ?]: 15-02: §13 row store stores dense bins RAW and sparse bins partition-local (column_hist_offsets folded in); read_bin reconstructs the global bin uniformly across dense/sparse
 
 ### Pending Todos
 
@@ -670,7 +672,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-29T21:35:52.223Z
+Last session: 2026-06-29T21:56:12.956Z
 Stopped at: Phase 15 context gathered
 Resume file: .planning/phases/15-on-device-device-dataset-row-subset-gather/15-CONTEXT.md
 
