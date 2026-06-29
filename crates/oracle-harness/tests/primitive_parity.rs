@@ -285,8 +285,21 @@ fn primitive_parity_reductions() {
                     "RED {name} dot (line {lineno}): got={got:e} cpp={cpp:e} (order band)"
                 );
             }
-            // C++ 0-identity bridge (see module doc): cpp == rust.max(0)/min(0),
-            // then BIT-EXACT (selection-only, order-independent).
+            // WR-01 — SUB-1024-THREAD ARTIFACT, NOT A REFERENCE SEMANTIC.
+            // The committed max/min goldens were captured as `<<<1, n>>>` with
+            // n ∈ {32,96,256} (num_warp < warpSize=32). At that sub-1024-thread
+            // width the verbatim C++ reduction folds a `0` for the out-of-range
+            // warp lanes (`shared_mem_buffer[warpLane] : 0`), so every committed
+            // `op=max` golden over the all-negative SpreadF64 inputs is exactly
+            // `0` and every `op=min` golden is the true (negative) min. PRODUCTION
+            // LightGBM launches these reductions at full 1024-thread blocks
+            // (num_warp == 32) where this `0` floor does NOT occur — so the
+            // `.max(0.0)`/`.min(0.0)` bridges below are CAPTURE-ARTIFACT
+            // reconciliation, NOT reference behavior, and `reduce_max_f64_on`'s
+            // genuine reference parity is effectively UNTESTED until the goldens
+            // are recaptured at `<<<1, 1024>>>` (or with a positive-containing,
+            // full-block-width case). Recapture is owned by the consumer that
+            // first relies on production reduction semantics (D-02); see WR-01.
             "max" => {
                 let got = reduce_max_f64_on(&client, &data).unwrap();
                 assert_eq!(
