@@ -78,8 +78,85 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
     used_indices: &[i32],
     num_data: usize,
 ) -> Result<BinColumn, ComputeError> {
-    let _ = (client, column, used_indices, num_data);
-    todo!("15-04: CopySubrow host launcher — validate indices (V5) then launch the native-width gather")
+    use cubecl::prelude::CubeElement;
+
+    // --- V5 / T-15-IDX boundary validation: every used index must be in
+    // `[0, num_data)` BEFORE any unsafe launch (the `partition.rs:233-241`
+    // per-index precedent). The C++ raw-pointer subset table has no bounds check;
+    // the Rust port adds one so a malformed index can never reach an OOB device
+    // read. ---
+    for (pos, &idx) in used_indices.iter().enumerate() {
+        if idx < 0 {
+            return Err(ComputeError::Runtime {
+                detail: format!("copy_subrow: used_indices[{pos}] = {idx} is negative"),
+            });
+        }
+        if idx as usize >= num_data {
+            return Err(ComputeError::BinIndexOutOfRange {
+                row: pos,
+                bin: idx as u32,
+                num_bin: num_data as u32,
+            });
+        }
+    }
+
+    let num_used = used_indices.len();
+    // Same-width empty subset (no launch needed) — keeps the narrow storage.
+    if num_used == 0 {
+        return Ok(match column {
+            BinColumn::U8(_) => BinColumn::U8(Vec::new()),
+            BinColumn::U16(_) => BinColumn::U16(Vec::new()),
+            BinColumn::U32(_) => BinColumn::U32(Vec::new()),
+        });
+    }
+
+    let h_used = client.create_from_slice(i32::as_bytes(used_indices));
+    let cube_dim = COPY_SUBROW_BLOCK_SIZE;
+    let cube_count = (num_used as u32).div_ceil(cube_dim);
+
+    // Dispatch the kernel monomorph on the column's NATIVE width (u8/u16/u32) — the
+    // `partition.rs` `launch_native!` idiom — so the subset uploads/reads at the same
+    // narrow width and the output `BinColumn` keeps that width (D-07, no widen).
+    macro_rules! gather_native {
+        ($w:ty, $variant:path, $slice:expr) => {{
+            // T-15-PART: guard the output byte sizing against `usize` overflow.
+            let elem = core::mem::size_of::<$w>();
+            let out_bytes = num_used.checked_mul(elem).ok_or_else(|| ComputeError::Runtime {
+                detail: format!(
+                    "copy_subrow: output sizing {num_used} * {elem} overflows usize"
+                ),
+            })?;
+            let n_in = $slice.len();
+            let h_in = client.create_from_slice(<$w>::as_bytes($slice));
+            let h_out = client.empty(out_bytes);
+            // SAFETY: `h_in` holds the full source column (`n_in` elems), `h_out` is
+            // sized for exactly `num_used` elems, and `h_used` holds `num_used` i32s;
+            // all three outlive the launch. The kernel bounds-checks `local <
+            // num_used` and each `used_indices[local]` was validated in `[0, num_data)`
+            // above (and `num_data == n_in`), so every `in_col[used_indices[local]]`
+            // read is in range. All cubecl unsafe is confined here (CMP-01).
+            unsafe {
+                copy_subrow_kernel::launch::<$w, R>(
+                    client,
+                    CubeCount::Static(cube_count, 1, 1),
+                    CubeDim::new_1d(cube_dim),
+                    ArrayArg::from_raw_parts(h_in, n_in),
+                    ArrayArg::from_raw_parts(h_out.clone(), num_used),
+                    ArrayArg::from_raw_parts(h_used.clone(), num_used),
+                    num_used as u32,
+                );
+            }
+            let bytes = client.read_one_unchecked(h_out);
+            $variant(<$w>::from_bytes(&bytes).to_vec())
+        }};
+    }
+
+    let result = match column {
+        BinColumn::U8(v) => gather_native!(u8, BinColumn::U8, v),
+        BinColumn::U16(v) => gather_native!(u16, BinColumn::U16, v),
+        BinColumn::U32(v) => gather_native!(u32, BinColumn::U32, v),
+    };
+    Ok(result)
 }
 
 /// On-device bagging draw: reproduce the host `[in-bag asc] ++ [OOB desc]` layout
