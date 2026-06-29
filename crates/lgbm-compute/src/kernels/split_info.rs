@@ -372,6 +372,14 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
 
     /// Read the numeric scalar fields of `slot` (no allocation).
     ///
+    /// This is an infallible-by-contract HOST helper (IN-01): unlike the
+    /// device-facing write paths (`set_scalars` / `set_cat_thresholds` /
+    /// `copy_slot`), which return a typed [`ComputeError::Runtime`] via
+    /// `check_slot` because their inputs cross the V5 boundary (T-14-04-01), the
+    /// read accessors take a host-supplied `slot` index and follow standard Rust
+    /// slice-indexing convention — an out-of-range slot is a caller bug, asserted
+    /// (panic), not a recoverable runtime error. Exempt from V5 by contract.
+    ///
     /// # Panics
     /// If `slot >= num_leaf_slots`.
     #[must_use]
@@ -473,6 +481,9 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
     /// The active categorical thresholds of `slot` (length `num_cat_threshold[slot]`),
     /// borrowing the reserved slab (no allocation).
     ///
+    /// Infallible-by-contract host read accessor, exempt from V5 — see
+    /// [`Self::scalars`] (IN-01).
+    ///
     /// # Panics
     /// If `slot >= num_leaf_slots`.
     #[must_use]
@@ -485,6 +496,9 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
 
     /// The active real categorical thresholds of `slot` (length
     /// `num_cat_threshold[slot]`), borrowing the reserved slab (no allocation).
+    ///
+    /// Infallible-by-contract host read accessor, exempt from V5 — see
+    /// [`Self::scalars`] (IN-01).
     ///
     /// # Panics
     /// If `slot >= num_leaf_slots`.
