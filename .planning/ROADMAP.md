@@ -99,7 +99,13 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   2. A CubeCL-safe device **split-record** (a pre-allocated `CUDASplitInfo` analog, no per-split in-kernel device alloc) and a **`CUDARandom` LCG** produce a bit-identical stream to the host `Random` (verified against the host extra-trees / sampling / per-item-rand draw sequence). (§15)
   3. The additive `Backend::grow_tree_on_device` seam + default-false `on_device_growth_supported()` discriminator + the anchor-pinned tie-aware `assert_on_device_tree_matches_cpu_anchor` oracle are re-established/extended in lgbm-compute / lgbm-treelearner / oracle-harness (the seam code already in git), never comparing two GPU paths to each other.
   4. `LGBM_CUDA_ON_DEVICE` is OFF by default; CPU / ROCm / existing-host-CUDA paths are byte-unchanged; the full merge gate is green.
-**Plans**: TBD
+**Plans**: 6 plans
+- [ ] 14-01-PLAN.md — Plane-intrinsic smoke test (Open Q1 de-risk) + new-module scaffolding (Wave 1)
+- [ ] 14-02-PLAN.md — C++/HIP device-primitive fixture-capture harness + committed goldens (Wave 1)
+- [ ] 14-03-PLAN.md — Full-depth primitives: prefix-sum (block+global), reductions, single-block bitonic argsort (Wave 2)
+- [ ] 14-04-PLAN.md — SoA pre-allocated device split-record + CUDARandom LCG (Wave 2)
+- [ ] 14-05-PLAN.md — Anchor-pinned skeletons: percentile, multi-block argsort, per-segment items-sort (Wave 3)
+- [ ] 14-06-PLAN.md — No-op seam + oracle extension + primitive fixture parity + full merge gate (Wave 4)
 **Notes**: The seam (`grow_tree_on_device`, `on_device_growth_supported`, `LeafPartitionLayout`, the tie-aware oracle) already exists in git from the cleared Phase-14/15 work — extend, don't rebuild. Bake the cubecl-0.10 gotcha checklist (no global barrier, `Atomic<i64>` broken, `wrapping_add` not an intrinsic, plane-sum ≤ plane width, `launch_unchecked` unsafe) into the primitives. Re-measured pre-on-device CUDA baseline (Kaggle Tesla T4, 500k×50, 100 trees): official LightGBM ~4.46× faster (3.36 s vs lgb-rs 14.98 s) — the bar later phases must beat.
 
 #### Phase 15: On-Device Device Dataset + Row-Subset Gather
