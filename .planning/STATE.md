@@ -4,17 +4,17 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 15
 current_phase_name: on-device-device-dataset-row-subset-gather
-status: executing
+status: verifying
 stopped_at: Phase 15 context gathered
-last_updated: "2026-06-29T22:08:15.328Z"
+last_updated: "2026-06-29T22:13:59.685Z"
 last_activity: 2026-06-29
 last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 10
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 11
-  completed_plans: 10
-  percent: 10
+  completed_plans: 11
+  percent: 20
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 15 (on-device-device-dataset-row-subset-gather) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-06-29 — Phase 15 execution started
 
@@ -556,6 +556,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 15 P02 | 7min | 3 tasks | 1 files |
 | Phase 15 P03 | 5min | 1 tasks | 1 files |
 | Phase 15 P04 | 4min | 2 tasks | 1 files |
+| Phase 15 P05 | 10 | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -646,6 +647,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Sparse 3x3 width matrix exercised via explicit row_ptr_bit_type param + nnz-as-number synthesizer (no 2^32-nnz materialization)
 - [Phase ?]: 15-02: §13 row store stores dense bins RAW and sparse bins partition-local (column_hist_offsets folded in); read_bin reconstructs the global bin uniformly across dense/sparse
 - [Phase 15]: ODL-04: CopySubrow gather + on-device bagging draw — host-validated indices, native-width dispatch, host-side bagging route anchored to host bag_data_indices (never GPU-vs-GPU)
+- [Phase 15]: Phase-15 merge gate D-10 green: device-dataset + row-subset-gather additions are fully additive (default cpu/ROCm/host-CUDA byte-unchanged, on-device seam OFF)
 
 ### Pending Todos
 
@@ -675,7 +677,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-29T22:07:48.180Z
+Last session: 2026-06-29T22:13:37.884Z
 Stopped at: Phase 15 context gathered
 Resume file: .planning/phases/15-on-device-device-dataset-row-subset-gather/15-CONTEXT.md
 
