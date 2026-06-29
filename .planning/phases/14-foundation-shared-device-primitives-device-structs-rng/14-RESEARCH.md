@@ -396,22 +396,27 @@ __global__ void shim_ShufflePrefixSum(T* buf, int n) { /* call __device__ Shuffl
 | A5 | The C++ f64 reduction order can be replicated in the cpu anchor for bit-exact f64 assertion | Pitfall 3 / Open Q2 | MEDIUM — if not, f64 reductions assert within a tight ULP band instead of bit-exact; argsort/int-prefix-sum remain bit-exact regardless. |
 | A6 | A host-side leaf-slot copy is sufficient for the Phase-14 `operator=` test (device copy kernel deferred to the §8 consumer) | Pattern 5 | LOW — D-07 explicitly defers the readback packet/consumer to Phase 17/18. |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All three open questions are resolved by the Phase-14 plans. Resolutions are recorded inline below and carried into the owning plan's tasks + SUMMARY.
 
 1. **Do `plane_inclusive_sum`/`plane_exclusive_sum`/`plane_max`/`plane_min` lower on cubecl-cpu AND cubecl-hip 0.10?**
    - What we know: the frontend exposes + registers IR for all of them (`plane.rs`); the repo has only exercised `plane_sum`/`plane_any`/`plane_ballot`/`plane_shuffle` on hip.
    - What's unclear: backend lowering coverage for the scan/max/min ops.
    - Recommendation: **Wave-0 smoke test per intrinsic per backend** before building the primitives; fall back to `plane_shuffle_up` manual scan if any op is missing.
+   - **RESOLVED by 14-01** (Wave-0 `plane_intrinsic_smoke.rs` per-intrinsic-per-backend smoke test, with the `plane_shuffle_up` manual-scan fallback authored and recorded in 14-01-SUMMARY for 14-03 to consume).
 
 2. **For f64 reductions/percentile, is the assertion bit-exact vs the C++ fixture, or bit-exact vs a Rust serial f64 ref + ~tol vs C++?**
    - What we know: D-03 says "numeric ops assert bit-exact on the cpu f64 anchor"; D-10 pins the anchor to the cubecl-cpu f64 fold. Bit-exactness between a GPU warp-tree f64 reduction and a serial CPU fold requires matching reduction order.
    - What's unclear: whether the C++ fixture's f64 reduction order is replicated in the Rust anchor, or whether f64 reductions get a tight-ULP tolerance.
    - Recommendation: integer prefix-sum + argsort permutation → bit-exact vs fixture; **f64 reductions/percentile → replicate the C++ pairwise order in the cpu anchor for bit-exact, else assert a documented f64 ULP band**. Decide at plan time per primitive.
+   - **RESOLVED by 14-03** (the per-primitive f64 reduction-order policy is decided in-plan in 14-03 Task 2 — bit-exact-with-matched-order vs documented ULP band, recorded per reduction in code/14-03-SUMMARY).
 
 3. **Exact `MAX_CAT_PER_SPLIT` reserved-slab width for `cat_threshold`/`cat_threshold_real`?**
    - What we know: D-06 reserves the buffers now; Phase 22 fills them.
    - What's unclear: the per-slot reserved length (C++ sizes it dynamically per split).
    - Recommendation: reserve a conservative fixed cap (e.g. matching `config_->max_cat_threshold`) and document it as Phase-22-tunable; the SoA layout doesn't change if the cap is revised, only the slab length.
+   - **RESOLVED by 14-04** (the `MAX_CAT_PER_SPLIT` reserved width is defined as a documented Phase-22-tunable `usize` const in 14-04 Task 1, with the cap recorded in 14-04-SUMMARY).
 
 ## Environment Availability
 
