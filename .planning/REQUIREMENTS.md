@@ -81,38 +81,54 @@ Explicitly excluded. Documented to prevent scope creep.
 
 ## Traceability
 
-Which phases cover which requirements. **Filled by the roadmapper** during roadmap creation (phases renumber from 14).
+Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf phases 09–13 preserved). Filled by the roadmapper 2026-06-29.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ODL-01 | TBD | Pending |
-| ODL-02 | TBD | Pending |
-| ODL-03 | TBD | Pending |
-| ODL-04 | TBD | Pending |
-| ODL-05 | TBD | Pending |
-| ODL-06 | TBD | Pending |
-| ODL-07 | TBD | Pending |
-| ODL-08 | TBD | Pending |
-| ODL-09 | TBD | Pending |
-| ODL-10 | TBD | Pending |
-| ODL-11 | TBD | Pending |
-| ODL-12 | TBD | Pending |
-| ODL-13 | TBD | Pending |
-| ODL-14 | TBD | Pending |
-| ODL-15 | TBD | Pending |
-| ODL-16 | TBD | Pending |
-| ODL-17 | TBD | Pending |
-| ODL-18 | TBD | Pending |
-| ODL-19 | TBD | Pending |
-| ODL-20 | TBD | Pending |
-| ODL-21 | TBD | Pending |
-| ODL-22 | TBD | Pending |
+| ODL-01 | Phase 14 | Pending |
+| ODL-02 | Phase 14 | Pending |
+| ODL-03 | Phase 15 | Pending |
+| ODL-04 | Phase 15 | Pending |
+| ODL-05 | Phase 19 | Pending |
+| ODL-06 | Phase 19 | Pending |
+| ODL-07 | Phase 19 | Pending |
+| ODL-08 | Phase 19 | Pending |
+| ODL-09 | Phase 16 | Pending |
+| ODL-10 | Phase 16 | Pending |
+| ODL-11 | Phase 17 | Pending |
+| ODL-12 | Phase 17 | Pending |
+| ODL-13 | Phase 18 | Pending |
+| ODL-14 | Phase 18 | Pending |
+| ODL-15 | Phase 18 | Pending |
+| ODL-16 | Phase 20 | Pending |
+| ODL-17 | Phase 20 | Pending |
+| ODL-18 | Phase 21 | Pending |
+| ODL-19 | Phase 21 | Pending |
+| ODL-20 | Phase 23 | Pending |
+| ODL-21 | Phase 23 | Pending |
+| ODL-22 | Phase 22 | Pending |
+
+**Phase → requirement rollup:**
+
+| Phase | Requirements | Count |
+|-------|--------------|-------|
+| Phase 14 — Foundation (primitives + structs/RNG) | ODL-01, ODL-02 | 2 |
+| Phase 15 — Device dataset + row-subset gather | ODL-03, ODL-04 | 2 |
+| Phase 16 — Histogram constructor | ODL-09, ODL-10 | 2 |
+| Phase 17 — Best-split finder | ODL-11, ODL-12 | 2 |
+| Phase 18 — Data partition, tree & prediction | ODL-13, ODL-14, ODL-15 | 3 |
+| Phase 19 — On-device objectives | ODL-05, ODL-06, ODL-07, ODL-08 | 4 |
+| Phase 20 — Score updater & metrics | ODL-16, ODL-17 | 2 |
+| Phase 21 — Driver integration + parity gate | ODL-18, ODL-19 | 2 |
+| Phase 22 — Categorical splits | ODL-22 | 1 |
+| Phase 23 — Perf-validation + default-on DoD | ODL-20, ODL-21 | 2 |
 
 **Coverage:**
 
 - v1.1 requirements: 22 total
-- Mapped to phases: 0 (roadmapper fills)
-- Unmapped: 22 (roadmapper fills)
+- Mapped to phases: 22 (100%)
+- Unmapped: 0
+- Each requirement mapped to exactly one phase (no orphans, no duplicates).
 
 ---
-*Requirements defined: 2026-06-28 (milestone v1.1); rewritten 2026-06-29 — full on-device pipeline, design-doc-grounded, quantized deferred to v2.*
+*Requirements defined: 2026-06-28 (milestone v1.1); rewritten 2026-06-29 — full on-device pipeline, design-doc-grounded, quantized deferred to v2. Traceability filled by roadmapper 2026-06-29 (phases 14–23).*

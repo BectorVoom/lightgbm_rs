@@ -2,11 +2,11 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: CUDA On-Device Training Backend
-status: planning
-last_updated: "2026-06-29T01:30:17.247Z"
+status: roadmapped
+last_updated: "2026-06-29T02:15:00.000Z"
 last_activity: 2026-06-29
 progress:
-  total_phases: 0
+  total_phases: 10
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,14 +20,31 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 14 — scaffold-oracle-slice-0
+**Current focus:** Phase 14 — Foundation: Shared Device Primitives + Device Structs/RNG (ODL-01, ODL-02)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-06-29 — Milestone v1.1 started
+Phase: 14 — Foundation: Shared Device Primitives + Device Structs/RNG
+Plan: — (not yet planned)
+Status: Roadmapped — ready to plan Phase 14
+Progress: [..........] 0/10 phases (v1.1)
+Last activity: 2026-06-29 — Milestone v1.1 roadmapped (10 phases 14–23, full on-device CUDA pipeline; 22/22 ODL requirements mapped, 100% coverage)
+
+Next: `/gsd-plan-phase 14`
+
+The v1.1 roadmap (rewritten 2026-06-29) ports the full single-GPU CUDA training pipeline on-device per `docs/cuda-kernel-design.md`, dependency-ordered across 10 anchor-gated phases:
+- Phase 14 — Foundation: shared device primitives + device split-record/RNG (ODL-01/02); re-establish the on-device seam + tie-aware oracle (code already in git)
+- Phase 15 — Device dataset + row-subset gather (ODL-03/04)
+- Phase 16 — Histogram constructor: build + subtraction trick (ODL-09/10)
+- Phase 17 — Best-split finder (ODL-11/12)
+- Phase 18 — Data partition, tree mutation & prediction (ODL-13/14/15)
+- Phase 19 — On-device objectives (ODL-05/06/07/08)
+- Phase 20 — Score updater & metrics (ODL-16/17)
+- Phase 21 — End-to-end driver integration + parity gate (ODL-18/19)
+- Phase 22 — Categorical splits (ODL-22)
+- Phase 23 — Perf-validation + default-on rollout DoD (ODL-20/21)
+
+Non-negotiables threaded into every phase: anchor-pinned to the cpu f64 fold (never GPU-vs-GPU), additive + off by default behind `LGBM_CUDA_ON_DEVICE`, NO f64 per-row hot loops (u64 fixed-point), subtraction-trick/most-freq-bin-fix/mark→prefix-sum→scatter as correctness, CUDATree.Split before DataPartition.Split.
 
 ## Deferred Items
 
