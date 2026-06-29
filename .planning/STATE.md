@@ -67,6 +67,7 @@ Items acknowledged and deferred at milestone v1.0 close on 2026-06-21. The v1.0 
 | quick_task | 260620-njg-fused-per-feature-build-fix-scan | shipped (marker not flipped) |
 | quick_task | 260620-sqf-optimize-gpu-hip-f32-medium | shipped (marker not flipped) |
 | quick_task | 260621-iaq-replace-old-gpu-global-atomic-histogram | shipped (checkpoint PASSED, marker not flipped) |
+| quick_task | 260629-djo-register-cuda-kernel-design-reference-do | complete (docs/planning only — registered docs/cuda-kernel-design.md as v1.1 C++ port-source map) |
 | todo | establish-large-data-benchmark-fixture (high) | pending (next-milestone candidate) |
 | todo | profile-gpu-training-loop-large-data (high) | pending (next-milestone candidate) |
 | todo | register-row-batching-histogram (medium) | pending |

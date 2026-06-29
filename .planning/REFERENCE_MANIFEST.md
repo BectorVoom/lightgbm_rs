@@ -1,5 +1,31 @@
 # Reference Manifest — Phase 7 Determinism Fixtures (D-05)
 
+## v1.1 CUDA On-Device Tree Learner — C++ Port-Source Map
+
+**`docs/cuda-kernel-design.md`** — authoritative, source-verified design reference for
+LightGBM's public CUDA backend (the read-only `LightGBM/` C++ tree being ported by the
+v1.1 milestone, Phases 14–19). Covers **all 58 CUDA source files** and **all 81
+`__global__` kernels** across **11 subsystems** (histogram constructor, best split
+finder, data partition, leaf splits/driver, objectives, metrics, score updater, gradient
+discretizer, tree I/O, CUDARowData, shared primitives), plus device structs, host
+infrastructure, end-to-end per-iteration sequencing, and a lightgbm_rs port-considerations
+section. Each kernel/device-helper/launcher is named and verified kernel-by-kernel against
+source (full-doc audit: 81/81 kernels named).
+
+Use as the port reference for Phases 15–19 (on-device growth → frontier best-split →
+data partition → feature coverage), which mirror `CUDASingleGPUTreeLearner` subsystem by
+subsystem. Key parity constraints captured: `CUDATree.Split` precedes `DataPartition.Split`
+(returns `right_leaf_index`); the histogram subtraction-trick + most-frequent-bin-fix are
+correctness (not just speed) requirements; interleaved `[2·b]/[2·b+1]` histogram layout;
+`hist_t=double` is durable while SP-f32 shared atomics are non-deterministic (the f32-vs-f64
+/ ROCm residual); the int16-packed quantized path is integer-exact (the natural bit-exact
+GPU target). CUDA-support boundaries: 11 CUDA objectives (no MAPE/Gamma/Tweedie/xentropy),
+12 CUDA pointwise metrics (no AUC/NDCG/MAP/multiclass).
+
+_Verified against `LightGBM/` C++ source 2026-06-29 (quick task 260629-djo)._
+
+---
+
 This planning-side manifest records the Phase-7 Wave-0 (D-05) bagged-subset
 split-gain determinism FP-trace capture command and the fixtures it produces.
 It complements the crate-side manifest at

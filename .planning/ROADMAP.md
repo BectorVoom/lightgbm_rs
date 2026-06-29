@@ -111,6 +111,10 @@ loop that issues ~8,570 small serial launches per 100-tree train (~86/tree). Spi
 (real-NVIDIA, Kaggle) refuted every cheap GPU-histogram lever (occupancy/fusion/sync); the on-device
 learner is the one remaining architectural lever.
 
+**C++ port-source map:** `docs/cuda-kernel-design.md` — source-verified design reference for the full
+CUDA backend (58 files, 81 `__global__` kernels, 11 subsystems) being mirrored on-device; the
+per-subsystem porting reference for Phases 15–19. See `.planning/REFERENCE_MANIFEST.md`.
+
 **Structure:** ~6 **anchor-gated vertical slices**. Each phase grows a real tree, returns the same
 `(Tree, DataPartition)` the boosting loop already consumes, passes the **anchor-pinned tie-aware**
 parity gate, and ships **default-off** behind `LGBM_CUDA_ON_DEVICE`. Each GPU slice carries a Kaggle
