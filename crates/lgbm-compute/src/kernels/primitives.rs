@@ -24,9 +24,15 @@
 //!   one unit walking each stage in `tid` order is bit-identical to the parallel
 //!   form — disjoint compare-swap pairs within a stage). [full depth — D-01]
 //!
-//! ## Deferred (NOT in this plan)
+//! ## 14-05 anchor-pinned skeletons (D-02)
 //! - **Percentile** (weighted/unweighted), **multi-block / `…Global` argsort**, and
-//!   **`BitonicArgSortItems`** as anchor-pinned **skeletons** — 14-05 (D-02).
+//!   the per-segment **`BitonicArgSortItems`** analog now exist as anchor-pinned
+//!   **skeletons** ([`percentile_unweighted_f32_on`] / [`percentile_weighted_f32_on`]
+//!   / [`bitonic_argsort_global_on`] / [`bitonic_argsort_items_on`]) — correct +
+//!   anchor-tested NOW, depth-hardening deferred to their Phase-19/22 consumers.
+//!   They COMPOSE the full-depth argsort + prefix-sum above.
+//!
+//! ## Deferred (NOT in this plan)
 //! - The **recursive `num_blocks > 1024` global scan** (arrays > ~1M elements where
 //!   the block-totals no longer fit a single tile and launch 2 must recurse) is
 //!   **OUT OF SCOPE this phase and OWNED by Phase 15** (on-device dataset, its first
@@ -680,8 +686,15 @@ fn bitonic_depth_aligned(num_items: usize) -> (u32, u32) {
 /// pairs with exactly one higher partner), so the serial `tid` walk is bit-
 /// identical to the parallel form with a `sync_cube()` between stages — the cpu
 /// anchor needs no barrier (single owner) and no plane op (14-01: cpu has none).
-#[cube(launch_unchecked)]
-fn bitonic_argsort_kernel(
+/// The SINGLE SOURCE OF TRUTH for the bitonic argsort network — a single-owner
+/// (`UNIT_POS == 0`) serial walk of the comparator network. Both the 14-03
+/// single-block launcher ([`bitonic_argsort_kernel`], `launch_unchecked`) and the
+/// 14-05 multi-block/global skeleton launcher ([`bitonic_argsort_global_kernel`],
+/// checked `::launch`) delegate here so the comparator/tie convention exists
+/// EXACTLY once (histogram single-source idiom). See [`bitonic_argsort_kernel`]'s
+/// doc for the comparator/tie convention.
+#[cube]
+fn bitonic_argsort_body(
     keys: &Array<f32>,
     indices: &mut Array<i32>,
     aligned: u32,
@@ -725,6 +738,17 @@ fn bitonic_argsort_kernel(
             od -= 1;
         }
     }
+}
+
+#[cube(launch_unchecked)]
+fn bitonic_argsort_kernel(
+    keys: &Array<f32>,
+    indices: &mut Array<i32>,
+    aligned: u32,
+    depth: u32,
+    ascending: u32,
+) {
+    bitonic_argsort_body(keys, indices, aligned, depth, ascending);
 }
 
 /// Single-block index-only bitonic argsort on the cpu anchor.
@@ -803,6 +827,333 @@ pub fn bitonic_argsort_on<R: cubecl::Runtime>(
         perm_full[..num_items].to_vec(),
         keys_after[..num_items].to_vec(),
     ))
+}
+
+// =========================================================================
+// 14-05 anchor-pinned SKELETONS (D-02) — percentile, multi-block / global
+// argsort, and per-segment ranking items-sort. Each is CORRECT + anchor-tested
+// NOW but its DEPTH/PERF hardening is explicitly deferred to its first real
+// consumer (named per skeleton). They COMPOSE the 14-03 full-depth primitives
+// above (argsort + prefix-sum) — they do not reinvent them. All three are cold
+// (non-grow-loop) paths, so f64 device math is acceptable here (RESEARCH
+// Pitfall 4). Skeleton launches are CHECKED (`::launch`, RESEARCH Pattern 6 /
+// threat T-14-05-01) and every host input is V5-validated to a typed
+// `ComputeError` before any launch (threat T-14-05-01, never a panic).
+// =========================================================================
+
+/// The Phase-14 single-call cap for the multi-block/global argsort SKELETON. The
+/// cpu anchor below sorts via the single-owner serial network (subsuming the C++
+/// per-block-sort + cross-block-merge phases with no cross-cube barrier); the GPU
+/// multi-block decomposition (`num_blocks > 1` merge kernels) is the Phase-19/22
+/// hardening task (D-02). This cap reflects the small-input regime exercised this
+/// phase, not a fundamental limit.
+pub const MAX_GLOBAL_ARGSORT_ELEMENTS: usize = 1 << 20;
+
+/// Multi-block / global index-only bitonic argsort — CHECKED-launch skeleton
+/// extending the single-block [`bitonic_argsort_on`] (14-03) to inputs larger than
+/// one single-block tile (`> BITONIC_SORT_NUM_ELEMENTS`).
+///
+/// Delegates to the SAME [`bitonic_argsort_body`] comparator/tie network as the
+/// single-block sort, so the permutation is bit-identical to the 14-03 convention
+/// (and to the C++ `BitonicArgSortGlobal`) — strict `>`, ascending parity, sentinel
+/// padding to the next power of two. Index-only (`keys` is `&Array<f32>`, never
+/// written; the returned `keys_after` proves it).
+///
+/// **3-phase global structure (the GPU hardening shape, deferred — D-02):** on a
+/// real GPU this is `per-block sort -> cross-block merge passes` with **no
+/// cross-cube barrier** (the C++ launches a fresh kernel per global merge stage).
+/// On the cubecl-cpu anchor a single owner (`UNIT_POS == 0`, `CubeDim::new_1d(1)`)
+/// walks the whole network serially, which IS the merged result of those phases —
+/// so the anchor needs neither blocks nor barriers (14-01: cubecl-cpu has
+/// `plane_size == 1`). Wiring the genuine multi-cube per-block + merge kernels (and
+/// the non-power-of-two offset handling in `BitonicArgCompareKernel`) is owned by
+/// the **Phase-19/22** consumer that first sorts `> 1024` elements on-device.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `keys.len() > MAX_GLOBAL_ARGSORT_ELEMENTS`.
+pub fn bitonic_argsort_global_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    keys: &[f32],
+    ascending: bool,
+) -> Result<(Vec<i32>, Vec<f32>), ComputeError> {
+    let num_items = keys.len();
+    if num_items == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // V5 boundary (T-14-05-01): reject before any device alloc / launch.
+    if num_items > MAX_GLOBAL_ARGSORT_ELEMENTS {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "bitonic_argsort_global: num_items {num_items} > \
+                 {MAX_GLOBAL_ARGSORT_ELEMENTS} — the genuine multi-cube per-block+merge \
+                 decomposition is the Phase-19/22 hardening task (D-02)"
+            ),
+        });
+    }
+
+    let (depth, aligned) = bitonic_depth_aligned(num_items);
+    let al = aligned as usize;
+    let sentinel = if ascending {
+        f32::INFINITY
+    } else {
+        f32::NEG_INFINITY
+    };
+    let mut padded = keys.to_vec();
+    padded.resize(al, sentinel);
+    let indices: Vec<i32> = (0..aligned as i32).collect();
+
+    let h_keys = client.create_from_slice(f32::as_bytes(&padded));
+    let h_idx = client.create_from_slice(i32::as_bytes(&indices));
+
+    // SAFETY: `h_keys`/`h_idx` are each sized exactly `aligned` (>= num_items) and
+    // outlive the launch. This is the CHECKED `::launch` (skeleton path, RESEARCH
+    // Pattern 6) so the cubecl runtime bounds-checks every `indices[..]` access;
+    // the network keeps `tid` and `cmp = tid + half` in `[0, aligned)` and every
+    // index value in `[0, aligned)`. `keys` is read-only. cubecl unsafe (the
+    // `from_raw_parts` handle/len pairing) is confined here (CMP-01 / T-14-05-01).
+    unsafe {
+        bitonic_argsort_global_kernel::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_keys.clone(), al),
+            ArrayArg::from_raw_parts(h_idx.clone(), al),
+            aligned,
+            depth,
+            u32::from(ascending),
+        );
+    }
+
+    let idx_bytes = client.read_one_unchecked(h_idx);
+    let perm_full = i32::from_bytes(&idx_bytes);
+    let keys_bytes = client.read_one_unchecked(h_keys);
+    let keys_after = f32::from_bytes(&keys_bytes);
+    Ok((
+        perm_full[..num_items].to_vec(),
+        keys_after[..num_items].to_vec(),
+    ))
+}
+
+/// The CHECKED (`::launch`) multi-block/global argsort skeleton kernel. Same
+/// single-source [`bitonic_argsort_body`] network as the single-block launcher;
+/// checked launch per the skeleton perf-irrelevant policy (RESEARCH Pattern 6,
+/// threat T-14-05-01).
+#[cube(launch)]
+fn bitonic_argsort_global_kernel(
+    keys: &Array<f32>,
+    indices: &mut Array<i32>,
+    aligned: u32,
+    depth: u32,
+    ascending: u32,
+) {
+    bitonic_argsort_body(keys, indices, aligned, depth, ascending);
+}
+
+/// Unweighted percentile — anchor-pinned SKELETON (D-02) composing the 14-03
+/// single-block argsort with the C++ `PercentileDevice` (unweighted branch)
+/// threshold formula.
+///
+/// Mirrors `PercentileDevice<…, USE_WEIGHT=false>`: sort `values` ASCENDING, then
+/// `float_pos = (1 - alpha) * len`, `pos = trunc(float_pos)`, and linearly
+/// interpolate between the `pos-1` and `pos` sorted values (clamping to the
+/// extremes). The interpolation is done in **f64** (acceptable on this cold
+/// Phase-19 consumer path, RESEARCH Pitfall 4) and cast back to `f32`.
+///
+/// **SKELETON — hardening owner: the Phase-19 objectives consumer** (regression/
+/// Huber/Fair init scores). Depth deferred: `values.len()` is capped at the 14-03
+/// single-block argsort (`<= BITONIC_SORT_NUM_ELEMENTS`); the `> 1024` path routes
+/// through [`bitonic_argsort_global_on`] when Phase 19 needs it.
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] on empty input; propagates the argsort error if
+/// `values.len() > BITONIC_SORT_NUM_ELEMENTS`.
+pub fn percentile_unweighted_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    values: &[f32],
+    alpha: f64,
+) -> Result<f32, ComputeError> {
+    let len = values.len();
+    if len == 0 {
+        // C++ `PercentileDevice` returns `values[0]` for `len <= 1` (UB on empty);
+        // the skeleton rejects empty at the V5 boundary instead (T-14-05-01).
+        return Err(ComputeError::LengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    if len == 1 {
+        return Ok(values[0]);
+    }
+
+    // Compose the 14-03 full-depth argsort (sort the values ascending).
+    let (perm, _keys_after) = bitonic_argsort_on(client, values, true)?;
+
+    let float_pos = (1.0 - alpha) * len as f64;
+    // `float_pos >= 0` (alpha in [0,1]); truncation toward zero == C++ static_cast.
+    let pos = float_pos as usize;
+    if pos < 1 {
+        return Ok(values[perm[0] as usize]);
+    }
+    if pos >= len {
+        return Ok(values[perm[len - 1] as usize]);
+    }
+    let bias = float_pos - pos as f64;
+    let v1 = values[perm[pos - 1] as usize] as f64;
+    let v2 = values[perm[pos] as usize] as f64;
+    Ok((v1 - (v1 - v2) * bias) as f32)
+}
+
+/// Weighted percentile — anchor-pinned SKELETON (D-02) composing the 14-03
+/// argsort + the 14-03 inclusive prefix-sum with the C++ `PercentileDevice`
+/// (weighted branch) threshold scan.
+///
+/// Mirrors `PercentileDevice<…, USE_WEIGHT=true>`: sort `values` ASCENDING, take
+/// the inclusive prefix-sum of the weights IN SORTED ORDER, set
+/// `threshold = total_weight * (1 - alpha)`, find the first sorted position whose
+/// cumulative weight crosses the threshold, and interpolate. Prefix-sum + interp
+/// are **f64** (cold path, RESEARCH Pitfall 4). The edge-position branch mirrors
+/// the C++ `values[pos]` (raw, un-permuted) read verbatim — a reference quirk the
+/// Phase-19 consumer revisits when it locks the dedicated weighted fixture.
+///
+/// **SKELETON — hardening owner: the Phase-19 objectives consumer.** (The 14-02
+/// HIP golden set captured the UNWEIGHTED percentile fixture only; the weighted
+/// fixture was deferred to NVIDIA/Phase-19, so this branch is anchored to the
+/// serial f64 reference here.)
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] on empty input or `weights.len() != len`;
+/// propagates the argsort/prefix-sum error for `len > BITONIC_SORT_NUM_ELEMENTS`.
+pub fn percentile_weighted_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    values: &[f32],
+    weights: &[f64],
+    alpha: f64,
+) -> Result<f32, ComputeError> {
+    let len = values.len();
+    if weights.len() != len {
+        return Err(ComputeError::LengthMismatch {
+            expected: len,
+            actual: weights.len(),
+        });
+    }
+    if len == 0 {
+        return Err(ComputeError::LengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    if len == 1 {
+        return Ok(values[0]);
+    }
+
+    let (perm, _keys_after) = bitonic_argsort_on(client, values, true)?;
+    // Gather the weights into sorted order, then the inclusive prefix-sum is the
+    // 14-03 device primitive (block_size keeps num_blocks <= 1024 for len <= 1024).
+    let sorted_w: Vec<f64> = perm.iter().map(|&i| weights[i as usize]).collect();
+    let wps = prefix_sum_inclusive_f64_on(client, &sorted_w, 256)?;
+
+    let threshold = wps[len - 1] * (1.0 - alpha);
+    // First sorted position whose cumulative weight strictly crosses the threshold
+    // (C++ uses a non-breaking loop; the strict `>` / `<=` crossing is unique for
+    // non-negative weights).
+    let mut pos = len;
+    for index in 0..len {
+        if wps[index] > threshold && (index == 0 || wps[index - 1] <= threshold) {
+            pos = index;
+        }
+    }
+    let pos = pos.min(len - 1);
+    if pos == 0 || pos == len - 1 {
+        // Verbatim C++ `values[pos]` (raw position, not `values[indices[pos]]`).
+        return Ok(values[pos]);
+    }
+    let v1 = values[perm[pos - 1] as usize] as f64;
+    let v2 = values[perm[pos] as usize] as f64;
+    let frac = (threshold - wps[pos - 1]) / (wps[pos] - wps[pos - 1]);
+    Ok((v1 - (v1 - v2) * frac) as f32)
+}
+
+/// Validate the per-segment items-sort boundaries at the V5 boundary
+/// (T-14-05-01) BEFORE any launch: `boundaries` must be non-empty, start at 0,
+/// end at `num_keys`, be non-decreasing, and bound each segment to the single-block
+/// argsort cap. Returns the segment count.
+fn validate_segments(boundaries: &[i32], num_keys: usize) -> Result<usize, ComputeError> {
+    if boundaries.len() < 2 {
+        return Err(ComputeError::Runtime {
+            detail: "items_sort: segment_boundaries needs >= 2 entries (start..end)".to_string(),
+        });
+    }
+    if boundaries[0] != 0 {
+        return Err(ComputeError::Runtime {
+            detail: format!("items_sort: segment_boundaries[0] = {} must be 0", boundaries[0]),
+        });
+    }
+    let last = boundaries[boundaries.len() - 1];
+    if last < 0 || last as usize != num_keys {
+        return Err(ComputeError::LengthMismatch {
+            expected: num_keys,
+            actual: last.max(0) as usize,
+        });
+    }
+    for w in boundaries.windows(2) {
+        if w[1] < w[0] {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "items_sort: segment_boundaries not non-decreasing ({} -> {})",
+                    w[0], w[1]
+                ),
+            });
+        }
+        let seg_len = (w[1] - w[0]) as usize;
+        if seg_len > BITONIC_SORT_NUM_ELEMENTS {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "items_sort: segment length {seg_len} > {BITONIC_SORT_NUM_ELEMENTS} — the \
+                     multi-block per-segment sort is the Phase-19 ranking hardening task (D-02)"
+                ),
+            });
+        }
+    }
+    Ok(boundaries.len() - 1)
+}
+
+/// Per-segment (per-query) ranking item-sort — anchor-pinned SKELETON (D-02), the
+/// `BitonicArgSortItems` analog. Given `segment_boundaries` (`[0, b1, b2, …, len]`,
+/// `data_size_t`/i32 like the C++ `cuda_query_boundaries`), sorts the indices
+/// WITHIN each segment by `keys`, never moving values, by composing the 14-03
+/// single-block [`bitonic_argsort_on`] segment-by-segment.
+///
+/// Returns a flat `Vec<i32>` of length `keys.len()`: segment `q`'s slice
+/// `[boundaries[q], boundaries[q+1])` holds that segment's LOCAL (0-based within the
+/// segment) permutation — matching the C++ `BitonicArgSortItemsGlobalKernel`, whose
+/// `BitonicArgSortDevice` initializes per-segment-local indices. Each segment reuses
+/// the locked 14-03 comparator/tie convention, so no dedicated C++ items-sort golden
+/// is needed this phase (the convention is already C++-locked by the 14-02 tie-rich
+/// single-block fixture; capturing an items-sort fixture is the Phase-19 task).
+///
+/// **SKELETON — hardening owner: the Phase-19 ranking objective consumer**
+/// (lambdarank per-query score sort). The C++ ranking default is DESCENDING
+/// (`ASCENDING=false`); `ascending` is exposed here for generality.
+///
+/// # Errors
+/// [`ComputeError`] if the boundaries are malformed (see [`validate_segments`]) or
+/// any segment exceeds the single-block argsort cap.
+pub fn bitonic_argsort_items_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    keys: &[f32],
+    segment_boundaries: &[i32],
+    ascending: bool,
+) -> Result<Vec<i32>, ComputeError> {
+    let num_segments = validate_segments(segment_boundaries, keys.len())?;
+    let mut out: Vec<i32> = Vec::with_capacity(keys.len());
+    for q in 0..num_segments {
+        let start = segment_boundaries[q] as usize;
+        let end = segment_boundaries[q + 1] as usize;
+        // Each segment reuses the 14-03 single-block argsort (local 0-based perm).
+        let (local_perm, _keys_after) = bitonic_argsort_on(client, &keys[start..end], ascending)?;
+        out.extend_from_slice(&local_perm);
+    }
+    Ok(out)
 }
 
 // =========================================================================

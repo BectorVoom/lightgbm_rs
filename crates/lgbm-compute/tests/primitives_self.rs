@@ -18,7 +18,8 @@
 //! `rocm`-gated and cross-validated in 14-06.
 
 use lgbm_compute::kernels::primitives::{
-    bitonic_argsort_on, dot_product_f64_on, prefix_sum_exclusive_f64_on,
+    bitonic_argsort_global_on, bitonic_argsort_items_on, bitonic_argsort_on, dot_product_f64_on,
+    percentile_unweighted_f32_on, percentile_weighted_f32_on, prefix_sum_exclusive_f64_on,
     prefix_sum_inclusive_f64_on, reduce_max_f64_on, reduce_min_f64_on, reduce_sum_f64_on,
 };
 use lgbm_compute::runtime::cpu_client;
@@ -298,4 +299,254 @@ fn argsort_single_and_empty() {
     let (ep, ek) = bitonic_argsort_on(&client, &[], true).unwrap();
     assert_eq!(ep, Vec::<i32>::new());
     assert_eq!(ek, Vec::<f32>::new());
+}
+
+// =========================================================================
+// 14-05 Task 1: weighted + unweighted percentile SKELETON
+// =========================================================================
+//
+// Serial f64 references mirroring the C++ `PercentileDevice` (unweighted +
+// weighted branches) EXACTLY, both composing the same `serial_bitonic_argsort`
+// ascending sort the device skeleton composes. The device skeleton is asserted
+// BIT-EXACT vs (a) hand-computed concrete values and (b) the serial reference on
+// non-uniform inputs — never GPU-vs-GPU (D-10).
+
+fn serial_percentile_unweighted(values: &[f32], alpha: f64) -> f32 {
+    let len = values.len();
+    if len == 1 {
+        return values[0];
+    }
+    let perm = serial_bitonic_argsort(values, true);
+    let float_pos = (1.0 - alpha) * len as f64;
+    let pos = float_pos as usize;
+    if pos < 1 {
+        return values[perm[0] as usize];
+    }
+    if pos >= len {
+        return values[perm[len - 1] as usize];
+    }
+    let bias = float_pos - pos as f64;
+    let v1 = values[perm[pos - 1] as usize] as f64;
+    let v2 = values[perm[pos] as usize] as f64;
+    (v1 - (v1 - v2) * bias) as f32
+}
+
+fn serial_percentile_weighted(values: &[f32], weights: &[f64], alpha: f64) -> f32 {
+    let len = values.len();
+    if len == 1 {
+        return values[0];
+    }
+    let perm = serial_bitonic_argsort(values, true);
+    let mut wps = vec![0.0f64; len];
+    let mut acc = 0.0f64;
+    for i in 0..len {
+        acc += weights[perm[i] as usize];
+        wps[i] = acc;
+    }
+    let threshold = wps[len - 1] * (1.0 - alpha);
+    let mut pos = len;
+    for index in 0..len {
+        if wps[index] > threshold && (index == 0 || wps[index - 1] <= threshold) {
+            pos = index;
+        }
+    }
+    let pos = pos.min(len - 1);
+    if pos == 0 || pos == len - 1 {
+        return values[pos];
+    }
+    let v1 = values[perm[pos - 1] as usize] as f64;
+    let v2 = values[perm[pos] as usize] as f64;
+    let frac = (threshold - wps[pos - 1]) / (wps[pos] - wps[pos - 1]);
+    (v1 - (v1 - v2) * frac) as f32
+}
+
+#[test]
+fn percentile_unweighted_median_concrete() {
+    // Behaviour: alpha=0.5 over [1,2,3,4,5] -> float_pos=2.5, pos=2, bias=0.5;
+    // interpolate sorted[1]=2 and sorted[2]=3 -> 2 - (2-3)*0.5 = 2.5. Order
+    // independent (unsorted input gives the same sorted order).
+    let client = cpu_client();
+    let sorted = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+    assert_eq!(percentile_unweighted_f32_on(&client, &sorted, 0.5).unwrap(), 2.5);
+    let unsorted = vec![3.0f32, 1.0, 4.0, 2.0, 5.0];
+    assert_eq!(
+        percentile_unweighted_f32_on(&client, &unsorted, 0.5).unwrap(),
+        2.5
+    );
+}
+
+#[test]
+fn percentile_unweighted_matches_serial() {
+    let client = cpu_client();
+    let values = vec![5.0f32, 2.0, 9.0, 1.0, 7.0, 3.0, 8.0, 4.0];
+    for &alpha in &[0.0f64, 0.1, 0.5, 0.9, 1.0] {
+        assert_eq!(
+            percentile_unweighted_f32_on(&client, &values, alpha).unwrap(),
+            serial_percentile_unweighted(&values, alpha),
+            "alpha = {alpha}"
+        );
+    }
+    // Empty -> error (V5 boundary); single -> the element.
+    assert!(percentile_unweighted_f32_on(&client, &[], 0.5).is_err());
+    assert_eq!(percentile_unweighted_f32_on(&client, &[7.0], 0.5).unwrap(), 7.0);
+}
+
+#[test]
+fn percentile_weighted_concrete_and_serial() {
+    let client = cpu_client();
+    // Concrete edge branch: weights [1,1,1,5], alpha=0.5 over [1,2,3,4].
+    // wps=[1,2,3,8], threshold=4.0, crossing at pos=3 == len-1 -> values[3]=4.0.
+    let values = vec![1.0f32, 2.0, 3.0, 4.0];
+    let weights = vec![1.0f64, 1.0, 1.0, 5.0];
+    assert_eq!(
+        percentile_weighted_f32_on(&client, &values, &weights, 0.5).unwrap(),
+        4.0
+    );
+    // Concrete interior: uniform weights, alpha=0.5 -> threshold 2.0, pos=2,
+    // frac=(2-2)/(3-2)=0 -> values[perm[1]]=2.0.
+    let uniform = vec![1.0f64, 1.0, 1.0, 1.0];
+    assert_eq!(
+        percentile_weighted_f32_on(&client, &values, &uniform, 0.5).unwrap(),
+        2.0
+    );
+    // Non-uniform vs serial reference across alphas (unsorted values, tie-free).
+    let v2 = vec![5.0f32, 2.0, 9.0, 1.0, 7.0];
+    let w2 = vec![2.0f64, 1.0, 4.0, 3.0, 1.0];
+    for &alpha in &[0.0f64, 0.25, 0.5, 0.75, 1.0] {
+        assert_eq!(
+            percentile_weighted_f32_on(&client, &v2, &w2, alpha).unwrap(),
+            serial_percentile_weighted(&v2, &w2, alpha),
+            "alpha = {alpha}"
+        );
+    }
+    // Mismatched weights length -> error.
+    assert!(percentile_weighted_f32_on(&client, &values, &[1.0], 0.5).is_err());
+}
+
+// =========================================================================
+// 14-05 Task 2: multi-block / global argsort SKELETON
+// =========================================================================
+//
+// The skeleton extends the single-block network to inputs spanning more than one
+// single-block tile (> 1024). Permutation asserted BIT-EXACT vs the same
+// `serial_bitonic_argsort` reference (an integer permutation, no float tol),
+// including a tie-rich case.
+
+#[test]
+fn argsort_global_multi_block_matches_serial() {
+    // 1500 elements > BITONIC_SORT_NUM_ELEMENTS (1024) forces the input to span
+    // more than one single-block tile. Distinct descending keys -> the ascending
+    // argsort permutation reverses them; asserted bit-exact vs the serial network.
+    let client = cpu_client();
+    let keys: Vec<f32> = (0..1500).map(|i| (1500 - i) as f32).collect();
+    let (perm, keys_after) = bitonic_argsort_global_on(&client, &keys, true).unwrap();
+    assert_eq!(perm, serial_bitonic_argsort(&keys, true));
+    assert_eq!(keys_after, keys, "keys must be unmutated (index-only)");
+    let gathered: Vec<f32> = perm.iter().map(|&i| keys[i as usize]).collect();
+    assert!(gathered.windows(2).all(|w| w[0] <= w[1]), "ascending");
+}
+
+#[test]
+fn argsort_global_tie_rich_matches_serial() {
+    // Tie-rich multi-block input: 1100 elements (> 1024) with only 3 distinct keys
+    // so ties are dense across tile boundaries. Permutation must match the serial
+    // C++-mirrored comparator exactly.
+    let client = cpu_client();
+    let keys: Vec<f32> = (0..1100).map(|i| (i % 3) as f32).collect();
+    let (perm, keys_after) = bitonic_argsort_global_on(&client, &keys, true).unwrap();
+    assert_eq!(perm, serial_bitonic_argsort(&keys, true));
+    assert_eq!(keys_after, keys);
+    let mut sorted = perm.clone();
+    sorted.sort_unstable();
+    let expected: Vec<i32> = (0..1100).collect();
+    assert_eq!(sorted, expected, "valid permutation of 0..1100");
+    let gathered: Vec<f32> = perm.iter().map(|&i| keys[i as usize]).collect();
+    assert!(gathered.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
+fn argsort_global_empty() {
+    let client = cpu_client();
+    let (ep, ek) = bitonic_argsort_global_on(&client, &[], true).unwrap();
+    assert_eq!(ep, Vec::<i32>::new());
+    assert_eq!(ek, Vec::<f32>::new());
+}
+
+// =========================================================================
+// 14-05 Task 3: per-segment ranking items-sort SKELETON
+// =========================================================================
+//
+// Sorts indices WITHIN each segment by key (index-only), each segment a LOCAL
+// 0-based permutation. Asserted bit-exact vs a serial per-segment reference that
+// reuses the same `serial_bitonic_argsort` convention, including a tie-rich
+// segment.
+
+fn serial_items_sort(keys: &[f32], boundaries: &[i32], ascending: bool) -> Vec<i32> {
+    let mut out = Vec::with_capacity(keys.len());
+    for q in 0..boundaries.len() - 1 {
+        let start = boundaries[q] as usize;
+        let end = boundaries[q + 1] as usize;
+        out.extend(serial_bitonic_argsort(&keys[start..end], ascending));
+    }
+    out
+}
+
+#[test]
+fn items_sort_per_segment_matches_serial() {
+    // Three segments of differing lengths: [0,3), [3,5), [5,9). Each segment's
+    // slice of the output is that segment's local (0-based) permutation.
+    let client = cpu_client();
+    let keys = vec![
+        3.0f32, 1.0, 2.0, // seg 0: -> local perm [1,2,0]
+        9.0, 4.0, // seg 1: -> [1,0]
+        5.0, 8.0, 1.0, 7.0, // seg 2
+    ];
+    let boundaries = vec![0i32, 3, 5, 9];
+    let got = bitonic_argsort_items_on(&client, &keys, &boundaries, true).unwrap();
+    assert_eq!(got, serial_items_sort(&keys, &boundaries, true));
+    // Hand-check the first two segments' local permutations.
+    assert_eq!(&got[0..3], &[1, 2, 0]);
+    assert_eq!(&got[3..5], &[1, 0]);
+    // Each segment slice is a valid local permutation and ascending by key.
+    for q in 0..boundaries.len() - 1 {
+        let s = boundaries[q] as usize;
+        let e = boundaries[q + 1] as usize;
+        let seg_perm = &got[s..e];
+        let mut sorted = seg_perm.to_vec();
+        sorted.sort_unstable();
+        let expected: Vec<i32> = (0..(e - s) as i32).collect();
+        assert_eq!(sorted, expected, "segment {q} local permutation");
+        let gathered: Vec<f32> = seg_perm.iter().map(|&i| keys[s + i as usize]).collect();
+        assert!(gathered.windows(2).all(|w| w[0] <= w[1]), "segment {q} ascending");
+    }
+}
+
+#[test]
+fn items_sort_tie_rich_segment_matches_serial() {
+    // A tie-rich segment ([2,1,2,1]) plus a distinct segment; the tie order must
+    // match the C++-mirrored comparator segment-by-segment.
+    let client = cpu_client();
+    let keys = vec![2.0f32, 1.0, 2.0, 1.0, 5.0, 3.0, 4.0];
+    let boundaries = vec![0i32, 4, 7];
+    let got = bitonic_argsort_items_on(&client, &keys, &boundaries, true).unwrap();
+    assert_eq!(got, serial_items_sort(&keys, &boundaries, true));
+    assert_eq!(
+        &got[0..4],
+        &serial_bitonic_argsort(&keys[0..4], true)[..],
+        "tie-rich segment matches the locked convention"
+    );
+}
+
+#[test]
+fn items_sort_rejects_malformed_boundaries() {
+    let client = cpu_client();
+    let keys = vec![1.0f32, 2.0, 3.0];
+    // Does not start at 0.
+    assert!(bitonic_argsort_items_on(&client, &keys, &[1, 3], true).is_err());
+    // Does not end at keys.len().
+    assert!(bitonic_argsort_items_on(&client, &keys, &[0, 2], true).is_err());
+    // Not non-decreasing.
+    assert!(bitonic_argsort_items_on(&client, &keys, &[0, 2, 1, 3], true).is_err());
+    // Too few entries.
+    assert!(bitonic_argsort_items_on(&client, &keys, &[0], true).is_err());
 }
