@@ -57,6 +57,14 @@ pub const KERNEL_MASTER_SEED: i32 = 0x4157_F00D;
 /// RNG-derived) synthetic corpus; the seed is recorded for format continuity.
 pub const LEARNER_MASTER_SEED: i32 = 0x1EA6_5EED;
 
+/// The recorded master seed for the Phase-14 device-primitive golden corpus
+/// (14-02, ODL-01 / D-03). Like the other master seeds it is the SINGLE source of
+/// randomness for the synthetic primitive inputs (prefix-sum / reduction / argsort
+/// / percentile arrays), derived via the header-only `LightGBM::Random`, so
+/// `primitive-capture` is byte-idempotent (empty `git diff`). Recorded in
+/// REFERENCE_MANIFEST.md.
+pub const PRIMITIVE_MASTER_SEED: i32 = 0x0DE7_1CE5;
+
 /// Pinned LightGBM submodule commit (recorded in the manifest, ORA-02 / D-05).
 pub const LIGHTGBM_COMMIT: &str = "195c26fc7b00eb0fec252dfe841e2e66d6833954";
 
@@ -266,6 +274,7 @@ fn main() -> Result<()> {
         Some("bin-capture") => bin_capture(),
         Some("model-capture") => model_capture(),
         Some("kernel-capture") => kernel_capture(),
+        Some("primitive-capture") => primitive_capture(),
         Some("learner-capture") => learner_capture(),
         Some("learner-oracle-capture") => learner_oracle_capture(),
         Some("boosting-oracle-capture") => boosting_oracle_capture(),
@@ -283,6 +292,7 @@ fn main() -> Result<()> {
             bail!(
                 "unknown subcommand `{other}` \
                  (try: regen | bin-capture | model-capture | kernel-capture | \
+                 primitive-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
                  rf-oracle-capture | metric-oracle-capture | categorical-oracle-capture | \
@@ -295,6 +305,7 @@ fn main() -> Result<()> {
             eprintln!(
                 "usage: cargo run -p xtask -- \
                  <regen | bin-capture | model-capture | kernel-capture | \
+                 primitive-capture | \
                  learner-capture | learner-oracle-capture | boosting-oracle-capture | \
                  subset-determinism-capture | goss-oracle-capture | dart-oracle-capture | \
                  rf-oracle-capture | metric-oracle-capture>"
@@ -403,6 +414,20 @@ fn regen() -> Result<()> {
 
     // 4. Refresh the reference manifest (idempotent — fixed content).
     write_manifest(&manifest_path)?;
+
+    // 5. Best-effort: refresh the Phase-14 device-primitive goldens via the HIP
+    //    harness. This is the umbrella refresh, but unlike the RNG capture it needs
+    //    `hipcc` + a HIP GPU, so a missing toolchain must NOT fail `regen` (the
+    //    committed primitive goldens stay valid). Skip with a clear notice instead.
+    eprintln!(
+        "xtask regen: refreshing device-primitive goldens (best-effort; needs hipcc + a HIP GPU) ..."
+    );
+    if let Err(e) = primitive_capture() {
+        eprintln!(
+            "xtask regen: SKIP device-primitive goldens (primitive-capture) — {e:#}. \
+             Run `cargo run -p xtask -- primitive-capture` on a ROCm/CUDA box to refresh them."
+        );
+    }
 
     eprintln!(
         "xtask regen: done. Wrote {} and {}.",
@@ -661,6 +686,126 @@ fn kernel_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- kernel-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/kernels/` \
+         is empty (byte-idempotent)."
+    );
+    Ok(())
+}
+
+/// Regenerate the Phase-14 device-primitive golden corpus (14-02, ODL-01 / D-03).
+///
+/// Mirrors [`kernel_capture`] but builds a HIP (`.cu`) harness with `hipcc` (NOT a
+/// plain C++ compiler): `xtask/cpp/primitive_capture.cu` VERBATIM-transcribes the
+/// AMD-fork device primitives + multi-kernel global wrappers
+/// (`cuda_algorithms.hpp`/`.cu`) and wraps each `__device__` block helper in a
+/// `__global__` shim so it is launchable (the submodule's `external_libs/` are not
+/// vendored here, so a `lib_lightgbm` link is impossible — same self-contained
+/// discipline as the sibling harnesses; see that file's header). It launches every
+/// numeric primitive on the local ROCm GPU (the spoofed gfx1100 APU) over a
+/// [`PRIMITIVE_MASTER_SEED`]-derived synthetic corpus and writes the committed
+/// goldens under `crates/oracle-harness/fixtures/primitives/`. Byte-idempotent.
+///
+/// Requires `hipcc` + a HIP GPU (capture-time only). The weighted `PercentileDevice`
+/// path is non-idempotent on the spoofed APU (reference block-cooperative UB), so by
+/// default its cases are emitted as deterministic Kaggle/nvcc deferral markers; set
+/// `LGBM_PRIMITIVE_WEIGHTED_PERCENTILE=1` to capture real weighted goldens on a CUDA
+/// box (RESEARCH A3). NEVER `git add` the `LightGBM/` tree.
+fn primitive_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    // The harness is built with hipcc (HIP), not the plain C++ toolchain.
+    check_tool("cmake", &["--version"]).context(
+        "cmake is required for `primitive-capture` (CMake >= 3.28). Install it and retry; \
+         normal `cargo test` does NOT need a toolchain (fixtures are committed).",
+    )?;
+    check_tool("hipcc", &["--version"]).context(
+        "hipcc (ROCm) is required for `primitive-capture` — the device-primitive goldens are \
+         captured by launching the AMD-fork primitives on a HIP GPU. Install ROCm/hipcc and \
+         retry, or capture on a CUDA box (Kaggle/nvcc, RESEARCH A3). Normal `cargo test` does \
+         NOT need this (the goldens are committed).",
+    )?;
+
+    // The header-only `LightGBM::Random` (for synthetic inputs) lives in the pinned
+    // LightGBM include tree, exactly like the sibling harnesses.
+    let lightgbm_dir = root.join("LightGBM");
+    if !lightgbm_dir
+        .join("include/LightGBM/utils/random.h")
+        .is_file()
+    {
+        bail!(
+            "LightGBM submodule not found at {} (expected include/LightGBM/utils/random.h)",
+            lightgbm_dir.display()
+        );
+    }
+
+    let cpp_dir = root.join("xtask/cpp");
+    let build_dir = root.join("target/xtask-cpp-build");
+    std::fs::create_dir_all(&build_dir)
+        .with_context(|| format!("creating build dir {}", build_dir.display()))?;
+
+    // Fixtures live under the TRACKED oracle-harness crate dir — NEVER the
+    // untracked LightGBM/ tree.
+    let fixtures_dir = root.join("crates/oracle-harness/fixtures/primitives");
+    std::fs::create_dir_all(&fixtures_dir)
+        .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
+
+    eprintln!("xtask primitive-capture: configuring C++/HIP capture build ...");
+    run(
+        Command::new("cmake")
+            .arg("-S")
+            .arg(&cpp_dir)
+            .arg("-B")
+            .arg(&build_dir)
+            .arg(format!("-DLIGHTGBM_DIR={}", lightgbm_dir.display()))
+            .arg("-DCMAKE_BUILD_TYPE=Release"),
+        "cmake configure",
+    )?;
+
+    eprintln!("xtask primitive-capture: building primitive_capture (hipcc) ...");
+    run(
+        Command::new("cmake")
+            .arg("--build")
+            .arg(&build_dir)
+            .arg("--target")
+            .arg("primitive_capture")
+            .arg("--config")
+            .arg("Release"),
+        "cmake build",
+    )?;
+
+    let exe = locate_exe(&build_dir, "primitive_capture")?;
+    eprintln!(
+        "xtask primitive-capture: running capture ({}) ...",
+        exe.display()
+    );
+    run(
+        Command::new(&exe)
+            .arg(&fixtures_dir)
+            .arg(PRIMITIVE_MASTER_SEED.to_string()),
+        "primitive_capture",
+    )?;
+
+    for name in ["prefix_sum.txt", "reduce.txt", "argsort.txt", "percentile.txt"] {
+        let p = fixtures_dir.join(name);
+        if !p.is_file() {
+            bail!("capture completed but {} was not written", p.display());
+        }
+    }
+
+    // Refresh the shared reference manifest (idempotent — pure function of the
+    // recorded constants).
+    let manifest_path = root
+        .join("crates/oracle-harness/fixtures")
+        .join("REFERENCE_MANIFEST.md");
+    write_manifest(&manifest_path)?;
+
+    eprintln!(
+        "xtask primitive-capture: done. Wrote 4 golden files to {} and refreshed {}.",
+        fixtures_dir.display(),
+        manifest_path.display()
+    );
+    eprintln!(
+        "Re-run `cargo run -p xtask -- primitive-capture` and confirm \
+         `git diff --stat crates/oracle-harness/fixtures/primitives/` \
          is empty (byte-idempotent)."
     );
     Ok(())
@@ -2517,6 +2662,69 @@ the pip wheel is the authoritative real binary.\n\
 \n\
 ```bash\n\
 LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- learner-oracle-capture\n\
+```\n\
+\n\
+## Device-Primitive Golden Set (Phase 14, 14-02, ODL-01 / D-03)\n\
+\n\
+Captured by `cargo run -p xtask -- primitive-capture` into\n\
+`crates/oracle-harness/fixtures/primitives/` (four files: `prefix_sum.txt`,\n\
+`reduce.txt`, `argsort.txt`, `percentile.txt`). These anchor the Rust CubeCL\n\
+device primitives (14-06): block inclusive/exclusive prefix-sum + the multi-kernel\n\
+global prefix-sum (`ShufflePrefixSum` family), the shuffle reductions sum/max/min +\n\
+dot-product (`ShuffleReduce*`), single-block + multi-block (global) bitonic argsort\n\
+(index-only), and weighted/unweighted `PercentileDevice`. Numeric outputs are\n\
+emitted as raw bit patterns (f64 -> decimal `u64`, f32 -> decimal `u32`) compared\n\
+bit-exact on the cpu f64 anchor / ~1e-6 for ROCm f32 (Pitfall 3); argsort\n\
+permutations are decimal index arrays compared BIT-EXACT, with a TIE-RICH input so\n\
+the comparator/tie-order convention is locked (Pitfall 5).\n\
+\n\
+- **Primitive master seed:** `{primitive_master_seed}` (`0x{primitive_master_seed_hex:08X}`) —\n\
+  the SINGLE source of randomness for the synthetic primitive inputs (via the\n\
+  header-only `LightGBM::Random`), so `primitive-capture` is byte-idempotent.\n\
+\n\
+### Capture-harness note (HIP, self-contained; external_libs unbuildable)\n\
+\n\
+Unlike the sibling C++ harnesses, `xtask/cpp/primitive_capture.cu` is a HIP (`.cu`)\n\
+harness built with `hipcc` against the in-repo AMD fork\n\
+(`LightGBM-release-4.6.0.99/`). The authoritative device primitives live in the\n\
+fork's `include/LightGBM/cuda/cuda_algorithms.hpp` (the `__device__` block helpers +\n\
+`PercentileDevice`) and `src/cuda/cuda_algorithms.cu` (the host-callable multi-kernel\n\
+global wrappers); both transitively pull `<LightGBM/bin.h>` -> `common.h` ->\n\
+`fast_double_parser.h` + `fmt/format.h` from `external_libs/`, present here only as\n\
+EMPTY directories, so neither can be `#include`d and no `lib_lightgbm`/`.cu` object\n\
+can be linked. The harness therefore VERBATIM-transcribes the device-primitive\n\
+bodies + global wrappers from the pinned fork (commit `{commit}`, version\n\
+`{version}`), wrapping each `__device__` block helper in a one-line `__global__`\n\
+shim (they are not host-callable as-is), and includes only the header-only\n\
+`LightGBM::Random` for synthetic inputs. Same self-contained discipline as\n\
+`rng_capture`/`bin_capture`/`kernel_capture`/`learner_capture`: no `external_libs`,\n\
+no `lib_lightgbm` link, no toolchain at `cargo test` time (the goldens are\n\
+committed). Built on the local spoofed gfx1100 APU (warpSize 32); the fork sizes its\n\
+`__shared__` warp buffers from `WARPSIZE == 32` for every non-GFX9 target, mirrored\n\
+exactly. `cargo test` reads the committed fixtures and needs NO HIP toolchain.\n\
+\n\
+### Faithfulness fixes + APU determinism notes\n\
+\n\
+- `__shfl_{{up,down}}_sync(mask, ...)` are mapped onto the fork's plain\n\
+  `__shfl_{{up,down}}` (cuda_rocm_interop.h:45-48) since the transcription always\n\
+  passes the full `0xffffffff` mask (ROCm's native `_sync` requires a 64-bit mask).\n\
+- The weighted prefix-sum base uses the exclusive-prefix RETURN value (the reference\n\
+  read `shared_buffer[threadIdx.x]` out-of-bounds for blockDim > warpSize — UB), and\n\
+  the bitonic-sort padding lanes are sentinel-initialised (the reference left their\n\
+  `__shared__` value uninitialised). Both restore byte-idempotency on the APU without\n\
+  changing any real-element result (argsort goldens are identical with/without).\n\
+- The **weighted `PercentileDevice`** path is intermittently NON-idempotent on the\n\
+  spoofed gfx1100 APU (its block-cooperative sort + sorted-prefix-sum carry `len`-vs-\n\
+  `BLOCK_DIM`/`MAX_DEPTH` preconditions the golden lengths violate). Per RESEARCH A3\n\
+  its cases are emitted as deterministic `status=deferred_kaggle_nvcc` markers (the\n\
+  case is MARKED for the Kaggle/nvcc fallback, not dropped); set\n\
+  `LGBM_PRIMITIVE_WEIGHTED_PERCENTILE=1` to capture real weighted goldens on a CUDA\n\
+  box. The UNWEIGHTED percentile is fully deterministic and committed.\n\
+\n\
+### Exact primitive-capture command\n\
+\n\
+```bash\n\
+cargo run -p xtask -- primitive-capture\n\
 ```\n",
         commit = LIGHTGBM_COMMIT,
         version = LIGHTGBM_VERSION,
@@ -2531,6 +2739,8 @@ LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- learner-oracl
         kernel_master_seed_hex = KERNEL_MASTER_SEED as u32,
         learner_master_seed = LEARNER_MASTER_SEED,
         learner_master_seed_hex = LEARNER_MASTER_SEED as u32,
+        primitive_master_seed = PRIMITIVE_MASTER_SEED,
+        primitive_master_seed_hex = PRIMITIVE_MASTER_SEED as u32,
         model_train_seed = MODEL_TRAIN_SEED,
         model_train_seed_hex = MODEL_TRAIN_SEED as u32,
         model_lgbm_version = MODEL_LIGHTGBM_VERSION,

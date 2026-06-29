@@ -101,3 +101,43 @@ target_include_directories(kernel_capture PRIVATE "${LIGHTGBM_DIR}/include")
 # golden is committed). See REFERENCE_MANIFEST.md.
 add_executable(learner_capture learner_capture.cpp)
 target_include_directories(learner_capture PRIVATE "${LIGHTGBM_DIR}/include")
+
+# primitive_capture: device-primitive HIP goldens (Phase 14, 14-02, ODL-01 / D-03).
+#
+# Unlike every sibling target above, this is a HIP (.cu) harness built with `hipcc`:
+# primitive_capture.cu VERBATIM-transcribes the AMD-fork device primitives + the
+# multi-kernel global wrappers (cuda_algorithms.hpp / cuda_algorithms.cu) and wraps
+# each __device__ block helper in a one-line __global__ shim so it is launchable.
+# Same self-contained discipline as the other harnesses — NO external_libs, NO
+# lib_lightgbm link (the LightGBM external_libs are empty here); it only needs
+# `-I LightGBM/include` for the header-only LightGBM::Random (synthetic inputs).
+#
+# It is built via a custom command invoking hipcc DIRECTLY rather than
+# `enable_language(HIP)`, so the project never makes HIP a hard requirement of this
+# standalone build — the rng/bin/kernel/learner C++ targets must stay buildable on a
+# box with no HIP toolchain. The target is skipped cleanly when hipcc is absent
+# (capture then needs a ROCm/CUDA box — RESEARCH A3). The offload arch defaults to
+# the local spoofed gfx1100 APU and is overridable via -DLGBM_HIP_ARCH=<arch>.
+find_program(LGBM_HIPCC NAMES hipcc)
+set(LGBM_HIP_ARCH "gfx1100" CACHE STRING
+  "HIP offload arch for primitive_capture (default: local spoofed gfx1100 APU)")
+if(LGBM_HIPCC)
+  # Target name intentionally differs from the OUTPUT file basename to avoid the
+  # CMake "circular <target> <- <file>" self-dependency. The COMMAND always runs
+  # when the target is built (hipcc is fast), so the exe is always fresh w.r.t. the
+  # .cu source. `cargo run -p xtask -- primitive-capture` builds `--target
+  # primitive_capture` and then locates the `primitive_capture` executable.
+  add_custom_target(primitive_capture
+    COMMAND "${LGBM_HIPCC}" -O2 "--offload-arch=${LGBM_HIP_ARCH}"
+            -I "${LIGHTGBM_DIR}/include"
+            -o "${CMAKE_CURRENT_BINARY_DIR}/primitive_capture"
+            "${CMAKE_CURRENT_SOURCE_DIR}/primitive_capture.cu"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/primitive_capture"
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/primitive_capture.cu"
+    COMMENT "Building primitive_capture (hipcc, ${LGBM_HIP_ARCH})"
+    VERBATIM)
+else()
+  message(STATUS
+    "hipcc not found — primitive_capture (14-02 device-primitive goldens) target "
+    "skipped. Capture needs a ROCm/CUDA box; committed fixtures need no toolchain.")
+endif()

@@ -418,3 +418,66 @@ divergence).
 ```bash
 LGBM_CAPTURE_PYTHON=/path/to/venv/bin/python cargo run -p xtask -- learner-oracle-capture
 ```
+
+## Device-Primitive Golden Set (Phase 14, 14-02, ODL-01 / D-03)
+
+Captured by `cargo run -p xtask -- primitive-capture` into
+`crates/oracle-harness/fixtures/primitives/` (four files: `prefix_sum.txt`,
+`reduce.txt`, `argsort.txt`, `percentile.txt`). These anchor the Rust CubeCL
+device primitives (14-06): block inclusive/exclusive prefix-sum + the multi-kernel
+global prefix-sum (`ShufflePrefixSum` family), the shuffle reductions sum/max/min +
+dot-product (`ShuffleReduce*`), single-block + multi-block (global) bitonic argsort
+(index-only), and weighted/unweighted `PercentileDevice`. Numeric outputs are
+emitted as raw bit patterns (f64 -> decimal `u64`, f32 -> decimal `u32`) compared
+bit-exact on the cpu f64 anchor / ~1e-6 for ROCm f32 (Pitfall 3); argsort
+permutations are decimal index arrays compared BIT-EXACT, with a TIE-RICH input so
+the comparator/tie-order convention is locked (Pitfall 5).
+
+- **Primitive master seed:** `233250021` (`0x0DE71CE5`) —
+the SINGLE source of randomness for the synthetic primitive inputs (via the
+header-only `LightGBM::Random`), so `primitive-capture` is byte-idempotent.
+
+### Capture-harness note (HIP, self-contained; external_libs unbuildable)
+
+Unlike the sibling C++ harnesses, `xtask/cpp/primitive_capture.cu` is a HIP (`.cu`)
+harness built with `hipcc` against the in-repo AMD fork
+(`LightGBM-release-4.6.0.99/`). The authoritative device primitives live in the
+fork's `include/LightGBM/cuda/cuda_algorithms.hpp` (the `__device__` block helpers +
+`PercentileDevice`) and `src/cuda/cuda_algorithms.cu` (the host-callable multi-kernel
+global wrappers); both transitively pull `<LightGBM/bin.h>` -> `common.h` ->
+`fast_double_parser.h` + `fmt/format.h` from `external_libs/`, present here only as
+EMPTY directories, so neither can be `#include`d and no `lib_lightgbm`/`.cu` object
+can be linked. The harness therefore VERBATIM-transcribes the device-primitive
+bodies + global wrappers from the pinned fork (commit `195c26fc7b00eb0fec252dfe841e2e66d6833954`, version
+`4.6.0.99`), wrapping each `__device__` block helper in a one-line `__global__`
+shim (they are not host-callable as-is), and includes only the header-only
+`LightGBM::Random` for synthetic inputs. Same self-contained discipline as
+`rng_capture`/`bin_capture`/`kernel_capture`/`learner_capture`: no `external_libs`,
+no `lib_lightgbm` link, no toolchain at `cargo test` time (the goldens are
+committed). Built on the local spoofed gfx1100 APU (warpSize 32); the fork sizes its
+`__shared__` warp buffers from `WARPSIZE == 32` for every non-GFX9 target, mirrored
+exactly. `cargo test` reads the committed fixtures and needs NO HIP toolchain.
+
+### Faithfulness fixes + APU determinism notes
+
+- `__shfl_{up,down}_sync(mask, ...)` are mapped onto the fork's plain
+`__shfl_{up,down}` (cuda_rocm_interop.h:45-48) since the transcription always
+passes the full `0xffffffff` mask (ROCm's native `_sync` requires a 64-bit mask).
+- The weighted prefix-sum base uses the exclusive-prefix RETURN value (the reference
+read `shared_buffer[threadIdx.x]` out-of-bounds for blockDim > warpSize — UB), and
+the bitonic-sort padding lanes are sentinel-initialised (the reference left their
+`__shared__` value uninitialised). Both restore byte-idempotency on the APU without
+changing any real-element result (argsort goldens are identical with/without).
+- The **weighted `PercentileDevice`** path is intermittently NON-idempotent on the
+spoofed gfx1100 APU (its block-cooperative sort + sorted-prefix-sum carry `len`-vs-
+`BLOCK_DIM`/`MAX_DEPTH` preconditions the golden lengths violate). Per RESEARCH A3
+its cases are emitted as deterministic `status=deferred_kaggle_nvcc` markers (the
+case is MARKED for the Kaggle/nvcc fallback, not dropped); set
+`LGBM_PRIMITIVE_WEIGHTED_PERCENTILE=1` to capture real weighted goldens on a CUDA
+box. The UNWEIGHTED percentile is fully deterministic and committed.
+
+### Exact primitive-capture command
+
+```bash
+cargo run -p xtask -- primitive-capture
+```
