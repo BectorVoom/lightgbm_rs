@@ -167,14 +167,54 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
     /// unsupported width is a typed error (Pitfall 2). Mirrors
     /// `GetSparseDataPartitioned` (§13).
     ///
+    /// `row_ptr_bit_type` ∈ {16, 32, 64} selects the CSR row-pointer width (in the
+    /// real path this is derived from the total nnz; it is passed explicitly here so
+    /// the 3×3 matrix is exercisable without materializing a 2^32-nnz column —
+    /// D-04). Any other value is an unsupported width (Pitfall 2).
+    ///
     /// # Errors
     /// [`ComputeError`] on an unsupported `bit_type`/`row_ptr_type` width.
     pub fn get_sparse_data_partitioned(
         client: &cubecl::prelude::ComputeClient<R>,
         columns: &[BinColumn],
         layout: &FeaturePartitionLayout,
+        row_ptr_bit_type: u32,
     ) -> Result<Self, ComputeError> {
-        let _ = (client, columns, layout);
+        let _ = (client, columns, layout, row_ptr_bit_type);
         todo!("15-03: GetSparseDataPartitioned — per-partition CSR re-lay (partition-local bins) over the 3×3 width matrix")
+    }
+
+    /// Read the re-laid store's LOGICAL global bin at `(row, column)` back from
+    /// device (dense or sparse, dispatched on [`Self::is_sparse`]) for the ODL-03
+    /// parity assert against host [`BinColumn::bin`] truth.
+    ///
+    /// # Errors
+    /// [`ComputeError`] if `(row, column)` is out of range.
+    pub fn read_bin(
+        &self,
+        client: &cubecl::prelude::ComputeClient<R>,
+        row: usize,
+        column: usize,
+    ) -> Result<u32, ComputeError> {
+        let _ = (client, row, column);
+        todo!("15-02/15-03: read back the logical global bin at (row, column) for parity")
+    }
+
+    /// Read the PARTITION-LOCAL stored bin for `partition`'s `local_row` and
+    /// `local_column` (the column's index WITHIN the partition). Equals the logical
+    /// global bin minus `partition_hist_offsets[partition]` (Pitfall 4) — the
+    /// re-lay's partition-local invariant the sparse test asserts.
+    ///
+    /// # Errors
+    /// [`ComputeError`] if any index is out of range.
+    pub fn read_partition_local_bin(
+        &self,
+        client: &cubecl::prelude::ComputeClient<R>,
+        partition: usize,
+        local_row: usize,
+        local_column: usize,
+    ) -> Result<u32, ComputeError> {
+        let _ = (client, partition, local_row, local_column);
+        todo!("15-02/15-03: read back the partition-local stored bin (Pitfall 4)")
     }
 }
