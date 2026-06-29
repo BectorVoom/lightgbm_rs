@@ -134,11 +134,11 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. The resident dataset reproduces the host binned values exactly (per-column bin parity), and bin-width + partition dispatch is validated across all three widths and the large-bin spill case.
   4. CPU / ROCm / existing-host-CUDA paths are byte-unchanged; the merge gate is green.
 
-**Plans**: 1/5 plans executed
+**Plans**: 3/5 plans executed
 
 - [x] 15-01-PLAN.md — Wave 0: register 3 ungated kernel modules + stub API surface + author both Nyquist parity test files + D-04 sparse synthesizer (ODL-03/04)
-- [ ] 15-02-PLAN.md — Wave 1: §13 CUDARowData row+partition store — DivideCUDAFeatureGroups + offset tables + dense/sparse 3×3 re-lay (ODL-03)
-- [ ] 15-03-PLAN.md — Wave 1: §3 CUDAColumnData column store + numeric per-feature meta, upload-once, no consumer (ODL-03)
+- [x] 15-02-PLAN.md — Wave 1: §13 CUDARowData row+partition store — DivideCUDAFeatureGroups + offset tables + dense/sparse 3×3 re-lay (ODL-03)
+- [x] 15-03-PLAN.md — Wave 1: §3 CUDAColumnData column store + numeric per-feature meta, upload-once, no consumer (ODL-03)
 - [ ] 15-04-PLAN.md — Wave 1: CopySubrow gather + on-device bagging draw anchored to host bag_data_indices (ODL-04)
 - [ ] 15-05-PLAN.md — Wave 2: merge gate — full workspace suite green, D-10 byte-unchanged default path (ODL-03/04)
 
@@ -270,7 +270,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
-| 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 1/5 | In Progress|  |
+| 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 3/5 | In Progress|  |
 | 16. On-Device Histogram Constructor | v1.1 | 0/? | Not started | - |
 | 17. On-Device Best-Split Finder | v1.1 | 0/? | Not started | - |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
