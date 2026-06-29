@@ -25,3 +25,13 @@ pub mod random;
 pub mod split;
 pub mod split_info;
 pub mod subtract;
+// Phase-15 device-dataset + row-subset-gather modules (ODL-03/04), additive and
+// behind the SAME OFF-by-default `LGBM_CUDA_ON_DEVICE` seam: the device columnar
+// store (`column_data`), the row-wise binned matrix + feature-partition layout
+// (`row_data`), and the `CopySubrow` bagging-subset gather (`copy_subrow`).
+// Ungated like `random`/`split` (NOT `#[cfg(feature = "gpu")]`) so the default cpu
+// f64 anchor runs them (D-08) and each Wave-1 plan fills exactly one owned file
+// with no `mod.rs` contention.
+pub mod column_data;
+pub mod copy_subrow;
+pub mod row_data;
