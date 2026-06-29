@@ -14,8 +14,8 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 
 ### Device dataset
 
-- [ ] **ODL-03**: An on-device **columnar binned dataset** (u8/16/32 bin-width dispatch; dense + sparse CSR) resident on device, carrying the **feature-partition layout** the histogram kernel is built around — features grouped so one partition's histogram fits shared memory, a too-wide column becoming its own large-bin partition (→ global-memory path). (§3, §13.)
-- [ ] **ODL-04**: On-device **row-subset gather** (a `CopySubrow` analog) builds the bagging / GOSS subset dataset on device, anchor-pinned to the host subset-selection draw sequence. (§3.)
+- [x] **ODL-03**: An on-device **columnar binned dataset** (u8/16/32 bin-width dispatch; dense + sparse CSR) resident on device, carrying the **feature-partition layout** the histogram kernel is built around — features grouped so one partition's histogram fits shared memory, a too-wide column becoming its own large-bin partition (→ global-memory path). (§3, §13.)
+- [x] **ODL-04**: On-device **row-subset gather** (a `CopySubrow` analog) builds the bagging / GOSS subset dataset on device, anchor-pinned to the host subset-selection draw sequence. (§3.)
 
 ### On-device objectives (§5)
 
@@ -87,8 +87,8 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 |-------------|-------|--------|
 | ODL-01 | Phase 14 | Pending |
 | ODL-02 | Phase 14 | Pending |
-| ODL-03 | Phase 15 | Pending |
-| ODL-04 | Phase 15 | Pending |
+| ODL-03 | Phase 15 | Complete |
+| ODL-04 | Phase 15 | Complete |
 | ODL-05 | Phase 19 | Pending |
 | ODL-06 | Phase 19 | Pending |
 | ODL-07 | Phase 19 | Pending |

@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
-current_phase: 14
-status: completed
+current_phase: 15
+current_phase_name: on-device-device-dataset-row-subset-gather
+status: executing
 stopped_at: Phase 15 context gathered
-last_updated: "2026-06-29T19:35:32.499Z"
+last_updated: "2026-06-29T21:36:18.523Z"
 last_activity: 2026-06-29
-last_activity_desc: Phase 14 marked complete
+last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 10
   completed_phases: 1
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 11
+  completed_plans: 7
   percent: 10
-current_phase_name: foundation-shared-device-primitives-device-structs-rng
 ---
 
 # Project State
@@ -24,15 +24,15 @@ current_phase_name: foundation-shared-device-primitives-device-structs-rng
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 14 — foundation-shared-device-primitives-device-structs-rng
+**Current focus:** Phase 15 — on-device-device-dataset-row-subset-gather
 
 ## Current Position
 
-Phase: 14 — COMPLETE
-Plan: 1 of 6
-Status: Phase 14 complete
+Phase: 15 (on-device-device-dataset-row-subset-gather) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-06-29 — Phase 14 marked complete
+Last activity: 2026-06-29 — Phase 15 execution started
 
 Next: `/gsd-plan-phase 14`
 
@@ -552,6 +552,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 14 P01 | 12min | 2 tasks | 4 files |
 | Phase 14 P02 | 3min | 2 tasks | 2 files |
 | Phase 14 P03 | 18min | 3 tasks | 1 files |
+| Phase 15 P01 | 8min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -638,6 +639,8 @@ Recent decisions affecting current work:
 - [Phase 13]: 13-03: wired BOTH scan paths (single-leaf + co-pack siblings) for autotuned CubeDim W; separate local_tuner namespaces avoid LaunchKey collision
 - [Phase 14]: D-03 resolved via Option A: LeafPartitionLayout POD payload in lgbm-dataset names the on-device seam's P without a treelearner crate cycle
 - [Phase 14]: Phase 14-03 oracle: default_left tie-aware comparator masks only bit1 (DEFAULT_LEFT_MASK), per-node tie gated on threshold + child_row_counts equality; host-fallback lives in oracle TEST only (D-01/D-02), production uses Ok(None) fall-through
+- [Phase ?]: Phase-15 device-dataset modules registered ungated (cpu f64 anchor runs them, D-08), not gpu-gated
+- [Phase ?]: Sparse 3x3 width matrix exercised via explicit row_ptr_bit_type param + nnz-as-number synthesizer (no 2^32-nnz materialization)
 
 ### Pending Todos
 
@@ -667,7 +670,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-29T19:35:32.487Z
+Last session: 2026-06-29T21:35:52.223Z
 Stopped at: Phase 15 context gathered
 Resume file: .planning/phases/15-on-device-device-dataset-row-subset-gather/15-CONTEXT.md
 
