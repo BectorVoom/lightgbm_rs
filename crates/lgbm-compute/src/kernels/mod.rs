@@ -14,5 +14,14 @@
 pub mod autotune;
 pub mod histogram;
 pub mod partition;
+// Phase-14 foundation (additive, behind the OFF-by-default `LGBM_CUDA_ON_DEVICE`
+// seam): shared device primitives (14-03/14-05), the SoA pre-allocated device
+// split-record (14-04), and the `CUDARandom` LCG (14-04). Ungated like the other
+// kernel modules (NOT `#[cfg(feature = "gpu")]` like `autotune`) so Wave-2 plans
+// can each fill exactly one owned file with no `mod.rs` contention; they land as
+// empty compiling stubs.
+pub mod primitives;
+pub mod random;
 pub mod split;
+pub mod split_info;
 pub mod subtract;
