@@ -644,3 +644,578 @@ pub fn dot_product_f64_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f64::from_bytes(&bytes)[0])
 }
+
+// =========================================================================
+// Task 3: single-block index-only bitonic argsort
+// =========================================================================
+
+/// Compute the bitonic `(depth, aligned)` for `num_items`, replicating the
+/// AMD-fork `BitonicArgSort_1024` alignment loop (`aligned` = next power of two
+/// >= `num_items`, `depth` = log2(aligned) + 1).
+fn bitonic_depth_aligned(num_items: usize) -> (u32, u32) {
+    let mut depth = 1u32;
+    let mut aligned = 1u32;
+    let mut r = (num_items as u32).saturating_sub(1);
+    while r > 0 {
+        r >>= 1;
+        aligned <<= 1;
+        depth += 1;
+    }
+    (depth, aligned)
+}
+
+/// Single-owner index-only bitonic argsort over `indices` (identity start, length
+/// `aligned`), keyed by the READ-ONLY `keys` array. Mirrors the AMD-fork
+/// `cuda_algorithms.hpp` `BitonicArgSort_1024` comparator EXACTLY:
+/// - the comparator reads `keys[indices[tid]]` (indirection) and swaps ONLY
+///   `indices` — `keys` is never written (index-only, D-01);
+/// - strict `>` comparison; ascending parity `outer_segment_index & 1 == 0`
+///   (`ASCENDING`) so ties resolve identically to the C++ reference (Pitfall 5);
+/// - the network walks `outer_depth = depth-1 .. 1`, `inner_depth = outer_depth
+///   .. depth-1`, comparing `tid` with `tid + half_segment_length` when the
+///   half-segment index is even.
+///
+/// Single owner (`UNIT_POS == 0`) walks every `tid` in stage order. Within one
+/// `inner_depth` stage the compare-swap pairs are DISJOINT (each lower element
+/// pairs with exactly one higher partner), so the serial `tid` walk is bit-
+/// identical to the parallel form with a `sync_cube()` between stages — the cpu
+/// anchor needs no barrier (single owner) and no plane op (14-01: cpu has none).
+#[cube(launch_unchecked)]
+fn bitonic_argsort_kernel(
+    keys: &Array<f32>,
+    indices: &mut Array<i32>,
+    aligned: u32,
+    depth: u32,
+    ascending: u32,
+) {
+    if UNIT_POS == 0 {
+        let mut od = depth - 1;
+        // od runs depth-1 down to 1; when depth == 1 (single element) od == 0 and
+        // the guard skips the network entirely. od never decrements below 0.
+        while od >= 1 {
+            let outer_segment_length = 1u32 << (depth - od);
+            let mut inner = od;
+            while inner < depth {
+                let segment_length = 1u32 << (depth - inner);
+                let half = segment_length >> 1;
+                let mut tid = 0u32;
+                while tid < aligned {
+                    let osi = tid / outer_segment_length;
+                    let asc = if ascending == 1 {
+                        (osi & 1u32) == 0u32
+                    } else {
+                        (osi & 1u32) == 1u32
+                    };
+                    let hsi = tid / half;
+                    if (hsi & 1u32) == 0u32 {
+                        let cmp = tid + half;
+                        let ia = indices[tid as usize] as usize;
+                        let ib = indices[cmp as usize] as usize;
+                        let gt = keys[ia] > keys[ib];
+                        if gt == asc {
+                            let tmp = indices[tid as usize];
+                            indices[tid as usize] = indices[cmp as usize];
+                            indices[cmp as usize] = tmp;
+                        }
+                    }
+                    tid += 1;
+                }
+                inner += 1;
+            }
+            od -= 1;
+        }
+    }
+}
+
+/// Single-block index-only bitonic argsort on the cpu anchor.
+///
+/// Returns `(permutation, keys_after)` where `permutation[r]` is the index of the
+/// `r`-th smallest (ascending) / largest (descending) key, and `keys_after` is the
+/// keys array read back AFTER the sort (always equal to the input — proves the
+/// index-only / values-unmoved contract). Internally the keys are sentinel-padded
+/// to the next power of two (`+inf` ascending / `-inf` descending) so the padding
+/// sorts to the tail; the returned slices are truncated to `keys.len()`.
+///
+/// `num_items <= 1024` (single block); larger inputs need the multi-block
+/// `…Global` argsort — a 14-05 skeleton (D-02).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `keys.len() > 1024`.
+pub fn bitonic_argsort_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    keys: &[f32],
+    ascending: bool,
+) -> Result<(Vec<i32>, Vec<f32>), ComputeError> {
+    let num_items = keys.len();
+    if num_items == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if num_items > BITONIC_SORT_NUM_ELEMENTS {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "bitonic_argsort: num_items {num_items} > {BITONIC_SORT_NUM_ELEMENTS} — the \
+                 multi-block …Global argsort is a 14-05 skeleton (D-02)"
+            ),
+        });
+    }
+
+    let (depth, aligned) = bitonic_depth_aligned(num_items);
+    let al = aligned as usize;
+    let sentinel = if ascending {
+        f32::INFINITY
+    } else {
+        f32::NEG_INFINITY
+    };
+    let mut padded = keys.to_vec();
+    padded.resize(al, sentinel);
+    let indices: Vec<i32> = (0..aligned as i32).collect();
+
+    let h_keys = client.create_from_slice(f32::as_bytes(&padded));
+    let h_idx = client.create_from_slice(i32::as_bytes(&indices));
+
+    // SAFETY: `h_keys` and `h_idx` are each sized exactly `aligned` (>= num_items)
+    // and outlive the launch. Every device access is host-proven in range: `tid`
+    // and `cmp = tid + half` both fall in `[0, aligned)` (the even-half-segment
+    // guard keeps `tid` in the lower half so `cmp < aligned`), and every
+    // `indices[..]` value is in `[0, aligned)` (identity start, only swapped). The
+    // keys array is READ-ONLY in the kernel (`&Array<f32>`). cubecl unsafe is
+    // confined here (CMP-01 / T-14-03-01).
+    unsafe {
+        bitonic_argsort_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_keys.clone(), al),
+            ArrayArg::from_raw_parts(h_idx.clone(), al),
+            aligned,
+            depth,
+            u32::from(ascending),
+        );
+    }
+
+    let idx_bytes = client.read_one_unchecked(h_idx);
+    let perm_full = i32::from_bytes(&idx_bytes);
+    let keys_bytes = client.read_one_unchecked(h_keys);
+    let keys_after = f32::from_bytes(&keys_bytes);
+
+    // Truncate the sentinel padding (it sorted to the tail for the real elements).
+    Ok((
+        perm_full[..num_items].to_vec(),
+        keys_after[..num_items].to_vec(),
+    ))
+}
+
+// =========================================================================
+// GPU plane-intrinsic variants (rocm-gated) — built on the cubecl-0.10 plane
+// intrinsics (RESEARCH Pattern 1/2), the GPU leg of D-01. These are the
+// `has_plane` device kernels the f32 hip mirror dispatches; the cpu anchor above
+// is the serial fold (14-01: cubecl-cpu has NO plane support). They are
+// CROSS-VALIDATED against the C++/HIP fixtures in 14-06 (this plan ships them;
+// the fixture parity gate lands next), held to ~1e-6 vs the f64 anchor — NEVER
+// asserted GPU-vs-GPU (def-f8u-01, D-10).
+//
+// The within-plane level maps directly onto `plane_inclusive_sum` /
+// `plane_exclusive_sum` / `plane_sum` / `plane_max` / `plane_min`; the block-wide
+// (cross-plane) level stages per-plane partials in a <=32-slot `SharedMemory`
+// buffer combined under `sync_cube()` (intra-cube barrier ONLY — no cross-cube
+// barrier exists, RESEARCH Pattern 2/3). Single-block (`n <= CubeDim`, <= 1024);
+// the multi-block global composition is wired by the first on-device consumer
+// (Phase 15) reusing the serial 3-launch structure above.
+
+/// Max planes per cube (1024 / 32 wave; AMD wave64 uses 16, 32 is the safe cap).
+/// `usize` to match `SharedMemory::new` (the comptime LDS size type, mirroring
+/// `histogram::HIST_LDS_MAX`).
+#[cfg(feature = "rocm")]
+const N_PLANES_MAX: usize = 32;
+
+/// Block-wide inclusive/exclusive prefix-sum via plane scan + LDS staging
+/// (RESEARCH Pattern 2). One cube; `exclusive = inclusive - own_value`.
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+fn plane_block_scan_kernel_f32(
+    data: &Array<f32>,
+    out: &mut Array<f32>,
+    n: u32,
+    plane_dim: u32,
+    inclusive: u32,
+) {
+    let mut stage = SharedMemory::<f32>::new(N_PLANES_MAX);
+    let nn = n as usize;
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let v = if i < nn { data[i] } else { f32::new(0.0) };
+    // 1. inclusive scan WITHIN each plane.
+    let local = plane_inclusive_sum(v);
+    // 2. last lane of each plane stages its plane total.
+    if lane == pd - 1 {
+        stage[plane_id] = local;
+    }
+    sync_cube();
+    // 3. plane 0 exclusive-scans the per-plane totals (n_planes <= plane width).
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { f32::new(0.0) };
+        stage[lane] = plane_exclusive_sum(t);
+    }
+    sync_cube();
+    // 4. add the plane base back; derive exclusive from inclusive - v.
+    if i < nn {
+        let base = stage[plane_id];
+        let result = if inclusive == 1 {
+            base + local
+        } else {
+            base + local - v
+        };
+        out[i] = result;
+    }
+}
+
+/// Block-wide SUM via `plane_sum` + LDS combine (RESEARCH Pattern 1).
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+fn plane_reduce_sum_kernel_f32(data: &Array<f32>, out: &mut Array<f32>, n: u32, plane_dim: u32) {
+    let mut stage = SharedMemory::<f32>::new(N_PLANES_MAX);
+    let nn = n as usize;
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let v = if i < nn { data[i] } else { f32::new(0.0) };
+    let psum = plane_sum(v);
+    if lane == 0 {
+        stage[plane_id] = psum;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { f32::new(0.0) };
+        let total = plane_sum(t);
+        if lane == 0 {
+            out[0] = total;
+        }
+    }
+}
+
+/// Block-wide MAX via `plane_max` + LDS combine; `ident` = the padding identity
+/// (`-inf`) supplied by the host so out-of-range lanes never win.
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+fn plane_reduce_max_kernel_f32(
+    data: &Array<f32>,
+    out: &mut Array<f32>,
+    n: u32,
+    plane_dim: u32,
+    ident: f32,
+) {
+    let mut stage = SharedMemory::<f32>::new(N_PLANES_MAX);
+    let nn = n as usize;
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let v = if i < nn { data[i] } else { ident };
+    let pmax = plane_max(v);
+    if lane == 0 {
+        stage[plane_id] = pmax;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { ident };
+        let total = plane_max(t);
+        if lane == 0 {
+            out[0] = total;
+        }
+    }
+}
+
+/// Block-wide MIN via `plane_min` + LDS combine; `ident` = `+inf`.
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+fn plane_reduce_min_kernel_f32(
+    data: &Array<f32>,
+    out: &mut Array<f32>,
+    n: u32,
+    plane_dim: u32,
+    ident: f32,
+) {
+    let mut stage = SharedMemory::<f32>::new(N_PLANES_MAX);
+    let nn = n as usize;
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let v = if i < nn { data[i] } else { ident };
+    let pmin = plane_min(v);
+    if lane == 0 {
+        stage[plane_id] = pmin;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { ident };
+        let total = plane_min(t);
+        if lane == 0 {
+            out[0] = total;
+        }
+    }
+}
+
+/// Block-wide DOT-PRODUCT: elementwise multiply then `plane_sum` + LDS combine
+/// (RESEARCH Pattern 1, C++ `ShuffleReduceDotProd`).
+#[cfg(feature = "rocm")]
+#[cube(launch_unchecked)]
+fn plane_dot_kernel_f32(
+    a: &Array<f32>,
+    b: &Array<f32>,
+    out: &mut Array<f32>,
+    n: u32,
+    plane_dim: u32,
+) {
+    let mut stage = SharedMemory::<f32>::new(N_PLANES_MAX);
+    let nn = n as usize;
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let v = if i < nn { a[i] * b[i] } else { f32::new(0.0) };
+    let psum = plane_sum(v);
+    if lane == 0 {
+        stage[plane_id] = psum;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { f32::new(0.0) };
+        let total = plane_sum(t);
+        if lane == 0 {
+            out[0] = total;
+        }
+    }
+}
+
+/// Round a block size up to a multiple of `plane_dim`, capped at 1024 (the
+/// single-block plane-scan cap; multi-block global is Phase-15).
+#[cfg(feature = "rocm")]
+fn plane_block_dim(n: usize, plane_dim: u32) -> Result<u32, ComputeError> {
+    if n > 1024 {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "plane primitive: n {n} > 1024 single-block cap — multi-block GPU global \
+                 composition is wired by the Phase-15 consumer"
+            ),
+        });
+    }
+    let pd = plane_dim.max(1);
+    Ok((n as u32).div_ceil(pd) * pd)
+}
+
+/// GPU (`has_plane`) block-wide inclusive prefix-sum on f32 cells, built on the
+/// plane intrinsics. Cross-validated vs the C++ fixture in 14-06 (~1e-6).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `n > 1024` (single-block cap).
+#[cfg(feature = "rocm")]
+pub fn plane_prefix_sum_inclusive_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f32],
+    plane_dim: u32,
+) -> Result<Vec<f32>, ComputeError> {
+    plane_prefix_sum_f32_on(client, data, plane_dim, true)
+}
+
+/// GPU block-wide exclusive prefix-sum. See [`plane_prefix_sum_inclusive_f32_on`].
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `n > 1024`.
+#[cfg(feature = "rocm")]
+pub fn plane_prefix_sum_exclusive_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f32],
+    plane_dim: u32,
+) -> Result<Vec<f32>, ComputeError> {
+    plane_prefix_sum_f32_on(client, data, plane_dim, false)
+}
+
+#[cfg(feature = "rocm")]
+fn plane_prefix_sum_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f32],
+    plane_dim: u32,
+    inclusive: bool,
+) -> Result<Vec<f32>, ComputeError> {
+    let n = data.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let block_dim = plane_block_dim(n, plane_dim)?;
+    let h_in = client.create_from_slice(f32::as_bytes(data));
+    let h_out = client.empty(n * core::mem::size_of::<f32>());
+    // SAFETY: `h_in`/`h_out` sized exactly `n`; the kernel guards every access by
+    // `i < n` and stages only `<= N_PLANES_MAX` per-plane partials. cubecl unsafe
+    // confined here (CMP-01).
+    unsafe {
+        plane_block_scan_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(block_dim),
+            ArrayArg::from_raw_parts(h_in, n),
+            ArrayArg::from_raw_parts(h_out.clone(), n),
+            n as u32,
+            plane_dim.max(1),
+            u32::from(inclusive),
+        );
+    }
+    Ok(f32::from_bytes(&client.read_one_unchecked(h_out)).to_vec())
+}
+
+/// GPU (`has_plane`) block-wide f32 reductions, built on `plane_sum`/`plane_max`/
+/// `plane_min`. Cross-validated vs the C++ fixture in 14-06 (~1e-6).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `n > 1024`; [`ComputeError::LengthMismatch`] on
+/// empty max/min or mismatched dot lengths.
+#[cfg(feature = "rocm")]
+pub fn plane_reduce_sum_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f32],
+    plane_dim: u32,
+) -> Result<f32, ComputeError> {
+    if data.is_empty() {
+        return Ok(0.0);
+    }
+    let block_dim = plane_block_dim(data.len(), plane_dim)?;
+    let h_in = client.create_from_slice(f32::as_bytes(data));
+    let h_out = client.empty(core::mem::size_of::<f32>());
+    // SAFETY: see `plane_prefix_sum_f32_on`; single scalar out.
+    unsafe {
+        plane_reduce_sum_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(block_dim),
+            ArrayArg::from_raw_parts(h_in, data.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), 1),
+            data.len() as u32,
+            plane_dim.max(1),
+        );
+    }
+    Ok(f32::from_bytes(&client.read_one_unchecked(h_out))[0])
+}
+
+/// GPU block-wide MAX. See [`plane_reduce_sum_f32_on`].
+///
+/// # Errors
+/// As [`plane_reduce_sum_f32_on`]; empty -> [`ComputeError::LengthMismatch`].
+#[cfg(feature = "rocm")]
+pub fn plane_reduce_max_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f32],
+    plane_dim: u32,
+) -> Result<f32, ComputeError> {
+    if data.is_empty() {
+        return Err(ComputeError::LengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let block_dim = plane_block_dim(data.len(), plane_dim)?;
+    let h_in = client.create_from_slice(f32::as_bytes(data));
+    let h_out = client.empty(core::mem::size_of::<f32>());
+    // SAFETY: see `plane_prefix_sum_f32_on`; single scalar out.
+    unsafe {
+        plane_reduce_max_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(block_dim),
+            ArrayArg::from_raw_parts(h_in, data.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), 1),
+            data.len() as u32,
+            plane_dim.max(1),
+            f32::NEG_INFINITY,
+        );
+    }
+    Ok(f32::from_bytes(&client.read_one_unchecked(h_out))[0])
+}
+
+/// GPU block-wide MIN. See [`plane_reduce_sum_f32_on`].
+///
+/// # Errors
+/// As [`plane_reduce_sum_f32_on`]; empty -> [`ComputeError::LengthMismatch`].
+#[cfg(feature = "rocm")]
+pub fn plane_reduce_min_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f32],
+    plane_dim: u32,
+) -> Result<f32, ComputeError> {
+    if data.is_empty() {
+        return Err(ComputeError::LengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let block_dim = plane_block_dim(data.len(), plane_dim)?;
+    let h_in = client.create_from_slice(f32::as_bytes(data));
+    let h_out = client.empty(core::mem::size_of::<f32>());
+    // SAFETY: see `plane_prefix_sum_f32_on`; single scalar out.
+    unsafe {
+        plane_reduce_min_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(block_dim),
+            ArrayArg::from_raw_parts(h_in, data.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), 1),
+            data.len() as u32,
+            plane_dim.max(1),
+            f32::INFINITY,
+        );
+    }
+    Ok(f32::from_bytes(&client.read_one_unchecked(h_out))[0])
+}
+
+/// GPU block-wide DOT-PRODUCT. See [`plane_reduce_sum_f32_on`].
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `a.len() != b.len()`; `Runtime` if n>1024.
+#[cfg(feature = "rocm")]
+pub fn plane_dot_product_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    a: &[f32],
+    b: &[f32],
+    plane_dim: u32,
+) -> Result<f32, ComputeError> {
+    if a.len() != b.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: a.len(),
+            actual: b.len(),
+        });
+    }
+    if a.is_empty() {
+        return Ok(0.0);
+    }
+    let block_dim = plane_block_dim(a.len(), plane_dim)?;
+    let h_a = client.create_from_slice(f32::as_bytes(a));
+    let h_b = client.create_from_slice(f32::as_bytes(b));
+    let h_out = client.empty(core::mem::size_of::<f32>());
+    // SAFETY: `h_a`/`h_b` sized `a.len()`; single scalar out. cubecl unsafe
+    // confined here (CMP-01).
+    unsafe {
+        plane_dot_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(block_dim),
+            ArrayArg::from_raw_parts(h_a, a.len()),
+            ArrayArg::from_raw_parts(h_b, a.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), 1),
+            a.len() as u32,
+            plane_dim.max(1),
+        );
+    }
+    Ok(f32::from_bytes(&client.read_one_unchecked(h_out))[0])
+}
