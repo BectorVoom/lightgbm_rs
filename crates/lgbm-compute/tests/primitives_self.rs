@@ -18,8 +18,8 @@
 //! `rocm`-gated and cross-validated in 14-06.
 
 use lgbm_compute::kernels::primitives::{
-    dot_product_f64_on, prefix_sum_exclusive_f64_on, prefix_sum_inclusive_f64_on,
-    reduce_max_f64_on, reduce_min_f64_on, reduce_sum_f64_on,
+    bitonic_argsort_on, dot_product_f64_on, prefix_sum_exclusive_f64_on,
+    prefix_sum_inclusive_f64_on, reduce_max_f64_on, reduce_min_f64_on, reduce_sum_f64_on,
 };
 use lgbm_compute::runtime::cpu_client;
 
@@ -182,4 +182,120 @@ fn prefix_sum_empty_and_single() {
         prefix_sum_exclusive_f64_on(&client, &[42.0], 256).unwrap(),
         vec![0.0]
     );
+}
+
+// =========================================================================
+// Task 3: single-block index-only bitonic argsort
+// =========================================================================
+//
+// Serial reference mirroring the AMD-fork `cuda_algorithms.hpp`
+// `BitonicArgSort_1024` comparator EXACTLY (strict `>`, `outer_segment_index`
+// ascending parity, sentinel-padded to the next power of two). The kernel is
+// asserted permutation-bit-exact against THIS reference (an integer permutation
+// has no float tolerance), including a tie-rich input that locks the convention.
+
+fn ref_depth_aligned(num_items: usize) -> (u32, u32) {
+    let mut depth = 1u32;
+    let mut aligned = 1u32;
+    let mut r = (num_items as u32).saturating_sub(1);
+    while r > 0 {
+        r >>= 1;
+        aligned <<= 1;
+        depth += 1;
+    }
+    (depth, aligned)
+}
+
+fn serial_bitonic_argsort(keys: &[f32], ascending: bool) -> Vec<i32> {
+    let num_items = keys.len();
+    if num_items == 0 {
+        return Vec::new();
+    }
+    let (depth, aligned) = ref_depth_aligned(num_items);
+    let sentinel = if ascending {
+        f32::INFINITY
+    } else {
+        f32::NEG_INFINITY
+    };
+    let mut padded = keys.to_vec();
+    padded.resize(aligned as usize, sentinel);
+    let mut indices: Vec<i32> = (0..aligned as i32).collect();
+    for od in (1..depth).rev() {
+        let outer_segment_length = 1u32 << (depth - od);
+        for inner in od..depth {
+            let segment_length = 1u32 << (depth - inner);
+            let half = segment_length >> 1;
+            for tid in 0..aligned {
+                let osi = tid / outer_segment_length;
+                let asc = if ascending {
+                    osi & 1 == 0
+                } else {
+                    osi & 1 == 1
+                };
+                let hsi = tid / half;
+                if hsi & 1 == 0 {
+                    let cmp = tid + half;
+                    let ka = padded[indices[tid as usize] as usize];
+                    let kb = padded[indices[cmp as usize] as usize];
+                    if (ka > kb) == asc {
+                        indices.swap(tid as usize, cmp as usize);
+                    }
+                }
+            }
+        }
+    }
+    indices[..num_items].to_vec()
+}
+
+#[test]
+fn argsort_distinct_keys_ascending() {
+    // Behaviour: argsort of [3,1,2] (identity start) -> permutation [1,2,0].
+    let client = cpu_client();
+    let keys = vec![3.0f32, 1.0, 2.0];
+    let (perm, keys_after) = bitonic_argsort_on(&client, &keys, true).unwrap();
+    assert_eq!(perm, vec![1, 2, 0]);
+    // The value/key array is never mutated — only the index array is reordered.
+    assert_eq!(keys_after, keys, "keys must be unmutated (index-only argsort)");
+}
+
+#[test]
+fn argsort_matches_serial_distinct() {
+    let client = cpu_client();
+    let keys = vec![5.0f32, 2.0, 9.0, 1.0, 7.0, 3.0, 8.0];
+    let (perm, _) = bitonic_argsort_on(&client, &keys, true).unwrap();
+    assert_eq!(perm, serial_bitonic_argsort(&keys, true));
+    let gathered: Vec<f32> = perm.iter().map(|&i| keys[i as usize]).collect();
+    assert!(gathered.windows(2).all(|w| w[0] <= w[1]), "ascending");
+}
+
+#[test]
+fn argsort_tie_rich_matches_serial() {
+    // Tie-rich input ([2,1,2,1]) yields the SAME permutation the C++-mirrored
+    // comparator produces (locks the tie convention before 14-06's fixture check).
+    let client = cpu_client();
+    let keys = vec![2.0f32, 1.0, 2.0, 1.0];
+    let (perm, keys_after) = bitonic_argsort_on(&client, &keys, true).unwrap();
+    assert_eq!(
+        perm,
+        serial_bitonic_argsort(&keys, true),
+        "tie order must match the C++ comparator/tie convention"
+    );
+    assert_eq!(keys_after, keys);
+    // Valid permutation of 0..4 and ascending by key.
+    let mut sorted = perm.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3]);
+    let gathered: Vec<f32> = perm.iter().map(|&i| keys[i as usize]).collect();
+    assert!(gathered.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
+fn argsort_single_and_empty() {
+    let client = cpu_client();
+    let (perm, ka) = bitonic_argsort_on(&client, &[42.0f32], true).unwrap();
+    assert_eq!(perm, vec![0]);
+    assert_eq!(ka, vec![42.0]);
+    let (ep, ek) = bitonic_argsort_on(&client, &[], true).unwrap();
+    assert_eq!(ep, Vec::<i32>::new());
+    assert_eq!(ek, Vec::<f32>::new());
 }
