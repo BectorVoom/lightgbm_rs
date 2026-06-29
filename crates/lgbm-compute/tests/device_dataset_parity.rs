@@ -88,21 +88,49 @@ mod synth {
 }
 
 /// ODL-03: dense re-lay reproduces every (row, column) bin at each `bit_type`
-/// width (u8/u16/u32). Anchor: host [`BinColumn::bin`].
+/// width (u8/u16/u32). Anchor: host [`BinColumn::bin`] + the global feature offset.
+///
+/// WR-02: uses REAL per-column bin counts (was an all-zero `num_bin_per_column`, which
+/// zeroed every `column_hist_offsets`/`partition_hist_offsets` and reduced the assert to
+/// raw passthrough). The U8+U16 columns pack into ONE partition (so col1 carries a
+/// NON-ZERO partition-local offset), while the U32 column spills to its own large-bin
+/// partition — genuinely exercising `read_bin`'s offset-add (`stored + column_hist_offsets
+/// + partition_hist_offsets`) with non-zero offsets.
 #[test]
 fn dense_bin_parity_all_widths() {
     let client = cpu_client();
 
     // One column per width (num_bin selects U8 / U16 / U32).
     let columns = vec![
-        BinColumn::new(vec![0, 1, 2, 3, 0, 1], 200),       // U8
-        BinColumn::new(vec![0, 300, 1, 2, 400, 5], 4_000), // U16
-        BinColumn::new(vec![0, 70_000, 1, 2, 3, 4], 100_000), // U32
+        BinColumn::new(vec![0, 1, 2, 3, 100, 199], 200),          // U8  (num_bin 200)
+        BinColumn::new(vec![0, 300, 1, 2, 1999, 5], 2_000),       // U16 (num_bin 2000)
+        BinColumn::new(vec![0, 70_000, 1, 2, 3, 99_999], 100_000), // U32 (num_bin 100000)
     ];
     let num_rows = columns[0].len();
-    let num_bin_per_column: Vec<usize> = columns.iter().map(|_| 0usize).collect();
-    // hand layout: pack all columns into partitions under a generous budget.
+    // REAL per-column bin counts (WR-02) — drives non-zero partition-local offsets.
+    let num_bin_per_column = vec![200usize, 2_000, 100_000];
     let layout = divide_cuda_feature_groups(&num_bin_per_column, 6144);
+
+    // The layout must actually contain a multi-column partition with a non-zero offset,
+    // otherwise the offset-add path is still untested (the WR-02 trap).
+    assert_eq!(
+        layout.column_hist_offsets,
+        vec![0, 200, 0],
+        "U8+U16 pack into one partition → col1 carries a non-zero partition-local offset"
+    );
+    assert_eq!(
+        layout.num_large_bin_partition, 1,
+        "the U32 (100000-bin) column spills to its own large-bin partition"
+    );
+
+    // Global feature-bin offset of column `c` = sum of all preceding columns' bin counts.
+    // `read_bin` returns the LOGICAL GLOBAL bin = raw + this offset.
+    let mut global_offset = vec![0u32; num_bin_per_column.len()];
+    let mut acc = 0u32;
+    for (c, &nb) in num_bin_per_column.iter().enumerate() {
+        global_offset[c] = acc;
+        acc += nb as u32;
+    }
 
     let device =
         CudaRowData::<ActiveRuntime>::get_dense_data_partitioned(&client, &columns, &layout)
@@ -110,9 +138,15 @@ fn dense_bin_parity_all_widths() {
 
     for (col_idx, column) in columns.iter().enumerate() {
         for row in 0..num_rows {
-            let host = column.bin(row);
+            let raw = column.bin(row);
+            let expected = raw + global_offset[col_idx];
             let dev = device.read_bin(&client, row, col_idx).expect("read back");
-            assert_eq!(dev, host, "dense bin mismatch at (row={row}, col={col_idx})");
+            assert_eq!(
+                dev, expected,
+                "dense global bin mismatch at (row={row}, col={col_idx}): \
+                 raw {raw} + offset {} != {dev}",
+                global_offset[col_idx]
+            );
         }
     }
 }
@@ -222,6 +256,110 @@ fn sparse_relay_3x3_and_partition_local() {
         8, // unsupported
     );
     assert!(err.is_err(), "unsupported row_ptr width must error (Pitfall 2)");
+}
+
+/// CR-01 / WR-01: when ≥2 NARROW (u8) columns pack into ONE partition, each stored
+/// partition-local bin is `raw + column_hist_offsets[c]` and can exceed 255 — so the
+/// sparse store width MUST be sized to the partition-local bin RANGE, not the raw column
+/// width. The pre-CR-01-fix code sized `bit_type` from the raw u8 width and truncated
+/// (e.g. `399 as u8 = 143`); this test asserts the partition-local fold-in with NON-ZERO
+/// offsets across all three `row_ptr_type` widths, plus the large-bin spill case. It
+/// FAILS against the pre-fix code and passes after.
+#[test]
+fn sparse_partition_local_nonzero_offset_fold() {
+    let client = cpu_client();
+
+    // --- Corpus A: three u8 columns (num_bin <= 256) packing into ONE partition. col1/col2
+    // get non-zero partition-local offsets (200, 400); their partition-local bins (up to
+    // 599) overflow a u8 store — reproducing CR-01 (every column is u8, so the buggy
+    // raw-width selection picks bit_type=8). ---
+    let columns_a = vec![
+        BinColumn::new(vec![10, 20, 30, 40, 50, 60, 70, 80], 200), // offset 0
+        BinColumn::new(vec![199, 150, 100, 5, 6, 7, 8, 9], 200),   // offset 200 -> up to 399
+        BinColumn::new(vec![0, 1, 2, 3, 100, 199, 50, 60], 200),   // offset 400 -> up to 599
+    ];
+    let num_rows = columns_a[0].len();
+    let num_bin_a = vec![200usize, 200, 200];
+    let layout_a = divide_cuda_feature_groups(&num_bin_a, 6144);
+    assert_eq!(
+        layout_a.num_feature_partitions, 1,
+        "all three u8 columns pack into one partition"
+    );
+    assert_eq!(
+        layout_a.column_hist_offsets,
+        vec![0, 200, 400],
+        "non-zero partition-local offsets"
+    );
+
+    for &rpt in &[16u32, 32, 64] {
+        let device = CudaRowData::<ActiveRuntime>::get_sparse_data_partitioned(
+            &client, &columns_a, &layout_a, rpt,
+        )
+        .expect("sparse re-lay (corpus A)");
+        for (col_idx, column) in columns_a.iter().enumerate() {
+            let off = layout_a.column_hist_offsets[col_idx] as u32;
+            for row in 0..num_rows {
+                let raw = column.bin(row);
+                // partition 0 -> local_column == col_idx; partition offset == 0.
+                let local = device
+                    .read_partition_local_bin(&client, 0, row, col_idx)
+                    .expect("partition-local");
+                assert_eq!(
+                    local,
+                    raw + off,
+                    "rpt={rpt}: partition-local bin at (row={row}, col={col_idx}) must be \
+                     raw {raw} + offset {off} (CR-01: must not truncate)"
+                );
+                let global = device.read_bin(&client, row, col_idx).expect("global");
+                assert_eq!(global, raw + off, "rpt={rpt}: global bin (partition offset 0)");
+            }
+        }
+    }
+
+    // --- Corpus B: narrow columns + a large-bin spill column (num_bin > budget). Exercises
+    // the partition-local fold-in alongside a Pitfall-1 large-bin partition. ---
+    let columns_b = vec![
+        BinColumn::new(vec![10, 20, 30, 40, 50, 60, 70, 80], 200), // offset 0, partition 0
+        BinColumn::new(vec![199, 150, 100, 5, 6, 7, 8, 9], 200),   // offset 200, partition 0
+        BinColumn::new(vec![0, 1, 2, 3, 4, 5, 6, 4000], 4_096),    // large-bin -> own partition
+    ];
+    let num_bin_b = vec![200usize, 200, 4_096];
+    let layout_b = divide_cuda_feature_groups(&num_bin_b, 6144);
+    assert_eq!(layout_b.num_large_bin_partition, 1, "large-bin spill (Pitfall 1)");
+    assert_eq!(
+        layout_b.num_feature_partitions, 2,
+        "narrow partition + large-bin partition"
+    );
+
+    for &rpt in &[16u32, 32, 64] {
+        let device = CudaRowData::<ActiveRuntime>::get_sparse_data_partitioned(
+            &client, &columns_b, &layout_b, rpt,
+        )
+        .expect("sparse re-lay (corpus B)");
+        for (col_idx, column) in columns_b.iter().enumerate() {
+            let partition = (0..layout_b.num_feature_partitions)
+                .find(|&p| {
+                    let lo = layout_b.feature_partition_column_index_offsets[p];
+                    let hi = layout_b.feature_partition_column_index_offsets[p + 1];
+                    (lo..hi).contains(&col_idx)
+                })
+                .expect("column belongs to a partition");
+            let lo = layout_b.feature_partition_column_index_offsets[partition];
+            let local_column = col_idx - lo;
+            let off = layout_b.column_hist_offsets[col_idx] as u32;
+            for row in 0..num_rows {
+                let raw = column.bin(row);
+                let local = device
+                    .read_partition_local_bin(&client, partition, row, local_column)
+                    .expect("partition-local");
+                assert_eq!(
+                    local,
+                    raw + off,
+                    "rpt={rpt}: corpus B partition-local bin at (row={row}, col={col_idx})"
+                );
+            }
+        }
+    }
 }
 
 /// ODL-03: column-major store read-back + numeric `ColumnFeatureMeta` parity.
