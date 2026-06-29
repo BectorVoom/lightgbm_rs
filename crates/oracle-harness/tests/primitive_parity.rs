@@ -62,11 +62,55 @@ const PCTL_REL_TOL: f64 = 1e-6;
 /// global running sum. This is a faithful reference quirk: the cpu anchor's
 /// clean exclusive scan is bit-exact EVERYWHERE EXCEPT those warp-boundary lanes,
 /// where the golden is asserted to be exactly `0`.
+///
+/// CROSS-VALIDATION GAP (WR-03): because `ShufflePrefixSumExclusive` is a
+/// *within-warp* building block (not a true global exclusive scan), the C++
+/// golden carries no meaningful exclusive value at the warp-boundary lanes — so
+/// for any `n > WARP` the cross-warp combination of the Rust exclusive scan is
+/// NOT cross-validated against the C++ reference here; only the within-warp
+/// values are. The Rust true exclusive scan's cross-warp correctness rests
+/// entirely on the serial self-test in `primitives_self.rs`, NOT on this C++
+/// oracle. Closing this gap means capturing an exclusive golden from the
+/// multi-kernel `ShufflePrefixSumGlobal` exclusive path (a true global scan);
+/// owned by the Phase-19/22 consumer that first relies on the cross-warp
+/// exclusive result (D-02).
+///
+/// COUPLING (IN-02): `WARP` is hardcoded to the warp-32 capture. If the goldens
+/// are ever recaptured on a warp-64 (GFX9) device the boundary lanes move to
+/// multiples of 64; `assert_capture_warp_width` (called at parse time) enforces
+/// that the fixture's recorded `WARP_WIDTH` metadata matches this constant, so a
+/// warp-64 recapture fails loudly instead of silently mis-validating.
 const WARP: usize = 32;
 
 /// Is `idx` a C++ exclusive-scan warp-boundary lane (golden == 0 quirk)?
 fn is_excl_warp_boundary(idx: usize) -> bool {
     idx > 0 && idx % WARP == 0
+}
+
+/// Parse the optional `WARP_WIDTH <n>` metadata record from a fixture header.
+fn fixture_warp_width(text: &str) -> Option<usize> {
+    text.lines().find_map(|raw| {
+        let line = raw.trim();
+        let rest = line.strip_prefix("WARP_WIDTH ")?;
+        rest.trim().parse::<usize>().ok()
+    })
+}
+
+/// Enforce (IN-02) that a fixture captured at a recorded warp width matches the
+/// hardcoded [`WARP`] this test reasons about. A warp-64 (GFX9) recapture moves
+/// the exclusive-scan boundary lanes to multiples of 64, so silently reusing the
+/// warp-32 boundary logic would mis-validate. If the fixture carries no
+/// `WARP_WIDTH` record we accept it (legacy capture) but the assertion fires the
+/// moment a recapture declares a different width.
+fn assert_capture_warp_width(text: &str, fixture_name: &str) {
+    if let Some(w) = fixture_warp_width(text) {
+        assert_eq!(
+            w, WARP,
+            "{fixture_name}: fixture WARP_WIDTH={w} != test WARP={WARP} — the warp-boundary \
+             logic (e.g. is_excl_warp_boundary) is coupled to the capture warp width; recapture \
+             this test's WARP const before reusing a differently-warped golden set (IN-02)"
+        );
+    }
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -145,7 +189,7 @@ fn records(text: &str) -> impl Iterator<Item = (usize, Vec<&str>)> {
         }
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens[0] {
-            "MASTER_SEED" => None,
+            "MASTER_SEED" | "WARP_WIDTH" => None,
             _ => Some((i + 1, tokens)),
         }
     })
@@ -156,6 +200,7 @@ fn primitive_parity_prefix_sum() {
     let Some(text) = load_or_skip("prefix_sum.txt") else {
         return;
     };
+    assert_capture_warp_width(&text, "prefix_sum.txt");
     let client = cpu_client();
     let (mut int_cases, mut f64_cases, mut f64_bitexact) = (0usize, 0usize, 0usize);
 
