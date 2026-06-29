@@ -270,7 +270,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
-| 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete   | 2026-06-29 |
+| 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
 | 16. On-Device Histogram Constructor | v1.1 | 0/? | Not started | - |
 | 17. On-Device Best-Split Finder | v1.1 | 0/? | Not started | - |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
