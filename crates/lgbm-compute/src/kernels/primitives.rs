@@ -1020,6 +1020,17 @@ pub fn percentile_unweighted_f32_on<R: cubecl::Runtime>(
 /// fixture was deferred to NVIDIA/Phase-19, so this branch is anchored to the
 /// serial f64 reference here.)
 ///
+/// **NO INDEPENDENT C++ ORACLE YET — SELF-VALIDATED ONLY (WR-02).** Every
+/// `weighted=1` record in `percentile.txt` is a `deferred_kaggle_nvcc` marker
+/// with no captured `out=`, and `primitive_parity` skips all weighted cases — so
+/// the ONLY check on this function is `primitives_self.rs::serial_percentile_weighted`,
+/// which re-implements the identical threshold-scan + interpolation. That is a
+/// paraphrase of this code, NOT a C++ reference: a transcription error shared by
+/// both would pass green. In particular the edge-position `values[pos]` quirk
+/// above is UNCONFIRMED against C++. A future consumer MUST NOT assume reference
+/// parity until the real weighted goldens are captured on a CUDA box
+/// (`LGBM_PRIMITIVE_WEIGHTED_PERCENTILE=1`, harness path exists) and cross-checked.
+///
 /// # Errors
 /// [`ComputeError::LengthMismatch`] on empty input or `weights.len() != len`;
 /// propagates the argsort/prefix-sum error for `len > BITONIC_SORT_NUM_ELEMENTS`.
