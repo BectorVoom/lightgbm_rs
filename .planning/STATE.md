@@ -1,20 +1,16 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.1
-milestone_name: "— GPU Training-Speed: CUDA On-Device Tree Learner`]"
-current_phase: 15
-current_phase_name: Slice 1
-status: verifying
-stopped_at: Phase 15 context gathered
-last_updated: "2026-06-28T23:12:08.403Z"
-last_activity: 2026-06-28
-last_activity_desc: Phase 14 complete, transitioned to Phase 15
+milestone_name: CUDA On-Device Training Backend
+status: planning
+last_updated: "2026-06-29T01:30:17.247Z"
+last_activity: 2026-06-29
 progress:
-  total_phases: 6
-  completed_phases: 1
-  total_plans: 3
-  completed_plans: 3
-  percent: 17
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -28,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 ## Current Position
 
-Phase: 15 — Minimal On-Device Growth (Slice 1)
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-06-28 — Phase 14 complete, transitioned to Phase 15
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-06-29 — Milestone v1.1 started
 
 ## Deferred Items
 

@@ -18,18 +18,25 @@ Post-v1.0 work (running as phases/quick tasks, **not** part of the v1.0 scope): 
 
 **Port reference:** `docs/cuda-kernel-design.md` is the authoritative, source-verified map of the C++ CUDA backend being ported (58 files, 81 `__global__` kernels, 11 subsystems, verified kernel-by-kernel against `LightGBM/`). It is the per-subsystem porting reference for the on-device tree-learner slices (Phases 15–19) and records the parity-critical constraints: split-before-partition ordering (`CUDATree.Split` returns `right_leaf_index` before `DataPartition.Split`), subtraction-trick/most-freq-bin-fix as correctness (not speed) requirements, `hist_t=double` vs SP-f32 atomic nondeterminism, the integer-exact int16-packed quantized path, and the CUDA objective/metric support boundaries. Catalogued in `.planning/REFERENCE_MANIFEST.md`.
 
-## Current Milestone: v1.1 GPU Training-Speed — CUDA On-Device Tree Learner
+## Current Milestone: v1.1 — CUDA On-Device Training Backend
 
-**Goal:** Close the architectural GPU training-speed gap vs official LightGBM by growing the whole tree on-device (mirror `CUDASingleGPUTreeLearner`) instead of the current host-driven per-leaf loop that issues ~8,570 small serial launches/train.
+**Goal:** Port the full LightGBM single-GPU CUDA training pipeline on-device per `docs/cuda-kernel-design.md` — all training state (gradients, histograms, split records, row permutation, tree model, cumulative scores) stays resident on device while the host only sizes grids, resolves template specializations, sequences kernel launches on streams, and reads back a handful of scalars per iteration. This mirrors `CUDASingleGPUTreeLearner` + the boosting-layer device path, replacing the host-driven per-leaf loop (~8,570 small serial launches/train) and closing the architectural GPU training-speed gap vs official LightGBM. Anchor-pinned bit-exact to the cubecl-cpu f64 fold; CUDA/ROCm f32 within ~1e-6. Fully additive — CPU, ROCm, and the existing host-CUDA path stay byte-unchanged, off by default behind `LGBM_CUDA_ON_DEVICE`.
 
-**Target features:**
-- On-device multi-leaf growth loop — build → best-split → partition stay resident, driven by few large kernels (not ~86 host launches/tree)
-- On-device data partitioning per split (eliminate the host round-trip)
-- On-device best-split selection across the leaf frontier
-- Real-CUDA benchmark harness (Kaggle) as the verification surface — target materially closer to official than today's 3.9×@50f / 1.9×@500f (re-measured on current HEAD on a Kaggle Tesla T4 on 2026-06-29 = official LightGBM ~4.46× faster @50f cold: 3.36 s vs 14.98 s; 500k×50, 100 trees, no warmup; the gap is unchanged from the spike-051..054 baseline, confirming the on-device learner remains the one architectural lever)
-- Coexistence with the existing host-orchestrated path (feature-gated / fallback) so ROCm + CPU routing stay untouched
+**Target subsystems (design-doc §-grounded, full on-device pipeline):**
+- **Shared device primitives** (§2.4) — block/global prefix-sum, shuffle reductions, bitonic argsort, weighted percentile (the port-first foundation every subsystem builds on)
+- **Device dataset + row-data partition layout** (§3, §13) — columnar binned store with u8/16/32 width dispatch, feature-partition (shared-hist-fit) layout the histogram kernel is built around, CopySubrow bagging subsets
+- **On-device objectives** (§5) — regression family (L2/L1/Quantile/Huber/Fair/Poisson), binary logloss, multiclass (softmax/OVA), rank (LambdaRank-NDCG / RankXENDCG) — grad/hess + ConvertOutput + BoostFromScore + RenewTreeOutput
+- **Leaf-splits + tree-learner driver** (§6) — root init, leaf-stat reduce/refit, categorical bitset construction, the per-leaf grow-loop orchestration
+- **Histogram constructor** (§7) — build (dense/sparse × shared/global), FixHistogram (most-freq-bin omission repair), SubtractHistogram with `hist_t**` pointer rotation
+- **Best-split finder** (§8) — 3-stage: per-feature evaluation → cross-feature reduce → cross-leaf argmax, numerical + categorical cores
+- **Data partition** (§9) — mark→prefix-sum→scatter (never sort), SplitTreeStructure histogram-pool pointer swap, data-index→leaf map, AddPredictionToScore
+- **Tree model I/O + prediction kernel** (§10) — device tree arrays, Split/SplitCategorical, Shrinkage/AddBias, tree-walk predict
+- **Score updater** (§11) — resident `cuda_score_`, constant add/multiply, host-mirror toggle
+- **On-device metrics** (§12) — EvalKernel + the 12 pointwise (regression/binary) losses
+- **Device structs + RNG** (§15) — a CubeCL-safe pre-allocated `CUDASplitInfo` analog (no per-split device alloc), a `CUDARandom` LCG bit-identical to the host RNG stream
+- **Real-CUDA perf-validation + default-on rollout** — Kaggle A/B `device_launches` + wall-clock ratio as the DoD; the on-device path becomes the default CUDA learner contingent on parity + not-slower
 
-**Non-negotiables (carried from spikes 051–054):** CPU f64 anchor stays the bit-exact merge gate; CUDA/ROCm held to ~1e-6; NO f64 hot loops in new CUDA kernels (consumer-NVIDIA f64 = 1/32 f32 — keep the u64 fixed-point build path). Scoped by spikes 051–054 (real-NVIDIA, Kaggle): the cheap GPU-histogram levers (occupancy/fusion/sync-reduction) are all refuted — this on-device learner is the one remaining architectural lever. Reference port: `LightGBM/src/treelearner/cuda/cuda_single_gpu_tree_learner.cpp`.
+**Non-negotiables (carried from spikes 051–054 + §17 port considerations):** CPU f64 anchor stays the bit-exact merge gate; CUDA/ROCm held to ~1e-6; **NO f64 per-row hot loops** in new kernels (consumer-NVIDIA f64 = 1/32 f32 throughput; keep the u64 fixed-point build path), f64 only in scalar/gain math where the reference uses it; the **subtraction trick + most-freq-bin fix are correctness requirements** (build-smaller / subtract-larger gives a different rounding path than building larger directly); the mark→prefix-sum→scatter row permutation must match the reference so per-leaf f32 accumulation order is identical. On-device **quantized training** (the gradient discretizer §4 + discretized histogram/split paths) is **deferred to v2** (ODL-13). Canonical port reference: `docs/cuda-kernel-design.md` (source-verified against `LightGBM/src/treelearner/cuda/`).
 
 ## Requirements
 
@@ -52,7 +59,7 @@ Post-v1.0 work (running as phases/quick tasks, **not** part of the v1.0 scope): 
 
 <!-- v1.0 shipped. No active v1 requirements — all 69 satisfied. Next milestone (v1.1/v2) not yet scoped. -->
 
-_(empty — v1.0 complete; the next milestone's requirements will be defined via `/gsd-new-milestone`. Candidate themes: GPU large-data perf (post-v1.0 campaign), quantized training `QNT-01`, linear-tree `LIN-01`, text/binary/Arrow ingestion `ING-01..03`.)_
+**Milestone v1.1 — CUDA On-Device Training Backend (rewritten 2026-06-29, design-doc-grounded).** Active requirements are the `ODL-*` set in `.planning/REQUIREMENTS.md`, derived subsystem-by-subsystem from `docs/cuda-kernel-design.md`: shared primitives, device dataset/row-data, on-device objectives, leaf-splits/driver, histogram constructor, best-split finder, data partition, tree I/O + predict, score updater, on-device metrics, device structs/RNG, and the real-CUDA perf/rollout DoD. On-device quantized training (ODL-13) is deferred to v2. Phases renumber from 14.
 
 ### Out of Scope
 
@@ -113,4 +120,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-29 — Phase 14 (Scaffold + Oracle, Slice 0) complete: additive on-device growth seam + anchor-pinned tie-aware oracle, ZERO behavior change, merge gate proven before any kernel (ODL-01/ODL-02 validated). Milestone v1.1 (GPU Training-Speed — CUDA on-device tree learner) started 2026-06-28, scoped by spikes 051–054 (real-NVIDIA Kaggle: cheap GPU-hist levers refuted, the on-device learner is the one architectural lever). v1.0 milestone (2026-06-21): full single-machine C++ LightGBM parity shipped (8/8 phases, 55 plans, 69/69 v1 requirements, milestone audit PASSED). Post-v1.0 perf phases 09–13 (GPU kernel campaign) complete. Next: Phase 15 — Minimal On-Device Growth (Slice 1).*
+*Last updated: 2026-06-29 — Milestone v1.1 REWRITTEN as "CUDA On-Device Training Backend", re-derived subsystem-by-subsystem from `docs/cuda-kernel-design.md` (full on-device pipeline, not just the tree learner); scope expanded from the on-device growth-loop slice to the entire single-GPU CUDA training path (shared primitives → dataset → objectives → leaf-splits → histogram → best-split → partition → tree I/O → score updater → metrics → structs/RNG → perf DoD). On-device quantized training deferred to v2 (ODL-13). Phases renumber from 14 (post-v1.0 perf phases 09–13 preserved; prior Phase 14/15 planning artifacts cleared and re-rolled into the new roadmap — the ODL-01/02 seam + oracle code remain in git). v1.0 milestone (2026-06-21): full single-machine C++ LightGBM parity shipped (8/8 phases, 55 plans, 69/69 v1 requirements, milestone audit PASSED).*
