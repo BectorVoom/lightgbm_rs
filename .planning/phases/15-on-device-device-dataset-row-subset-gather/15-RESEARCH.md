@@ -353,17 +353,15 @@ pub fn new(client: &ComputeClient<R>, total_bytes: usize) -> Self {
 
 **Verification note:** A1's exact constants should be confirmed against `include/LightGBM/cuda/cuda_row_data.hpp` / `cuda_histogram_constructor.hpp` if the read-only `LightGBM/` reference tree is available locally (per MEMORY, `external_libs` CAN be fetched and the AMD fork `LightGBM-release-4.6.0.99/` is the HIP baseline). The design doc is the registered port-source map; treat its numbers as authoritative unless the reference contradicts.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Should the §3 column store carry the full per-feature meta now, or only the buffers Phase-18 will read?**
+1. **Should the §3 column store carry the full per-feature meta now, or only the buffers Phase-18 will read?** — **RESOLVED:** build the buffers + numeric meta now; defer categorical-bitset meta to Phase-22 (categorical is ODL-22). Parity-test the binned column values + numeric meta; leave a documented TODO for categorical meta. *(Adopted by plan 15-03, which cites "Open Question 1".)*
    - What we know: §14 lists the meta (`bit_type`, `feature_{min,max}_bin`, `offset`, `most_freq_bin`, `default_bin`, missing/mfb flags, `feature_to_column`). D-01 says build it now.
-   - What's unclear: whether the missing/categorical meta is needed before Phase-18/22.
-   - Recommendation: build the buffers + numeric meta now; defer categorical-bitset meta to Phase-22 (categorical is ODL-22). Parity-test the binned column values + numeric meta; leave a documented TODO for categorical meta.
+   - What was unclear: whether the missing/categorical meta is needed before Phase-18/22.
 
-2. **Single bagging-draw kernel vs host-side route after `draw_next_float_on`?**
+2. **Single bagging-draw kernel vs host-side route after `draw_next_float_on`?** — **RESOLVED:** for this phase's *anchor* (proving the block structure), compute the route host-side from the device draw stream and assert vs host `bag_data_indices` — simplest, fully anchored. A fused device route kernel is a Phase-21 driver optimization. *(Adopted by plan 15-04, which cites "Open Question 2 recommendation".)*
    - What we know: `draw_next_float_on` returns the float stream; the route (`< fraction`) is trivial.
-   - What's unclear: whether to add a device route kernel or compute the route host-side from the readback.
-   - Recommendation: for this phase's *anchor* (proving the block structure), compute the route host-side from the device draw stream and assert vs host `bag_data_indices` — simplest, fully anchored. A fused device route kernel is a Phase-21 driver optimization.
+   - What was unclear: whether to add a device route kernel or compute the route host-side from the readback.
 
 ## Environment Availability
 
