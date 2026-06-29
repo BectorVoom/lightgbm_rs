@@ -18,7 +18,8 @@
 //! `rocm`-gated and cross-validated in 14-06.
 
 use lgbm_compute::kernels::primitives::{
-    prefix_sum_exclusive_f64_on, prefix_sum_inclusive_f64_on,
+    dot_product_f64_on, prefix_sum_exclusive_f64_on, prefix_sum_inclusive_f64_on,
+    reduce_max_f64_on, reduce_min_f64_on, reduce_sum_f64_on,
 };
 use lgbm_compute::runtime::cpu_client;
 
@@ -90,6 +91,75 @@ fn prefix_sum_block_boundary_exact() {
     assert_eq!(got_incl, vec![1.0, 3.0, 6.0, 10.0, 15.0, 21.0, 28.0]);
     let got_excl = prefix_sum_exclusive_f64_on(&client, &data, 2).unwrap();
     assert_eq!(got_excl, vec![0.0, 1.0, 3.0, 6.0, 10.0, 15.0, 21.0]);
+}
+
+// =========================================================================
+// Task 2: shuffle reductions (sum / max / min, dot-product)
+// =========================================================================
+//
+// Open Q2 (f64 reduction-order policy) RESOLVED per reduction:
+// - sum  : BIT-EXACT vs a serial Rust f64 fold in ASCENDING index order — the
+//          cpu anchor's single-owner fold IS that order (matched-order policy).
+// - max/min: BIT-EXACT, order-INDEPENDENT (no rounding; selection only).
+// - dotprod: BIT-EXACT vs `acc += a[i]*b[i]` in ascending order (matched order).
+// The f32 hip warp-tree reductions are held to ~1e-6 only (14-06, never asserted
+// GPU-vs-GPU here).
+
+fn serial_sum(data: &[f64]) -> f64 {
+    let mut acc = 0.0f64;
+    for &x in data {
+        acc += x;
+    }
+    acc
+}
+
+fn serial_dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = 0.0f64;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+#[test]
+fn reduce_sum_max_min_within_plane() {
+    let client = cpu_client();
+    let data = vec![1.0f64, 2.0, 3.0, 4.0];
+    assert_eq!(reduce_sum_f64_on(&client, &data).unwrap(), 10.0);
+    assert_eq!(reduce_max_f64_on(&client, &data).unwrap(), 4.0);
+    assert_eq!(reduce_min_f64_on(&client, &data).unwrap(), 1.0);
+}
+
+#[test]
+fn reduce_dot_product() {
+    let client = cpu_client();
+    let a = vec![1.0f64, 2.0, 3.0];
+    let b = vec![4.0f64, 5.0, 6.0];
+    // 1*4 + 2*5 + 3*6 = 32.
+    assert_eq!(dot_product_f64_on(&client, &a, &b).unwrap(), 32.0);
+}
+
+#[test]
+fn reduce_cross_plane_matches_serial() {
+    // Length > any plane width (1000) folds correctly. f64 sum is bit-exact vs
+    // the serial ascending fold (matched-order policy); max/min order-independent.
+    let client = cpu_client();
+    let data: Vec<f64> = (1..=1000).map(|i| i as f64).collect();
+    assert_eq!(reduce_sum_f64_on(&client, &data).unwrap(), serial_sum(&data));
+    assert_eq!(reduce_max_f64_on(&client, &data).unwrap(), 1000.0);
+    assert_eq!(reduce_min_f64_on(&client, &data).unwrap(), 1.0);
+
+    let b: Vec<f64> = (1..=1000).map(|i| (1001 - i) as f64).collect();
+    assert_eq!(
+        dot_product_f64_on(&client, &data, &b).unwrap(),
+        serial_dot(&data, &b)
+    );
+}
+
+#[test]
+fn reduce_dot_length_mismatch_errors() {
+    let client = cpu_client();
+    assert!(dot_product_f64_on(&client, &[1.0, 2.0], &[1.0]).is_err());
 }
 
 #[test]
