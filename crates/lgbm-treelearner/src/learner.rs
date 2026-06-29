@@ -440,6 +440,16 @@ pub struct ColSamplerTrace {
 /// unless the value is EXACTLY `"1"`. Any other value — unset, empty, `"0"`,
 /// `"true"`, malformed — yields `false`, guaranteeing the byte-unchanged merge
 /// gate when the env is unset (SC#1). No path/format/injection surface (T-14-02).
+///
+/// Phase 14 closes (14-06) with the env still an opt-in `"1"` AND-gate that is
+/// ANDed with `backend.on_device_growth_supported()` (FROZEN `false` in Slice 0,
+/// D-09): with `LGBM_CUDA_ON_DEVICE` unset, `on_device_eligible` is `false` on
+/// every backend and the host/per-leaf path is byte-unchanged. The foundation the
+/// future on-device grow loop (Phase 21) consumes already exists and is
+/// golden-validated — the shared `lgbm_compute::kernels::primitives` device
+/// primitives, `kernels::split_info` split/leaf structs, and `kernels::random`
+/// on-device RNG — but NONE of it is wired into this gate yet (the seam is a
+/// strict no-op until Slice 1).
 fn cuda_on_device_env() -> bool {
     matches!(std::env::var("LGBM_CUDA_ON_DEVICE").as_deref(), Ok("1"))
 }

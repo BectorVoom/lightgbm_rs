@@ -2163,6 +2163,25 @@ mod hip {
     /// Slice 0 (no kernel yet produces a flip) but compiles and is reachable. The
     /// on-device tree is ALWAYS pinned to the cpu f64 anchor — never a second GPU
     /// f32 path (def-f8u-01).
+    ///
+    /// ## Anchor discipline made explicit (14-06, D-10)
+    /// This is the phase's tie-aware on-device oracle, and its discipline is a
+    /// hard invariant for every future on-device-growth slice (Phase 21):
+    /// - The reference (`anchor`) is ALWAYS the cubecl-cpu f64 single-owner fold
+    ///   ([`cpu_anchor_tree`]) — the deterministic bit-exact merge gate.
+    /// - The ONLY tolerated divergence is a `default_left` flip on a genuine
+    ///   f32-vs-f64 `split_gain` near-tie (corroborated by an identical threshold
+    ///   and identical child row-counts); everything else is asserted bit-exact.
+    /// - It NEVER compares two GPU f32 paths to each other (def-f8u-01) — both the
+    ///   resident and the fused GPU trees are each pinned to the SAME cpu anchor.
+    /// The on-device tree this oracle will eventually receive is grown from the
+    /// Phase-14 foundation that 14-06 golden-validates against the committed C++
+    /// fixtures: the shared `lgbm_compute::kernels::primitives` device primitives
+    /// (prefix-sum / reductions / argsort / percentile), the `kernels::split_info`
+    /// device split/leaf-split structs, and the `kernels::random` on-device RNG —
+    /// the same building blocks `primitive_parity.rs` cross-checks. Until Slice 1
+    /// wires a kernel, the seam stays a no-op and this oracle runs against the
+    /// host-fallback stand-in ([`host_grow`], TEST-ONLY).
     fn assert_on_device_tree_matches_cpu_anchor(
         on_device: &lgbm_model::Tree,
         anchor: &lgbm_model::Tree,

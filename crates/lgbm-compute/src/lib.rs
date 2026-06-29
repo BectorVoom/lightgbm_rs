@@ -1266,6 +1266,16 @@ pub trait Backend {
     /// - a plane-sum reduction spans at most ONE plane width — no cross-plane sum.
     /// - `launch_unchecked` is `unsafe` — uphold the launch-arg invariants by hand.
     ///
+    /// # Phase-14 foundation modules this Slice-1 kernel will compose (14-06)
+    /// The shared device primitives, split-info structs, and on-device RNG the
+    /// future on-device grow loop assembles already exist and are golden-validated
+    /// (14-06, ODL-01): [`kernels::primitives`] (block + global prefix-sum,
+    /// shuffle reductions, index-only bitonic argsort, percentile),
+    /// [`kernels::split_info`] (the device-side split/leaf-split structs), and
+    /// [`kernels::random`] (the on-device LCG mirror). The on-device growth
+    /// consumer (Phase 21) reuses these — this seam stays a strict no-op until
+    /// then; the discriminator above is FROZEN `false` (D-09).
+    ///
     /// # Errors
     /// Returns [`ComputeError`] only once Slice 1 wires a real kernel that can fail
     /// (device OOM, launch error). In Slice 0 it is infallible (`Ok(None)`).
