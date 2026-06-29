@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 14
-current_phase_name: "Foundation: Shared Device Primitives + Device Structs/RNG"
-status: roadmapped
-stopped_at: Phase 14 context gathered
-last_updated: "2026-06-29T08:21:41.209Z"
+status: completed
+stopped_at: Phase 15 context gathered
+last_updated: "2026-06-29T19:35:32.499Z"
 last_activity: 2026-06-29
-last_activity_desc: Milestone v1.1 roadmapped (10 phases 14–23, full on-device CUDA pipeline; 22/22 ODL requirements mapped, 100% coverage)
+last_activity_desc: Phase 14 marked complete
 progress:
   total_phases: 10
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 6
+  completed_plans: 6
+  percent: 10
+current_phase_name: foundation-shared-device-primitives-device-structs-rng
 ---
 
 # Project State
@@ -24,15 +24,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 14 — Foundation: Shared Device Primitives + Device Structs/RNG (ODL-01, ODL-02)
+**Current focus:** Phase 14 — foundation-shared-device-primitives-device-structs-rng
 
 ## Current Position
 
-Phase: 14 — Foundation: Shared Device Primitives + Device Structs/RNG
-Plan: — (not yet planned)
-Status: Roadmapped — ready to plan Phase 14
+Phase: 14 — COMPLETE
+Plan: 1 of 6
+Status: Phase 14 complete
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-06-29 — Milestone v1.1 roadmapped (10 phases 14–23, full on-device CUDA pipeline; 22/22 ODL requirements mapped, 100% coverage)
+Last activity: 2026-06-29 — Phase 14 marked complete
 
 Next: `/gsd-plan-phase 14`
 
@@ -667,9 +667,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-29T08:21:41.200Z
-Stopped at: Phase 14 context gathered
-Resume file: .planning/phases/14-foundation-shared-device-primitives-device-structs-rng/14-CONTEXT.md
+Last session: 2026-06-29T19:35:32.487Z
+Stopped at: Phase 15 context gathered
+Resume file: .planning/phases/15-on-device-device-dataset-row-subset-gather/15-CONTEXT.md
 
 ## Operator Next Steps
 
