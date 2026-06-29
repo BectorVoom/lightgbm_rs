@@ -1,10 +1,14 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.1
-milestone_name: CUDA On-Device Training Backend
+milestone_name: — CUDA On-Device Training Backend
+current_phase: 14
+current_phase_name: "Foundation: Shared Device Primitives + Device Structs/RNG"
 status: roadmapped
-last_updated: "2026-06-29T02:15:00.000Z"
+stopped_at: Phase 14 context gathered
+last_updated: "2026-06-29T08:21:41.209Z"
 last_activity: 2026-06-29
+last_activity_desc: Milestone v1.1 roadmapped (10 phases 14–23, full on-device CUDA pipeline; 22/22 ODL requirements mapped, 100% coverage)
 progress:
   total_phases: 10
   completed_phases: 0
@@ -33,6 +37,7 @@ Last activity: 2026-06-29 — Milestone v1.1 roadmapped (10 phases 14–23, full
 Next: `/gsd-plan-phase 14`
 
 The v1.1 roadmap (rewritten 2026-06-29) ports the full single-GPU CUDA training pipeline on-device per `docs/cuda-kernel-design.md`, dependency-ordered across 10 anchor-gated phases:
+
 - Phase 14 — Foundation: shared device primitives + device split-record/RNG (ODL-01/02); re-establish the on-device seam + tie-aware oracle (code already in git)
 - Phase 15 — Device dataset + row-subset gather (ODL-03/04)
 - Phase 16 — Histogram constructor: build + subtraction trick (ODL-09/10)
@@ -662,9 +667,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-28T23:12:08.392Z
-Stopped at: Phase 15 context gathered
-Resume file: .planning/phases/15-minimal-on-device-growth-slice-1/15-CONTEXT.md
+Last session: 2026-06-29T08:21:41.200Z
+Stopped at: Phase 14 context gathered
+Resume file: .planning/phases/14-foundation-shared-device-primitives-device-structs-rng/14-CONTEXT.md
 
 ## Operator Next Steps
 
