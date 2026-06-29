@@ -76,7 +76,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 
 ### Phases (summary checklist)
 
-- [ ] **Phase 14: Foundation — Shared Device Primitives + Device Structs/RNG** — The reusable CubeCL primitives + device split-record/RNG every later subsystem builds on; re-establish the on-device seam + anchor-pinned oracle.
+- [x] **Phase 14: Foundation — Shared Device Primitives + Device Structs/RNG** — The reusable CubeCL primitives + device split-record/RNG every later subsystem builds on; re-establish the on-device seam + anchor-pinned oracle. (completed 2026-06-29)
 - [ ] **Phase 15: On-Device Device Dataset + Row-Subset Gather** — Resident columnar binned dataset in the feature-partition layout the histogram kernel needs, + CopySubrow bagging/GOSS subset.
 - [ ] **Phase 16: On-Device Histogram Constructor** — The hot path: build (dense/sparse × shared/global) on u64 fixed-point + the subtraction trick (FixHistogram + SubtractHistogram via `hist_t**` rotation).
 - [ ] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`.
@@ -101,24 +101,24 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. The additive `Backend::grow_tree_on_device` seam + default-false `on_device_growth_supported()` discriminator + the anchor-pinned tie-aware `assert_on_device_tree_matches_cpu_anchor` oracle are re-established/extended in lgbm-compute / lgbm-treelearner / oracle-harness (the seam code already in git), never comparing two GPU paths to each other.
   4. `LGBM_CUDA_ON_DEVICE` is OFF by default; CPU / ROCm / existing-host-CUDA paths are byte-unchanged; the full merge gate is green.
 
-**Plans**: 6 plans
+**Plans**: 6/6 plans complete
 **Wave 1**
 
-- [ ] 14-01-PLAN.md — Plane-intrinsic smoke test (Open Q1 de-risk) + new-module scaffolding (Wave 1)
-- [ ] 14-02-PLAN.md — C++/HIP device-primitive fixture-capture harness + committed goldens (Wave 1)
+- [x] 14-01-PLAN.md — Plane-intrinsic smoke test (Open Q1 de-risk) + new-module scaffolding (Wave 1)
+- [x] 14-02-PLAN.md — C++/HIP device-primitive fixture-capture harness + committed goldens (Wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 14-03-PLAN.md — Full-depth primitives: prefix-sum (block+global), reductions, single-block bitonic argsort (Wave 2)
-- [ ] 14-04-PLAN.md — SoA pre-allocated device split-record + CUDARandom LCG (Wave 2)
+- [x] 14-03-PLAN.md — Full-depth primitives: prefix-sum (block+global), reductions, single-block bitonic argsort (Wave 2)
+- [x] 14-04-PLAN.md — SoA pre-allocated device split-record + CUDARandom LCG (Wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 14-05-PLAN.md — Anchor-pinned skeletons: percentile, multi-block argsort, per-segment items-sort (Wave 3)
+- [x] 14-05-PLAN.md — Anchor-pinned skeletons: percentile, multi-block argsort, per-segment items-sort (Wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 14-06-PLAN.md — No-op seam + oracle extension + primitive fixture parity + full merge gate (Wave 4)
+- [x] 14-06-PLAN.md — No-op seam + oracle extension + primitive fixture parity + full merge gate (Wave 4)
 
 **Notes**: The seam (`grow_tree_on_device`, `on_device_growth_supported`, `LeafPartitionLayout`, the tie-aware oracle) already exists in git from the cleared Phase-14/15 work — extend, don't rebuild. Bake the cubecl-0.10 gotcha checklist (no global barrier, `Atomic<i64>` broken, `wrapping_add` not an intrinsic, plane-sum ≤ plane width, `launch_unchecked` unsafe) into the primitives. Re-measured pre-on-device CUDA baseline (Kaggle Tesla T4, 500k×50, 100 trees): official LightGBM ~4.46× faster (3.36 s vs lgb-rs 14.98 s) — the bar later phases must beat.
 
@@ -134,8 +134,14 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. The resident dataset reproduces the host binned values exactly (per-column bin parity), and bin-width + partition dispatch is validated across all three widths and the large-bin spill case.
   4. CPU / ROCm / existing-host-CUDA paths are byte-unchanged; the merge gate is green.
 
-**Plans**: TBD
-**Notes**: `CUDARowData` (§13) is pure host-side layout infrastructure plus the `CopySubrow` kernel — the per-partition CSR re-lay (`GetSparseDataPartitioned`, subtracting `partition_hist_start`) and the `max_num_bin_per_partition = shared_hist_size/2` budget are the parity-load-bearing details. Reuse the v1.0 binning; this phase only mirrors it resident in the partition layout.
+**Plans**: 5 plans
+- [ ] 15-01-PLAN.md — Wave 0: register 3 ungated kernel modules + stub API surface + author both Nyquist parity test files + D-04 sparse synthesizer (ODL-03/04)
+- [ ] 15-02-PLAN.md — Wave 1: §13 CUDARowData row+partition store — DivideCUDAFeatureGroups + offset tables + dense/sparse 3×3 re-lay (ODL-03)
+- [ ] 15-03-PLAN.md — Wave 1: §3 CUDAColumnData column store + numeric per-feature meta, upload-once, no consumer (ODL-03)
+- [ ] 15-04-PLAN.md — Wave 1: CopySubrow gather + on-device bagging draw anchored to host bag_data_indices (ODL-04)
+- [ ] 15-05-PLAN.md — Wave 2: merge gate — full workspace suite green, D-10 byte-unchanged default path (ODL-03/04)
+
+**Notes**: `CUDARowData` (§13) is pure host-side layout infrastructure plus the `CopySubrow` kernel — the per-partition CSR re-lay (`GetSparseDataPartitioned`, subtracting `partition_hist_start`) and the `max_num_bin_per_partition = shared_hist_size/2` budget are the parity-load-bearing details. Reuse the v1.0 binning; this phase only mirrors it resident in the partition layout. Wave shape: 0 (scaffold) → 1 (row_data ∥ column_data ∥ copy_subrow — disjoint files) → 2 (merge gate). Bagging anchor test reproduces the host draw INLINE via `lgbm_core::random::Random` — lgbm-compute cannot dev-dep lgbm-boosting (crate cycle).
 
 #### Phase 16: On-Device Histogram Constructor
 
@@ -262,7 +268,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 0/? | Not started | - |
+| 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 0/? | Not started | - |
 | 16. On-Device Histogram Constructor | v1.1 | 0/? | Not started | - |
 | 17. On-Device Best-Split Finder | v1.1 | 0/? | Not started | - |
