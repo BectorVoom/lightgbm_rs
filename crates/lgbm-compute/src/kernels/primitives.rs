@@ -396,3 +396,251 @@ fn prefix_sum_f32_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f32::from_bytes(&bytes).to_vec())
 }
+
+// =========================================================================
+// Task 2: shuffle reductions (sum / max / min, dot-product)
+// =========================================================================
+
+/// Single-owner ordered SUM fold — ascending index order (the matched reduction
+/// order, Open Q2). Writes the scalar result to `out[0]`.
+#[cube]
+fn reduce_sum_body<N: Numeric>(data: &Array<N>, out: &mut Array<N>, n: u32) {
+    if UNIT_POS == 0 {
+        let nn = n as usize;
+        let mut acc = N::from_int(0);
+        let mut i = 0usize;
+        while i < nn {
+            acc += data[i];
+            i += 1;
+        }
+        out[0] = acc;
+    }
+}
+
+/// Single-owner MAX reduction (order-independent; `n >= 1` host-guaranteed).
+#[cube]
+fn reduce_max_body<N: Numeric>(data: &Array<N>, out: &mut Array<N>, n: u32) {
+    if UNIT_POS == 0 {
+        let nn = n as usize;
+        let mut acc = data[0];
+        let mut i = 1usize;
+        while i < nn {
+            let v = data[i];
+            if v > acc {
+                acc = v;
+            }
+            i += 1;
+        }
+        out[0] = acc;
+    }
+}
+
+/// Single-owner MIN reduction (order-independent; `n >= 1` host-guaranteed).
+#[cube]
+fn reduce_min_body<N: Numeric>(data: &Array<N>, out: &mut Array<N>, n: u32) {
+    if UNIT_POS == 0 {
+        let nn = n as usize;
+        let mut acc = data[0];
+        let mut i = 1usize;
+        while i < nn {
+            let v = data[i];
+            if v < acc {
+                acc = v;
+            }
+            i += 1;
+        }
+        out[0] = acc;
+    }
+}
+
+/// Single-owner DOT-PRODUCT fold — `acc += a[i]*b[i]` in ascending order (matched
+/// order, Open Q2). The C++ `ShuffleReduceDotProd` is elementwise-mul then sum.
+#[cube]
+fn dot_body<N: Numeric>(a: &Array<N>, b: &Array<N>, out: &mut Array<N>, n: u32) {
+    if UNIT_POS == 0 {
+        let nn = n as usize;
+        let mut acc = N::from_int(0);
+        let mut i = 0usize;
+        while i < nn {
+            acc += a[i] * b[i];
+            i += 1;
+        }
+        out[0] = acc;
+    }
+}
+
+// --- thin per-cell-type launch wrappers (f64 cpu anchor / f32 hip mirror) ---
+
+#[cube(launch_unchecked)]
+fn reduce_sum_kernel_f64(data: &Array<f64>, out: &mut Array<f64>, n: u32) {
+    reduce_sum_body::<f64>(data, out, n);
+}
+#[cube(launch_unchecked)]
+fn reduce_sum_kernel_f32(data: &Array<f32>, out: &mut Array<f32>, n: u32) {
+    reduce_sum_body::<f32>(data, out, n);
+}
+#[cube(launch_unchecked)]
+fn reduce_max_kernel_f64(data: &Array<f64>, out: &mut Array<f64>, n: u32) {
+    reduce_max_body::<f64>(data, out, n);
+}
+#[cube(launch_unchecked)]
+fn reduce_max_kernel_f32(data: &Array<f32>, out: &mut Array<f32>, n: u32) {
+    reduce_max_body::<f32>(data, out, n);
+}
+#[cube(launch_unchecked)]
+fn reduce_min_kernel_f64(data: &Array<f64>, out: &mut Array<f64>, n: u32) {
+    reduce_min_body::<f64>(data, out, n);
+}
+#[cube(launch_unchecked)]
+fn reduce_min_kernel_f32(data: &Array<f32>, out: &mut Array<f32>, n: u32) {
+    reduce_min_body::<f32>(data, out, n);
+}
+#[cube(launch_unchecked)]
+fn dot_kernel_f64(a: &Array<f64>, b: &Array<f64>, out: &mut Array<f64>, n: u32) {
+    dot_body::<f64>(a, b, out, n);
+}
+#[cube(launch_unchecked)]
+fn dot_kernel_f32(a: &Array<f32>, b: &Array<f32>, out: &mut Array<f32>, n: u32) {
+    dot_body::<f32>(a, b, out, n);
+}
+
+/// Which single-input reduction to launch.
+enum ReduceOp {
+    Sum,
+    Max,
+    Min,
+}
+
+/// f64 single-input reduction on the cpu anchor.
+///
+/// SUM is bit-exact vs a serial ascending Rust fold (matched-order policy,
+/// Open Q2); MAX/MIN are order-independent and bit-exact. Empty input: SUM -> 0.0;
+/// MAX/MIN -> [`ComputeError::LengthMismatch`] (no identity element).
+fn reduce_f64_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f64],
+    op: ReduceOp,
+) -> Result<f64, ComputeError> {
+    let n = data.len();
+    if n == 0 {
+        return match op {
+            ReduceOp::Sum => Ok(0.0),
+            ReduceOp::Max | ReduceOp::Min => Err(ComputeError::LengthMismatch {
+                expected: 1,
+                actual: 0,
+            }),
+        };
+    }
+    let h_in = client.create_from_slice(f64::as_bytes(data));
+    // `out[0]` is unconditionally written by the single owner -> empty is safe.
+    let h_out = client.empty(core::mem::size_of::<f64>());
+
+    // SAFETY: `h_in` sized exactly `n` f64 cells, `h_out` one cell; both outlive
+    // the launch. The single owner reads only `data[0..n)` and writes `out[0]`,
+    // both host-proven in range. cubecl unsafe confined here (CMP-01).
+    unsafe {
+        match op {
+            ReduceOp::Sum => reduce_sum_kernel_f64::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(h_in, n),
+                ArrayArg::from_raw_parts(h_out.clone(), 1),
+                n as u32,
+            ),
+            ReduceOp::Max => reduce_max_kernel_f64::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(h_in, n),
+                ArrayArg::from_raw_parts(h_out.clone(), 1),
+                n as u32,
+            ),
+            ReduceOp::Min => reduce_min_kernel_f64::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(h_in, n),
+                ArrayArg::from_raw_parts(h_out.clone(), 1),
+                n as u32,
+            ),
+        }
+    }
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f64::from_bytes(&bytes)[0])
+}
+
+/// Sum reduction on the f64 cpu anchor (bit-exact, ascending matched order).
+///
+/// # Errors
+/// Never (empty -> 0.0). Returns `Result` for API symmetry with max/min.
+pub fn reduce_sum_f64_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f64],
+) -> Result<f64, ComputeError> {
+    reduce_f64_on(client, data, ReduceOp::Sum)
+}
+
+/// Max reduction on the f64 cpu anchor (order-independent, bit-exact).
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] on empty input (no identity element).
+pub fn reduce_max_f64_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f64],
+) -> Result<f64, ComputeError> {
+    reduce_f64_on(client, data, ReduceOp::Max)
+}
+
+/// Min reduction on the f64 cpu anchor (order-independent, bit-exact).
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] on empty input (no identity element).
+pub fn reduce_min_f64_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[f64],
+) -> Result<f64, ComputeError> {
+    reduce_f64_on(client, data, ReduceOp::Min)
+}
+
+/// Dot-product reduction on the f64 cpu anchor — `sum_i a[i]*b[i]` in ascending
+/// order (matched-order policy, Open Q2). Empty -> 0.0.
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `a.len() != b.len()`.
+pub fn dot_product_f64_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    a: &[f64],
+    b: &[f64],
+) -> Result<f64, ComputeError> {
+    if a.len() != b.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: a.len(),
+            actual: b.len(),
+        });
+    }
+    let n = a.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+    let h_a = client.create_from_slice(f64::as_bytes(a));
+    let h_b = client.create_from_slice(f64::as_bytes(b));
+    let h_out = client.empty(core::mem::size_of::<f64>());
+
+    // SAFETY: `h_a`/`h_b` sized exactly `n` f64 cells, `h_out` one cell; all
+    // outlive the launch. The single owner reads `a[0..n)`/`b[0..n)` and writes
+    // `out[0]`, host-proven in range. cubecl unsafe confined here (CMP-01).
+    unsafe {
+        dot_kernel_f64::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_a, n),
+            ArrayArg::from_raw_parts(h_b, n),
+            ArrayArg::from_raw_parts(h_out.clone(), 1),
+            n as u32,
+        );
+    }
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f64::from_bytes(&bytes)[0])
+}
