@@ -847,7 +847,15 @@ pub fn bitonic_argsort_on<R: cubecl::Runtime>(
 /// multi-block decomposition (`num_blocks > 1` merge kernels) is the Phase-19/22
 /// hardening task (D-02). This cap reflects the small-input regime exercised this
 /// phase, not a fundamental limit.
-pub const MAX_GLOBAL_ARGSORT_ELEMENTS: usize = 1 << 20;
+///
+/// IN-03: deliberately held to a few × [`BITONIC_SORT_NUM_ELEMENTS`] (the regime
+/// actually exercised this phase — the largest test is 1500 elements). The cpu
+/// anchor runs the WHOLE bitonic network on a single owner (`CubeDim::new_1d(1)`),
+/// i.e. O(n·log²n) serial compare-swaps; a multi-megabyte input would silently
+/// hang for a very long time. Raise this only when the genuine multi-cube
+/// per-block + merge decomposition lands (Phase-19/22), so the single-owner
+/// serial path can never be invoked on a pathologically large input.
+pub const MAX_GLOBAL_ARGSORT_ELEMENTS: usize = 16 * BITONIC_SORT_NUM_ELEMENTS;
 
 /// Multi-block / global index-only bitonic argsort — CHECKED-launch skeleton
 /// extending the single-block [`bitonic_argsort_on`] (14-03) to inputs larger than
