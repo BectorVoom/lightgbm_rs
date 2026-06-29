@@ -28,6 +28,11 @@
 //! `partition_hist_offsets[partition]` so each stored bin is partition-local
 //! (Pitfall 4).
 
+use core::marker::PhantomData;
+
+use cubecl::prelude::*;
+use cubecl::server::Handle;
+
 use crate::error::ComputeError;
 use crate::BinColumn;
 
@@ -166,21 +171,52 @@ pub struct CudaRowData<R: cubecl::Runtime> {
     pub layout: FeaturePartitionLayout,
     /// Whether the store is sparse (CSR) vs dense.
     pub is_sparse: bool,
-    _runtime: core::marker::PhantomData<R>,
+    /// The live bin buffer width ∈ {8, 16, 32} (= the widest column in the store).
+    bit_type: u32,
+    /// The sparse CSR row-pointer width ∈ {16, 32, 64}; `0` for a dense store.
+    row_ptr_bit_type: u32,
+    /// Rows in the store (every column shares this length).
+    num_rows: usize,
+    /// Total columns across all partitions.
+    num_columns: usize,
+    /// The ONCE-uploaded row-major partition-local bin buffer (Pitfall 3): a NEW
+    /// buffer, distinct from the feature-major `resident_bins` (lib.rs:2360). Layout:
+    /// partition `p`'s region is `[off[p]·num_rows, off[p+1]·num_rows)`, and within it
+    /// cell `(row, local_col)` sits at `row·ncol_p + local_col`. `Handle` is cheaply
+    /// clonable (ref-counted) — `read_bin` clones it to read back.
+    data_handle: Handle,
+    /// The ONCE-uploaded per-partition CSR row pointers (sparse only); `None` for dense.
+    row_ptr_handle: Option<Handle>,
+    _runtime: PhantomData<R>,
 }
 
 impl<R: cubecl::Runtime> CudaRowData<R> {
     /// The live bin buffer width selector ∈ {8, 16, 32} (`bit_type()`).
     #[must_use]
     pub fn bit_type(&self) -> u32 {
-        todo!("15-02: report the live dense/sparse bin buffer width (8/16/32)")
+        self.bit_type
     }
 
     /// The sparse CSR row-pointer width selector ∈ {16, 32, 64}
-    /// (`row_ptr_bit_type()`). Only meaningful when [`Self::is_sparse`].
+    /// (`row_ptr_bit_type()`). Only meaningful when [`Self::is_sparse`] (`0` for dense).
     #[must_use]
     pub fn row_ptr_bit_type(&self) -> u32 {
-        todo!("15-03: report the sparse CSR row-pointer width (16/32/64)")
+        self.row_ptr_bit_type
+    }
+
+    /// The ONCE-uploaded row-major partition-local bin buffer handle — the direct
+    /// Phase-16 histogram input (`blockIdx.x` = partition, `threadIdx.x` = column).
+    #[must_use]
+    pub fn data_handle(&self) -> &Handle {
+        &self.data_handle
+    }
+
+    /// The ONCE-uploaded per-partition CSR row-pointer handle (sparse only; `None` for
+    /// dense) — consumed by the Phase-16 sparse histogram launcher alongside
+    /// [`Self::row_ptr_bit_type`].
+    #[must_use]
+    pub fn row_ptr_handle(&self) -> Option<&Handle> {
+        self.row_ptr_handle.as_ref()
     }
 
     /// `NumLargeBinPartition()` — number of single-column partitions too big for
@@ -238,8 +274,57 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
         columns: &[BinColumn],
         layout: &FeaturePartitionLayout,
     ) -> Result<Self, ComputeError> {
-        let _ = (client, columns, layout);
-        todo!("15-02: GetDenseDataPartitioned — per-partition row-major re-lay + read-back")
+        let (num_rows, num_columns) = validate_columns(columns)?;
+        // `bit_type` is the WIDEST column width (the store is one uniform-width buffer;
+        // narrower columns widen losslessly into it — the `resident_bins` qix shape, but
+        // row-major). C++ uses a single `bit_type()` for the whole row matrix.
+        let bit_type = columns
+            .iter()
+            .map(column_bit_width)
+            .max()
+            .unwrap_or(8);
+
+        // T-15-PART: overflow-check the buffer length product BEFORE any device alloc.
+        let total = num_columns.checked_mul(num_rows).ok_or_else(|| ComputeError::Runtime {
+            detail: format!(
+                "GetDenseDataPartitioned: num_columns {num_columns} * num_rows {num_rows} \
+                 overflows usize"
+            ),
+        })?;
+
+        // Assemble the NEW row-major partition-local buffer (Pitfall 3 — NOT the
+        // feature-major resident buffer). Dense stores the RAW per-column bin (the kernel
+        // applies `column_hist_offsets` at accumulation time, §7.2); `read_bin` adds the
+        // global offset back so it returns the logical global bin.
+        let mut vals: Vec<u32> = Vec::with_capacity(total);
+        for p in 0..layout.num_feature_partitions {
+            let lo = layout.feature_partition_column_index_offsets[p];
+            let hi = layout.feature_partition_column_index_offsets[p + 1];
+            for row in 0..num_rows {
+                for column in &columns[lo..hi] {
+                    vals.push(column.bin(row));
+                }
+            }
+        }
+        debug_assert_eq!(vals.len(), total, "row-major re-lay fills exactly num_columns*num_rows");
+
+        // Upload ONCE at native width (D-09 alloc-once; no per-call `create_from_slice`
+        // in a loop). Pure store/relay: a safe `create_from_slice` round-trip, no kernel
+        // launch and therefore no `unsafe` (CMP-01: the only unsafe in the crate stays in
+        // kernel launchers; this re-lay has none).
+        let data_handle = upload_store_buffer(client, &vals, bit_type)?;
+
+        Ok(Self {
+            layout: layout.clone(),
+            is_sparse: false,
+            bit_type,
+            row_ptr_bit_type: 0,
+            num_rows,
+            num_columns,
+            data_handle,
+            row_ptr_handle: None,
+            _runtime: PhantomData,
+        })
     }
 
     /// Build per-partition CSR for SPARSE data, subtracting
@@ -277,8 +362,27 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
         row: usize,
         column: usize,
     ) -> Result<u32, ComputeError> {
-        let _ = (client, row, column);
-        todo!("15-02/15-03: read back the logical global bin at (row, column) for parity")
+        if row >= self.num_rows || column >= self.num_columns {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "read_bin: (row={row}, column={column}) out of range \
+                     (num_rows={}, num_columns={})",
+                    self.num_rows, self.num_columns
+                ),
+            });
+        }
+        let partition = self.partition_of(column)?;
+        let stored = self.read_stored_cell(client, partition, row, column)?;
+        // The stored cell is partition-local for sparse (the re-lay already subtracted
+        // `partition_hist_start`) but RAW for dense — add back the partition-local column
+        // offset in the dense case so both return the same logical GLOBAL bin.
+        let part_off = self.layout.partition_hist_offsets[partition] as u32;
+        let global = if self.is_sparse {
+            stored + part_off
+        } else {
+            stored + self.layout.column_hist_offsets[column] as u32 + part_off
+        };
+        Ok(global)
     }
 
     /// Read the PARTITION-LOCAL stored bin for `partition`'s `local_row` and
@@ -295,7 +399,143 @@ impl<R: cubecl::Runtime> CudaRowData<R> {
         local_row: usize,
         local_column: usize,
     ) -> Result<u32, ComputeError> {
-        let _ = (client, partition, local_row, local_column);
-        todo!("15-02/15-03: read back the partition-local stored bin (Pitfall 4)")
+        if partition >= self.layout.num_feature_partitions {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "read_partition_local_bin: partition {partition} out of range \
+                     (num_feature_partitions={})",
+                    self.layout.num_feature_partitions
+                ),
+            });
+        }
+        let lo = self.layout.feature_partition_column_index_offsets[partition];
+        let hi = self.layout.feature_partition_column_index_offsets[partition + 1];
+        let ncol_p = hi - lo;
+        if local_column >= ncol_p || local_row >= self.num_rows {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "read_partition_local_bin: (local_row={local_row}, \
+                     local_column={local_column}) out of range (ncol_p={ncol_p}, \
+                     num_rows={})",
+                    self.num_rows
+                ),
+            });
+        }
+        let column = lo + local_column;
+        let stored = self.read_stored_cell(client, partition, local_row, column)?;
+        // Partition-local bin = global - partition_hist_offsets[partition] (Pitfall 4).
+        // Sparse already stores it partition-local; dense stores RAW, so fold the
+        // partition-local column offset in.
+        let local = if self.is_sparse {
+            stored
+        } else {
+            stored + self.layout.column_hist_offsets[column] as u32
+        };
+        Ok(local)
+    }
+
+    /// Decode the ONCE-uploaded store buffer's cell `(row, column)` (read back from the
+    /// cached device [`Handle`]). `partition` is `column`'s owning partition. Returns the
+    /// raw stored value (dense: raw bin; sparse: partition-local bin). The read is a safe
+    /// `read_one_unchecked` round-trip — no kernel launch, no `unsafe` (CMP-01).
+    fn read_stored_cell(
+        &self,
+        client: &cubecl::prelude::ComputeClient<R>,
+        partition: usize,
+        row: usize,
+        column: usize,
+    ) -> Result<u32, ComputeError> {
+        let lo = self.layout.feature_partition_column_index_offsets[partition];
+        let hi = self.layout.feature_partition_column_index_offsets[partition + 1];
+        let ncol_p = hi - lo;
+        // partition base = lo·num_rows, then row-major `row·ncol_p + local_col`.
+        let idx = lo * self.num_rows + row * ncol_p + (column - lo);
+        let bytes = client.read_one_unchecked(self.data_handle.clone());
+        Ok(decode_store_cell(&bytes, self.bit_type, idx))
+    }
+
+    /// The partition index owning `column` (`off[p] <= column < off[p+1]`).
+    fn partition_of(&self, column: usize) -> Result<usize, ComputeError> {
+        let offs = &self.layout.feature_partition_column_index_offsets;
+        for p in 0..self.layout.num_feature_partitions {
+            if column >= offs[p] && column < offs[p + 1] {
+                return Ok(p);
+            }
+        }
+        Err(ComputeError::Runtime {
+            detail: format!("column {column} belongs to no partition"),
+        })
+    }
+}
+
+/// Bin-store element width of a [`BinColumn`] (8/16/32) — selects `bit_type`.
+fn column_bit_width(col: &BinColumn) -> u32 {
+    match col {
+        BinColumn::U8(_) => 8,
+        BinColumn::U16(_) => 16,
+        BinColumn::U32(_) => 32,
+    }
+}
+
+/// Validate that every column shares one row count; return `(num_rows, num_columns)`.
+///
+/// # Errors
+/// [`ComputeError`] if `columns` is empty or any column length differs.
+fn validate_columns(columns: &[BinColumn]) -> Result<(usize, usize), ComputeError> {
+    let num_columns = columns.len();
+    if num_columns == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "row data re-lay requires >= 1 column".to_string(),
+        });
+    }
+    let num_rows = columns[0].len();
+    for (i, c) in columns.iter().enumerate() {
+        if c.len() != num_rows {
+            return Err(ComputeError::LengthMismatch {
+                expected: num_rows,
+                actual: c.len(),
+            });
+        }
+        let _ = i;
+    }
+    Ok((num_rows, num_columns))
+}
+
+/// Upload a `u32`-valued buffer to the device at the selected `bit_type` width, narrowing
+/// losslessly (the value is a bin INDEX, byte-faithful across widths). ONE
+/// `create_from_slice` — the alloc-once upload (D-09).
+///
+/// # Errors
+/// [`ComputeError`] on an unsupported `bit_type` (Pitfall 2 — never a silent widen).
+fn upload_store_buffer<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    vals_u32: &[u32],
+    bit_type: u32,
+) -> Result<Handle, ComputeError> {
+    let handle = match bit_type {
+        8 => {
+            let v: Vec<u8> = vals_u32.iter().map(|&x| x as u8).collect();
+            client.create_from_slice(u8::as_bytes(&v))
+        }
+        16 => {
+            let v: Vec<u16> = vals_u32.iter().map(|&x| x as u16).collect();
+            client.create_from_slice(u16::as_bytes(&v))
+        }
+        32 => client.create_from_slice(u32::as_bytes(vals_u32)),
+        other => {
+            return Err(ComputeError::Runtime {
+                detail: format!("unsupported bin bit_type {other} (expected 8/16/32)"),
+            })
+        }
+    };
+    Ok(handle)
+}
+
+/// Decode cell `idx` of a store buffer's raw bytes at the given `bit_type` to `u32`.
+fn decode_store_cell(bytes: &[u8], bit_type: u32, idx: usize) -> u32 {
+    match bit_type {
+        8 => u32::from(u8::from_bytes(bytes)[idx]),
+        16 => u32::from(u16::from_bytes(bytes)[idx]),
+        _ => u32::from_bytes(bytes)[idx],
     }
 }
