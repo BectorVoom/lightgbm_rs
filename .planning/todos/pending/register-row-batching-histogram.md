@@ -4,6 +4,7 @@ date: 2026-06-15
 priority: medium
 type: todo
 context: /gsd-explore "Compare learning kernel in C++ hip and cubecl, then optimise cubecl kernel"
+resolves_phase: 16
 ---
 
 # Todo: register row-batching in the histogram kernel
