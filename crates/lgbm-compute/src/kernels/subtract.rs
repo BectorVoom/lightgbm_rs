@@ -296,6 +296,102 @@ pub fn subtract_histograms_f64_from_handles_on<R: cubecl::Runtime>(
     Ok(h_out)
 }
 
+/// SubtractHistogram via the [`HistArena`] `hist_t**` rotation (Plan 16-04 Task 2,
+/// ODL-10 / §7.5 / §17) — derive the larger child `larger = parent − smaller` IN
+/// PLACE in the parent's buffer, reusing the VERBATIM [`subtract_hist_kernel`] (no
+/// new subtract kernel; Don't-Hand-Roll).
+///
+/// The subtraction trick is a CORRECTNESS requirement (§17): building the larger child
+/// directly takes a DIFFERENT f32 rounding path, so it MUST be derived by subtraction.
+/// This fn:
+/// 1. is GUARDED by `larger_leaf_index >= 0` (§7.5 `larger.leaf_index >= 0`) — a
+///    negative index (no real sibling) returns `Ok(None)`, NO rotation, NO launch;
+/// 2. calls [`HistArena::rotate`] (16-02 / D-02) so `larger_idx <- parent_idx`
+///    (in-place) and `smaller_idx <- a fresh non-aliasing slot`;
+/// 3. asserts the HistArena no-alias invariant (T-16-04-02: `smaller_idx != larger_idx`)
+///    BEFORE the in-place subtract launch — the in-place write into the parent slot is
+///    sound only because `smaller` is a distinct slot;
+/// 4. launches [`subtract_hist_kernel`] computing `out = parent − smaller` over the
+///    arena's `slot_len_elems` cells, writing into the larger (== old parent) slot.
+///
+/// ## Ordering invariant (T-16-04-03 / the 8aed100 guard)
+/// `parent` and `smaller` are the ALREADY-built + de-quanted + fixed leaf histograms —
+/// the host slices the caller obtained by reading back the synced build (the kernel
+/// boundary IS the sync; cubecl 0.10 has no grid barrier). Passing them as inputs
+/// structurally enforces "build fully synced BEFORE subtract": the subtract cannot run
+/// until the build's readback has produced these slices. The negative control (subtract
+/// reading the parent before the build syncs) is the Wave-0 `subtract_ordering` guard.
+///
+/// The derived larger child is anchor-pinned: bit-exact on the cpu f64 anchor, within
+/// ~1e-6 on hip (never GPU-vs-GPU).
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `parent.len()` / `smaller.len()` differ from the
+/// arena's `slot_len_elems`; propagates [`HistArena::rotate`]'s error (pool `< 2` slots).
+#[cfg(feature = "gpu")]
+pub fn subtract_histogram_on_device<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    arena: &mut crate::kernels::histogram_arena::HistArena<R>,
+    parent: &[f64],
+    smaller: &[f64],
+    larger_leaf_index: i32,
+) -> Result<Option<Vec<f64>>, ComputeError> {
+    // §7.5: SubtractHistogram runs only for a real larger sibling (leaf_index >= 0).
+    if larger_leaf_index < 0 {
+        return Ok(None);
+    }
+
+    // V5 (T-16-04-01): parent/smaller must exactly fill the arena slot, so the in-place
+    // subtract over `slot_len_elems` never reads/writes out of the slot's allocation.
+    let len = arena.slot_len_elems();
+    if parent.len() != len || smaller.len() != len {
+        return Err(ComputeError::LengthMismatch {
+            expected: len,
+            actual: parent.len().min(smaller.len()),
+        });
+    }
+    if len == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    // Rotation (16-02 / D-02): larger inherits the parent slot in-place; smaller takes a
+    // fresh slot. Reassigns indices only — zero realloc, zero bulk copy.
+    arena.rotate()?;
+    // T-16-04-02: the in-place subtract into the larger (== parent) slot is safe ONLY
+    // because the smaller occupies a distinct slot — assert it before the launch.
+    assert_ne!(
+        arena.smaller_idx(),
+        arena.larger_idx(),
+        "subtract_histogram_on_device: smaller must not alias the larger (== parent) slot"
+    );
+    // The larger child is derived into the old parent slot (in place, == parent slot).
+    let h_larger = arena.larger_handle();
+
+    let h_parent = client.create_from_slice(f64::as_bytes(parent));
+    let h_smaller = client.create_from_slice(f64::as_bytes(smaller));
+
+    // SAFETY: `h_parent`/`h_smaller` are each sized exactly `len` f64 cells (validated
+    // equal to the arena slot length above), and the arena's larger slot was allocated
+    // for `len` f64 cells in `HistArena::new`; all three outlive the launch and the
+    // kernel touches only indices `0..len` (the grid over-covers but the `while i < n`
+    // bound guards every write). The element-wise `out[i] = parent[i] - smaller[i]` reads
+    // and writes the same index, so aliasing the parent slot as the output is sound. All
+    // cubecl unsafe is confined here (CMP-01).
+    unsafe {
+        subtract_hist_kernel::launch(
+            client,
+            CubeCount::Static(64, 1, 1),
+            CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts(h_parent, len),
+            ArrayArg::from_raw_parts(h_smaller, len),
+            ArrayArg::from_raw_parts(h_larger.clone(), len),
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_larger);
+    Ok(Some(f64::from_bytes(&bytes).to_vec()))
+}
+
 /// Host-side `subtract_histograms` in **f32 cells** on ANY runtime (the no-f64
 /// hip path; CMP-03/CMP-04). Same `derived[i] = parent[i] - child[i]` math and
 /// V5 validation as [`subtract_histograms_cpu`], but in f32 cells. Generic over

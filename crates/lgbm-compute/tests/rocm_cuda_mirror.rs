@@ -519,6 +519,94 @@ mod fix_histogram_host {
 }
 
 // ===========================================================================
+// Plan 16-04 Task 2 host tests (run under `--features gpu`, on the cpu client):
+// SubtractHistogram via the HistArena rotation. The VERBATIM `subtract_hist_kernel`
+// is element-wise (no LDS atomics, no reduction) so cubecl-cpu launches it and the
+// derived larger child is BIT-EXACT on the cpu f64 anchor — the hard merge gate. The
+// negative ordering control (subtract before the parent build syncs) is the Wave-0
+// `subtract_ordering_parent_synced_before_subtract` guard above.
+// ===========================================================================
+#[cfg(feature = "gpu")]
+mod subtract_on_device_host {
+    use lgbm_compute::error::ComputeError;
+    use lgbm_compute::kernels::histogram_arena::HistArena;
+    use lgbm_compute::kernels::subtract::subtract_histogram_on_device;
+    use lgbm_compute::runtime::cpu_client;
+
+    /// The correctly-ordered build→fix→subtract derives `larger = parent − smaller`
+    /// BIT-EXACTLY on the cpu f64 anchor, IN PLACE in the parent slot via the HistArena
+    /// rotation: `larger_idx == old parent_idx` and `smaller_idx != larger_idx` (the
+    /// no-alias invariant). Reuses `subtract_hist_kernel` — no new kernel.
+    #[test]
+    fn subtract_derives_larger_in_place_bit_exact() {
+        let client = cpu_client();
+        let nb = 4usize;
+        let slot_len = 2 * nb; // stride-2 [g,h,g,h,…]
+        let mut arena = HistArena::new(&client, 3, slot_len).unwrap();
+        let old_parent = arena.parent_idx();
+
+        // The already-built+fixed parent and smaller-child histograms (host slices — the
+        // readback IS the build sync, so subtract is structurally after the build).
+        let parent = vec![10.0f64, 5.0, 8.0, 4.0, 9.0, 3.0, 7.0, 2.0];
+        let smaller = vec![3.0f64, 2.0, 1.0, 1.0, 4.0, 1.0, 2.0, 1.0];
+        let expected: Vec<f64> = parent.iter().zip(&smaller).map(|(p, s)| p - s).collect();
+
+        let larger = subtract_histogram_on_device(&client, &mut arena, &parent, &smaller, 0)
+            .expect("subtract launch")
+            .expect("larger_leaf_index >= 0 → Some");
+
+        // Bit-exact (cpu f64 anchor), cell by cell.
+        assert_eq!(larger.len(), expected.len());
+        for i in 0..expected.len() {
+            assert_eq!(
+                larger[i].to_bits(),
+                expected[i].to_bits(),
+                "cell {i}: larger {} vs parent-smaller {} not bit-identical",
+                larger[i],
+                expected[i]
+            );
+        }
+        // In-place: larger inherited the parent slot; smaller is a distinct slot.
+        assert_eq!(arena.larger_idx(), old_parent, "larger derived in the parent slot");
+        assert_ne!(arena.smaller_idx(), arena.larger_idx(), "smaller must not alias larger");
+    }
+
+    /// `larger.leaf_index < 0` (no real sibling) is the §7.5 skip case: `Ok(None)`, NO
+    /// rotation (the arena's role indices are untouched), NO launch.
+    #[test]
+    fn subtract_skipped_when_larger_leaf_negative() {
+        let client = cpu_client();
+        let slot_len = 8usize;
+        let mut arena = HistArena::new(&client, 3, slot_len).unwrap();
+        let parent_idx_before = arena.parent_idx();
+        let smaller_idx_before = arena.smaller_idx();
+        let parent = vec![1.0f64; slot_len];
+        let smaller = vec![0.5f64; slot_len];
+
+        let out = subtract_histogram_on_device(&client, &mut arena, &parent, &smaller, -1)
+            .expect("skip path is Ok");
+        assert!(out.is_none(), "negative larger_leaf_index → Ok(None), no subtract");
+        // No rotation happened.
+        assert_eq!(arena.parent_idx(), parent_idx_before);
+        assert_eq!(arena.smaller_idx(), smaller_idx_before);
+    }
+
+    /// A parent/smaller length that does not fill the arena slot is a typed
+    /// `LengthMismatch` BEFORE any rotation or launch (T-16-04-01).
+    #[test]
+    fn subtract_rejects_length_mismatch() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 3, 8).unwrap();
+        let short = vec![1.0f64; 6]; // != slot_len 8
+        let smaller = vec![0.5f64; 8];
+        assert!(matches!(
+            subtract_histogram_on_device(&client, &mut arena, &short, &smaller, 0),
+            Err(ComputeError::LengthMismatch { .. })
+        ));
+    }
+}
+
+// ===========================================================================
 // GPU mirror tests (rocm only) — pinned GPU-vs-cpu-f64-anchor, NEVER GPU-vs-GPU.
 //
 // The CubeCL mirror of LightGBM's CUDA `CUDAConstructHistogramDenseKernel`
