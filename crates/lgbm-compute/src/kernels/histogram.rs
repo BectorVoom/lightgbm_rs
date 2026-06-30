@@ -1313,6 +1313,138 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
     }
 }
 
+// ===========================================================================
+// NET-NEW (Plan 16-03 / ODL-09): the §13 feature-partition TWO-TIER build kernel.
+//
+// Lifts the shipped Phase-11 u64 fixed-point LDS accumulation body
+// (`construct_leaf_hist_resident_lds_kernel_u64`, above — left BYTE-UNCHANGED, D-03)
+// onto the design-doc §7.1 / §13 partition geometry (`CalcConstructHistogramKernelDim`):
+//   * `CUBE_POS_X` = feature PARTITION (was one cube per FEATURE);
+//   * `UNIT_POS_X` = one COLUMN within the partition's `[off[p], off[p+1])` range;
+//   * `UNIT_POS_Y × CUBE_POS_Y` = the leaf-row STRIPE (disjoint y-blocks).
+//
+// Two-tier atomics (§7.2): fast LDS block-local `Atomic<u64>` accumulation during the
+// sweep, then a cross-block GLOBAL atomic merge into the leaf histogram. cubecl 0.10 has
+// NO grid barrier, so the cross-block reduction MUST be a global atomic (many y-blocks
+// cover disjoint row stripes of the same partition). Dense-vs-sparse is ONE `#[cube]`
+// generic with a `#[comptime] is_sparse` branch (the §7.2 Dense/Sparse axis). The cpu
+// f64 anchor stays the single-owner `construct_histograms_f64_on` fold (D-06); this
+// kernel is the hip path only (`Atomic<u64>` is unsupported / nondeterministic on
+// cubecl-cpu, Pitfall 7).
+// ===========================================================================
+
+/// Two-tier §13-geometry u64 fixed-point BUILD (NET-NEW, ODL-09 / D-03/D-06/D-08).
+///
+/// One `#[cube]` generic over the bin width `B: Int` with a `#[comptime] is_sparse`
+/// branch (the §7.2 Dense/Sparse axis). Accumulates `round(value · 2^30)` as a
+/// two's-complement i64 stored BITS-as-u64 via LDS `Atomic<u64>::fetch_add` (the wrapping
+/// add IS a signed i64 add — no bias offset, spike-018b), then merges each cube's LDS
+/// sub-histogram into the global leaf histogram with one cross-block global atomic per
+/// cell. NO f64 in the per-row scatter (D-08) — the dequant to `hist_t` is a SEPARATE
+/// pass ([`dequant_leaf_hist`], Plan 16-03 Task 3 / 16-04 Fix).
+///
+/// HARD CONSTRAINT (spike-018b, def-f8u-01): the cell type MUST be `Atomic<u64>` with
+/// `.store(0u64)` / `.fetch_add(qbits)` — NEVER `Atomic<i64>` (cubecl-hip 0.10 link-fails).
+///
+/// Geometry (§7.1):
+/// * `CUBE_POS_X` = partition `p`; columns `[off[p], off[p+1])`, `ncol_p` wide.
+/// * `UNIT_POS_X` = local column `tx` (one column per x-thread; `tx < ncol_p` guard).
+/// * `CUBE_POS_Y · CUBE_DIM_Y + UNIT_POS_Y` = the leaf-row stripe start; stride
+///   `CUBE_COUNT_Y · CUBE_DIM_Y` (disjoint y-blocks → the merge is atomic, not a sync).
+///
+/// Bin fetch (comptime):
+/// * dense — partition row-major store `data[lo·num_data + idx·ncol_p + tx]` holds the
+///   RAW per-column bin; the LDS cell is `(column_hist_offsets[col] + raw) · 2` (the
+///   partition-local offset is applied at accumulation time, §7.2).
+/// * sparse — per-partition CSR: `row_start = row_ptr[p·(num_data+1) + idx]`, and the
+///   stored value `data[row_start + tx]` is ALREADY partition-local (the §13 re-lay
+///   subtracted `partition_hist_start`, Pitfall 4), so the LDS cell is `stored · 2`;
+///   the per-row `tx < row_end − row_start` guard handles the nnz remainder.
+///
+/// LDS holds this partition's `span·2` cells (`span = partition bin count`), capped at
+/// `HIST_LDS_MAX` (256 bins) — a partition whose `span·2` exceeds the cap routes to the
+/// `_GlobalMemory` sibling instead (parity-neutral capacity choice, §17). `grad`/`hess`
+/// are FULL-CORPUS arrays read at the gathered row `idx = leaf_rows[k]` (§7.2
+/// `cuda_gradients[idx]`), matching the `cpu_anchor_columns` f64 fold.
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_leaf_hist_partition_u64<B: Int>(
+    data: &Array<B>,                     // partition row-major bin store (dense raw / sparse local)
+    row_ptr: &Array<u32>,                // sparse CSR row pointers [num_partitions·(num_data+1)]
+    leaf_rows: &Array<u32>,              // data_indices_in_leaf
+    grad: &Array<f32>,                   // FULL-CORPUS gradients [num_data]
+    hess: &Array<f32>,                   // FULL-CORPUS hessians  [num_data]
+    partition_col_offsets: &Array<u32>,  // off[]: partition p owns cols [off[p], off[p+1])
+    column_hist_offsets: &Array<u32>,    // per-column partition-local bin offset [num_columns]
+    partition_hist_offsets: &Array<u32>, // global bin offset per partition [num_partitions+1]
+    num_data: usize,
+    out: &mut Array<Atomic<u64>>,        // global leaf histogram, stride-2 [2·num_total_bin]
+    #[comptime] is_sparse: bool,
+) {
+    let p = CUBE_POS_X as usize; // ONE cube-x per feature partition
+    let lo = partition_col_offsets[p] as usize;
+    let hi = partition_col_offsets[p + 1] as usize;
+    let ncol_p = hi - lo;
+    let phs = partition_hist_offsets[p] as usize; // partition global bin start
+    let phe = partition_hist_offsets[p + 1] as usize;
+    let lds_len = (phe - phs) * 2; // grad+hess cells for this partition
+
+    let cd = CUBE_DIM as usize; // flat threads/cube (= CUBE_DIM_X · CUBE_DIM_Y)
+    let sub = SharedMemory::<Atomic<u64>>::new(HIST_LDS_MAX);
+    // 1. zero this partition's active LDS cells cooperatively (u64 zero = additive identity).
+    let mut c = UNIT_POS as usize;
+    while c < lds_len {
+        sub[c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+
+    // 2. scatter — one column per x-thread; rows striped over (CUBE_POS_Y, UNIT_POS_Y).
+    let tx = UNIT_POS_X as usize;
+    if tx < ncol_p {
+        let col = lo + tx;
+        let col_off = column_hist_offsets[col] as usize; // partition-local bin offset (dense)
+        let rp_base = p * (num_data + 1); // this partition's CSR block (sparse)
+        let dense_part_base = lo * num_data; // this partition's row-major base (dense)
+        let r = leaf_rows.len();
+        let stride = CUBE_COUNT_Y as usize * CUBE_DIM_Y as usize;
+        let mut k = CUBE_POS_Y as usize * CUBE_DIM_Y as usize + UNIT_POS_Y as usize;
+        while k < r {
+            let idx = leaf_rows[k] as usize;
+            // quantize `round(v·2^30)` → i64 → bits-as-u64 (u64-only hot loop, D-08).
+            let qg = u64::cast_from(i64::cast_from(f32::round(grad[idx] * SCALE_F32)));
+            let qh = u64::cast_from(i64::cast_from(f32::round(hess[idx] * SCALE_F32)));
+            if is_sparse {
+                // CSR: stored bin is ALREADY partition-local (re-lay subtracted phs).
+                let row_start = row_ptr[rp_base + idx] as usize;
+                let row_end = row_ptr[rp_base + idx + 1] as usize;
+                if tx < row_end - row_start {
+                    let cell = u32::cast_from(data[row_start + tx]) as usize * 2;
+                    sub[cell].fetch_add(qg);
+                    sub[cell + 1].fetch_add(qh);
+                }
+            } else {
+                // dense row-major partition store holds the RAW bin; add the local offset.
+                let raw = u32::cast_from(data[dense_part_base + idx * ncol_p + tx]) as usize;
+                let cell = (col_off + raw) * 2;
+                sub[cell].fetch_add(qg);
+                sub[cell + 1].fetch_add(qh);
+            }
+            k += stride;
+        }
+    }
+    sync_cube();
+
+    // 3. merge LDS → this partition's global slot (cross-block atomic; phs·2 base).
+    let base = phs * 2;
+    let mut m = UNIT_POS as usize;
+    while m < lds_len {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
 /// LDS batched RAW build: one cube per feature, reads host-gathered bins
 /// (`gathered_bins[f*R + k]`). `slot_off` has `num_features + 1` entries (sentinel).
 #[cfg(feature = "gpu")]
