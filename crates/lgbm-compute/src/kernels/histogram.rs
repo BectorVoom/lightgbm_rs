@@ -1445,6 +1445,106 @@ pub fn construct_leaf_hist_partition_u64<B: Int>(
     }
 }
 
+/// `_GlobalMemory` spill twin of [`construct_leaf_hist_partition_u64`] (Plan 16-03
+/// Task 2 / D-04/D-09 — the §7.2 Dense/Sparse × `_GlobalMemory` axis).
+///
+/// IDENTICAL §13 geometry, gather, quantize, and cross-block merge as the shared twin —
+/// the ONLY difference is the per-y-block partial histogram lives in a PRE-ALLOCATED
+/// global `Array<Atomic<u64>>` (`spill`) instead of `SharedMemory`, so a partition whose
+/// bin span exceeds the LDS cap (`HIST_LDS_MAX`) still builds for real (the C++
+/// `CUDAConstructHistogram*Kernel_GlobalMemory` path, `NumLargeBinPartition() > 0`).
+///
+/// Each y-block owns the slice `spill[(CUBE_POS_Y · num_total_bin + global_bin) · 2]`
+/// (§7.2: `cuda_hist_buffer_` at `(blockIdx.y · num_total_bin + phs) · 2`), so disjoint
+/// y-blocks never collide WITHIN the spill; the final per-cell merge into `out` is the
+/// SAME cross-block global atomic as the shared path (different y-blocks → same `out`
+/// cell → atomic). Shared-vs-global is parity-neutral (§17 — a capacity choice with no
+/// float-parity impact as long as the in-strategy reduction order is fixed; here both
+/// fold the partition's bins in ascending order). u64 fixed-point ONLY (D-08).
+///
+/// The caller (`construct_leaf_hist_on_device`) pre-allocates `spill` ONCE sized
+/// `grid_dim_y · num_total_bin · 2` (`checked_mul`-guarded, D-09) and ZEROES the active
+/// slices via this kernel's Phase-1 cooperative store — never reallocated per tree.
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_leaf_hist_partition_global_u64<B: Int>(
+    data: &Array<B>,
+    row_ptr: &Array<u32>,
+    leaf_rows: &Array<u32>,
+    grad: &Array<f32>,
+    hess: &Array<f32>,
+    partition_col_offsets: &Array<u32>,
+    column_hist_offsets: &Array<u32>,
+    partition_hist_offsets: &Array<u32>,
+    num_data: usize,
+    num_total_bin: usize,                 // total bins across all partitions (spill stride)
+    spill: &mut Array<Atomic<u64>>,       // per-y-block partials [grid_dim_y·num_total_bin·2]
+    out: &mut Array<Atomic<u64>>,         // global leaf histogram, stride-2 [2·num_total_bin]
+    #[comptime] is_sparse: bool,
+) {
+    let p = CUBE_POS_X as usize;
+    let lo = partition_col_offsets[p] as usize;
+    let hi = partition_col_offsets[p + 1] as usize;
+    let ncol_p = hi - lo;
+    let phs = partition_hist_offsets[p] as usize;
+    let phe = partition_hist_offsets[p + 1] as usize;
+    let span = phe - phs;
+
+    // This y-block's spill base (§7.2 `(blockIdx.y · num_total_bin + phs) · 2`).
+    let yblock_base = (CUBE_POS_Y as usize * num_total_bin + phs) * 2;
+    let cd = CUBE_DIM as usize;
+    // 1. zero THIS y-block's active spill cells cooperatively.
+    let mut c = UNIT_POS as usize;
+    while c < span * 2 {
+        spill[yblock_base + c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+
+    // 2. scatter — same gather/quantize as the shared twin, into the global spill slice.
+    let tx = UNIT_POS_X as usize;
+    if tx < ncol_p {
+        let col = lo + tx;
+        let col_off = column_hist_offsets[col] as usize;
+        let rp_base = p * (num_data + 1);
+        let dense_part_base = lo * num_data;
+        let r = leaf_rows.len();
+        let stride = CUBE_COUNT_Y as usize * CUBE_DIM_Y as usize;
+        let mut k = CUBE_POS_Y as usize * CUBE_DIM_Y as usize + UNIT_POS_Y as usize;
+        while k < r {
+            let idx = leaf_rows[k] as usize;
+            let qg = u64::cast_from(i64::cast_from(f32::round(grad[idx] * SCALE_F32)));
+            let qh = u64::cast_from(i64::cast_from(f32::round(hess[idx] * SCALE_F32)));
+            if is_sparse {
+                let row_start = row_ptr[rp_base + idx] as usize;
+                let row_end = row_ptr[rp_base + idx + 1] as usize;
+                if tx < row_end - row_start {
+                    let local = u32::cast_from(data[row_start + tx]) as usize;
+                    let cell = yblock_base + local * 2;
+                    spill[cell].fetch_add(qg);
+                    spill[cell + 1].fetch_add(qh);
+                }
+            } else {
+                let raw = u32::cast_from(data[dense_part_base + idx * ncol_p + tx]) as usize;
+                let cell = yblock_base + (col_off + raw) * 2;
+                spill[cell].fetch_add(qg);
+                spill[cell + 1].fetch_add(qh);
+            }
+            k += stride;
+        }
+    }
+    sync_cube();
+
+    // 3. merge THIS y-block's spill slice → the global leaf slot (cross-block atomic).
+    let out_base = phs * 2;
+    let mut m = UNIT_POS as usize;
+    while m < span * 2 {
+        out[out_base + m].fetch_add(spill[yblock_base + m].load());
+        m += cd;
+    }
+}
+
 /// LDS batched RAW build: one cube per feature, reads host-gathered bins
 /// (`gathered_bins[f*R + k]`). `slot_off` has `num_features + 1` entries (sentinel).
 #[cfg(feature = "gpu")]
