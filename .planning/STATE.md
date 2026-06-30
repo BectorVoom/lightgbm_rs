@@ -6,14 +6,14 @@ current_phase: 16
 current_phase_name: on-device-histogram-constructor
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-30T21:52:32.130Z"
+last_updated: "2026-06-30T22:16:24.977Z"
 last_activity: 2026-06-30
 last_activity_desc: Phase 16 execution started
 progress:
   total_phases: 10
   completed_phases: 2
   total_plans: 16
-  completed_plans: 13
+  completed_plans: 14
   percent: 20
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 16 (on-device-histogram-constructor) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-06-30 — Phase 16 execution started
@@ -560,6 +560,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 15 P05 | 10 | 1 tasks | 1 files |
 | Phase 16 P01 | 35min | 2 tasks | 2 files |
 | Phase 16 P02 | 4 | 2 tasks | 2 files |
+| Phase 16 P03 | 45min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -654,6 +655,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 16-01: Wave-0 fixtures are synthetic in-code (regenerable without C++ toolchain); committed histogram.txt dense anchor untouched
 - [Phase ?]: 16-01: ODL-09/ODL-10 stay pending — phase-spanning, completed only when build/fix/subtract kernels land (16-03/16-04)
 - [Phase ?]: HistArena pre-allocates the histogram slot pool exactly once (counted client.empty + assert, D-09); rotate() reassigns hist_t** role indices so larger derives in-place in the parent buffer and smaller takes a fresh non-aliasing slot (D-02). Whole-tree pool SWAP deferred to Phase 18.
+- [Phase ?]: 16-03: on-device histogram BUILD (ODL-09) shipped — two-tier §13-partition u64 fixed-point kernel (dense+sparse × shared-LDS + _GlobalMemory spill), de-quant-once at 2^30, V5 launcher; anchor-pinned to cpu f64 fold, 18/18 green on ROCm APU; shipped per-feature kernel byte-unchanged
+- [Phase ?]: 16-03: shared-LDS cap is HIST_LDS_MAX (256 bins); larger partitions route to _GlobalMemory — parity-neutral (§17); de-quant kept a SEPARATE pass (RESEARCH Pattern 3)
 
 ### Pending Todos
 
@@ -683,7 +686,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-30T21:52:12.448Z
+Last session: 2026-06-30T22:16:03.802Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-on-device-histogram-constructor/16-CONTEXT.md
 

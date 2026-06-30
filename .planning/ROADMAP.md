@@ -156,11 +156,11 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. The build-smaller-before-subtract ordering invariant holds (parent fully built before any child subtract reads it — the 8aed100-class guard), and the most-freq-bin fix + interleaved `[2b]/[2b+1]` layout match the reference exactly — both as CORRECTNESS requirements, not speed. (§17)
   4. The derived larger-child histogram is anchor-pinned (bit-exact on the cpu f64 anchor; ROCm/CUDA f32 within ~1e-6); CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 2/5 plans executed
+**Plans**: 3/5 plans executed
 
 - [x] 16-01-PLAN.md
 - [x] 16-02-PLAN.md
-- [ ] 16-03-PLAN.md
+- [x] 16-03-PLAN.md
 - [ ] 16-04-PLAN.md
 - [ ] 16-05-PLAN.md
 
@@ -278,7 +278,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 |-------|-----------|----------------|--------|-----------|
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
-| 16. On-Device Histogram Constructor | v1.1 | 2/5 | In Progress|  |
+| 16. On-Device Histogram Constructor | v1.1 | 3/5 | In Progress|  |
 | 17. On-Device Best-Split Finder | v1.1 | 0/? | Not started | - |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
 | 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
