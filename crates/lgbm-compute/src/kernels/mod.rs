@@ -35,3 +35,9 @@ pub mod subtract;
 pub mod column_data;
 pub mod copy_subrow;
 pub mod row_data;
+// Phase-16 histogram-constructor support: the pre-allocated-once histogram arena +
+// the `{parent, smaller, larger}` hist_t** handle-rotation contract (ODL-10 / D-02 /
+// D-09). Ungated like the other Phase-14/15 kernel modules (NOT
+// `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor exercises the index
+// bookkeeping in isolation (D-08); the whole-tree pool SWAP is deferred to Phase 18.
+pub mod histogram_arena;
