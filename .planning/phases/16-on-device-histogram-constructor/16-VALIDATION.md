@@ -1,8 +1,8 @@
 ---
 phase: 16
 slug: on-device-histogram-constructor
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-07-01
 ---
@@ -38,13 +38,24 @@ created: 2026-07-01
 
 ## Per-Task Verification Map
 
-> Filled by the planner from PLAN.md tasks. Anchor every numeric output to the cubecl-cpu f64 fold (bit-exact structure; ROCm/CUDA f32 within ~1e-6).
+> Derived from the 5 PLAN.md task lists. Anchor every numeric output to the cubecl-cpu f64 fold (bit-exact structure; ROCm/CUDA f32 within ~1e-6); never GPU-vs-GPU (def-f8u-01). Threat surface is internal memory-safety only (no network/auth/untrusted input).
 
-| Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
-|---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 16-01-01 | 01 | 0 | ODL-09/10 | — | N/A (internal compute) | fixture | `cargo test -p lgbm-compute` | ❌ W0 | ⬜ pending |
+| Task | Plan | Wave | Requirement | Secure Behavior | Test Type | Automated Command | File Exists | Status |
+|------|------|------|-------------|-----------------|-----------|-------------------|-------------|--------|
+| T1: sparse + large-bin/spill + mfb≠0 fixtures (D-05) | 01 | 0 | ODL-09/10 | bounds-checked fixture data | fixture | `cargo test -p oracle-harness kernel_parity` | ❌ W0 | ⬜ pending |
+| T2: ordering-invariant harness + [2b]/[2b+1] assert (D-05) | 01 | 0 | ODL-09/10 | no aliased reads | harness | `cargo test -p lgbm-compute rocm_cuda_mirror` | ❌ W0 | ⬜ pending |
+| T1: HistArena allocate-exactly-once slot pool (D-02/D-09) | 02 | 1 | ODL-10 | no double-alloc / leak | unit | `cargo test -p lgbm-compute histogram_arena` | ❌ W0 | ⬜ pending |
+| T2: hist_t** rotation — no aliasing (D-02) | 02 | 1 | ODL-10 | parent≠smaller slot assert | unit | `cargo test -p lgbm-compute histogram_arena` | ❌ W0 | ⬜ pending |
+| T1: two-tier §13 build kernel, dense+sparse (D-03/D-06/D-08) | 03 | 1 | ODL-09 | V5 launch-arg bounds | parity | `cargo test -p lgbm-compute construct_leaf_hist_partition` | ❌ W0 | ⬜ pending |
+| T2: _GlobalMemory spill variant (D-04/D-09) | 03 | 1 | ODL-09 | spill-buffer bounds | parity | `cargo test -p lgbm-compute spill` | ❌ W0 | ⬜ pending |
+| T3: de-quant-once → hist_t + launcher (D-01/D-08/D-05) | 03 | 1 | ODL-09 | no f64 hot loop | parity | `cargo test -p lgbm-compute construct_leaf_hist_partition` | ❌ W0 | ⬜ pending |
+| T1: FixHistogram mfb repair, DROP compact (D-01/D-06) | 04 | 2 | ODL-10 | mfb bound 0<mfb<num_bin | parity | `cargo test -p lgbm-compute fix_histogram` | ❌ W0 | ⬜ pending |
+| T2: Subtract via rotation + build-synced ordering (D-01/D-02) | 04 | 2 | ODL-10 | parent synced before read | parity | `cargo test -p lgbm-compute subtract` | ❌ W0 | ⬜ pending |
+| T3: ConstructHistogramForLeaf entry, env-gated (D-07/D-08) | 04 | 2 | ODL-10 | OFF by default; growth=false | unit | `cargo test -p lgbm-compute on_device_growth_supported` | ❌ W0 | ⬜ pending |
+| T1: hard merge gate — green, no f64 loop, no Atomic<i64> (D-07/D-08/ODL-19) | 05 | 3 | ODL-09/10 | default byte-unchanged | gate | `cargo test` + grep gates | ✅ | ⬜ pending |
+| T2: ROCm f32 parity human-verify (D-06) | 05 | 3 | ODL-09/10 | ~1e-6 vs cpu anchor | manual | `LGBM_CUDA_ON_DEVICE=1 cargo test --features hip` (on ROCm host) | ✅ | ⬜ pending |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky · "❌ W0" = file created by the Wave 0 fixtures task*
 
 ---
 
@@ -75,11 +86,11 @@ created: 2026-07-01
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 60s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies (16-05 T2 is an exempt human-verify checkpoint for physical-GPU parity)
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (16-01 fixtures/harnesses land first; build/fix kernels `depends_on` them)
+- [x] No watch-mode flags
+- [x] Feedback latency < 60s (quick crate-scoped run)
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-07-01 (plan-checker VERIFICATION PASSED, 0 blockers)
