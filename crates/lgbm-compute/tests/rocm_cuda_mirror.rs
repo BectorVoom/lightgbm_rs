@@ -483,6 +483,42 @@ mod build_partition_host {
 }
 
 // ===========================================================================
+// Plan 16-04 Task 1 host tests (run under `--features gpu`, on the cpu client):
+// the FixHistogram launcher's V5 boundary ladder + empty-feats no-launch path.
+// These return BEFORE any device launch (the `fix_histogram_mfb` kernel itself —
+// like the shipped `fix_compact_kernel` — is a per-feature fold-with-select the
+// cubecl-cpu MLIR backend rejects, so the bit-exact repair is validated on the
+// real ROCm device in `mod hip`, pinned to the plain-Rust f64 golden).
+// ===========================================================================
+#[cfg(feature = "gpu")]
+mod fix_histogram_host {
+    use lgbm_compute::error::ComputeError;
+    use lgbm_compute::kernels::histogram::fix_histogram_mfb_on;
+    use lgbm_compute::runtime::cpu_client;
+
+    /// V5 boundary: `num_bin == 0` and a `slot_off + 2*num_bin` overrun are typed errors
+    /// BEFORE any launch; an empty `feats` returns the hist_t unchanged with NO launch.
+    #[test]
+    fn fix_v5_rejects_and_empty_no_launch() {
+        let client = cpu_client();
+        let hist = vec![1.0f64, 2.0, 3.0, 4.0];
+        // empty feats → unchanged, no launch.
+        let same = fix_histogram_mfb_on(&client, &hist, &[], 0.0, 0.0).unwrap();
+        assert_eq!(same, hist, "empty feats must return hist unchanged");
+        // num_bin == 0 → Runtime error.
+        assert!(matches!(
+            fix_histogram_mfb_on(&client, &hist, &[(0usize, 0u32, 0u32)], 0.0, 0.0),
+            Err(ComputeError::Runtime { .. })
+        ));
+        // slot_off + 2*num_bin > hist.len() → LengthMismatch.
+        assert!(matches!(
+            fix_histogram_mfb_on(&client, &hist, &[(2usize, 4u32, 1u32)], 0.0, 0.0),
+            Err(ComputeError::LengthMismatch { .. })
+        ));
+    }
+}
+
+// ===========================================================================
 // GPU mirror tests (rocm only) — pinned GPU-vs-cpu-f64-anchor, NEVER GPU-vs-GPU.
 //
 // The CubeCL mirror of LightGBM's CUDA `CUDAConstructHistogramDenseKernel`
@@ -500,7 +536,7 @@ mod hip {
     use lgbm_compute::kernels::histogram::{
         construct_histograms_cpu, construct_histograms_cuda_mirror_on,
         construct_histograms_cuda_mirror_resident_on, construct_leaf_hist_on_device,
-        dequant_leaf_hist,
+        dequant_leaf_hist, fix_histogram_mfb_on,
     };
     use lgbm_compute::kernels::row_data::FeaturePartitionLayout;
     use lgbm_compute::runtime::rocm_client;
@@ -885,5 +921,75 @@ mod hip {
         )
         .unwrap();
         assert_eq!(first, second, "second build must not fold onto stale out cells");
+    }
+
+    // =======================================================================
+    // Plan 16-04 Task 1: FixHistogram most-freq-bin repair on the real device,
+    // pinned to the plain-Rust f64 golden (the cpu anchor math, NEVER GPU-vs-GPU).
+    // =======================================================================
+
+    /// Replicate the kernel's EXACT ascending fold so the golden matches cell-for-cell:
+    /// `leaf_total − Σ_{i≠mfb, ascending} hist[2i+which]`.
+    fn golden_repair(hist: &[f64], base: usize, nb: usize, mfb: usize, leaf_total: f64, which: usize) -> f64 {
+        let mut acc = leaf_total;
+        for i in 0..nb {
+            if i != mfb {
+                acc -= hist[base + i * 2 + which];
+            }
+        }
+        acc
+    }
+
+    /// On an `mfb != 0` fixture the repaired most-freq cell equals the precomputed golden
+    /// `leaf_total − Σ(ascending)` within ~1e-6 of the cpu f64 anchor on the real device,
+    /// every other cell is untouched, and a sibling feature with `mfb == 0` is left
+    /// byte-identical (the per-feature `do_fix` guard). `leaf_total` is seeded as the
+    /// ascending fold of all bins, so the repair round-trips to the original mfb value.
+    #[test]
+    fn fix_histogram_mfb_repairs_omitted_bin() {
+        let gc = rocm_client();
+        let nb = 6usize;
+        let mfb = 3usize; // mfb != 0 → the fix path runs.
+        // feat0 (6 bins, mfb=3, repaired) ‖ feat1 (4 bins, mfb=0, untouched).
+        let nb1 = 4usize;
+        let mut hist: Vec<f64> = vec![
+            // feat0:
+            1.5, 2.0, -0.5, 1.0, 2.25, 0.75, 4.0, 3.0, -1.25, 0.5, 0.75, 2.5,
+            // feat1:
+            9.0, 9.0, 8.0, 8.0, 7.0, 7.0, 6.0, 6.0,
+        ];
+        let base1 = 2 * nb; // feat1 region start
+        // Leaf totals = EXACT ascending fold of feat0's bins (the RAW un-bumped totals).
+        let mut leaf_g = 0.0f64;
+        let mut leaf_h = 0.0f64;
+        for i in 0..nb {
+            leaf_g += hist[i * 2];
+            leaf_h += hist[i * 2 + 1];
+        }
+        let golden_g = golden_repair(&hist, 0, nb, mfb, leaf_g, 0);
+        let golden_h = golden_repair(&hist, 0, nb, mfb, leaf_h, 1);
+
+        // Simulate the BUILD omitting the most-frequent bin: zero its cell pre-fix. The
+        // kernel excludes i==mfb from the fold (select), so the zeroed value is inert.
+        hist[mfb * 2] = 0.0;
+        hist[mfb * 2 + 1] = 0.0;
+        let untouched0 = hist[0];
+        let feat1_before = hist[base1..base1 + 2 * nb1].to_vec();
+
+        let feats = vec![
+            (0usize, nb as u32, mfb as u32),
+            (base1, nb1 as u32, 0u32), // mfb == 0 → skipped
+        ];
+        let out = fix_histogram_mfb_on(&gc, &hist, &feats, leaf_g, leaf_h).expect("fix launch");
+
+        assert_eq!(out.len(), hist.len());
+        assert!((out[mfb * 2] - golden_g).abs() < 5e-6, "grad repair {} vs golden {}", out[mfb * 2], golden_g);
+        assert!((out[mfb * 2 + 1] - golden_h).abs() < 5e-6, "hess repair {} vs golden {}", out[mfb * 2 + 1], golden_h);
+        // Round-trip: the repaired value reproduces the original mfb cell (4.0 / 3.0).
+        assert!((out[mfb * 2] - 4.0).abs() < 5e-6, "grad round-trip ≈ original mfb");
+        assert!((out[mfb * 2 + 1] - 3.0).abs() < 5e-6, "hess round-trip ≈ original mfb");
+        // Non-mfb cell 0 of feat0 untouched; feat1 (mfb==0) byte-identical.
+        assert_eq!(out[0].to_bits(), untouched0.to_bits(), "non-mfb cell 0 untouched");
+        assert_eq!(&out[base1..base1 + 2 * nb1], &feat1_before[..], "feat1 (mfb==0) untouched");
     }
 }

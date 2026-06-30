@@ -3039,6 +3039,197 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     Ok(f64::from_bytes(&bytes).to_vec())
 }
 
+// ===========================================================================
+// Plan 16-04 Task 1 (ODL-10): FixHistogram most-freq-bin repair in the hist_t
+// FLOAT domain — `docs/cuda-kernel-design.md` §7.5 FixHistogramKernel. The
+// §7 on-device path is build → fix → subtract: BUILD (16-03) accumulates the
+// raw u64 fixed-point histogram OMITTING the most-frequent bin to save work,
+// de-quant (16-03) widens it once to `hist_t`, and FIX here reconstructs the
+// omitted bin as `leaf_total − Σ(other bins)`. This is a SEPARATE kernel from
+// the legacy `fix_compact_kernel`: it (a) consumes the already-de-quanted
+// `hist_t` (NOT the raw u64 — no re-quantize, no 2^30 scale), and (b) DROPS the
+// compact (offset-shift) step — compaction is a CPU-learner artifact (DEF-07-02
+// class) the §7 reference path does not perform (Pitfall 5).
+// ===========================================================================
+
+/// FixHistogram most-frequent-bin repair over the de-quanted `hist_t` (§7.5).
+///
+/// One cube per feature (`CUBE_POS_X = f`, `CubeDim::new_1d(1)` — the single-owner
+/// ascending fold, the load-bearing f64 order shared with `fix_compact_kernel`).
+/// Repairs ONLY when `most_freq_bin > 0 && most_freq_bin < num_bin` (the C++
+/// `if (most_freq_bin > 0)` guard plus the defensive in-range bound — Pitfall 4);
+/// `mfb == 0` and out-of-range features are left untouched (no write).
+///
+/// The repaired most-freq cell = the RAW (un-bumped) leaf totals `sum_gradient` /
+/// `sum_hessian` (HOST-side exact f64 scalars, shared across every feature — Pitfall 2)
+/// minus every OTHER bin's cell, folded in ASCENDING bin order (never reorder /
+/// parallelize on the cpu anchor — the f64 fold order is the bit-exact contract). The
+/// `i != mfb` exclusion is a branchless `select` so the guarded cell drops out without a
+/// nested-if mutation. Writes the result into `hist[mfb·2]` (grad) / `hist[mfb·2+1]`
+/// (hess) IN PLACE.
+///
+/// Unlike `fix_compact_kernel` this kernel does NOT dequantize (it consumes `hist_t`,
+/// not the raw u64) and does NOT compact (the `if off > 0` offset-shift block is absent
+/// — §7 is build→fix→subtract only). The cpu anchor folds ascending (bit-exact); the hip
+/// device runs the SAME single-owner fold within the ~1e-6 gate (the proven
+/// `fix_compact_kernel` precedent — a ShuffleReduceSum/plane-reduce twin over
+/// `num_bin_aligned` is the §7.5 perf lever, parity-neutral within ~1e-6 and deferred:
+/// the merge gate is the cpu f64 anchor, never GPU-vs-GPU).
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+pub fn fix_histogram_mfb(
+    // De-quanted hist_t (`[g0,h0,g1,h1,…]` per feature region) — READ-ONLY input.
+    hist_in: &Array<f64>,
+    // Pre-seeded copy of `hist_in` (launcher uploads the same cells) — the repaired
+    // most-freq cell is overwritten here. Splitting read (`hist_in`) from write
+    // (`hist_out`) avoids the read-after-write aliasing of one `&mut Array` that the
+    // cubecl-cpu MLIR backend rejects ("operand does not dominate this use"), so the
+    // hard merge gate runs the SAME kernel on the cubecl-cpu f64 anchor, not only hip.
+    hist_out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    most_freq_bin: &Array<i32>,
+    // LEAF-LEVEL RAW (un-bumped) f64 totals, shared across the batch (Pitfall 2).
+    sum_gradient: f64,
+    sum_hessian: f64,
+) {
+    // One cube per feature (`CUBE_POS_X = f`, `CubeDim::new_1d(1)`) — the SHIPPED
+    // `fix_compact_kernel` launch geometry. Each feature's fix is independent; the
+    // ascending per-feature fold is the load-bearing f64 order. The hip device runs the
+    // SAME kernel within ~1e-6 (a per-feature plane-reduce twin over `num_bin_aligned`
+    // is the §7.5 perf lever, parity-neutral and deferred — the merge gate is the cpu f64
+    // anchor, never GPU-vs-GPU). Like `fix_compact_kernel`, this kernel is launched only
+    // on the GPU device (cubecl-cpu's MLIR backend rejects the per-feature fold-with-
+    // select); the cpu f64 anchor is the plain-Rust golden the rocm test pins to.
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let base = slot_off[fi] as usize;
+    let nb = num_bin[fi];
+    let mfb = most_freq_bin[fi];
+
+    // C++ `if (most_freq_bin > 0)`: skip mfb == 0 (bin 0 is never folded back) AND the
+    // defensive `mfb < num_bin` out-of-range bound (Pitfall 4) — no OOB write.
+    let do_fix = mfb > 0 && mfb < nb;
+    if do_fix {
+        let mfbu = mfb as usize;
+        // Seed with the RAW leaf totals (literal-init loop-carried mutables, the cubecl
+        // lowering discipline shared with `fix_compact_kernel`).
+        let mut g = 0.0f64;
+        let mut h = 0.0f64;
+        g += sum_gradient;
+        h += sum_hessian;
+        // Subtract every OTHER bin's cell in ASCENDING order (load-bearing f64 fold;
+        // `i != mfb` via branchless select).
+        let count = nb;
+        for i in 0..count {
+            let bi = base + (i as usize) * 2;
+            let gi = hist_in[bi];
+            let hi = hist_in[bi + 1];
+            let take = i != mfb;
+            g -= select(take, gi, 0.0);
+            h -= select(take, hi, 0.0);
+        }
+        let mi = base + mfbu * 2;
+        hist_out[mi] = g;
+        hist_out[mi + 1] = h;
+    }
+    // NO compact step (Pitfall 5): §7 is build→fix→subtract; the `if off > 0`
+    // offset-shift belongs only to the legacy `fix_compact_kernel`.
+}
+
+/// Host launcher for [`fix_histogram_mfb`] (§7.5, ODL-10): repairs the omitted
+/// most-frequent bin over the de-quanted `hist_t` (the [`dequant_leaf_hist`] output
+/// of 16-03), in place, returning the repaired histogram. Mirrors the
+/// [`fix_compact_f64_on`] V5 launcher checks — but the `feats` tuple drops `offset`
+/// (no compaction) and the input is `hist_t` (no quantize round-trip).
+///
+/// `feats` is `&[(slot_off, num_bin, most_freq_bin)]` per feature, in the same order
+/// as the concatenated regions in `hist`.
+///
+/// V5 boundary validation BEFORE launch (T-16-04-01): `num_bin == 0` → typed error;
+/// `2*num_bin` overflow → typed error; `slot_off + 2*num_bin > hist.len()` →
+/// [`ComputeError::LengthMismatch`]; empty `feats` → `Ok(hist.to_vec())` with NO launch.
+///
+/// # Errors
+/// As above (length / overflow validation, V5).
+#[cfg(feature = "gpu")]
+pub fn fix_histogram_mfb_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist: &[f64],
+    feats: &[(usize, u32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+) -> Result<Vec<f64>, ComputeError> {
+    // Empty batch: no launch — return the hist_t unchanged (degenerate Ok path).
+    if feats.is_empty() {
+        return Ok(hist.to_vec());
+    }
+
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut mfb_a: Vec<i32> = Vec::with_capacity(n);
+    for &(slot_off, num_bin, most_freq_bin) in feats {
+        if num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "fix_histogram_mfb: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {num_bin} overflows the histogram length"),
+            })?;
+        let end = slot_off
+            .checked_add(cells)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "fix_histogram_mfb: slot_off + region overflows".to_string(),
+            })?;
+        if end > hist.len() {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: hist.len(),
+            });
+        }
+        slot_off_a.push(slot_off as u32);
+        num_bin_a.push(num_bin as i32);
+        mfb_a.push(most_freq_bin as i32);
+    }
+
+    // Read input + a pre-seeded copy as the write target (the un-fixed cells stay equal
+    // to the input, so non-mfb cells and mfb==0 features are returned byte-identical).
+    let h_in = client.create_from_slice(f64::as_bytes(hist));
+    let h_out = client.create_from_slice(f64::as_bytes(hist));
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+    let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
+
+    // SAFETY: every handle is sized to its slice and outlives the launch. Cube `f`
+    // (`CUBE_POS_X < n`) reads `h_in` and writes `h_out` only within `[slot_off[f],
+    // slot_off[f]+2*num_bin[f])` — each validated `<= hist.len()` above — and the
+    // `do_fix` guard keeps the `mfb·2` reconstruct cell in range; the per-feature index
+    // arrays all have exactly `n` elements. The kernel is f64 + DETERMINISTIC (one cube
+    // per feature, `CubeDim::new_1d(1)`, ascending fold), so `launch_unchecked` (dropping
+    // bounds-check codegen) is sound AND bit-exact. All cubecl unsafe is confined here.
+    unsafe {
+        fix_histogram_mfb::launch_unchecked(
+            client,
+            CubeCount::Static(n as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_in, hist.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), hist.len()),
+            ArrayArg::from_raw_parts(h_slot, n),
+            ArrayArg::from_raw_parts(h_numbin, n),
+            ArrayArg::from_raw_parts(h_mfb, n),
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f64::from_bytes(&bytes).to_vec())
+}
+
 /// Upload the binned feature columns to the device feature-major (feature `f`'s
 /// row `r` at `f * num_data + r`) and return the resident `Handle` — the same
 /// concatenated layout [`RocmBackend::upload_resident_bins`](crate::Backend::upload_resident_bins)
