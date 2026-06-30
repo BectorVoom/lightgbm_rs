@@ -5,8 +5,8 @@ milestone_name: — CUDA On-Device Training Backend
 current_phase: 16
 current_phase_name: On-Device Histogram Constructor
 status: verifying
-stopped_at: Phase 15 context gathered
-last_updated: "2026-06-29T22:42:31.031Z"
+stopped_at: Phase 16 context gathered
+last_updated: "2026-06-30T13:53:58.106Z"
 last_activity: 2026-06-29
 last_activity_desc: Phase 15 complete, transitioned to Phase 16
 progress:
@@ -678,9 +678,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-29T22:13:37.884Z
-Stopped at: Phase 15 context gathered
-Resume file: .planning/phases/15-on-device-device-dataset-row-subset-gather/15-CONTEXT.md
+Last session: 2026-06-30T13:53:58.096Z
+Stopped at: Phase 16 context gathered
+Resume file: .planning/phases/16-on-device-histogram-constructor/16-CONTEXT.md
 
 ## Operator Next Steps
 
