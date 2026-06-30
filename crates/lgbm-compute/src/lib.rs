@@ -1295,6 +1295,25 @@ pub trait Backend {
 /// Binds [`runtime::ActiveRuntime`] (cubecl-cpu under the default `cpu` feature)
 /// and dispatches [`construct_histograms`](Backend::construct_histograms) to the
 /// single-owner ordered f64 fold in [`kernels::histogram`].
+/// THE production seam gate for the on-device histogram/tree path (D-07, ODL-10).
+///
+/// `LGBM_CUDA_ON_DEVICE` is OFF by default (`"1"` ⇒ on), read ONCE (OnceLock-cached,
+/// mirroring [`split_2lane_enabled`]). While it is unset the on-device histogram entry
+/// ([`kernels::histogram::construct_histogram_for_leaf`]) and the Phase-18/21 tree-growth
+/// driver that will call it stay UNREACHABLE, so the CPU / ROCm / host-CUDA paths are
+/// byte-unchanged. This is the call-site gate the future growth loop checks, exactly as
+/// it ANDs in [`Backend::on_device_growth_supported`] — which INDEPENDENTLY stays `false`
+/// this phase (Phase 16 demonstrates the build→fix→subtract histogram path in isolation;
+/// the growth loop that consumes it is Phase 18/21). The entry fn is additive and pure:
+/// it never mutates global state and is invoked only behind this gate (in production) or
+/// directly by the anchor tests.
+#[must_use]
+pub fn cuda_on_device_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_CUDA_ON_DEVICE").map(|v| v == "1").unwrap_or(false))
+}
+
 /// quick-260620-8v4 opt-in gate for the additive 2-lane native split scan. Read
 /// ONCE from `LGBM_SPLIT_2LANE` (`"1"` => on). OFF by default: the serial
 /// [`kernels::split::find_best_split_cpu_native`] is the bit-exact source of truth
@@ -3476,5 +3495,33 @@ mod core_scaled_threshold_tests {
         let s = unified_subscan_threshold();
         assert!((THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&b));
         assert!((THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&s));
+    }
+}
+
+/// Plan 16-04 Task 3 (D-07/D-08): the on-device seam is OFF by default and the
+/// tree-growth discriminator stays `false` — Phase 16 demonstrates the histogram
+/// build→fix→subtract path in isolation; the growth driver is Phase 18/21.
+#[cfg(all(test, feature = "cpu"))]
+mod on_device_seam_tests {
+    use super::{cuda_on_device_enabled, Backend, CpuBackend};
+
+    /// `LGBM_CUDA_ON_DEVICE` is OFF by default (env unset in the test process): the
+    /// production gate the future growth driver checks returns `false`, so the on-device
+    /// histogram entry is unreachable and the CPU/ROCm/host-CUDA paths are byte-unchanged.
+    #[test]
+    fn cuda_on_device_seam_off_by_default() {
+        assert!(!cuda_on_device_enabled(), "LGBM_CUDA_ON_DEVICE must be OFF by default");
+    }
+
+    /// The tree-growth discriminator stays `false` this phase (no growth driver wired);
+    /// the learner's on-device eligibility gate ANDs this in and always takes the
+    /// byte-unchanged host/per-leaf path.
+    #[test]
+    fn on_device_growth_supported_stays_false() {
+        let backend = CpuBackend;
+        assert!(
+            !backend.on_device_growth_supported(),
+            "on_device_growth_supported must stay false in Phase 16"
+        );
     }
 }

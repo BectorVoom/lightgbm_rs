@@ -607,6 +607,47 @@ mod subtract_on_device_host {
 }
 
 // ===========================================================================
+// Plan 16-04 Task 3 host test (run under `--features gpu`, on the cpu client):
+// the §7.0 early-return — when BOTH children fail min_data/min_sum_hessian the
+// entry builds NOTHING (Ok(None)), so it never reaches the GPU-only build kernel
+// and runs on the cpu client. The full build→fix→subtract end-to-end (both
+// children vs the cpu f64 anchor) is `mod hip` (rocm).
+// ===========================================================================
+#[cfg(feature = "gpu")]
+mod construct_for_leaf_host {
+    use lgbm_compute::kernels::histogram::{construct_histogram_for_leaf, LeafConstructGate};
+    use lgbm_compute::kernels::histogram_arena::HistArena;
+    use lgbm_compute::kernels::row_data::divide_cuda_feature_groups;
+    use lgbm_compute::runtime::cpu_client;
+
+    /// §7.0: a leaf pair failing BOTH `min_data_in_leaf` / `min_sum_hessian_in_leaf`
+    /// builds nothing and returns `Ok(None)` — the early-return short-circuits before any
+    /// device build, so this exercises on the cpu client without launching the GPU kernel.
+    #[test]
+    fn construct_for_leaf_early_returns_when_both_children_fail_gate() {
+        let client = cpu_client();
+        let layout = divide_cuda_feature_groups(&[4usize], 6144);
+        let mut arena = HistArena::new(&client, 3, 8).unwrap();
+        // Both children below min_data_in_leaf (count 0 < 1) → early-return, no build.
+        let gate = LeafConstructGate {
+            smaller_count: 0,
+            smaller_sum_hessian: 0.0,
+            larger_count: 0,
+            larger_sum_hessian: 0.0,
+            larger_leaf_index: -1,
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 1.0,
+        };
+        let out = construct_histogram_for_leaf(
+            &client, &mut arena, &layout, &[], None, &[], &[], &[], 0, &[], 0.0, 0.0, &[], gate,
+            false,
+        )
+        .expect("early-return is the degenerate Ok path");
+        assert!(out.is_none(), "both children failing the gate must build nothing");
+    }
+}
+
+// ===========================================================================
 // GPU mirror tests (rocm only) — pinned GPU-vs-cpu-f64-anchor, NEVER GPU-vs-GPU.
 //
 // The CubeCL mirror of LightGBM's CUDA `CUDAConstructHistogramDenseKernel`
@@ -622,10 +663,11 @@ mod hip {
     use super::{assert_close, cpu_anchor_columns, cpu_client, divide_cuda_feature_groups};
     use cubecl::prelude::CubeElement;
     use lgbm_compute::kernels::histogram::{
-        construct_histograms_cpu, construct_histograms_cuda_mirror_on,
+        construct_histogram_for_leaf, construct_histograms_cpu, construct_histograms_cuda_mirror_on,
         construct_histograms_cuda_mirror_resident_on, construct_leaf_hist_on_device,
-        dequant_leaf_hist, fix_histogram_mfb_on,
+        dequant_leaf_hist, fix_histogram_mfb_on, LeafConstructGate,
     };
+    use lgbm_compute::kernels::histogram_arena::HistArena;
     use lgbm_compute::kernels::row_data::FeaturePartitionLayout;
     use lgbm_compute::runtime::rocm_client;
     use lgbm_compute::BinColumn;
@@ -1079,5 +1121,72 @@ mod hip {
         // Non-mfb cell 0 of feat0 untouched; feat1 (mfb==0) byte-identical.
         assert_eq!(out[0].to_bits(), untouched0.to_bits(), "non-mfb cell 0 untouched");
         assert_eq!(&out[base1..base1 + 2 * nb1], &feat1_before[..], "feat1 (mfb==0) untouched");
+    }
+
+    // =======================================================================
+    // Plan 16-04 Task 3: the ConstructHistogramForLeaf entry end-to-end on the
+    // real device — build (smaller) → de-quant → fix → rotate+subtract (larger).
+    // BOTH children pinned to the cpu f64 anchor (never GPU-vs-GPU). The build
+    // (16-03) accumulates the FULL histogram (it does not omit the most-freq bin),
+    // so `fix_feats` uses mfb==0 here (fix is a structural no-op, exercised but
+    // inert) — the real omit-and-repair is validated in
+    // `fix_histogram_mfb_repairs_omitted_bin`. The subtraction-derived larger child
+    // is the key assertion.
+    // =======================================================================
+    #[test]
+    fn construct_histogram_for_leaf_produces_both_children_vs_anchor() {
+        let gc = rocm_client();
+        let (columns, num_bins, num_data, smaller_rows, grad, hess) = small_columns();
+        let layout = divide_cuda_feature_groups(&num_bins, 6144);
+        let nb_u32: Vec<u32> = num_bins.iter().map(|&b| b as u32).collect();
+        let data = dense_partition_store(&columns, &layout, num_data);
+
+        // The parent leaf = smaller ∪ larger; pick the larger as the complement of the
+        // smaller subset over the 8 corpus rows.
+        let larger_rows: Vec<u32> = (0..num_data as u32)
+            .filter(|r| !smaller_rows.contains(r))
+            .collect();
+        let parent_rows: Vec<u32> = (0..num_data as u32).collect();
+
+        // Parent histogram (already built+fixed, here the full cpu f64 anchor) → subtract input.
+        let parent_hist = cpu_anchor_columns(&columns, &nb_u32, &parent_rows, &grad, &hess);
+        // Arena slot length must equal the concatenated 2*Σnum_bin layout.
+        let slot_len = parent_hist.len();
+        let mut arena = HistArena::new(&gc, 3, slot_len).unwrap();
+
+        // fix_feats: per-feature (slot_off, num_bin, mfb==0 → fix no-op for the full build).
+        let mut fix_feats: Vec<(usize, u32, u32)> = Vec::new();
+        let mut off = 0usize;
+        for &nb in &num_bins {
+            fix_feats.push((off, nb as u32, 0u32));
+            off += 2 * nb;
+        }
+
+        let gate = LeafConstructGate {
+            smaller_count: smaller_rows.len() as i32,
+            smaller_sum_hessian: 100.0,
+            larger_count: larger_rows.len() as i32,
+            larger_sum_hessian: 100.0,
+            larger_leaf_index: 1, // a real sibling → subtract runs
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+        };
+
+        let built = construct_histogram_for_leaf(
+            &gc, &mut arena, &layout, &data, None, &smaller_rows, &grad, &hess, num_data, &fix_feats,
+            0.0, 0.0, &parent_hist, gate, false,
+        )
+        .expect("construct entry")
+        .expect("gate passes → Some");
+
+        // Smaller child matches the cpu f64 anchor over the smaller rows.
+        let anchor_smaller = cpu_anchor_columns(&columns, &nb_u32, &smaller_rows, &grad, &hess);
+        assert_close(&anchor_smaller, &built.smaller, "construct_for_leaf_smaller");
+
+        // Larger child (= parent − smaller, derived by the subtraction trick) matches the
+        // cpu f64 anchor over the larger rows.
+        let larger = built.larger.expect("larger_leaf_index >= 0 → Some");
+        let anchor_larger = cpu_anchor_columns(&columns, &nb_u32, &larger_rows, &grad, &hess);
+        assert_close(&anchor_larger, &larger, "construct_for_leaf_larger");
     }
 }

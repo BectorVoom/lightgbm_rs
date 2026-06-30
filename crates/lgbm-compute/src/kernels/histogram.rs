@@ -3230,6 +3230,148 @@ pub fn fix_histogram_mfb_on<R: cubecl::Runtime>(
     Ok(f64::from_bytes(&bytes).to_vec())
 }
 
+// ===========================================================================
+// Plan 16-04 Task 3 (ODL-10): the ConstructHistogramForLeaf entry — §7.0. The
+// build→de-quant→fix→rotate→subtract sequence behind the OFF-by-default
+// `LGBM_CUDA_ON_DEVICE` seam (`crate::cuda_on_device_enabled`, checked at the
+// future call site). `on_device_growth_supported()` independently stays false:
+// Phase 16 demonstrates the histogram path in isolation; the whole-tree pool SWAP
+// + growth driver are Phase 18/21.
+// ===========================================================================
+
+/// The two children's `hist_in_leaf` produced by [`construct_histogram_for_leaf`].
+///
+/// `smaller` is built-from-data → de-quanted → fixed; `larger` is the subtraction-trick
+/// derived child (`parent − smaller`, §17), `None` when `larger_leaf_index < 0` (no real
+/// sibling). Consumed by Phase 17 (best-split finder); the rotation contract by Phase 18
+/// (pool swap).
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone)]
+pub struct ConstructedLeafHists {
+    /// The smaller leaf's repaired hist_t (build → de-quant → fix).
+    pub smaller: Vec<f64>,
+    /// The larger leaf's hist_t (`parent − smaller`), or `None` if skipped.
+    pub larger: Option<Vec<f64>>,
+}
+
+/// The §7.0 child eligibility gate + the larger-sibling identity for
+/// [`construct_histogram_for_leaf`]. Mirrors the C++ `ConstructHistogramForLeaf`
+/// early-return: if BOTH children fail `min_data_in_leaf` / `min_sum_hessian_in_leaf`,
+/// nothing is built.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy)]
+pub struct LeafConstructGate {
+    /// Row count in the smaller leaf.
+    pub smaller_count: i32,
+    /// Σ hessian in the smaller leaf.
+    pub smaller_sum_hessian: f64,
+    /// Row count in the larger leaf.
+    pub larger_count: i32,
+    /// Σ hessian in the larger leaf.
+    pub larger_sum_hessian: f64,
+    /// The larger child's leaf index (`< 0` ⇒ no real sibling ⇒ subtract skipped, §7.5).
+    pub larger_leaf_index: i32,
+    /// `min_data_in_leaf` config.
+    pub min_data_in_leaf: i32,
+    /// `min_sum_hessian_in_leaf` config.
+    pub min_sum_hessian_in_leaf: f64,
+}
+
+/// `ConstructHistogramForLeaf` (§7.0, ODL-10): the on-device build→de-quant→fix→
+/// rotate→subtract entry. Sequences the 16-03 BUILD, the once de-quant, the 16-04 T1
+/// FIX of the smaller leaf, and the 16-04 T2 rotate+subtract that derives the larger
+/// child `parent − smaller` (§17) — returning BOTH children's `hist_in_leaf`.
+///
+/// §7.0 early-return: if BOTH children fail `min_data_in_leaf` / `min_sum_hessian_in_leaf`
+/// the call builds NOTHING and returns `Ok(None)`. Otherwise ONLY the smaller leaf is
+/// built from data (the larger is always derived by subtraction — building it directly
+/// takes a different f32 rounding path, §17). The larger is `None` when
+/// `larger_leaf_index < 0`.
+///
+/// ## Gating (D-07)
+/// This entry is reached in PRODUCTION only behind the OFF-by-default
+/// [`crate::cuda_on_device_enabled`] seam (the call site the Phase-18/21 growth driver
+/// adds; [`crate::Backend::on_device_growth_supported`] independently stays `false`). With
+/// the seam unset the entry is unreachable and every existing path is byte-unchanged. The
+/// anchor tests call it directly to validate the kernel sequence.
+///
+/// ## Anchor-pinning
+/// Both children are pinned to the cpu f64 fold (bit-exact structure; within ~1e-6 on
+/// hip), NEVER GPU-vs-GPU (def-f8u-01). `parent_hist` is the already-built+fixed parent
+/// leaf histogram (de-quanted hist_t) the subtract derives the larger from; the arena's
+/// `slot_len_elems` must equal `parent_hist.len()`.
+///
+/// # Errors
+/// Propagates [`construct_leaf_hist_on_device`] (BUILD V5), [`fix_histogram_mfb_on`]
+/// (FIX V5), and [`crate::kernels::subtract::subtract_histogram_on_device`] (rotation /
+/// length) errors.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_histogram_for_leaf<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    arena: &mut crate::kernels::histogram_arena::HistArena<R>,
+    layout: &crate::kernels::row_data::FeaturePartitionLayout,
+    data: &[u32],
+    row_ptr: Option<&[u32]>,
+    smaller_leaf_rows: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_data: usize,
+    // (slot_off, num_bin, most_freq_bin) per feature, for the smaller-leaf FIX.
+    fix_feats: &[(usize, u32, u32)],
+    // The smaller leaf's RAW (un-bumped) f64 totals (the FIX seed, Pitfall 2).
+    smaller_sum_gradient: f64,
+    smaller_sum_hessian: f64,
+    // The already-built+fixed parent leaf histogram (de-quanted hist_t) — subtract input.
+    parent_hist: &[f64],
+    gate: LeafConstructGate,
+    force_global: bool,
+) -> Result<Option<ConstructedLeafHists>, ComputeError> {
+    // §7.0 early-return: build NOTHING if BOTH children fail the leaf-size gate.
+    let smaller_ok = gate.smaller_count >= gate.min_data_in_leaf
+        && gate.smaller_sum_hessian >= gate.min_sum_hessian_in_leaf;
+    let larger_ok = gate.larger_count >= gate.min_data_in_leaf
+        && gate.larger_sum_hessian >= gate.min_sum_hessian_in_leaf;
+    if !smaller_ok && !larger_ok {
+        return Ok(None);
+    }
+
+    // BUILD only the smaller leaf from data (§7.0) → RAW u64 fixed-point histogram.
+    let raw = construct_leaf_hist_on_device(
+        client,
+        layout,
+        data,
+        row_ptr,
+        smaller_leaf_rows,
+        grad,
+        hess,
+        num_data,
+        force_global,
+    )?;
+    // DE-QUANT once (16-03 / Pattern 3): raw u64 → hist_t.
+    let smaller_dq = dequant_leaf_hist(&raw);
+    // FIX the smaller leaf's omitted most-freq bin in the hist_t domain (16-04 T1).
+    let smaller = fix_histogram_mfb_on(
+        client,
+        &smaller_dq,
+        fix_feats,
+        smaller_sum_gradient,
+        smaller_sum_hessian,
+    )?;
+    // ROTATE + SUBTRACT: derive larger = parent − smaller in place (16-04 T2). The
+    // smaller histogram above is the synced readback, so the subtract is structurally
+    // AFTER the build/fix sync (the 8aed100 ordering invariant).
+    let larger = crate::kernels::subtract::subtract_histogram_on_device(
+        client,
+        arena,
+        parent_hist,
+        &smaller,
+        gate.larger_leaf_index,
+    )?;
+
+    Ok(Some(ConstructedLeafHists { smaller, larger }))
+}
+
 /// Upload the binned feature columns to the device feature-major (feature `f`'s
 /// row `r` at `f * num_data + r`) and return the resident `Handle` — the same
 /// concatenated layout [`RocmBackend::upload_resident_bins`](crate::Backend::upload_resident_bins)
