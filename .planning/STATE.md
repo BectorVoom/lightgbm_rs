@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 16
-current_phase_name: On-Device Histogram Constructor
+current_phase_name: on-device-histogram-constructor
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-30T21:24:42.456Z"
-last_activity: 2026-06-29
-last_activity_desc: Phase 15 complete, transitioned to Phase 16
+last_updated: "2026-06-30T21:43:39.699Z"
+last_activity: 2026-06-30
+last_activity_desc: Phase 16 execution started
 progress:
   total_phases: 10
   completed_phases: 2
-  total_plans: 11
-  completed_plans: 11
+  total_plans: 16
+  completed_plans: 12
   percent: 20
 ---
 
@@ -24,15 +24,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 15 — on-device-device-dataset-row-subset-gather
+**Current focus:** Phase 16 — on-device-histogram-constructor
 
 ## Current Position
 
-Phase: 16 — On-Device Histogram Constructor
-Plan: Not started
+Phase: 16 (on-device-histogram-constructor) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-06-29 — Phase 15 complete, transitioned to Phase 16
+Last activity: 2026-06-30 — Phase 16 execution started
 
 Next: `/gsd-plan-phase 14`
 
@@ -558,6 +558,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 15 P03 | 5min | 1 tasks | 1 files |
 | Phase 15 P04 | 4min | 2 tasks | 1 files |
 | Phase 15 P05 | 10 | 1 tasks | 1 files |
+| Phase 16 P01 | 35min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -649,6 +650,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 15-02: §13 row store stores dense bins RAW and sparse bins partition-local (column_hist_offsets folded in); read_bin reconstructs the global bin uniformly across dense/sparse
 - [Phase 15]: ODL-04: CopySubrow gather + on-device bagging draw — host-validated indices, native-width dispatch, host-side bagging route anchored to host bag_data_indices (never GPU-vs-GPU)
 - [Phase 15]: Phase-15 merge gate D-10 green: device-dataset + row-subset-gather additions are fully additive (default cpu/ROCm/host-CUDA byte-unchanged, on-device seam OFF)
+- [Phase ?]: 16-01: Wave-0 fixtures are synthetic in-code (regenerable without C++ toolchain); committed histogram.txt dense anchor untouched
+- [Phase ?]: 16-01: ODL-09/ODL-10 stay pending — phase-spanning, completed only when build/fix/subtract kernels land (16-03/16-04)
 
 ### Pending Todos
 
@@ -678,7 +681,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-30T13:53:58.096Z
+Last session: 2026-06-30T21:42:48.934Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-on-device-histogram-constructor/16-CONTEXT.md
 
