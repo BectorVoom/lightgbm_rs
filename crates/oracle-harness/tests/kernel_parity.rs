@@ -3159,3 +3159,313 @@ mod hip {
         }
     }
 }
+
+// ===========================================================================
+// Phase 16 Wave 0 (Plan 16-01, Task 1): synthetic build/fix/subtract fixtures.
+//
+// Closes three VALIDATION.md Wave 0 gaps with PURE-SYNTHETIC, f64-anchored
+// fixtures (no C++ capture needed — these are the *exact* places parity
+// historically broke):
+//   (1) a sparse column set forcing CSR `row_ptr_type` ∈ {16,32,64} (§13 re-lay);
+//   (2) a large-bin column forcing `NumLargeBinPartition() > 0` (the `_GlobalMemory`
+//       spill, §7.2 / Pitfall 1);
+//   (3) a purpose-built `most_freq_bin != 0` column whose FixHistogram repaired
+//       default-bin value (`leaf_total − Σ(other bins, ascending)`) is stored as a
+//       golden constant computed in PLAIN Rust f64 — NEVER from the fix kernel under
+//       test (16-04's `fix_compact_kernel`).
+//
+// Every expected histogram is anchored to the cpu f64 fold
+// (`construct_histograms_f64_on`, CubeDim::new_1d(1)); NO GPU output is ever stored
+// as a golden (D-05, def-f8u-01). NO fixture stores a compacted (offset-shifted)
+// histogram shape — §7 is build→fix→subtract only (Pitfall 5).
+//
+// The committed dense corpora build anchor (`tests/fixtures/kernels/histogram.txt`,
+// replayed by `kernel_parity_histogram_bit_exact_on_cpu` above) remains the C++-
+// captured half of the D-05 anchor; these synthetic builders are the partition-
+// layout / Fix / ordering half that needs no C++ toolchain to regenerate.
+// ===========================================================================
+mod kernel16_fixtures {
+    use lgbm_compute::kernels::histogram::construct_histograms_f64_on;
+    use lgbm_compute::kernels::row_data::{divide_cuda_feature_groups, CudaRowData};
+    use lgbm_compute::runtime::{cpu_client, ActiveRuntime};
+    use lgbm_compute::BinColumn;
+
+    /// `shared_hist_size` for every §13 partition layout here (the design-doc DP
+    /// value; the SMEM budget = `shared_hist_size / 2` = 3072 bins).
+    pub const SHARED_HIST_SIZE: usize = 6144;
+
+    // ---- sparse fixture (forces row_ptr_type {16,32,64}) -------------------
+    /// One synthesized sparse column: the host binned-value oracle + the logical nnz
+    /// that selects the CSR `row_ptr_type` width.
+    pub struct SparseSynthColumn {
+        pub bins: BinColumn,
+        pub num_bin: u32,
+        /// Logical non-zeros — selects the CSR `row_ptr_type` width {16, 32, 64}
+        /// (carried as a NUMBER; never materialized — D-04).
+        pub nnz: u64,
+    }
+
+    /// The CSR `row_ptr_type` width a logical nnz forces (16-bit if it fits a `u16`
+    /// row-pointer, 32-bit if a `u32`, else 64-bit).
+    #[must_use]
+    pub fn row_ptr_type_for(nnz: u64) -> u32 {
+        if nnz <= u64::from(u16::MAX) {
+            16
+        } else if nnz <= u64::from(u32::MAX) {
+            32
+        } else {
+            64
+        }
+    }
+
+    /// Three synthetic sparse columns, each tagged with a logical nnz that forces a
+    /// distinct CSR `row_ptr_type` width {16, 32, 64}. All share 8 rows so they re-lay
+    /// as one matrix (the Phase-15 `synth` shape, reused per research A3).
+    #[must_use]
+    pub fn sparse_columns() -> Vec<SparseSynthColumn> {
+        vec![
+            // small nnz -> row_ptr_type 16.
+            SparseSynthColumn {
+                bins: BinColumn::new(vec![0, 1, 2, 3, 0, 1, 2, 3], 200),
+                num_bin: 200,
+                nnz: 1_000,
+            },
+            // nnz crosses 2^16 -> row_ptr_type 32.
+            SparseSynthColumn {
+                bins: BinColumn::new(vec![0, 300, 301, 5, 6, 7, 8, 9], 4_000),
+                num_bin: 4_000,
+                nnz: 70_000,
+            },
+            // nnz crosses 2^32 -> row_ptr_type 64.
+            SparseSynthColumn {
+                bins: BinColumn::new(vec![0, 1, 2, 3, 4, 5, 6, 7], 200),
+                num_bin: 200,
+                nnz: 5_000_000_000,
+            },
+        ]
+    }
+
+    /// Drive the §13 sparse re-lay over the fixture and return the set of resolved
+    /// `row_ptr_bit_type` widths (the re-lay width the device actually selected) — the
+    /// authoritative assertion that each of {16,32,64} is forced.
+    #[must_use]
+    pub fn sparse_resolved_widths() -> std::collections::BTreeSet<u32> {
+        let client = cpu_client();
+        let cols = sparse_columns();
+        let bin_columns: Vec<BinColumn> = cols.iter().map(|c| c.bins.clone()).collect();
+        let num_bin_per_column: Vec<usize> = cols.iter().map(|c| c.num_bin as usize).collect();
+        let layout = divide_cuda_feature_groups(&num_bin_per_column, SHARED_HIST_SIZE);
+
+        let mut widths = std::collections::BTreeSet::new();
+        for c in &cols {
+            let rpt = row_ptr_type_for(c.nnz);
+            let device = CudaRowData::<ActiveRuntime>::get_sparse_data_partitioned(
+                &client,
+                &bin_columns,
+                &layout,
+                rpt,
+            )
+            .expect("sparse re-lay");
+            // Assert the re-lay resolved to the width the fixture forces (not a silent widen).
+            assert_eq!(
+                device.row_ptr_bit_type(),
+                rpt,
+                "sparse re-lay must select the row_ptr width the fixture forces"
+            );
+            widths.insert(device.row_ptr_bit_type());
+        }
+        widths
+    }
+
+    // ---- large-bin / global-spill fixture (NumLargeBinPartition() > 0) ------
+    /// Per-column bin counts whose final column (4000 bins) exceeds the SMEM budget
+    /// (3072 for `shared_hist_size` 6144), forcing its own large-bin partition — the
+    /// `_GlobalMemory` spill path (Pitfall 1, D-04).
+    #[must_use]
+    pub fn large_bin_num_bin_per_column() -> Vec<usize> {
+        vec![1_000, 1_000, 4_000]
+    }
+
+    /// `NumLargeBinPartition()` the large-bin fixture yields (must be > 0).
+    #[must_use]
+    pub fn large_bin_num_large_partitions() -> usize {
+        divide_cuda_feature_groups(&large_bin_num_bin_per_column(), SHARED_HIST_SIZE)
+            .num_large_bin_partition
+    }
+
+    // ---- most_freq_bin != 0 fixture (FixHistogram omit-and-repair) ----------
+    /// A purpose-built `most_freq_bin != 0` column + its f64-anchored build histogram
+    /// and the golden repaired default-bin value.
+    pub struct MfbFixture {
+        pub bins: Vec<u32>,
+        pub grad: Vec<f32>,
+        pub hess: Vec<f32>,
+        pub num_bin: u32,
+        /// The most-frequent bin — non-zero AND in range (`0 < mfb < num_bin`), so it
+        /// exercises FixHistogram's omit-and-repair path (Pitfall 4, DEF-07-02 class).
+        pub mfb: u32,
+        /// Raw f64 leaf totals (`Σ grad`, `Σ hess` over the leaf's rows, ascending) —
+        /// the seeds FixHistogram subtracts from.
+        pub leaf_total_grad: f64,
+        pub leaf_total_hess: f64,
+        /// The full `2*num_bin` interleaved build histogram, anchored to the cpu f64
+        /// fold. NO compaction (Pitfall 5).
+        pub hist: Vec<f64>,
+        /// The GOLDEN repaired default-bin value = `leaf_total − Σ(other bins,
+        /// ascending)`, computed in PLAIN Rust f64 — never the fix kernel under test.
+        pub golden_repaired_grad: f64,
+        pub golden_repaired_hess: f64,
+    }
+
+    /// Build the mfb!=0 fixture. The histogram is the cpu f64 BUILD anchor; the repaired
+    /// default-bin value is computed in plain Rust f64 (the stored golden), independent
+    /// of the FixHistogram kernel under test (16-04).
+    #[must_use]
+    pub fn mfb_fixture() -> MfbFixture {
+        let num_bin = 5u32;
+        let mfb = 2u32; // non-zero, in-range; the most-frequent bin below.
+        // bin 2 is the most-frequent (4 of 8 rows); the other in-range bins appear once.
+        let bins = vec![2u32, 0, 2, 1, 2, 3, 4, 2];
+        // Signed/fractional grad so cancellation is real (the cell is a difference of
+        // partial sums — the DEF-07-02-class sensitivity).
+        let grad = vec![0.5f32, -1.25, 2.0, -0.75, 3.5, -2.5, 1.0, -0.25];
+        let hess = vec![1.0f32, 1.5, 2.0, 0.5, 1.25, 2.5, 0.75, 1.75];
+
+        // Raw leaf totals: f64 sum over rows in ascending row order.
+        let mut leaf_total_grad = 0.0f64;
+        let mut leaf_total_hess = 0.0f64;
+        for i in 0..bins.len() {
+            leaf_total_grad += f64::from(grad[i]);
+            leaf_total_hess += f64::from(hess[i]);
+        }
+
+        // BUILD anchor: the cpu f64 single-owner ordered fold — never a GPU output.
+        let client = cpu_client();
+        let hist =
+            construct_histograms_f64_on::<ActiveRuntime>(&client, &bins, &grad, &hess, num_bin)
+                .expect("mfb build anchor");
+
+        // Golden repaired value: leaf_total − Σ(other bins, ASCENDING). Ascending bin
+        // order is load-bearing (the cpu anchor fold order); this is the exact arithmetic
+        // FixHistogram performs, computed here in plain f64.
+        let mut g = leaf_total_grad;
+        let mut h = leaf_total_hess;
+        for b in 0..num_bin {
+            if b == mfb {
+                continue;
+            }
+            g -= hist[(b as usize) * 2];
+            h -= hist[(b as usize) * 2 + 1];
+        }
+
+        MfbFixture {
+            bins,
+            grad,
+            hess,
+            num_bin,
+            mfb,
+            leaf_total_grad,
+            leaf_total_hess,
+            hist,
+            golden_repaired_grad: g,
+            golden_repaired_hess: h,
+        }
+    }
+}
+
+/// Wave 0 (16-01 T1): the synthetic SPARSE fixture forces each CSR `row_ptr_type`
+/// width {16,32,64} across its three configured columns (assert on the *resolved*
+/// re-lay width, not just the tag).
+#[test]
+fn kernel16_sparse_fixture_forces_all_row_ptr_widths() {
+    let widths = kernel16_fixtures::sparse_resolved_widths();
+    assert_eq!(
+        widths,
+        [16u32, 32, 64].into_iter().collect(),
+        "the three configured sparse columns must force row_ptr widths {{16,32,64}}"
+    );
+}
+
+/// Wave 0 (16-01 T1): the synthetic LARGE-BIN fixture forces the `_GlobalMemory`
+/// spill — `divide_cuda_feature_groups` yields `num_large_bin_partition > 0`.
+#[test]
+fn kernel16_large_bin_fixture_forces_global_spill() {
+    assert!(
+        kernel16_fixtures::large_bin_num_large_partitions() > 0,
+        "large-bin fixture must yield num_large_bin_partition > 0 (the _GlobalMemory spill path)"
+    );
+}
+
+/// Wave 0 (16-01 T1): the `most_freq_bin != 0` fixture's stored golden default-bin
+/// value equals `leaf_total − Σ(other bins, ascending)`, recomputed INDEPENDENTLY by
+/// a plain Rust f64 loop in this test (NOT the fix kernel under test), and the build
+/// anchor carries the full `2*num_bin` interleaved shape (no compaction, Pitfall 5).
+#[test]
+fn fix_mfb_nonzero_repaired_default_bin_anchored() {
+    let fx = kernel16_fixtures::mfb_fixture();
+
+    // (a) No compacted shape: the stored build anchor is the full 2*num_bin interleaved
+    //     histogram (§7 never compacts — Pitfall 5).
+    assert_eq!(
+        fx.hist.len(),
+        2 * fx.num_bin as usize,
+        "build anchor must be the full 2*num_bin shape (no offset-shifted compaction)"
+    );
+
+    // (b) mfb is non-zero AND in range — the omit-and-repair precondition
+    //     (`0 < mfb < num_bin`, the fix_compact_kernel `do_fix` guard).
+    assert!(
+        fx.mfb > 0 && fx.mfb < fx.num_bin,
+        "fixture must force the mfb>0 in-range FixHistogram path"
+    );
+    // and it is genuinely the most-frequent bin (the scatter would omit it).
+    let mfb_count = fx.bins.iter().filter(|&&b| b == fx.mfb).count();
+    for b in 0..fx.num_bin {
+        let c = fx.bins.iter().filter(|&&x| x == b).count();
+        assert!(
+            mfb_count >= c,
+            "mfb {} must be the most-frequent bin (bin {b} appears {c} >= {mfb_count})",
+            fx.mfb
+        );
+    }
+
+    // (c) INDEPENDENT plain-f64 recompute of leaf totals (ascending row order) and of
+    //     `leaf_total − Σ(other bins, ascending)` — a SEPARATE loop from the builder's,
+    //     never the fix kernel.
+    let mut leaf_g = 0.0f64;
+    let mut leaf_h = 0.0f64;
+    for i in 0..fx.bins.len() {
+        leaf_g += f64::from(fx.grad[i]);
+        leaf_h += f64::from(fx.hess[i]);
+    }
+    assert_eq!(
+        leaf_g.to_bits(),
+        fx.leaf_total_grad.to_bits(),
+        "independent leaf_total_grad must match the stored seed"
+    );
+    assert_eq!(
+        leaf_h.to_bits(),
+        fx.leaf_total_hess.to_bits(),
+        "independent leaf_total_hess must match the stored seed"
+    );
+
+    let mut rep_g = leaf_g;
+    let mut rep_h = leaf_h;
+    for b in 0..fx.num_bin {
+        if b == fx.mfb {
+            continue;
+        }
+        rep_g -= fx.hist[(b as usize) * 2];
+        rep_h -= fx.hist[(b as usize) * 2 + 1];
+    }
+    assert_eq!(
+        rep_g.to_bits(),
+        fx.golden_repaired_grad.to_bits(),
+        "stored golden grad must equal leaf_total − Σ(other bins ascending), computed independently"
+    );
+    assert_eq!(
+        rep_h.to_bits(),
+        fx.golden_repaired_hess.to_bits(),
+        "stored golden hess must equal leaf_total − Σ(other bins ascending), computed independently"
+    );
+}
