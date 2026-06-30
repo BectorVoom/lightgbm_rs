@@ -209,6 +209,62 @@ impl<R: cubecl::Runtime> HistArena<R> {
     pub fn larger_handle(&self) -> Handle {
         self.slots[self.larger_idx].clone()
     }
+
+    /// Rotate the `hist_t**` role indices for the subtraction trick (D-02 / §17):
+    /// the larger child is derived **in-place in the parent's buffer**
+    /// (`larger_idx <- parent_idx`) and the smaller child is assigned a **fresh
+    /// slot** distinct from the parent (`smaller_idx <- fresh`).
+    ///
+    /// This reassigns INDICES ONLY — it performs ZERO `client.empty` calls and NO
+    /// bulk histogram copy, so [`Self::device_allocations`] is unchanged across any
+    /// number of `rotate()` calls. After rotation the round-trip contract holds:
+    /// handing `{parent_handle(), smaller_handle()}` to a subtract that computes
+    /// `larger = parent - smaller` lands the result in the `larger` slot — which is
+    /// the parent's old buffer (`larger_idx == old parent_idx`).
+    ///
+    /// The no-alias invariant `smaller_idx != parent_idx` (== `larger_idx`) is
+    /// enforced (T-16-02-02): a parent/smaller alias would let the in-place subtract
+    /// corrupt the parent before the smaller is read.
+    ///
+    /// This is the ONE-triple demonstration; the cross-tree whole-pool SWAP is
+    /// Phase 18 (16-CONTEXT §9).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] if the pool has fewer than 2 slots — a fresh,
+    /// non-aliasing slot for the smaller child cannot be allocated from a 1-slot
+    /// pool without aliasing the parent.
+    pub fn rotate(&mut self) -> Result<(), ComputeError> {
+        if self.num_slots < 2 {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "HistArena::rotate: a non-aliasing smaller slot requires \
+                     num_slots >= 2 (have {})",
+                    self.num_slots
+                ),
+            });
+        }
+
+        // The larger child is derived in-place in the parent's buffer.
+        self.larger_idx = self.parent_idx;
+        // The smaller child takes a fresh slot distinct from the parent (== larger).
+        let fresh = (self.parent_idx + 1) % self.num_slots;
+        self.smaller_idx = fresh;
+
+        // T-16-02-02: never alias parent and smaller into the same slot. With
+        // `num_slots >= 2`, `(parent_idx + 1) % num_slots != parent_idx` always
+        // holds; assert it as a hard invariant (a violation is a logic bug, not a
+        // recoverable runtime condition).
+        debug_assert_ne!(
+            self.smaller_idx, self.parent_idx,
+            "HistArena::rotate must never alias parent and smaller into one slot"
+        );
+        assert_ne!(
+            self.smaller_idx, self.larger_idx,
+            "HistArena::rotate: smaller must not alias the larger (== parent) slot"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +336,122 @@ mod tests {
         let arena = HistArena::new(&client, 3, 16).unwrap();
         assert_eq!(arena.parent_idx(), 0);
         assert_ne!(arena.smaller_idx(), arena.parent_idx());
+    }
+
+    /// D-02 / T-16-02-02: after `rotate()`, `larger_idx == previous parent_idx`,
+    /// `smaller_idx != parent_idx`, and `smaller_idx != larger_idx` — the larger
+    /// child inherits the parent buffer in-place and the smaller takes a fresh,
+    /// non-aliasing slot. Anchor-tests the INDEX bookkeeping in isolation.
+    #[test]
+    fn rotate_bookkeeping_no_alias() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 3, 16).unwrap();
+        let old_parent = arena.parent_idx();
+
+        arena.rotate().unwrap();
+
+        assert_eq!(
+            arena.larger_idx(),
+            old_parent,
+            "larger must inherit the parent slot in-place"
+        );
+        assert_ne!(
+            arena.smaller_idx(),
+            arena.parent_idx(),
+            "smaller must not alias the parent slot"
+        );
+        assert_ne!(
+            arena.smaller_idx(),
+            arena.larger_idx(),
+            "smaller must not alias the larger (== parent) slot"
+        );
+    }
+
+    /// D-09: the allocation counter is identical before and after any number of
+    /// `rotate()` calls — rotation reassigns indices only, no `client.empty`.
+    #[test]
+    fn rotate_does_not_allocate() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 3, 16).unwrap();
+        let before = arena.device_allocations();
+        for _ in 0..5 {
+            arena.rotate().unwrap();
+        }
+        assert_eq!(
+            arena.device_allocations(),
+            before,
+            "rotate() must perform zero allocations"
+        );
+    }
+
+    /// A 1-slot pool cannot supply a non-aliasing smaller slot — `rotate()` rejects
+    /// it with a typed error rather than aliasing the parent (T-16-02-02).
+    #[test]
+    fn rotate_rejects_single_slot_pool() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 1, 16).unwrap();
+        let res = arena.rotate();
+        assert!(matches!(res, Err(ComputeError::Runtime { .. })));
+    }
+
+    /// D-02 round-trip on the cpu f64 anchor (never GPU-vs-GPU): after `rotate()`,
+    /// driving `{parent, smaller}` through the VERBATIM `subtract_hist_kernel`
+    /// (`out = parent - smaller`) with the arena's `larger` slot as the output lands
+    /// the derived histogram in the `larger` (== old parent) slot — proving the
+    /// in-place derivation contract. The allocation counter stays frozen.
+    #[test]
+    fn rotate_subtract_lands_in_larger_parent_slot() {
+        use crate::kernels::subtract::subtract_hist_kernel;
+
+        let client = cpu_client();
+        let slot_len = 8usize; // 4 bins × 2 (stride-2 [g,h,g,h,…])
+        let mut arena = HistArena::new(&client, 3, slot_len).unwrap();
+        let old_parent = arena.parent_idx();
+
+        arena.rotate().unwrap();
+        // The larger child is derived into the old parent slot.
+        assert_eq!(arena.larger_idx(), old_parent);
+
+        // Representative parent / smaller-child stride-2 histograms.
+        let parent_data = vec![10.0f64, 5.0, 8.0, 4.0, 9.0, 3.0, 7.0, 2.0];
+        let smaller_data = vec![3.0f64, 2.0, 1.0, 1.0, 4.0, 1.0, 2.0, 1.0];
+        let expected: Vec<f64> = parent_data
+            .iter()
+            .zip(&smaller_data)
+            .map(|(p, c)| p - c)
+            .collect();
+
+        let h_parent = client.create_from_slice(f64::as_bytes(&parent_data));
+        let h_smaller = client.create_from_slice(f64::as_bytes(&smaller_data));
+        // The OUTPUT is the arena's larger slot (== old parent slot, in-place).
+        let h_larger = arena.larger_handle();
+
+        let allocs_before_launch = arena.device_allocations();
+
+        // SAFETY: `h_parent`/`h_smaller` are each sized `slot_len` f64 cells, and the
+        // arena's larger slot was allocated for `slot_len` f64 cells in `new`; all
+        // three outlive the launch and the kernel touches only indices `0..slot_len`
+        // (the grid over-covers but the `while i < n` bound guards every write).
+        unsafe {
+            subtract_hist_kernel::launch(
+                &client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(h_parent, slot_len),
+                ArrayArg::from_raw_parts(h_smaller, slot_len),
+                ArrayArg::from_raw_parts(h_larger.clone(), slot_len),
+            );
+        }
+
+        let bytes = client.read_one_unchecked(h_larger);
+        let got = f64::from_bytes(&bytes).to_vec();
+        assert_eq!(got, expected, "derived larger histogram must equal parent - smaller");
+
+        // The whole round-trip allocated nothing in the arena (D-09).
+        assert_eq!(
+            arena.device_allocations(),
+            allocs_before_launch,
+            "rotate + subtract round-trip must not grow the arena allocation count"
+        );
     }
 }
