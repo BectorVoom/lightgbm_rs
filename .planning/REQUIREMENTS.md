@@ -27,7 +27,7 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 ### Histogram constructor (§7) — the hot path
 
 - [ ] **ODL-09**: On-device **histogram build** (dense + sparse × shared-memory + global-memory spill), two-tier atomic accumulation (block-local then cross-block merge), on the f32 / **u64 fixed-point** accumulation path (NO f64 per-row hot loop — ODL-19), anchor-pinned to the cpu f64 fold. (§7.1–7.4.)
-- [ ] **ODL-10**: The **subtraction trick on device** — build-smaller-only, `FixHistogram` (most-frequent-bin omission repair via leaf-total minus scanned sum), `SubtractHistogram` (larger = parent − smaller) realized through **`hist_t**` pointer rotation** (larger child inherits the parent buffer; smaller child gets a fresh arena slot), no bulk histogram copy. Preserved as a **correctness** requirement — building the larger child directly takes a different rounding path. (§7.5, §17.)
+- [x] **ODL-10**: The **subtraction trick on device** — build-smaller-only, `FixHistogram` (most-frequent-bin omission repair via leaf-total minus scanned sum), `SubtractHistogram` (larger = parent − smaller) realized through **`hist_t**` pointer rotation** (larger child inherits the parent buffer; smaller child gets a fresh arena slot), no bulk histogram copy. Preserved as a **correctness** requirement — building the larger child directly takes a different rounding path. (§7.5, §17.)
 
 ### Best-split finder (§8)
 
@@ -94,7 +94,7 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-07 | Phase 19 | Pending |
 | ODL-08 | Phase 19 | Pending |
 | ODL-09 | Phase 16 | Pending |
-| ODL-10 | Phase 16 | Pending |
+| ODL-10 | Phase 16 | Complete |
 | ODL-11 | Phase 17 | Pending |
 | ODL-12 | Phase 17 | Pending |
 | ODL-13 | Phase 18 | Pending |
