@@ -1545,6 +1545,254 @@ pub fn construct_leaf_hist_partition_global_u64<B: Int>(
     }
 }
 
+/// De-quant the raw u64 fixed-point histogram to `hist_t` (f64) exactly ONCE
+/// (Plan 16-03 Task 3 / D-01/D-08): `(bits as i64) / 2^30` — the SAME 2^30 scale as the
+/// build side ([`SCALE_F32`]), mirroring `fix_compact_kernel`'s folded dequant first pass
+/// (`(bits as i64)/SCALE_F64`). Kept a SEPARATE pass (RESEARCH Pattern 3 / Open Q1) so
+/// BUILD stays a clean u64-only accumulator and the cpu-anchor split is unentangled; the
+/// 16-04 Fix step then operates on the durable `hist_t`. Round-trip exact for
+/// integer-valued cells, ≤ 1/2^30 abs error otherwise — well inside the ~1e-6 ROCm gate.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn dequant_leaf_hist(raw: &[u64]) -> Vec<f64> {
+    const SCALE_F64: f64 = 1_073_741_824.0; // 2^30 (matches SCALE_F32 / fix_compact SCALE_F64)
+    raw.iter().map(|&bits| (bits as i64) as f64 / SCALE_F64).collect()
+}
+
+/// f32 mirror of [`dequant_leaf_hist`] for the no-f64 hip device (CMP-04): the durable
+/// `hist_t` on ROCm/CUDA is f32. Same 2^30 scale; the ~1e-6 ROCm gate absorbs the f32
+/// rounding (never the cpu f64 anchor).
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn dequant_leaf_hist_f32(raw: &[u64]) -> Vec<f32> {
+    const SCALE_F32D: f32 = 1_073_741_824.0; // 2^30
+    raw.iter().map(|&bits| (bits as i64) as f32 / SCALE_F32D).collect()
+}
+
+/// Spill-buffer cell count for the `_GlobalMemory` path (`grid_dim_y · num_total_bin · 2`),
+/// `checked_mul`-guarded (D-09 / T-16-03-03). A separate `#[must_use]` helper so the
+/// overflow guard is unit-testable without a device.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if the product overflows `usize` (or is zero).
+#[cfg(feature = "gpu")]
+pub fn spill_cells(grid_dim_y: usize, num_total_bin: usize) -> Result<usize, ComputeError> {
+    let cells = grid_dim_y
+        .checked_mul(num_total_bin)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!(
+                "spill buffer size grid_dim_y {grid_dim_y} · num_total_bin {num_total_bin} · 2 \
+                 overflows usize"
+            ),
+        })?;
+    if cells == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "spill buffer size is zero (empty layout)".to_string(),
+        });
+    }
+    Ok(cells)
+}
+
+/// Host launcher for the §13 two-tier BUILD (Plan 16-03 Task 3 / ODL-09). Derives the
+/// §7.1 geometry from [`FeaturePartitionLayout`], runs the V5 bounds checks BEFORE any
+/// `launch_unchecked` (T-16-03-01), zeroes the `out` accumulator from an explicit zero
+/// slice (Caller-must-zero, never a pooled-uninitialized buffer), selects dense/sparse
+/// (`row_ptr.is_some()`) and shared/`_GlobalMemory` (large-bin or `force_global`), and
+/// returns the RAW u64 fixed-point histogram `[2·num_total_bin]`. The caller de-quants
+/// once via [`dequant_leaf_hist`] (BUILD stays u64-only, D-08 / Pattern 3).
+///
+/// `data` is the partition row-major store (dense: RAW per-column bin; sparse: the CSR
+/// values, partition-local). `grad`/`hess` are FULL-CORPUS, read at the gathered row.
+/// `force_global` forces the `_GlobalMemory` path on a fitting layout — the parity-neutral
+/// toggle (§17) the shared-vs-global equivalence test drives.
+///
+/// # Errors
+/// [`ComputeError`] for: empty layout (→ `Ok(vec![])`, NO launch), `num_total_bin == 0`,
+/// `2·num_total_bin` overflow, a `leaf_rows`/`grad`/`hess`/`data`/`row_ptr` length or
+/// range violation, or a spill-size overflow.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_leaf_hist_on_device<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    layout: &crate::kernels::row_data::FeaturePartitionLayout,
+    data: &[u32],
+    row_ptr: Option<&[u32]>,
+    leaf_rows: &[u32],
+    grad: &[f32],
+    hess: &[f32],
+    num_data: usize,
+    force_global: bool,
+) -> Result<Vec<u64>, ComputeError> {
+    let num_partitions = layout.num_feature_partitions;
+    // Empty layout: no columns / no partitions → no launch (the degenerate Ok path).
+    if num_partitions == 0 || layout.feature_partition_column_index_offsets.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let num_columns = *layout
+        .feature_partition_column_index_offsets
+        .last()
+        .expect("offsets has >= 2 entries");
+    let num_total_bin = *layout
+        .partition_hist_offsets
+        .last()
+        .expect("partition_hist_offsets has >= 2 entries");
+
+    // --- V5 boundary validation (T-16-03-01) BEFORE any launch ---
+    if num_total_bin == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "construct_leaf_hist_on_device: num_total_bin must be > 0".to_string(),
+        });
+    }
+    let out_len = num_total_bin
+        .checked_mul(2)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!("2 · num_total_bin {num_total_bin} overflows usize"),
+        })?;
+    if grad.len() < num_data || hess.len() < num_data {
+        return Err(ComputeError::LengthMismatch {
+            expected: num_data,
+            actual: grad.len().min(hess.len()),
+        });
+    }
+    for (row, &di) in leaf_rows.iter().enumerate() {
+        if di as usize >= num_data {
+            return Err(ComputeError::BinIndexOutOfRange {
+                row,
+                bin: di,
+                num_bin: num_data as u32,
+            });
+        }
+    }
+    let is_sparse = row_ptr.is_some();
+    if is_sparse {
+        let rp = row_ptr.expect("is_sparse implies row_ptr present");
+        let expect_rp = num_partitions
+            .checked_mul(num_data + 1)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "num_partitions · (num_data+1) overflows usize".to_string(),
+            })?;
+        if rp.len() != expect_rp {
+            return Err(ComputeError::LengthMismatch { expected: expect_rp, actual: rp.len() });
+        }
+    } else {
+        // dense store must cover every partition's row-major region (num_columns · num_data).
+        let expect = num_columns
+            .checked_mul(num_data)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: "num_columns · num_data overflows usize".to_string(),
+            })?;
+        if data.len() < expect {
+            return Err(ComputeError::LengthMismatch { expected: expect, actual: data.len() });
+        }
+    }
+
+    // --- §7.1 geometry ---
+    let bx = layout.max_num_column_per_partition.max(1) as u32; // block_dim_x = cols/partition
+    let by = (256u32 / bx).max(1); // row workers (NUM_THREADS_PER_BLOCK analog)
+    let rows = leaf_rows.len();
+    // grid_dim_y: a modest row over-decomposition; correctness is gy-independent (atomic
+    // merge), so keep it small here (the §7.1 floor of 160 is an occupancy knob, no parity).
+    let gy = (rows.div_ceil((by as usize).max(1)))
+        .clamp(1, 16)
+        .max(1) as u32;
+
+    // Per-partition max bin span decides the shared-vs-global route (LDS cap = HIST_LDS_MAX).
+    let mut max_span = 0usize;
+    for p in 0..num_partitions {
+        let span =
+            layout.partition_hist_offsets[p + 1] - layout.partition_hist_offsets[p];
+        if span > max_span {
+            max_span = span;
+        }
+    }
+    let use_global =
+        force_global || layout.num_large_bin_partition > 0 || max_span * 2 > HIST_LDS_MAX;
+
+    // --- upload (caller-zeroed `out`; explicit zero slice, never pooled-uninitialized) ---
+    let part_col_off: Vec<u32> = layout
+        .feature_partition_column_index_offsets
+        .iter()
+        .map(|&v| v as u32)
+        .collect();
+    let col_hist_off: Vec<u32> =
+        layout.column_hist_offsets.iter().map(|&v| v as u32).collect();
+    let part_hist_off: Vec<u32> =
+        layout.partition_hist_offsets.iter().map(|&v| v as u32).collect();
+    let dummy_rp = [0u32]; // dense: kernel never reads row_ptr (is_sparse=false)
+    let rp_slice = row_ptr.unwrap_or(&dummy_rp);
+
+    let h_data = client.create_from_slice(u32::as_bytes(data));
+    let h_rp = client.create_from_slice(u32::as_bytes(rp_slice));
+    let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
+    let h_grad = client.create_from_slice(f32::as_bytes(grad));
+    let h_hess = client.create_from_slice(f32::as_bytes(hess));
+    let h_pco = client.create_from_slice(u32::as_bytes(&part_col_off));
+    let h_cho = client.create_from_slice(u32::as_bytes(&col_hist_off));
+    let h_pho = client.create_from_slice(u32::as_bytes(&part_hist_off));
+    let zeros = vec![0u64; out_len];
+    let h_out = client.create_from_slice(u64::as_bytes(&zeros));
+
+    let cube_count = CubeCount::Static(num_partitions as u32, gy, 1);
+    let cube_dim = CubeDim::new_2d(bx, by);
+
+    if use_global {
+        // Pre-allocate the spill buffer ONCE (D-09): a single `client.empty`, never in a
+        // per-tree loop. The kernel zeroes each active y-block slice in its Phase 1, so an
+        // uninitialized pool buffer is sound (every read is preceded by a store).
+        let spill_len = spill_cells(gy as usize, num_total_bin)?;
+        let h_spill = client.empty(spill_len * core::mem::size_of::<u64>());
+        // SAFETY: every handle is sized to its slice/alloc and outlives the launch; the V5
+        // checks above prove `leaf_rows ⊂ [0,num_data)`, `data`/`row_ptr` cover every
+        // partition region, and `out`/`spill` are sized `out_len`/`spill_len`. All cubecl
+        // unsafe is confined here (CMP-01).
+        unsafe {
+            construct_leaf_hist_partition_global_u64::launch_unchecked::<u32, R>(
+                client,
+                cube_count,
+                cube_dim,
+                ArrayArg::from_raw_parts(h_data, data.len()),
+                ArrayArg::from_raw_parts(h_rp, rp_slice.len()),
+                ArrayArg::from_raw_parts(h_rows, rows),
+                ArrayArg::from_raw_parts(h_grad, grad.len()),
+                ArrayArg::from_raw_parts(h_hess, hess.len()),
+                ArrayArg::from_raw_parts(h_pco, part_col_off.len()),
+                ArrayArg::from_raw_parts(h_cho, col_hist_off.len()),
+                ArrayArg::from_raw_parts(h_pho, part_hist_off.len()),
+                num_data,
+                num_total_bin,
+                ArrayArg::from_raw_parts(h_spill, spill_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                is_sparse,
+            );
+        }
+    } else {
+        // SAFETY: as above; the shared path uses LDS (no spill), `max_span·2 <= HIST_LDS_MAX`
+        // guaranteed by the `use_global` route.
+        unsafe {
+            construct_leaf_hist_partition_u64::launch_unchecked::<u32, R>(
+                client,
+                cube_count,
+                cube_dim,
+                ArrayArg::from_raw_parts(h_data, data.len()),
+                ArrayArg::from_raw_parts(h_rp, rp_slice.len()),
+                ArrayArg::from_raw_parts(h_rows, rows),
+                ArrayArg::from_raw_parts(h_grad, grad.len()),
+                ArrayArg::from_raw_parts(h_hess, hess.len()),
+                ArrayArg::from_raw_parts(h_pco, part_col_off.len()),
+                ArrayArg::from_raw_parts(h_cho, col_hist_off.len()),
+                ArrayArg::from_raw_parts(h_pho, part_hist_off.len()),
+                num_data,
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                is_sparse,
+            );
+        }
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(u64::from_bytes(&bytes).to_vec())
+}
+
 /// LDS batched RAW build: one cube per feature, reads host-gathered bins
 /// (`gathered_bins[f*R + k]`). `slot_off` has `num_features + 1` entries (sentinel).
 #[cfg(feature = "gpu")]

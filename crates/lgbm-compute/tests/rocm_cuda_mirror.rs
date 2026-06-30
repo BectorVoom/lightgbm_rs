@@ -302,8 +302,9 @@ fn partition_aware_sparse_cpu_anchor_scaffold() {
         interleave_layout(feat, &eg, &eh);
         base += 2 * nb as usize;
     }
-    // TODO(16-03/16-04): build the GPU sparse histogram over `data_indices` and
-    // `assert_close(&anchor, &gpu, "sparse_partition")` (never GPU-vs-GPU).
+    // 16-03 DONE: `mod hip::partition_build_sparse_matches_cpu_anchor` builds the GPU
+    // sparse §13 histogram over `data_indices`, de-quants, and `assert_close`s it to this
+    // cpu f64 anchor (never GPU-vs-GPU).
 }
 
 /// §13 LARGE-BIN / `_GlobalMemory` spill partition-aware case entry point: a column
@@ -348,8 +349,9 @@ fn partition_aware_largebin_spill_cpu_anchor_scaffold() {
         interleave_layout(&anchor[base..base + 2 * nb as usize], &eg, &eh);
         base += 2 * nb as usize;
     }
-    // TODO(16-03): build the GPU `_GlobalMemory` spill histogram and
-    // `assert_close(&anchor, &gpu, "largebin_spill")` (never GPU-vs-GPU).
+    // 16-03 DONE: `mod hip::partition_build_largebin_spill_matches_anchor` builds the GPU
+    // `_GlobalMemory` spill histogram for this large-bin layout, de-quants, and
+    // `assert_close`s it to the cpu f64 anchor (never GPU-vs-GPU).
 }
 
 /// Self-test of the `assert_close` envelope (the shared ~1e-6 ROCm gate): a within-tol
@@ -371,6 +373,116 @@ fn assert_close_envelope_self_test() {
 }
 
 // ===========================================================================
+// Plan 16-03 Task 3 host tests (run under `--features gpu`, on the cpu client):
+// de-quant round-trip, the spill `checked_mul` guard, and the V5 launcher bounds
+// checks + empty-layout no-launch path. These exercise ONLY the non-launching paths
+// (validation returns before any device kernel), so they run on the cpu runtime
+// without needing a real GPU. The actual two-tier BUILD launch + assert_close is
+// `mod hip` below (rocm-only). D-08 dequant is a pure host fn (runs everywhere).
+// ===========================================================================
+#[cfg(feature = "gpu")]
+mod build_partition_host {
+    use lgbm_compute::error::ComputeError;
+    use lgbm_compute::kernels::histogram::{
+        construct_leaf_hist_on_device, dequant_leaf_hist, spill_cells,
+    };
+    use lgbm_compute::kernels::row_data::divide_cuda_feature_groups;
+    use lgbm_compute::runtime::cpu_client;
+
+    /// De-quant inverts the build-side quantize (`round(v·2^30)` → `(bits as i64)/2^30`)
+    /// at the SAME 2^30 scale — round-trip exact for the integer-valued cells a small leaf
+    /// produces, matching a plain-Rust f64 reference.
+    #[test]
+    fn dequant_roundtrip_matches_plain_f64() {
+        const S: f64 = 1_073_741_824.0; // 2^30
+        // A known small leaf's stride-2 grad/hess cells (f64 truth).
+        let truth = [3.0f64, 5.0, -2.0, 4.0, 0.0, 7.0, -1.5, 2.5];
+        // Build the raw u64 fixed-point cells the kernel would accumulate.
+        let raw: Vec<u64> = truth.iter().map(|&v| (v * S).round() as i64 as u64).collect();
+        let got = dequant_leaf_hist(&raw);
+        assert_eq!(got.len(), truth.len());
+        for (i, (&g, &t)) in got.iter().zip(&truth).enumerate() {
+            // 2^30 has > 9 fractional bits; these half-integer values round-trip exactly.
+            assert!((g - t).abs() < 1e-9, "cell {i}: dequant {g} vs truth {t}");
+        }
+    }
+
+    /// The spill-size helper guards `checked_mul` overflow and the zero (empty-layout) case
+    /// (D-09 / T-16-03-03), and returns the exact `grid_dim_y · num_total_bin · 2` otherwise.
+    #[test]
+    fn spill_cells_guards_overflow_and_zero() {
+        assert_eq!(spill_cells(4, 10).unwrap(), 80, "4 · 10 · 2");
+        assert!(matches!(spill_cells(usize::MAX, 2), Err(ComputeError::Runtime { .. })), "overflow");
+        assert!(matches!(spill_cells(0, 5), Err(ComputeError::Runtime { .. })), "zero size");
+    }
+
+    /// An empty layout (no partitions) returns `Ok(vec![])` with NO launch — the degenerate
+    /// path the V5 ladder short-circuits before touching the device.
+    #[test]
+    fn on_device_empty_layout_no_launch() {
+        let client = cpu_client();
+        let layout = divide_cuda_feature_groups(&[], 6144);
+        assert_eq!(layout.num_feature_partitions, 0, "empty layout has no partitions");
+        let out = construct_leaf_hist_on_device(
+            &client, &layout, &[], None, &[], &[], &[], 0, false,
+        )
+        .expect("empty layout is the degenerate Ok path");
+        assert!(out.is_empty(), "empty layout → empty histogram, no launch");
+    }
+
+    /// The V5 launcher rejects out-of-range leaf rows, a grad/hess length shortfall, and a
+    /// too-short dense store — each a typed `ComputeError` returned BEFORE any launch
+    /// (T-16-03-01), never a panic.
+    #[test]
+    fn on_device_v5_rejects_bad_args() {
+        let client = cpu_client();
+        // One small partition (200 bins fits the shared LDS), 8 rows of data.
+        let layout = divide_cuda_feature_groups(&[4usize], 6144);
+        let num_data = 8usize;
+        let grad = vec![0.1f32; num_data];
+        let hess = vec![1.0f32; num_data];
+        // dense store: 1 column · num_data rows.
+        let data = vec![0u32; num_data];
+
+        // (a) leaf row index out of range → BinIndexOutOfRange.
+        let bad_rows = [0u32, 99];
+        assert!(
+            matches!(
+                construct_leaf_hist_on_device(
+                    &client, &layout, &data, None, &bad_rows, &grad, &hess, num_data, false,
+                ),
+                Err(ComputeError::BinIndexOutOfRange { .. })
+            ),
+            "out-of-range leaf row must be rejected"
+        );
+
+        // (b) grad shorter than num_data → LengthMismatch.
+        let short_grad = vec![0.1f32; num_data - 1];
+        assert!(
+            matches!(
+                construct_leaf_hist_on_device(
+                    &client, &layout, &data, None, &[0u32, 1], &short_grad, &hess, num_data, false,
+                ),
+                Err(ComputeError::LengthMismatch { .. })
+            ),
+            "grad length shortfall must be rejected"
+        );
+
+        // (c) dense store too short to cover num_columns · num_data → LengthMismatch.
+        let short_data = vec![0u32; num_data - 1];
+        assert!(
+            matches!(
+                construct_leaf_hist_on_device(
+                    &client, &layout, &short_data, None, &[0u32, 1], &grad, &hess, num_data, false,
+                ),
+                Err(ComputeError::LengthMismatch { .. })
+            ),
+            "too-short dense store must be rejected"
+        );
+    }
+}
+
+// ===========================================================================
 // GPU mirror tests (rocm only) — pinned GPU-vs-cpu-f64-anchor, NEVER GPU-vs-GPU.
 //
 // The CubeCL mirror of LightGBM's CUDA `CUDAConstructHistogramDenseKernel`
@@ -383,13 +495,75 @@ fn assert_close_envelope_self_test() {
 // ===========================================================================
 #[cfg(feature = "rocm")]
 mod hip {
-    use super::{assert_close, cpu_client};
+    use super::{assert_close, cpu_anchor_columns, cpu_client, divide_cuda_feature_groups};
     use cubecl::prelude::CubeElement;
     use lgbm_compute::kernels::histogram::{
         construct_histograms_cpu, construct_histograms_cuda_mirror_on,
-        construct_histograms_cuda_mirror_resident_on,
+        construct_histograms_cuda_mirror_resident_on, construct_leaf_hist_on_device,
+        dequant_leaf_hist,
     };
+    use lgbm_compute::kernels::row_data::FeaturePartitionLayout;
     use lgbm_compute::runtime::rocm_client;
+    use lgbm_compute::BinColumn;
+
+    /// Build the §13 DENSE partition row-major store host-side (mirrors
+    /// `CudaRowData::get_dense_data_partitioned`): partition `p`'s region starts at
+    /// `lo·num_data`, cell `(row, local_col)` at `row·ncol_p + local_col`, holding the RAW
+    /// per-column bin. The launcher applies `column_hist_offsets` at accumulation time.
+    fn dense_partition_store(
+        columns: &[BinColumn],
+        layout: &FeaturePartitionLayout,
+        num_data: usize,
+    ) -> Vec<u32> {
+        let offs = &layout.feature_partition_column_index_offsets;
+        let num_columns = columns.len();
+        let mut data = vec![0u32; num_columns * num_data];
+        for p in 0..layout.num_feature_partitions {
+            let lo = offs[p];
+            let hi = offs[p + 1];
+            let ncol_p = hi - lo;
+            let part_base = lo * num_data;
+            for row in 0..num_data {
+                for (lc, col) in columns[lo..hi].iter().enumerate() {
+                    data[part_base + row * ncol_p + lc] = col.bin(row);
+                }
+            }
+        }
+        data
+    }
+
+    /// Build the §13 SPARSE per-partition CSR store host-side (mirrors
+    /// `get_sparse_data_partitioned`): values are PARTITION-LOCAL
+    /// (`raw + column_hist_offsets[c]`), and `row_ptr[p·(num_data+1) + r] = r·ncol_p`
+    /// (fully-dense relay). Returns `(values, row_ptr)`.
+    fn sparse_partition_store(
+        columns: &[BinColumn],
+        layout: &FeaturePartitionLayout,
+        num_data: usize,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let offs = &layout.feature_partition_column_index_offsets;
+        let num_columns = columns.len();
+        let mut vals = vec![0u32; num_columns * num_data];
+        let mut row_ptr = vec![0u32; layout.num_feature_partitions * (num_data + 1)];
+        for p in 0..layout.num_feature_partitions {
+            let lo = offs[p];
+            let hi = offs[p + 1];
+            let ncol_p = hi - lo;
+            let part_base = lo * num_data;
+            for row in 0..num_data {
+                for (lc, col) in columns[lo..hi].iter().enumerate() {
+                    let c = lo + lc;
+                    vals[part_base + row * ncol_p + lc] =
+                        col.bin(row) + layout.column_hist_offsets[c] as u32;
+                }
+            }
+            let rp_base = p * (num_data + 1);
+            for r in 0..=num_data {
+                row_ptr[rp_base + r] = (r * ncol_p) as u32;
+            }
+        }
+        (vals, row_ptr)
+    }
 
     /// A small dense corpus: 3 features, ~2000 rows, 16 bins. Returns the resident
     /// feature-major bin buffer (`data[f * num_data + row]`), the full-corpus grad/hess.
@@ -576,5 +750,140 @@ mod hip {
 
         let anchor = cpu_anchor(&corpus, &data_indices);
         assert_close(&anchor, &gpu, "cuda_mirror_resident");
+    }
+
+    // =======================================================================
+    // Plan 16-03: the §13 two-tier BUILD kernel end-to-end (build → de-quant →
+    // assert_close vs the cpu f64 anchor). The global-bin out layout aligns with
+    // `cpu_anchor_columns`' per-feature concatenation (prefix[col]·2), so the
+    // de-quanted raw u64 histogram compares cell-for-cell to the anchor. NEVER
+    // GPU-vs-GPU (def-f8u-01).
+    // =======================================================================
+
+    /// A 2-column small corpus whose layout yields one SHARED partition (both columns
+    /// fit the LDS cap), exercised over a non-trivial leaf subset.
+    fn small_columns() -> (Vec<BinColumn>, Vec<usize>, usize, Vec<u32>, Vec<f32>, Vec<f32>) {
+        let num_data = 8usize;
+        let columns = vec![
+            BinColumn::new(vec![0, 1, 2, 3, 0, 1, 2, 3], 8), // 8 bins
+            BinColumn::new(vec![3, 2, 1, 0, 3, 2, 1, 0], 8), // 8 bins
+        ];
+        let num_bins = vec![8usize, 8];
+        let data_indices: Vec<u32> = vec![1, 2, 4, 6, 7];
+        let grad = vec![0.5f32, -1.0, 2.0, -0.5, 1.5, -2.0, 0.25, -0.75];
+        let hess = vec![1.0f32, 1.5, 2.0, 0.5, 1.25, 2.5, 0.75, 1.75];
+        (columns, num_bins, num_data, data_indices, grad, hess)
+    }
+
+    #[test]
+    fn partition_build_dense_matches_cpu_anchor() {
+        let gc = rocm_client();
+        let (columns, num_bins, num_data, di, grad, hess) = small_columns();
+        let layout = divide_cuda_feature_groups(&num_bins, 6144);
+        let nb_u32: Vec<u32> = num_bins.iter().map(|&b| b as u32).collect();
+
+        let data = dense_partition_store(&columns, &layout, num_data);
+        let raw = construct_leaf_hist_on_device(
+            &gc, &layout, &data, None, &di, &grad, &hess, num_data, false,
+        )
+        .unwrap();
+        let gpu = dequant_leaf_hist(&raw);
+
+        let anchor = cpu_anchor_columns(&columns, &nb_u32, &di, &grad, &hess);
+        assert_close(&anchor, &gpu, "partition_build_dense");
+    }
+
+    #[test]
+    fn partition_build_sparse_matches_cpu_anchor() {
+        let gc = rocm_client();
+        let (columns, num_bins, num_data, di, grad, hess) = small_columns();
+        let layout = divide_cuda_feature_groups(&num_bins, 6144);
+        let nb_u32: Vec<u32> = num_bins.iter().map(|&b| b as u32).collect();
+
+        let (vals, row_ptr) = sparse_partition_store(&columns, &layout, num_data);
+        let raw = construct_leaf_hist_on_device(
+            &gc, &layout, &vals, Some(&row_ptr), &di, &grad, &hess, num_data, false,
+        )
+        .unwrap();
+        let gpu = dequant_leaf_hist(&raw);
+
+        let anchor = cpu_anchor_columns(&columns, &nb_u32, &di, &grad, &hess);
+        assert_close(&anchor, &gpu, "partition_build_sparse");
+    }
+
+    /// The shared-vs-`_GlobalMemory` flag is parity-neutral (§17): the SAME fitting layout
+    /// built via the LDS path and via `force_global=true` both match the cpu f64 anchor.
+    #[test]
+    fn partition_build_shared_and_global_both_match_anchor() {
+        let gc = rocm_client();
+        let (columns, num_bins, num_data, di, grad, hess) = small_columns();
+        let layout = divide_cuda_feature_groups(&num_bins, 6144);
+        let nb_u32: Vec<u32> = num_bins.iter().map(|&b| b as u32).collect();
+        let data = dense_partition_store(&columns, &layout, num_data);
+        let anchor = cpu_anchor_columns(&columns, &nb_u32, &di, &grad, &hess);
+
+        let shared = dequant_leaf_hist(
+            &construct_leaf_hist_on_device(
+                &gc, &layout, &data, None, &di, &grad, &hess, num_data, false,
+            )
+            .unwrap(),
+        );
+        let global = dequant_leaf_hist(
+            &construct_leaf_hist_on_device(
+                &gc, &layout, &data, None, &di, &grad, &hess, num_data, true,
+            )
+            .unwrap(),
+        );
+        assert_close(&anchor, &shared, "partition_build_shared");
+        assert_close(&anchor, &global, "partition_build_global_forced");
+    }
+
+    /// The Phase-15 large-bin column (`num_large_bin_partition > 0`) routes through the
+    /// `_GlobalMemory` spill path and de-quants to within ~1e-6 of the cpu f64 anchor.
+    #[test]
+    fn partition_build_largebin_spill_matches_anchor() {
+        let gc = rocm_client();
+        // num_bin 4096 > budget 3072 → the spill column owns its own large-bin partition.
+        let num_bins = vec![8usize, 4_096];
+        let layout = divide_cuda_feature_groups(&num_bins, 6144);
+        assert!(layout.num_large_bin_partition > 0, "must force the spill partition");
+        let num_data = 8usize;
+        let columns = vec![
+            BinColumn::new(vec![0, 1, 2, 3, 0, 1, 2, 3], 8),
+            BinColumn::new(vec![0, 1, 2, 3, 4, 5, 6, 4_000], 4_096),
+        ];
+        let nb_u32: Vec<u32> = num_bins.iter().map(|&b| b as u32).collect();
+        let di: Vec<u32> = vec![0, 2, 3, 5, 7];
+        let grad = vec![0.5f32, -1.0, 2.0, -0.5, 1.5, -2.0, 0.25, -0.75];
+        let hess = vec![1.0f32, 1.5, 2.0, 0.5, 1.25, 2.5, 0.75, 1.75];
+
+        let data = dense_partition_store(&columns, &layout, num_data);
+        let raw = construct_leaf_hist_on_device(
+            &gc, &layout, &data, None, &di, &grad, &hess, num_data, false,
+        )
+        .unwrap();
+        let gpu = dequant_leaf_hist(&raw);
+        let anchor = cpu_anchor_columns(&columns, &nb_u32, &di, &grad, &hess);
+        assert_close(&anchor, &gpu, "partition_build_largebin_spill");
+    }
+
+    /// The `out` accumulator is provably zeroed before launch (the launcher uploads an
+    /// explicit zero slice, never a pooled-uninitialized buffer): two back-to-back builds
+    /// on the same client return the IDENTICAL histogram — a stale fold would diverge.
+    #[test]
+    fn partition_build_out_is_zeroed_not_folded() {
+        let gc = rocm_client();
+        let (columns, num_bins, num_data, di, grad, hess) = small_columns();
+        let layout = divide_cuda_feature_groups(&num_bins, 6144);
+        let data = dense_partition_store(&columns, &layout, num_data);
+        let first = construct_leaf_hist_on_device(
+            &gc, &layout, &data, None, &di, &grad, &hess, num_data, false,
+        )
+        .unwrap();
+        let second = construct_leaf_hist_on_device(
+            &gc, &layout, &data, None, &di, &grad, &hess, num_data, false,
+        )
+        .unwrap();
+        assert_eq!(first, second, "second build must not fold onto stale out cells");
     }
 }
