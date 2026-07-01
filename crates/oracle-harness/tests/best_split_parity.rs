@@ -38,9 +38,10 @@
 use std::path::PathBuf;
 
 use lgbm_compute::kernels::best_split::{
-    find_best_splits_stage1_f32_on, find_best_splits_stage1_on, sync_best_split_for_leaf_on,
-    SplitFindTask, Stage1Scalars,
+    find_best_from_all_splits_on, find_best_splits_stage1_f32_on, find_best_splits_stage1_on,
+    sync_best_split_for_leaf_on, SplitFindTask, Stage1Scalars,
 };
+use lgbm_compute::kernels::split_info::SplitScalars;
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
 use oracle_harness::comparator::compare_exact_f64_bits;
@@ -419,6 +420,72 @@ fn best_split_parity_stage2_cross_feature_reduce() {
     let none = sync_best_split_for_leaf_on(&client, &empty_slab, 2, true).unwrap();
     assert!(!none.is_valid, "stage2: all-invalid tasks → is_valid=false");
     assert_eq!(none.gain, f64::NEG_INFINITY, "stage2: no-valid-split gain = kMinScore");
+}
+
+/// STAGE-3 cross-leaf argmax + 8-int export (ODL-12, §8.3): drive the full stage-1→2→3
+/// pipeline on the cpu f64 fold, then assert the 8-int buffer field layout (idx 0-7), the
+/// best-leaf argmax, the self-invalidation (chosen leaf + freshly-created slot), the
+/// single-readback contract (SC#2), and the `best_leaf_index == -1` no-split export.
+#[test]
+fn best_split_parity_stage3_export() {
+    let path = kernels_dir().join("best_split.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("best_split_parity(stage3_export): SKIP — fixture {} not found.", path.display());
+        return;
+    };
+    let cases = parse_best_split(&text);
+    let client = cpu_client();
+
+    let g_default = cases
+        .iter()
+        .find(|g| g.name == "default_fwd_smaller")
+        .expect("default_fwd_smaller golden");
+    let g_l1 = cases.iter().find(|g| g.name == "use_l1").expect("use_l1 golden");
+
+    let run = |g: &BestSplitGolden, feat: i32| {
+        let mut task = task_of(g);
+        task.inner_feature_index = feat;
+        find_best_splits_stage1_on(&client, &g.hist, &task, &scalars_of(g))
+            .unwrap_or_else(|e| panic!("stage1 for `{}`: {e:?}", g.name))
+    };
+
+    // Two leaves' best splits from stage-2 (smaller = leaf 0 via feat 5, larger = leaf 1
+    // via feat 8). Leaf 0's default template has the higher gain than leaf 1's L1-shrunk.
+    let s0 = run(g_default, 5);
+    let s1 = run(g_l1, 8);
+    let leaf0 = sync_best_split_for_leaf_on(&client, &[s0, s0], 1, true).unwrap();
+    let leaf1 = sync_best_split_for_leaf_on(&client, &[s1, s1], 1, true).unwrap();
+    assert!(leaf0.gain > leaf1.gain, "leaf 0 (default) must out-gain leaf 1 (L1)");
+
+    // per_leaf: [leaf0, leaf1, freshly-created slot]. cur_num_leaves = 2.
+    let mut per_leaf = vec![leaf0, leaf1, SplitScalars::default()];
+    let out = find_best_from_all_splits_on(&client, &mut per_leaf, 0, 1, 2).unwrap();
+
+    // Field layout idx 0-7.
+    assert_eq!(out[0] as i32, leaf0.inner_feature_index, "[0] smaller.inner_feature_index");
+    assert_eq!(out[1] as u32, leaf0.threshold, "[1] smaller.threshold");
+    assert_eq!(out[2], i64::from(leaf0.default_left), "[2] smaller.default_left");
+    assert_eq!(out[3] as i32, leaf1.inner_feature_index, "[3] larger.inner_feature_index");
+    assert_eq!(out[4] as u32, leaf1.threshold, "[4] larger.threshold");
+    assert_eq!(out[5], i64::from(leaf1.default_left), "[5] larger.default_left");
+    assert_eq!(out[6], 0, "[6] best_leaf_index = the higher-gain leaf 0");
+    assert_eq!(out[7], 0, "[7] num_cat_threshold = 0 (continuous)");
+
+    // Self-invalidation: leaf 0 (chosen) + slot 2 (freshly-created) now invalid.
+    assert!(!per_leaf[0].is_valid, "chosen leaf 0 self-invalidated");
+    assert!(!per_leaf[2].is_valid, "freshly-created slot 2 self-invalidated");
+    assert!(per_leaf[1].is_valid, "leaf 1 untouched — re-pickable next iteration");
+
+    // Two-iteration: leaf 1 is now the winner (leaf 0 was invalidated).
+    let out2 = find_best_from_all_splits_on(&client, &mut per_leaf, 0, 1, 2).unwrap();
+    assert_eq!(out2[6], 1, "iteration 2 picks leaf 1 (leaf 0 invalidated)");
+
+    // No-valid-split export: all leaves invalid → best_leaf_index = -1.
+    let mut none = vec![leaf0, leaf1];
+    none[0].is_valid = false;
+    none[1].is_valid = false;
+    let o = find_best_from_all_splits_on(&client, &mut none, 0, 1, 2).unwrap();
+    assert_eq!(o[6], -1, "empty-leaf export → best_leaf_index = -1");
 }
 
 /// The f32 stage-1 mirror drives through cubecl-cpu producing a STRUCTURALLY identical

@@ -1264,6 +1264,66 @@ fn stage1_block_scan(v: f32, plane_dim: u32) -> f32 {
     base + local
 }
 
+/// `ReduceBestGainForLeaves` block argmax over `(local_gain, leaf_index)` — the winning
+/// LEAF index (stage-3 cross-leaf reduce, `cu:67-123`). Mirror of [`reduce_best_gain`]: leaf
+/// indices are non-negative, so a valid leaf encodes as `leaf_index as u32` and "no valid
+/// leaf" as the `block_size` sentinel (u32 throughout — cubecl lowers the u32 shared-read
+/// return, matching `reduce_best_gain`; the caller maps `block_size` → `-1`). Strict `>`
+/// keeps the LOWEST leaf index on a tie, matching the Task-2 cpu fold. gpu-gated f32 (D-10 —
+/// the leaf gains are widened to f32 on the hip path; the cpu anchor argmax is the host f64
+/// fold in [`find_best_from_all_splits_on`]); compile-verified, on-device asserted in 17-05.
+#[cfg(feature = "gpu")]
+#[cube]
+fn reduce_best_gain_for_leaves(local_gain: f32, leaf_index: i32, block_size: u32) -> u32 {
+    let mut sh_gain = SharedMemory::<f32>::new(STAGE1_BLOCK_MAX);
+    let mut sh_leaf = SharedMemory::<u32>::new(STAGE1_BLOCK_MAX);
+    let mut sh_win = SharedMemory::<u32>::new(1usize);
+    let i = UNIT_POS as usize;
+    let valid = leaf_index != -1i32;
+    sh_gain[i] = local_gain;
+    // Encode: valid leaf → its (non-negative) index as u32; invalid → block_size sentinel.
+    sh_leaf[i] = select(valid, u32::cast_from(leaf_index), block_size);
+    sync_cube();
+    if UNIT_POS == 0 {
+        let mut best = block_size; // sentinel: no valid leaf
+        let mut best_g = 0.0f32;
+        let n = block_size as usize;
+        for k in 0..n {
+            let fnd = sh_leaf[k] != block_size;
+            // strict `>` keeps the FIRST (lowest leaf index) on a tie; `best == sentinel`
+            // admits the first valid candidate.
+            let take = fnd && (best == block_size || sh_gain[k] > best_g);
+            best = select(take, sh_leaf[k], best);
+            best_g = select(take, sh_gain[k], best_g);
+        }
+        sh_win[0] = best;
+    }
+    sync_cube();
+    sh_win[0]
+}
+
+/// `PrepareLeafBestSplitInfo` + the `FindBestFromAllSplitsKernel` `[6]`/`[7]` writes
+/// (`cu:2113-2159`) — the single-owner 8-int export packer (SC#2, the ONLY device→host
+/// transfer per iteration). `inp` carries the pre-read scalars
+/// `[0]=smaller.inner_feature_index [1]=smaller.threshold [2]=smaller.default_left
+///  [3]=larger.inner_feature_index [4]=larger.threshold [5]=larger.default_left
+///  [6]=best_leaf_index [7]=best_leaf.num_cat_threshold [8]=has_larger`; `out` is the
+/// 8-int buffer with the larger triple gated on `has_larger` and `[7]` gated on
+/// `best_leaf_index != -1` — the C++ conditional-write layout.
+#[cube(launch_unchecked)]
+fn prepare_leaf_best_split_info_kernel(inp: &Array<i32>, out: &mut Array<i32>) {
+    let has_larger = inp[8] != 0i32;
+    let best = inp[6];
+    out[0] = inp[0];
+    out[1] = inp[1];
+    out[2] = inp[2];
+    out[3] = select(has_larger, inp[3], 0i32);
+    out[4] = select(has_larger, inp[4], 0i32);
+    out[5] = select(has_larger, inp[5], 0i32);
+    out[6] = best;
+    out[7] = select(best != -1i32, inp[7], 0i32);
+}
+
 /// `ReduceBestGain` block argmax over `(local_gain, found, thread_index)` — the winning
 /// thread index, tie-break by the LOWEST index via strict `>` (Pitfall 5, matching the
 /// Task-1 cpu fold's first-max-wins). Stages each unit's `(gain, found)` into
@@ -2010,30 +2070,157 @@ pub fn set_invalid_leaf_split_info(
     }
 }
 
-/// STAGE 3 (STUB — Wave 4 fills the cross-leaf argmax + 8-int export, 17-05).
-///
-/// `FindBestFromAllSplitsKernel` + `PrepareLeafBestSplitInfo`: cross-leaf argmax over
-/// `(gain, leaf_index)` → `best_leaf_index`, SELF-INVALIDATE the chosen leaf AND the
-/// freshly-created leaf slot (`cur_num_leaves`), then pack the 8-int buffer (the ONLY
-/// device→host transfer per iteration, SC#2). Field layout (17-RESEARCH §"3-Stage
-/// Reduction & Export"): `[0]` smaller.inner_feature_index, `[1]` smaller.threshold,
-/// `[2]` smaller.default_left, `[3..6]` larger triple, `[6]` best_leaf_index (`-1` if
-/// none), `[7]` the best leaf's categorical-threshold count (0 for continuous; Phase
-/// 22 fills it for categorical).
-///
-/// Wave-0 sentinel: returns the `best_leaf = -1` (no split) export.
+/// V5 launch-boundary validation for stage-3 (threat T-17-01/T-17-02): the export reads
+/// `per_leaf[smaller_leaf_index]` / `[larger_leaf_index]` and the argmax + self-invalidation
+/// index `[0, cur_num_leaves]` plus the freshly-created leaf slot `[cur_num_leaves]`, so
+/// every index must be in range BEFORE the export launch.
 ///
 /// # Errors
-/// [`ComputeError`] once Wave-4 launch-boundary validation lands; the stub is
-/// infallible.
+/// [`ComputeError::Runtime`] if any leaf index is out of `[0, len)` (larger `< 0` = "no
+/// larger leaf", allowed), or if `cur_num_leaves` exceeds the argmax window.
+fn validate_stage3_inputs(
+    len: usize,
+    smaller_leaf_index: i32,
+    larger_leaf_index: i32,
+    cur_num_leaves: usize,
+) -> Result<(), ComputeError> {
+    let in_range = |idx: i32| idx >= 0 && (idx as usize) < len;
+    if !in_range(smaller_leaf_index) {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "stage3: smaller_leaf_index {smaller_leaf_index} out of range [0, {len})"
+            ),
+        });
+    }
+    if larger_leaf_index >= 0 && !in_range(larger_leaf_index) {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "stage3: larger_leaf_index {larger_leaf_index} out of range [0, {len})"
+            ),
+        });
+    }
+    if cur_num_leaves > len {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "stage3: cur_num_leaves {cur_num_leaves} exceeds the per-leaf slab {len}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// STAGE 3 — `FindBestFromAllSplitsKernel` + `PrepareLeafBestSplitInfo` (ODL-12, §8.3).
+///
+/// Cross-leaf argmax over `(gain, leaf_index)` for the `[0, cur_num_leaves)` per-leaf best
+/// splits (strict `>` ⇒ the LOWEST leaf index survives a tie, matching
+/// [`reduce_best_gain_for_leaves`]) → `best_leaf_index` (`-1` if none valid). Then the
+/// behavioral SELF-INVALIDATION (`cu:2131-2135`): the chosen leaf's slot AND the
+/// freshly-created leaf slot (`cur_num_leaves`) are marked `is_valid=false` so neither is
+/// re-picked next iteration. Finally the 8-int `cuda_best_split_info_buffer` is packed via
+/// [`prepare_leaf_best_split_info_kernel`] — the ONLY device→host transfer per iteration
+/// (SC#2, a single `read_one_unchecked`); the full per-side records stay RESIDENT for
+/// Phase 18.
+///
+/// Field layout (17-RESEARCH §"3-Stage Reduction & Export"):
+/// `[0]=smaller.inner_feature_index [1]=smaller.threshold [2]=smaller.default_left
+///  [3]=larger.inner_feature_index  [4]=larger.threshold  [5]=larger.default_left
+///  [6]=best_leaf_index [7]=best_leaf.num_cat_threshold` (0 for continuous — Phase-22 fills
+/// categorical). The larger triple `[3..6]` is written only when `larger_leaf_index >= 0`;
+/// `[7]` only when `best_leaf_index != -1` (else 0). `per_leaf` is mutated in place by the
+/// self-invalidation (observable to the caller / a two-iteration golden).
+///
+/// # Errors
+/// [`ComputeError`] from [`validate_stage3_inputs`] (out-of-range leaf indices) or the
+/// export launch.
 pub fn find_best_from_all_splits_on<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
-    per_leaf: &[SplitScalars],
+    per_leaf: &mut [SplitScalars],
+    smaller_leaf_index: i32,
+    larger_leaf_index: i32,
     cur_num_leaves: usize,
 ) -> Result<[i64; 8], ComputeError> {
-    let _ = (client, per_leaf, cur_num_leaves);
-    // [6] = best_leaf_index = -1 (no split); all other cells sentinel-zero.
-    Ok([0, 0, 0, 0, 0, 0, -1, 0])
+    validate_stage3_inputs(
+        per_leaf.len(),
+        smaller_leaf_index,
+        larger_leaf_index,
+        cur_num_leaves,
+    )?;
+
+    // FindBestFromAllSplitsKernel: cross-leaf argmax, strict `>` ⇒ lowest leaf index on a
+    // tie (the deterministic cpu f64 anchor; the gpu-gated reduce_best_gain_for_leaves is
+    // the hip mirror, 17-05 Task 3).
+    let mut best_leaf: i32 = -1;
+    let mut best_gain = f64::NEG_INFINITY;
+    for (leaf, r) in per_leaf.iter().enumerate().take(cur_num_leaves) {
+        if r.is_valid && r.gain > best_gain {
+            best_gain = r.gain;
+            best_leaf = leaf as i32;
+        }
+    }
+    // [7] reads the chosen leaf's num_cat_threshold (before self-invalidation flips is_valid;
+    // num_cat_threshold is unaffected — read it now).
+    let best_num_cat = if best_leaf >= 0 {
+        per_leaf[best_leaf as usize].num_cat_threshold
+    } else {
+        0
+    };
+
+    // Self-invalidation (behavioral, cu:2131-2135): the chosen leaf + the freshly-created
+    // leaf slot so neither is re-picked next iteration.
+    if best_leaf != -1 {
+        per_leaf[best_leaf as usize].is_valid = false;
+        if cur_num_leaves < per_leaf.len() {
+            per_leaf[cur_num_leaves].is_valid = false;
+        }
+    }
+
+    // PrepareLeafBestSplitInfo reads the smaller/larger leaves' feature/threshold/default_left
+    // (NOT is_valid — unaffected by the self-invalidation above). SplitScalars is Copy.
+    let smaller = per_leaf[smaller_leaf_index as usize];
+    let has_larger = larger_leaf_index >= 0;
+    let larger = if has_larger {
+        per_leaf[larger_leaf_index as usize]
+    } else {
+        SplitScalars::default()
+    };
+
+    let inp: [i32; 9] = [
+        smaller.inner_feature_index,
+        smaller.threshold as i32,
+        i32::from(smaller.default_left),
+        larger.inner_feature_index,
+        larger.threshold as i32,
+        i32::from(larger.default_left),
+        best_leaf,
+        best_num_cat,
+        i32::from(has_larger),
+    ];
+
+    let h_in = client.create_from_slice(i32::as_bytes(&inp));
+    // The export kernel writes ALL 8 cells (single owner), so `empty` needs no zero-init.
+    let h_out = client.empty(8 * core::mem::size_of::<i32>());
+
+    // SAFETY: `h_in` is exactly 9 i32 cells, `h_out` 8 i32 cells; both outlive the launch.
+    // The single-owner kernel indexes only `inp[0..9]` / `out[0..8]` (constant indices).
+    // This is the ONLY device→host readback per iteration (SC#2). cubecl unsafe confined
+    // here (CMP-01, T-17-01/T-17-03).
+    unsafe {
+        prepare_leaf_best_split_info_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_in, 9),
+            ArrayArg::from_raw_parts(h_out.clone(), 8),
+        );
+    }
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = i32::from_bytes(&bytes);
+
+    let mut out = [0i64; 8];
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = cells[k] as i64;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2245,6 +2432,69 @@ mod tests {
         // larger_leaf_index < 0 (no larger leaf) is a no-op on the larger slot.
         set_invalid_leaf_split_info(&mut leaf_best, true, false, 1, -1);
         assert!(leaf_best[1].is_valid, "no larger leaf → no invalidation");
+    }
+
+    /// Stage-3 cross-leaf argmax + 8-int export + self-invalidation (ODL-12, §8.3):
+    /// the field layout, the strict-`>` lowest-leaf tie-break, the behavioral
+    /// self-invalidation (chosen leaf + cur_num_leaves slot), and the no-split path.
+    /// Runs on the cubecl-cpu client with the single 8-int readback (SC#2).
+    #[test]
+    fn stage3_cross_leaf_argmax_export_and_self_invalidation() {
+        use crate::runtime::cpu_client;
+        let client = cpu_client();
+
+        // V5: out-of-range leaf indices rejected before the export.
+        assert!(validate_stage3_inputs(2, 5, -1, 2).is_err());
+        assert!(validate_stage3_inputs(2, 0, 9, 2).is_err());
+        assert!(validate_stage3_inputs(2, 0, -1, 3).is_err());
+        assert!(validate_stage3_inputs(4, 0, 1, 2).is_ok());
+
+        // 3 valid leaves + a reserved freshly-created slot (index 3). smaller=leaf 0,
+        // larger=leaf 1. Leaf 2 has the max gain → best_leaf_index=2.
+        let mut per_leaf = vec![
+            rec(2.0, 10, true), // leaf 0 (smaller)
+            rec(3.0, 11, true), // leaf 1 (larger)
+            rec(9.0, 12, true), // leaf 2 (cross-leaf winner)
+            rec(0.0, -1, false),
+        ];
+        per_leaf[0].threshold = 5;
+        per_leaf[0].default_left = true;
+        per_leaf[1].threshold = 7;
+        per_leaf[1].default_left = false;
+
+        let out = find_best_from_all_splits_on(&client, &mut per_leaf, 0, 1, 3).unwrap();
+        // Field layout idx 0-7.
+        assert_eq!(out[0], 10, "[0] smaller.inner_feature_index");
+        assert_eq!(out[1], 5, "[1] smaller.threshold");
+        assert_eq!(out[2], 1, "[2] smaller.default_left");
+        assert_eq!(out[3], 11, "[3] larger.inner_feature_index");
+        assert_eq!(out[4], 7, "[4] larger.threshold");
+        assert_eq!(out[5], 0, "[5] larger.default_left");
+        assert_eq!(out[6], 2, "[6] best_leaf_index = the max-gain leaf");
+        assert_eq!(out[7], 0, "[7] num_cat_threshold = 0 for continuous");
+
+        // Self-invalidation: chosen leaf (2) AND the freshly-created slot (3) are now invalid.
+        assert!(!per_leaf[2].is_valid, "chosen leaf 2 self-invalidated");
+        assert!(!per_leaf[3].is_valid, "freshly-created slot 3 self-invalidated");
+        assert!(per_leaf[0].is_valid && per_leaf[1].is_valid, "other leaves untouched");
+
+        // Two-iteration proof: re-running the argmax no longer re-picks leaf 2 — the next
+        // best is leaf 1 (gain 3 > leaf 0's 2).
+        let out2 = find_best_from_all_splits_on(&client, &mut per_leaf, 0, 1, 3).unwrap();
+        assert_eq!(out2[6], 1, "iteration 2 picks leaf 1 (leaf 2 was invalidated)");
+
+        // No-larger-leaf: larger triple stays 0.
+        let mut two = vec![rec(4.0, 20, true), rec(0.0, -1, false)];
+        two[0].threshold = 8;
+        let o = find_best_from_all_splits_on(&client, &mut two, 0, -1, 1).unwrap();
+        assert_eq!([o[3], o[4], o[5]], [0, 0, 0], "no larger leaf → larger triple zero");
+        assert_eq!(o[6], 0, "best_leaf_index = leaf 0");
+
+        // No-valid-split path: all leaves invalid → best_leaf_index = -1, [7] = 0.
+        let mut none = vec![rec(1.0, 0, false), rec(2.0, 1, false)];
+        let o = find_best_from_all_splits_on(&client, &mut none, 0, 1, 2).unwrap();
+        assert_eq!(o[6], -1, "no valid leaf → best_leaf_index = -1");
+        assert_eq!(o[7], 0, "no valid leaf → num_cat_threshold = 0");
     }
 
     /// Helper: a non-categorical `FeatureMeta` with the given num_bin/missing_type.
