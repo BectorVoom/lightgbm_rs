@@ -5,8 +5,8 @@ milestone_name: — CUDA On-Device Training Backend
 current_phase: 17
 current_phase_name: On-Device Best-Split Finder
 status: verifying
-stopped_at: Phase 16 context gathered
-last_updated: "2026-07-01T00:43:03.602Z"
+stopped_at: Phase 17 context gathered
+last_updated: "2026-07-01T01:06:54.010Z"
 last_activity: 2026-07-01
 last_activity_desc: Phase 16 complete, transitioned to Phase 17
 progress:
@@ -691,9 +691,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T00:30:25.417Z
-Stopped at: Phase 16 context gathered
-Resume file: .planning/phases/16-on-device-histogram-constructor/16-CONTEXT.md
+Last session: 2026-07-01T01:06:54.000Z
+Stopped at: Phase 17 context gathered
+Resume file: .planning/phases/17-on-device-best-split-finder/17-CONTEXT.md
 
 ## Operator Next Steps
 
