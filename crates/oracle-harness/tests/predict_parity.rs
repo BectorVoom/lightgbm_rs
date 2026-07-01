@@ -225,3 +225,164 @@ fn early_stop_numeric() {
 fn early_stop_multiclass() {
     run_early_stop_cell("multiclass");
 }
+
+// ===========================================================================
+// Phase-18 (18-01, ODL-15) on-device tree-walk predict scaffold. The new cells
+// read the committed `tests/fixtures/kernels/predict.txt` golden (VERBATIM
+// AddPredictionToScoreKernel, cuda_tree.cu:317-396): numeric missing/default +
+// threshold and categorical `FindInBitset` membership, `score += leaf_value[~node]`
+// in f64. The device tree-walk kernel lands in **18-04** (Wave 2); until then each
+// cell parses + structurally validates and is `#[ignore]`d so the merge gate stays
+// GREEN with `LGBM_CUDA_ON_DEVICE` unset (D-13 / ODL-19). 18-04 replaces the
+// `// UN-IGNORE (18-04):` block with the real device call + `compare_within`.
+//
+// Record format (see `tests/fixtures/kernels/predict.txt`):
+//   PREDICT name=.. kind=numeric|categorical num_rows=N num_features=F \
+//           num_nodes=M num_leaves=L
+//   PFEAT  <per-feature `min,max,default,mfb,offset,bit_type,column`; ';'-sep>
+//   PNODE  <per-node `split_feature_inner,threshold_in_bin,decision_type,left,right`>
+//   PLEAF  <leaf values, f64 bits ';'-sep>
+//   PCATPOOL <bitset_inner words>  ; PCATBOUND <cat_boundaries_inner>
+//   PROWS  <N rows × F raw column bins; rows ';'-sep, cols ','-sep>
+//   PSCORE <N reference raw margins, f64 bits ';'-sep>
+// ===========================================================================
+
+/// The committed kernels golden dir — TRACKED under oracle-harness, never the
+/// untracked C++/LightGBM reference tree.
+fn kernels_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kernels")
+}
+
+/// One parsed PREDICT block from `predict.txt`.
+#[allow(dead_code)]
+struct PredictGolden {
+    name: String,
+    kind: String,
+    num_rows: usize,
+    num_features: usize,
+    scores: Vec<f64>,
+    rows: Vec<Vec<u32>>,
+}
+
+/// Parse `predict.txt` into its PREDICT blocks, SKIP (empty vec via `None`) absent.
+fn read_predict_golden() -> Option<Vec<PredictGolden>> {
+    let path = kernels_dir().join("predict.txt");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("predict_parity(kernels): SKIP — golden {} not found.", path.display());
+            return None;
+        }
+    };
+    let mut out = Vec::new();
+    let mut lines = text.lines();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t[0] != "PREDICT" {
+            continue;
+        }
+        let get = |key: &str| -> String {
+            t.iter()
+                .find_map(|tok| tok.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+                .unwrap_or_else(|| panic!("PREDICT missing `{key}`"))
+                .to_string()
+        };
+        let name = get("name");
+        let kind = get("kind");
+        let num_rows: usize = get("num_rows").parse().expect("num_rows");
+        let num_features: usize = get("num_features").parse().expect("num_features");
+
+        // The block body: PFEAT PNODE PLEAF PCATPOOL PCATBOUND PROWS PSCORE.
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        let mut scores: Vec<f64> = Vec::new();
+        for body in lines.by_ref() {
+            let bt: Vec<&str> = body.trim().split_whitespace().collect();
+            if bt.is_empty() {
+                continue;
+            }
+            match bt[0] {
+                "PROWS" => {
+                    let payload = bt.get(1).copied().unwrap_or("");
+                    if !payload.is_empty() {
+                        rows = payload
+                            .split(';')
+                            .map(|r| r.split(',').map(|c| c.parse::<u32>().expect("row bin")).collect())
+                            .collect();
+                    }
+                }
+                "PSCORE" => {
+                    let payload = bt.get(1).copied().unwrap_or("");
+                    if !payload.is_empty() {
+                        scores = payload
+                            .split(';')
+                            .map(|s| f64::from_bits(s.parse::<u64>().expect("score f64 bits")))
+                            .collect();
+                    }
+                    break; // PSCORE is the last line of a block
+                }
+                _ => {}
+            }
+        }
+        out.push(PredictGolden { name, kind, num_rows, num_features, scores, rows });
+    }
+    Some(out)
+}
+
+/// Structural validation shared by both cells: row/score counts match the header.
+fn assert_predict_shape(g: &PredictGolden) {
+    assert_eq!(g.scores.len(), g.num_rows, "PREDICT `{}`: PSCORE count != num_rows", g.name);
+    assert_eq!(g.rows.len(), g.num_rows, "PREDICT `{}`: PROWS count != num_rows", g.name);
+    for r in &g.rows {
+        assert_eq!(r.len(), g.num_features, "PREDICT `{}`: row width != num_features", g.name);
+    }
+    for s in &g.scores {
+        assert!(s.is_finite(), "PREDICT `{}`: reference margin must be finite", g.name);
+    }
+}
+
+/// `on_device` cell (ODL-15, numeric tree-walk 8/16/32 vs the f64 anchor).
+mod on_device {
+    use super::*;
+
+    #[test]
+    #[ignore = "Wave-0 scaffold; un-ignore when 18-04 lands"]
+    fn predict_parity_on_device_numeric() {
+        let Some(goldens) = read_predict_golden() else { return };
+        let numeric: Vec<&PredictGolden> = goldens.iter().filter(|g| g.kind == "numeric").collect();
+        assert!(!numeric.is_empty(), "predict.txt has no numeric PREDICT block");
+        for g in numeric {
+            assert_predict_shape(g);
+            // UN-IGNORE (18-04): drive the device tree-walk and compare within tol, e.g.
+            //   let got = lgbm_compute::kernels::predict::add_prediction_to_score_on_device(
+            //       &client, &cuda_tree, &cuda_column_data, &g.rows)?;
+            //   let got_f32: Vec<f32> = got.iter().map(|&v| v as f32).collect();
+            //   let exp_f32: Vec<f32> = g.scores.iter().map(|&v| v as f32).collect();
+            //   compare_within(&got_f32, &exp_f32, ORACLE_TOL)?;
+        }
+    }
+}
+
+/// `cat` cell (ODL-15, categorical membership predict: cat_onehot / cat_manyvsmany).
+mod cat {
+    use super::*;
+
+    #[test]
+    #[ignore = "Wave-0 scaffold; un-ignore when 18-04 lands"]
+    fn predict_parity_cat_membership() {
+        let Some(goldens) = read_predict_golden() else { return };
+        let cats: Vec<&PredictGolden> = goldens.iter().filter(|g| g.kind == "categorical").collect();
+        assert!(!cats.is_empty(), "predict.txt has no categorical PREDICT block");
+        // Both the one-hot and many-vs-many models must be present (D-03/D-05).
+        assert!(cats.iter().any(|g| g.name == "cat_onehot"), "missing cat_onehot block");
+        assert!(cats.iter().any(|g| g.name == "cat_manyvsmany"), "missing cat_manyvsmany block");
+        for g in cats {
+            assert_predict_shape(g);
+            // UN-IGNORE (18-04): drive the device categorical tree-walk (FindInBitsetCUDA
+            // membership) and compare within ORACLE_TOL vs g.scores.
+        }
+    }
+}
