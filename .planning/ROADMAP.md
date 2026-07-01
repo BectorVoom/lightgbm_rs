@@ -234,8 +234,13 @@ Plans:
   4. On-device **ranking** grad/hess (LambdaRank-NDCG + RankXENDCG, per-query block layout, bitonic item ranking, per-item RNG with the bit-identical stream) anchor-pinned. (§5.4)
   5. The CUDA-unsupported objectives (MAPE / Gamma / Tweedie / cross-entropy / rank-MAP) honestly fall back to host; CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: TBD
-**Notes**: Exactly 11 CUDA-supported objectives (§5). The atomic-ordering nondeterminism in binary BoostFromScore + lambdarank is the documented f32-vs-f64 residual the ROCm gate tolerates — pin to the cpu f64 anchor, never GPU-vs-GPU. Each objective is a separable, individually-anchor-gated addition.
+**Plans**: 5 plans
+- [ ] 19-00-PLAN.md — Wave 1: greenfield objective module stubs + mod.rs, host-fallback support-set (SC #5), shared parity harness, lambdarank golden capture
+- [ ] 19-01-PLAN.md — Wave 2: ODL-05 regression family (6 grad/hess kernels + ConvertOutput + BoostFromScore + host-orchestrated RenewTreeOutput)
+- [ ] 19-02-PLAN.md — Wave 2: ODL-06 binary-logloss (grad/hess + two-stage BoostFromScore logit init + sigmoid ConvertOutput + OVA label reset)
+- [ ] 19-03-PLAN.md — Wave 2: ODL-07 multiclass (class-major softmax grad/hess + softmax ConvertOutput + MulticlassOVA)
+- [ ] 19-04-PLAN.md — Wave 2: ODL-08 ranking (LambdaRank-NDCG shared+>2048 + RankXENDCG shared+global + per-item RNG)
+**Notes**: Exactly 11 CUDA-supported objectives (§5). The atomic-ordering nondeterminism in binary BoostFromScore + lambdarank is the documented f32-vs-f64 residual the ROCm gate tolerates — pin to the cpu f64 anchor, never GPU-vs-GPU. Each objective is a separable, individually-anchor-gated addition. Wave 2 plans (19-01..04) are fully parallel (disjoint owned files); each depends only on 19-00.
 
 #### Phase 20: On-Device Score Updater & Metrics
 
