@@ -38,7 +38,7 @@
 use std::path::PathBuf;
 
 use lgbm_compute::kernels::best_split::{
-    find_best_splits_stage1_on, SplitFindTask, Stage1Scalars,
+    find_best_splits_stage1_f32_on, find_best_splits_stage1_on, SplitFindTask, Stage1Scalars,
 };
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
@@ -359,4 +359,60 @@ fn best_split_parity_stage1_bit_exact_on_cpu() {
     assert!(saw_empty, "fixture must cover the empty/no-valid-split (is_valid=0) case");
     assert!(saw_globalmem, "fixture must cover the global-memory spill (num_bin > 256) case");
     assert!(saw_default_left_tie, "fixture must cover a tie-aware default_left case");
+}
+
+/// The f32 stage-1 mirror drives through cubecl-cpu producing a STRUCTURALLY identical
+/// record (is_valid / threshold / default_left / left+right count bit-exact) with the
+/// continuous per-side sums / value / gain within the ~1e-5 f32 envelope of the f64
+/// fold (17-03 Task 2, def-f8u-01 — anchored to the cpu f64 fold, NEVER GPU-vs-GPU).
+/// Exercised on the default-template + USE_L1 goldens (small exact-ish values).
+#[test]
+fn best_split_parity_stage1_f32_within_tol_on_cpu() {
+    let path = kernels_dir().join("best_split.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("best_split_parity(f32): SKIP — fixture {} not found.", path.display());
+        return;
+    };
+    let cases = parse_best_split(&text);
+    let client = cpu_client();
+    let tol = 1e-5_f64;
+    let mut checked = 0;
+    for g in &cases {
+        // Default-template + USE_L1 only (the plan's f32 anchor scope; small values).
+        if !(g.name.starts_with("default_") && !g.name.contains("tie") || g.name == "use_l1") {
+            continue;
+        }
+        let task = task_of(g);
+        let scalars = scalars_of(g);
+        let hist_f32: Vec<f32> = g.hist.iter().map(|&x| x as f32).collect();
+        let si = find_best_splits_stage1_f32_on(&client, &hist_f32, &task, &scalars)
+            .unwrap_or_else(|e| panic!("BEST_SPLIT f32 `{}`: launch failed: {e:?}", g.name));
+        // Structure must be bit-exact.
+        assert_eq!(si.is_valid, g.win_is_valid, "f32 `{}`: is_valid", g.name);
+        if !g.win_is_valid {
+            continue;
+        }
+        assert_eq!(si.threshold, g.win_threshold, "f32 `{}`: threshold", g.name);
+        assert_eq!(si.default_left, g.win_default_left, "f32 `{}`: default_left", g.name);
+        assert_eq!(si.left_count, g.win_left_count, "f32 `{}`: left_count", g.name);
+        assert_eq!(si.right_count, g.win_right_count, "f32 `{}`: right_count", g.name);
+        // Continuous fields within ~1e-5 of the f64 anchor golden.
+        let pairs = [
+            (si.left_sum_gradients, g.win_left_sum_gradient, "left_sum_gradient"),
+            (si.left_sum_hessians, g.win_left_sum_hessian, "left_sum_hessian"),
+            (si.right_sum_gradients, g.win_right_sum_gradient, "right_sum_gradient"),
+            (si.right_sum_hessians, g.win_right_sum_hessian, "right_sum_hessian"),
+            (si.left_value, g.win_value, "value"),
+            (si.gain, g.win_gain, "gain"),
+        ];
+        for (got, exp, field) in pairs {
+            assert!(
+                (got - exp).abs() <= tol,
+                "f32 `{}`: {field} {got} vs {exp} exceeds {tol}",
+                g.name
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked >= 2, "f32 mirror must exercise default-template + USE_L1 (got {checked})");
 }

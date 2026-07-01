@@ -56,8 +56,10 @@ use lgbm_dataset::MissingType;
 
 use crate::error::ComputeError;
 use crate::gain::{
-    calculate_splitted_leaf_output, calculate_splitted_leaf_output_smoothed,
-    get_leaf_gain_given_output, get_leaf_gain_smoothed, get_split_gains,
+    calculate_splitted_leaf_output, calculate_splitted_leaf_output_f32,
+    calculate_splitted_leaf_output_smoothed, calculate_splitted_leaf_output_smoothed_f32,
+    get_leaf_gain_given_output, get_leaf_gain_given_output_f32, get_leaf_gain_smoothed,
+    get_leaf_gain_smoothed_f32, get_split_gains, get_split_gains_f32,
 };
 use crate::kernels::random::draw_rand_int32_on;
 use crate::kernels::split_info::SplitScalars;
@@ -414,8 +416,8 @@ pub fn split_eval_body(
     for t in 0..scan_count {
         // ---- read this thread's bin (forward: bin t; reverse: bin fnbmo-1-t) ----
         // skip_sum excludes the default bin from the accumulation (a `continue`).
-        let skip = (rev && skip_def && (num_bin - 1 - t) == default_bin)
-            || (!rev && skip_def && (t + mfb_offset) == default_bin);
+        let skip = skip_def
+            && ((rev && (num_bin - 1 - t) == default_bin) || (!rev && (t + mfb_offset) == default_bin));
         // Only threads whose bin exists (t < fnbmo) and are not skipped load a value.
         let read_active = t < fnbmo && !skip;
         let bin_fwd = t;
@@ -720,6 +722,554 @@ pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
         right_value: cells[11],
         num_cat_threshold: 0,
     })
+}
+
+// ===========================================================================
+// hip f32 mirror (17-03 Task 2) — the f32 numerical core.
+//
+// TWO paths, mirroring the codebase convention (Phases 14-16): the cpu-testable
+// SINGLE-OWNER f32 fold ([`split_eval_kernel_f32`]) that drives through cubecl-cpu
+// (which has NO plane support — primitives.rs:1182) so the f32 numerics are anchored
+// to the Task-1 f64 fold (structure bit-exact, values within the ~1e-5 f32 envelope,
+// def-f8u-01 — NEVER GPU-vs-GPU); AND the block-parallel hip path
+// ([`split_eval_block_kernel_f32`]) built on the NET-NEW two-level LDS scan
+// ([`stage1_block_scan`], D-03) + [`reduce_best_gain`] block argmax, `#[cfg(feature =
+// "gpu")]` like every rocm kernel in `histogram.rs`/`primitives.rs`. The block path's
+// on-device rocm parity assertion is added in 17-05 (this task ships + compiles it).
+// NO f64 anywhere in the f32 path (D-10, WR-05 literal pinning throughout).
+// ===========================================================================
+
+/// f32 mirror of [`round_ties_even_cube`] (`__double2int_rn`, round-ties-EVEN) — the
+/// no-f64 hip path. Uses `f32::floor` only; every literal pinned f32 (WR-05).
+#[cube]
+fn round_ties_even_f32_cube(x: f32) -> i32 {
+    let f = f32::floor(x);
+    let diff = x - f;
+    let parity = f - 2.0f32 * f32::floor(f * 0.5f32);
+    let f_is_odd = parity > 0.5f32;
+    let up = diff > 0.5f32 || (diff == 0.5f32 && f_is_odd);
+    let r = select(up, f + 1.0f32, f);
+    i32::cast_from(r)
+}
+
+/// The f32 single-owner mirror of [`split_eval_body`] — the SAME §8.1 accumulation in
+/// f32 (all literals pinned f32, WR-05; the `*_f32` gain mirrors), driven single-owner
+/// so it runs on the cubecl-cpu anchor. Anchored to the Task-1 f64 fold within ~1e-5
+/// (def-f8u-01). Structure (threshold/counts/default_left/is_valid) is bit-exact; the
+/// per-side sums/value/gain absorb the f32-vs-f64 accumulation gap (~1e-5).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn split_eval_body_f32(
+    hist: &Array<f32>,
+    out: &mut Array<f32>,
+    num_bin: i32,
+    mfb_offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    reverse: u32,
+    assume_out_default_left: u32,
+    use_l1: u32,
+    use_smoothing: u32,
+    use_rand: u32,
+    rand_threshold: i32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f32,
+    lambda_l1: f32,
+    lambda_l2: f32,
+    path_smooth: f32,
+    parent_output: f32,
+    min_gain_shift: f32,
+    sum_gradient: f32,
+    sum_hessian: f32,
+    num_data: i32,
+    scan_count: i32,
+) {
+    let eps = f32::cast_from(K_EPSILON);
+    let l1 = lambda_l1;
+    let l2 = lambda_l2;
+    let rev = reverse != 0;
+    let use_l1_b = use_l1 != 0;
+    let sm = use_smoothing != 0;
+    let use_rand_b = use_rand != 0;
+    let skip_def = skip_default_bin != 0;
+
+    let cnt_factor = f32::cast_from(num_data) / sum_hessian;
+    let fnbmo = num_bin - mfb_offset;
+    let fwd_end = fnbmo - 2;
+    let rev_end = num_bin - 2;
+
+    let mut acc_g = 0.0f32;
+    let mut acc_h = 0.0f32;
+    let mut best_gain = 0.0f32;
+    let mut best_threshold = 0i32;
+    let mut best_scanned_g = 0.0f32;
+    let mut best_scanned_h = 0.0f32;
+    let mut is_valid = 0.0f32;
+
+    for t in 0..scan_count {
+        let skip = skip_def
+            && ((rev && (num_bin - 1 - t) == default_bin) || (!rev && (t + mfb_offset) == default_bin));
+        let read_active = t < fnbmo && !skip;
+        let bin = select(rev, fnbmo - 1 - t, t);
+        let bin_safe = select(read_active, bin, 0i32);
+        let base = (bin_safe as usize) * 2;
+        let g = select(read_active, hist[base], 0.0f32);
+        let h_raw = select(read_active, hist[base + 1], 0.0f32);
+        let h = h_raw + select(t == 0, eps, 0.0f32);
+
+        acc_g += g;
+        acc_h += h;
+
+        let scanned_g = acc_g;
+        let scanned_h = acc_h;
+        let comp_g = sum_gradient - scanned_g;
+        let comp_h = sum_hessian - scanned_h;
+        let scanned_cnt = round_ties_even_f32_cube(scanned_h * cnt_factor);
+        let comp_cnt = num_data - scanned_cnt;
+
+        let l_g = select(rev, comp_g, scanned_g);
+        let l_h = select(rev, comp_h, scanned_h);
+        let lc = select(rev, comp_cnt, scanned_cnt);
+        let r_g = select(rev, scanned_g, comp_g);
+        let r_h = select(rev, scanned_h, comp_h);
+        let rc = select(rev, scanned_cnt, comp_cnt);
+        let threshold = select(rev, rev_end - t, t + mfb_offset);
+
+        let in_range = (rev && t <= rev_end) || (!rev && t <= fwd_end);
+        let cand = in_range && !skip;
+        let guard = l_h >= min_sum_hessian_in_leaf
+            && lc >= min_data_in_leaf
+            && r_h >= min_sum_hessian_in_leaf
+            && rc >= min_data_in_leaf;
+        let rand_ok = !use_rand_b || threshold == rand_threshold;
+
+        let gain_ns = get_split_gains_f32(use_l1_b, l_g, l_h, r_g, r_h, l1, l2);
+        let gain_sm = get_leaf_gain_smoothed_f32(use_l1_b, l_g, l_h, l1, l2, path_smooth, lc, parent_output)
+            + get_leaf_gain_smoothed_f32(use_l1_b, r_g, r_h, l1, l2, path_smooth, rc, parent_output);
+        let current_gain = select(sm, gain_sm, gain_ns);
+
+        let valid = cand && guard && rand_ok && current_gain > min_gain_shift;
+        let local_gain = current_gain - min_gain_shift;
+        let take = valid && local_gain > best_gain;
+        best_gain = select(take, local_gain, best_gain);
+        best_threshold = select(take, threshold, best_threshold);
+        best_scanned_g = select(take, scanned_g, best_scanned_g);
+        best_scanned_h = select(take, scanned_h, best_scanned_h);
+        is_valid = select(take, 1.0f32, is_valid);
+    }
+
+    let w_scanned_g = best_scanned_g;
+    let w_scanned_h = best_scanned_h - eps;
+    let w_scanned_cnt = round_ties_even_f32_cube(w_scanned_h * cnt_factor);
+    let w_comp_g = sum_gradient - w_scanned_g;
+    let w_comp_h = sum_hessian - w_scanned_h - eps;
+    let w_comp_cnt = num_data - w_scanned_cnt;
+
+    let wl_g = select(rev, w_comp_g, w_scanned_g);
+    let wl_h = select(rev, w_comp_h, w_scanned_h);
+    let wl_c = select(rev, w_comp_cnt, w_scanned_cnt);
+    let wr_g = select(rev, w_scanned_g, w_comp_g);
+    let wr_h = select(rev, w_scanned_h, w_comp_h);
+    let wr_c = select(rev, w_scanned_cnt, w_comp_cnt);
+
+    let l_out_ns = calculate_splitted_leaf_output_f32(use_l1_b, wl_g, wl_h, l1, l2);
+    let l_out_sm =
+        calculate_splitted_leaf_output_smoothed_f32(use_l1_b, wl_g, wl_h, l1, l2, path_smooth, wl_c, parent_output);
+    let left_output = select(sm, l_out_sm, l_out_ns);
+    let r_out_ns = calculate_splitted_leaf_output_f32(use_l1_b, wr_g, wr_h, l1, l2);
+    let r_out_sm =
+        calculate_splitted_leaf_output_smoothed_f32(use_l1_b, wr_g, wr_h, l1, l2, path_smooth, wr_c, parent_output);
+    let right_output = select(sm, r_out_sm, r_out_ns);
+    let left_gain = get_leaf_gain_given_output_f32(use_l1_b, wl_g, wl_h, l1, l2, left_output);
+    let right_gain = get_leaf_gain_given_output_f32(use_l1_b, wr_g, wr_h, l1, l2, right_output);
+
+    let default_left_f = select(assume_out_default_left != 0, 1.0f32, 0.0f32);
+
+    out[0] = is_valid;
+    out[1] = f32::cast_from(best_threshold);
+    out[2] = default_left_f;
+    out[3] = best_gain;
+    out[4] = wl_g;
+    out[5] = wl_h;
+    out[6] = f32::cast_from(wl_c);
+    out[7] = wr_g;
+    out[8] = wr_h;
+    out[9] = f32::cast_from(wr_c);
+    out[10] = left_output;
+    out[11] = right_output;
+    out[12] = left_gain;
+    out[13] = right_gain;
+}
+
+/// The f32 single-owner launch wrapper (mirrors `split.rs:444` `find_best_split_kernel_f32`,
+/// f32 cell type). Delegates to [`split_eval_body_f32`].
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn split_eval_kernel_f32(
+    hist: &Array<f32>,
+    out: &mut Array<f32>,
+    num_bin: i32,
+    mfb_offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    reverse: u32,
+    assume_out_default_left: u32,
+    use_l1: u32,
+    use_smoothing: u32,
+    use_rand: u32,
+    rand_threshold: i32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f32,
+    lambda_l1: f32,
+    lambda_l2: f32,
+    path_smooth: f32,
+    parent_output: f32,
+    min_gain_shift: f32,
+    sum_gradient: f32,
+    sum_hessian: f32,
+    num_data: i32,
+    scan_count: i32,
+) {
+    split_eval_body_f32(
+        hist, out, num_bin, mfb_offset, default_bin, skip_default_bin, reverse,
+        assume_out_default_left, use_l1, use_smoothing, use_rand, rand_threshold,
+        min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2, path_smooth,
+        parent_output, min_gain_shift, sum_gradient, sum_hessian, num_data, scan_count,
+    );
+}
+
+/// STAGE 1 f32 mirror launcher (single-owner) — drives [`split_eval_kernel_f32`] on
+/// the cubecl-cpu anchor and decodes the [`SplitScalars`] record (f32 widened to the
+/// f64 storage fields). Anchored to [`find_best_splits_stage1_on`] within ~1e-5
+/// (def-f8u-01); the on-device rocm f32 path is [`split_eval_block_kernel_f32`] (17-05).
+///
+/// # Errors
+/// [`ComputeError`] from [`validate_stage1_inputs`] or the USE_RAND draw.
+pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    hist: &[f32],
+    task: &SplitFindTask,
+    scalars: &Stage1Scalars,
+) -> Result<SplitScalars, ComputeError> {
+    validate_stage1_inputs(task.num_bin, hist.len())?;
+    if task.is_categorical {
+        return Ok(SplitScalars::default());
+    }
+    let num_bin_i = task.num_bin as i32;
+    let rand_threshold: i32 = if scalars.use_rand && num_bin_i - 2 > 0 {
+        let draw = draw_rand_int32_on(client, &[scalars.rng_seed as u32], 1)?;
+        draw[0] % (num_bin_i - 2)
+    } else {
+        -1
+    };
+    let min_gain_shift = (scalars.parent_gain + scalars.min_gain_to_split) as f32;
+
+    let h_hist = client.create_from_slice(f32::as_bytes(hist));
+    let h_out = client.empty(STAGE1_OUT_LEN * core::mem::size_of::<f32>());
+
+    // SAFETY: identical sizing/index contract as `find_best_splits_stage1_on` (T-17-01),
+    // f32 cells. cubecl unsafe confined here (CMP-01).
+    unsafe {
+        split_eval_kernel_f32::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_hist, hist.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), STAGE1_OUT_LEN),
+            num_bin_i,
+            task.mfb_offset as i32,
+            task.default_bin as i32,
+            if task.skip_default_bin { 1u32 } else { 0u32 },
+            if task.reverse { 1u32 } else { 0u32 },
+            if task.assume_out_default_left { 1u32 } else { 0u32 },
+            if scalars.use_l1 { 1u32 } else { 0u32 },
+            if scalars.use_smoothing { 1u32 } else { 0u32 },
+            if scalars.use_rand { 1u32 } else { 0u32 },
+            rand_threshold,
+            scalars.min_data_in_leaf,
+            scalars.min_sum_hessian_in_leaf as f32,
+            scalars.lambda_l1 as f32,
+            scalars.lambda_l2 as f32,
+            scalars.path_smooth as f32,
+            scalars.parent_output as f32,
+            min_gain_shift,
+            scalars.sum_gradient as f32,
+            scalars.sum_hessian as f32,
+            scalars.num_data,
+            num_bin_i,
+        );
+    }
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = f32::from_bytes(&bytes);
+    if cells[0] == 0.0 {
+        return Ok(SplitScalars::default());
+    }
+    Ok(SplitScalars {
+        is_valid: true,
+        leaf_index: -1,
+        gain: cells[3] as f64,
+        inner_feature_index: task.inner_feature_index,
+        threshold: cells[1] as u32,
+        default_left: cells[2] != 0.0,
+        left_sum_gradients: cells[4] as f64,
+        left_sum_hessians: cells[5] as f64,
+        left_sum_gh_quant: 0,
+        left_count: cells[6] as i32,
+        left_gain: cells[12] as f64,
+        left_value: cells[10] as f64,
+        right_sum_gradients: cells[7] as f64,
+        right_sum_hessians: cells[8] as f64,
+        right_sum_gh_quant: 0,
+        right_count: cells[9] as i32,
+        right_gain: cells[13] as f64,
+        right_value: cells[11] as f64,
+        num_cat_threshold: 0,
+    })
+}
+
+/// Max block width for the hip block-parallel stage-1 path (256 threads, the C++
+/// `NUM_THREADS_PER_BLOCK_BEST_SPLIT_FINDER`). Also the `SharedMemory` staging cap.
+#[cfg(feature = "gpu")]
+const STAGE1_BLOCK_MAX: usize = 256;
+
+/// Max planes per cube for the cross-plane carry stage (1024/32; 32 is the safe cap,
+/// mirroring `primitives::N_PLANES_MAX`).
+#[cfg(feature = "gpu")]
+const STAGE1_N_PLANES_MAX: usize = 32;
+
+/// NET-NEW two-level within-block inclusive scan (D-03) — the hip stage-1 scan, built
+/// on the cubecl-0.10 plane intrinsics + a `SharedMemory` cross-plane carry under
+/// `sync_cube()` (the idiom borrowed from `primitives.rs`, NOT the generic `block_scan`
+/// segment contract). Returns unit `UNIT_POS`'s block-wide inclusive prefix of `v`.
+/// Two levels: `plane_inclusive_sum` intra-plane, then plane 0 exclusive-scans the
+/// per-plane totals and each unit adds its plane base back (mirrors
+/// `primitives::plane_block_scan_kernel_f32`, forward=cumulative-LEFT / reverse=
+/// cumulative-RIGHT via the caller's read pattern).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::manual_div_ceil)] // matches primitives::plane_block_scan_kernel_f32 (cubecl lowering)
+fn stage1_block_scan(v: f32, plane_dim: u32) -> f32 {
+    let mut stage = SharedMemory::<f32>::new(STAGE1_N_PLANES_MAX);
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    // 1. inclusive scan WITHIN each plane.
+    let local = plane_inclusive_sum(v);
+    // 2. last lane of each plane stages its plane total.
+    if lane == pd - 1 {
+        stage[plane_id] = local;
+    }
+    sync_cube();
+    // 3. plane 0 exclusive-scans the per-plane totals.
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { f32::new(0.0) };
+        stage[lane] = plane_exclusive_sum(t);
+    }
+    sync_cube();
+    // 4. add the plane base back → block-wide inclusive prefix.
+    let base = stage[plane_id];
+    base + local
+}
+
+/// `ReduceBestGain` block argmax over `(local_gain, found, thread_index)` — the winning
+/// thread index, tie-break by the LOWEST index via strict `>` (Pitfall 5, matching the
+/// Task-1 cpu fold's first-max-wins). Stages each unit's `(gain, found)` into
+/// `SharedMemory`, `sync_cube()`, then unit 0 folds with strict `>`; a `block_size`
+/// sentinel means "no thread found a split". D-03 borrows the LDS idiom, not the
+/// generic reduction.
+#[cfg(feature = "gpu")]
+#[cube]
+fn reduce_best_gain(local_gain: f32, found: bool, block_size: u32) -> u32 {
+    let mut sh_gain = SharedMemory::<f32>::new(STAGE1_BLOCK_MAX);
+    let mut sh_found = SharedMemory::<u32>::new(STAGE1_BLOCK_MAX);
+    let mut sh_win = SharedMemory::<u32>::new(1usize);
+    let i = UNIT_POS as usize;
+    sh_gain[i] = local_gain;
+    sh_found[i] = select(found, 1u32, 0u32);
+    sync_cube();
+    if UNIT_POS == 0 {
+        let mut best = block_size; // sentinel: no winner
+        let mut best_g = 0.0f32;
+        let n = block_size as usize;
+        for k in 0..n {
+            let fnd = sh_found[k] == 1u32;
+            // strict `>` keeps the FIRST (lowest index) on a tie; `best == sentinel`
+            // admits the first found candidate.
+            let take = fnd && (best == block_size || sh_gain[k] > best_g);
+            best = select(take, k as u32, best);
+            best_g = select(take, sh_gain[k], best_g);
+        }
+        sh_win[0] = best;
+    }
+    sync_cube();
+    sh_win[0]
+}
+
+/// The hip block-parallel stage-1 kernel (D-03/D-06) — one block per `(leaf,feature)`
+/// task, 256 threads: each unit loads its bin, the two-level [`stage1_block_scan`]
+/// produces the cumulative scanned side, complement-from-parent + two-phase count
+/// recovery + guards + gain (smoothing dispatch) per unit, [`reduce_best_gain`] picks
+/// the winner (strict `>`), and the winning unit writes the record (kEpsilon-subtracted).
+/// Byte-for-byte the §8.1 math of [`split_eval_body_f32`], parallelized. Anchored to the
+/// Task-1 cpu f64 fold; the on-device rocm parity assertion lands in 17-05 (def-f8u-01,
+/// NEVER GPU-vs-GPU). NO f64 (D-10, WR-05).
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn split_eval_block_kernel_f32(
+    hist: &Array<f32>,
+    out: &mut Array<f32>,
+    num_bin: i32,
+    mfb_offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    reverse: u32,
+    assume_out_default_left: u32,
+    use_l1: u32,
+    use_smoothing: u32,
+    use_rand: u32,
+    rand_threshold: i32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f32,
+    lambda_l1: f32,
+    lambda_l2: f32,
+    path_smooth: f32,
+    parent_output: f32,
+    min_gain_shift: f32,
+    sum_gradient: f32,
+    sum_hessian: f32,
+    num_data: i32,
+    plane_dim: u32,
+    block_size: u32,
+) {
+    let eps = f32::cast_from(K_EPSILON);
+    let rev = reverse != 0;
+    let use_l1_b = use_l1 != 0;
+    let sm = use_smoothing != 0;
+    let use_rand_b = use_rand != 0;
+    let skip_def = skip_default_bin != 0;
+
+    let cnt_factor = f32::cast_from(num_data) / sum_hessian;
+    let fnbmo = num_bin - mfb_offset;
+    let fwd_end = fnbmo - 2;
+    let rev_end = num_bin - 2;
+
+    let t = UNIT_POS as i32;
+    // ---- per-unit bin read (forward: bin t; reverse: bin fnbmo-1-t) ----
+    let skip = skip_def
+        && ((rev && (num_bin - 1 - t) == default_bin) || (!rev && (t + mfb_offset) == default_bin));
+    let read_active = t < fnbmo && !skip;
+    let bin = select(rev, fnbmo - 1 - t, t);
+    let bin_safe = select(read_active, bin, 0i32);
+    let base = (bin_safe as usize) * 2;
+    let g = select(read_active, hist[base], 0.0f32);
+    let h_raw = select(read_active, hist[base + 1], 0.0f32);
+    // thread 0 seeds kEpsilon ONCE at the scan origin.
+    let h = h_raw + select(t == 0, eps, 0.0f32);
+
+    // ---- two-level block-inclusive prefix (grad and hess, two scans) ----
+    let scanned_g = stage1_block_scan(g, plane_dim);
+    let scanned_h = stage1_block_scan(h, plane_dim);
+
+    // ---- guard phase at this unit ----
+    let comp_g = sum_gradient - scanned_g;
+    let comp_h = sum_hessian - scanned_h;
+    let scanned_cnt = round_ties_even_f32_cube(scanned_h * cnt_factor);
+    let comp_cnt = num_data - scanned_cnt;
+
+    let l_g = select(rev, comp_g, scanned_g);
+    let l_h = select(rev, comp_h, scanned_h);
+    let lc = select(rev, comp_cnt, scanned_cnt);
+    let r_g = select(rev, scanned_g, comp_g);
+    let r_h = select(rev, scanned_h, comp_h);
+    let rc = select(rev, scanned_cnt, comp_cnt);
+    let threshold = select(rev, rev_end - t, t + mfb_offset);
+
+    let in_range = (rev && t <= rev_end) || (!rev && t <= fwd_end);
+    let cand = in_range && !skip;
+    let guard = l_h >= min_sum_hessian_in_leaf
+        && lc >= min_data_in_leaf
+        && r_h >= min_sum_hessian_in_leaf
+        && rc >= min_data_in_leaf;
+    let rand_ok = !use_rand_b || threshold == rand_threshold;
+
+    let gain_ns = get_split_gains_f32(use_l1_b, l_g, l_h, r_g, r_h, lambda_l1, lambda_l2);
+    let gain_sm = get_leaf_gain_smoothed_f32(use_l1_b, l_g, l_h, lambda_l1, lambda_l2, path_smooth, lc, parent_output)
+        + get_leaf_gain_smoothed_f32(use_l1_b, r_g, r_h, lambda_l1, lambda_l2, path_smooth, rc, parent_output);
+    let current_gain = select(sm, gain_sm, gain_ns);
+
+    let found = cand && guard && rand_ok && current_gain > min_gain_shift;
+    let local_gain = select(found, current_gain - min_gain_shift, f32::new(0.0));
+
+    // ---- block argmax (strict >, lowest index wins ties) ----
+    let win = reduce_best_gain(local_gain, found, block_size);
+    let no_winner = win >= block_size;
+
+    // unit 0 initialises the "no valid split" sentinel; the winning unit overwrites.
+    if UNIT_POS == 0 && no_winner {
+        out[0] = f32::new(0.0);
+        out[1] = f32::new(0.0);
+        out[2] = f32::new(0.0);
+        out[3] = f32::new(0.0);
+        out[4] = f32::new(0.0);
+        out[5] = f32::new(0.0);
+        out[6] = f32::new(0.0);
+        out[7] = f32::new(0.0);
+        out[8] = f32::new(0.0);
+        out[9] = f32::new(0.0);
+        out[10] = f32::new(0.0);
+        out[11] = f32::new(0.0);
+        out[12] = f32::new(0.0);
+        out[13] = f32::new(0.0);
+    }
+    if UNIT_POS == win {
+        // write phase: kEpsilon subtracted, count RE-recovered (this unit's prefix).
+        let w_scanned_g = scanned_g;
+        let w_scanned_h = scanned_h - eps;
+        let w_scanned_cnt = round_ties_even_f32_cube(w_scanned_h * cnt_factor);
+        let w_comp_g = sum_gradient - w_scanned_g;
+        let w_comp_h = sum_hessian - w_scanned_h - eps;
+        let w_comp_cnt = num_data - w_scanned_cnt;
+
+        let wl_g = select(rev, w_comp_g, w_scanned_g);
+        let wl_h = select(rev, w_comp_h, w_scanned_h);
+        let wl_c = select(rev, w_comp_cnt, w_scanned_cnt);
+        let wr_g = select(rev, w_scanned_g, w_comp_g);
+        let wr_h = select(rev, w_scanned_h, w_comp_h);
+        let wr_c = select(rev, w_scanned_cnt, w_comp_cnt);
+
+        let l_out_ns = calculate_splitted_leaf_output_f32(use_l1_b, wl_g, wl_h, lambda_l1, lambda_l2);
+        let l_out_sm = calculate_splitted_leaf_output_smoothed_f32(
+            use_l1_b, wl_g, wl_h, lambda_l1, lambda_l2, path_smooth, wl_c, parent_output,
+        );
+        let left_output = select(sm, l_out_sm, l_out_ns);
+        let r_out_ns = calculate_splitted_leaf_output_f32(use_l1_b, wr_g, wr_h, lambda_l1, lambda_l2);
+        let r_out_sm = calculate_splitted_leaf_output_smoothed_f32(
+            use_l1_b, wr_g, wr_h, lambda_l1, lambda_l2, path_smooth, wr_c, parent_output,
+        );
+        let right_output = select(sm, r_out_sm, r_out_ns);
+        let left_gain = get_leaf_gain_given_output_f32(use_l1_b, wl_g, wl_h, lambda_l1, lambda_l2, left_output);
+        let right_gain = get_leaf_gain_given_output_f32(use_l1_b, wr_g, wr_h, lambda_l1, lambda_l2, right_output);
+        let default_left_f = select(assume_out_default_left != 0, 1.0f32, 0.0f32);
+
+        out[0] = f32::new(1.0);
+        out[1] = f32::cast_from(threshold);
+        out[2] = default_left_f;
+        out[3] = local_gain;
+        out[4] = wl_g;
+        out[5] = wl_h;
+        out[6] = f32::cast_from(wl_c);
+        out[7] = wr_g;
+        out[8] = wr_h;
+        out[9] = f32::cast_from(wr_c);
+        out[10] = left_output;
+        out[11] = right_output;
+        out[12] = left_gain;
+        out[13] = right_gain;
+    }
 }
 
 /// STAGE 2 (STUB — Wave 3 fills the cross-feature reduce, 17-04).
