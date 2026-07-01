@@ -125,8 +125,13 @@ fn validate_softmax(
     labels: usize,
     num_class: usize,
 ) -> Result<usize, ComputeError> {
-    if num_class < 1 {
-        return Err(ComputeError::LengthMismatch { expected: 1, actual: num_class });
+    // Softmax requires >= 2 classes: `factor = num_class / (num_class - 1)` divides by
+    // zero at `num_class == 1` (→ inf/NaN hessians), and a single-class softmax is
+    // nonsensical. Reject it with a typed error rather than propagating NaN (IN-04).
+    if num_class < 2 {
+        return Err(ComputeError::Runtime {
+            detail: format!("multiclass softmax requires num_class >= 2, got {num_class}"),
+        });
     }
     if scores % num_class != 0 {
         // Not a length mismatch (the two numbers are not comparable lengths) — a
