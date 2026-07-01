@@ -6,14 +6,14 @@ current_phase: 19
 current_phase_name: on-device-objectives
 status: executing
 stopped_at: Phase 19 context gathered
-last_updated: "2026-07-01T14:56:12.664Z"
+last_updated: "2026-07-01T15:25:12.819Z"
 last_activity: 2026-07-01
 last_activity_desc: Phase 19 execution started
 progress:
   total_phases: 10
   completed_phases: 5
   total_plans: 30
-  completed_plans: 26
+  completed_plans: 27
   percent: 50
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 19 (on-device-objectives) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-07-01 — Phase 19 execution started
@@ -575,6 +575,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 18 P03 | 40min | 2 tasks | 2 files |
 | Phase 18 P04 | 13min | 2 tasks | 3 files |
 | Phase 19 P00 | 15min | 3 tasks | 12 files |
+| Phase 19 P01 | 16min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -679,6 +680,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 18-02: route flags are #[comptime] bools passed as plain host-computed values at the launch site — cubecl auto-specializes+caches per combination (no host match), honoring the D-02 fan-out
 - [Phase ?]: 18-02: device partition scatter uses the global scan (D-04 order-equivalence to a stable partition), reusing 18-01 u16/u32 primitives; exclusive rank IS the [tid-1] inclusive derivation
 - [Phase 19]: device_objective_supported() is a pure 11-true/7-false classifier; on_device_growth_supported() stays false (19-00 foundation)
+- [Phase ?]: 19-01: on-device regression grad/hess = ONE generic #[cube] body<F: Float> + comptime objective_tag; the f64 cpu-anchor launcher casts to f32 (score_t), reproducing the C++ f64-compute->f32-cast order bit-for-bit
+- [Phase ?]: 19-01: percentile_unweighted_f32_on skeleton ((1-alpha)*len) diverges from CPU PercentileFun ((len-1)*(1-alpha)) the goldens use; BoostFromScore/Renew compose bitonic_argsort_on + PercentileFun finalize instead of mutating the phase-14 primitive
 
 ### Pending Todos
 
@@ -694,6 +697,7 @@ None yet.
 - [Phase 5 / contract-doc reconciliation, 2026-06-06; RESOLVED 2026-06-07]: the stale CLAUDE.md `1e-12` framing has been reconciled to the authoritative ~1e-6 (f32) contract (the 2026-06-05 Phase-1 decision). CLAUDE.md Core Value + Numerical constraint now mirror PROJECT.md, and PROJECT.md's Core Value was enriched to record the two-regime reality: the `cubecl-cpu` f64-fold path is the deterministic anchor / hard merge gate and is **bit-exact** to C++ where the algorithm permits (binning; the serial tree learner is bit-exact vs real lib_lightgbm 4.6 on both committed corpora), while `cubecl-hip` (f32) is the ~1e-6 best-effort gate. All four contract docs (CLAUDE/PROJECT/REQUIREMENTS/ROADMAP) now agree on the ~1e-6-f32-with-bit-exact-CPU-anchor framing; the 2.3e-16 learner residual was closed bit-exact in 05-09 regardless. Historical phase-outcome bullets that say "inside the ≤1e-12 contract" are left as accurate past-tense records.
 
 - [Phase 7 / 07-02 checkpoint:human-verify, 2026-06-07 — RESOLVED]: the human chose the "ship green, defer blocked cells" disposition. The capture ran (byte-idempotent, 87 fixtures), huber/mape/quantile-spine shipped faithful GREEN (committed), and fair (all) + quantile bagged/iterated were `#[ignore]`'d under DEF-07-02 (07-01-class learner-level split-gain knife-edge; g/h bit-exact ⇒ not an objective bug). 07-02 is COMPLETE. The remaining cells are tracked by DEF-07-02 for a dedicated source-built lib_lightgbm 4.6 FP-trace learner-fix plan. NEVER git-add LightGBM/.
+- Phase-14 percentile skeleton (percentile_{un,}weighted_f32_on) convention unvalidated (no percentile.txt fixture) and diverges from CPU PercentileFun (median 10 vs 11) — reconcile before other consumers rely on it
 
 ## Deferred Items
 
@@ -708,7 +712,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T14:55:38.995Z
+Last session: 2026-07-01T15:24:37.175Z
 Stopped at: Phase 19 context gathered
 Resume file: .planning/phases/19-on-device-objectives/19-CONTEXT.md
 
