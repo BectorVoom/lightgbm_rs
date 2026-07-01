@@ -21,7 +21,7 @@ mod objective_common;
 
 use lgbm_compute::kernels::objective_multiclass as obj;
 use lgbm_compute::runtime::cpu_client;
-use lgbm_objective::multiclass::MulticlassSoftmax;
+use lgbm_objective::multiclass::{MulticlassOva, MulticlassSoftmax};
 use objective_common::{parse_gh, read_boosting_golden};
 use oracle_harness::comparator::{compare_exact_u32, ORACLE_TOL};
 
@@ -37,6 +37,9 @@ const MULTICLASS_LABELS: [f32; 12] =
 
 const NUM_CLASS: usize = 3;
 const NUM_DATA: usize = 12;
+
+/// The multiclass spine sigmoid (`config.sigmoid` default 1.0) — used by OVA.
+const SIGMOID: f64 = 1.0;
 
 /// The capture's `MULTICLASS_LATER_ITER` for the `*_gh_iterN` golden (the multiclass
 /// cells cap the horizon at 5 iters and use `later_iter = 4`, NOT the single-output
@@ -54,6 +57,15 @@ fn host_softmax_gh(score: &[f64], labels: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut g = vec![0.0f32; score.len()];
     let mut h = vec![0.0f32; score.len()];
     obj.get_gradients(score, &mut g, &mut h).expect("host softmax anchor grad/hess");
+    (g, h)
+}
+
+/// The host f64 OVA anchor grad/hess over the class-major `score` buffer.
+fn host_ova_gh(score: &[f64], labels: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let obj = MulticlassOva::new(NUM_CLASS as i32, SIGMOID, labels).unwrap();
+    let mut g = vec![0.0f32; score.len()];
+    let mut h = vec![0.0f32; score.len()];
+    obj.get_gradients(score, &mut g, &mut h).expect("host OVA anchor grad/hess");
     (g, h)
 }
 
@@ -145,6 +157,50 @@ fn multiclass() {
     if let Some(score_prev) = read_scores_line("multiclass_scores.txt", LATER_ITER - 2) {
         assert_eq!(score_prev.len(), NUM_DATA * NUM_CLASS, "scores line width");
         check_softmax_at(&client, &score_prev, "multiclass_gh_iterN.txt", "iterN");
+    }
+}
+
+/// Assert device OVA == host OVA anchor (D-05) AND device == golden, bit-exact.
+fn check_ova_at(client: &Client, scores: &[f64], gh_file: &str, tag: &str) {
+    let (dg, dh) =
+        obj::multiclassova_get_gradients_on(client, scores, &MULTICLASS_LABELS, NUM_CLASS, SIGMOID)
+            .expect("device OVA grad/hess launch");
+
+    let (hg, hh) = host_ova_gh(scores, &MULTICLASS_LABELS);
+    compare_exact_u32(&bits(&dg), &bits(&hg))
+        .unwrap_or_else(|m| panic!("{tag} OVA grad vs host anchor not bit-exact: {m:?}"));
+    compare_exact_u32(&bits(&dh), &bits(&hh))
+        .unwrap_or_else(|m| panic!("{tag} OVA hess vs host anchor not bit-exact: {m:?}"));
+
+    if let Some(text) = read_boosting_golden(gh_file) {
+        let (g_golden, h_golden) = parse_gh(&text);
+        assert_eq!(g_golden.len(), NUM_DATA * NUM_CLASS, "{tag} golden grad width");
+        compare_exact_u32(&bits(&dg), &bits(&g_golden))
+            .unwrap_or_else(|m| panic!("{tag} OVA grad vs golden not bit-exact: {m:?}"));
+        compare_exact_u32(&bits(&dh), &bits(&h_golden))
+            .unwrap_or_else(|m| panic!("{tag} OVA hess vs golden not bit-exact: {m:?}"));
+    }
+}
+
+#[test]
+fn multiclassova() {
+    let client = cpu_client();
+
+    // iter-1: OVA score0 = per-class binary BoostFromScore init broadcast.
+    let ova = MulticlassOva::new(NUM_CLASS as i32, SIGMOID, &MULTICLASS_LABELS).unwrap();
+    let mut score0 = vec![0.0f64; NUM_DATA * NUM_CLASS];
+    for k in 0..NUM_CLASS {
+        let init = ova.boost_from_score(k as i32);
+        for i in 0..NUM_DATA {
+            score0[NUM_DATA * k + i] = init;
+        }
+    }
+    check_ova_at(&client, &score0, "multiclassova_gh_iter1.txt", "iter1");
+
+    // iter-N: raw score at num_iteration = LATER_ITER - 1.
+    if let Some(score_prev) = read_scores_line("multiclassova_scores.txt", LATER_ITER - 2) {
+        assert_eq!(score_prev.len(), NUM_DATA * NUM_CLASS, "OVA scores line width");
+        check_ova_at(&client, &score_prev, "multiclassova_gh_iterN.txt", "iterN");
     }
 }
 

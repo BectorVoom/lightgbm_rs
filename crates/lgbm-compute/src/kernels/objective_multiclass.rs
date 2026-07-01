@@ -301,3 +301,116 @@ pub fn softmax_convert_output_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f64::from_bytes(&bytes).to_vec())
 }
+
+// =========================================================================
+// Task 2: MulticlassOVA (one-vs-all) — reuse the binary-logloss response math
+// per class at offset = num_data*i (§5.2 CUDAMulticlassOVA = binary-per-class).
+// =========================================================================
+
+/// The MulticlassOVA grad/hess body — ONE thread per ROW, looping the `num_class`
+/// one-vs-all classes at `offset = num_data * i`. Transcribes the binary-logloss
+/// response math locally (mirroring `binary.rs:87-94`) so this plan is self-contained
+/// (no cross-file dependency on 19-02): per class `i`, `is_pos = (label == i)`,
+/// `label_val = is_pos ? 1 : -1`, `response = -label_val*sigmoid/(1+exp(label_val*
+/// sigmoid*score))`, `grad = response`, `hess = |response|*(sigmoid-|response|)`.
+#[cube]
+fn ova_grad_hess_body<F: Float>(
+    scores: &Array<F>,
+    labels: &Array<F>,
+    grad: &mut Array<F>,
+    hess: &mut Array<F>,
+    num_data: usize,
+    num_class: usize,
+    sigmoid: F,
+) {
+    let row = ABSOLUTE_POS;
+    if row < num_data {
+        let label_i = labels[row];
+        for i in 0..num_class {
+            // class-major offset for one-vs-all class i.
+            let offset = num_data * i;
+            let idx = offset + row;
+            let is_pos = label_i == F::cast_from(i);
+            let label_val = select(is_pos, F::new(1.0), F::new(-1.0));
+            let response =
+                -label_val * sigmoid / (F::new(1.0) + (label_val * sigmoid * scores[idx]).exp());
+            let abs_response = response.abs();
+            grad[idx] = response;
+            hess[idx] = abs_response * (sigmoid - abs_response);
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn ova_grad_hess_kernel_f64(
+    scores: &Array<f64>,
+    labels: &Array<f64>,
+    grad: &mut Array<f64>,
+    hess: &mut Array<f64>,
+    num_data: usize,
+    num_class: usize,
+    sigmoid: f64,
+) {
+    ova_grad_hess_body::<f64>(scores, labels, grad, hess, num_data, num_class, sigmoid);
+}
+
+/// Compute multiclass-OVA (one-vs-all) grad/hess on the f64 cpu anchor.
+///
+/// `scores` is the class-major f64 score buffer (length `num_data*num_class`);
+/// `labels` are the f32 integer class labels (length `num_data`); `sigmoid` is
+/// `config.sigmoid` (`> 0`). Per class `i`, the binary-logloss response is applied at
+/// `offset = num_data*i` with `is_pos = (label == i)` — parity-neutral vs the host
+/// `MulticlassOva` (K independent `Binary`, Discretion). Returns `(grad, hess)` as
+/// class-major `f32`, bit-exact vs the host anchor and the real `multiclassova_gh`
+/// golden (per-row math, no accumulation → the f64 `exp` residual is f32-cast-absorbed).
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `scores` is not `num_data*num_class` or
+/// `labels` is not `num_data` (V5 boundary).
+pub fn multiclassova_get_gradients_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    scores: &[f64],
+    labels: &[f32],
+    num_class: usize,
+    sigmoid: f64,
+) -> Result<(Vec<f32>, Vec<f32>), ComputeError> {
+    let total = scores.len();
+    let num_data = validate_softmax(total, labels.len(), num_class)?;
+    if total == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
+    let h_scores = client.create_from_slice(f64::as_bytes(scores));
+    let h_labels = client.create_from_slice(f64::as_bytes(&labels_f64));
+    let h_grad = client.empty(total * core::mem::size_of::<f64>());
+    let h_hess = client.empty(total * core::mem::size_of::<f64>());
+
+    let cube_dim = 256u32;
+    let cube_count = (num_data as u32).div_ceil(cube_dim);
+
+    // SAFETY: `h_scores`/`h_grad`/`h_hess` are each sized exactly `total` f64 cells and
+    // `h_labels` `num_data`; all outlive the launch. The kernel bounds-guards
+    // `row < num_data` and every `num_data*i + row` with `i < num_class` lands in
+    // `[0, total)`. cubecl unsafe confined here (CMP-01 / T-19-03-01).
+    unsafe {
+        ova_grad_hess_kernel_f64::launch_unchecked(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(h_scores, total),
+            ArrayArg::from_raw_parts(h_labels, num_data),
+            ArrayArg::from_raw_parts(h_grad.clone(), total),
+            ArrayArg::from_raw_parts(h_hess.clone(), total),
+            num_data,
+            num_class,
+            sigmoid,
+        );
+    }
+
+    let grad_bytes = client.read_one_unchecked(h_grad);
+    let hess_bytes = client.read_one_unchecked(h_hess);
+    let grad: Vec<f32> = f64::from_bytes(&grad_bytes).iter().map(|&g| g as f32).collect();
+    let hess: Vec<f32> = f64::from_bytes(&hess_bytes).iter().map(|&h| h as f32).collect();
+    Ok((grad, hess))
+}
