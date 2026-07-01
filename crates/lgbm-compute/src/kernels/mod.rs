@@ -41,3 +41,10 @@ pub mod row_data;
 // `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor exercises the index
 // bookkeeping in isolation (D-08); the whole-tree pool SWAP is deferred to Phase 18.
 pub mod histogram_arena;
+// Phase-17 best-split finder (ODL-11 / ODL-12): the 3-stage split-finding pipeline
+// (§8) — stage-1 per-task eval / stage-2 cross-feature reduce / stage-3 cross-leaf
+// argmax + the single 8-int readback (D-06). Additive and OFF by default behind
+// `LGBM_CUDA_ON_DEVICE` (D-09). Ungated like the other Phase-14/15/16 kernel modules
+// (NOT `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor exercises the
+// host task-builder + count-recovery rounding in isolation (D-08).
+pub mod best_split;
