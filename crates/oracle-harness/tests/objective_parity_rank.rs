@@ -23,9 +23,11 @@
 mod objective_common;
 
 use lgbm_compute::kernels::objective_rank as obj;
+use lgbm_compute::kernels::random::draw_next_float_on;
 use lgbm_compute::runtime::cpu_client;
+use lgbm_core::random::Random;
 use lgbm_metric::dcg_calculator::DcgCalculator;
-use lgbm_objective::rank::Lambdarank;
+use lgbm_objective::rank::{Lambdarank, RankXendcg};
 use objective_common::{parse_gh, read_rank_golden};
 use oracle_harness::comparator::{compare_exact_u32, compare_within, ORACLE_TOL};
 
@@ -161,4 +163,112 @@ fn lambdarank() {
     // Device == host anchor on the DISTINCT final trained scores (no tie ambiguity —
     // an unambiguous-sort cross-check that bitonic == the host stable sort).
     check_lambdarank(&client, &final_scores, &labels, &qb, "final");
+}
+
+/// The §5.4 rank_xendcg `objective_seed` used for the grad/hess anchor + RNG-replay
+/// (the committed `rank_xendcg_objseed5` golden freezes seed 5).
+const OBJSEED: i32 = 5;
+
+/// The host f64 anchor grad/hess (rank.rs `RankXendcg::get_gradients`) over the
+/// per-query `Random(seed + q)` gamma stream.
+fn host_xendcg_gh(scores: &[f64], labels: &[f32], qb: &[i32], seed: i32) -> (Vec<f32>, Vec<f32>) {
+    let obj = RankXendcg::new(seed, labels, qb).unwrap();
+    let mut rands = obj.make_rands();
+    let mut g = vec![0.0f32; scores.len()];
+    let mut h = vec![0.0f32; scores.len()];
+    obj.get_gradients(scores, labels, &mut rands, &mut g, &mut h).expect("host rank_xendcg anchor");
+    (g, h)
+}
+
+#[test]
+fn rank_xendcg() {
+    let client = cpu_client();
+
+    // Corpus labels + query_boundaries from the scores golden (skip-pass if absent).
+    let Some(scores_txt) = read_rank_golden("rank_xendcg_scores.txt") else {
+        return;
+    };
+    let (final_scores, labels, qb) = parse_scores(&scores_txt);
+    let n = labels.len();
+
+    // iter-1: score_0 = 0 (ranking has no boost-from-average init) + the distinct final
+    // trained scores. Both exercise the softmax → three-order fold + per-item RNG.
+    for (scores, tag) in [(vec![0.0f64; n], "iter1"), (final_scores.clone(), "final")] {
+        let (dg, dh) = obj::rank_xendcg_get_gradients_on(&client, &scores, &labels, &qb, OBJSEED)
+            .expect("device rank_xendcg (shared)");
+        let (gg, gh) = obj::rank_xendcg_get_gradients_global_on(&client, &scores, &labels, &qb, OBJSEED)
+            .expect("device rank_xendcg (_GlobalMemory)");
+
+        // Pitfall 4 guard: the shared and >2048 _GlobalMemory (hessian-buffer aliasing)
+        // paths must produce IDENTICAL grad/hess.
+        compare_exact_u32(&bits(&dg), &bits(&gg))
+            .unwrap_or_else(|m| panic!("{tag} rank_xendcg shared vs global grad differ: {m:?}"));
+        compare_exact_u32(&bits(&dh), &bits(&gh))
+            .unwrap_or_else(|m| panic!("{tag} rank_xendcg shared vs global hess differ (Pitfall 4): {m:?}"));
+
+        // D-05 anchor: device == host f64 fold within ORACLE_TOL (softmax/exp residual).
+        let (hg, hh) = host_xendcg_gh(&scores, &labels, &qb, OBJSEED);
+        compare_within(&dg, &hg, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{tag} rank_xendcg grad vs host anchor: {m:?}"));
+        compare_within(&dh, &hh, ORACLE_TOL)
+            .unwrap_or_else(|m| panic!("{tag} rank_xendcg hess vs host anchor: {m:?}"));
+    }
+
+    // Twice-run determinism (single-owner ⇒ bit-stable).
+    let (a, _) = obj::rank_xendcg_get_gradients_on(&client, &final_scores, &labels, &qb, OBJSEED).unwrap();
+    let (b, _) = obj::rank_xendcg_get_gradients_on(&client, &final_scores, &labels, &qb, OBJSEED).unwrap();
+    compare_exact_u32(&bits(&a), &bits(&b))
+        .unwrap_or_else(|m| panic!("rank_xendcg grad determinism: {m:?}"));
+}
+
+#[test]
+fn rank_xendcg_rng_replay() {
+    // The per-item gamma draw ORDER is load-bearing: per query q, Random(seed + q)
+    // yields one NextFloat() per row, row-major. Assert the DEVICE draw_next_float_on
+    // stream is BIT-EXACT (compare_exact_u32 on to_bits) vs the host Random(seed + q)
+    // stream — NEVER GPU-vs-GPU (D-05) — and vs the committed rank_xendcg_objseed5
+    // golden draws when present (copies rank_parity::rank_xendcg_objseed_rng_replay).
+    let client = cpu_client();
+    let Some(text) = read_rank_golden("rank_xendcg_objseed5.txt") else {
+        return;
+    };
+    let mut cells = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut seed = 0i32;
+        let mut qb: Vec<i32> = Vec::new();
+        let mut exp_draws: Vec<u32> = Vec::new();
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("objective_seed=") {
+                seed = v.parse().unwrap();
+            } else if let Some(v) = tok.strip_prefix("query_boundaries=") {
+                qb = v.split(',').map(|t| t.parse().unwrap()).collect();
+            } else if let Some(v) = tok.strip_prefix("draws=") {
+                exp_draws = v.split(',').map(|t| t.parse::<u32>().unwrap()).collect();
+            }
+        }
+        let num_queries = qb.len() - 1;
+        let mut device: Vec<u32> = Vec::new();
+        let mut host: Vec<u32> = Vec::new();
+        for q in 0..num_queries {
+            let cnt = (qb[q + 1] - qb[q]) as u32;
+            // Device: compose draw_next_float_on with seed = seed + q (bit-identical LCG).
+            let d = draw_next_float_on(&client, &[(seed + q as i32) as u32], cnt).unwrap();
+            device.extend(d.iter().map(|f| f.to_bits()));
+            // Host oracle: Random(seed + q).next_float() per row.
+            let mut rng = Random::new(seed + q as i32);
+            for _ in 0..cnt {
+                host.push(rng.next_float().to_bits());
+            }
+        }
+        compare_exact_u32(&device, &host)
+            .unwrap_or_else(|m| panic!("objective_seed={seed} device vs host RNG stream: {m:?}"));
+        compare_exact_u32(&device, &exp_draws)
+            .unwrap_or_else(|m| panic!("objective_seed={seed} device stream vs golden draws: {m:?}"));
+        cells += 1;
+    }
+    assert!(cells > 0, "rank_xendcg objseed golden present but had no cells");
 }

@@ -43,6 +43,7 @@ use cubecl::prelude::*;
 
 use crate::error::ComputeError;
 use crate::kernels::primitives::bitonic_argsort_items_on;
+use crate::kernels::random::draw_next_float_on;
 
 /// C++ `LambdarankNDCG::_sigmoid_bins = 1024 * 1024` (rank_objective.hpp:365) — the
 /// sigmoid lookup-table resolution, replicated so the device grad/hess is bit-exact
@@ -55,6 +56,24 @@ const SIGMOID_BINS: usize = 1024 * 1024;
 /// fold (see the module doc). Autotune of the grid is deferred (Phase 21+).
 pub const NUM_QUERY_PER_BLOCK: u32 = 10;
 
+/// C++ `Common::Pow(2, power)` for an integer power (`common.h:248`) — repeated
+/// multiplication (NOT `powf`), matching the C++ bit-for-bit for small int powers.
+/// Used to precompute `2^label` host-side for RankXENDCG's `Phi` (labels are
+/// host-known non-negative integers, so the value is bit-identical to the in-kernel
+/// evaluation while sidestepping a device integer-bit-op loop).
+fn pow2_int(power: i32) -> f64 {
+    let mut ret = 1.0f64;
+    let mut base = 2.0f64;
+    let mut p = power;
+    while p > 0 {
+        if p & 1 == 1 {
+            ret *= base;
+        }
+        p >>= 1;
+        base *= base;
+    }
+    ret
+}
 
 /// Build the C++ `ConstructSigmoidTable` (rank_objective.hpp:281-294) host-side so the
 /// device kernel does the identical `GetSigmoid` lookup: `min = -50 / sigmoid / 2`,
@@ -493,3 +512,301 @@ fn lambdarank_impl<R: cubecl::Runtime>(
     Ok((grad, hess))
 }
 
+
+// =========================================================================
+// Task 2: RankXENDCG grad/hess (shared + `_GlobalMemory`) + per-item RNG.
+// =========================================================================
+
+/// The RankXENDCG per-query cross-entropy-NDCG fold (rank.rs:490-540), single-owner.
+/// `grad` is `f32` (host `&mut [f32]` accumulation); `hess` is `f64` (final
+/// `rho·(1-rho)` cast to `f32` at read-back). `two_pow_label` = `2^label` (host
+/// `pow2_int`); `gamma` = the per-item `NextFloat` draws (row-major). `rho_buf` /
+/// `params_buf` are the two length-N f64 intermediates (softmax `rho` and `params`).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn rank_xendcg_body(
+    scores: &Array<f64>,
+    two_pow_label: &Array<f64>,
+    gamma: &Array<f32>,
+    query_boundaries: &Array<i32>,
+    rho_buf: &mut Array<f64>,
+    params_buf: &mut Array<f64>,
+    grad: &mut Array<f32>,
+    hess: &mut Array<f64>,
+    num_queries: u32,
+    k_eps: f64,
+) {
+    if UNIT_POS == 0 {
+        let mut q = 0u32;
+        while q < num_queries {
+            let qi = q as usize;
+            let start = query_boundaries[qi] as usize;
+            let end = query_boundaries[qi + 1] as usize;
+            let cnt = end - start;
+            if cnt <= 1 {
+                let mut z = 0usize;
+                while z < cnt {
+                    grad[start + z] = 0.0f32;
+                    hess[start + z] = 0.0f64;
+                    z += 1;
+                }
+            } else {
+                // rho = softmax(score) over the query slice (max-subtraction), into
+                // rho_buf (which the _GlobalMemory launcher aliases onto `hess`).
+                let mut wmax = scores[start];
+                let mut a = 1usize;
+                while a < cnt {
+                    let v = scores[start + a];
+                    if v > wmax {
+                        wmax = v;
+                    }
+                    a += 1;
+                }
+                let mut wsum = 0.0f64;
+                a = 0usize;
+                while a < cnt {
+                    let e = (scores[start + a] - wmax).exp();
+                    rho_buf[start + a] = e;
+                    wsum += e;
+                    a += 1;
+                }
+                a = 0usize;
+                while a < cnt {
+                    rho_buf[start + a] = rho_buf[start + a] / wsum;
+                    a += 1;
+                }
+                // params[i] = phi(label, gamma) = 2^label - gamma; inv_den.
+                let mut sum_params = 0.0f64;
+                a = 0usize;
+                while a < cnt {
+                    let p = two_pow_label[start + a] - f64::cast_from(gamma[start + a]);
+                    params_buf[start + a] = p;
+                    sum_params += p;
+                    a += 1;
+                }
+                let denom = if sum_params > k_eps { sum_params } else { k_eps };
+                let inv_den = 1.0f64 / denom;
+                // First-order terms.
+                let mut sum_l1 = 0.0f64;
+                a = 0usize;
+                while a < cnt {
+                    let rho = rho_buf[start + a];
+                    let term = -params_buf[start + a] * inv_den + rho;
+                    grad[start + a] = f32::cast_from(term);
+                    let pv = term / (1.0f64 - rho);
+                    params_buf[start + a] = pv;
+                    sum_l1 += pv;
+                    a += 1;
+                }
+                // Second-order terms.
+                let mut sum_l2 = 0.0f64;
+                a = 0usize;
+                while a < cnt {
+                    let rho = rho_buf[start + a];
+                    let term = rho * (sum_l1 - params_buf[start + a]);
+                    grad[start + a] += f32::cast_from(term);
+                    let pv = term / (1.0f64 - rho);
+                    params_buf[start + a] = pv;
+                    sum_l2 += pv;
+                    a += 1;
+                }
+                // Third-order terms + hessian (reads rho before overwriting `hess`
+                // in the aliased _GlobalMemory path — same-index read-then-write).
+                a = 0usize;
+                while a < cnt {
+                    let rho = rho_buf[start + a];
+                    let term = rho * (sum_l2 - params_buf[start + a]);
+                    grad[start + a] += f32::cast_from(term);
+                    hess[start + a] = rho * (1.0f64 - rho);
+                    a += 1;
+                }
+            }
+            q += 1u32;
+        }
+    }
+}
+
+/// Shared-memory RankXENDCG variant (`GetGradientsKernel_RankXENDCG_SharedMemory`):
+/// distinct `rho_buf` / `params_buf` scratch.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn rank_xendcg_kernel_shared_f64(
+    scores: &Array<f64>,
+    two_pow_label: &Array<f64>,
+    gamma: &Array<f32>,
+    query_boundaries: &Array<i32>,
+    rho_buf: &mut Array<f64>,
+    params_buf: &mut Array<f64>,
+    grad: &mut Array<f32>,
+    hess: &mut Array<f64>,
+    num_queries: u32,
+    k_eps: f64,
+) {
+    rank_xendcg_body(
+        scores, two_pow_label, gamma, query_boundaries, rho_buf, params_buf, grad,
+        hess, num_queries, k_eps,
+    );
+}
+
+/// The `>2048` `_GlobalMemory` RankXENDCG variant
+/// (`GetGradientsKernel_RankXENDCG_GlobalMemory`): the CUDA path stashes the two
+/// length-N intermediates in the **hessian output buffer + `cuda_params_buffer`**
+/// (Pitfall 4). The launcher realizes this by aliasing `rho_buf` onto the `hess`
+/// handle and pre-allocating `params_buf` (= `cuda_params_buffer`) ONCE; the body is
+/// shared, and the final hessian overwrites the aliased rho per-index after its last
+/// read.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn rank_xendcg_kernel_global_f64(
+    scores: &Array<f64>,
+    two_pow_label: &Array<f64>,
+    gamma: &Array<f32>,
+    query_boundaries: &Array<i32>,
+    rho_buf: &mut Array<f64>,
+    params_buf: &mut Array<f64>,
+    grad: &mut Array<f32>,
+    hess: &mut Array<f64>,
+    num_queries: u32,
+    k_eps: f64,
+) {
+    rank_xendcg_body(
+        scores, two_pow_label, gamma, query_boundaries, rho_buf, params_buf, grad,
+        hess, num_queries, k_eps,
+    );
+}
+
+/// Draw the per-item RankXENDCG gamma stream by composing `draw_next_float_on`: per
+/// query `q`, `Random(seed + q)` yields one `NextFloat` per row, row-major over all
+/// rows (rank.rs:482-487; the exact consumption proven by
+/// `rank_parity::rank_xendcg_objseed_rng_replay`). Returns the length-`num_data`
+/// gamma vector.
+fn draw_gammas<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    seed: i32,
+    query_boundaries: &[i32],
+) -> Result<Vec<f32>, ComputeError> {
+    let num_queries = query_boundaries.len() - 1;
+    let mut gammas: Vec<f32> = Vec::with_capacity(*query_boundaries.last().unwrap() as usize);
+    for q in 0..num_queries {
+        let cnt = (query_boundaries[q + 1] - query_boundaries[q]) as u32;
+        if cnt == 0 {
+            continue;
+        }
+        let seed_q = (seed.wrapping_add(q as i32)) as u32;
+        let draws = draw_next_float_on(client, &[seed_q], cnt)?;
+        gammas.extend_from_slice(&draws);
+    }
+    Ok(gammas)
+}
+
+/// Compute RankXENDCG grad/hess on the f64 cpu anchor (shared-memory variant).
+///
+/// `scores` (all rows, f64), `labels` (f32 rank labels), `query_boundaries`
+/// (prefix-sum), `seed` = `config.objective_seed`. The per-item gamma draws compose
+/// `draw_next_float_on` (the bit-identical LCG); `2^label` is the host `pow2_int`
+/// (repeated-multiply). Returns `(grad, hess)` as `f32`.
+///
+/// # Errors
+/// [`ComputeError`] on a malformed `labels`/`query_boundaries` at the V5 boundary.
+pub fn rank_xendcg_get_gradients_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    scores: &[f64],
+    labels: &[f32],
+    query_boundaries: &[i32],
+    seed: i32,
+) -> Result<(Vec<f32>, Vec<f32>), ComputeError> {
+    rank_xendcg_impl(client, scores, labels, query_boundaries, seed, false)
+}
+
+/// The `>2048` `_GlobalMemory` RankXENDCG launcher (D-03 / Pitfall 4): identical
+/// contract to [`rank_xendcg_get_gradients_on`], but the two length-N intermediates
+/// are stashed in the hessian output buffer (`rho`) + a pre-allocated-once
+/// `cuda_params_buffer` (`params`) — the faithful CUDA buffer-aliasing. The shared and
+/// global launchers are asserted to produce identical hessians (the Pitfall 4 guard).
+pub fn rank_xendcg_get_gradients_global_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    scores: &[f64],
+    labels: &[f32],
+    query_boundaries: &[i32],
+    seed: i32,
+) -> Result<(Vec<f32>, Vec<f32>), ComputeError> {
+    rank_xendcg_impl(client, scores, labels, query_boundaries, seed, true)
+}
+
+fn rank_xendcg_impl<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    scores: &[f64],
+    labels: &[f32],
+    query_boundaries: &[i32],
+    seed: i32,
+    global_memory: bool,
+) -> Result<(Vec<f32>, Vec<f32>), ComputeError> {
+    let n = scores.len();
+    if labels.len() != n {
+        return Err(ComputeError::LengthMismatch { expected: n, actual: labels.len() });
+    }
+    let num_queries = validate_query_boundaries(query_boundaries, n)?;
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let gammas = draw_gammas(client, seed, query_boundaries)?;
+    let two_pow_label: Vec<f64> = labels.iter().map(|&l| pow2_int(l as i32)).collect();
+    let k_eps = f64::from(1e-15f32); // C++ `kEpsilon = 1e-15f`.
+
+    let h_scores = client.create_from_slice(f64::as_bytes(scores));
+    let h_two_pow = client.create_from_slice(f64::as_bytes(&two_pow_label));
+    let h_gamma = client.create_from_slice(f32::as_bytes(&gammas));
+    let h_qb = client.create_from_slice(i32::as_bytes(query_boundaries));
+    let h_grad = client.empty(n * core::mem::size_of::<f32>());
+    let h_hess = client.empty(n * core::mem::size_of::<f64>());
+    // D-09: `cuda_params_buffer` — the params intermediate, allocated ONCE. In the
+    // _GlobalMemory path `rho` is stashed in the hessian buffer (aliased below).
+    let h_params = client.empty(n * core::mem::size_of::<f64>());
+
+    // SAFETY: every handle is sized to its slice and outlives the launch; the single
+    // owner walks disjoint per-query row windows in `[0, n)`. In the _GlobalMemory
+    // path `h_hess` is bound to BOTH `rho_buf` and `hess`: the body reads `rho` before
+    // the same-index final `hess` write, so the aliasing is race-free (T-19-04-01).
+    unsafe {
+        let cc = CubeCount::Static(1, 1, 1);
+        let cd = CubeDim::new_1d(1);
+        if global_memory {
+            rank_xendcg_kernel_global_f64::launch_unchecked(
+                client, cc, cd,
+                ArrayArg::from_raw_parts(h_scores, n),
+                ArrayArg::from_raw_parts(h_two_pow, n),
+                ArrayArg::from_raw_parts(h_gamma, n),
+                ArrayArg::from_raw_parts(h_qb, num_queries + 1),
+                ArrayArg::from_raw_parts(h_hess.clone(), n), // rho_buf aliases hess.
+                ArrayArg::from_raw_parts(h_params, n),
+                ArrayArg::from_raw_parts(h_grad.clone(), n),
+                ArrayArg::from_raw_parts(h_hess.clone(), n),
+                num_queries as u32,
+                k_eps,
+            );
+        } else {
+            let h_rho = client.empty(n * core::mem::size_of::<f64>());
+            rank_xendcg_kernel_shared_f64::launch_unchecked(
+                client, cc, cd,
+                ArrayArg::from_raw_parts(h_scores, n),
+                ArrayArg::from_raw_parts(h_two_pow, n),
+                ArrayArg::from_raw_parts(h_gamma, n),
+                ArrayArg::from_raw_parts(h_qb, num_queries + 1),
+                ArrayArg::from_raw_parts(h_rho, n),
+                ArrayArg::from_raw_parts(h_params, n),
+                ArrayArg::from_raw_parts(h_grad.clone(), n),
+                ArrayArg::from_raw_parts(h_hess.clone(), n),
+                num_queries as u32,
+                k_eps,
+            );
+        }
+    }
+
+    let grad = f32::from_bytes(&client.read_one_unchecked(h_grad)).to_vec();
+    let hess: Vec<f32> = f64::from_bytes(&client.read_one_unchecked(h_hess))
+        .iter()
+        .map(|&h| h as f32)
+        .collect();
+    Ok((grad, hess))
+}
