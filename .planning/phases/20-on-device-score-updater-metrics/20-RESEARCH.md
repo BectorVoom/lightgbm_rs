@@ -351,21 +351,24 @@ assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &cpu_anchor_tree(..), 
 
 **Not empty:** These 5 assumptions need confirmation during planning/discuss; A1 and A2 are the most plan-shaping.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **`on_device_growth_supported()` flip on a shared `GpuBackend<R>`**
    - What we know: One generic impl serves ROCm/CUDA/WGPU; the env AND-gate provides one guard.
    - What's unclear: Whether the plan wants CUDA-only on-device growth (excluding ROCm even when env is set) or ROCm-included.
    - Recommendation: Gate the `true` behind `cuda_on_device_enabled()` for the merge gate; decide CUDA-vs-ROCm targeting at plan time (Pitfall 2). Note: the local "GPU" is a spoofed 8-CU APU (project memory `rocm-gfx1100-available`) — parity is valid, but this is a ROCm target, not real CUDA. STRUCTURE parity can be validated on ROCm; CUDA-specific behavior cannot be exercised locally.
+   - **RESOLVED (20-03 Task 1):** The env-gated `on_device_growth_supported()` flip lands behind the `LGBM_CUDA_ON_DEVICE` AND-gate — ROCm/CUDA stays `false` with the env unset (byte-unchanged host path), so no runtime type-split is needed for the merge gate.
 
 2. **Handle aliasing / batched `client.read(vec![h])` readback (D-01 discretion)**
    - What we know: The idiomatic `client.read(Vec<Handle>)` surfaced a launch-bound win in prior spikes (project memory `gpu-lazy-dispatch-deferred-sync-win`), but production launchers are already 1-launch/1-read.
    - What's unclear: In-place-alias vs ping-pong for the per-split leaf map.
    - Recommendation: Prefer double-buffer; A/B against the cpu anchor before committing (Pitfall 3).
+   - **RESOLVED (20-03 Task 1):** Double-buffer is the safe execution-time default for the data→leaf `Handle` map; the in-place alias is A/B-tested against the cpu anchor at execution time, with the `num_leaves>2` STRUCTURE gate acting as the corruption catcher if the alias is unsafe.
 
 3. **Which 12-metric goldens to capture vs cpu-fold-anchor**
    - What we know: 8 exist, 4 absent.
    - Recommendation: Capture the 4 (A1); it honors D-03's fidelity intent at near-zero cost.
+   - **RESOLVED (20-00 Task 1):** Capture the 4 missing goldens (rmse/l2/l1/binary_logloss) against the pinned lightgbm 4.6 `.venv`; if the venv is unavailable the 4 anchor to the cpu-f64 fold with the reason documented in the SUMMARY (A1 fallback).
 
 ## Environment Availability
 
