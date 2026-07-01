@@ -38,7 +38,8 @@
 use std::path::PathBuf;
 
 use lgbm_compute::kernels::best_split::{
-    find_best_splits_stage1_f32_on, find_best_splits_stage1_on, SplitFindTask, Stage1Scalars,
+    find_best_splits_stage1_f32_on, find_best_splits_stage1_on, sync_best_split_for_leaf_on,
+    SplitFindTask, Stage1Scalars,
 };
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
@@ -359,6 +360,65 @@ fn best_split_parity_stage1_bit_exact_on_cpu() {
     assert!(saw_empty, "fixture must cover the empty/no-valid-split (is_valid=0) case");
     assert!(saw_globalmem, "fixture must cover the global-memory spill (num_bin > 256) case");
     assert!(saw_default_left_tie, "fixture must cover a tie-aware default_left case");
+}
+
+/// STAGE-2 cross-feature reduce (ODL-12, §8.2): drive stage-1 over several distinct
+/// features (distinct `inner_feature_index`) to build the per-task record slab, then
+/// assert [`sync_best_split_for_leaf_on`] picks the max-gain feature per leaf with the
+/// strict-`>` lowest-index tie-break — bit-exact on the winning fields — and marks a
+/// no-valid-split leaf `is_valid=false`, with NO device→host readback in stage-2 (SC#2).
+#[test]
+fn best_split_parity_stage2_cross_feature_reduce() {
+    let path = kernels_dir().join("best_split.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("best_split_parity(stage2): SKIP — fixture {} not found.", path.display());
+        return;
+    };
+    let cases = parse_best_split(&text);
+    let client = cpu_client();
+
+    // Pick two distinct continuous features and run stage-1 to get real records.
+    let g_default = cases
+        .iter()
+        .find(|g| g.name == "default_fwd_smaller")
+        .expect("default_fwd_smaller golden");
+    let g_l1 = cases.iter().find(|g| g.name == "use_l1").expect("use_l1 golden");
+
+    // Two smaller-leaf tasks (feat 0 = default, feat 1 = l1) + two larger-leaf tasks.
+    let run = |g: &BestSplitGolden, feat: i32| {
+        let mut task = task_of(g);
+        task.inner_feature_index = feat;
+        find_best_splits_stage1_on(&client, &g.hist, &task, &scalars_of(g))
+            .unwrap_or_else(|e| panic!("stage1 for `{}`: {e:?}", g.name))
+    };
+    let s0 = run(g_default, 0); // higher gain
+    let s1 = run(g_l1, 1); // lower gain (L1 shrinks the gain)
+    assert!(s0.gain > s1.gain, "default gain must exceed the L1-shrunk gain for this fixture");
+
+    // Full 2·num_tasks slab: smaller half [s0, s1], larger half [s1, s0].
+    let per_task = vec![s0, s1, s1, s0];
+
+    let smaller = sync_best_split_for_leaf_on(&client, &per_task, 2, true).unwrap();
+    assert!(smaller.is_valid, "stage2 smaller: a valid winner");
+    assert_eq!(smaller.inner_feature_index, 0, "stage2 smaller picks the max-gain feature (0)");
+    if let Err(m) = compare_exact_f64_bits(&[smaller.gain], &[s0.gain]) {
+        panic!("stage2 smaller winner gain divergence: {m}");
+    }
+    assert_eq!(smaller.threshold, s0.threshold, "stage2 winner threshold copied verbatim");
+
+    let larger = sync_best_split_for_leaf_on(&client, &per_task, 2, false).unwrap();
+    assert!(larger.is_valid, "stage2 larger: a valid winner");
+    assert_eq!(larger.inner_feature_index, 0, "stage2 larger reads [num_tasks,2·num_tasks) and picks feat 0");
+
+    // A leaf whose tasks are all invalid yields the no-valid-split sentinel.
+    let mut invalid0 = s0;
+    let mut invalid1 = s1;
+    invalid0.is_valid = false;
+    invalid1.is_valid = false;
+    let empty_slab = vec![invalid0, invalid1];
+    let none = sync_best_split_for_leaf_on(&client, &empty_slab, 2, true).unwrap();
+    assert!(!none.is_valid, "stage2: all-invalid tasks → is_valid=false");
+    assert_eq!(none.gain, f64::NEG_INFINITY, "stage2: no-valid-split gain = kMinScore");
 }
 
 /// The f32 stage-1 mirror drives through cubecl-cpu producing a STRUCTURALLY identical

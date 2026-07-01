@@ -1840,26 +1840,174 @@ pub fn find_best_splits_stage1_globalmem_f32_on<R: cubecl::Runtime>(
     })
 }
 
-/// STAGE 2 (STUB — Wave 3 fills the cross-feature reduce, 17-04).
-///
-/// `SyncBestSplitForLeafKernel`: block-reduce the per-task `(is_valid, gain)` records
-/// for one leaf via `ReduceBestGain` (strict `>` ⇒ lowest task index survives a tie,
-/// 17-RESEARCH Pitfall 5) into the leaf's best split. `read_index = is_smaller ?
-/// task_index : task_index + num_tasks` (the IS_LARGER duality).
-///
-/// Wave-0 sentinel: returns [`SplitScalars::default`] (`is_valid=false`).
+/// The C++ `NUM_TASKS_PER_SYNC_BLOCK` (`cuda_best_split_finder.hpp:24`) — the stage-2
+/// sync-block width. `num_blocks_per_leaf = ceil(num_tasks / NUM_TASKS_PER_SYNC_BLOCK)`;
+/// for the anchor fixtures `num_tasks << 1024` so `num_blocks_per_leaf == 1` (the common
+/// case the `…AllBlocks` fold collapses to — Claude's Discretion per 17-CONTEXT).
+pub const NUM_TASKS_PER_SYNC_BLOCK: usize = 1024;
+
+/// The number of stage-2 sync blocks per leaf for `num_tasks` tasks
+/// (`(num_tasks + NUM_TASKS_PER_SYNC_BLOCK - 1) / NUM_TASKS_PER_SYNC_BLOCK`,
+/// `cuda_best_split_finder.cu:2045`). Always ≥ 1.
+#[must_use]
+pub fn stage2_num_blocks_per_leaf(num_tasks: usize) -> usize {
+    num_tasks.div_ceil(NUM_TASKS_PER_SYNC_BLOCK).max(1)
+}
+
+/// V5 launch-boundary validation for stage-2/3 (threat T-17-01/T-17-02): the
+/// leaf-best-split slab is indexed at `leaf_index + block·num_leaves`, so
+/// `num_leaves × num_blocks_per_leaf` must be non-zero and must not overflow BEFORE
+/// the reduce writes the per-leaf winner. Returns the required slab length.
 ///
 /// # Errors
-/// [`ComputeError`] once Wave-3 launch-boundary validation lands; the stub is
-/// infallible.
+/// [`ComputeError::Runtime`] if either operand is zero or the product overflows `usize`.
+pub fn validate_stage2_inputs(
+    num_leaves: usize,
+    num_blocks_per_leaf: usize,
+) -> Result<usize, ComputeError> {
+    if num_leaves == 0 || num_blocks_per_leaf == 0 {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "stage2: num_leaves ({num_leaves}) and num_blocks_per_leaf \
+                 ({num_blocks_per_leaf}) must both be > 0"
+            ),
+        });
+    }
+    num_leaves
+        .checked_mul(num_blocks_per_leaf)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!(
+                "stage2: num_leaves {num_leaves} × num_blocks_per_leaf {num_blocks_per_leaf} \
+                 overflows the leaf-best-split slab"
+            ),
+        })
+}
+
+/// STAGE 2 — `SyncBestSplitForLeafKernel` cross-feature reduce per leaf (ODL-12, §8.2).
+///
+/// Reduces the per-task `(is_valid, gain)` records for ONE leaf via the `ReduceBestGain`
+/// family (strict `>` ⇒ the FIRST / lowest task index survives a tie, 17-RESEARCH
+/// Pitfall 5) into that leaf's best split. `per_task` is the full `2·num_tasks` record
+/// slab stage-1 produced (smaller-leaf records `[0, num_tasks)`, larger-leaf records
+/// `[num_tasks, 2·num_tasks)`); the reader indexes `read_index = is_smaller ? task_index
+/// : task_index + num_tasks` (the IS_LARGER duality, `cu:1943`). The winner is copied
+/// verbatim (its `inner_feature_index` was already stamped by stage-1 from
+/// `task.inner_feature_index`, identical to the C++ re-stamp from `tasks[best_read_index]`);
+/// a no-valid-split leaf yields `is_valid=false, gain=kMinScore`.
+///
+/// The reduction is a RESIDENT fold over records that already live from stage-1: the
+/// deterministic strict-`>` order is the parity contract, and it performs **no device→host
+/// readback** — the single readback is stage-3's 8-int export ONLY (SC#2). `client` is
+/// unused here (reserved for the Phase-18 device-resident path).
+///
+/// For `num_blocks_per_leaf > 1` (num_tasks > `NUM_TASKS_PER_SYNC_BLOCK`) the per-block
+/// winners are reduced by [`sync_best_split_all_blocks`]; the common
+/// `num_blocks_per_leaf == 1` case is folded in here (Claude's Discretion, parity-neutral).
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `per_task` is shorter than the read window
+/// (`base + num_tasks`); [`ComputeError::Runtime`] on `base + num_tasks` overflow.
 pub fn sync_best_split_for_leaf_on<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
     per_task: &[SplitScalars],
     num_tasks: usize,
     is_smaller: bool,
 ) -> Result<SplitScalars, ComputeError> {
-    let _ = (client, per_task, num_tasks, is_smaller);
-    Ok(SplitScalars::default())
+    let _ = client; // reserved for the Phase-18 device-resident path (no readback here, SC#2).
+    let base = if is_smaller { 0usize } else { num_tasks };
+    let needed = base
+        .checked_add(num_tasks)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: "stage2: base + num_tasks overflows the per-task record window".to_string(),
+        })?;
+    if per_task.len() < needed {
+        return Err(ComputeError::LengthMismatch {
+            expected: needed,
+            actual: per_task.len(),
+        });
+    }
+
+    // ReduceBestGain: strict `>` keeps the FIRST (lowest task index) on a tie (Pitfall 5).
+    let mut best: Option<usize> = None;
+    let mut best_gain = f64::NEG_INFINITY;
+    for t in 0..num_tasks {
+        let rec = &per_task[base + t];
+        if rec.is_valid && (best.is_none() || rec.gain > best_gain) {
+            best = Some(base + t);
+            best_gain = rec.gain;
+        }
+    }
+
+    Ok(match best {
+        // The winner already carries its `inner_feature_index` (stage-1); the C++ re-stamps
+        // it from `tasks[best_read_index]` (identical value). `is_valid` forced true.
+        Some(i) => {
+            let mut win = per_task[i];
+            win.is_valid = true;
+            win
+        }
+        // No valid split for this leaf: `gain = kMinScore` (cu:1966), `is_valid=false`.
+        None => SplitScalars {
+            is_valid: false,
+            gain: f64::NEG_INFINITY,
+            ..SplitScalars::default()
+        },
+    })
+}
+
+/// `SyncBestSplitForLeafKernelAllBlocks` (`cu:1972-2008`) — fold the per-block winners of
+/// one leaf when `num_blocks_per_leaf > 1`. The block-0 winner is the accumulator; each
+/// later block replaces it on `(other.is_valid && acc.is_valid && other.gain > acc.gain) ||
+/// (!acc.is_valid && other.is_valid)` — i.e. strict `>`, block-0 survives a tie (ascending
+/// block order, parity-neutral). For the common `num_blocks_per_leaf == 1` case this is the
+/// identity, so [`sync_best_split_for_leaf_on`] handles it inline.
+#[must_use]
+pub fn sync_best_split_all_blocks(block_winners: &[SplitScalars]) -> SplitScalars {
+    let mut best: Option<usize> = None;
+    let mut best_gain = f64::NEG_INFINITY;
+    for (b, rec) in block_winners.iter().enumerate() {
+        if rec.is_valid && (best.is_none() || rec.gain > best_gain) {
+            best = Some(b);
+            best_gain = rec.gain;
+        }
+    }
+    match best {
+        Some(i) => {
+            let mut w = block_winners[i];
+            w.is_valid = true;
+            w
+        }
+        None => SplitScalars {
+            is_valid: false,
+            gain: f64::NEG_INFINITY,
+            ..SplitScalars::default()
+        },
+    }
+}
+
+/// `SetInvalidLeafSplitInfoKernel` (`cu:2010-2023`) — mark the smaller/larger leaf
+/// best-split slots `is_valid=false` when a leaf produced no valid candidate (the C++
+/// pre-pass that runs before the reduce for no-valid-split leaves). Bounds-checked
+/// (`leaf_index >= 0 && < len`); `larger_leaf_index < 0` means "no larger leaf".
+pub fn set_invalid_leaf_split_info(
+    leaf_best: &mut [SplitScalars],
+    is_smaller_leaf_valid: bool,
+    is_larger_leaf_valid: bool,
+    smaller_leaf_index: i32,
+    larger_leaf_index: i32,
+) {
+    if !is_smaller_leaf_valid
+        && smaller_leaf_index >= 0
+        && (smaller_leaf_index as usize) < leaf_best.len()
+    {
+        leaf_best[smaller_leaf_index as usize].is_valid = false;
+    }
+    if !is_larger_leaf_valid
+        && larger_leaf_index >= 0
+        && (larger_leaf_index as usize) < leaf_best.len()
+    {
+        leaf_best[larger_leaf_index as usize].is_valid = false;
+    }
 }
 
 /// STAGE 3 (STUB — Wave 4 fills the cross-leaf argmax + 8-int export, 17-05).
@@ -2001,6 +2149,102 @@ mod tests {
         assert_eq!(scratch.num_concurrent_blocks(), 4);
         // Overflowing construction is rejected (V5) before any alloc.
         assert!(Stage1GlobalMemScratch::new(&client, usize::MAX, 2).is_err());
+    }
+
+    /// A minimal valid [`SplitScalars`] with the given gain / inner_feature_index — a
+    /// stage-1 output stand-in for the stage-2/3 reduction unit tests.
+    fn rec(gain: f64, feat: i32, valid: bool) -> SplitScalars {
+        SplitScalars {
+            is_valid: valid,
+            inner_feature_index: feat,
+            gain,
+            threshold: 3,
+            default_left: false,
+            ..SplitScalars::default()
+        }
+    }
+
+    /// V5 stage-2 launch-boundary validation (T-17-01/T-17-02): zero operands and
+    /// overflowing `num_leaves × num_blocks_per_leaf` are rejected before any reduce;
+    /// `num_blocks_per_leaf` derivation is `ceil(num_tasks / 1024)` (≥ 1).
+    #[test]
+    fn validate_stage2_inputs_and_block_count() {
+        assert!(matches!(
+            validate_stage2_inputs(0, 1),
+            Err(ComputeError::Runtime { .. })
+        ));
+        assert!(matches!(
+            validate_stage2_inputs(1, 0),
+            Err(ComputeError::Runtime { .. })
+        ));
+        assert!(matches!(
+            validate_stage2_inputs(usize::MAX, 2),
+            Err(ComputeError::Runtime { .. })
+        ));
+        assert_eq!(validate_stage2_inputs(7, 3).unwrap(), 21);
+        // ceil(num_tasks / NUM_TASKS_PER_SYNC_BLOCK), floored at 1.
+        assert_eq!(stage2_num_blocks_per_leaf(0), 1);
+        assert_eq!(stage2_num_blocks_per_leaf(1), 1);
+        assert_eq!(stage2_num_blocks_per_leaf(1024), 1);
+        assert_eq!(stage2_num_blocks_per_leaf(1025), 2);
+    }
+
+    /// Stage-2 cross-feature reduce: strict `>` argmax (lowest task index on a tie), the
+    /// smaller/larger read-window duality, the `…AllBlocks` fold, and the invalid-leaf
+    /// marker. Runs on the cubecl-cpu client (no `gpu` feature).
+    #[test]
+    fn stage2_cross_feature_reduce_fold() {
+        use crate::runtime::cpu_client;
+        let client = cpu_client();
+        // 3 smaller-leaf tasks (feat 0/1/2) + 3 larger-leaf tasks (feat 3/4/5), the
+        // full 2·num_tasks slab. Smaller winner = feat 1 (gain 5); larger winner = feat 4.
+        let per_task = vec![
+            rec(2.0, 0, true),
+            rec(5.0, 1, true),
+            rec(5.0, 2, true), // tie with feat 1's gain — lowest index (feat 1) must win
+            rec(1.0, 3, true),
+            rec(9.0, 4, true),
+            rec(4.0, 5, true),
+        ];
+        let smaller = sync_best_split_for_leaf_on(&client, &per_task, 3, true).unwrap();
+        assert!(smaller.is_valid);
+        assert_eq!(smaller.inner_feature_index, 1, "strict-> keeps the lowest-index tie (feat 1)");
+        assert_eq!(smaller.gain, 5.0);
+        let larger = sync_best_split_for_leaf_on(&client, &per_task, 3, false).unwrap();
+        assert!(larger.is_valid);
+        assert_eq!(larger.inner_feature_index, 4, "larger reads [num_tasks, 2·num_tasks)");
+        assert_eq!(larger.gain, 9.0);
+
+        // A short slab (missing the larger half) is rejected (V5).
+        assert!(matches!(
+            sync_best_split_for_leaf_on(&client, &per_task[..3], 3, false),
+            Err(ComputeError::LengthMismatch { .. })
+        ));
+
+        // All-invalid tasks → no-valid-split sentinel (is_valid=false, gain=kMinScore).
+        let none = vec![rec(2.0, 0, false), rec(5.0, 1, false)];
+        let w = sync_best_split_for_leaf_on(&client, &none, 2, true).unwrap();
+        assert!(!w.is_valid);
+        assert_eq!(w.gain, f64::NEG_INFINITY);
+
+        // …AllBlocks fold: block winners reduce with strict `>` (block-0 on a tie).
+        let blocks = vec![rec(3.0, 7, true), rec(3.0, 8, true), rec(6.0, 9, true)];
+        assert_eq!(sync_best_split_all_blocks(&blocks).inner_feature_index, 9);
+        let blocks_tie = vec![rec(6.0, 7, true), rec(6.0, 8, true)];
+        assert_eq!(
+            sync_best_split_all_blocks(&blocks_tie).inner_feature_index,
+            7,
+            "…AllBlocks keeps the lowest block index on a tie"
+        );
+
+        // SetInvalidLeafSplitInfo marks no-valid-split leaves is_valid=false.
+        let mut leaf_best = vec![rec(1.0, 0, true), rec(2.0, 1, true), rec(3.0, 2, true)];
+        set_invalid_leaf_split_info(&mut leaf_best, false, true, 0, 2);
+        assert!(!leaf_best[0].is_valid, "smaller leaf 0 invalidated");
+        assert!(leaf_best[2].is_valid, "larger leaf 2 stays valid");
+        // larger_leaf_index < 0 (no larger leaf) is a no-op on the larger slot.
+        set_invalid_leaf_split_info(&mut leaf_best, true, false, 1, -1);
+        assert!(leaf_best[1].is_valid, "no larger leaf → no invalidation");
     }
 
     /// Helper: a non-categorical `FeatureMeta` with the given num_bin/missing_type.
