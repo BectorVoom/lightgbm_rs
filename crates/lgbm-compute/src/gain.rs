@@ -400,6 +400,36 @@ mod tests {
     }
 
     #[test]
+    fn given_output_matches_closed_form() {
+        // At the unconstrained output `o = -g/(h+l2)` the given-output gain form
+        // (form D) equals the closed-form `get_leaf_gain` (sg²/(h+l2)). This proves
+        // the #[cube]-promoted `get_leaf_gain_given_output` is consistent with the
+        // reused non-smoothing path (USE_SMOOTHING=false). Values chosen so the
+        // float arithmetic is bit-exact.
+        // no-L1: o = -4/2 = -2 -> -(2·4·-2 + 2·4) = 8 == 16/2.
+        let (g, h, l2) = (4.0_f64, 2.0_f64, 0.0_f64);
+        let o = calculate_splitted_leaf_output(false, g, h, 0.0, l2);
+        assert_eq!(
+            get_leaf_gain_given_output(false, g, h, 0.0, l2, o),
+            get_leaf_gain(false, g, h, 0.0, l2)
+        );
+        // L1: ThresholdL1(4,1)=3, o=-1.5 -> -(2·3·-1.5 + 2·2.25) = 4.5 == 9/2.
+        let (g, h, l1, l2) = (4.0_f64, 2.0_f64, 1.0_f64, 0.0_f64);
+        let o = calculate_splitted_leaf_output(true, g, h, l1, l2);
+        assert_eq!(
+            get_leaf_gain_given_output(true, g, h, l1, l2, o),
+            get_leaf_gain(true, g, h, l1, l2)
+        );
+        // f32 mirror consistency at the same closed-form output.
+        let (gf, hf, l2f) = (4.0_f32, 2.0_f32, 0.0_f32);
+        let of = calculate_splitted_leaf_output_f32(false, gf, hf, 0.0f32, l2f);
+        assert_eq!(
+            get_leaf_gain_given_output_f32(false, gf, hf, 0.0f32, l2f, of),
+            get_leaf_gain_f32(false, gf, hf, 0.0f32, l2f)
+        );
+    }
+
+    #[test]
     fn gain_config_from_default_config_is_noop_l1() {
         let cfg = lgbm_core::Config::default();
         let gc = GainConfig::from_config(&cfg);
