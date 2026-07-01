@@ -4,17 +4,17 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 16
 current_phase_name: on-device-histogram-constructor
-status: executing
+status: verifying
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-30T22:39:23.669Z"
+last_updated: "2026-07-01T00:30:53.032Z"
 last_activity: 2026-06-30
 last_activity_desc: Phase 16 execution started
 progress:
   total_phases: 10
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 16
-  completed_plans: 15
-  percent: 20
+  completed_plans: 16
+  percent: 30
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 16 (on-device-histogram-constructor) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-06-30 — Phase 16 execution started
 
@@ -562,6 +562,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 16 P02 | 4 | 2 tasks | 2 files |
 | Phase 16 P03 | 45min | 3 tasks | 2 files |
 | Phase 16 P04 | 15min | 3 tasks | 4 files |
+| Phase 16 P05 | 5min | 2 tasks | 0 files |
 
 ## Accumulated Context
 
@@ -658,6 +659,8 @@ Recent decisions affecting current work:
 - [Phase ?]: HistArena pre-allocates the histogram slot pool exactly once (counted client.empty + assert, D-09); rotate() reassigns hist_t** role indices so larger derives in-place in the parent buffer and smaller takes a fresh non-aliasing slot (D-02). Whole-tree pool SWAP deferred to Phase 18.
 - [Phase ?]: 16-03: on-device histogram BUILD (ODL-09) shipped — two-tier §13-partition u64 fixed-point kernel (dense+sparse × shared-LDS + _GlobalMemory spill), de-quant-once at 2^30, V5 launcher; anchor-pinned to cpu f64 fold, 18/18 green on ROCm APU; shipped per-feature kernel byte-unchanged
 - [Phase ?]: 16-03: shared-LDS cap is HIST_LDS_MAX (256 bins); larger partitions route to _GlobalMemory — parity-neutral (§17); de-quant kept a SEPARATE pass (RESEARCH Pattern 3)
+- [Phase ?]: Phase 16 merge gate (ODL-19) GREEN: cargo test --workspace 845/0 with default features + LGBM_CUDA_ON_DEVICE unset; no f64 per-row hot loop / no Atomic<i64> (D-08); shipped per-feature build kernel byte-unchanged vs 8df8523 (D-07)
+- [Phase ?]: ROCm f32 on-device build/fix/subtract parity attested within ~1e-6 of the cpu f64 anchor (hip-vs-anchor, never GPU-vs-GPU); the one failing --features rocm case is pre-existing out-of-scope DEF-16-OOS-02 (def-f8u-01 f32-atomic near-tie, kernel byte-unchanged), does not gate merge
 
 ### Pending Todos
 
@@ -687,7 +690,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-30T22:39:13.244Z
+Last session: 2026-07-01T00:30:25.417Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-on-device-histogram-constructor/16-CONTEXT.md
 

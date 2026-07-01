@@ -78,7 +78,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 
 - [x] **Phase 14: Foundation — Shared Device Primitives + Device Structs/RNG** — The reusable CubeCL primitives + device split-record/RNG every later subsystem builds on; re-establish the on-device seam + anchor-pinned oracle. (completed 2026-06-29)
 - [x] **Phase 15: On-Device Device Dataset + Row-Subset Gather** — Resident columnar binned dataset in the feature-partition layout the histogram kernel needs, + CopySubrow bagging/GOSS subset. (completed 2026-06-29)
-- [ ] **Phase 16: On-Device Histogram Constructor** — The hot path: build (dense/sparse × shared/global) on u64 fixed-point + the subtraction trick (FixHistogram + SubtractHistogram via `hist_t**` rotation).
+- [x] **Phase 16: On-Device Histogram Constructor** — The hot path: build (dense/sparse × shared/global) on u64 fixed-point + the subtraction trick (FixHistogram + SubtractHistogram via `hist_t**` rotation). (completed 2026-07-01)
 - [ ] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`.
 - [ ] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict.
 - [ ] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned.
@@ -156,13 +156,13 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. The build-smaller-before-subtract ordering invariant holds (parent fully built before any child subtract reads it — the 8aed100-class guard), and the most-freq-bin fix + interleaved `[2b]/[2b+1]` layout match the reference exactly — both as CORRECTNESS requirements, not speed. (§17)
   4. The derived larger-child histogram is anchor-pinned (bit-exact on the cpu f64 anchor; ROCm/CUDA f32 within ~1e-6); CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans complete
 
 - [x] 16-01-PLAN.md
 - [x] 16-02-PLAN.md
 - [x] 16-03-PLAN.md
 - [x] 16-04-PLAN.md
-- [ ] 16-05-PLAN.md
+- [x] 16-05-PLAN.md
 
 **Notes**: The single most performance-critical kernel (§7, 960 lines, 13 `__global__` variants in C++). The quantized/discretized build kernels (§7.3) are **v2 (QGD-02)** — skip. Template-flag explosion (BIN_TYPE/HIST_TYPE/shared-vs-global) maps to CubeCL comptime.
 
@@ -278,7 +278,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 |-------|-----------|----------------|--------|-----------|
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
-| 16. On-Device Histogram Constructor | v1.1 | 4/5 | In Progress|  |
+| 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete   | 2026-07-01 |
 | 17. On-Device Best-Split Finder | v1.1 | 0/? | Not started | - |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
 | 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
