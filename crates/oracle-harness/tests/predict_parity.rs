@@ -253,7 +253,9 @@ fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kernels")
 }
 
-/// One parsed PREDICT block from `predict.txt`.
+/// One parsed PREDICT block from `predict.txt` — the full synthetic model
+/// (feature meta + tree arrays + categorical bitset pool) the 18-04 device
+/// tree-walk replays.
 #[allow(dead_code)]
 struct PredictGolden {
     name: String,
@@ -262,6 +264,24 @@ struct PredictGolden {
     num_features: usize,
     scores: Vec<f64>,
     rows: Vec<Vec<u32>>,
+    // Per-feature meta (parallel vecs, indexed by split_feature_inner).
+    feat_min: Vec<i32>,
+    feat_max: Vec<i32>,
+    feat_default: Vec<i32>,
+    feat_mfb: Vec<i32>,
+    feat_offset: Vec<i32>,
+    feat_bit_type: Vec<u32>,
+    feat_column: Vec<i32>,
+    // Per-node tree arrays.
+    split_feature_inner: Vec<i32>,
+    threshold_in_bin: Vec<u32>,
+    decision_type: Vec<i32>,
+    left_child: Vec<i32>,
+    right_child: Vec<i32>,
+    leaf_value: Vec<f64>,
+    // Categorical bitset pool + boundaries.
+    bitset_inner: Vec<u32>,
+    cat_boundaries_inner: Vec<i32>,
 }
 
 /// Parse `predict.txt` into its PREDICT blocks, SKIP (empty vec via `None`) absent.
@@ -299,14 +319,68 @@ fn read_predict_golden() -> Option<Vec<PredictGolden>> {
         // The block body: PFEAT PNODE PLEAF PCATPOOL PCATBOUND PROWS PSCORE.
         let mut rows: Vec<Vec<u32>> = Vec::new();
         let mut scores: Vec<f64> = Vec::new();
+        let mut feat_min = Vec::new();
+        let mut feat_max = Vec::new();
+        let mut feat_default = Vec::new();
+        let mut feat_mfb = Vec::new();
+        let mut feat_offset = Vec::new();
+        let mut feat_bit_type = Vec::new();
+        let mut feat_column = Vec::new();
+        let mut split_feature_inner = Vec::new();
+        let mut threshold_in_bin = Vec::new();
+        let mut decision_type = Vec::new();
+        let mut left_child = Vec::new();
+        let mut right_child = Vec::new();
+        let mut leaf_value = Vec::new();
+        let mut bitset_inner = Vec::new();
+        let mut cat_boundaries_inner = Vec::new();
         for body in lines.by_ref() {
             let bt: Vec<&str> = body.trim().split_whitespace().collect();
             if bt.is_empty() {
                 continue;
             }
+            let payload = bt.get(1).copied().unwrap_or("");
             match bt[0] {
+                "PFEAT" => {
+                    // per feature `min,max,default,mfb,offset,bit_type,column` ';'-sep.
+                    for f in payload.split(';').filter(|s| !s.is_empty()) {
+                        let c: Vec<&str> = f.split(',').collect();
+                        feat_min.push(c[0].parse().expect("feat min"));
+                        feat_max.push(c[1].parse().expect("feat max"));
+                        feat_default.push(c[2].parse().expect("feat default"));
+                        feat_mfb.push(c[3].parse().expect("feat mfb"));
+                        feat_offset.push(c[4].parse().expect("feat offset"));
+                        feat_bit_type.push(c[5].parse().expect("feat bit_type"));
+                        feat_column.push(c[6].parse().expect("feat column"));
+                    }
+                }
+                "PNODE" => {
+                    // per node `split_feature_inner,threshold_in_bin,decision_type,left,right`.
+                    for n in payload.split(';').filter(|s| !s.is_empty()) {
+                        let c: Vec<&str> = n.split(',').collect();
+                        split_feature_inner.push(c[0].parse().expect("node sfi"));
+                        threshold_in_bin.push(c[1].parse().expect("node thr"));
+                        decision_type.push(c[2].parse().expect("node dt"));
+                        left_child.push(c[3].parse().expect("node left"));
+                        right_child.push(c[4].parse().expect("node right"));
+                    }
+                }
+                "PLEAF" => {
+                    for l in payload.split(';').filter(|s| !s.is_empty()) {
+                        leaf_value.push(f64::from_bits(l.parse::<u64>().expect("leaf f64 bits")));
+                    }
+                }
+                "PCATPOOL" => {
+                    for w in payload.split(';').filter(|s| !s.is_empty()) {
+                        bitset_inner.push(w.parse::<u32>().expect("cat pool word"));
+                    }
+                }
+                "PCATBOUND" => {
+                    for b in payload.split(';').filter(|s| !s.is_empty()) {
+                        cat_boundaries_inner.push(b.parse::<i32>().expect("cat boundary"));
+                    }
+                }
                 "PROWS" => {
-                    let payload = bt.get(1).copied().unwrap_or("");
                     if !payload.is_empty() {
                         rows = payload
                             .split(';')
@@ -315,7 +389,6 @@ fn read_predict_golden() -> Option<Vec<PredictGolden>> {
                     }
                 }
                 "PSCORE" => {
-                    let payload = bt.get(1).copied().unwrap_or("");
                     if !payload.is_empty() {
                         scores = payload
                             .split(';')
@@ -327,7 +400,29 @@ fn read_predict_golden() -> Option<Vec<PredictGolden>> {
                 _ => {}
             }
         }
-        out.push(PredictGolden { name, kind, num_rows, num_features, scores, rows });
+        out.push(PredictGolden {
+            name,
+            kind,
+            num_rows,
+            num_features,
+            scores,
+            rows,
+            feat_min,
+            feat_max,
+            feat_default,
+            feat_mfb,
+            feat_offset,
+            feat_bit_type,
+            feat_column,
+            split_feature_inner,
+            threshold_in_bin,
+            decision_type,
+            left_child,
+            right_child,
+            leaf_value,
+            bitset_inner,
+            cat_boundaries_inner,
+        });
     }
     Some(out)
 }
@@ -344,24 +439,88 @@ fn assert_predict_shape(g: &PredictGolden) {
     }
 }
 
+/// Build the `PredictTree` view over a parsed golden block.
+fn tree_of(g: &PredictGolden) -> lgbm_compute::kernels::predict::PredictTree<'_> {
+    lgbm_compute::kernels::predict::PredictTree {
+        feat_min: &g.feat_min,
+        feat_max: &g.feat_max,
+        feat_default: &g.feat_default,
+        feat_most_freq_bin: &g.feat_mfb,
+        feat_offset: &g.feat_offset,
+        feat_column: &g.feat_column,
+        split_feature_inner: &g.split_feature_inner,
+        threshold_in_bin: &g.threshold_in_bin,
+        decision_type: &g.decision_type,
+        left_child: &g.left_child,
+        right_child: &g.right_child,
+        leaf_value: &g.leaf_value,
+        bitset_inner: &g.bitset_inner,
+        cat_boundaries_inner: &g.cat_boundaries_inner,
+    }
+}
+
+/// Flatten the golden's `PROWS` into a row-major `[num_rows × num_features]` store.
+fn flat_rows(g: &PredictGolden) -> Vec<u32> {
+    g.rows.iter().flat_map(|r| r.iter().copied()).collect()
+}
+
+/// Drive the device tree-walk on the cpu f64 anchor for `g` at column width
+/// `bit_type` and assert the raw-margin scores match the golden within `ORACLE_TOL`
+/// (the f32 contract) AND bit-exact vs the cpu f64 anchor (lib_lightgbm-transcribed
+/// golden). The device kernel emits the RAW pre-inverse-link margin (Phase-19
+/// boundary), exactly what `predict.txt` PSCORE captures.
+fn drive_and_assert(g: &PredictGolden, bit_type: u32) {
+    use lgbm_compute::kernels::predict::add_prediction_to_score_on_device;
+    use lgbm_compute::runtime::cpu_client;
+
+    let client = cpu_client();
+    let tree = tree_of(g);
+    let rows = flat_rows(g);
+    let got = add_prediction_to_score_on_device(
+        &client,
+        &tree,
+        &rows,
+        g.num_rows,
+        g.num_features,
+        bit_type,
+        g.num_rows,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("PREDICT `{}` device walk (bit_type={bit_type}) failed: {e:?}", g.name));
+
+    // (1) bit-exact vs the golden PSCORE on the cpu f64 anchor (D-04/D-12).
+    for (i, (gt, ex)) in got.iter().zip(g.scores.iter()).enumerate() {
+        assert_eq!(
+            gt.to_bits(),
+            ex.to_bits(),
+            "PREDICT `{}` (bit_type={bit_type}) row {i}: device margin {gt} != golden {ex}",
+            g.name
+        );
+    }
+    // (2) within ORACLE_TOL under the f32 contract (the ~1e-6 numerical gate).
+    let got_f32: Vec<f32> = got.iter().map(|&v| v as f32).collect();
+    let exp_f32: Vec<f32> = g.scores.iter().map(|&v| v as f32).collect();
+    compare_within(&got_f32, &exp_f32, ORACLE_TOL)
+        .unwrap_or_else(|m| panic!("PREDICT `{}` (bit_type={bit_type}) not within ORACLE_TOL: {m:?}", g.name));
+}
+
 /// `on_device` cell (ODL-15, numeric tree-walk 8/16/32 vs the f64 anchor).
 mod on_device {
     use super::*;
 
     #[test]
-    #[ignore = "Wave-0 scaffold; un-ignore when 18-04 lands"]
     fn predict_parity_on_device_numeric() {
         let Some(goldens) = read_predict_golden() else { return };
         let numeric: Vec<&PredictGolden> = goldens.iter().filter(|g| g.kind == "numeric").collect();
         assert!(!numeric.is_empty(), "predict.txt has no numeric PREDICT block");
         for g in numeric {
             assert_predict_shape(g);
-            // UN-IGNORE (18-04): drive the device tree-walk and compare within tol, e.g.
-            //   let got = lgbm_compute::kernels::predict::add_prediction_to_score_on_device(
-            //       &client, &cuda_tree, &cuda_column_data, &g.rows)?;
-            //   let got_f32: Vec<f32> = got.iter().map(|&v| v as f32).collect();
-            //   let exp_f32: Vec<f32> = g.scores.iter().map(|&v| v as f32).collect();
-            //   compare_within(&got_f32, &exp_f32, ORACLE_TOL)?;
+            // A bin is a width-invariant index: drive the SAME numeric model at 8-,
+            // 16-, and 32-bit column width (D-05 dispatch coverage) — each must match
+            // the golden raw margins bit-exact + within ORACLE_TOL.
+            for bit_type in [8u32, 16, 32] {
+                drive_and_assert(g, bit_type);
+            }
         }
     }
 }
@@ -371,7 +530,7 @@ mod cat {
     use super::*;
 
     #[test]
-    #[ignore = "Wave-0 scaffold; un-ignore when 18-04 lands"]
+    #[ignore = "categorical cell + hip gate land in 18-04 Task 2"]
     fn predict_parity_cat_membership() {
         let Some(goldens) = read_predict_golden() else { return };
         let cats: Vec<&PredictGolden> = goldens.iter().filter(|g| g.kind == "categorical").collect();
@@ -381,8 +540,10 @@ mod cat {
         assert!(cats.iter().any(|g| g.name == "cat_manyvsmany"), "missing cat_manyvsmany block");
         for g in cats {
             assert_predict_shape(g);
-            // UN-IGNORE (18-04): drive the device categorical tree-walk (FindInBitsetCUDA
-            // membership) and compare within ORACLE_TOL vs g.scores.
+            // Drive at the model's native column width (cat_onehot 8-bit, cat_manyvsmany
+            // 16-bit); the categorical branch reuses the shared find_in_bitset helper.
+            let bit_type = *g.feat_bit_type.iter().max().unwrap_or(&8);
+            drive_and_assert(g, bit_type);
         }
     }
 }
