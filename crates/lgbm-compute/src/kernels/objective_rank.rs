@@ -365,9 +365,18 @@ pub fn lambdarank_get_gradients_on<R: cubecl::Runtime>(
 
 /// The `>2048` `_Sorted` (`<MAX_ITEM_GT_1024>`) LambdaRank-NDCG launcher (D-03). Same
 /// contract as [`lambdarank_get_gradients_on`]; routes through the `_Sorted` kernel.
-/// (True per-query lengths `> BITONIC_SORT_NUM_ELEMENTS` remain the deferred
-/// multi-block-sort hardening in `primitives.rs`; the variant is built and validated
-/// on the spine corpus to prove the `_Sorted` code path.)
+///
+/// **Coverage limitation (WR-04).** This variant shares the `lambdarank_body`
+/// accumulation with the shared launcher, so the tests can only prove the two produce
+/// identical grad/hess on the spine corpus — NOT that a genuinely large query
+/// (`> BITONIC_SORT_NUM_ELEMENTS` items) is handled correctly. In practice such a query
+/// is ALREADY REJECTED here, before any launch: the composed
+/// [`crate::kernels::primitives::bitonic_argsort_items_on`] returns
+/// [`ComputeError::Runtime`] for any segment exceeding
+/// [`crate::kernels::primitives::BITONIC_SORT_NUM_ELEMENTS`] (the multi-block-sort
+/// hardening is deferred, D-02). So this launcher cannot silently route a genuinely
+/// large query into an unverified path — it errors instead. Callers needing true
+/// `>1024`-item queries must wait on the deferred multi-block sort.
 #[allow(clippy::too_many_arguments)]
 pub fn lambdarank_get_gradients_sorted_on<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
@@ -753,6 +762,13 @@ pub fn rank_xendcg_get_gradients_on<R: cubecl::Runtime>(
 /// are stashed in the hessian output buffer (`rho`) + a pre-allocated-once
 /// `cuda_params_buffer` (`params`) — the faithful CUDA buffer-aliasing. The shared and
 /// global launchers are asserted to produce identical hessians (the Pitfall 4 guard).
+///
+/// **Coverage limitation (WR-04).** The RankXENDCG fold does no sort, so
+/// `rank_xendcg_body` is size-agnostic and the `hess`↔`rho_buf` aliasing runs
+/// identically for any query length. The tests therefore prove the aliasing is
+/// race-free by the shared-vs-global bit-exact guard, but ONLY on the spine corpus —
+/// there is no genuinely-large (`>2048`-item) captured golden. The aliasing is correct
+/// by construction (same-index read-before-write), not by large-item golden parity.
 pub fn rank_xendcg_get_gradients_global_on<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
     scores: &[f64],
