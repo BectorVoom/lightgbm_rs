@@ -98,13 +98,16 @@ pub fn get_split_gains(
         + get_leaf_gain(use_l1, sum_right_gradients, sum_right_hessians, l1, l2)
 }
 
-/// `GetLeafGainGivenOutput<USE_L1>` (feature_histogram.hpp:817-829): the leaf
-/// gain for a leaf whose output is FIXED (already monotone-clamped) rather than
-/// the unconstrained `-g/(h+l2)`. Used by the monotone (`USE_MC`) split-gain path
-/// where `left_output`/`right_output` are clamped to the leaf `[min,max]`
-/// constraint before the gain is computed. A plain host `fn` (the monotone gate
-/// runs on the deterministic CPU anchor only — not a `#[cube]` kernel).
-#[must_use]
+/// `GetLeafGainGivenOutput<USE_L1>` (feature_histogram.hpp:817-829 /
+/// cuda_leaf_splits.hpp:92-103): the leaf gain for a leaf whose output is FIXED
+/// (already monotone-clamped, OR the smoothing-blended output) rather than the
+/// unconstrained `-g/(h+l2)`. Used by the monotone (`USE_MC`) split-gain path AND
+/// by the net-new `USE_SMOOTHING` form-(D) gain path.
+///
+/// Promoted to `#[cube]` (17-02) so the smoothing gain path runs on device; a
+/// `#[cube]` fn is also a plain Rust `fn`, so the existing monotone host caller
+/// (`monotone_constraints.rs`) is byte-unchanged.
+#[cube]
 pub fn get_leaf_gain_given_output(
     use_l1: bool,
     sum_gradients: f64,
@@ -217,6 +220,26 @@ pub fn calculate_splitted_leaf_output_f32(
         -threshold_l1_f32(sum_gradients, l1) / (sum_hessians + l2)
     } else {
         -sum_gradients / (sum_hessians + l2)
+    }
+}
+
+/// f32 mirror of [`get_leaf_gain_given_output`] (the no-f64 hip path).
+#[cube]
+pub fn get_leaf_gain_given_output_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+    output: f32,
+) -> f32 {
+    // WR-05: every literal pinned f32 so cubecl cannot widen the `2.0` factor to
+    // f64 on the hip path (the f32 path exists precisely to avoid f64 on gfx1100).
+    if use_l1 {
+        let sg_l1 = threshold_l1_f32(sum_gradients, l1);
+        -(2.0f32 * sg_l1 * output + (sum_hessians + l2) * output * output)
+    } else {
+        -(2.0f32 * sum_gradients * output + (sum_hessians + l2) * output * output)
     }
 }
 
