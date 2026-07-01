@@ -40,6 +40,7 @@ Usage:
   rank_oracle_capture.py <out_dir> <seed> <bagging_seed> <objective_seed> <lightgbm_version>
 """
 
+import math
 import os
 import struct
 import sys
@@ -55,6 +56,12 @@ LEARNING_RATE = 0.1
 EARLY_STOPPING_ROUND = 2
 BAGGING_RAND_BLOCK = 1024
 EVAL_AT = [1, 3, 5]
+# The LATER iter whose grad/hess we freeze, matching boosting_oracle_capture.py's
+# LATER_ITER convention (the *_gh_iterN.txt golden).
+LATER_ITER = 5
+# config.h `sigmoid_` default (base_params leaves `sigmoid` unset → 1.0). The
+# score-derivation lambdarank grad/hess uses it verbatim.
+LAMBDARANK_SIGMOID = 1.0
 
 
 def f64_bits(value):
@@ -304,6 +311,193 @@ def capture_xendcg_objseed_rng(out_dir, objective_seed, group):
         fh.write("\n".join(lines) + "\n")
 
 
+# =====================================================================
+# Score-derivation lambdarank grad/hess (RESEARCH A1 route). Re-derives the per-row
+# lambda/hessian from the captured raw scores + labels + query_boundaries, mirroring
+# `lgbm_objective::rank::Lambdarank::get_gradients` (rank.rs) — itself a 1:1 port of
+# the C++ `LambdarankNDCG::GetGradientsForOneQuery` (rank_objective.hpp:180-266) —
+# BIT-FOR-BIT, including the f32 lambda/hessian accumulation. Emits the same
+# `GRAD <u32 bits>` / `HESS <u32 bits>` format as boosting/*_gh_iter*.txt (D-01).
+# =====================================================================
+def _default_label_gain():
+    """DCGCalculator::DefaultLabelGain (dcg_calculator.cpp:33-41): 2^i - 1 for
+    i in 0..31 (entry 0 = 0), max_label = 31 to avoid overflow."""
+    return [float((1 << i) - 1) for i in range(31)]
+
+
+def _discount_table(n):
+    """discount_[i] = 1 / log2(2 + i) (dcg_calculator.cpp Init, built once)."""
+    return [1.0 / math.log2(2.0 + i) for i in range(n)]
+
+
+def _sigmoid_table(sigmoid):
+    """ConstructSigmoidTable (rank_objective.hpp:281-294) — the 2^20-bin lookup, with
+    the ctor in-place `min = min / sigmoid / 2` mutation."""
+    nbins = 1024 * 1024
+    min_in = -50.0 / sigmoid / 2.0
+    max_in = -min_in
+    idx_factor = nbins / (max_in - min_in)
+    i = np.arange(nbins, dtype=np.float64)
+    score = i / idx_factor + min_in
+    table = 1.0 / (1.0 + np.exp(score * sigmoid))
+    return table, min_in, max_in, idx_factor, nbins
+
+
+def _get_sigmoid(s, table, min_in, max_in, idx_factor, nbins):
+    """LambdarankNDCG::GetSigmoid (rank_objective.hpp:268-279) — the table lookup."""
+    if s <= min_in:
+        return float(table[0])
+    if s >= max_in:
+        return float(table[nbins - 1])
+    # `as usize` truncates toward zero; (s - min_in) >= 0 here.
+    idx = int((s - min_in) * idx_factor)
+    return float(table[idx])
+
+
+def _cal_max_dcg_at_k(k, labels, label_gain, discount):
+    """DCGCalculator::CalMaxDCGAtK (dcg_calculator.cpp:78-107 single-k form)."""
+    num_data = len(labels)
+    label_cnt = [0] * len(label_gain)
+    for l in labels:
+        label_cnt[int(l)] += 1
+    top_label = len(label_gain) - 1
+    kk = min(k, num_data)
+    ret = 0.0
+    for j in range(kk):
+        while top_label > 0 and label_cnt[top_label] <= 0:
+            top_label -= 1
+        if top_label < 0:
+            break
+        ret += discount[j] * label_gain[top_label]
+        label_cnt[top_label] -= 1
+    return ret
+
+
+def lambdarank_grad_hess(scores, labels, qb, sigmoid, norm, truncation_level):
+    """Per-row grad/hess (f32) re-derived from raw `scores`, mirroring rank.rs
+    `get_gradients` → `gradients_for_one_query` bit-for-bit (f32 accumulation)."""
+    label_gain = _default_label_gain()
+    discount = _discount_table(10000)
+    sig_tbl, min_in, max_in, idx_factor, nbins = _sigmoid_table(sigmoid)
+    n = len(scores)
+    grad = np.zeros(n, dtype=np.float32)
+    hess = np.zeros(n, dtype=np.float32)
+    neg_inf = float("-inf")
+    f32_001 = float(np.float32(0.01))  # C++ uses the 0.01f literal in f64 math.
+    num_queries = len(qb) - 1
+    for q in range(num_queries):
+        start = qb[q]
+        cnt = qb[q + 1] - start
+        s = [float(scores[start + i]) for i in range(cnt)]
+        ql = [int(labels[start + i]) for i in range(cnt)]
+        m = _cal_max_dcg_at_k(
+            truncation_level, [labels[start + i] for i in range(cnt)], label_gain, discount
+        )
+        inv_max_dcg = (1.0 / m) if m > 0.0 else m
+        lam = [np.float32(0.0)] * cnt
+        hes = [np.float32(0.0)] * cnt
+        # sorted_idx by DESCENDING score, stable, ascending-index tie-break.
+        sorted_idx = sorted(range(cnt), key=lambda a: (-s[a], a))
+        best_score = s[sorted_idx[0]]
+        worst_idx = cnt - 1
+        if worst_idx > 0 and s[sorted_idx[worst_idx]] == neg_inf:
+            worst_idx -= 1
+        worst_score = s[sorted_idx[worst_idx]]
+        sum_lambdas = 0.0
+        i = 0
+        while i + 1 < cnt and i < truncation_level:
+            if s[sorted_idx[i]] == neg_inf:
+                i += 1
+                continue
+            for j in range(i + 1, cnt):
+                if s[sorted_idx[j]] == neg_inf:
+                    continue
+                if ql[sorted_idx[i]] == ql[sorted_idx[j]]:
+                    continue
+                if ql[sorted_idx[i]] > ql[sorted_idx[j]]:
+                    high_rank, low_rank = i, j
+                else:
+                    high_rank, low_rank = j, i
+                high = sorted_idx[high_rank]
+                low = sorted_idx[low_rank]
+                high_score = s[high]
+                low_score = s[low]
+                high_label_gain = label_gain[ql[high]]
+                low_label_gain = label_gain[ql[low]]
+                high_discount = discount[high_rank]
+                low_discount = discount[low_rank]
+                delta_score = high_score - low_score
+                dcg_gap = high_label_gain - low_label_gain
+                paired_discount = abs(high_discount - low_discount)
+                delta_pair_ndcg = dcg_gap * paired_discount * inv_max_dcg
+                if norm and best_score != worst_score:
+                    delta_pair_ndcg /= f32_001 + abs(delta_score)
+                p_lambda = _get_sigmoid(delta_score, sig_tbl, min_in, max_in, idx_factor, nbins)
+                p_hessian = p_lambda * (1.0 - p_lambda)
+                p_lambda *= -sigmoid * delta_pair_ndcg
+                p_hessian *= sigmoid * sigmoid * delta_pair_ndcg
+                lam[low] = np.float32(lam[low] - np.float32(p_lambda))
+                hes[low] = np.float32(hes[low] + np.float32(p_hessian))
+                lam[high] = np.float32(lam[high] + np.float32(p_lambda))
+                hes[high] = np.float32(hes[high] + np.float32(p_hessian))
+                sum_lambdas -= 2.0 * p_lambda
+            i += 1
+        if norm and sum_lambdas > 0.0:
+            norm_factor = math.log2(1.0 + sum_lambdas) / sum_lambdas
+            for i in range(cnt):
+                lam[i] = np.float32(float(lam[i]) * norm_factor)
+                hes[i] = np.float32(float(hes[i]) * norm_factor)
+        for i in range(cnt):
+            grad[start + i] = lam[i]
+            hess[start + i] = hes[i]
+    return grad, hess
+
+
+def _write_gh(out_dir, fname, grad, hess, header):
+    def bits_line(vals):
+        return " ".join(str(f32_bits(v)) for v in vals)
+
+    with open(os.path.join(out_dir, fname), "w") as fh:
+        fh.write(header + "\n")
+        fh.write("GRAD " + bits_line(grad) + "\n")
+        fh.write("HESS " + bits_line(hess) + "\n")
+
+
+def capture_lambdarank_gh(out_dir, X, labels, group, seed, bagging_seed, objective_seed):
+    """The one Wave-0 capture gap (19-VALIDATION / D-01): train real lib_lightgbm
+    lambdarank, capture per-iter raw scores, and re-derive the per-row grad/hess into
+    lambdarank_gh_iter{1,N}.txt in the boosting *_gh bit format (score-derivation route)."""
+    p = base_params("lambdarank", seed, bagging_seed, objective_seed, by_query=False)
+    sigmoid = LAMBDARANK_SIGMOID
+    norm = p["lambdarank_norm"]
+    trunc = p["lambdarank_truncation_level"]
+    qb = query_boundaries_from_group(group)
+    dtrain = lgb.Dataset(X, label=labels, group=group, params=p, free_raw_data=False)
+    dtrain.construct()
+    booster = lgb.train(
+        p, dtrain, num_boost_round=NUM_ITERATIONS,
+        valid_sets=[dtrain], valid_names=["training"],
+    )
+    # iter1: score_0 = 0 for every row (ranking has no boost-from-average init).
+    score0 = np.zeros(len(labels), dtype=np.float64)
+    grad1, hess1 = lambdarank_grad_hess(score0, labels, qb, sigmoid, norm, trunc)
+    _write_gh(
+        out_dir, "lambdarank_gh_iter1.txt", grad1, hess1,
+        "# lambdarank_gh_iter1 — iter-1 per-row grad/hess; f32 bits; GRAD then HESS "
+        "(real lib_lightgbm 4.6 score-derivation, D-01)",
+    )
+    # iterN: raw score AFTER LATER_ITER-1 trees (the input to tree LATER_ITER).
+    score_prev = np.asarray(
+        booster.predict(X, raw_score=True, num_iteration=LATER_ITER - 1), dtype=np.float64
+    )
+    gradN, hessN = lambdarank_grad_hess(score_prev, labels, qb, sigmoid, norm, trunc)
+    _write_gh(
+        out_dir, "lambdarank_gh_iterN.txt", gradN, hessN,
+        f"# lambdarank_gh_iterN — iter-{LATER_ITER} per-row grad/hess; f32 bits; GRAD then "
+        "HESS (real lib_lightgbm 4.6 score-derivation, D-01)",
+    )
+
+
 def main():
     if len(sys.argv) != 6:
         sys.exit("usage: rank_oracle_capture.py <out_dir> <seed> <bagging_seed> "
@@ -330,8 +524,10 @@ def main():
     # RNG-replay goldens (no wheel-internal state needed).
     capture_bag_by_query_rng(out_dir, bagging_seed, group)
     capture_xendcg_objseed_rng(out_dir, objective_seed, group)
+    # lambdarank grad/hess golden (the one Wave-0 capture gap, D-01).
+    capture_lambdarank_gh(out_dir, X, labels, group, seed, bagging_seed, objective_seed)
     print("rank_oracle_capture: wrote ranking model cells + per-query metrics + "
-          "RNG-replay goldens to", out_dir)
+          "RNG-replay goldens + lambdarank_gh goldens to", out_dir)
 
 
 if __name__ == "__main__":

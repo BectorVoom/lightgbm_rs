@@ -1893,6 +1893,9 @@ fn rank_oracle_capture() -> Result<()> {
         "bagging_by_query_seed3.txt",
         "rank_xendcg_objseed5.txt",
         "rank_lambdarank_byq0_es0_model.txt",
+        // The lambdarank grad/hess golden (Phase-19 Wave-0 capture gap, D-01).
+        "lambdarank_gh_iter1.txt",
+        "lambdarank_gh_iterN.txt",
     ] {
         let p = out_dir.join(name);
         if !p.is_file() {
