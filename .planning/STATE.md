@@ -6,14 +6,14 @@ current_phase: 18
 current_phase_name: on-device-data-partition-tree-mutation-prediction
 status: executing
 stopped_at: Phase 18 context gathered
-last_updated: "2026-07-01T11:47:27.162Z"
+last_updated: "2026-07-01T12:11:51.310Z"
 last_activity: 2026-07-01
 last_activity_desc: Phase 18 execution started
 progress:
   total_phases: 10
   completed_phases: 4
   total_plans: 25
-  completed_plans: 22
+  completed_plans: 23
   percent: 40
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 18 (on-device-data-partition-tree-mutation-prediction) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-07-01 — Phase 18 execution started
@@ -570,6 +570,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 17 P03 | 95min | 2 tasks | 3 files |
 | Phase 17 P05 | 55min | 3 tasks | 3 files |
 | Phase 18 P01 | 75min | 3 tasks | 13 files |
+| Phase 18 P02 | 21min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -671,6 +672,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 17-03: stage-1 split_eval_body f64 fold bit-exact to §8.1 goldens (all 5 landmines); goldens finalized by an independent calculator, not cpu-fold output (anti-circularity)
 - [Phase ?]: 17-03: f32 hip mirror split per codebase convention — cpu-testable single-owner fold + gpu-gated two-level LDS block scan/argmax (on-device rocm assertion deferred to 17-05)
 - [Phase 17]: 17-05: stage-2/3 reductions are deterministic host folds over stage-1 SplitScalars (the reduction order is the parity contract); only the 8-int export is a device kernel (the single SC#2 readback)
+- [Phase ?]: 18-02: route flags are #[comptime] bools passed as plain host-computed values at the launch site — cubecl auto-specializes+caches per combination (no host match), honoring the D-02 fan-out
+- [Phase ?]: 18-02: device partition scatter uses the global scan (D-04 order-equivalence to a stable partition), reusing 18-01 u16/u32 primitives; exclusive rank IS the [tid-1] inclusive derivation
 
 ### Pending Todos
 
@@ -700,7 +703,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T11:47:19.986Z
+Last session: 2026-07-01T12:11:30.519Z
 Stopped at: Phase 18 context gathered
 Resume file: .planning/phases/18-on-device-data-partition-tree-mutation-prediction/18-CONTEXT.md
 
