@@ -1893,9 +1893,10 @@ fn rank_oracle_capture() -> Result<()> {
         "bagging_by_query_seed3.txt",
         "rank_xendcg_objseed5.txt",
         "rank_lambdarank_byq0_es0_model.txt",
-        // The lambdarank grad/hess golden (Phase-19 Wave-0 capture gap, D-01).
+        // The lambdarank grad/hess golden (Phase-19 Wave-0 capture gap, D-01). Only
+        // iter1 is captured+consumed; the iterN golden was dropped (WR-01) since the
+        // rank scores fixture cannot reconstruct the iterN intermediate score vector.
         "lambdarank_gh_iter1.txt",
-        "lambdarank_gh_iterN.txt",
     ] {
         let p = out_dir.join(name);
         if !p.is_file() {

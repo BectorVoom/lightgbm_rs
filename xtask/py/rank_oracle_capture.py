@@ -56,9 +56,6 @@ LEARNING_RATE = 0.1
 EARLY_STOPPING_ROUND = 2
 BAGGING_RAND_BLOCK = 1024
 EVAL_AT = [1, 3, 5]
-# The LATER iter whose grad/hess we freeze, matching boosting_oracle_capture.py's
-# LATER_ITER convention (the *_gh_iterN.txt golden).
-LATER_ITER = 5
 # config.h `sigmoid_` default (base_params leaves `sigmoid` unset → 1.0). The
 # score-derivation lambdarank grad/hess uses it verbatim.
 LAMBDARANK_SIGMOID = 1.0
@@ -465,8 +462,10 @@ def _write_gh(out_dir, fname, grad, hess, header):
 
 def capture_lambdarank_gh(out_dir, X, labels, group, seed, bagging_seed, objective_seed):
     """The one Wave-0 capture gap (19-VALIDATION / D-01): train real lib_lightgbm
-    lambdarank, capture per-iter raw scores, and re-derive the per-row grad/hess into
-    lambdarank_gh_iter{1,N}.txt in the boosting *_gh bit format (score-derivation route)."""
+    lambdarank and re-derive the iter-1 per-row grad/hess into lambdarank_gh_iter1.txt
+    in the boosting *_gh bit format (score-derivation route). The iterN golden was
+    dropped (WR-01): the rank scores fixture stores only the final raw-score line, so
+    the iterN intermediate score vector cannot be reconstructed by any test."""
     p = base_params("lambdarank", seed, bagging_seed, objective_seed, by_query=False)
     sigmoid = LAMBDARANK_SIGMOID
     norm = p["lambdarank_norm"]
@@ -474,7 +473,12 @@ def capture_lambdarank_gh(out_dir, X, labels, group, seed, bagging_seed, objecti
     qb = query_boundaries_from_group(group)
     dtrain = lgb.Dataset(X, label=labels, group=group, params=p, free_raw_data=False)
     dtrain.construct()
-    booster = lgb.train(
+    # Train the real binary as a smoke check that the corpus/params fit; the iter-1
+    # golden below is derived from a zero score vector (ranking has no boost-from-average
+    # init) and does not depend on the trained model. The iterN golden was DROPPED
+    # (WR-01): the rank scores fixture stores only the final raw-score line, so the iterN
+    # intermediate score vector cannot be reconstructed and no test could consume it.
+    lgb.train(
         p, dtrain, num_boost_round=NUM_ITERATIONS,
         valid_sets=[dtrain], valid_names=["training"],
     )
@@ -485,16 +489,6 @@ def capture_lambdarank_gh(out_dir, X, labels, group, seed, bagging_seed, objecti
         out_dir, "lambdarank_gh_iter1.txt", grad1, hess1,
         "# lambdarank_gh_iter1 — iter-1 per-row grad/hess; f32 bits; GRAD then HESS "
         "(real lib_lightgbm 4.6 score-derivation, D-01)",
-    )
-    # iterN: raw score AFTER LATER_ITER-1 trees (the input to tree LATER_ITER).
-    score_prev = np.asarray(
-        booster.predict(X, raw_score=True, num_iteration=LATER_ITER - 1), dtype=np.float64
-    )
-    gradN, hessN = lambdarank_grad_hess(score_prev, labels, qb, sigmoid, norm, trunc)
-    _write_gh(
-        out_dir, "lambdarank_gh_iterN.txt", gradN, hessN,
-        f"# lambdarank_gh_iterN — iter-{LATER_ITER} per-row grad/hess; f32 bits; GRAD then "
-        "HESS (real lib_lightgbm 4.6 score-derivation, D-01)",
     )
 
 
