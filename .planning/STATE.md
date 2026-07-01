@@ -5,8 +5,8 @@ milestone_name: — CUDA On-Device Training Backend
 current_phase: 18
 current_phase_name: On-Device Data Partition, Tree Mutation & Prediction
 status: verifying
-stopped_at: Phase 17 context gathered
-last_updated: "2026-07-01T03:24:22.091Z"
+stopped_at: Phase 18 context gathered
+last_updated: "2026-07-01T09:50:03.969Z"
 last_activity: 2026-07-01
 last_activity_desc: Phase 17 complete, transitioned to Phase 18
 progress:
@@ -699,9 +699,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T03:10:54.780Z
-Stopped at: Phase 17 context gathered
-Resume file: .planning/phases/17-on-device-best-split-finder/17-CONTEXT.md
+Last session: 2026-07-01T09:50:03.959Z
+Stopped at: Phase 18 context gathered
+Resume file: .planning/phases/18-on-device-data-partition-tree-mutation-prediction/18-CONTEXT.md
 
 ## Operator Next Steps
 
