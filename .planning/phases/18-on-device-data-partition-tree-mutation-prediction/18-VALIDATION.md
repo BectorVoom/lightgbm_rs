@@ -71,6 +71,38 @@ Scaffold tests land `#[ignore = "Wave-0 scaffold"]` and are un-ignored when the 
 
 ---
 
+## Golden Provenance Limitation (IN-01)
+
+> Raised by the phase-18 code review (`18-REVIEW.md`, IN-01). Recorded here so the
+> numerical-fidelity contract is read with the right caveat.
+
+The partition (`SplitRouteFanout`), categorical (`SplitCategoricalRoute` /
+`FindInBitsetHost`) and predict (`PredWalk`) goldens in `xtask/cpp/kernel_capture.cpp`
+(≈`:512`, `:585`, `:598`, `:1437`) are **hand-written host re-transcriptions** of
+`dense_bin.hpp` / `cuda_tree.cu`, **not** captures from the compiled reference
+(`lib_lightgbm` 4.6 / the AMD-fork CUDA path). The Rust kernels (`route_to_left`,
+`route_left_host`, the predict walk) are independent transcriptions of the *same* C++
+source lines.
+
+**Implication:** the phase-18 partition / tree-mutation / predict parity cells prove the
+two transcriptions **agree with each other** — not that either matches the *compiled*
+reference. A transcription error shared by both sides (e.g. a remapped-`bin`-vs-raw
+`default_bin` comparison that both omit, `predict.rs:130` / `kernel_capture.cpp:1462`)
+would pass green. This differs from the project's binning / serial-tree-learner goldens,
+which ARE captured from real `lib_lightgbm` 4.6 and are therefore reference-faithful.
+The CLAUDE.md fidelity contract is stated against the *compiled* reference, so these
+phase-18 goldens are a weaker (transcription-consistency) guarantee until pinned.
+
+**Remediation (deferred, not blocking — kernels are OFF behind `LGBM_CUDA_ON_DEVICE` /
+`on_device_growth_supported() == false`):** where the AMD-fork CUDA path can be built on
+the Kaggle CUDA harness, capture at least one PORDER / predict golden from the compiled
+kernel to pin the transcription against the real reference. Tracked below under
+Manual-Only Verifications ("Real `lib_lightgbm` 4.6 golden capture").
+
+See also MEMORY: `on-device-kernel-goldens-are-retranscriptions`.
+
+---
+
 ## Manual-Only Verifications
 
 | Behavior | Requirement | Why Manual | Test Instructions |
