@@ -181,10 +181,21 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 **Plans**: 5 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 17-01-PLAN.md — Wave-0 test infra + host scaffolding (best_split_parity harness, best_split.txt 6-category fixtures, SplitFindTask, build_split_find_tasks task-gen table, round-ties-even helper, RNG-seed lock) [wave 1]
 - [ ] 17-02-PLAN.md — Gain-math USE_SMOOTHING output-blend branch + #[cube] promotion of get_leaf_gain_given_output (additive; non-smoothing gain fns byte-unchanged) [wave 1]
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 17-03-PLAN.md — Stage-1 numerical core: split_eval_body cpu f64 fold (scan→complement→count-recovery→guards→gain→argmax→record) + hip f32 two-level LDS scan mirror [wave 2]
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 17-04-PLAN.md — Stage-1 _GlobalMemory >256-bin spill variant + pre-allocated scratch (D-05/D-11) [wave 3]
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 17-05-PLAN.md — Stage-2 cross-feature reduce + Stage-3 cross-leaf argmax + 8-int export + self-invalidation + tie-aware default_left on hip [wave 4]
 
 **Notes**: The 256-bin within-feature scan needs a segmented LDS block-scan (plane-sum caps at plane width 32/64 ≪ 256) — net-new kernel work, not a reuse (research flag). The discretized split finder (§8.1 quantized inner) is **v2 (QGD-02)** — skip. Do NOT defer the tie-aware assert.

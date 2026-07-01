@@ -4,9 +4,9 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 17
 current_phase_name: On-Device Best-Split Finder
-status: verifying
+status: executing
 stopped_at: Phase 17 context gathered
-last_updated: "2026-07-01T01:06:54.010Z"
+last_updated: "2026-07-01T01:39:40.416Z"
 last_activity: 2026-07-01
 last_activity_desc: Phase 16 complete, transitioned to Phase 17
 progress:
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 17 — On-Device Best-Split Finder
 Plan: Not started
-Status: Phase complete — ready for verification
+Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-07-01 — Phase 16 complete, transitioned to Phase 17
 
