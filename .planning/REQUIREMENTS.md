@@ -36,9 +36,9 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 
 ### Data partition, tree & prediction (§9, §10)
 
-- [ ] **ODL-13**: On-device **data partition** — `mark → prefix-sum → scatter` row permutation (**never sorting**) into two contiguous child ranges, the data-index→leaf-index map, and the `SplitTreeStructure` **histogram-pool pointer swap**; the resulting row order matches the reference so per-leaf f32 accumulation order is identical (§17). (§9.)
-- [ ] **ODL-14**: On-device **tree mutation** — `Split` writing the device tree arrays, ordered **before** partition (returns `right_leaf_index` the partition consumes), plus `Shrinkage` / `AddBias`, anchor-pinned to the host tree structure. (§10, §1 ordering note.)
-- [ ] **ODL-15**: On-device **prediction** — the tree-walk `AddPredictionToScore` kernel over the device columnar dataset (numeric threshold + missing/`default_left` handling, categorical bitset membership), within ~1e-6 + objective inverse-link. (§10.)
+- [x] **ODL-13**: On-device **data partition** — `mark → prefix-sum → scatter` row permutation (**never sorting**) into two contiguous child ranges, the data-index→leaf-index map, and the `SplitTreeStructure` **histogram-pool pointer swap**; the resulting row order matches the reference so per-leaf f32 accumulation order is identical (§17). (§9.)
+- [x] **ODL-14**: On-device **tree mutation** — `Split` writing the device tree arrays, ordered **before** partition (returns `right_leaf_index` the partition consumes), plus `Shrinkage` / `AddBias`, anchor-pinned to the host tree structure. (§10, §1 ordering note.)
+- [x] **ODL-15**: On-device **prediction** — the tree-walk `AddPredictionToScore` kernel over the device columnar dataset (numeric threshold + missing/`default_left` handling, categorical bitset membership), within ~1e-6 + objective inverse-link. (§10.)
 
 ### Score updater & metrics (§11, §12)
 
@@ -97,9 +97,9 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-10 | Phase 16 | Complete |
 | ODL-11 | Phase 17 | Complete |
 | ODL-12 | Phase 17 | Complete |
-| ODL-13 | Phase 18 | Pending |
-| ODL-14 | Phase 18 | Pending |
-| ODL-15 | Phase 18 | Pending |
+| ODL-13 | Phase 18 | Complete |
+| ODL-14 | Phase 18 | Complete |
+| ODL-15 | Phase 18 | Complete |
 | ODL-16 | Phase 20 | Pending |
 | ODL-17 | Phase 20 | Pending |
 | ODL-18 | Phase 21 | Pending |
