@@ -281,9 +281,12 @@ pub fn add_prediction_to_score_on_device<R: cubecl::Runtime>(
             let h_bins = client.create_from_slice(<$w>::as_bytes(&bins_w));
             // SAFETY: every handle is sized exactly as declared (`h_bins` = num_rows*
             // num_features cells, meta = nf, tree = nn, leaf = nl, score = num_data);
-            // all outlive the launch; the kernel bounds-guards `i < num_rows` and the
-            // walk only reads valid node/feature/leaf indices from the fixture tree
-            // (validated) with find_in_bitset guarding the bitset word (T-18-03/06).
+            // all outlive the launch; the kernel bounds-guards `i < num_rows`.
+            // `validate_walk` has already range-checked every tree index the walk
+            // dereferences (WR-02): split_feature_inner ∈ [0, nf), each child either a
+            // leaf `~child < nl` or an internal node `< nn`, categorical cat_idx within
+            // cat_boundaries_inner, and cat_boundaries_inner monotone with its last word
+            // bound ≤ bitset_inner.len() (the `n` passed to find_in_bitset, T-18-03/06).
             unsafe {
                 add_prediction_to_score_kernel::launch::<$w, R>(
                     client,
@@ -515,6 +518,80 @@ fn validate_walk(
         return Err(ComputeError::Runtime {
             detail: "add_prediction_to_score: tree must have at least one internal node".to_string(),
         });
+    }
+    // WR-02: validate the tree indices the walk actually dereferences. The launch
+    // SAFETY comment claims the walk "only reads valid node/feature/leaf indices" —
+    // enforce that here so a malformed fixture tree surfaces a typed ComputeError at
+    // the host boundary (SP-4) instead of an in-kernel out-of-bounds.
+    let nl = tree.leaf_value.len();
+    for n in 0..nn {
+        // split_feature_inner[node] indexes the per-feature meta arrays (len nf).
+        let sf = tree.split_feature_inner[n];
+        if sf < 0 || sf as usize >= nf {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "add_prediction_to_score: node {n} split_feature_inner {sf} out of range [0, {nf})"
+                ),
+            });
+        }
+        // left_child/right_child: negative encodes a leaf (~child == -child-1) into
+        // leaf_value; non-negative is an internal-node index back into the node arrays.
+        for (side, child) in [("left", tree.left_child[n]), ("right", tree.right_child[n])] {
+            if child < 0 {
+                let leaf = (-child - 1) as usize;
+                if leaf >= nl {
+                    return Err(ComputeError::Runtime {
+                        detail: format!(
+                            "add_prediction_to_score: node {n} {side}_child leaf {leaf} >= num_leaves {nl}"
+                        ),
+                    });
+                }
+            } else if child as usize >= nn {
+                return Err(ComputeError::Runtime {
+                    detail: format!(
+                        "add_prediction_to_score: node {n} {side}_child node {child} >= num_nodes {nn}"
+                    ),
+                });
+            }
+        }
+        // Categorical nodes read cat_boundaries_inner[cat_idx] and [cat_idx + 1].
+        if (tree.decision_type[n] & K_CATEGORICAL_MASK) != 0 {
+            let cat_idx = tree.threshold_in_bin[n] as usize;
+            if cat_idx + 1 >= tree.cat_boundaries_inner.len() {
+                return Err(ComputeError::Runtime {
+                    detail: format!(
+                        "add_prediction_to_score: node {n} categorical cat_idx {cat_idx} out of \
+                         cat_boundaries_inner (len {})",
+                        tree.cat_boundaries_inner.len()
+                    ),
+                });
+            }
+        }
+    }
+    // cat_boundaries_inner must be monotone non-decreasing, and its final word bound
+    // must lie within the bitset pool — find_in_bitset uses `end` as the length guard,
+    // so `end <= bitset_inner.len()` is what keeps the pool read in-bounds.
+    if !tree.cat_boundaries_inner.is_empty() {
+        for w in tree.cat_boundaries_inner.windows(2) {
+            if w[1] < w[0] {
+                return Err(ComputeError::Runtime {
+                    detail: format!(
+                        "add_prediction_to_score: cat_boundaries_inner not monotone ({} < {})",
+                        w[1], w[0]
+                    ),
+                });
+            }
+        }
+        let last = *tree.cat_boundaries_inner.last().unwrap();
+        if last < 0 || last as usize > tree.bitset_inner.len() {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "add_prediction_to_score: cat_boundaries_inner last {last} exceeds \
+                     bitset_inner len {}",
+                    tree.bitset_inner.len()
+                ),
+            });
+        }
     }
     // A used-index subset must land inside the num_data score accumulator; the
     // identity path (None) is already covered by the num_rows <= num_data check.
