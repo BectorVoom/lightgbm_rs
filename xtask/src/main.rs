@@ -622,6 +622,8 @@ fn kernel_capture() -> Result<()> {
     let split_path = fixtures_dir.join("split.txt");
     let partition_path = fixtures_dir.join("partition.txt");
     let subtract_path = fixtures_dir.join("subtract.txt");
+    // Phase-18 (18-01) tree-walk predict golden (D-05 / D-11).
+    let predict_path = fixtures_dir.join("predict.txt");
 
     eprintln!("xtask kernel-capture: configuring C++ capture build ...");
     run(
@@ -658,11 +660,18 @@ fn kernel_capture() -> Result<()> {
             .arg(KERNEL_MASTER_SEED.to_string())
             .arg(&split_path)
             .arg(&partition_path)
-            .arg(&subtract_path),
+            .arg(&subtract_path)
+            .arg(&predict_path),
         "kernel_capture",
     )?;
 
-    for p in [&fixture_path, &split_path, &partition_path, &subtract_path] {
+    for p in [
+        &fixture_path,
+        &split_path,
+        &partition_path,
+        &subtract_path,
+        &predict_path,
+    ] {
         if !p.is_file() {
             bail!("capture completed but {} was not written", p.display());
         }
@@ -676,11 +685,12 @@ fn kernel_capture() -> Result<()> {
     write_manifest(&manifest_path)?;
 
     eprintln!(
-        "xtask kernel-capture: done. Wrote {}, {}, {}, {} and refreshed {}.",
+        "xtask kernel-capture: done. Wrote {}, {}, {}, {}, {} and refreshed {}.",
         fixture_path.display(),
         split_path.display(),
         partition_path.display(),
         subtract_path.display(),
+        predict_path.display(),
         manifest_path.display()
     );
     eprintln!(

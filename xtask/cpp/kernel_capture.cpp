@@ -502,6 +502,124 @@ static std::vector<int> SplitRoute(const std::vector<uint32_t>& bins, int min_bi
   return route;
 }
 
+// VERBATIM full-fan-out numeric route (dense_bin.hpp:314-394 SplitInner + the
+// Split() dispatcher :405-421). Extends SplitRoute above with the missing-type /
+// default_left / most-freq-bin flag fan-out (D-02). Returns the per-row route
+// (0 = lte/left, 1 = gt/right) — order-equivalent to §9's GenDataToLeftBitVector.
+// missing_type: 0 = None, 1 = Zero, 2 = NaN. USE_MIN_BIN is always true here (the
+// min_bin >= 1 dispatcher path exercised by these goldens). The comptime flags are
+// derived exactly as the Split() dispatcher (:407-418).
+static std::vector<int> SplitRouteFanout(const std::vector<uint32_t>& bins,
+                                         int min_bin, int max_bin, int default_bin,
+                                         int most_freq_bin, int missing_type,
+                                         bool default_left, int threshold) {
+  const bool MISS_IS_ZERO = (missing_type == 1);
+  const bool MISS_IS_NA = (missing_type == 2);
+  const bool MFB_IS_ZERO = MISS_IS_ZERO && (default_bin == most_freq_bin);
+  const bool MFB_IS_NA =
+      MISS_IS_NA && (max_bin == most_freq_bin + min_bin && most_freq_bin > 0);
+
+  int th = threshold + min_bin;
+  int t_zero_bin = min_bin + default_bin;
+  if (most_freq_bin == 0) {
+    --th;
+    --t_zero_bin;
+  }
+  const int minb = min_bin;
+  const int maxb = max_bin;
+
+  // default_indices target (dense_bin.hpp:332-339): gt, flipped to lte if
+  // most_freq_bin <= threshold.
+  const int default_target = (most_freq_bin <= threshold) ? 0 : 1;
+  // missing_default_indices target (:334-345): gt, flipped to lte only when a
+  // missing flag is set AND default_left.
+  const int missing_default_target =
+      ((MISS_IS_ZERO || MISS_IS_NA) && default_left) ? 0 : 1;
+
+  std::vector<int> route(bins.size(), 0);
+  if (min_bin < max_bin) {
+    for (size_t i = 0; i < bins.size(); ++i) {
+      const int bin = static_cast<int>(bins[i]);
+      if ((MISS_IS_ZERO && !MFB_IS_ZERO && bin == t_zero_bin) ||
+          (MISS_IS_NA && !MFB_IS_NA && bin == maxb)) {
+        route[i] = missing_default_target;
+      } else if (bin < minb || bin > maxb) {  // USE_MIN_BIN branch
+        if ((MISS_IS_NA && MFB_IS_NA) || (MISS_IS_ZERO && MFB_IS_ZERO)) {
+          route[i] = missing_default_target;
+        } else {
+          route[i] = default_target;
+        }
+      } else if (bin > th) {
+        route[i] = 1;
+      } else {
+        route[i] = 0;
+      }
+    }
+  } else {
+    // Degenerate min_bin == max_bin branch (dense_bin.hpp:366-391).
+    const int max_bin_target = (maxb <= th) ? 0 : 1;
+    for (size_t i = 0; i < bins.size(); ++i) {
+      const int bin = static_cast<int>(bins[i]);
+      if (MISS_IS_ZERO && !MFB_IS_ZERO && bin == t_zero_bin) {
+        route[i] = missing_default_target;
+      } else if (bin != maxb) {
+        if ((MISS_IS_NA && MFB_IS_NA) || (MISS_IS_ZERO && MFB_IS_ZERO)) {
+          route[i] = missing_default_target;
+        } else {
+          route[i] = default_target;
+        }
+      } else {  // bin == maxb
+        if (MISS_IS_NA && !MFB_IS_NA) {
+          route[i] = missing_default_target;
+        } else {
+          route[i] = max_bin_target;
+        }
+      }
+    }
+  }
+  return route;
+}
+
+// VERBATIM Common::FindInBitset (common.h:836-843) — shared by the categorical
+// partition route (SplitCategoricalInner) and the predict tree-walk cat branch.
+static bool FindInBitsetHost(const std::vector<uint32_t>& bits, uint32_t pos) {
+  const int n = static_cast<int>(bits.size());
+  const int i1 = static_cast<int>(pos) / 32;
+  if (i1 >= n) {
+    return false;
+  }
+  const int i2 = static_cast<int>(pos) % 32;
+  return ((bits[i1] >> i2) & 1u) != 0u;
+}
+
+// VERBATIM categorical route (dense_bin.hpp:450-483 SplitCategoricalInner<true>,
+// USE_MIN_BIN=true) — membership via FindInBitset(bin - min_bin + offset). D-03.
+// Returns the per-row route (0 = lte/left/member, 1 = gt/right/non-member).
+static std::vector<int> SplitCategoricalRoute(const std::vector<uint32_t>& bins,
+                                              int min_bin, int max_bin,
+                                              int most_freq_bin,
+                                              const std::vector<uint32_t>& bitset) {
+  const int offset = (most_freq_bin == 0) ? 1 : 0;
+  int default_target = 1;  // gt
+  if (most_freq_bin > 0 &&
+      FindInBitsetHost(bitset, static_cast<uint32_t>(most_freq_bin))) {
+    default_target = 0;  // lte
+  }
+  std::vector<int> route(bins.size(), 0);
+  for (size_t i = 0; i < bins.size(); ++i) {
+    const int bin = static_cast<int>(bins[i]);
+    if (bin < min_bin || bin > max_bin) {
+      route[i] = default_target;
+    } else if (FindInBitsetHost(bitset,
+                                static_cast<uint32_t>(bin - min_bin + offset))) {
+      route[i] = 0;
+    } else {
+      route[i] = 1;
+    }
+  }
+  return route;
+}
+
 // A deterministic case generator reusing the reference Random LCG so the corpus
 // is reproducible from KERNEL_MASTER_SEED (bin_capture.cpp:1073-1080).
 struct CaseGen {
@@ -962,6 +1080,13 @@ struct PCaseSpec {
   int max_bin;
   int threshold;
   int most_freq_bin;
+  // Phase-18 flag fan-out (D-02). missing_type: 0=None, 1=Zero, 2=NaN. default_bin
+  // is the Zero-missing sentinel bin. Old Phase-4 cases leave these at the None
+  // defaults, so SplitRouteFanout(None) reduces to the original SplitRoute and
+  // their PORDER stays byte-identical.
+  int missing_type = 0;
+  int default_bin = 0;
+  bool default_left = false;
   std::string note;
 };
 
@@ -976,8 +1101,11 @@ void EmitPCase(std::ofstream& out, const PCaseSpec& cs) {
               << ") >= num_bin (" << cs.num_bin << ")\n";
     std::abort();
   }
-  std::vector<int> route = SplitRoute(cs.bins, cs.min_bin, cs.max_bin, cs.threshold,
-                                      cs.most_freq_bin);
+  // Full flag fan-out route (SplitInner); None reduces to the Phase-4 SplitRoute.
+  std::vector<int> route =
+      SplitRouteFanout(cs.bins, cs.min_bin, cs.max_bin, cs.default_bin,
+                       cs.most_freq_bin, cs.missing_type, cs.default_left,
+                       cs.threshold);
   // Stable two-pass gather: left (route 0) then right (route 1), each in order.
   std::vector<uint32_t> reordered;
   reordered.reserve(cs.bins.size());
@@ -990,7 +1118,9 @@ void EmitPCase(std::ofstream& out, const PCaseSpec& cs) {
   out << "PCASE name=" << cs.name << " num_bin=" << cs.num_bin
       << " min_bin=" << cs.min_bin << " max_bin=" << cs.max_bin
       << " threshold=" << cs.threshold << " most_freq_bin=" << cs.most_freq_bin
-      << " note=" << cs.note << "\n";
+      << " missing_type=" << cs.missing_type << " default_bin=" << cs.default_bin
+      << " default_left=" << (cs.default_left ? 1 : 0) << " note=" << cs.note
+      << "\n";
   out << "PBINS ";
   for (size_t i = 0; i < cs.bins.size(); ++i) {
     if (i) out << ";";
@@ -1040,7 +1170,426 @@ std::vector<PCaseSpec> BuildPartitionCorpus(int master_seed) {
     for (int i = 0; i < n; ++i) p.bins[i] = static_cast<uint32_t>(gen.NextInt(0, 16));
     p.note = "random-40-rows"; cases.push_back(p);
   }
+  // --- Phase-18 flag fan-out (D-02): each PCASE exercises one SplitInner branch.
+  // The rows deliberately hit the min/max/default/NA sentinels so the route flips.
+  // (e) missing-is-zero, default_left FALSE: rows at the zero/default sentinel take
+  //     the missing branch → gt (missing_default_target = gt when !default_left).
+  {
+    PCaseSpec p;
+    p.name = "missing_zero_dl0"; p.bins = {1, 3, 2, 5, 3, 6, 4, 3};
+    p.num_bin = 8; p.min_bin = 1; p.max_bin = 6; p.threshold = 3; p.most_freq_bin = 5;
+    p.missing_type = 1; p.default_bin = 2; p.default_left = false;
+    p.note = "MISS_IS_ZERO-defbin2-dl0"; cases.push_back(p);
+  }
+  // (f) missing-is-zero, default_left TRUE: sentinel rows now take the missing
+  //     branch → lte (missing_default_target = lte when default_left).
+  {
+    PCaseSpec p;
+    p.name = "missing_zero_dl1"; p.bins = {1, 3, 2, 5, 3, 6, 4, 3};
+    p.num_bin = 8; p.min_bin = 1; p.max_bin = 6; p.threshold = 3; p.most_freq_bin = 5;
+    p.missing_type = 1; p.default_bin = 2; p.default_left = true;
+    p.note = "MISS_IS_ZERO-defbin2-dl1"; cases.push_back(p);
+  }
+  // (g) missing-is-NA, default_left FALSE: rows at the max bin (NA sentinel) take
+  //     the missing branch. most_freq_bin != max so MFB_IS_NA is false.
+  {
+    PCaseSpec p;
+    p.name = "missing_na_dl0"; p.bins = {2, 6, 3, 6, 4, 1, 5, 6};
+    p.num_bin = 8; p.min_bin = 1; p.max_bin = 6; p.threshold = 3; p.most_freq_bin = 2;
+    p.missing_type = 2; p.default_bin = 0; p.default_left = false;
+    p.note = "MISS_IS_NA-maxNA-dl0"; cases.push_back(p);
+  }
+  // (h) missing-is-NA, default_left TRUE.
+  {
+    PCaseSpec p;
+    p.name = "missing_na_dl1"; p.bins = {2, 6, 3, 6, 4, 1, 5, 6};
+    p.num_bin = 8; p.min_bin = 1; p.max_bin = 6; p.threshold = 3; p.most_freq_bin = 2;
+    p.missing_type = 2; p.default_bin = 0; p.default_left = true;
+    p.note = "MISS_IS_NA-maxNA-dl1"; cases.push_back(p);
+  }
+  // (i) MFB_IS_ZERO: most_freq_bin coincides with the zero/default bin (Zero
+  //     missing + default_bin == most_freq_bin). Out-of-[min,max] rows fold to the
+  //     missing branch instead of the default branch.
+  {
+    PCaseSpec p;
+    p.name = "mfb_is_zero"; p.bins = {2, 3, 0, 9, 4, 2, 5, 3};
+    p.num_bin = 10; p.min_bin = 2; p.max_bin = 6; p.threshold = 3; p.most_freq_bin = 3;
+    p.missing_type = 1; p.default_bin = 3; p.default_left = true;
+    p.note = "MFB_IS_ZERO-oor-folds-missing"; cases.push_back(p);
+  }
+  // (j) MFB_IS_NA: most_freq_bin coincides with the NA (max) bin
+  //     (max_bin == most_freq_bin + min_bin, most_freq_bin > 0). Out-of-range rows
+  //     fold to the missing branch.
+  {
+    PCaseSpec p;
+    p.name = "mfb_is_na"; p.bins = {2, 5, 0, 9, 3, 5, 4, 2};
+    p.num_bin = 10; p.min_bin = 1; p.max_bin = 5; p.threshold = 2; p.most_freq_bin = 4;
+    p.missing_type = 2; p.default_bin = 0; p.default_left = false;
+    p.note = "MFB_IS_NA-oor-folds-missing"; cases.push_back(p);
+  }
+  // (k) degenerate min_bin == max_bin (single non-default bin): everything routes
+  //     by the max-bin / default-direction logic (the else branch of SplitInner).
+  {
+    PCaseSpec p;
+    p.name = "min_eq_max"; p.bins = {4, 0, 4, 7, 4, 2, 4, 4};
+    p.num_bin = 9; p.min_bin = 4; p.max_bin = 4; p.threshold = 0; p.most_freq_bin = 8;
+    p.missing_type = 0; p.default_bin = 0; p.default_left = false;
+    p.note = "MIN_IS_MAX-degenerate"; cases.push_back(p);
+  }
+  // (l) max-to-left in the degenerate branch: maxb <= th so the max bin routes lte.
+  {
+    PCaseSpec p;
+    p.name = "max_to_left"; p.bins = {3, 3, 1, 3, 8, 3, 0, 3};
+    p.num_bin = 9; p.min_bin = 3; p.max_bin = 3; p.threshold = 5; p.most_freq_bin = 0;
+    p.missing_type = 0; p.default_bin = 0; p.default_left = false;
+    p.note = "MAX_TO_LEFT-degenerate-mfb0"; cases.push_back(p);
+  }
   return cases;
+}
+
+// ===========================================================================
+// Phase-18 (18-01, D-03) CATEGORICAL partition golden. Membership routing via
+// FindInBitset(bin - min_bin + offset) — SplitCategoricalInner<true>. Tagged
+// with a PCAT marker so the Rust replay distinguishes it from numeric PCASE.
+// ===========================================================================
+struct PCatCaseSpec {
+  std::string name;
+  std::vector<uint32_t> bins;
+  int num_bin;
+  int min_bin;
+  int max_bin;
+  int most_freq_bin;
+  std::vector<uint32_t> bitset;  // membership threshold bitset (raw u32 words)
+  std::string note;
+};
+
+void EmitPCatCase(std::ofstream& out, const PCatCaseSpec& cs) {
+  std::vector<int> route = SplitCategoricalRoute(cs.bins, cs.min_bin, cs.max_bin,
+                                                 cs.most_freq_bin, cs.bitset);
+  std::vector<uint32_t> reordered;
+  reordered.reserve(cs.bins.size());
+  for (size_t i = 0; i < route.size(); ++i)
+    if (route[i] == 0) reordered.push_back(static_cast<uint32_t>(i));
+  const int split_point = static_cast<int>(reordered.size());
+  for (size_t i = 0; i < route.size(); ++i)
+    if (route[i] != 0) reordered.push_back(static_cast<uint32_t>(i));
+
+  out << "PCAT name=" << cs.name << " num_bin=" << cs.num_bin
+      << " min_bin=" << cs.min_bin << " max_bin=" << cs.max_bin
+      << " most_freq_bin=" << cs.most_freq_bin
+      << " num_threshold=" << cs.bitset.size() << " note=" << cs.note << "\n";
+  out << "PCATBITSET ";
+  for (size_t i = 0; i < cs.bitset.size(); ++i) {
+    if (i) out << ";";
+    out << cs.bitset[i];
+  }
+  out << "\n";
+  out << "PCATBINS ";
+  for (size_t i = 0; i < cs.bins.size(); ++i) {
+    if (i) out << ";";
+    out << cs.bins[i];
+  }
+  out << "\n";
+  out << "PCATORDER ";
+  for (size_t i = 0; i < reordered.size(); ++i) {
+    if (i) out << ";";
+    out << reordered[i];
+  }
+  out << "\n";
+  out << "PCATSPLIT " << split_point << "\n";
+}
+
+std::vector<PCatCaseSpec> BuildCatPartitionCorpus(int master_seed) {
+  std::vector<PCatCaseSpec> cases;
+  CaseGen gen(master_seed ^ 0x0CA7);
+  // (a) one-hot membership: only bin (1 - min_bin + offset) is a member.
+  {
+    PCatCaseSpec p;
+    p.name = "cat_onehot"; p.bins = {1, 2, 3, 1, 4, 1, 5, 2};
+    p.num_bin = 6; p.min_bin = 1; p.max_bin = 5; p.most_freq_bin = 0;
+    // offset = 1 (most_freq_bin==0). Member local-bin 1 => raw bin 1.
+    p.bitset = {0x2u};  // bit 1 set
+    p.note = "one-hot-local1"; cases.push_back(p);
+  }
+  // (b) many-vs-many membership: several local bins in the set (bits 2,3,5).
+  {
+    PCatCaseSpec p;
+    p.name = "cat_manyvsmany"; p.bins = {2, 3, 4, 5, 6, 2, 7, 4};
+    p.num_bin = 9; p.min_bin = 2; p.max_bin = 7; p.most_freq_bin = 3;
+    // offset = 0 (most_freq_bin>0). Members: local bins 2,3,5 (bits set).
+    p.bitset = {(1u << 2) | (1u << 3) | (1u << 5)};
+    p.note = "many-vs-many-mfb3"; cases.push_back(p);
+  }
+  // (c) out-of-range rows fold to the default (membership of most_freq_bin) side.
+  {
+    PCatCaseSpec p;
+    p.name = "cat_oor_default"; p.bins = {2, 9, 4, 0, 5, 3, 8, 6};
+    p.num_bin = 10; p.min_bin = 2; p.max_bin = 7; p.most_freq_bin = 3;
+    // most_freq_bin 3 IS a member (bit 3) → default routes lte; oor rows go lte.
+    p.bitset = {(1u << 1) | (1u << 3)};
+    p.note = "oor-default-member"; cases.push_back(p);
+  }
+  (void)gen;
+  return cases;
+}
+
+// ===========================================================================
+// Phase-18 (18-01, D-08 / A4) 16-int SplitTreeStructure child-stats packet.
+// HOST-RECONSTRUCTED (Open-Q2 recommendation): the fields are computed from the
+// C++ tree/partition on CPU exactly as SplitTreeStructureKernel packs them
+// (cuda_data_partition.cu:799-825 + the smaller/larger branch :823-905), NOT
+// from an instrumented device build. Layout: 8 ints + 4 f64 (as the upper 8 ints
+// reinterpret_cast<double*>). buffer[6]/[7] = smaller/larger child leaf index,
+// chosen by num_data[left] < num_data[right].
+// ===========================================================================
+struct PacketSpec {
+  std::string name;
+  int left_leaf_index;
+  int right_leaf_index;
+  int left_num_data;
+  int left_data_start;
+  int right_num_data;
+  int right_data_start;
+  double left_sum_hessians;
+  double right_sum_hessians;
+  double left_sum_gradients;
+  double right_sum_gradients;
+  std::string note;
+};
+
+void EmitPacket(std::ofstream& out, const PacketSpec& cs) {
+  // buffer[6]=smaller, buffer[7]=larger by num_data (SplitTreeStructureKernel:823).
+  const bool left_smaller = cs.left_num_data < cs.right_num_data;
+  const int smaller = left_smaller ? cs.left_leaf_index : cs.right_leaf_index;
+  const int larger = left_smaller ? cs.right_leaf_index : cs.left_leaf_index;
+  out << "PPACKET name=" << cs.name
+      << " left_leaf=" << cs.left_leaf_index          // [0]
+      << " left_num_data=" << cs.left_num_data        // [1]
+      << " left_data_start=" << cs.left_data_start    // [2]
+      << " right_leaf=" << cs.right_leaf_index        // [3]
+      << " right_num_data=" << cs.right_num_data      // [4]
+      << " right_data_start=" << cs.right_data_start  // [5]
+      << " smaller=" << smaller                       // [6]
+      << " larger=" << larger                         // [7]
+      << " left_sum_hessians=" << F64Bits(cs.left_sum_hessians)    // dbl[0]
+      << " right_sum_hessians=" << F64Bits(cs.right_sum_hessians)  // dbl[1]
+      << " left_sum_gradients=" << F64Bits(cs.left_sum_gradients)  // dbl[2]
+      << " right_sum_gradients=" << F64Bits(cs.right_sum_gradients)  // dbl[3]
+      << " note=" << cs.note << "\n";
+}
+
+std::vector<PacketSpec> BuildPacketCorpus() {
+  std::vector<PacketSpec> cases;
+  // (a) left is smaller → smaller=left, larger=right.
+  cases.push_back({"left_smaller", 0, 1, 7, 0, 13, 7, 3.5, 6.5, -2.0, 4.0,
+                   "left-smaller-branch"});
+  // (b) right is smaller → smaller=right, larger=left.
+  cases.push_back({"right_smaller", 2, 3, 20, 5, 8, 25, 9.0, 4.0, 1.5, -3.5,
+                   "right-smaller-branch"});
+  return cases;
+}
+
+// ===========================================================================
+// Phase-18 (18-01, D-05 / D-11) PREDICT tree-walk golden. VERBATIM transcription
+// of AddPredictionToScoreKernel (cuda_tree.cu:317-396): read the raw column bin
+// (8/16/32), remap `bin ∈ [min,max] ? bin-min+offset : most_freq_bin`, then the
+// shared numeric missing/default → threshold decision, or the categorical
+// FindInBitset membership branch. Leaf reached (`node < 0`): `score += leaf_value[~node]`
+// in f64 (D-14). decision_type bit layout (tree.h:20-21 + cuda_tree.cu:21-31):
+// bit0 = categorical, bit1 = default_left, bits2-3 = missing_type (0/1/2).
+// Synthetic trees + feature meta + row bins (self-contained, header-only
+// discipline); the DECISION is the reference. Objective inverse-link stays
+// host-side this phase, so the golden is the raw pre-link margin.
+// ===========================================================================
+struct PredFeat {
+  int min_bin;
+  int max_bin;
+  int default_bin;
+  int most_freq_bin;
+  int offset;
+  int bit_type;  // 8/16/32
+  int column;    // feature_to_column
+};
+
+struct PredNode {
+  int split_feature_inner;
+  uint32_t threshold_in_bin;  // numeric threshold OR (categorical) cat_idx
+  int8_t decision_type;
+  int left_child;   // >=0 node, <0 => ~leaf
+  int right_child;
+};
+
+struct PredModel {
+  std::string name;
+  std::string kind;  // "numeric" | "categorical"
+  int num_features;
+  std::vector<PredFeat> feats;
+  std::vector<PredNode> nodes;
+  std::vector<double> leaf_values;
+  // Categorical bitset pool + boundaries (cuda_bitset_inner / cat_boundaries_inner).
+  std::vector<uint32_t> bitset_inner;
+  std::vector<int> cat_boundaries_inner;
+  // Row data: num_rows × num_features raw column bins (pre-remap).
+  std::vector<std::vector<uint32_t>> rows;
+};
+
+// One row's tree-walk (cuda_tree.cu:342-394). Returns the raw margin.
+double PredWalk(const PredModel& m, const std::vector<uint32_t>& row) {
+  int node = 0;
+  while (node >= 0) {
+    const PredNode& nd = m.nodes[node];
+    const PredFeat& ft = m.feats[nd.split_feature_inner];
+    uint32_t bin = row[ft.column];  // raw column bin (8/16/32 already decoded)
+    if (bin >= static_cast<uint32_t>(ft.min_bin) &&
+        bin <= static_cast<uint32_t>(ft.max_bin)) {
+      bin = bin - ft.min_bin + ft.offset;
+    } else {
+      bin = static_cast<uint32_t>(ft.most_freq_bin);
+    }
+    const int8_t decision_type = nd.decision_type;
+    const bool is_categorical = (decision_type & 1) > 0;  // kCategoricalMask
+    if (is_categorical) {
+      const int cat_idx = static_cast<int>(nd.threshold_in_bin);
+      const int start = m.cat_boundaries_inner[cat_idx];
+      const int len = m.cat_boundaries_inner[cat_idx + 1] - start;
+      std::vector<uint32_t> slice(m.bitset_inner.begin() + start,
+                                  m.bitset_inner.begin() + start + len);
+      node = FindInBitsetHost(slice, bin) ? nd.left_child : nd.right_child;
+    } else {
+      const uint32_t threshold_in_bin = nd.threshold_in_bin;
+      const int8_t missing_type = (decision_type >> 2) & 3;
+      const bool default_left = (decision_type & 2) > 0;  // kDefaultLeftMask
+      if ((missing_type == 1 && bin == static_cast<uint32_t>(ft.default_bin)) ||
+          (missing_type == 2 && bin == static_cast<uint32_t>(ft.max_bin))) {
+        node = default_left ? nd.left_child : nd.right_child;
+      } else {
+        node = (bin <= threshold_in_bin) ? nd.left_child : nd.right_child;
+      }
+    }
+  }
+  return m.leaf_values[~node];
+}
+
+void EmitPredict(std::ofstream& out, const PredModel& m) {
+  const int num_rows = static_cast<int>(m.rows.size());
+  out << "PREDICT name=" << m.name << " kind=" << m.kind
+      << " num_rows=" << num_rows << " num_features=" << m.num_features
+      << " num_nodes=" << m.nodes.size() << " num_leaves=" << m.leaf_values.size()
+      << "\n";
+  // PFEAT: per feature `min,max,default,mfb,offset,bit_type,column` ';'-separated.
+  out << "PFEAT ";
+  for (size_t f = 0; f < m.feats.size(); ++f) {
+    if (f) out << ";";
+    const PredFeat& ft = m.feats[f];
+    out << ft.min_bin << "," << ft.max_bin << "," << ft.default_bin << ","
+        << ft.most_freq_bin << "," << ft.offset << "," << ft.bit_type << ","
+        << ft.column;
+  }
+  out << "\n";
+  // PNODE: per node `split_feature_inner,threshold_in_bin,decision_type,left,right`.
+  out << "PNODE ";
+  for (size_t n = 0; n < m.nodes.size(); ++n) {
+    if (n) out << ";";
+    const PredNode& nd = m.nodes[n];
+    out << nd.split_feature_inner << "," << nd.threshold_in_bin << ","
+        << static_cast<int>(nd.decision_type) << "," << nd.left_child << ","
+        << nd.right_child;
+  }
+  out << "\n";
+  // PLEAF: leaf values as raw f64 bits.
+  out << "PLEAF ";
+  for (size_t l = 0; l < m.leaf_values.size(); ++l) {
+    if (l) out << ";";
+    out << F64Bits(m.leaf_values[l]);
+  }
+  out << "\n";
+  // PCATPOOL / PCATBOUND: categorical bitset pool + boundaries (empty for numeric).
+  out << "PCATPOOL ";
+  for (size_t i = 0; i < m.bitset_inner.size(); ++i) {
+    if (i) out << ";";
+    out << m.bitset_inner[i];
+  }
+  out << "\n";
+  out << "PCATBOUND ";
+  for (size_t i = 0; i < m.cat_boundaries_inner.size(); ++i) {
+    if (i) out << ";";
+    out << m.cat_boundaries_inner[i];
+  }
+  out << "\n";
+  // PROWS: one row per line-segment, `num_features` raw column bins.
+  out << "PROWS ";
+  for (int r = 0; r < num_rows; ++r) {
+    if (r) out << ";";
+    for (int f = 0; f < m.num_features; ++f) {
+      if (f) out << ",";
+      out << m.rows[r][f];
+    }
+  }
+  out << "\n";
+  // PSCORE: the reference tree-walk raw margin per row, f64 bits.
+  out << "PSCORE ";
+  for (int r = 0; r < num_rows; ++r) {
+    if (r) out << ";";
+    out << F64Bits(PredWalk(m, m.rows[r]));
+  }
+  out << "\n";
+}
+
+std::vector<PredModel> BuildPredictCorpus() {
+  std::vector<PredModel> models;
+  // (a) NUMERIC model: 2 features, depth-2 tree exercising the 8-bit column, the
+  // missing/default branch (Zero + default_left) and a plain threshold branch.
+  {
+    PredModel m;
+    m.name = "numeric"; m.kind = "numeric"; m.num_features = 2;
+    // feat 0: bins [1..6], offset 0, mfb 5, default_bin 2; feat 1: bins [1..4].
+    m.feats = {{1, 6, 2, 5, 0, 8, 0}, {1, 4, 0, 2, 0, 8, 1}};
+    // node0: numeric on feat0, threshold 3, missing_type=Zero(1)+default_left → dt.
+    // decision_type: default_left(bit1=2) + missing Zero(1<<2=4) = 6.
+    // node1: numeric on feat1, threshold 2, missing None, no default_left → dt 0.
+    m.nodes = {
+        {0, 3, static_cast<int8_t>(6), 1, ~2},   // node0 → node1 / leaf2
+        {1, 2, static_cast<int8_t>(0), ~0, ~1},  // node1 → leaf0 / leaf1
+    };
+    m.leaf_values = {-0.5, 0.25, 1.75};
+    // rows: raw column bins per feature. Include an out-of-range row (bin 9→mfb),
+    // a default-sentinel row (feat0 bin == default_bin 2 → missing branch), etc.
+    m.rows = {
+        {2, 1},  // feat0 bin2==default_bin, Zero+default_left → left → node1; feat1 bin1<=2 → leaf0
+        {5, 4},  // feat0 bin5 remap 5 >3 → right → leaf2
+        {1, 3},  // feat0 bin1 remap1 <=3 → node1; feat1 bin3 remap3 >2 → leaf1
+        {9, 2},  // feat0 bin9 oor → mfb 5 >3 → leaf2
+        {3, 1},  // feat0 bin3 remap3 <=3 → node1; feat1 bin1<=2 → leaf0
+    };
+    models.push_back(m);
+  }
+  // (b) CATEGORICAL one-hot model: 1 feature, root categorical node via bitset.
+  {
+    PredModel m;
+    m.name = "cat_onehot"; m.kind = "categorical"; m.num_features = 1;
+    m.feats = {{1, 5, 0, 0, 1, 8, 0}};  // mfb 0 → offset 1
+    // node0: categorical (bit0=1) on feat0, cat_idx 0. threshold_in_bin=cat_idx.
+    m.nodes = {{0, 0, static_cast<int8_t>(1), ~0, ~1}};
+    m.leaf_values = {2.5, -1.0};
+    // bitset pool: cat 0 spans boundaries[0..1]; member local-bin 1 (bit1).
+    m.bitset_inner = {0x2u};
+    m.cat_boundaries_inner = {0, 1};
+    m.rows = {{1}, {2}, {3}, {4}, {0}};  // bin1→member→leaf0; others→leaf1; bin0 oor→mfb0→non-member
+    models.push_back(m);
+  }
+  // (c) CATEGORICAL many-vs-many: members are local bins {2,3,5}.
+  {
+    PredModel m;
+    m.name = "cat_manyvsmany"; m.kind = "categorical"; m.num_features = 1;
+    m.feats = {{2, 7, 0, 3, 0, 16, 0}};  // 16-bit column, mfb 3 → offset 0
+    m.nodes = {{0, 0, static_cast<int8_t>(1), ~0, ~1}};
+    m.leaf_values = {0.75, -0.5};
+    m.bitset_inner = {(1u << 2) | (1u << 3) | (1u << 5)};
+    m.cat_boundaries_inner = {0, 1};
+    m.rows = {{2}, {4}, {5}, {7}, {6}};  // 2,5 members→leaf0; 4,7,6 non→leaf1
+    models.push_back(m);
+  }
+  return models;
 }
 
 // ===========================================================================
@@ -1100,9 +1649,12 @@ std::vector<SubCaseSpec> BuildSubtractCorpus(int master_seed) {
 
 int main(int argc, char** argv) {
   // argv: <hist_out> <master_seed> <split_out> <partition_out> <subtract_out>
-  if (argc != 6) {
+  //       [predict_out]
+  // predict_out is OPTIONAL (positional) so an older 6-arg driver still works; the
+  // Phase-18 xtask passes it to emit the tree-walk predict golden.
+  if (argc != 6 && argc != 7) {
     std::cerr << "usage: kernel_capture <hist_out> <master_seed> "
-                 "<split_out> <partition_out> <subtract_out>\n";
+                 "<split_out> <partition_out> <subtract_out> [predict_out]\n";
     return 2;
   }
   const std::string out_path = argv[1];
@@ -1110,6 +1662,7 @@ int main(int argc, char** argv) {
   const std::string split_path = argv[3];
   const std::string partition_path = argv[4];
   const std::string subtract_path = argv[5];
+  const std::string predict_path = (argc == 7) ? std::string(argv[6]) : std::string();
 
   std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
   if (!out) {
@@ -1165,16 +1718,25 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::vector<PCaseSpec> pcorpus = BuildPartitionCorpus(master_seed);
-  pout << "# LightGBM-rs data_partition golden (Phase 4 04-03). VERBATIM SplitInner\n";
-  pout << "# routing (dense_bin.hpp:314-394, MissingType::None) + stable two-pass\n";
-  pout << "# gather. Emits the reordered index array + split_point.\n";
+  std::vector<PCatCaseSpec> pcatcorpus = BuildCatPartitionCorpus(master_seed);
+  std::vector<PacketSpec> packetcorpus = BuildPacketCorpus();
+  pout << "# LightGBM-rs data_partition golden (Phase 4 04-03 + Phase 18 18-01).\n";
+  pout << "# VERBATIM SplitInner routing (dense_bin.hpp:314-394) with the D-02 full\n";
+  pout << "# flag fan-out (missing-zero/NA, default_left, MFB coincidence, min==max,\n";
+  pout << "# max-to-left) + stable two-pass gather. PCAT = categorical membership\n";
+  pout << "# (SplitCategoricalInner<true>, D-03). PPACKET = the 16-int\n";
+  pout << "# SplitTreeStructure child-stats packet (host-reconstructed, D-08/A4).\n";
   pout << "KERNEL_MASTER_SEED " << master_seed << "\n";
-  pout << "COUNTS partition=" << pcorpus.size() << "\n";
+  pout << "COUNTS partition=" << pcorpus.size() << " cat=" << pcatcorpus.size()
+       << " packet=" << packetcorpus.size() << "\n";
   for (const auto& cs : pcorpus) EmitPCase(pout, cs);
+  for (const auto& cs : pcatcorpus) EmitPCatCase(pout, cs);
+  for (const auto& cs : packetcorpus) EmitPacket(pout, cs);
   pout.flush();
   if (!pout) { std::cerr << "error: failed writing partition golden\n"; return 1; }
-  std::cerr << "kernel_capture: wrote " << pcorpus.size() << " partition cases to "
-            << partition_path << "\n";
+  std::cerr << "kernel_capture: wrote " << pcorpus.size() << " partition + "
+            << pcatcorpus.size() << " cat + " << packetcorpus.size()
+            << " packet cases to " << partition_path << "\n";
 
   // ---- SUBTRACT golden ----
   std::ofstream subout(subtract_path, std::ios::binary | std::ios::trunc);
@@ -1193,6 +1755,29 @@ int main(int argc, char** argv) {
   if (!subout) { std::cerr << "error: failed writing subtract golden\n"; return 1; }
   std::cerr << "kernel_capture: wrote " << subcorpus.size() << " subtract cases to "
             << subtract_path << "\n";
+
+  // ---- PREDICT tree-walk golden (Phase 18 18-01, D-05/D-11) ----
+  if (!predict_path.empty()) {
+    std::ofstream pdout(predict_path, std::ios::binary | std::ios::trunc);
+    if (!pdout) {
+      std::cerr << "error: cannot open output file: " << predict_path << "\n";
+      return 1;
+    }
+    std::vector<PredModel> predcorpus = BuildPredictCorpus();
+    pdout << "# LightGBM-rs on-device predict tree-walk golden (Phase 18 18-01,\n";
+    pdout << "# D-05/D-11). VERBATIM AddPredictionToScoreKernel (cuda_tree.cu:317-396):\n";
+    pdout << "# 8/16/32 column read -> remap -> numeric missing/default+threshold OR\n";
+    pdout << "# categorical FindInBitset membership -> score += leaf_value[~node] (f64).\n";
+    pdout << "# Synthetic trees/feature-meta/rows; the DECISION is the reference. Raw\n";
+    pdout << "# pre-inverse-link margin (inverse-link stays host-side this phase).\n";
+    pdout << "KERNEL_MASTER_SEED " << master_seed << "\n";
+    pdout << "COUNTS predict=" << predcorpus.size() << "\n";
+    for (const auto& m : predcorpus) EmitPredict(pdout, m);
+    pdout.flush();
+    if (!pdout) { std::cerr << "error: failed writing predict golden\n"; return 1; }
+    std::cerr << "kernel_capture: wrote " << predcorpus.size() << " predict models to "
+              << predict_path << "\n";
+  }
 
   return 0;
 }

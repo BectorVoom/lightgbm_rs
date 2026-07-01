@@ -1188,6 +1188,21 @@ fn kernel_parity_partition_exact_on_cpu() {
         let max_bin = parse_i64(&t, "max_bin") as u32;
         let threshold = parse_i64(&t, "threshold") as u32;
         let most_freq_bin = parse_i64(&t, "most_freq_bin") as u32;
+        // Phase-18 (18-01): the fixture now also carries the D-02 flag fan-out cases
+        // (`missing_type != None`), which are routed by the NEW device
+        // `GenDataToLeftBitVector` path (18-02) — NOT this None-only host-gather
+        // `data_partition`. Skip them HERE (consuming their 3 payload lines to keep
+        // the stream aligned); they are covered by `partition_parity.rs`. The
+        // `missing_type` field is absent on Phase-4 goldens → defaults to 0 (None).
+        let missing_type = field(&t, "missing_type")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if missing_type != 0 {
+            let _ = lines.next(); // PBINS
+            let _ = lines.next(); // PORDER
+            let _ = lines.next(); // PSPLIT
+            continue;
+        }
 
         let bt: Vec<&str> = lines.next().expect("PBINS").split_whitespace().collect();
         assert_eq!(bt[0], "PBINS", "expected PBINS for `{name}`");
