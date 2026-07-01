@@ -80,7 +80,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 - [x] **Phase 15: On-Device Device Dataset + Row-Subset Gather** — Resident columnar binned dataset in the feature-partition layout the histogram kernel needs, + CopySubrow bagging/GOSS subset. (completed 2026-06-29)
 - [x] **Phase 16: On-Device Histogram Constructor** — The hot path: build (dense/sparse × shared/global) on u64 fixed-point + the subtraction trick (FixHistogram + SubtractHistogram via `hist_t**` rotation). (completed 2026-07-01)
 - [x] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`. (completed 2026-07-01)
-- [ ] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict.
+- [x] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict. (completed 2026-07-01)
 - [ ] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned.
 - [ ] **Phase 20: On-Device Score Updater & Metrics** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host.
 - [ ] **Phase 21: End-to-End On-Device Driver Integration + Parity Gate** — The single-GPU tree-learner driver runs the full grow loop on-device; STRUCTURE bit-exact; no-f64 kernel constraint verified.
@@ -212,12 +212,12 @@ Plans:
   3. On-device **prediction** — the tree-walk `AddPredictionToScore` over the device columnar dataset (numeric threshold + missing/`default_left` handling, categorical bitset membership) — is within ~1e-6 + objective inverse-link. (§10)
   4. Per-split device→host transfer is the single 16-int packet; structure anchor-pinned, leaf values within ~1e-5; CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans complete
 
 - [x] 18-01-PLAN.md — Wave 0: u16/u32 integer scan launchers + extended kernel_capture goldens (flag fan-out, categorical, 16-int packet, predict) + #[ignore] Nyquist scaffolds (ODL-13/14/15)
 - [x] 18-02-PLAN.md — Wave 1: data_partition.rs §9 mark→prefix-sum→scatter (numeric + categorical) + 16-int packet + cpu f64 stable-partition anchor + HistArena leaf-indexed pool swap (ODL-13)
 - [x] 18-03-PLAN.md — Wave 1: tree.rs device flat CUDATree + SplitKernel (Split-before-partition) + SplitCategorical/Shrinkage/AddBias (ODL-14)
-- [ ] 18-04-PLAN.md — Wave 2: predict.rs tree-walk AddPredictionToScore (numeric 8/16/32 + categorical membership) + §9 leaf-map add + hip f32 parity gate (ODL-15)
+- [x] 18-04-PLAN.md — Wave 2: predict.rs tree-walk AddPredictionToScore (numeric 8/16/32 + categorical membership) + §9 leaf-map add + hip f32 parity gate (ODL-15)
 
 **Notes**: Clone the shipped `LGBM_RESIDENT_FORCE` size-gate + default-off routing precedent. Partition placement nuance (spike-035): the round-trip is pure overhead on shared-memory APUs (ROCm keeps its host-partition path); the payoff is on discrete PCIe NVIDIA — measure on Kaggle. Categorical membership routing is wired here but the categorical *feature* end-to-end lands in Phase 22. D-04 order-equivalence RESOLVED CONFIRMED (cpu anchor = plain stable partition, no block-tiled escalation).
 
@@ -305,7 +305,7 @@ Plans:
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
-| 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 3/4 | In Progress|  |
+| 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete   | 2026-07-01 |
 | 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
