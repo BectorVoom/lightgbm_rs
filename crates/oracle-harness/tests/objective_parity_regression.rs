@@ -285,6 +285,42 @@ fn boost_from_score_poisson_rejects_bad_labels() {
 }
 
 #[test]
+fn renew_leaf() {
+    let client = cpu_client();
+    // f32-exact distinct residuals so the device f32-key percentile is bit-exact vs
+    // the host f64 PercentileFun (same descending order, same f64 interpolation).
+    let leaves: Vec<Vec<f32>> = vec![
+        vec![10.0, 8.0, 2.0, 0.0, 4.0],
+        vec![1.0, 2.0, 3.0],
+        vec![-3.0, 5.0, -1.0, 7.0, 2.0, -6.0, 0.0],
+        vec![42.0],
+    ];
+
+    for (tag, alpha, host_obj) in [
+        (obj::TAG_L1, 0.0f64, Objective::RegressionL1),
+        (obj::TAG_QUANTILE, 0.9f64, Objective::Quantile { alpha: 0.9 }),
+    ] {
+        let device = obj::renew_tree_output_on(&client, tag, alpha, &leaves).expect("renew");
+        assert_eq!(device.len(), leaves.len());
+        for (i, leaf) in leaves.iter().enumerate() {
+            let res_f64: Vec<f64> = leaf.iter().map(|&x| f64::from(x)).collect();
+            // L1/Quantile renew_leaf_output ignore the labels arg.
+            let host = host_obj.renew_leaf_output(&res_f64, &[]);
+            assert_eq!(
+                device[i].to_bits(),
+                host.to_bits(),
+                "{host_obj:?} leaf {i}: device {} != host {host}",
+                device[i]
+            );
+        }
+    }
+
+    // Non-renew objectives are rejected (mirror is_renew_tree_output).
+    assert!(obj::renew_tree_output_on(&client, obj::TAG_L2, 0.0, &leaves).is_err());
+    assert!(obj::renew_tree_output_on(&client, obj::TAG_POISSON, 0.0, &leaves).is_err());
+}
+
+#[test]
 fn convert_regression() {
     use lgbm_model::objective::{convert_poisson, convert_regression};
     let client = cpu_client();

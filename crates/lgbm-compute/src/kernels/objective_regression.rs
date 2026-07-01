@@ -549,3 +549,55 @@ pub fn boost_from_score_on<R: cubecl::Runtime>(
     // TAG_L2 / TAG_HUBER / TAG_FAIR: the label mean.
     label_mean_on(client, &labels_f64)
 }
+
+// =========================================================================
+// Task 3: RenewTreeOutput (L1/Quantile per-leaf median) — HOST-ORCHESTRATED
+// loop over leaves (Discrepancy 1 — there is NO percentile_device per-leaf
+// kernel; the host loop is parity-identical to the CUDA one-block-per-leaf
+// result: same sort, same percentile index math).
+// =========================================================================
+
+/// RenewTreeOutput for L1/Quantile: recompute each leaf's output as the (unweighted)
+/// percentile of that leaf's RESIDUALS. `leaf_residuals[k]` are the per-row
+/// `label - score` residuals for the rows in leaf `k` (the C++ `residual_getter`),
+/// in the data partition's row order; returns one new leaf value per leaf.
+///
+/// This is a HOST loop over leaves calling the device-composed [`percentile_fun_on`]
+/// (Discrepancy 1 — NO `percentile_device` per-leaf kernel exists; the host loop is
+/// parity-identical to the CUDA one-block-per-leaf refit). Mirrors
+/// `regression.rs:627-651`:
+/// - L1: unweighted residual median (PercentileFun at α = 0.5).
+/// - Quantile: unweighted residual percentile at the f32-rounded α (`alpha_` is
+///   score_t; the renew result is NOT f32-narrowed — unlike BoostFromScore).
+///
+/// `alpha` is used only by Quantile (ignored for L1).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] for a non-renew `objective_tag` (only L1/Quantile renew,
+/// mirroring `is_renew_tree_output`); propagates the argsort primitive error.
+pub fn renew_tree_output_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    objective_tag: u32,
+    alpha: f64,
+    leaf_residuals: &[Vec<f32>],
+) -> Result<Vec<f64>, ComputeError> {
+    let percentile_alpha = if objective_tag == TAG_L1 {
+        0.5
+    } else if objective_tag == TAG_QUANTILE {
+        // C++ `alpha_` is score_t (f32); round α through f32 before the index math.
+        f64::from(alpha as f32)
+    } else {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "renew_tree_output: objective_tag {objective_tag} does not renew leaves \
+                 (only L1/Quantile have IsRenewTreeOutput() == true)"
+            ),
+        });
+    };
+
+    let mut out = Vec::with_capacity(leaf_residuals.len());
+    for residuals in leaf_residuals {
+        out.push(percentile_fun_on(client, residuals, percentile_alpha)?);
+    }
+    Ok(out)
+}
