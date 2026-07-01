@@ -601,7 +601,10 @@ fn scatter_marked<R: cubecl::Runtime>(
 
     // PrepareOffset (u16 INCLUSIVE): incl[i] = # left rows in [0, i]. Bit-exact
     // cross-check of the [tid-1] inclusive↔exclusive relation (Pitfall 2). Guarded
-    // to n <= 65535 for the u16 cell width.
+    // to n <= 65535 for the u16 cell width. IN-02: this scan feeds ONLY the
+    // debug_assert below, so the whole block is compiled out of release builds — it
+    // must never launch three extra kernels per partition in a release run.
+    #[cfg(debug_assertions)]
     if n <= u16::MAX as usize {
         let to_left_u16: Vec<u16> = to_left.iter().map(|&x| x as u16).collect();
         let incl = prefix_sum_inclusive_u16_on(client, &to_left_u16, block_size)?;
