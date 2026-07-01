@@ -246,7 +246,7 @@ fn lambdarank_body(
                     // (frontend/operation/unary.rs). The <=1-ULP vs libm `log2` scales
                     // the whole query's grad/hess by (1 ± ~1e-16) — negligible vs
                     // ORACLE_TOL (the norm path stays anchor-faithful, D-05).
-                    let log2_num = (1.0f64 + sum_lambdas).ln() / 0.693_147_180_559_945_3f64;
+                    let log2_num = (1.0f64 + sum_lambdas).ln() / 2.0f64.ln();
                     let norm_factor = log2_num / sum_lambdas;
                     let mut a = 0usize;
                     while a < cnt {
