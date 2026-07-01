@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 17
-current_phase_name: On-Device Best-Split Finder
+current_phase_name: on-device-best-split-finder
 status: executing
 stopped_at: Phase 17 context gathered
-last_updated: "2026-07-01T01:39:40.416Z"
+last_updated: "2026-07-01T01:56:49.211Z"
 last_activity: 2026-07-01
-last_activity_desc: Phase 16 complete, transitioned to Phase 17
+last_activity_desc: Phase 17 execution started
 progress:
   total_phases: 10
   completed_phases: 3
-  total_plans: 16
-  completed_plans: 16
+  total_plans: 21
+  completed_plans: 17
   percent: 30
 ---
 
@@ -24,15 +24,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 16 — on-device-histogram-constructor
+**Current focus:** Phase 17 — on-device-best-split-finder
 
 ## Current Position
 
-Phase: 17 — On-Device Best-Split Finder
-Plan: Not started
+Phase: 17 (on-device-best-split-finder) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-01 — Phase 16 complete, transitioned to Phase 17
+Last activity: 2026-07-01 — Phase 17 execution started
 
 Next: `/gsd-plan-phase 14`
 
@@ -564,6 +564,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 16 P03 | 45min | 3 tasks | 2 files |
 | Phase 16 P04 | 15min | 3 tasks | 4 files |
 | Phase 16 P05 | 5min | 2 tasks | 0 files |
+| Phase 17 P01 | 11min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -691,7 +692,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T01:06:54.000Z
+Last session: 2026-07-01T01:56:42.721Z
 Stopped at: Phase 17 context gathered
 Resume file: .planning/phases/17-on-device-best-split-finder/17-CONTEXT.md
 
