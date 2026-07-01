@@ -37,7 +37,6 @@
 //!   per row row-major (rank.rs:482-487).
 //!
 //! Numerically faithful to `crates/lgbm-objective/src/rank.rs`.
-#![allow(unused_imports)]
 
 use cubecl::prelude::*;
 

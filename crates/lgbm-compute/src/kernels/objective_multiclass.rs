@@ -36,7 +36,6 @@
 //! exercises this module (D-08); it is additive and OFF by default behind
 //! `LGBM_CUDA_ON_DEVICE` (D-06). Numerically faithful to
 //! `crates/lgbm-objective/src/multiclass.rs`.
-#![allow(unused_imports)]
 
 use cubecl::prelude::*;
 

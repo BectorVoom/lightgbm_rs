@@ -36,7 +36,6 @@
 //! leaf. There is NO `percentile_device` per-segment kernel (it does not exist in
 //! the primitive set); the host loop is parity-identical to the CUDA
 //! one-block-per-leaf result (same sort, same percentile index math).
-#![allow(unused_imports)]
 
 use cubecl::prelude::*;
 
