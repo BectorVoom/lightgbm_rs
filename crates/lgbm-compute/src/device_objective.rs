@@ -29,6 +29,14 @@
 /// The eleven CUDA (on-device) objective kinds — the §5 kernel roster
 /// (`docs/cuda-kernel-design.md`). Everything NOT expressible as one of these has no
 /// device kernel and is host-only (see [`device_objective_supported`]).
+///
+/// **This is a support/grad-hess-kernel classifier ONLY — never a ConvertOutput
+/// routing key (IN-03).** Several distinct objectives collapse to one variant because
+/// they share a grad/hess kernel: e.g. `regression_sqrt`/`l2_root`/`rmse` all map to
+/// [`Self::L2`], yet the sqrt variants need `CONVERT_SQRT_SQUARE` at inverse-link time
+/// while plain L2 needs `CONVERT_PASSTHROUGH`. A future consumer that keys the
+/// ConvertOutput mode off this enum would silently pick the wrong link for those
+/// variants. Route inverse-link off the original objective name, not this kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceObjectiveKind {
     /// `regression` / `regression_l2` / `l2` / `mse` … — `RegressionL2loss` (§5.1).
