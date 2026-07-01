@@ -298,7 +298,7 @@ Plans:
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
-| 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete   | 2026-07-01 |
+| 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
 | 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |
