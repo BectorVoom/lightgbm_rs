@@ -90,6 +90,13 @@ pub fn get_missing_type(decision_type: i8) -> i8 {
 /// `leaf_depth/leaf_value/leaf_weight = 0`, `leaf_count = 0` (slot 0 gets
 /// `root_count`), and the node arrays to 0. Runs once after [`DeviceCudaTree::new`]
 /// (the reference `CUDATree::InitCUDAMemory` analog); NOT a per-split allocation.
+///
+/// IN-03: this now zeroes ALL 18 field buffers — including `split_gain`,
+/// `internal_weight`, `internal_value`, `threshold`, `cat_boundaries`, and
+/// `cat_boundaries_inner` — so the tree has a fully-defined initial state rather than
+/// relying on the implicit write-before-read invariant for never-split node slots. The
+/// two `cat_boundaries*` slabs are `max_leaves + 1` long, so they are guarded by their
+/// own `i < cat_n` bound.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn init_tree_kernel(
@@ -102,11 +109,18 @@ fn init_tree_kernel(
     right_child: &mut Array<i32>,
     split_feature_inner: &mut Array<i32>,
     split_feature: &mut Array<i32>,
+    split_gain: &mut Array<f32>,
+    internal_weight: &mut Array<f64>,
+    internal_value: &mut Array<f64>,
     internal_count: &mut Array<i32>,
     decision_type: &mut Array<i32>,
     threshold_in_bin: &mut Array<u32>,
+    threshold: &mut Array<f64>,
+    cat_boundaries: &mut Array<i32>,
+    cat_boundaries_inner: &mut Array<i32>,
     root_count: i32,
     n: u32,
+    cat_n: u32,
 ) {
     let i = ABSOLUTE_POS;
     if i < n as usize {
@@ -119,9 +133,18 @@ fn init_tree_kernel(
         right_child[i] = 0i32;
         split_feature_inner[i] = 0i32;
         split_feature[i] = 0i32;
+        split_gain[i] = 0.0f32;
+        internal_weight[i] = 0.0f64;
+        internal_value[i] = 0.0f64;
         internal_count[i] = 0i32;
         decision_type[i] = 0i32;
         threshold_in_bin[i] = 0u32;
+        threshold[i] = 0.0f64;
+    }
+    // cat_boundaries / cat_boundaries_inner are `max_leaves + 1` long (one slot slack).
+    if i < cat_n as usize {
+        cat_boundaries[i] = 0i32;
+        cat_boundaries_inner[i] = 0i32;
     }
 }
 
@@ -618,15 +641,19 @@ impl<R: cubecl::Runtime> DeviceCudaTree<R> {
 
     fn launch_init(&self, client: &ComputeClient<R>, root_count: i32) {
         let n = self.max_leaves;
-        let blocks = (n as u32).div_ceil(LEAF_OP_BLOCK);
+        // cat_boundaries* slabs are `max_leaves + 1`; size the grid to the larger slab
+        // so their trailing slot is initialized too (IN-03).
+        let cat_len = n + 1;
+        let blocks = (cat_len as u32).div_ceil(LEAF_OP_BLOCK);
         let d = &self.device;
-        // SAFETY: every array is sized `max_leaves`; the kernel guards `i < n`, so
-        // all writes stay in-bounds. cubecl unsafe confined here (CMP-01).
+        // SAFETY: node arrays are sized `max_leaves` (guard `i < n`) and the two
+        // cat_boundaries* arrays `max_leaves + 1` (guard `i < cat_n`), so all writes
+        // stay in-bounds. cubecl unsafe confined here (CMP-01).
         unsafe {
             init_tree_kernel::launch(
                 client,
                 CubeCount::Static(blocks, 1, 1),
-                CubeDim::new_1d(LEAF_OP_BLOCK.min(n as u32).max(1)),
+                CubeDim::new_1d(LEAF_OP_BLOCK.min(cat_len as u32).max(1)),
                 ArrayArg::from_raw_parts(d.leaf_value.clone(), n),
                 ArrayArg::from_raw_parts(d.leaf_weight.clone(), n),
                 ArrayArg::from_raw_parts(d.leaf_count.clone(), n),
@@ -636,11 +663,18 @@ impl<R: cubecl::Runtime> DeviceCudaTree<R> {
                 ArrayArg::from_raw_parts(d.right_child.clone(), n),
                 ArrayArg::from_raw_parts(d.split_feature_inner.clone(), n),
                 ArrayArg::from_raw_parts(d.split_feature.clone(), n),
+                ArrayArg::from_raw_parts(d.split_gain.clone(), n),
+                ArrayArg::from_raw_parts(d.internal_weight.clone(), n),
+                ArrayArg::from_raw_parts(d.internal_value.clone(), n),
                 ArrayArg::from_raw_parts(d.internal_count.clone(), n),
                 ArrayArg::from_raw_parts(d.decision_type.clone(), n),
                 ArrayArg::from_raw_parts(d.threshold_in_bin.clone(), n),
+                ArrayArg::from_raw_parts(d.threshold.clone(), n),
+                ArrayArg::from_raw_parts(d.cat_boundaries.clone(), cat_len),
+                ArrayArg::from_raw_parts(d.cat_boundaries_inner.clone(), cat_len),
                 root_count,
                 n as u32,
+                cat_len as u32,
             );
         }
     }
