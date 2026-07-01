@@ -317,7 +317,7 @@ Plans:
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
-| 19. On-Device Objectives | v1.1 | 5/5 | Complete   | 2026-07-01 |
+| 19. On-Device Objectives | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
