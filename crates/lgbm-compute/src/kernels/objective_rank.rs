@@ -413,6 +413,22 @@ fn lambdarank_impl<R: cubecl::Runtime>(
         return Ok((Vec::new(), Vec::new()));
     }
 
+    // V5 (WR-03): the kernel indexes `label_gain[label]` inside a `launch_unchecked`
+    // body, so every label MUST be a non-negative integer strictly less than the gain
+    // table length — an unchecked OOB read otherwise (UB on device, and not
+    // bounds-checked on the cubecl-cpu anchor either). Guard it here alongside the
+    // other pre-launch length checks, matching how `query_boundaries` is validated.
+    for &l in labels {
+        if !l.is_finite() || l < 0.0 || (l as usize) >= label_gain.len() {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "lambdarank: label {l} is not a valid label_gain index (table len {})",
+                    label_gain.len()
+                ),
+            });
+        }
+    }
+
     // Per-query DESCENDING-score ranking (compose the primitive; segment = query).
     let scores_f32: Vec<f32> = scores.iter().map(|&s| s as f32).collect();
     let mut sorted_idx = bitonic_argsort_items_on(client, &scores_f32, query_boundaries, false)?;
@@ -748,6 +764,18 @@ fn rank_xendcg_impl<R: cubecl::Runtime>(
     let num_queries = validate_query_boundaries(query_boundaries, n)?;
     if n == 0 {
         return Ok((Vec::new(), Vec::new()));
+    }
+
+    // V5 (WR-03): `2^label` is precomputed host-side via `pow2_int(l as i32)`, which
+    // silently returns 1.0 for a negative power — a negative label would therefore
+    // produce a wrong (not merely OOB) `Phi`. Reject out-of-domain labels before the
+    // launch, mirroring the lambdarank label guard.
+    for &l in labels {
+        if !l.is_finite() || l < 0.0 {
+            return Err(ComputeError::Runtime {
+                detail: format!("rank_xendcg: label {l} must be a non-negative integer"),
+            });
+        }
     }
 
     let gammas = draw_gammas(client, seed, query_boundaries)?;
