@@ -81,7 +81,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 - [x] **Phase 16: On-Device Histogram Constructor** — The hot path: build (dense/sparse × shared/global) on u64 fixed-point + the subtraction trick (FixHistogram + SubtractHistogram via `hist_t**` rotation). (completed 2026-07-01)
 - [x] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`. (completed 2026-07-01)
 - [x] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict. (completed 2026-07-01)
-- [ ] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned.
+- [x] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned. (completed 2026-07-01)
 - [ ] **Phase 20: On-Device Score Updater & Metrics** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host.
 - [ ] **Phase 21: End-to-End On-Device Driver Integration + Parity Gate** — The single-GPU tree-learner driver runs the full grow loop on-device; STRUCTURE bit-exact; no-f64 kernel constraint verified.
 - [ ] **Phase 22: On-Device Categorical Splits (Feature Coverage)** — Bitset construction + categorical split eval + categorical partition + SplitCategorical, via the pre-allocated bitset.
@@ -234,7 +234,7 @@ Plans:
   4. On-device **ranking** grad/hess (LambdaRank-NDCG + RankXENDCG, per-query block layout, bitonic item ranking, per-item RNG with the bit-identical stream) anchor-pinned. (§5.4)
   5. The CUDA-unsupported objectives (MAPE / Gamma / Tweedie / cross-entropy / rank-MAP) honestly fall back to host; CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans complete
 **Wave 1**
 
 - [x] 19-00-PLAN.md — Wave 1: greenfield objective module stubs + mod.rs, host-fallback support-set (SC #5), shared parity harness, lambdarank golden capture
@@ -244,7 +244,7 @@ Plans:
 - [x] 19-01-PLAN.md — Wave 2: ODL-05 regression family (6 grad/hess kernels + ConvertOutput + BoostFromScore + host-orchestrated RenewTreeOutput)
 - [x] 19-02-PLAN.md — Wave 2: ODL-06 binary-logloss (grad/hess + two-stage BoostFromScore logit init + sigmoid ConvertOutput + OVA label reset)
 - [x] 19-03-PLAN.md — Wave 2: ODL-07 multiclass (class-major softmax grad/hess + softmax ConvertOutput + MulticlassOVA)
-- [ ] 19-04-PLAN.md — Wave 2: ODL-08 ranking (LambdaRank-NDCG shared+>2048 + RankXENDCG shared+global + per-item RNG)
+- [x] 19-04-PLAN.md — Wave 2: ODL-08 ranking (LambdaRank-NDCG shared+>2048 + RankXENDCG shared+global + per-item RNG)
 
 **Notes**: Exactly 11 CUDA-supported objectives (§5). The atomic-ordering nondeterminism in binary BoostFromScore + lambdarank is the documented f32-vs-f64 residual the ROCm gate tolerates — pin to the cpu f64 anchor, never GPU-vs-GPU. Each objective is a separable, individually-anchor-gated addition. Wave 2 plans (19-01..04) are fully parallel (disjoint owned files); each depends only on 19-00.
 
@@ -317,7 +317,7 @@ Plans:
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
-| 19. On-Device Objectives | v1.1 | 4/5 | In Progress|  |
+| 19. On-Device Objectives | v1.1 | 5/5 | Complete   | 2026-07-01 |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
