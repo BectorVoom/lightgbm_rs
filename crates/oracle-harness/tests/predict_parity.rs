@@ -530,7 +530,6 @@ mod cat {
     use super::*;
 
     #[test]
-    #[ignore = "categorical cell + hip gate land in 18-04 Task 2"]
     fn predict_parity_cat_membership() {
         let Some(goldens) = read_predict_golden() else { return };
         let cats: Vec<&PredictGolden> = goldens.iter().filter(|g| g.kind == "categorical").collect();

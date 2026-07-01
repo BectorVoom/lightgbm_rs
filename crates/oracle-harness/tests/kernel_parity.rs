@@ -3173,6 +3173,210 @@ mod hip {
             eprintln!("all-WSET scan: LGBM_SCAN_CUBEDIM={w} byte-identical to W=1 ({} feats)", feats.len());
         }
     }
+
+    // =======================================================================
+    // 18-04 (ODL-15) PREDICT tree-walk hip parity. Drive the numeric + categorical
+    // AddPredictionToScore tree-walk on cubecl-hip and assert within ~1e-6 of the
+    // cpu f64 anchor (NEVER GPU-vs-GPU, def-f8u-01). The walk is deterministic
+    // integer routing + a single f64 leaf-value write per row (no f32 accumulation),
+    // so the hip result equals the cpu anchor exactly; the tie-aware assert_within
+    // (D-03a) surfaces any residual as a documented gap rather than silently passing.
+    // Reads the committed predict.txt golden (self-contained mini-parser).
+    // =======================================================================
+
+    /// A parsed PREDICT block (feature meta + tree arrays + cat pool + rows + scores).
+    struct HipPredictGolden {
+        name: String,
+        num_rows: usize,
+        num_features: usize,
+        scores: Vec<f64>,
+        rows: Vec<u32>, // row-major [num_rows × num_features]
+        feat_min: Vec<i32>,
+        feat_max: Vec<i32>,
+        feat_default: Vec<i32>,
+        feat_mfb: Vec<i32>,
+        feat_offset: Vec<i32>,
+        feat_bit_type: Vec<u32>,
+        feat_column: Vec<i32>,
+        split_feature_inner: Vec<i32>,
+        threshold_in_bin: Vec<u32>,
+        decision_type: Vec<i32>,
+        left_child: Vec<i32>,
+        right_child: Vec<i32>,
+        leaf_value: Vec<f64>,
+        bitset_inner: Vec<u32>,
+        cat_boundaries_inner: Vec<i32>,
+    }
+
+    fn parse_predict_blocks(text: &str) -> Vec<HipPredictGolden> {
+        let mut out = Vec::new();
+        let mut lines = text.lines();
+        while let Some(raw) = lines.next() {
+            let line = raw.trim();
+            if !line.starts_with("PREDICT") {
+                continue;
+            }
+            let t: Vec<&str> = line.split_whitespace().collect();
+            let name = field(&t, "name").expect("PREDICT name").to_string();
+            let num_rows = parse_i64(&t, "num_rows") as usize;
+            let num_features = parse_i64(&t, "num_features") as usize;
+            let (mut fmin, mut fmax, mut fdef, mut fmfb, mut foff, mut fbt, mut fcol) =
+                (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+            let (mut sfi, mut thr, mut dt, mut lc, mut rc) = (vec![], vec![], vec![], vec![], vec![]);
+            let (mut leaf, mut pool, mut catb) = (vec![], vec![], vec![]);
+            let mut rows2: Vec<Vec<u32>> = Vec::new();
+            let mut scores = Vec::new();
+            for body in lines.by_ref() {
+                let bt: Vec<&str> = body.split_whitespace().collect();
+                if bt.is_empty() {
+                    continue;
+                }
+                let payload = bt.get(1).copied().unwrap_or("");
+                match bt[0] {
+                    "PFEAT" => {
+                        for f in payload.split(';').filter(|s| !s.is_empty()) {
+                            let c: Vec<&str> = f.split(',').collect();
+                            fmin.push(c[0].parse().unwrap());
+                            fmax.push(c[1].parse().unwrap());
+                            fdef.push(c[2].parse().unwrap());
+                            fmfb.push(c[3].parse().unwrap());
+                            foff.push(c[4].parse().unwrap());
+                            fbt.push(c[5].parse().unwrap());
+                            fcol.push(c[6].parse().unwrap());
+                        }
+                    }
+                    "PNODE" => {
+                        for n in payload.split(';').filter(|s| !s.is_empty()) {
+                            let c: Vec<&str> = n.split(',').collect();
+                            sfi.push(c[0].parse().unwrap());
+                            thr.push(c[1].parse().unwrap());
+                            dt.push(c[2].parse().unwrap());
+                            lc.push(c[3].parse().unwrap());
+                            rc.push(c[4].parse().unwrap());
+                        }
+                    }
+                    "PLEAF" => {
+                        for l in payload.split(';').filter(|s| !s.is_empty()) {
+                            leaf.push(f64::from_bits(l.parse::<u64>().unwrap()));
+                        }
+                    }
+                    "PCATPOOL" => {
+                        for w in payload.split(';').filter(|s| !s.is_empty()) {
+                            pool.push(w.parse::<u32>().unwrap());
+                        }
+                    }
+                    "PCATBOUND" => {
+                        for b in payload.split(';').filter(|s| !s.is_empty()) {
+                            catb.push(b.parse::<i32>().unwrap());
+                        }
+                    }
+                    "PROWS" if !payload.is_empty() => {
+                        rows2 = payload
+                            .split(';')
+                            .map(|r| r.split(',').map(|c| c.parse::<u32>().unwrap()).collect())
+                            .collect();
+                    }
+                    "PSCORE" => {
+                        if !payload.is_empty() {
+                            scores = payload
+                                .split(';')
+                                .map(|s| f64::from_bits(s.parse::<u64>().unwrap()))
+                                .collect();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(HipPredictGolden {
+                name,
+                num_rows,
+                num_features,
+                scores,
+                rows: rows2.into_iter().flatten().collect(),
+                feat_min: fmin,
+                feat_max: fmax,
+                feat_default: fdef,
+                feat_mfb: fmfb,
+                feat_offset: foff,
+                feat_bit_type: fbt,
+                feat_column: fcol,
+                split_feature_inner: sfi,
+                threshold_in_bin: thr,
+                decision_type: dt,
+                left_child: lc,
+                right_child: rc,
+                leaf_value: leaf,
+                bitset_inner: pool,
+                cat_boundaries_inner: catb,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn kernel_parity_predict_within_tol_on_hip() {
+        use lgbm_compute::kernels::predict::{add_prediction_to_score_on_device, PredictTree};
+
+        let path = kernels_dir().join("predict.txt");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("hip parity(predict): SKIP — fixture {} not found.", path.display());
+            return;
+        };
+        let blocks = parse_predict_blocks(&text);
+        assert!(!blocks.is_empty(), "predict fixture parsed zero PREDICT blocks");
+
+        let hip = rocm_client();
+        let cpu = cpu_client();
+
+        for g in &blocks {
+            let tree = PredictTree {
+                feat_min: &g.feat_min,
+                feat_max: &g.feat_max,
+                feat_default: &g.feat_default,
+                feat_most_freq_bin: &g.feat_mfb,
+                feat_offset: &g.feat_offset,
+                feat_column: &g.feat_column,
+                split_feature_inner: &g.split_feature_inner,
+                threshold_in_bin: &g.threshold_in_bin,
+                decision_type: &g.decision_type,
+                left_child: &g.left_child,
+                right_child: &g.right_child,
+                leaf_value: &g.leaf_value,
+                bitset_inner: &g.bitset_inner,
+                cat_boundaries_inner: &g.cat_boundaries_inner,
+            };
+            let bit_type = *g.feat_bit_type.iter().max().unwrap_or(&8);
+
+            // (1) f64 tree-walk on the REAL hip GPU (integer routing + f64 leaf write).
+            let hip_f64 = add_prediction_to_score_on_device(
+                &hip, &tree, &g.rows, g.num_rows, g.num_features, bit_type, g.num_rows, None,
+            )
+            .unwrap_or_else(|e| panic!("hip predict `{}` failed: {e:?}", g.name));
+            // (2) f64 anchor on cubecl-cpu (never GPU-vs-GPU, def-f8u-01).
+            let cpu_anchor_f64 = add_prediction_to_score_on_device(
+                &cpu, &tree, &g.rows, g.num_rows, g.num_features, bit_type, g.num_rows, None,
+            )
+            .unwrap_or_else(|e| panic!("cpu predict anchor `{}` failed: {e:?}", g.name));
+
+            // Sanity: the cpu f64 anchor itself reproduces the committed golden
+            // margins bit-exact (localizes a fixture/anchor divergence away from the
+            // hip gap below).
+            for (i, (a, s)) in cpu_anchor_f64.iter().zip(g.scores.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    s.to_bits(),
+                    "predict `{}` cpu anchor row {i}: {a} != golden {s}",
+                    g.name
+                );
+            }
+
+            // (3) collect both to f32, (4) compare within ORACLE_TOL (tie-aware assert_within).
+            let hip_f32 = anchor_to_f32(&hip_f64);
+            let cpu_anchor_f32 = anchor_to_f32(&cpu_anchor_f64);
+            assert_within(&format!("predict/{}", g.name), &hip_f32, &cpu_anchor_f32);
+        }
+    }
 }
 
 // ===========================================================================

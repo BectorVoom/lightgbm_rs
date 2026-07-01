@@ -467,17 +467,16 @@ fn validate_walk(
             detail: "add_prediction_to_score: tree must have at least one internal node".to_string(),
         });
     }
-    match used_indices {
-        Some(idx) => {
-            for &di in idx {
-                if di as usize >= num_data {
-                    return Err(ComputeError::Runtime {
-                        detail: format!("add_prediction_to_score: used index {di} >= num_data {num_data}"),
-                    });
-                }
+    // A used-index subset must land inside the num_data score accumulator; the
+    // identity path (None) is already covered by the num_rows <= num_data check.
+    if let Some(idx) = used_indices {
+        for &di in idx {
+            if di as usize >= num_data {
+                return Err(ComputeError::Runtime {
+                    detail: format!("add_prediction_to_score: used index {di} >= num_data {num_data}"),
+                });
             }
         }
-        None => {} // identity: num_rows <= num_data already checked above.
     }
     Ok(())
 }
@@ -487,13 +486,16 @@ mod tests {
     use super::*;
     use crate::runtime::cpu_client;
 
+    /// Owned model arrays: (feat min/max/def/mfb/off/col, sfi/thr/dt/lc/rc/leaf).
+    type ModelArrays = (
+        Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>,
+        Vec<i32>, Vec<u32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f64>,
+    );
+
     /// The numeric golden model from `predict.txt` (PREDICT name=numeric): a depth-2
     /// tree exercising the 8-bit column, the missing/default (Zero + default_left)
     /// branch, out-of-range → most_freq_bin, and a plain threshold branch.
-    fn numeric_tree() -> (
-        Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, // feat min/max/def/mfb/off/col
-        Vec<i32>, Vec<u32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f64>, // sfi/thr/dt/lc/rc/leaf
-    ) {
+    fn numeric_tree() -> ModelArrays {
         // feat0 {min1,max6,default2,mfb5,offset0,col0}; feat1 {min1,max4,default0,mfb2,offset0,col1}.
         let feat_min = vec![1, 1];
         let feat_max = vec![6, 4];
@@ -536,7 +538,7 @@ mod tests {
         };
         // rows row-major [5 × 2]; expected raw margins from predict.txt PSCORE.
         let rows: Vec<u32> = vec![2, 1, 5, 4, 1, 3, 9, 2, 3, 1];
-        let expected = vec![-0.5f64, 1.75, -0.5, 1.75, -0.5];
+        let expected = [-0.5f64, 1.75, -0.5, 1.75, -0.5];
         for bit_type in [8u32, 16, 32] {
             let got = add_prediction_to_score_on_device(&client, &tree, &rows, 5, 2, bit_type, 5, None)
                 .expect("numeric walk");
@@ -574,7 +576,7 @@ mod tests {
             cat_boundaries_inner: &[0, 1],
         };
         let rows: Vec<u32> = vec![1, 2, 3, 4, 0];
-        let expected = vec![2.5f64, -1.0, -1.0, -1.0, -1.0];
+        let expected = [2.5f64, -1.0, -1.0, -1.0, -1.0];
         let got = add_prediction_to_score_on_device(&client, &tree, &rows, 5, 1, 8, 5, None)
             .expect("cat_onehot walk");
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
@@ -599,7 +601,7 @@ mod tests {
             cat_boundaries_inner: &[0, 1],
         };
         let rows2: Vec<u32> = vec![2, 4, 5, 7, 6];
-        let expected2 = vec![-0.5f64, 0.75, 0.75, 0.75, -0.5];
+        let expected2 = [-0.5f64, 0.75, 0.75, 0.75, -0.5];
         let got2 = add_prediction_to_score_on_device(&client, &tree2, &rows2, 5, 1, 16, 5, None)
             .expect("cat_manyvsmany walk");
         for (i, (g, e)) in got2.iter().zip(expected2.iter()).enumerate() {
@@ -609,12 +611,7 @@ mod tests {
 
     /// USE_INDICES=true walks a used-index subset, writing scores only at the walked
     /// data indices (the rest stay 0 in the num_data-sized accumulator).
-    fn numeric_predict_tree<'a>(
-        m: &'a (
-            Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>,
-            Vec<i32>, Vec<u32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f64>,
-        ),
-    ) -> PredictTree<'a> {
+    fn numeric_predict_tree(m: &ModelArrays) -> PredictTree<'_> {
         PredictTree {
             feat_min: &m.0,
             feat_max: &m.1,
@@ -645,7 +642,7 @@ mod tests {
         let used = vec![1u32, 3, 4];
         let got = add_prediction_to_score_on_device(&client, &tree, &rows, 3, 2, 8, 5, Some(&used))
             .expect("subset walk");
-        let mut expected = vec![0.0f64; 5];
+        let mut expected = [0.0f64; 5];
         expected[1] = 1.75;
         expected[3] = 1.75;
         expected[4] = -0.5;
@@ -663,7 +660,7 @@ mod tests {
         let map = vec![0i32, 2, 1, 0];
         let got = add_prediction_bagging_on_device(&client, &map, &leaf_value, 4, None)
             .expect("bagging identity");
-        let expected = vec![-0.5f64, 1.75, 0.25, -0.5];
+        let expected = [-0.5f64, 1.75, 0.25, -0.5];
         assert_eq!(got.len(), 4);
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "bagging row {i}: {g} != {e}");
@@ -673,7 +670,7 @@ mod tests {
         let used = vec![1u32, 3];
         let got2 = add_prediction_bagging_on_device(&client, &map, &leaf_value, 4, Some(&used))
             .expect("bagging subset");
-        let expected2 = vec![0.0f64, 1.75, 0.0, -0.5];
+        let expected2 = [0.0f64, 1.75, 0.0, -0.5];
         for (i, (g, e)) in got2.iter().zip(expected2.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "bagging subset row {i}: {g} != {e}");
         }
