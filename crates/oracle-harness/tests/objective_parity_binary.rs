@@ -22,7 +22,7 @@ use lgbm_compute::kernels::objective_binary as obj;
 use lgbm_compute::runtime::cpu_client;
 use lgbm_objective::binary::Binary;
 use objective_common::{parse_gh, read_boosting_golden};
-use oracle_harness::comparator::compare_exact_u32;
+use oracle_harness::comparator::{compare_exact_u32, compare_within, ORACLE_TOL};
 
 /// The cubecl-cpu f64 anchor client type (oracle-harness stays cubecl-free at the
 /// crate level, CMP-01 — only the re-exported client type is named here).
@@ -149,6 +149,45 @@ fn binary_weight_branch_and_determinism() {
         .unwrap_or_else(|m| panic!("grad determinism: {m:?}"));
     compare_exact_u32(&bits(&h_nw), &bits(&h2))
         .unwrap_or_else(|m| panic!("hess determinism: {m:?}"));
+}
+
+#[test]
+fn binary_boost() {
+    let client = cpu_client();
+    let labels = BINARY_LABELS.to_vec();
+
+    // Two-stage BoostFromScore: device Σ is_pos reduce + host logit finalize. The
+    // device reduce is the documented atomicAdd-order residual (D-05 / Pitfall 5), so
+    // the init scalar is held to ORACLE_TOL vs the host anchor — NOT compare_exact.
+    let host_init = Binary::new(SIGMOID).unwrap().boost_from_score(&labels);
+    let device_init =
+        obj::boost_from_score_on(&client, &labels, None, SIGMOID).expect("device boost");
+    compare_within(&[device_init as f32], &[host_init as f32], ORACLE_TOL).unwrap_or_else(|m| {
+        panic!("binary BoostFromScore init not within ORACLE_TOL: device {device_init} host {host_init}: {m:?}")
+    });
+
+    // Weighted prior (all-1.0 weights) collapses to the unweighted logit (sumw = N),
+    // still within ORACLE_TOL of the host anchor.
+    let ones = vec![1.0f32; labels.len()];
+    let device_init_w = obj::boost_from_score_on(&client, &labels, Some(&ones), SIGMOID)
+        .expect("device boost weighted");
+    compare_within(&[device_init_w as f32], &[host_init as f32], ORACLE_TOL)
+        .unwrap_or_else(|m| panic!("weighted BoostFromScore init not within ORACLE_TOL: {m:?}"));
+
+    // Length-mismatched weights are a typed V5 error.
+    assert!(obj::boost_from_score_on(&client, &labels, Some(&[1.0f32, 2.0]), SIGMOID).is_err());
+
+    // OVA (one-vs-all) label reset: out[i] = (label == class) ? +1 : -1, bit-exact.
+    let multiclass_labels = [0.0f32, 1.0, 2.0, 1.0, 0.0, 2.0];
+    for class_id in 0..3i32 {
+        let got = obj::reset_ova_label_on(&client, &multiclass_labels, class_id).expect("ova");
+        let want: Vec<f32> = multiclass_labels
+            .iter()
+            .map(|&l| if l as i32 == class_id { 1.0f32 } else { -1.0 })
+            .collect();
+        compare_exact_u32(&bits(&got), &bits(&want))
+            .unwrap_or_else(|m| panic!("OVA label reset class {class_id} not bit-exact: {m:?}"));
+    }
 }
 
 #[test]

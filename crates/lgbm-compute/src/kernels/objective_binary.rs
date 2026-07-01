@@ -287,3 +287,124 @@ pub fn sigmoid_convert_output_on<R: cubecl::Runtime>(
     let bytes = client.read_one_unchecked(h_out);
     Ok(f64::from_bytes(&bytes).to_vec())
 }
+
+// =========================================================================
+// Task 2: two-stage BoostFromScore (logit init) — device reduce COMPOSED with
+// a host scalar finalize (D-08 — compose the primitive, never hand-roll a
+// reduce) — plus the OVA (one-vs-all) label-reset kernel.
+// =========================================================================
+
+/// The two-stage binary `BoostFromScore` (the C++
+/// `BoostFromScoreKernel_1/2_BinaryLogloss<USE_WEIGHT>` analog, mirroring
+/// `binary.rs:102-117` verbatim):
+/// - **stage 1** (device, the `atomicAdd` reduce): `Σ is_pos` via
+///   [`reduce_sum_f64_on`] where `is_pos = (label > 0) ? 1 : 0`; on the weighted path
+///   `Σ is_pos·w` and `sumw = Σ w` are reduced too (D-08 — COMPOSE the primitive).
+/// - **stage 2** (`<<<1,1>>>` analog, an f64 host scalar — D-07 allows f64 in the
+///   scalar BoostFromScore): `pavg = clamp(Σ / N, ε, 1-ε); init = ln(pavg/(1-pavg)) /
+///   sigmoid`. `ε = K_EPSILON as f64` (the `1e-15f32 as f64` narrow — matched to the
+///   host anchor's `K_EPSILON as f64` bit-for-bit).
+///
+/// `weights` is `Some(&[f32])` for the per-row weighted prior (or `None` → unweighted,
+/// `sumw = N` exactly as `binary.rs:106`). Empty labels → `0.0`.
+///
+/// The device `Σ is_pos` reduce is the documented f32-vs-f64 atomicAdd-order residual
+/// (D-05 / Pitfall 5) — the caller asserts this init within `ORACLE_TOL`, NOT
+/// bit-exact.
+///
+/// # Errors
+/// [`ComputeError::LengthMismatch`] if `weights` is present and disagrees with
+/// `labels`; propagates the [`reduce_sum_f64_on`] error.
+pub fn boost_from_score_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    sigmoid: f64,
+) -> Result<f64, ComputeError> {
+    if labels.is_empty() {
+        return Ok(0.0);
+    }
+    if let Some(w) = weights {
+        if w.len() != labels.len() {
+            return Err(ComputeError::LengthMismatch { expected: labels.len(), actual: w.len() });
+        }
+    }
+
+    // Stage 1: device reduce of Σ is_pos [and, on the weighted path, Σ is_pos·w + Σ w].
+    let (suml, sumw) = if let Some(w) = weights {
+        let is_pos_w: Vec<f64> = labels
+            .iter()
+            .zip(w)
+            .map(|(&l, &wi)| if l > 0.0 { f64::from(wi) } else { 0.0 })
+            .collect();
+        let w_f64: Vec<f64> = w.iter().map(|&x| f64::from(x)).collect();
+        (reduce_sum_f64_on(client, &is_pos_w)?, reduce_sum_f64_on(client, &w_f64)?)
+    } else {
+        let is_pos: Vec<f64> = labels.iter().map(|&l| if l > 0.0 { 1.0 } else { 0.0 }).collect();
+        // Unweighted: sumw = num_data exactly (binary.rs:106).
+        (reduce_sum_f64_on(client, &is_pos)?, labels.len() as f64)
+    };
+
+    // Stage 2: host f64 scalar finalize (mirrors binary.rs:112-116 verbatim).
+    let mut pavg = suml / sumw;
+    let eps = f64::from(K_EPSILON);
+    pavg = pavg.min(1.0 - eps);
+    pavg = pavg.max(eps);
+    Ok((pavg / (1.0 - pavg)).ln() / sigmoid)
+}
+
+// --- OVA (one-vs-all) label reset (elementwise) ---
+
+/// The `ResetOVACUDALabelKernel` body: per-row `out = (label == class) ? +1 : -1` —
+/// the one-vs-all label rewrite shared with the multiclass OVA path. `class_id` is
+/// integer-valued (class indices stored as `F`), so the `==` is exact.
+#[cube]
+fn reset_ova_body<F: Float>(labels: &Array<F>, out: &mut Array<F>, class_id: F) {
+    let i = ABSOLUTE_POS;
+    if i < labels.len() {
+        out[i] = select(labels[i] == class_id, F::new(1.0), F::new(-1.0));
+    }
+}
+
+#[cube(launch_unchecked)]
+fn reset_ova_kernel_f64(labels: &Array<f64>, out: &mut Array<f64>, class_id: f64) {
+    reset_ova_body::<f64>(labels, out, class_id);
+}
+
+/// Rewrite `labels` into the one-vs-all `±1` target for class `class_id` on the f64
+/// anchor: `out[i] = (label[i] == class_id) ? +1 : -1`. Returns the `±1` labels as
+/// `f32`. Bit-exact (elementwise compare/select, no accumulation).
+///
+/// # Errors
+/// Never (empty → empty); returns `Result` for launcher symmetry.
+pub fn reset_ova_label_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    labels: &[f32],
+    class_id: i32,
+) -> Result<Vec<f32>, ComputeError> {
+    let n = labels.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
+    let h_in = client.create_from_slice(f64::as_bytes(&labels_f64));
+    let h_out = client.empty(n * core::mem::size_of::<f64>());
+    let cube_dim = 256u32;
+    let cube_count = (n as u32).div_ceil(cube_dim);
+
+    // SAFETY: `h_in`/`h_out` are each sized exactly `n` f64 cells and outlive the
+    // launch; the kernel bounds-guards `i < labels.len()`. cubecl unsafe confined
+    // here (CMP-01 / T-19-02-01).
+    unsafe {
+        reset_ova_kernel_f64::launch_unchecked(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(h_in, n),
+            ArrayArg::from_raw_parts(h_out.clone(), n),
+            f64::from(class_id),
+        );
+    }
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(f64::from_bytes(&bytes).iter().map(|&x| x as f32).collect())
+}
