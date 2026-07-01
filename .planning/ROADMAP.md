@@ -79,7 +79,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 - [x] **Phase 14: Foundation — Shared Device Primitives + Device Structs/RNG** — The reusable CubeCL primitives + device split-record/RNG every later subsystem builds on; re-establish the on-device seam + anchor-pinned oracle. (completed 2026-06-29)
 - [x] **Phase 15: On-Device Device Dataset + Row-Subset Gather** — Resident columnar binned dataset in the feature-partition layout the histogram kernel needs, + CopySubrow bagging/GOSS subset. (completed 2026-06-29)
 - [x] **Phase 16: On-Device Histogram Constructor** — The hot path: build (dense/sparse × shared/global) on u64 fixed-point + the subtraction trick (FixHistogram + SubtractHistogram via `hist_t**` rotation). (completed 2026-07-01)
-- [ ] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`.
+- [x] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`. (completed 2026-07-01)
 - [ ] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict.
 - [ ] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned.
 - [ ] **Phase 20: On-Device Score Updater & Metrics** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host.
@@ -178,7 +178,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. **Tie-aware `default_left`** parity to the cpu anchor: a flip is accepted only on a verified f32 tie (same threshold + left_count + f32-equal gains); a flip on any non-tie split hard-fails; the empty / sparse-default-bin fixtures pass.
   4. The chosen split is anchor-pinned (structure bit-exact, values within ~1e-5); CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans complete
 
 Plans:
 **Wave 1**
@@ -196,7 +196,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 17-05-PLAN.md — Stage-2 cross-feature reduce + Stage-3 cross-leaf argmax + 8-int export + self-invalidation + tie-aware default_left on hip [wave 4]
+- [x] 17-05-PLAN.md — Stage-2 cross-feature reduce + Stage-3 cross-leaf argmax + 8-int export + self-invalidation + tie-aware default_left on hip [wave 4]
 
 **Notes**: The 256-bin within-feature scan needs a segmented LDS block-scan (plane-sum caps at plane width 32/64 ≪ 256) — net-new kernel work, not a reuse (research flag). The discretized split finder (§8.1 quantized inner) is **v2 (QGD-02)** — skip. Do NOT defer the tie-aware assert.
 
@@ -298,7 +298,7 @@ Plans:
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
-| 17. On-Device Best-Split Finder | v1.1 | 4/5 | In Progress|  |
+| 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete   | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
 | 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |

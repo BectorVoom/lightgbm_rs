@@ -4,17 +4,17 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 17
 current_phase_name: on-device-best-split-finder
-status: executing
+status: verifying
 stopped_at: Phase 17 context gathered
-last_updated: "2026-07-01T02:47:14.406Z"
+last_updated: "2026-07-01T03:11:29.642Z"
 last_activity: 2026-07-01
 last_activity_desc: Phase 17 execution started
 progress:
   total_phases: 10
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 21
-  completed_plans: 20
-  percent: 30
+  completed_plans: 21
+  percent: 40
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 17 (on-device-best-split-finder) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-07-01 — Phase 17 execution started
 
@@ -567,6 +567,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 17 P01 | 11min | 3 tasks | 4 files |
 | Phase 17 P02 | 4min | 2 tasks | 1 files |
 | Phase 17 P03 | 95min | 2 tasks | 3 files |
+| Phase 17 P05 | 55min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -667,6 +668,7 @@ Recent decisions affecting current work:
 - [Phase ?]: ROCm f32 on-device build/fix/subtract parity attested within ~1e-6 of the cpu f64 anchor (hip-vs-anchor, never GPU-vs-GPU); the one failing --features rocm case is pre-existing out-of-scope DEF-16-OOS-02 (def-f8u-01 f32-atomic near-tie, kernel byte-unchanged), does not gate merge
 - [Phase ?]: 17-03: stage-1 split_eval_body f64 fold bit-exact to §8.1 goldens (all 5 landmines); goldens finalized by an independent calculator, not cpu-fold output (anti-circularity)
 - [Phase ?]: 17-03: f32 hip mirror split per codebase convention — cpu-testable single-owner fold + gpu-gated two-level LDS block scan/argmax (on-device rocm assertion deferred to 17-05)
+- [Phase 17]: 17-05: stage-2/3 reductions are deterministic host folds over stage-1 SplitScalars (the reduction order is the parity contract); only the 8-int export is a device kernel (the single SC#2 readback)
 
 ### Pending Todos
 
@@ -696,7 +698,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T02:47:14.397Z
+Last session: 2026-07-01T03:10:54.780Z
 Stopped at: Phase 17 context gathered
 Resume file: .planning/phases/17-on-device-best-split-finder/17-CONTEXT.md
 

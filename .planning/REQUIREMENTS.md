@@ -32,7 +32,7 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 ### Best-split finder (§8)
 
 - [x] **ODL-11**: On-device **per-feature split evaluation** (stage 1, one block per (leaf,feature) task) — block prefix-sum → cumulative left/right sums, count recovery via `cnt_factor`, min-data / min-sum-hessian guards, gain math, forward/reverse default-bin scan, block argmax → per-task split record. (§8.1, numerical core.)
-- [ ] **ODL-12**: On-device **cross-feature reduce (stage 2) + cross-leaf argmax (stage 3)** producing the chosen `(leaf, feature, threshold, default_left)` with a single small scalar readback per split (the 8-int buffer), and **tie-aware `default_left`** parity to the cpu anchor. (§8.2–8.3.)
+- [x] **ODL-12**: On-device **cross-feature reduce (stage 2) + cross-leaf argmax (stage 3)** producing the chosen `(leaf, feature, threshold, default_left)` with a single small scalar readback per split (the 8-int buffer), and **tie-aware `default_left`** parity to the cpu anchor. (§8.2–8.3.)
 
 ### Data partition, tree & prediction (§9, §10)
 
@@ -96,7 +96,7 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-09 | Phase 16 | Complete |
 | ODL-10 | Phase 16 | Complete |
 | ODL-11 | Phase 17 | Complete |
-| ODL-12 | Phase 17 | Pending |
+| ODL-12 | Phase 17 | Complete |
 | ODL-13 | Phase 18 | Pending |
 | ODL-14 | Phase 18 | Pending |
 | ODL-15 | Phase 18 | Pending |
