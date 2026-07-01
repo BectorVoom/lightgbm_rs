@@ -503,9 +503,13 @@ against repo code or the design doc. The planner should gate A1/A4 behind a
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Does the lambdarank grad/hess golden derive cleanly from raw scores, or does it need a
+> All three carry firm recommendations, folded into the Phase 19 plans: OQ1 → plan 19-00 T3
+> (score-derivation first, `fobj` fallback); OQ2 → plan 19-01 T1 (comptime-generic kernel);
+> OQ3 → plan 19-00 (device-objective trait/enum placement mirroring `lgbm-objective`).
+
+1. **RESOLVED — Does the lambdarank grad/hess golden derive cleanly from raw scores, or does it need a
    `fobj` interception?**
    - What we know: L2/binary/multiclass derive from scores via the objective math
      (`boosting_oracle_capture.py`). Lambdarank grad/hess is a function of within-query ranks
@@ -515,13 +519,13 @@ against repo code or the design doc. The planner should gate A1/A4 behind a
    - Recommendation: attempt score-derivation first (cheapest, matches the established
      pattern); fall back to `fobj` interception if the λ accumulation is hard to reproduce.
 
-2. **One comptime-generic regression kernel vs six kernels?**
+2. **RESOLVED — One comptime-generic regression kernel vs six kernels?**
    - What we know: parity-neutral (Claude's Discretion, D-135).
    - Recommendation: one `#[cube]` with a `#[comptime]` objective tag + `#[comptime] use_weight`
      — fewer launch sites, matches how histogram.rs already fans out on comptime. Six-kernel is
      equally acceptable if the enum-branch codegen bloats.
 
-3. **Device-objective trait/enum placement** — `crates/lgbm-compute/src/` vs a new sub-module.
+3. **RESOLVED — Device-objective trait/enum placement** — `crates/lgbm-compute/src/` vs a new sub-module.
    - Recommendation: mirror `lgbm-objective`'s enum-dispatch surface (`Objective`, `Binary`,
      `MulticlassSoftmax/Ova`, `Lambdarank`, `RankXendcg`) as a device-side trait/enum so
      Phase 21 can wire it symmetrically. Non-load-bearing for parity.

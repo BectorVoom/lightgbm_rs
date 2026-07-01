@@ -1,8 +1,8 @@
 ---
 phase: 19
 slug: on-device-objectives
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-07-01
 ---
@@ -22,15 +22,20 @@ created: 2026-07-01
 |----------|-------|
 | **Framework** | Rust `cargo test` (workspace); new parity tests in `crates/oracle-harness/tests/` |
 | **Config file** | none — standard `cargo test`; ROCm cross-check gated by `--features rocm` |
-| **Quick run command** | `cargo test -p oracle-harness --test objective_parity <family>` (new file) |
+| **Quick run command** | `cargo test -p oracle-harness --test objective_parity_<family>` (per-family test binary: `_regression`/`_binary`/`_multiclass`/`_rank`; shared harness in `objective_parity.rs`) |
 | **Full suite command** | `cargo test --workspace` (cpu hard merge gate, `LGBM_CUDA_ON_DEVICE` unset) |
 | **Estimated runtime** | quick ~30 s per family · full suite ~several min |
+
+> **Test-file layout (reconciled to the plans):** the plans split parity into per-family
+> test binaries (`objective_parity_<family>.rs`) sharing a common harness (`objective_parity.rs`,
+> created in plan 19-00) so Wave-2 family plans own **disjoint** files. The original single-file
+> `objective_parity <family>` filter form below is superseded by the per-binary form.
 
 ---
 
 ## Sampling Rate
 
-- **After every task commit:** Run `cargo test -p oracle-harness --test objective_parity <family>` (the family under edit).
+- **After every task commit:** Run `cargo test -p oracle-harness --test objective_parity_<family>` (the family under edit).
 - **After every plan wave:** Run `cargo test -p oracle-harness` (all objective + existing parity).
 - **Before `/gsd-verify-work`:** `cargo test --workspace` must be green with `LGBM_CUDA_ON_DEVICE` unset (ODL-19 / D-06); optional `cargo test -p oracle-harness --features rocm` for the ~1e-6 hip cross-check.
 - **Max feedback latency:** ~30 seconds (per-family quick run).
@@ -57,20 +62,20 @@ created: 2026-07-01
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 19-00-01 | 00 | 0 | ODL-05..08 | — | N/A | scaffold | `cargo test -p oracle-harness --test objective_parity` (compiles) | ❌ W0 | ⬜ pending |
-| 19-00-02 | 00 | 0 | ODL-08 | — | N/A | fixture | `test -f crates/oracle-harness/tests/fixtures/rank/lambdarank_gh_iter1.txt` | ❌ W0 | ⬜ pending |
-| 19-01-xx | 01 | 1 | ODL-05 | — | N/A | parity | `cargo test -p oracle-harness --test objective_parity regression` | ❌ W0; goldens ✅ | ⬜ pending |
-| 19-01-xx | 01 | 1 | ODL-05 | — | N/A | parity | `... objective_parity boost_from_score` | ❌ W0 | ⬜ pending |
-| 19-01-xx | 01 | 1 | ODL-05 | — | N/A | parity | `... objective_parity renew_leaf` | ❌ W0; `regression_l1` renewed ✅ | ⬜ pending |
-| 19-01-xx | 01 | 1 | ODL-05 | — | N/A | parity | `... objective_parity convert_regression` | ❌ W0 | ⬜ pending |
-| 19-02-xx | 02 | 1 | ODL-06 | — | N/A | parity | `... objective_parity binary` | ❌ W0; `binary_gh_*` ✅ | ⬜ pending |
-| 19-02-xx | 02 | 1 | ODL-06 | — | N/A | parity | `... objective_parity binary_boost` | ❌ W0 | ⬜ pending |
-| 19-03-xx | 03 | 1 | ODL-07 | — | N/A | parity | `... objective_parity multiclass` | ❌ W0; `multiclass_gh_*` ✅ | ⬜ pending |
-| 19-03-xx | 03 | 1 | ODL-07 | — | N/A | parity | `... objective_parity multiclassova` | ❌ W0; `multiclassova_gh_*` ✅ | ⬜ pending |
-| 19-04-xx | 04 | 1 | ODL-08 | — | N/A | parity | `... objective_parity lambdarank` | ❌ W0; golden from 19-00-02 | ⬜ pending |
-| 19-04-xx | 04 | 1 | ODL-08 | — | N/A | parity | `... objective_parity rank_xendcg` | ❌ W0; `rank_xendcg_objseed5` ✅ | ⬜ pending |
+| 19-00-01 | 00 | 1 | ODL-05..08 | — | N/A | scaffold | `cargo test -p oracle-harness --test objective_parity` (harness compiles) | ❌ W0 | ⬜ pending |
+| 19-00-03 | 00 | 1 | ODL-08 | — | N/A | fixture | `test -f crates/oracle-harness/tests/fixtures/rank/lambdarank_gh_iter1.txt` | ❌ W0 | ⬜ pending |
+| 19-01-xx | 01 | 2 | ODL-05 | — | N/A | parity | `cargo test -p oracle-harness --test objective_parity_regression` | ❌ W0; goldens ✅ | ⬜ pending |
+| 19-01-xx | 01 | 2 | ODL-05 | — | N/A | parity | `... objective_parity_regression boost_from_score` | ❌ W0 | ⬜ pending |
+| 19-01-xx | 01 | 2 | ODL-05 | — | N/A | parity | `... objective_parity_regression renew_leaf` | ❌ W0; `regression_l1` renewed ✅ | ⬜ pending |
+| 19-01-xx | 01 | 2 | ODL-05 | — | N/A | parity | `... objective_parity_regression convert` | ❌ W0 | ⬜ pending |
+| 19-02-xx | 02 | 2 | ODL-06 | — | N/A | parity | `... objective_parity_binary` | ❌ W0; `binary_gh_*` ✅ | ⬜ pending |
+| 19-02-xx | 02 | 2 | ODL-06 | — | N/A | parity | `... objective_parity_binary boost` | ❌ W0 | ⬜ pending |
+| 19-03-xx | 03 | 2 | ODL-07 | — | N/A | parity | `... objective_parity_multiclass` | ❌ W0; `multiclass_gh_*` ✅ | ⬜ pending |
+| 19-03-xx | 03 | 2 | ODL-07 | — | N/A | parity | `... objective_parity_multiclass ova` | ❌ W0; `multiclassova_gh_*` ✅ | ⬜ pending |
+| 19-04-xx | 04 | 2 | ODL-08 | — | N/A | parity | `... objective_parity_rank lambdarank` | ❌ W0; golden from 19-00 T3 | ⬜ pending |
+| 19-04-xx | 04 | 2 | ODL-08 | — | N/A | parity | `... objective_parity_rank xendcg` | ❌ W0; `rank_xendcg_objseed5` ✅ | ⬜ pending |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky. Task IDs are indicative — the planner assigns final IDs; the family→command mapping is the load-bearing contract.*
+*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky. Task IDs are indicative — the planner assigns final IDs; the family→command mapping is the load-bearing contract. Foundation (harness + lambdarank golden) is plan 19-00 (wave 1); families are 19-01..04 (wave 2).*
 
 ---
 
@@ -85,7 +90,7 @@ created: 2026-07-01
 
 ## Wave 0 Requirements
 
-- [ ] `crates/oracle-harness/tests/objective_parity.rs` — new parity test file (reuse `parse_gh_golden` / `assert_gradients` / `compare_exact_u32` / `compare_within(ORACLE_TOL=1e-6)` from `boosting_parity.rs`).
+- [ ] `crates/oracle-harness/tests/objective_parity.rs` — shared harness (`parse_gh_golden` / `assert_gradients` / `compare_exact_u32` / `compare_within(ORACLE_TOL=1e-6)` reused from `boosting_parity.rs`), created in plan 19-00; consumed by the per-family binaries `objective_parity_{regression,binary,multiclass,rank}.rs` (plans 19-01..04, disjoint ownership).
 - [ ] `crates/oracle-harness/tests/fixtures/rank/lambdarank_gh_iter{1,N}.txt` — **capture** the one missing golden (extend `xtask/py/rank_oracle_capture.py`, score-derivation route; fall back to custom-`fobj` interception if within-query λ math doesn't derive cleanly — Open Question A1).
 - [ ] Confirm the uv `.venv` has `lightgbm==4.6` before the capture task (Open Question A4).
 - [ ] `crates/lgbm-compute/src/kernels/objective_*.rs` + `mod.rs` exports (greenfield — no objective module exists today).
@@ -106,11 +111,11 @@ created: 2026-07-01
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references (objective_parity.rs test file + lambdarank golden)
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 30s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (objective_parity.rs harness + lambdarank golden — plan 19-00)
+- [x] No watch-mode flags
+- [x] Feedback latency < 30s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-07-01 (plan-checker Dimension 8 PASS; reconciled to per-family test-file layout)
