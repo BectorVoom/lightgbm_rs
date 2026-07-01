@@ -354,7 +354,9 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
             actual: data_index_to_leaf.len(),
         });
     }
-    for (di, &leaf) in data_index_to_leaf.iter().enumerate() {
+    // WR-04: validate a leaf-map entry only where the kernel actually reads it. A
+    // single closure keeps the error text identical for both paths.
+    let check_leaf = |di: usize, leaf: i32| -> Result<(), ComputeError> {
         if leaf < 0 || leaf as usize >= leaf_value.len() {
             return Err(ComputeError::Runtime {
                 detail: format!(
@@ -364,15 +366,22 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
                 ),
             });
         }
-    }
+        Ok(())
+    };
     let (use_indices, idx_owned, num_rows): (bool, Vec<u32>, usize) = match used_indices {
         Some(idx) => {
+            // WR-04: subset (USE_BAGGING) mode reads only data_index_to_leaf[idx[i]],
+            // so validate ONLY the walked entries. Un-sampled rows legitimately carry
+            // the `-1` sentinel that `update_data_index_to_leaf_on` writes
+            // (data_partition.rs:841) and must NOT be rejected — the kernel never reads
+            // them.
             for &di in idx {
                 if di as usize >= num_data {
                     return Err(ComputeError::Runtime {
                         detail: format!("add_prediction_bagging: used index {di} >= num_data {num_data}"),
                     });
                 }
+                check_leaf(di as usize, data_index_to_leaf[di as usize])?;
             }
             // IN-02: `score[data_index] += ...` requires unique used indices — a
             // duplicate double-counts (and races on a real GPU backend). Debug-only.
@@ -385,7 +394,13 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
             );
             (true, idx.to_vec(), idx.len())
         }
-        None => (false, vec![0u32], num_data),
+        None => {
+            // Identity mode walks every row, so every leaf-map entry is read.
+            for (di, &leaf) in data_index_to_leaf.iter().enumerate() {
+                check_leaf(di, leaf)?;
+            }
+            (false, vec![0u32], num_data)
+        }
     };
     if num_rows == 0 {
         return Ok(vec![0.0f64; num_data]);
