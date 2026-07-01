@@ -49,7 +49,10 @@
 //!   `DeviceSplitInfo` / [`SplitScalars`] `CUDASplitInfo` analog the stage records
 //!   and 8-int export write into (D-11).
 
+use core::marker::PhantomData;
+
 use cubecl::prelude::*;
+use cubecl::server::Handle;
 
 use lgbm_core::types::K_EPSILON;
 use lgbm_dataset::MissingType;
@@ -1027,10 +1030,197 @@ pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
     })
 }
 
+// ===========================================================================
+// _GlobalMemory stage-1 spill variant (17-04, D-05/D-11) — the >256-bin path.
+//
+// For features whose bin count exceeds the block's thread count, the C++
+// `FindBestSplitsForLeafKernel_GlobalMemory` (`cuda_best_split_finder.cu:1051-1273`)
+// spills the per-bin scanned sums into a PRE-ALLOCATED global-memory scratch slab
+// and scans it with `GlobalMemoryPrefixSum` (a chunked two-level in-place scan,
+// `cuda_algorithms.hpp:169-185`) over STRIDED thread loops (each thread owns bins
+// `t, t+blockDim, t+2·blockDim, …`). The gain / count-recovery / guard / argmax
+// semantics are IDENTICAL to the in-block two-level path (17-03) — only the scan
+// carrier (global scratch vs LDS) and the strided iteration differ (A4).
+//
+// The cpu single-owner f64 fold ([`split_eval_body`]) needs NO separate >256
+// implementation: its serial body has no register/LDS cap, so a `num_bin=300`
+// feature is handled by a larger loop bound — that is why the `globalmem_spill`
+// golden (num_bin=300) already passes bit-exact on the cpu fold. This section adds
+// the NET-NEW hip strided f32 kernel (gpu-gated, compile-verified; its on-device
+// rocm parity assertion lands in 17-05, the same deferral as the block kernel) plus
+// the alloc-once scratch (D-11) and the launch-boundary size validation (V5).
+// ===========================================================================
+
+/// The stage-1 block thread width (256 = the C++
+/// `NUM_THREADS_PER_BLOCK_BEST_SPLIT_FINDER`). The dispatch boundary: a feature with
+/// `num_bin` bins beyond this width spills to the [`split_eval_globalmem_kernel_f32`]
+/// strided path; at or below it uses the 17-03 in-block two-level scan. Ungated so the
+/// cpu-side dispatch decision ([`stage1_needs_globalmem`]) and validation are testable
+/// without the `gpu` feature.
+pub const STAGE1_BLOCK_THREADS: usize = 256;
+
+/// The number of pre-allocated global-memory scratch buffers the `_GlobalMemory`
+/// spill path reserves ONCE in [`Stage1GlobalMemScratch::new`] (D-11): the grad / hess
+/// scan carriers plus the `stat` / `index` buffers reserved for the discretized &
+/// categorical `_GlobalMemory` variants (C++ TODO / Phase-22 seam — reserved, not used
+/// by the continuous kernel, mirroring how `DeviceSplitInfo` reserves its categorical
+/// slabs). Used by the "allocated exactly once" counter assertion.
+pub const NUM_STAGE1_SCRATCH_BUFFERS: usize = 4;
+
+/// Stage-1 spill dispatch (D-05): does this feature's bin count exceed the block
+/// thread width, requiring the `_GlobalMemory` strided path? `num_bin > block_threads`
+/// spills; at or below stays on the in-block two-level scan (17-03). The cpu
+/// single-owner fold ([`find_best_splits_stage1_on`]) handles BOTH via the same serial
+/// body (A4), so this only routes the gpu block/globalmem kernels (wired on-device in
+/// 17-05).
+#[must_use]
+pub fn stage1_needs_globalmem(num_bin: u32, block_threads: usize) -> bool {
+    (num_bin as usize) > block_threads
+}
+
+/// V5 launch-boundary validation for the `_GlobalMemory` scratch slab (threat
+/// T-17-01/T-17-02): reject a `largest_feature_bin_count × num_concurrent_blocks`
+/// product that would overflow `usize` BEFORE any `client.empty` / strided
+/// `launch_unchecked`. Returns the validated per-buffer slab length (in elements).
+///
+/// Mirrors `split_info.rs`'s `checked_mul` categorical-slab guard and `random.rs`'s
+/// `validate_draw_inputs` overflow guard.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `largest_feature_bin_count == 0`,
+/// `num_concurrent_blocks == 0`, or the slab length
+/// `largest_feature_bin_count * num_concurrent_blocks` overflows `usize`.
+pub fn validate_globalmem_scratch(
+    largest_feature_bin_count: usize,
+    num_concurrent_blocks: usize,
+) -> Result<usize, ComputeError> {
+    if largest_feature_bin_count == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "globalmem scratch: largest_feature_bin_count must be > 0".to_string(),
+        });
+    }
+    if num_concurrent_blocks == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "globalmem scratch: num_concurrent_blocks must be > 0".to_string(),
+        });
+    }
+    largest_feature_bin_count
+        .checked_mul(num_concurrent_blocks)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!(
+                "globalmem scratch: slab length {largest_feature_bin_count} * \
+                 {num_concurrent_blocks} overflows usize"
+            ),
+        })
+}
+
+/// The pre-allocated `_GlobalMemory` stage-1 scratch (D-11) — the grad / hess scan
+/// carriers plus the reserved `stat` / `index` buffers, each a CubeCL [`Handle`]
+/// allocated **once** in [`Self::new`] via the counted `alloc` closure (the
+/// `DeviceSplitInfo::new` idiom, `split_info.rs:289-293`). There is NO per-split /
+/// in-kernel device allocation anywhere: the strided kernel indexes these reserved
+/// handles, it never calls `client.empty`.
+///
+/// Each buffer is sized `largest_feature_bin_count * num_concurrent_blocks` so every
+/// concurrently-launched spill block owns a disjoint `largest_feature_bin_count`-wide
+/// scan region.
+pub struct Stage1GlobalMemScratch<R: cubecl::Runtime> {
+    /// `feature_hist_grad_buffer` — the strided gradient scan carrier (f32).
+    pub feature_hist_grad_buffer: Handle,
+    /// `feature_hist_hess_buffer` — the strided hessian scan carrier (f32).
+    pub feature_hist_hess_buffer: Handle,
+    /// `feature_hist_stat_buffer` — reserved for the discretized `_GlobalMemory`
+    /// variant (C++ TODO / v2 QGD-02); allocated but unused by the continuous kernel.
+    pub feature_hist_stat_buffer: Handle,
+    /// `feature_hist_index_buffer` — reserved for the categorical `_GlobalMemory`
+    /// variant (Phase-22 seam); allocated but unused by the continuous kernel.
+    pub feature_hist_index_buffer: Handle,
+    /// The largest per-feature bin count the scratch is sized for.
+    largest_feature_bin_count: usize,
+    /// The number of concurrently-launched spill blocks the scratch is sized for.
+    num_concurrent_blocks: usize,
+    /// The per-buffer slab length in elements
+    /// (`largest_feature_bin_count * num_concurrent_blocks`).
+    slab_len: usize,
+    /// Count of `client.empty` allocations — equals [`NUM_STAGE1_SCRATCH_BUFFERS`]
+    /// after [`Self::new`] and never changes (proves "allocated exactly once", D-11).
+    device_allocations: usize,
+    _runtime: PhantomData<R>,
+}
+
+impl<R: cubecl::Runtime> Stage1GlobalMemScratch<R> {
+    /// Pre-allocate the four `_GlobalMemory` scratch buffers — **one `client.empty`
+    /// per buffer, exactly once** (D-11). No allocation happens anywhere else (no
+    /// per-split / in-kernel device alloc). The slab length is V5-validated
+    /// ([`validate_globalmem_scratch`]) for overflow before any allocation.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] from [`validate_globalmem_scratch`] (zero or
+    /// overflowing `largest_feature_bin_count * num_concurrent_blocks`).
+    pub fn new(
+        client: &ComputeClient<R>,
+        largest_feature_bin_count: usize,
+        num_concurrent_blocks: usize,
+    ) -> Result<Self, ComputeError> {
+        let slab_len = validate_globalmem_scratch(largest_feature_bin_count, num_concurrent_blocks)?;
+
+        // The counted alloc closure is the ONLY caller of `client.empty` in the spill
+        // path, and it runs only here in `new` — so `device_allocations` structurally
+        // proves the alloc-once invariant (D-11), exactly like `DeviceSplitInfo::new`.
+        let mut device_allocations = 0usize;
+        let mut alloc = |elem_size: usize| -> Handle {
+            device_allocations += 1;
+            client.empty(slab_len * elem_size)
+        };
+        let feature_hist_grad_buffer = alloc(core::mem::size_of::<f32>());
+        let feature_hist_hess_buffer = alloc(core::mem::size_of::<f32>());
+        let feature_hist_stat_buffer = alloc(core::mem::size_of::<f32>());
+        let feature_hist_index_buffer = alloc(core::mem::size_of::<i32>());
+
+        Ok(Stage1GlobalMemScratch {
+            feature_hist_grad_buffer,
+            feature_hist_hess_buffer,
+            feature_hist_stat_buffer,
+            feature_hist_index_buffer,
+            largest_feature_bin_count,
+            num_concurrent_blocks,
+            slab_len,
+            device_allocations,
+            _runtime: PhantomData,
+        })
+    }
+
+    /// The largest per-feature bin count this scratch is sized for.
+    #[must_use]
+    pub fn largest_feature_bin_count(&self) -> usize {
+        self.largest_feature_bin_count
+    }
+
+    /// The number of concurrent spill blocks this scratch is sized for.
+    #[must_use]
+    pub fn num_concurrent_blocks(&self) -> usize {
+        self.num_concurrent_blocks
+    }
+
+    /// The per-buffer slab length in elements.
+    #[must_use]
+    pub fn slab_len(&self) -> usize {
+        self.slab_len
+    }
+
+    /// The number of device buffers allocated — equals [`NUM_STAGE1_SCRATCH_BUFFERS`]
+    /// after [`Self::new`] and never changes (proves the D-11 alloc-once invariant: no
+    /// per-split / in-kernel alloc).
+    #[must_use]
+    pub fn device_allocations(&self) -> usize {
+        self.device_allocations
+    }
+}
+
 /// Max block width for the hip block-parallel stage-1 path (256 threads, the C++
 /// `NUM_THREADS_PER_BLOCK_BEST_SPLIT_FINDER`). Also the `SharedMemory` staging cap.
 #[cfg(feature = "gpu")]
-const STAGE1_BLOCK_MAX: usize = 256;
+const STAGE1_BLOCK_MAX: usize = STAGE1_BLOCK_THREADS;
 
 /// Max planes per cube for the cross-plane carry stage (1024/32; 32 is the safe cap,
 /// mirroring `primitives::N_PLANES_MAX`).
@@ -1272,6 +1462,384 @@ pub fn split_eval_block_kernel_f32(
     }
 }
 
+/// `GlobalMemoryPrefixSum` (`cuda_algorithms.hpp:169-185`) — a chunked two-level
+/// IN-PLACE inclusive scan over a global-memory scratch `array[0..len]` (D-05). Each
+/// unit owns a contiguous chunk of `ceil(len / blockDim)` elements: it sums its chunk,
+/// the block exclusive-scans the per-chunk sums (the `ShufflePrefixSumExclusive`
+/// analog, here `stage1_block_scan(sum) - sum`), each unit adds that base to its first
+/// element, then serially propagates within its chunk. NO f64 (D-10, WR-05). Every
+/// unit must reach both `sync_cube()`s (the C++ `__syncthreads()` after each scan is
+/// issued by the caller).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::manual_div_ceil)] // `.div_ceil()` does not lower in cubecl `#[cube]`
+fn global_memory_prefix_sum(array: &mut Array<f32>, len: u32, plane_dim: u32) {
+    let bd = CUBE_DIM;
+    let num_per_thread = (len + bd - 1) / bd;
+    let start = UNIT_POS * num_per_thread;
+    let cand_end = start + num_per_thread;
+    let end = select(cand_end < len, cand_end, len);
+
+    // 1. this unit's chunk sum (strided contiguous chunk `[start, end)`).
+    let mut thread_sum = f32::new(0.0);
+    for k in 0..num_per_thread {
+        let index = start + k;
+        let active = index < end;
+        thread_sum += select(active, array[(select(active, index, 0u32)) as usize], f32::new(0.0));
+    }
+
+    // 2. exclusive block-scan of the per-chunk sums (base = inclusive − own).
+    let incl = stage1_block_scan(thread_sum, plane_dim);
+    let thread_base = incl - thread_sum;
+    sync_cube();
+
+    // 3. add the base to the chunk's first element, then serially propagate.
+    if start < end {
+        array[start as usize] += thread_base;
+    }
+    for k in 0..num_per_thread {
+        let index = start + k;
+        if index > start && index < end {
+            array[index as usize] += array[(index - 1) as usize];
+        }
+    }
+}
+
+/// The hip `_GlobalMemory` stage-1 strided kernel (D-05/D-06) — one block per
+/// `(leaf,feature)` task, 256 threads, for features whose `num_bin` exceeds the block
+/// width. A VERBATIM strided port of `FindBestSplitsForLeafKernelInner_GlobalMemory`
+/// (`cuda_best_split_finder.cu:1051-1273`, the continuous non-`na_as_missing`-mfb1
+/// branches): each unit STRIDES over bins `t, t+blockDim, …` linearising the
+/// scan-position sums into the pre-allocated `grad_buf`/`hess_buf` global scratch,
+/// [`global_memory_prefix_sum`] scans them in place, then a second strided pass
+/// evaluates guards + gain (smoothing dispatch) exactly as [`split_eval_body_f32`],
+/// [`reduce_best_gain`] picks the winner (strict `>`, lowest index), and the winning
+/// unit writes the record (kEpsilon-subtracted). SAME gain / count / guard / argmax
+/// math as 17-03 — only the scan carrier (global scratch) and the strided iteration
+/// differ (A4). Anchored to the cpu f64 fold; the on-device rocm assertion lands in
+/// 17-05 (def-f8u-01, NEVER GPU-vs-GPU). NO f64 (D-10, WR-05).
+///
+/// Faithful-scope note: the `na_as_missing && mfb_offset == 1` special reduction
+/// subcase (`cu:1095-1114`, a `ShuffleReduceSum` of the non-default bins) is NOT
+/// exercised by the D-07 fixture (the `globalmem_spill` golden is forward, `mfb=0`,
+/// `na=0`); it is a `_GlobalMemory` sub-branch to complete when a golden needs it,
+/// tracked as a known limitation, not a silent stub (the continuous forward/reverse
+/// branches this kernel ports are the ones the fixture drives).
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_div_ceil)] // `.div_ceil()` does not lower in cubecl `#[cube]`
+pub fn split_eval_globalmem_kernel_f32(
+    hist: &Array<f32>,
+    grad_buf: &mut Array<f32>,
+    hess_buf: &mut Array<f32>,
+    out: &mut Array<f32>,
+    num_bin: i32,
+    mfb_offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    reverse: u32,
+    assume_out_default_left: u32,
+    use_l1: u32,
+    use_smoothing: u32,
+    use_rand: u32,
+    rand_threshold: i32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f32,
+    lambda_l1: f32,
+    lambda_l2: f32,
+    path_smooth: f32,
+    parent_output: f32,
+    min_gain_shift: f32,
+    sum_gradient: f32,
+    sum_hessian: f32,
+    num_data: i32,
+    plane_dim: u32,
+    block_size: u32,
+) {
+    let eps = f32::cast_from(K_EPSILON);
+    let rev = reverse != 0;
+    let use_l1_b = use_l1 != 0;
+    let sm = use_smoothing != 0;
+    let use_rand_b = use_rand != 0;
+    let skip_def = skip_default_bin != 0;
+
+    let cnt_factor = f32::cast_from(num_data) / sum_hessian;
+    let fnbmo = num_bin - mfb_offset; // feature_num_bin_minus_offset
+    let fwd_end = fnbmo - 2;
+    let rev_end = num_bin - 2;
+
+    let bd = CUBE_DIM;
+    let fnbmo_u = fnbmo as u32;
+    // ceil(fnbmo / blockDim) strided iterations cover every scan position.
+    let iters = (fnbmo_u + bd - 1) / bd;
+
+    // ---- phase A: linearise the (skip/reverse-adjusted) per-bin sums into scratch ----
+    for k in 0..iters {
+        let bin = UNIT_POS + k * bd; // strided scan position in [0, fnbmo)
+        let bin_i = bin as i32;
+        if bin < fnbmo_u {
+            // forward skip: (bin + mfb_offset) == default_bin; reverse skip: (num_bin-1-bin) == default_bin.
+            let skip_sum = skip_def
+                && ((rev && (num_bin - 1 - bin_i) == default_bin)
+                    || (!rev && (bin_i + mfb_offset) == default_bin));
+            // reverse read-index = fnbmo-1-bin; forward read-index = bin.
+            let read_index = select(rev, fnbmo - 1 - bin_i, bin_i);
+            let ro = (read_index as usize) * 2;
+            let g = select(skip_sum, f32::new(0.0), hist[ro]);
+            let h = select(skip_sum, f32::new(0.0), hist[ro + 1]);
+            grad_buf[bin as usize] = g;
+            hess_buf[bin as usize] = h;
+        }
+    }
+    sync_cube();
+    // thread 0 seeds kEpsilon ONCE at the scan origin (cu:1146).
+    if UNIT_POS == 0 {
+        hess_buf[0] += eps;
+    }
+    sync_cube();
+
+    // ---- phase B: in-place global-memory inclusive prefix sums ----
+    global_memory_prefix_sum(grad_buf, fnbmo_u, plane_dim);
+    sync_cube();
+    global_memory_prefix_sum(hess_buf, fnbmo_u, plane_dim);
+    sync_cube();
+
+    // ---- phase C: strided evaluate — per-unit best (last-beating within the stride,
+    // then cross-thread ReduceBestGain), faithfully reproducing cu:1152-1208. ----
+    let mut local_gain = f32::new(0.0);
+    let mut threshold_value = 0i32;
+    let mut found = false;
+    for k in 0..iters {
+        let bin = UNIT_POS + k * bd;
+        let bin_i = bin as i32;
+        // forward candidate upper bound (mfb1/na special not covered here — see note).
+        let in_range = select(rev, bin_i <= rev_end, bin_i <= fwd_end) && bin < fnbmo_u;
+        let skip_sum = skip_def
+            && ((rev && (num_bin - 1 - bin_i) == default_bin)
+                || (!rev && (bin_i + mfb_offset) == default_bin));
+        if in_range && !skip_sum {
+            let scanned_g = grad_buf[bin as usize];
+            let scanned_h = hess_buf[bin as usize];
+            let scanned_cnt = round_ties_even_f32_cube(scanned_h * cnt_factor);
+            let comp_g = sum_gradient - scanned_g;
+            let comp_h = sum_hessian - scanned_h;
+            let comp_cnt = num_data - scanned_cnt;
+
+            // reverse: scanned side = RIGHT; forward: scanned side = LEFT.
+            let l_g = select(rev, comp_g, scanned_g);
+            let l_h = select(rev, comp_h, scanned_h);
+            let lc = select(rev, comp_cnt, scanned_cnt);
+            let r_g = select(rev, scanned_g, comp_g);
+            let r_h = select(rev, scanned_h, comp_h);
+            let rc = select(rev, scanned_cnt, comp_cnt);
+            let threshold = select(rev, rev_end - bin_i, bin_i + mfb_offset);
+
+            let guard = l_h >= min_sum_hessian_in_leaf
+                && lc >= min_data_in_leaf
+                && r_h >= min_sum_hessian_in_leaf
+                && rc >= min_data_in_leaf;
+            let rand_ok = !use_rand_b || threshold == rand_threshold;
+
+            let gain_ns = get_split_gains_f32(use_l1_b, l_g, l_h, r_g, r_h, lambda_l1, lambda_l2);
+            let gain_sm =
+                get_leaf_gain_smoothed_f32(use_l1_b, l_g, l_h, lambda_l1, lambda_l2, path_smooth, lc, parent_output)
+                    + get_leaf_gain_smoothed_f32(use_l1_b, r_g, r_h, lambda_l1, lambda_l2, path_smooth, rc, parent_output);
+            let current_gain = select(sm, gain_sm, gain_ns);
+
+            // C++ overwrites on every beating candidate (last-in-stride wins within a
+            // thread), then cross-thread ReduceBestGain picks the max (cu:1199-1204).
+            let beat = guard && rand_ok && current_gain > min_gain_shift;
+            local_gain = select(beat, current_gain - min_gain_shift, local_gain);
+            threshold_value = select(beat, threshold, threshold_value);
+            found = found || beat;
+        }
+    }
+
+    // ---- block argmax (strict >, lowest thread index wins ties) ----
+    let win = reduce_best_gain(local_gain, found, block_size);
+    let no_winner = win >= block_size;
+
+    if UNIT_POS == 0 && no_winner {
+        out[0] = f32::new(0.0);
+        out[1] = f32::new(0.0);
+        out[2] = f32::new(0.0);
+        out[3] = f32::new(0.0);
+        out[4] = f32::new(0.0);
+        out[5] = f32::new(0.0);
+        out[6] = f32::new(0.0);
+        out[7] = f32::new(0.0);
+        out[8] = f32::new(0.0);
+        out[9] = f32::new(0.0);
+        out[10] = f32::new(0.0);
+        out[11] = f32::new(0.0);
+        out[12] = f32::new(0.0);
+        out[13] = f32::new(0.0);
+    }
+    if UNIT_POS == win {
+        // write phase: recover the winning bin's scanned side from scratch, kEpsilon
+        // subtracted, count RE-recovered (cu:1215-1272).
+        let best_bin = select(rev, num_bin - 2 - threshold_value, threshold_value - mfb_offset);
+        let w_scanned_g = grad_buf[best_bin as usize];
+        let w_scanned_h = hess_buf[best_bin as usize] - eps;
+        let w_scanned_cnt = round_ties_even_f32_cube(w_scanned_h * cnt_factor);
+        let w_comp_g = sum_gradient - w_scanned_g;
+        let w_comp_h = sum_hessian - w_scanned_h - eps;
+        let w_comp_cnt = num_data - w_scanned_cnt;
+
+        let wl_g = select(rev, w_comp_g, w_scanned_g);
+        let wl_h = select(rev, w_comp_h, w_scanned_h);
+        let wl_c = select(rev, w_comp_cnt, w_scanned_cnt);
+        let wr_g = select(rev, w_scanned_g, w_comp_g);
+        let wr_h = select(rev, w_scanned_h, w_comp_h);
+        let wr_c = select(rev, w_scanned_cnt, w_comp_cnt);
+
+        let l_out_ns = calculate_splitted_leaf_output_f32(use_l1_b, wl_g, wl_h, lambda_l1, lambda_l2);
+        let l_out_sm = calculate_splitted_leaf_output_smoothed_f32(
+            use_l1_b, wl_g, wl_h, lambda_l1, lambda_l2, path_smooth, wl_c, parent_output,
+        );
+        let left_output = select(sm, l_out_sm, l_out_ns);
+        let r_out_ns = calculate_splitted_leaf_output_f32(use_l1_b, wr_g, wr_h, lambda_l1, lambda_l2);
+        let r_out_sm = calculate_splitted_leaf_output_smoothed_f32(
+            use_l1_b, wr_g, wr_h, lambda_l1, lambda_l2, path_smooth, wr_c, parent_output,
+        );
+        let right_output = select(sm, r_out_sm, r_out_ns);
+        let left_gain = get_leaf_gain_given_output_f32(use_l1_b, wl_g, wl_h, lambda_l1, lambda_l2, left_output);
+        let right_gain = get_leaf_gain_given_output_f32(use_l1_b, wr_g, wr_h, lambda_l1, lambda_l2, right_output);
+        let default_left_f = select(assume_out_default_left != 0, 1.0f32, 0.0f32);
+
+        out[0] = f32::new(1.0);
+        out[1] = f32::cast_from(threshold_value);
+        out[2] = default_left_f;
+        out[3] = local_gain;
+        out[4] = wl_g;
+        out[5] = wl_h;
+        out[6] = f32::cast_from(wl_c);
+        out[7] = wr_g;
+        out[8] = wr_h;
+        out[9] = f32::cast_from(wr_c);
+        out[10] = left_output;
+        out[11] = right_output;
+        out[12] = left_gain;
+        out[13] = right_gain;
+    }
+}
+
+/// STAGE 1 `_GlobalMemory` spill launcher (hip f32, gpu-gated) — drives
+/// [`split_eval_globalmem_kernel_f32`] over one `(leaf,feature)` task whose bin count
+/// exceeds the block width, using the PRE-ALLOCATED [`Stage1GlobalMemScratch`] handles
+/// (D-11 — never allocates the scan scratch here). The output packet is the standard
+/// 14-cell [`SplitScalars`] readback (SC#2 single transfer). Anchored to
+/// [`find_best_splits_stage1_on`] within the ~1e-5 f32 envelope; the on-device rocm
+/// parity assertion lands in 17-05 (def-f8u-01).
+///
+/// `block_threads` is the launch width (≤ [`STAGE1_BLOCK_THREADS`]); `plane_dim` is the
+/// device plane/warp width for the two-level per-chunk scan.
+///
+/// # Errors
+/// [`ComputeError`] from [`validate_stage1_inputs`] (bad `num_bin` / histogram length)
+/// or if the scratch slab is too small for this feature's `num_bin - mfb_offset`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_stage1_globalmem_f32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    hist: &[f32],
+    task: &SplitFindTask,
+    scalars: &Stage1Scalars,
+    scratch: &Stage1GlobalMemScratch<R>,
+    block_threads: u32,
+    plane_dim: u32,
+) -> Result<SplitScalars, ComputeError> {
+    validate_stage1_inputs(task.num_bin, hist.len())?;
+    if task.is_categorical {
+        return Ok(SplitScalars::default());
+    }
+    let num_bin_i = task.num_bin as i32;
+    let fnbmo = (task.num_bin as usize).saturating_sub(task.mfb_offset as usize);
+    if fnbmo > scratch.slab_len() {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "globalmem stage1: feature scan length {fnbmo} exceeds scratch slab {}",
+                scratch.slab_len()
+            ),
+        });
+    }
+    let rand_threshold: i32 = if scalars.use_rand && num_bin_i - 2 > 0 {
+        let draw = draw_rand_int32_on(client, &[scalars.rng_seed as u32], 1)?;
+        draw[0] % (num_bin_i - 2)
+    } else {
+        -1
+    };
+    let min_gain_shift = (scalars.parent_gain + scalars.min_gain_to_split) as f32;
+
+    let h_hist = client.create_from_slice(f32::as_bytes(hist));
+    let h_out = client.empty(STAGE1_OUT_LEN * core::mem::size_of::<f32>());
+
+    // SAFETY: `h_hist` is host-validated to `2*num_bin` cells; the scan scratch slab is
+    // `>= fnbmo` (checked above) and pre-allocated once in `Stage1GlobalMemScratch::new`;
+    // `h_out` is `STAGE1_OUT_LEN` cells. All indices derive from the validated bin count.
+    // cubecl unsafe confined here (CMP-01, T-17-01/T-17-02).
+    unsafe {
+        split_eval_globalmem_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(block_threads),
+            ArrayArg::from_raw_parts(h_hist, hist.len()),
+            ArrayArg::from_raw_parts(scratch.feature_hist_grad_buffer.clone(), scratch.slab_len()),
+            ArrayArg::from_raw_parts(scratch.feature_hist_hess_buffer.clone(), scratch.slab_len()),
+            ArrayArg::from_raw_parts(h_out.clone(), STAGE1_OUT_LEN),
+            num_bin_i,
+            task.mfb_offset as i32,
+            task.default_bin as i32,
+            if task.skip_default_bin { 1u32 } else { 0u32 },
+            if task.reverse { 1u32 } else { 0u32 },
+            if task.assume_out_default_left { 1u32 } else { 0u32 },
+            if scalars.use_l1 { 1u32 } else { 0u32 },
+            if scalars.use_smoothing { 1u32 } else { 0u32 },
+            if scalars.use_rand { 1u32 } else { 0u32 },
+            rand_threshold,
+            scalars.min_data_in_leaf,
+            scalars.min_sum_hessian_in_leaf as f32,
+            scalars.lambda_l1 as f32,
+            scalars.lambda_l2 as f32,
+            scalars.path_smooth as f32,
+            scalars.parent_output as f32,
+            min_gain_shift,
+            scalars.sum_gradient as f32,
+            scalars.sum_hessian as f32,
+            scalars.num_data,
+            plane_dim,
+            block_threads,
+        );
+    }
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = f32::from_bytes(&bytes);
+    if cells[0] == 0.0 {
+        return Ok(SplitScalars::default());
+    }
+    Ok(SplitScalars {
+        is_valid: true,
+        leaf_index: -1,
+        gain: cells[3] as f64,
+        inner_feature_index: task.inner_feature_index,
+        threshold: cells[1] as u32,
+        default_left: cells[2] != 0.0,
+        left_sum_gradients: cells[4] as f64,
+        left_sum_hessians: cells[5] as f64,
+        left_sum_gh_quant: 0,
+        left_count: cells[6] as i32,
+        left_gain: cells[12] as f64,
+        left_value: cells[10] as f64,
+        right_sum_gradients: cells[7] as f64,
+        right_sum_hessians: cells[8] as f64,
+        right_sum_gh_quant: 0,
+        right_count: cells[9] as i32,
+        right_gain: cells[13] as f64,
+        right_value: cells[11] as f64,
+        num_cat_threshold: 0,
+    })
+}
+
 /// STAGE 2 (STUB — Wave 3 fills the cross-feature reduce, 17-04).
 ///
 /// `SyncBestSplitForLeafKernel`: block-reduce the per-task `(is_valid, gain)` records
@@ -1376,6 +1944,63 @@ mod tests {
         ));
         // Correct length is accepted (returns 2*num_bin).
         assert_eq!(validate_stage1_inputs(4, 8).unwrap(), 8);
+    }
+
+    /// D-05 dispatch boundary: `num_bin > block_threads` spills to `_GlobalMemory`.
+    #[test]
+    fn stage1_dispatch_globalmem_boundary() {
+        // At or below the block width → in-block two-level path.
+        assert!(!stage1_needs_globalmem(1, STAGE1_BLOCK_THREADS));
+        assert!(!stage1_needs_globalmem(256, STAGE1_BLOCK_THREADS));
+        // Beyond the block width → strided global-memory spill (the golden's num_bin=300).
+        assert!(stage1_needs_globalmem(257, STAGE1_BLOCK_THREADS));
+        assert!(stage1_needs_globalmem(300, STAGE1_BLOCK_THREADS));
+    }
+
+    /// V5 (T-17-01/T-17-02): the `_GlobalMemory` scratch-slab sizing rejects a
+    /// zero/overflowing `largest_feature_bin_count × num_concurrent_blocks` product
+    /// with a typed error BEFORE any allocation.
+    #[test]
+    fn validate_globalmem_scratch_rejects_overflow() {
+        // Zero bin count / zero blocks → Runtime error.
+        assert!(matches!(
+            validate_globalmem_scratch(0, 1),
+            Err(ComputeError::Runtime { .. })
+        ));
+        assert!(matches!(
+            validate_globalmem_scratch(300, 0),
+            Err(ComputeError::Runtime { .. })
+        ));
+        // Overflowing product → Runtime error (usize::MAX bins × 2 blocks).
+        assert!(matches!(
+            validate_globalmem_scratch(usize::MAX, 2),
+            Err(ComputeError::Runtime { .. })
+        ));
+        // A valid product returns the slab length.
+        assert_eq!(validate_globalmem_scratch(300, 4).unwrap(), 1200);
+    }
+
+    /// D-11 alloc-once: the scratch constructor allocates EXACTLY
+    /// [`NUM_STAGE1_SCRATCH_BUFFERS`] (+4) device buffers, once, and never more — the
+    /// structural "no per-split device alloc" invariant (the `DeviceSplitInfo` counter
+    /// idiom). Runs on the cubecl-cpu client (no `gpu` feature needed).
+    #[test]
+    fn globalmem_scratch_allocated_exactly_once() {
+        use crate::runtime::cpu_client;
+        let client = cpu_client();
+        let scratch = Stage1GlobalMemScratch::new(&client, 300, 4)
+            .expect("scratch alloc for 300 bins × 4 blocks");
+        assert_eq!(
+            scratch.device_allocations(),
+            NUM_STAGE1_SCRATCH_BUFFERS,
+            "the 4 scan/reserved buffers are allocated exactly once (D-11)"
+        );
+        assert_eq!(scratch.device_allocations(), 4);
+        assert_eq!(scratch.slab_len(), 1200);
+        assert_eq!(scratch.largest_feature_bin_count(), 300);
+        assert_eq!(scratch.num_concurrent_blocks(), 4);
+        // Overflowing construction is rejected (V5) before any alloc.
+        assert!(Stage1GlobalMemScratch::new(&client, usize::MAX, 2).is_err());
     }
 
     /// Helper: a non-categorical `FeatureMeta` with the given num_bin/missing_type.
