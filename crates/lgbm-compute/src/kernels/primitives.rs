@@ -477,6 +477,13 @@ fn add_base_kernel_u32(out: &mut Array<u32>, block_bases: &Array<u32>, block_siz
 /// serial Rust inclusive scan (no rounding). Same 3-launch structure + single
 /// reused block-totals scratch as [`prefix_sum_inclusive_f64_on`].
 ///
+/// # Precondition (IN-04)
+/// The scan accumulates in `u16`, so the **inclusive total** (`sum of all cells`)
+/// must be `<= u16::MAX` (65535); a larger total wraps silently. The phase-18 caller
+/// is safe — `scatter_marked` scans 0/1 marks gated by `if n <= u16::MAX`
+/// (`data_partition.rs`) — but a general caller must respect this ceiling. A
+/// `debug_assert` on the input sum guards it with no release-mode cost.
+///
 /// # Errors
 /// [`ComputeError::Runtime`] if `block_size == 0` or `num_blocks > 1024`.
 pub fn prefix_sum_inclusive_u16_on<R: cubecl::Runtime>(
@@ -489,6 +496,13 @@ pub fn prefix_sum_inclusive_u16_on<R: cubecl::Runtime>(
     if n == 0 {
         return Ok(Vec::new());
     }
+
+    // IN-04: the u16 accumulator wraps silently past 65535. Guard the inclusive-total
+    // ceiling in debug builds (sum computed in u64 to avoid the very overflow we check).
+    debug_assert!(
+        data.iter().map(|&x| u64::from(x)).sum::<u64>() <= u64::from(u16::MAX),
+        "prefix_sum_inclusive_u16_on: inclusive total exceeds u16::MAX (65535) and would wrap"
+    );
 
     let h_in = client.create_from_slice(u16::as_bytes(data));
     let h_out = client.empty(n * core::mem::size_of::<u16>());
