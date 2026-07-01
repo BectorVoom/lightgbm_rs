@@ -10,14 +10,13 @@
 //! untracked `LightGBM/` tree), raw-integer / raw-f64-bits parsing (zero
 //! rounding), graceful SKIP when the fixture is absent, and a localizing assert.
 //!
-//! ## Wave-0 status (18-01)
-//! The §9-faithful device partition core lands in **18-02** (Wave 1). Until then
-//! there is no device entry point to drive, so every cell here parses + structurally
-//! validates its golden and is marked
-//! `#[ignore = "Wave-0 scaffold; un-ignore when 18-02 lands"]` so the merge-gate
-//! `cargo test --workspace` stays GREEN with `LGBM_CUDA_ON_DEVICE` unset
-//! (D-13 / ODL-19). 18-02 replaces each `// UN-IGNORE (18-02):` block with the
-//! real device call + `compare_exact_*` and removes the `#[ignore]`.
+//! ## 18-02 status (Wave 1, ODL-13)
+//! The §9-faithful device partition core landed in **18-02**. Each cell drives the
+//! cpu f64 stable-partition ANCHOR (`partition_leaf_stable` /
+//! `partition_categorical_stable`, D-04 CONFIRMED) AND the full device fold
+//! (`partition_on_device` / `partition_categorical_on_device`) where the cpu
+//! device client is available, comparing bit-exact to the golden — never
+//! GPU-vs-GPU (D-12).
 //!
 //! ## Record format (see `tests/fixtures/kernels/partition.txt`)
 //! ```text
@@ -38,12 +37,20 @@
 
 use std::path::PathBuf;
 
+use lgbm_compute::kernels::data_partition::{
+    partition_categorical_on_device, partition_categorical_stable, partition_leaf_stable,
+    partition_on_device, split_tree_structure_packet,
+};
+use lgbm_compute::kernels::split_info::SplitScalars;
+use lgbm_compute::runtime::cpu_client;
+use lgbm_compute::BinColumn;
+use oracle_harness::comparator::{compare_exact_f64_bits, compare_exact_u32};
+
 fn kernels_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kernels")
 }
 
 /// Parse an `f64` from a raw little-endian f64 bit pattern (decimal `u64`).
-#[allow(dead_code)]
 fn parse_f64_bits(s: &str) -> f64 {
     f64::from_bits(s.parse::<u64>().expect("f64-bits u64 field"))
 }
@@ -85,8 +92,7 @@ fn read_partition() -> Option<String> {
 }
 
 /// Assert `order` is a permutation of `0..n` split at `split_point` — the
-/// structural invariant of a stable partition (D-04). Real device-vs-golden
-/// bit-exact comparison is wired in 18-02.
+/// structural invariant of a stable partition (D-04).
 fn assert_permutation(name: &str, order: &[u32], n: usize, split_point: usize) {
     assert_eq!(order.len(), n, "PARTITION `{name}`: order length != row count");
     assert!(split_point <= n, "PARTITION `{name}`: split_point out of range");
@@ -98,13 +104,13 @@ fn assert_permutation(name: &str, order: &[u32], n: usize, split_point: usize) {
     }
 }
 
-/// `order` cell (ODL-13, numeric row-order): parse every PCASE and assert the
-/// golden PORDER is a valid stable partition. 18-02 un-ignores and drives the
-/// device `mark → prefix-sum → scatter` fold, comparing bit-exact.
+/// `order` cell (ODL-13, numeric row-order): parse every PCASE, drive the cpu f64
+/// stable-partition ANCHOR AND the device `mark → prefix-sum → scatter` fold, and
+/// assert both equal the golden PORDER bit-exact across the full flag fan-out.
 #[test]
-#[ignore = "Wave-0 scaffold; un-ignore when 18-02 lands"]
 fn partition_parity_order() {
     let Some(text) = read_partition() else { return };
+    let client = cpu_client();
     let mut lines = text.lines();
     let mut n_cases = 0;
     while let Some(raw) = lines.next() {
@@ -117,13 +123,15 @@ fn partition_parity_order() {
             continue;
         }
         let name = field(&t, "name").expect("PCASE name").to_string();
-        let _min_bin = parse_i64(&t, "min_bin") as u32;
-        let _max_bin = parse_i64(&t, "max_bin") as u32;
-        let _threshold = parse_i64(&t, "threshold") as u32;
-        let _most_freq_bin = parse_i64(&t, "most_freq_bin") as u32;
-        let _missing_type = field(&t, "missing_type").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-        let _default_bin = field(&t, "default_bin").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-        let _default_left = field(&t, "default_left").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0;
+        let num_bin = parse_i64(&t, "num_bin") as u32;
+        let min_bin = parse_i64(&t, "min_bin") as u32;
+        let max_bin = parse_i64(&t, "max_bin") as u32;
+        let threshold = parse_i64(&t, "threshold") as u32;
+        let most_freq_bin = parse_i64(&t, "most_freq_bin") as u32;
+        let missing_type = field(&t, "missing_type").and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+        let default_bin = field(&t, "default_bin").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let default_left =
+            field(&t, "default_left").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0;
 
         let bt: Vec<&str> = lines.next().expect("PBINS").split_whitespace().collect();
         assert_eq!(bt[0], "PBINS", "expected PBINS for `{name}`");
@@ -137,12 +145,46 @@ fn partition_parity_order() {
 
         assert_permutation(&name, &order, bins.len(), split_point);
 
-        // UN-IGNORE (18-02): drive the device fold and compare bit-exact, e.g.
-        //   let (got_order, got_split) = lgbm_compute::kernels::data_partition::
-        //       partition_on_device(&client, &bins, num_bin, min_bin, max_bin,
-        //           default_bin, most_freq_bin, missing_type, default_left, threshold)?;
-        //   oracle_harness::comparator::compare_exact_u32(&got_order, &order)?;
-        //   assert_eq!(got_split, split_point);
+        let col = BinColumn::new(bins.clone(), num_bin);
+        let data_indices: Vec<u32> = (0..bins.len() as u32).collect();
+
+        // cpu f64 stable-partition ANCHOR (D-04 CONFIRMED).
+        let (got_order, got_split) = partition_leaf_stable(
+            &col,
+            &data_indices,
+            num_bin,
+            min_bin,
+            max_bin,
+            default_bin,
+            most_freq_bin,
+            missing_type,
+            default_left,
+            threshold,
+        )
+        .unwrap_or_else(|e| panic!("PCASE `{name}` anchor errored: {e:?}"));
+        compare_exact_u32(&got_order, &order)
+            .unwrap_or_else(|m| panic!("PCASE `{name}` anchor PORDER mismatch: {m:?}"));
+        assert_eq!(got_split, split_point, "PCASE `{name}` anchor split_point");
+
+        // Full device mark → prefix-sum → scatter fold (still cpu-fold-anchored).
+        let (dev_order, dev_split) = partition_on_device(
+            &client,
+            &col,
+            &data_indices,
+            num_bin,
+            min_bin,
+            max_bin,
+            default_bin,
+            most_freq_bin,
+            missing_type,
+            default_left,
+            threshold,
+        )
+        .unwrap_or_else(|e| panic!("PCASE `{name}` device errored: {e:?}"));
+        compare_exact_u32(&dev_order, &order)
+            .unwrap_or_else(|m| panic!("PCASE `{name}` device PORDER mismatch: {m:?}"));
+        assert_eq!(dev_split, split_point, "PCASE `{name}` device split_point");
+
         n_cases += 1;
     }
     assert!(n_cases > 0, "partition fixture present but parsed zero PCASE");
@@ -152,13 +194,12 @@ fn partition_parity_order() {
 mod cat {
     use super::*;
 
-    /// Parse every PCAT block and assert the membership golden PCATORDER is a valid
-    /// stable partition. 18-02 un-ignores and drives the device
-    /// `GenDataToLeftBitVectorKernel_Categorical` (`FindInBitsetCUDA`) fold.
+    /// Parse every PCAT block, drive the categorical anchor + device fold
+    /// (`FindInBitset` membership), and compare bit-exact to the golden PCATORDER.
     #[test]
-    #[ignore = "Wave-0 scaffold; un-ignore when 18-02 lands"]
     fn partition_parity_cat_membership() {
         let Some(text) = read_partition() else { return };
+        let client = cpu_client();
         let mut lines = text.lines();
         let mut n_cases = 0;
         while let Some(raw) = lines.next() {
@@ -168,13 +209,14 @@ mod cat {
                 continue;
             }
             let name = field(&t, "name").expect("PCAT name").to_string();
-            let _min_bin = parse_i64(&t, "min_bin") as u32;
-            let _max_bin = parse_i64(&t, "max_bin") as u32;
-            let _most_freq_bin = parse_i64(&t, "most_freq_bin") as u32;
+            let num_bin = parse_i64(&t, "num_bin") as u32;
+            let min_bin = parse_i64(&t, "min_bin") as u32;
+            let max_bin = parse_i64(&t, "max_bin") as u32;
+            let most_freq_bin = parse_i64(&t, "most_freq_bin") as u32;
 
             let bs: Vec<&str> = lines.next().expect("PCATBITSET").split_whitespace().collect();
             assert_eq!(bs[0], "PCATBITSET", "expected PCATBITSET for `{name}`");
-            let _bitset = parse_u32_list(bs.get(1).copied().unwrap_or(""));
+            let bitset = parse_u32_list(bs.get(1).copied().unwrap_or(""));
             let bt: Vec<&str> = lines.next().expect("PCATBINS").split_whitespace().collect();
             assert_eq!(bt[0], "PCATBINS", "expected PCATBINS for `{name}`");
             let bins = parse_u32_list(bt.get(1).copied().unwrap_or(""));
@@ -187,11 +229,24 @@ mod cat {
 
             assert_permutation(&name, &order, bins.len(), split_point);
 
-            // UN-IGNORE (18-02): drive the categorical device fold and compare, e.g.
-            //   let (got_order, got_split) = lgbm_compute::kernels::data_partition::
-            //       partition_categorical_on_device(&client, &bins, min_bin, max_bin,
-            //           most_freq_bin, &bitset)?;
-            //   oracle_harness::comparator::compare_exact_u32(&got_order, &order)?;
+            let col = BinColumn::new(bins.clone(), num_bin);
+            let data_indices: Vec<u32> = (0..bins.len() as u32).collect();
+
+            let (got_order, got_split) =
+                partition_categorical_stable(&col, &data_indices, num_bin, min_bin, max_bin, most_freq_bin, &bitset)
+                    .unwrap_or_else(|e| panic!("PCAT `{name}` anchor errored: {e:?}"));
+            compare_exact_u32(&got_order, &order)
+                .unwrap_or_else(|m| panic!("PCAT `{name}` anchor PCATORDER mismatch: {m:?}"));
+            assert_eq!(got_split, split_point, "PCAT `{name}` anchor split_point");
+
+            let (dev_order, dev_split) = partition_categorical_on_device(
+                &client, &col, &data_indices, num_bin, min_bin, max_bin, most_freq_bin, &bitset,
+            )
+            .unwrap_or_else(|e| panic!("PCAT `{name}` device errored: {e:?}"));
+            compare_exact_u32(&dev_order, &order)
+                .unwrap_or_else(|m| panic!("PCAT `{name}` device PCATORDER mismatch: {m:?}"));
+            assert_eq!(dev_split, split_point, "PCAT `{name}` device split_point");
+
             n_cases += 1;
         }
         assert!(n_cases > 0, "partition fixture present but parsed zero PCAT");
@@ -202,48 +257,51 @@ mod cat {
 mod packet {
     use super::*;
 
-    /// Parse every PPACKET block and assert the packet field self-consistency
-    /// (smaller/larger chosen by num_data). 18-02 un-ignores and compares the
-    /// device-reconstructed 16-int buffer field-for-field (ints exact, the 4 f64
-    /// sums via `compare_exact_f64_bits`).
+    /// Parse every PPACKET block, reconstruct the 16-int packet
+    /// (`split_tree_structure_packet`), and compare field-for-field (8 ints exact +
+    /// the 4 f64 sums via `compare_exact_f64_bits`).
     #[test]
-    #[ignore = "Wave-0 scaffold; un-ignore when 18-02 lands"]
     fn partition_parity_packet_fields() {
         let Some(text) = read_partition() else { return };
         let mut n_cases = 0;
         for raw in text.lines() {
-            let t: Vec<&str> = raw.trim().split_whitespace().collect();
+            let t: Vec<&str> = raw.split_whitespace().collect();
             if t.is_empty() || t[0] != "PPACKET" {
                 continue;
             }
             let name = field(&t, "name").expect("PPACKET name").to_string();
-            let left_leaf = parse_i64(&t, "left_leaf");
-            let right_leaf = parse_i64(&t, "right_leaf");
-            let left_num = parse_i64(&t, "left_num_data");
-            let right_num = parse_i64(&t, "right_num_data");
-            let smaller = parse_i64(&t, "smaller");
-            let larger = parse_i64(&t, "larger");
-            // The 4 f64 packet sums (parsed to prove the bit-hex convention).
-            let _lh = parse_f64_bits(field(&t, "left_sum_hessians").expect("lh"));
-            let _rh = parse_f64_bits(field(&t, "right_sum_hessians").expect("rh"));
-            let _lg = parse_f64_bits(field(&t, "left_sum_gradients").expect("lg"));
-            let _rg = parse_f64_bits(field(&t, "right_sum_gradients").expect("rg"));
+            let left_leaf = parse_i64(&t, "left_leaf") as i32;
+            let right_leaf = parse_i64(&t, "right_leaf") as i32;
+            let left_num = parse_i64(&t, "left_num_data") as i32;
+            let right_num = parse_i64(&t, "right_num_data") as i32;
+            let left_start = parse_i64(&t, "left_data_start") as i32;
+            let right_start = parse_i64(&t, "right_data_start") as i32;
+            let smaller = parse_i64(&t, "smaller") as i32;
+            let larger = parse_i64(&t, "larger") as i32;
+            let lh = parse_f64_bits(field(&t, "left_sum_hessians").expect("lh"));
+            let rh = parse_f64_bits(field(&t, "right_sum_hessians").expect("rh"));
+            let lg = parse_f64_bits(field(&t, "left_sum_gradients").expect("lg"));
+            let rg = parse_f64_bits(field(&t, "right_sum_gradients").expect("rg"));
 
-            // buffer[6]/[7] = smaller/larger by num_data[left] < num_data[right]
-            // (SplitTreeStructureKernel:823) — self-consistency of the golden.
-            let (exp_smaller, exp_larger) = if left_num < right_num {
-                (left_leaf, right_leaf)
-            } else {
-                (right_leaf, left_leaf)
+            // Reconstruct the packet from the CUDASplitInfo per-side sums (D-08).
+            let scalars = SplitScalars {
+                left_sum_hessians: lh,
+                right_sum_hessians: rh,
+                left_sum_gradients: lg,
+                right_sum_gradients: rg,
+                ..SplitScalars::default()
             };
-            assert_eq!(smaller, exp_smaller, "PPACKET `{name}`: smaller-child index");
-            assert_eq!(larger, exp_larger, "PPACKET `{name}`: larger-child index");
+            let pk = split_tree_structure_packet(
+                left_leaf, left_num, left_start, right_leaf, right_num, right_start, &scalars,
+            );
 
-            // UN-IGNORE (18-02): reconstruct the 16-int packet on-device and compare
-            // field-for-field, e.g.
-            //   let pk = lgbm_compute::kernels::data_partition::split_tree_structure_packet(..);
-            //   assert_eq!(pk.ints, [left_leaf, left_num, left_start, right_leaf, ...]);
-            //   oracle_harness::comparator::compare_exact_f64_bits(&pk.sums, &[lh, rh, lg, rg])?;
+            assert_eq!(
+                pk.ints,
+                [left_leaf, left_num, left_start, right_leaf, right_num, right_start, smaller, larger],
+                "PPACKET `{name}`: 16-int packet ints mismatch"
+            );
+            compare_exact_f64_bits(&pk.sums, &[lh, rh, lg, rg])
+                .unwrap_or_else(|m| panic!("PPACKET `{name}`: packet f64 sums mismatch: {m:?}"));
             n_cases += 1;
         }
         assert!(n_cases > 0, "partition fixture present but parsed zero PPACKET");
