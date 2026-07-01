@@ -36,6 +36,7 @@
 //! the V5 `checked_mul` slab-sizing boundary (T-16-02-01).
 
 use core::marker::PhantomData;
+use std::collections::HashMap;
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -70,6 +71,11 @@ pub struct HistArena<R: cubecl::Runtime> {
     /// Current slot index the larger child is derived into (becomes `parent_idx`
     /// after [`Self::rotate`]).
     larger_idx: usize,
+    /// Leaf-index → slot-index table for the cross-tree whole-pool SWAP (Phase 18,
+    /// D-09). Maps a live leaf id to the pool slot holding its histogram; mutated
+    /// ONLY by [`Self::set_leaf_slot`] / [`Self::swap`] (index reassignment, zero
+    /// `client.empty`).
+    leaf_to_slot: HashMap<usize, usize>,
     _runtime: PhantomData<R>,
 }
 
@@ -146,6 +152,7 @@ impl<R: cubecl::Runtime> HistArena<R> {
             parent_idx: 0,
             smaller_idx,
             larger_idx: 0,
+            leaf_to_slot: HashMap::new(),
             _runtime: PhantomData,
         })
     }
@@ -263,6 +270,113 @@ impl<R: cubecl::Runtime> HistArena<R> {
             "HistArena::rotate: smaller must not alias the larger (== parent) slot"
         );
 
+        Ok(())
+    }
+
+    // =====================================================================
+    // Phase-18 cross-tree whole-pool SWAP (D-09) — the `SplitTreeStructureKernel`
+    // leaf-indexed histogram-pool pointer swap. Extends (does NOT rebuild) the
+    // per-split `rotate()` above with a leaf-index → slot-handle table.
+    // =====================================================================
+
+    /// Assign leaf `leaf` to pool slot `slot` (index reassignment ONLY, no
+    /// allocation). Seeds the leaf→slot table for the root / a freshly-created
+    /// leaf before it is split via [`Self::swap`].
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] if `slot >= num_slots`.
+    pub fn set_leaf_slot(&mut self, leaf: usize, slot: usize) -> Result<(), ComputeError> {
+        if slot >= self.num_slots {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "HistArena::set_leaf_slot: slot {slot} >= num_slots {}",
+                    self.num_slots
+                ),
+            });
+        }
+        self.leaf_to_slot.insert(leaf, slot);
+        Ok(())
+    }
+
+    /// The pool slot index currently holding leaf `leaf`'s histogram, if assigned.
+    #[must_use]
+    pub fn leaf_slot(&self, leaf: usize) -> Option<usize> {
+        self.leaf_to_slot.get(&leaf).copied()
+    }
+
+    /// The device `Handle` for leaf `leaf`'s histogram slot (clone — no allocation).
+    ///
+    /// # Panics
+    /// If `leaf` has no slot assignment (call [`Self::set_leaf_slot`] /
+    /// [`Self::swap`] first).
+    #[must_use]
+    pub fn leaf_handle(&self, leaf: usize) -> Handle {
+        let slot = self
+            .leaf_to_slot
+            .get(&leaf)
+            .copied()
+            .expect("HistArena::leaf_handle: leaf has no slot assignment");
+        self.slots[slot].clone()
+    }
+
+    /// The `SplitTreeStructureKernel` whole-pool swap (`cuda_data_partition.cu:827-906`,
+    /// D-09): the leaf `parent_leaf` splits into `left_leaf` / `right_leaf`. The
+    /// **larger** child inherits the parent's slot (so the subtraction trick derives
+    /// `larger = parent − smaller` IN-PLACE in that buffer); the **smaller** child
+    /// takes a FRESH non-aliasing slot and rebuilds directly (§17, Pitfall 5).
+    /// `smaller_is_left` picks the branch (`num_data[left] < num_data[right]`).
+    ///
+    /// Reassigns leaf→slot INDICES only — ZERO `client.empty` (`device_allocations`
+    /// frozen), NO bulk histogram copy. Mirrors [`Self::rotate`]'s no-alias
+    /// discipline (T-16-02-02): the smaller child never aliases the larger's slot.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] if `parent_leaf` has no slot assignment or the pool
+    /// has fewer than 2 slots (a non-aliasing fresh slot cannot be supplied).
+    pub fn swap(
+        &mut self,
+        parent_leaf: usize,
+        left_leaf: usize,
+        right_leaf: usize,
+        smaller_is_left: bool,
+    ) -> Result<(), ComputeError> {
+        if self.num_slots < 2 {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "HistArena::swap: a non-aliasing fresh slot requires num_slots >= 2 (have {})",
+                    self.num_slots
+                ),
+            });
+        }
+        let parent_slot = self.leaf_to_slot.get(&parent_leaf).copied().ok_or_else(|| {
+            ComputeError::Runtime {
+                detail: format!("HistArena::swap: parent leaf {parent_leaf} has no slot assignment"),
+            }
+        })?;
+
+        let (smaller_leaf, larger_leaf) = if smaller_is_left {
+            (left_leaf, right_leaf)
+        } else {
+            (right_leaf, left_leaf)
+        };
+
+        // Larger child inherits the parent buffer in-place (`larger = parent − smaller`).
+        // Smaller child takes a fresh slot distinct from the parent (== larger).
+        let fresh = (parent_slot + 1) % self.num_slots;
+
+        // T-16-02-02: never alias the smaller and larger children into one slot.
+        assert_ne!(
+            fresh, parent_slot,
+            "HistArena::swap must never alias the smaller and larger children into one slot"
+        );
+
+        self.leaf_to_slot.insert(larger_leaf, parent_slot);
+        self.leaf_to_slot.insert(smaller_leaf, fresh);
+        // Track the roles so `parent_handle`/`smaller_handle`/`larger_handle` and the
+        // allocation-frozen invariant stay consistent with `rotate()`.
+        self.parent_idx = parent_slot;
+        self.larger_idx = parent_slot;
+        self.smaller_idx = fresh;
         Ok(())
     }
 }
@@ -452,6 +566,98 @@ mod tests {
             arena.device_allocations(),
             allocs_before_launch,
             "rotate + subtract round-trip must not grow the arena allocation count"
+        );
+    }
+
+    /// D-09 whole-pool SWAP: `set_leaf_slot` + `swap` reassign leaf→slot INDICES
+    /// only (zero `client.empty`), the larger child inherits the parent slot, and
+    /// the smaller child takes a fresh non-aliasing slot.
+    #[test]
+    fn swap_bookkeeping_no_alloc_no_alias() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 3, 16).unwrap();
+        let before = arena.device_allocations();
+        arena.set_leaf_slot(0, 0).unwrap(); // parent leaf 0 lives in slot 0
+
+        // Left is smaller → larger (right=2) inherits parent slot; smaller (left=1) fresh.
+        arena.swap(0, 1, 2, true).unwrap();
+        let larger_slot = arena.leaf_slot(2).unwrap();
+        let smaller_slot = arena.leaf_slot(1).unwrap();
+        assert_eq!(larger_slot, 0, "larger child must inherit the parent slot");
+        assert_ne!(smaller_slot, larger_slot, "smaller must not alias the larger slot");
+        assert_eq!(arena.device_allocations(), before, "swap must not allocate");
+
+        // Mirror branch: right smaller → larger (left) inherits, smaller (right) fresh.
+        arena.set_leaf_slot(3, 1).unwrap();
+        arena.swap(3, 4, 5, false).unwrap();
+        assert_eq!(arena.leaf_slot(4).unwrap(), 1, "larger (left) inherits parent slot");
+        assert_ne!(arena.leaf_slot(5).unwrap(), 1, "smaller (right) must be fresh");
+        assert_eq!(arena.device_allocations(), before, "swap must not allocate");
+    }
+
+    /// A 1-slot pool cannot supply a non-aliasing fresh slot — `swap()` rejects it
+    /// with a typed error rather than aliasing (T-16-02-02).
+    #[test]
+    fn swap_rejects_single_slot_pool() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 1, 16).unwrap();
+        arena.set_leaf_slot(0, 0).unwrap();
+        assert!(matches!(arena.swap(0, 1, 2, true), Err(ComputeError::Runtime { .. })));
+    }
+
+    /// D-09 round-trip on the cpu f64 anchor (never GPU-vs-GPU): after the
+    /// leaf-indexed `swap()`, driving `{parent, smaller}` through the VERBATIM
+    /// `subtract_hist_kernel` with the LARGER child's slot as output lands the
+    /// `parent − smaller` result in the larger child's slot (== the old parent
+    /// slot), proving the subtraction-trick reuse is correct. Allocations frozen.
+    #[test]
+    fn swap_subtract_lands_in_larger_slot() {
+        use crate::kernels::subtract::subtract_hist_kernel;
+
+        let client = cpu_client();
+        let slot_len = 8usize; // 4 bins × 2 (stride-2 [g,h,g,h,…])
+        let mut arena = HistArena::new(&client, 3, slot_len).unwrap();
+        arena.set_leaf_slot(0, 0).unwrap(); // parent leaf 0 in slot 0
+
+        // Left smaller: larger = right (leaf 2) inherits slot 0; smaller = left (leaf 1) fresh.
+        arena.swap(0, 1, 2, true).unwrap();
+        assert_eq!(arena.leaf_slot(2).unwrap(), 0);
+
+        let parent_data = vec![10.0f64, 5.0, 8.0, 4.0, 9.0, 3.0, 7.0, 2.0];
+        let smaller_data = vec![3.0f64, 2.0, 1.0, 1.0, 4.0, 1.0, 2.0, 1.0];
+        let expected: Vec<f64> = parent_data
+            .iter()
+            .zip(&smaller_data)
+            .map(|(p, c)| p - c)
+            .collect();
+
+        let h_parent = client.create_from_slice(f64::as_bytes(&parent_data));
+        let h_smaller = client.create_from_slice(f64::as_bytes(&smaller_data));
+        // OUTPUT is the LARGER child's slot (leaf 2 == old parent slot 0, in-place).
+        let h_larger = arena.leaf_handle(2);
+        let allocs_before = arena.device_allocations();
+
+        // SAFETY: `h_parent`/`h_smaller` sized `slot_len` f64 cells; the larger slot
+        // was allocated for `slot_len` f64 cells in `new`; all outlive the launch and
+        // the kernel guards `i < n`.
+        unsafe {
+            subtract_hist_kernel::launch(
+                &client,
+                CubeCount::Static(64, 1, 1),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(h_parent, slot_len),
+                ArrayArg::from_raw_parts(h_smaller, slot_len),
+                ArrayArg::from_raw_parts(h_larger.clone(), slot_len),
+            );
+        }
+
+        let bytes = client.read_one_unchecked(h_larger);
+        let got = f64::from_bytes(&bytes).to_vec();
+        assert_eq!(got, expected, "derived larger histogram must equal parent - smaller");
+        assert_eq!(
+            arena.device_allocations(),
+            allocs_before,
+            "swap + subtract round-trip must not grow the arena allocation count"
         );
     }
 }
