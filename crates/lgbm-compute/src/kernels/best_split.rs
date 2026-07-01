@@ -51,6 +51,8 @@
 
 use cubecl::prelude::*;
 
+use lgbm_dataset::MissingType;
+
 use crate::error::ComputeError;
 use crate::kernels::split_info::SplitScalars;
 
@@ -99,6 +101,33 @@ pub struct SplitFindTask {
     pub rand_threshold: i32,
 }
 
+/// The host feature-metadata input to [`build_split_find_tasks`] — the per-inner-
+/// feature fields the C++ task-gen loop (`cuda_best_split_finder.cpp:137-227`)
+/// reads to decide the emitted task(s) and their `assume_out_default_left`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureMeta {
+    /// The inner feature index (`inner_feature_index`).
+    pub inner_feature_index: i32,
+    /// The feature's bin count (`feature_num_bins_[i]`).
+    pub num_bin: u32,
+    /// The feature's missing type (`feature_missing_type_[i]`).
+    pub missing_type: MissingType,
+    /// Whether the feature is categorical (`is_categorical_[i]`).
+    pub is_categorical: bool,
+    /// The `max_cat_to_onehot_` threshold used to set `is_one_hot`.
+    pub max_cat_to_onehot: i32,
+    /// This feature's histogram start offset (`feature_hist_offsets_[i]`).
+    pub hist_offset: u32,
+    /// The most-frequent-bin layout offset (`feature_mfb_offsets_[i]`, u8).
+    pub mfb_offset: u8,
+    /// The feature's default bin (`feature_default_bins_[i]`).
+    pub default_bin: u32,
+    /// The USE_RAND drawn threshold to stamp (`-1` when extra-trees off). The actual
+    /// draw (`CUDARandom.NextInt(0, num_bin-2)` seeded `extra_seed + task_index`) is
+    /// a Wave-2 concern; the host builder only carries the value through.
+    pub rand_threshold: i32,
+}
+
 /// `__double2int_rn` — round to nearest, ties to EVEN (IEEE round-half-to-even),
 /// the CUDA-core count-recovery rounding (`cnt = __double2int_rn(scanned_hess *
 /// cnt_factor)`, `cuda_best_split_finder.cu`).
@@ -130,6 +159,95 @@ pub fn round_ties_even_branchfree(x: f64) -> i32 {
     // tie (diff == 0.5) rounds to the EVEN neighbour; otherwise round-half-up.
     let up = diff > 0.5 || (diff == 0.5 && ((f as i64) & 1 == 1));
     (if up { f + 1.0 } else { f }) as i32
+}
+
+/// Reproduce the C++ `SplitFindTask` task-gen table
+/// (`cuda_best_split_finder.cpp:137-227`) EXACTLY.
+///
+/// Emits, per inner feature, in C++ order (so task indices line up with the
+/// smaller/larger stream split the Wave-3 stage-2 reader expects — smaller task `t`
+/// ↔ record `[t]`, larger task `t` ↔ `[t + num_tasks]`):
+///
+/// | Feature condition | Tasks emitted | `assume_out_default_left` |
+/// |---|---|---|
+/// | `num_bin>2 && missing==Zero && !cat` | forward (skip_default_bin) THEN reverse (skip_default_bin) | fwd=**false**, rev=**true** |
+/// | `num_bin>2 && missing==NaN && !cat` | forward (na_as_missing) THEN reverse (na_as_missing) | fwd=**false**, rev=**true** |
+/// | `num_bin<=2 or missing==None`, non-cat | single reverse task | `(missing != NaN) ? **true** : **false**` |
+/// | categorical | single forward task (`is_one_hot = num_bin <= max_cat_to_onehot`) | **false** (Phase-22 seam, D-04) |
+///
+/// The D-01 landmine (Pitfall 3): `default_left` is precomputed here at task-gen
+/// time from the missing type, NOT from `reverse` — a `MissingType::None` feature
+/// yields a single `reverse=true` task with `assume_out_default_left=false`
+/// (`default_left != reverse`). No categorical eval math lives here (D-04 wires the
+/// `is_categorical`/`is_one_hot` dispatch seam only; Phase 22 fills the eval).
+pub fn build_split_find_tasks(features: &[FeatureMeta]) -> Vec<SplitFindTask> {
+    let mut tasks = Vec::new();
+    for f in features {
+        if f.num_bin > 2 && f.missing_type != MissingType::None && !f.is_categorical {
+            // Forward-then-reverse PAIR. `skip_default_bin`/`na_as_missing` differ by
+            // missing type; `assume_out_default_left` is false on forward, true on
+            // reverse (cpp:141-171 Zero, :172-200 NaN).
+            let (skip_default_bin, na_as_missing) = match f.missing_type {
+                MissingType::Zero => (true, false),
+                MissingType::NaN => (false, true),
+                MissingType::None => unreachable!("guarded by missing_type != None above"),
+            };
+            // Forward task (assume_out_default_left = false).
+            tasks.push(SplitFindTask {
+                inner_feature_index: f.inner_feature_index,
+                reverse: false,
+                skip_default_bin,
+                na_as_missing,
+                assume_out_default_left: false,
+                is_categorical: false,
+                is_one_hot: false,
+                hist_offset: f.hist_offset,
+                mfb_offset: f.mfb_offset,
+                num_bin: f.num_bin,
+                default_bin: f.default_bin,
+                rand_threshold: f.rand_threshold,
+            });
+            // Reverse task (assume_out_default_left = true).
+            tasks.push(SplitFindTask {
+                inner_feature_index: f.inner_feature_index,
+                reverse: true,
+                skip_default_bin,
+                na_as_missing,
+                assume_out_default_left: true,
+                is_categorical: false,
+                is_one_hot: false,
+                hist_offset: f.hist_offset,
+                mfb_offset: f.mfb_offset,
+                num_bin: f.num_bin,
+                default_bin: f.default_bin,
+                rand_threshold: f.rand_threshold,
+            });
+        } else {
+            // Single task (cpp:202-227). Categorical → forward one-hot seam; else
+            // reverse. `default_left = (missing != NaN && !categorical)`.
+            let (reverse, is_categorical, is_one_hot) = if f.is_categorical {
+                (false, true, (f.num_bin as i32) <= f.max_cat_to_onehot)
+            } else {
+                (true, false, false)
+            };
+            let assume_out_default_left = f.missing_type != MissingType::NaN && !f.is_categorical;
+            tasks.push(SplitFindTask {
+                inner_feature_index: f.inner_feature_index,
+                reverse,
+                skip_default_bin: false,
+                na_as_missing: false,
+                assume_out_default_left,
+                is_categorical,
+                is_one_hot,
+                hist_offset: f.hist_offset,
+                mfb_offset: f.mfb_offset,
+                num_bin: f.num_bin,
+                default_bin: f.default_bin,
+                rand_threshold: f.rand_threshold,
+            });
+        }
+    }
+    tasks
 }
 
 /// The shared per-task stage-1 scalars — the leaf totals + gain/guard config the
@@ -234,7 +352,8 @@ pub fn sync_best_split_for_leaf_on<R: cubecl::Runtime>(
 /// device→host transfer per iteration, SC#2). Field layout (17-RESEARCH §"3-Stage
 /// Reduction & Export"): `[0]` smaller.inner_feature_index, `[1]` smaller.threshold,
 /// `[2]` smaller.default_left, `[3..6]` larger triple, `[6]` best_leaf_index (`-1` if
-/// none), `[7]` best_leaf.num_cat_threshold.
+/// none), `[7]` the best leaf's categorical-threshold count (0 for continuous; Phase
+/// 22 fills it for categorical).
 ///
 /// Wave-0 sentinel: returns the `best_leaf = -1` (no split) export.
 ///
@@ -288,5 +407,105 @@ mod tests {
                 "branch-free fallback must match the intrinsic at {x}"
             );
         }
+    }
+
+    /// Helper: a non-categorical `FeatureMeta` with the given num_bin/missing_type.
+    fn feat(idx: i32, num_bin: u32, missing: MissingType) -> FeatureMeta {
+        FeatureMeta {
+            inner_feature_index: idx,
+            num_bin,
+            missing_type: missing,
+            is_categorical: false,
+            max_cat_to_onehot: 4,
+            hist_offset: 0,
+            mfb_offset: 0,
+            default_bin: 0,
+            rand_threshold: -1,
+        }
+    }
+
+    /// The `assume_out_default_left` task-gen table
+    /// (`cuda_best_split_finder.cpp:137-227`) — all four rows, including the D-01
+    /// load-bearing divergence `default_left != reverse` (17-RESEARCH Pitfall 3).
+    #[test]
+    fn assume_out_default_left_table() {
+        // Row 1: num_bin>2 && Zero → forward(assume=false) THEN reverse(assume=true),
+        // both skip_default_bin, both !na_as_missing. Emission order fwd-then-rev.
+        let zero = build_split_find_tasks(&[feat(0, 5, MissingType::Zero)]);
+        assert_eq!(zero.len(), 2, "Zero num_bin>2 emits a forward+reverse PAIR");
+        assert!(!zero[0].reverse, "task[0] is forward");
+        assert!(zero[1].reverse, "task[1] is reverse");
+        assert!(!zero[0].assume_out_default_left, "forward assume=false");
+        assert!(zero[1].assume_out_default_left, "reverse assume=true");
+        assert!(zero[0].skip_default_bin && zero[1].skip_default_bin, "Zero → skip_default_bin");
+        assert!(!zero[0].na_as_missing && !zero[1].na_as_missing, "Zero → !na_as_missing");
+        // The Zero reverse task is the `reverse == true && assume == true` case.
+        assert!(
+            zero[1].reverse && zero[1].assume_out_default_left,
+            "Zero num_bin>2 reverse: reverse==true AND assume_out_default_left==true"
+        );
+
+        // Row 2: num_bin>2 && NaN → forward(assume=false) THEN reverse(assume=true),
+        // both na_as_missing, both !skip_default_bin.
+        let nan = build_split_find_tasks(&[feat(0, 5, MissingType::NaN)]);
+        assert_eq!(nan.len(), 2, "NaN num_bin>2 emits a forward+reverse PAIR");
+        assert!(!nan[0].reverse && nan[1].reverse);
+        assert!(!nan[0].assume_out_default_left && nan[1].assume_out_default_left);
+        assert!(nan[0].na_as_missing && nan[1].na_as_missing, "NaN → na_as_missing");
+        assert!(!nan[0].skip_default_bin && !nan[1].skip_default_bin, "NaN → !skip_default_bin");
+
+        // Row 3a: MissingType::None (num_bin>2) → single reverse task. Per the C++
+        // else-branch (cpp:216-220) `assume = (missing != NaN && !categorical)`, so
+        // None → assume=**true**. default_left is still DECOUPLED from reverse (it is
+        // set from the missing-type formula, NOT `= reverse` like host split.rs); for
+        // None the two happen to coincide (both true).
+        let none = build_split_find_tasks(&[feat(0, 5, MissingType::None)]);
+        assert_eq!(none.len(), 1, "None emits a single reverse task");
+        assert!(none[0].reverse, "None single task is reverse");
+        assert!(
+            none[0].assume_out_default_left,
+            "MissingType::None non-cat: assume == (missing != NaN) == true (cpp:216-220)"
+        );
+
+        // Row 3b: num_bin<=2 Zero-missing → single reverse task, assume = (missing != NaN) = true.
+        let small = build_split_find_tasks(&[feat(0, 2, MissingType::Zero)]);
+        assert_eq!(small.len(), 1, "num_bin<=2 emits a single reverse task");
+        assert!(small[0].reverse);
+        assert!(
+            small[0].reverse && small[0].assume_out_default_left,
+            "num_bin<=2 Zero-missing reverse: reverse==true AND assume_out_default_left==true"
+        );
+
+        // Row 3c: THE load-bearing divergence `default_left != reverse` (Pitfall 3):
+        // num_bin<=2 NaN, non-categorical → single reverse task, assume = (NaN != NaN)
+        // = **false**. reverse==true WHILE assume_out_default_left==false — proving
+        // default_left is decoupled from reverse (host split.rs would wrongly emit
+        // default_left=reverse=true here).
+        let small_nan = build_split_find_tasks(&[feat(0, 2, MissingType::NaN)]);
+        assert_eq!(small_nan.len(), 1, "num_bin<=2 NaN emits a single reverse task");
+        assert!(
+            small_nan[0].reverse && !small_nan[0].assume_out_default_left,
+            "num_bin<=2 NaN reverse: reverse==true AND assume_out_default_left==false \
+             (default_left != reverse — Pitfall 3)"
+        );
+
+        // Row 4: categorical → single forward task, is_categorical=true,
+        // is_one_hot = (num_bin <= max_cat_to_onehot), assume=false. No eval math.
+        let mut cat = feat(0, 3, MissingType::None); // num_bin 3 <= max_cat_to_onehot 4 → one-hot
+        cat.is_categorical = true;
+        let cat_tasks = build_split_find_tasks(&[cat]);
+        assert_eq!(cat_tasks.len(), 1, "categorical emits a single forward task");
+        assert!(!cat_tasks[0].reverse, "categorical task is forward");
+        assert!(cat_tasks[0].is_categorical, "is_categorical=true");
+        assert!(cat_tasks[0].is_one_hot, "num_bin(3) <= max_cat_to_onehot(4) → one-hot");
+        assert!(!cat_tasks[0].assume_out_default_left, "categorical assume=false (Phase-22 seam)");
+        // Above the one-hot cap → is_one_hot=false.
+        let mut cat_many = feat(0, 10, MissingType::None);
+        cat_many.is_categorical = true;
+        let cat_many_tasks = build_split_find_tasks(&[cat_many]);
+        assert!(
+            cat_many_tasks[0].is_categorical && !cat_many_tasks[0].is_one_hot,
+            "num_bin(10) > max_cat_to_onehot(4) → categorical, NOT one-hot"
+        );
     }
 }
