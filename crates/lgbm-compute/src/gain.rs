@@ -151,6 +151,84 @@ pub fn calculate_splitted_leaf_output(
 }
 
 // ===========================================================================
+// Net-new USE_SMOOTHING (path_smooth) gain path — form (B) output-blend + form
+// (D) given-output gain. VERBATIM transcription of
+// `LightGBM/src/treelearner/cuda/cuda_leaf_splits.hpp:74-122` (the
+// `USE_SMOOTHING=true` template branch). ADDITIVE ONLY: the three non-smoothing
+// gain fns above (`threshold_l1`, `get_leaf_gain`, `calculate_splitted_leaf_output`,
+// `get_split_gains`) are byte-unchanged (D-09) — the Wave-2 stage-1 body dispatches
+// to these NEW fns when `use_smoothing` is set and the EXISTING fns otherwise.
+//
+// `parent_output` is the leaf's parent output (from `CUDALeafSplitsStruct`),
+// threaded as a scalar. `num_data` is `data_size_t` (i32) exactly as the CUDA
+// signature; the `num_data / path_smooth` division promotes it to double
+// (`num_data as f64`) — matching the C++ int→double promotion. The `as` cast is
+// used rather than `f64::cast_from` because these fns are ALSO called on the host
+// (unit tests + the CPU anchor), where `cast_from`'s host stub panics; `as` has a
+// real host impl and the `#[cube]` macro lowers it to a device cast.
+// ===========================================================================
+
+/// `CalculateSplittedLeafOutput<USE_L1, true>` — the `USE_SMOOTHING=true` form (B)
+/// (cuda_leaf_splits.hpp:74-90): compute the base output exactly as
+/// [`calculate_splitted_leaf_output`] does, then blend toward `parent_output`:
+///
+/// ```cpp
+/// ret = ret * (num_data / path_smooth) / (num_data / path_smooth + 1)
+///     + parent_output / (num_data / path_smooth + 1);
+/// ```
+///
+/// Precedence is verbatim: `ret * nps / (nps + 1)` == `(ret * nps) / (nps + 1)`,
+/// NOT `ret * (nps / (nps + 1))` (the two differ in the last bit).
+#[cube]
+pub fn calculate_splitted_leaf_output_smoothed(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    path_smooth: f64,
+    num_data: i32,
+    parent_output: f64,
+) -> f64 {
+    // Reuse the non-smoothing base output (bit-identical to inlining the branch).
+    let ret = calculate_splitted_leaf_output(use_l1, sum_gradients, sum_hessians, l1, l2);
+    let n_over_ps = num_data as f64 / path_smooth;
+    ret * n_over_ps / (n_over_ps + 1.0) + parent_output / (n_over_ps + 1.0)
+}
+
+/// `GetLeafGain<USE_L1, true>` — the `USE_SMOOTHING=true` form (D)
+/// (cuda_leaf_splits.hpp:117-121): the gain is NOT the closed form `sg²/(h+l2)`;
+/// it is [`get_leaf_gain_given_output`] evaluated at the smoothing-blended output:
+///
+/// ```cpp
+/// const double output = CalculateSplittedLeafOutput<USE_L1, true>(...);
+/// return GetLeafGainGivenOutput<USE_L1>(sum_gradients, sum_hessians, l1, l2, output);
+/// ```
+#[cube]
+pub fn get_leaf_gain_smoothed(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    path_smooth: f64,
+    num_data: i32,
+    parent_output: f64,
+) -> f64 {
+    let output = calculate_splitted_leaf_output_smoothed(
+        use_l1,
+        sum_gradients,
+        sum_hessians,
+        l1,
+        l2,
+        path_smooth,
+        num_data,
+        parent_output,
+    );
+    get_leaf_gain_given_output(use_l1, sum_gradients, sum_hessians, l1, l2, output)
+}
+
+// ===========================================================================
 // f32 mirrors of the gain primitives for the no-f64 hip device (CMP-04).
 //
 // IDENTICAL formula structure and gate ORDER as the f64 anchors above — the ONLY
@@ -221,6 +299,50 @@ pub fn calculate_splitted_leaf_output_f32(
     } else {
         -sum_gradients / (sum_hessians + l2)
     }
+}
+
+/// f32 mirror of [`calculate_splitted_leaf_output_smoothed`] (the no-f64 hip path).
+#[cube]
+pub fn calculate_splitted_leaf_output_smoothed_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+    path_smooth: f32,
+    num_data: i32,
+    parent_output: f32,
+) -> f32 {
+    // WR-05: pin every literal f32 (the `+ 1` denominators) so cubecl cannot widen
+    // the blend to f64 on the hip path.
+    let ret = calculate_splitted_leaf_output_f32(use_l1, sum_gradients, sum_hessians, l1, l2);
+    let n_over_ps = num_data as f32 / path_smooth;
+    ret * n_over_ps / (n_over_ps + 1.0f32) + parent_output / (n_over_ps + 1.0f32)
+}
+
+/// f32 mirror of [`get_leaf_gain_smoothed`] (the no-f64 hip path).
+#[cube]
+pub fn get_leaf_gain_smoothed_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+    path_smooth: f32,
+    num_data: i32,
+    parent_output: f32,
+) -> f32 {
+    let output = calculate_splitted_leaf_output_smoothed_f32(
+        use_l1,
+        sum_gradients,
+        sum_hessians,
+        l1,
+        l2,
+        path_smooth,
+        num_data,
+        parent_output,
+    );
+    get_leaf_gain_given_output_f32(use_l1, sum_gradients, sum_hessians, l1, l2, output)
 }
 
 /// f32 mirror of [`get_leaf_gain_given_output`] (the no-f64 hip path).
