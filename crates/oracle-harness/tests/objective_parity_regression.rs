@@ -237,6 +237,53 @@ fn regression_weight_branch_and_determinism() {
     }
 }
 
+impl Reg {
+    /// The device BoostFromScore composition tag + alpha for this objective.
+    fn boost_tag_alpha(self) -> (u32, f64) {
+        match self {
+            L2 => (obj::TAG_L2, 0.0),
+            L1 => (obj::TAG_L1, 0.0),
+            Quantile => (obj::TAG_QUANTILE, 0.9),
+            Huber => (obj::TAG_HUBER, 0.0),
+            Fair => (obj::TAG_FAIR, 0.0),
+            Poisson => (obj::TAG_POISSON, 0.0),
+        }
+    }
+}
+
+#[test]
+fn boost_from_score() {
+    let client = cpu_client();
+    let labels = SPINE_LABELS.to_vec();
+
+    for reg in ALL {
+        let (tag, alpha) = reg.boost_tag_alpha();
+        let device_init =
+            obj::boost_from_score_on(&client, tag, &labels, alpha).expect("device boost");
+        let host_init = reg.host().boost_from_score(&labels);
+        // Deterministic reduction order (reduce_sum ascending fold / percentile) →
+        // bit-exact vs the host f64 anchor for all six.
+        assert_eq!(
+            device_init.to_bits(),
+            host_init.to_bits(),
+            "{reg:?} BoostFromScore not bit-exact vs host anchor: device {device_init} host {host_init}"
+        );
+    }
+}
+
+#[test]
+fn boost_from_score_poisson_rejects_bad_labels() {
+    let client = cpu_client();
+    // A negative label is rejected (Pitfall 6 label-domain guard).
+    assert!(obj::boost_from_score_on(&client, obj::TAG_POISSON, &[1.0, -0.5, 2.0], 0.0).is_err());
+    // A zero label-sum is rejected.
+    assert!(obj::boost_from_score_on(&client, obj::TAG_POISSON, &[0.0, 0.0], 0.0).is_err());
+    // A valid non-negative, non-zero-sum corpus is accepted.
+    assert!(obj::boost_from_score_on(&client, obj::TAG_POISSON, &[0.0, 1.0, 2.0], 0.0).is_ok());
+    // The non-poisson objectives have no label-domain guard.
+    assert!(obj::boost_from_score_on(&client, obj::TAG_L2, &[-1.0, 2.0], 0.0).is_ok());
+}
+
 #[test]
 fn convert_regression() {
     use lgbm_model::objective::{convert_poisson, convert_regression};

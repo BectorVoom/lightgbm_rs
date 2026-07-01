@@ -41,6 +41,7 @@
 use cubecl::prelude::*;
 
 use crate::error::ComputeError;
+use crate::kernels::primitives::{bitonic_argsort_on, reduce_min_f64_on, reduce_sum_f64_on};
 
 // =========================================================================
 // Objective tags (comptime dispatch selector) + convert modes.
@@ -412,4 +413,139 @@ pub fn convert_output_on<R: cubecl::Runtime>(
     }
     let bytes = client.read_one_unchecked(h_out);
     Ok(f64::from_bytes(&bytes).to_vec())
+}
+
+// =========================================================================
+// Task 2: BoostFromScore init — device reduce/percentile COMPOSED with a host
+// scalar finalize (D-08 — compose the primitives, never hand-roll a reduce).
+// =========================================================================
+
+/// `Common::SafeLog` (`common.h:877`): `ln(x)` for `x > 0`, else `-inf`. Mirrors
+/// `regression.rs::safe_log`; the scalar finalize is legitimately f64 (D-07 allows
+/// f64 in the scalar BoostFromScore).
+fn safe_log(x: f64) -> f64 {
+    if x > 0.0 {
+        x.ln()
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+/// Device-composed `PercentileFun` (the CPU BoostFromScore/RenewTreeOutput
+/// reference, `lgbm_objective::percentile::percentile_fun`): sort DESCENDING via the
+/// shared [`bitonic_argsort_on`] device primitive (index-only), then apply the exact
+/// `PercentileFun` index math as an f64 scalar finalize (D-07 allows f64 in the
+/// scalar path). Returns the raw f64 percentile (the caller applies the f32 narrow
+/// where the C++ reference does — quantile BoostFromScore only).
+///
+/// **Deviation (Rule 1 — hardening the percentile skeleton at its Phase-19
+/// consumer):** the [`crate::kernels::primitives::percentile_unweighted_f32_on`]
+/// skeleton uses a `(1-alpha)*len` index convention that DIVERGES from the CPU
+/// `PercentileFun` `(len-1)*(1-alpha)` convention the real-lib_lightgbm
+/// BoostFromScore / RenewTreeOutput goldens use (e.g. the spine-label median is 10
+/// under the skeleton vs the reference 11). Rather than mutate that phase-14
+/// primitive (its ROCm percentile fixture would silently drift), this Phase-19
+/// consumer — the designated percentile hardening owner — composes the argsort
+/// primitive with the `PercentileFun` finalize here so the init/renew scalars are
+/// bit-exact vs the host f64 anchor.
+fn percentile_fun_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    values: &[f32],
+    alpha: f64,
+) -> Result<f64, ComputeError> {
+    let cnt = values.len();
+    if cnt <= 1 {
+        return Ok(if cnt == 0 { 0.0 } else { f64::from(values[0]) });
+    }
+    // Descending sort via the device bitonic argsort (index-only): desc[k] =
+    // values[perm[k]]. For distinct keys this is uniquely descending (== the host
+    // `sorted_descending`); ties inherit the argsort's stable parity.
+    let (perm, _after) = bitonic_argsort_on(client, values, false)?;
+    let desc: Vec<f64> = perm.iter().map(|&i| f64::from(values[i as usize])).collect();
+
+    let float_pos = (cnt as f64 - 1.0) * (1.0 - alpha);
+    let pos = float_pos as i64 + 1;
+    if pos < 1 {
+        return Ok(desc[0]);
+    }
+    if pos >= cnt as i64 {
+        return Ok(desc[cnt - 1]);
+    }
+    let pos = pos as usize;
+    let bias = float_pos - (pos - 1) as f64;
+    let v1 = desc[pos - 1];
+    let v2 = desc[pos];
+    Ok(v1 - (v1 - v2) * bias)
+}
+
+/// The unweighted label mean via the device `reduce_sum_f64_on` primitive divided by
+/// `num_data` — the SAME ordered f64 fold as `regression.rs:548-558` (bit-exact
+/// deterministic anchor). Empty → `0.0`.
+fn label_mean_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    labels_f64: &[f64],
+) -> Result<f64, ComputeError> {
+    if labels_f64.is_empty() {
+        return Ok(0.0);
+    }
+    let suml = reduce_sum_f64_on(client, labels_f64)?;
+    Ok(suml / labels_f64.len() as f64)
+}
+
+/// Compute the regression BoostFromScore init scalar for one objective, COMPOSING
+/// the existing device primitives (D-08):
+/// - L2/Huber/Fair: the label mean via [`reduce_sum_f64_on`] (`regression.rs:548`).
+/// - L1: the label median via [`percentile_unweighted_f32_on`] at α = 0.5
+///   (`regression.rs:586`).
+/// - Quantile: the label percentile at the **f32-rounded** α
+///   (`regression.rs:567` — `alpha_` is `score_t`; the result is f32-narrowed).
+/// - Poisson: the label non-negativity/finiteness check via [`reduce_min_f64_on`] +
+///   [`reduce_sum_f64_on`] (Pitfall 6 — the other objectives skip this) THEN
+///   `safe_log(mean)` (`regression.rs:595-605`).
+///
+/// `alpha` is used only by Quantile (ignored otherwise).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if a Poisson label is negative or the label-sum is zero
+/// (mirroring `regression.rs::check_labels`); propagates the primitive errors.
+pub fn boost_from_score_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    objective_tag: u32,
+    labels: &[f32],
+    alpha: f64,
+) -> Result<f64, ComputeError> {
+    let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
+
+    if objective_tag == TAG_L1 {
+        // The label MEDIAN (PercentileFun at α = 0.5, NOT the mean; regression.rs:586).
+        return percentile_fun_on(client, labels, 0.5);
+    }
+    if objective_tag == TAG_QUANTILE {
+        // The label percentile at the f32-rounded α (C++ `alpha_` is score_t and the
+        // PercentileFun result is f32-narrowed; regression.rs:567-570).
+        let v = percentile_fun_on(client, labels, f64::from(alpha as f32))?;
+        return Ok(f64::from(v as f32));
+    }
+    if objective_tag == TAG_POISSON {
+        // Label-domain guard (Pitfall 6): every label >= 0 AND Σ label != 0.
+        if !labels.is_empty() {
+            let miny = reduce_min_f64_on(client, &labels_f64)?;
+            if miny < 0.0 {
+                return Err(ComputeError::Runtime {
+                    detail: format!(
+                        "poisson BoostFromScore: label {miny} is negative (must be >= 0)"
+                    ),
+                });
+            }
+            let sumy = reduce_sum_f64_on(client, &labels_f64)?;
+            if sumy == 0.0 {
+                return Err(ComputeError::Runtime {
+                    detail: "poisson BoostFromScore: sum of labels is zero".to_string(),
+                });
+            }
+        }
+        return Ok(safe_log(label_mean_on(client, &labels_f64)?));
+    }
+    // TAG_L2 / TAG_HUBER / TAG_FAIR: the label mean.
+    label_mean_on(client, &labels_f64)
 }
