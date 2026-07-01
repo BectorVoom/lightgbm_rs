@@ -129,7 +129,13 @@ fn validate_softmax(
         return Err(ComputeError::LengthMismatch { expected: 1, actual: num_class });
     }
     if scores % num_class != 0 {
-        return Err(ComputeError::LengthMismatch { expected: scores, actual: num_class });
+        // Not a length mismatch (the two numbers are not comparable lengths) — a
+        // divisibility failure. Report it as such (IN-02).
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "multiclass scores length {scores} is not a multiple of num_class {num_class}"
+            ),
+        });
     }
     let num_data = scores / num_class;
     if labels != num_data {
