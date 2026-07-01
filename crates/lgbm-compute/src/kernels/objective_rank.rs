@@ -432,29 +432,43 @@ fn lambdarank_impl<R: cubecl::Runtime>(
     // Per-query DESCENDING-score ranking (compose the primitive; segment = query).
     let scores_f32: Vec<f32> = scores.iter().map(|&s| s as f32).collect();
     let mut sorted_idx = bitonic_argsort_items_on(client, &scores_f32, query_boundaries, false)?;
-    // The host anchor's std sort is STABLE with an ascending-index tie-break
-    // (rank.rs:293-298); `bitonic_argsort_items_on`'s comparator has NO index
-    // tie-break, so equal keys resolve network-dependently (e.g. a size-3 tie →
-    // reversed). Real ranking scores tie constantly (rows sharing a leaf value), so
-    // we CANONICALIZE ties to the reference order: within each query, bitonic has
-    // already placed equal scores CONTIGUOUSLY; we reorder each equal-score run to
-    // ascending original index (matching the std-stable convention the golden was
-    // derived with). Distinct scores → runs of length 1 → no-op, bitonic's order is
-    // used verbatim. The kernel reads the ORIGINAL f64 `scores`.
+    // The host anchor's std sort is STABLE over the f64 scores with a DESCENDING-score
+    // primary key and an ascending-index tie-break (rank.rs:293-298).
+    // `bitonic_argsort_items_on` sorts on the DOWNCAST f32 keys and has NO index
+    // tie-break, so equal f32 keys resolve network-dependently (e.g. a size-3 tie →
+    // reversed). Two subtleties must both be repaired (WR-02):
+    //   (1) rows equal in f64 (hence equal in f32) — the anchor orders them by
+    //       ascending original index;
+    //   (2) rows DISTINCT in f64 but collapsing to the SAME f32 — bitonic ties them
+    //       arbitrarily, yet the anchor orders them by descending f64 score.
+    // A run of equal f32 KEYS (exactly the set bitonic left in arbitrary order) is
+    // contiguous; we canonicalize each such run by (descending f64 score, then
+    // ascending original index), which reproduces the host order for BOTH cases while
+    // leaving distinct-f32 rows (singleton runs) in bitonic's already-correct order.
+    // The kernel reads the ORIGINAL f64 `scores`.
     for q in 0..num_queries {
         let start = query_boundaries[q] as usize;
         let end = query_boundaries[q + 1] as usize;
         let seg = &mut sorted_idx[start..end];
         let mut i = 0usize;
         while i < seg.len() {
+            // Group by the f32 KEY bitonic actually compared (not the f64 score), so
+            // f32-tied / f64-distinct rows fall in the SAME run and get repaired.
             let mut j = i + 1;
             while j < seg.len()
-                && scores[start + seg[j] as usize] == scores[start + seg[i] as usize]
+                && scores_f32[start + seg[j] as usize] == scores_f32[start + seg[i] as usize]
             {
                 j += 1;
             }
             if j - i > 1 {
-                seg[i..j].sort_unstable();
+                seg[i..j].sort_unstable_by(|&a, &b| {
+                    let sa = scores[start + a as usize];
+                    let sb = scores[start + b as usize];
+                    // Descending f64 score, then ascending original index.
+                    sb.partial_cmp(&sa)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                        .then(a.cmp(&b))
+                });
             }
             i = j;
         }
