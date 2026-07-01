@@ -59,3 +59,14 @@ pub mod best_split;
 pub mod data_partition;
 pub mod predict;
 pub mod tree;
+// Phase-19 on-device objectives (ODL-05/06/07/08): the §5 grad/hess + inverse-link
+// kernels — regression (§5.1), binary (§5.2), multiclass (§5.3), rank (§5.4).
+// Declared here in Wave-1 (19-00) as empty compiling stubs so each Wave-2 family
+// plan (19-01/02/03/04) fills exactly one owned file with NO `mod.rs` contention.
+// Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE` (D-06); ungated like the
+// other Phase-14..18 kernel modules (NOT `#[cfg(feature = "gpu")]`, per D-08) so the
+// default cpu f64 anchor exercises them.
+pub mod objective_binary;
+pub mod objective_multiclass;
+pub mod objective_rank;
+pub mod objective_regression;

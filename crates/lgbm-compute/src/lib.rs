@@ -11,12 +11,14 @@
 //! re-exported [`ComputeError`]), never on `cubecl` directly — that is the whole
 //! point of the seam, and the `cmp01_containment` guard test enforces it.
 
+pub mod device_objective;
 pub mod error;
 pub mod fusion_prof;
 pub mod gain;
 pub mod kernels;
 pub mod runtime;
 
+pub use device_objective::{device_objective_supported, DeviceObjectiveKind};
 pub use error::ComputeError;
 pub use gain::{GainConfig, SplitInfo};
 pub use kernels::split::BatchedSplitFeature;
