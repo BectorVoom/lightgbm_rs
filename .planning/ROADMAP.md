@@ -234,10 +234,10 @@ Plans:
   4. On-device **ranking** grad/hess (LambdaRank-NDCG + RankXENDCG, per-query block layout, bitonic item ranking, per-item RNG with the bit-identical stream) anchor-pinned. (§5.4)
   5. The CUDA-unsupported objectives (MAPE / Gamma / Tweedie / cross-entropy / rank-MAP) honestly fall back to host; CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 5 plans
+**Plans**: 1/5 plans executed
 **Wave 1**
 
-- [ ] 19-00-PLAN.md — Wave 1: greenfield objective module stubs + mod.rs, host-fallback support-set (SC #5), shared parity harness, lambdarank golden capture
+- [x] 19-00-PLAN.md — Wave 1: greenfield objective module stubs + mod.rs, host-fallback support-set (SC #5), shared parity harness, lambdarank golden capture
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -317,7 +317,7 @@ Plans:
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
-| 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
+| 19. On-Device Objectives | v1.1 | 1/5 | In Progress|  |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |

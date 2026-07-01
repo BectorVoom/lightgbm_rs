@@ -19,10 +19,10 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 
 ### On-device objectives (§5)
 
-- [ ] **ODL-05**: On-device **regression-family** gradients/hessians (L2, L1, Quantile, Huber, Fair, Poisson) + `ConvertOutput` inverse-link + `BoostFromScore` (mean via reduce / median via percentile) + `RenewTreeOutput` (median/quantile leaf refit, one block per leaf), anchor-pinned. (§5.1.)
-- [ ] **ODL-06**: On-device **binary-logloss** gradients/hessians + `BoostFromScore` (label-prior logit init) + sigmoid `ConvertOutput`; one-vs-all label reset for OVA, anchor-pinned. (§5.2.)
-- [ ] **ODL-07**: On-device **multiclass** gradients/hessians — softmax + one-vs-all, class-major `[k·num_data+i]` layout, anchor-pinned. (§5.3.)
-- [ ] **ODL-08**: On-device **ranking** gradients/hessians — LambdaRank-NDCG + RankXENDCG, per-query block layout, bitonic item ranking, per-item RNG (bit-identical stream), anchor-pinned. (§5.4.)
+- [x] **ODL-05**: On-device **regression-family** gradients/hessians (L2, L1, Quantile, Huber, Fair, Poisson) + `ConvertOutput` inverse-link + `BoostFromScore` (mean via reduce / median via percentile) + `RenewTreeOutput` (median/quantile leaf refit, one block per leaf), anchor-pinned. (§5.1.)
+- [x] **ODL-06**: On-device **binary-logloss** gradients/hessians + `BoostFromScore` (label-prior logit init) + sigmoid `ConvertOutput`; one-vs-all label reset for OVA, anchor-pinned. (§5.2.)
+- [x] **ODL-07**: On-device **multiclass** gradients/hessians — softmax + one-vs-all, class-major `[k·num_data+i]` layout, anchor-pinned. (§5.3.)
+- [x] **ODL-08**: On-device **ranking** gradients/hessians — LambdaRank-NDCG + RankXENDCG, per-query block layout, bitonic item ranking, per-item RNG (bit-identical stream), anchor-pinned. (§5.4.)
 
 ### Histogram constructor (§7) — the hot path
 
@@ -89,10 +89,10 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-02 | Phase 14 | Pending |
 | ODL-03 | Phase 15 | Complete |
 | ODL-04 | Phase 15 | Complete |
-| ODL-05 | Phase 19 | Pending |
-| ODL-06 | Phase 19 | Pending |
-| ODL-07 | Phase 19 | Pending |
-| ODL-08 | Phase 19 | Pending |
+| ODL-05 | Phase 19 | Complete |
+| ODL-06 | Phase 19 | Complete |
+| ODL-07 | Phase 19 | Complete |
+| ODL-08 | Phase 19 | Complete |
 | ODL-09 | Phase 16 | Complete |
 | ODL-10 | Phase 16 | Complete |
 | ODL-11 | Phase 17 | Complete |

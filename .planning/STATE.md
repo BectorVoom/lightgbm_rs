@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 19
-current_phase_name: On-Device Objectives
+current_phase_name: on-device-objectives
 status: executing
 stopped_at: Phase 19 context gathered
-last_updated: "2026-07-01T14:35:15.955Z"
+last_updated: "2026-07-01T14:56:12.664Z"
 last_activity: 2026-07-01
-last_activity_desc: Phase 18 complete, transitioned to Phase 19
+last_activity_desc: Phase 19 execution started
 progress:
   total_phases: 10
   completed_phases: 5
-  total_plans: 25
-  completed_plans: 25
+  total_plans: 30
+  completed_plans: 26
   percent: 50
 ---
 
@@ -24,15 +24,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 18 — on-device-data-partition-tree-mutation-prediction
+**Current focus:** Phase 19 — on-device-objectives
 
 ## Current Position
 
-Phase: 19 — On-Device Objectives
-Plan: Not started
+Phase: 19 (on-device-objectives) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-01 — Phase 18 complete, transitioned to Phase 19
+Last activity: 2026-07-01 — Phase 19 execution started
 
 Next: `/gsd-plan-phase 14`
 
@@ -574,6 +574,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 18 P02 | 21min | 3 tasks | 3 files |
 | Phase 18 P03 | 40min | 2 tasks | 2 files |
 | Phase 18 P04 | 13min | 2 tasks | 3 files |
+| Phase 19 P00 | 15min | 3 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -677,6 +678,7 @@ Recent decisions affecting current work:
 - [Phase 17]: 17-05: stage-2/3 reductions are deterministic host folds over stage-1 SplitScalars (the reduction order is the parity contract); only the 8-int export is a device kernel (the single SC#2 readback)
 - [Phase ?]: 18-02: route flags are #[comptime] bools passed as plain host-computed values at the launch site — cubecl auto-specializes+caches per combination (no host match), honoring the D-02 fan-out
 - [Phase ?]: 18-02: device partition scatter uses the global scan (D-04 order-equivalence to a stable partition), reusing 18-01 u16/u32 primitives; exclusive rank IS the [tid-1] inclusive derivation
+- [Phase 19]: device_objective_supported() is a pure 11-true/7-false classifier; on_device_growth_supported() stays false (19-00 foundation)
 
 ### Pending Todos
 
@@ -706,7 +708,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-01T13:47:06.320Z
+Last session: 2026-07-01T14:55:38.995Z
 Stopped at: Phase 19 context gathered
 Resume file: .planning/phases/19-on-device-objectives/19-CONTEXT.md
 
