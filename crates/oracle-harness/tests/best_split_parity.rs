@@ -256,10 +256,11 @@ fn scalars_of(g: &BestSplitGolden) -> Stage1Scalars {
 
 /// Stage-1 per-task record bit-exact vs the CUDA-core f64 fold (ODL-11).
 ///
-/// RED against the Wave-0 stub (17-03 turns it green) — `#[ignore]`d so the
-/// merge-gate stays green (D-09).
+/// The 17-03 cpu f64 fold ([`find_best_splits_stage1_on`]) reproduces every
+/// `CUDASplitInfo` field bit-exactly against the C++-transcribed `best_split.txt`
+/// goldens (all six D-07 categories + the round-ties-even count case). Un-ignored in
+/// 17-03 (Wave 2) now that the numerical core lands.
 #[test]
-#[ignore = "Wave-0 scaffold; un-ignore when 17-03 lands"]
 fn best_split_parity_stage1_bit_exact_on_cpu() {
     let path = kernels_dir().join("best_split.txt");
     let Ok(text) = std::fs::read_to_string(&path) else {

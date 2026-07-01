@@ -51,9 +51,15 @@
 
 use cubecl::prelude::*;
 
+use lgbm_core::types::K_EPSILON;
 use lgbm_dataset::MissingType;
 
 use crate::error::ComputeError;
+use crate::gain::{
+    calculate_splitted_leaf_output, calculate_splitted_leaf_output_smoothed,
+    get_leaf_gain_given_output, get_leaf_gain_smoothed, get_split_gains,
+};
+use crate::kernels::random::draw_rand_int32_on;
 use crate::kernels::split_info::SplitScalars;
 
 /// The host-constructed per-(feature, direction) split-find task — a field-for-field
@@ -294,32 +300,426 @@ pub struct Stage1Scalars {
     pub rng_seed: i32,
 }
 
-/// STAGE 1 (STUB — Wave 2 fills the numerical core, 17-03).
+/// The number of f64 cells the stage-1 kernel writes per task (the flattened
+/// [`SplitScalars`] the launcher decodes). Layout:
+/// `[0]=is_valid [1]=threshold [2]=default_left [3]=gain [4]=left_sum_grad
+///  [5]=left_sum_hess [6]=left_count [7]=right_sum_grad [8]=right_sum_hess
+///  [9]=right_count [10]=left_value [11]=right_value [12]=left_gain [13]=right_gain]`.
+const STAGE1_OUT_LEN: usize = 14;
+
+/// `__double2int_rn` inside `#[cube]` — round to nearest, ties to EVEN, using only
+/// `f64::floor` (a cubecl `Float` intrinsic) so it lowers on cubecl-cpu AND hip
+/// (research Assumption A1: `f64::round_ties_even` is NOT relied on inside `#[cube]`).
 ///
-/// `FindBestSplitsForLeafKernel<USE_RAND, USE_L1, USE_SMOOTHING, IS_LARGER>`: block
-/// prefix-sum → complement-from-parent → count recovery ([`round_ties_even`]) →
-/// guards → gain (`crate::gain`, + net-new smoothing branch) → block argmax, writing
-/// ONE per-task [`SplitScalars`] `CUDASplitInfo` record. `hist` is the interleaved
-/// `[g0,h0,g1,h1,…]` f64 histogram for the task's feature (already offset).
+/// Branch-free even-round identity for `x >= 0` (hessian·cnt_factor ≥ 0 here):
+/// `f = floor(x)`, tie when `x - f == 0.5` rounds toward the EVEN neighbour; `f`'s
+/// parity is `f - 2·floor(f/2)` (0 even, 1 odd) — pure float, no `i64` bit-ops. This
+/// DIVERGES from [`super::split::round_int`]'s round-half-up (the D-01 landmine,
+/// 17-RESEARCH Pitfall 1) — it is byte-equivalent to the host [`round_ties_even`].
+#[cube]
+fn round_ties_even_cube(x: f64) -> i32 {
+    let f = f64::floor(x);
+    let diff = x - f; // in [0, 1)
+    // f's parity as a float: 0.0 if even, 1.0 if odd.
+    let parity = f - 2.0 * f64::floor(f * 0.5);
+    let f_is_odd = parity > 0.5;
+    let up = diff > 0.5 || (diff == 0.5 && f_is_odd);
+    let r = select(up, f + 1.0, f);
+    i32::cast_from(r)
+}
+
+/// The stage-1 numerical core — a VERBATIM `#[cube]` transcription of
+/// `FindBestSplitsForLeafKernelInner` (`cuda_best_split_finder.cu:146-320`) driven
+/// SINGLE-OWNER (`CubeDim(1)`) as the deterministic cpu f64 fold (D-01/D-08). One
+/// call evaluates one `(leaf,feature)` task: serial inclusive prefix-sum → cumulative
+/// scanned side → complement-from-parent → two-phase count recovery
+/// ([`round_ties_even_cube`]) → guards → gain (smoothing dispatch) → strict-`>`
+/// argmax → the winning `CUDASplitInfo` record.
 ///
-/// Wave-0 sentinel: returns [`SplitScalars::default`] (`is_valid=false`) so the
-/// golden-anchor harness RED-fails via ASSERTION (the golden expects a valid record),
-/// NOT a compile/panic error. The `client` is threaded now so the Wave-2 signature
-/// does not change.
+/// Landmines reproduced 1:1 (17-RESEARCH §"Common Pitfalls"):
+/// - **Count recovery** is round-ties-EVEN, NOT `split.rs`'s round-half-up (Pitfall 1).
+/// - **kEpsilon two-phase** (Pitfall 2): thread-0 adds `kEpsilon` ONCE at the scan
+///   origin (the CUDA single-kEpsilon placement, NOT `split.rs`'s `2·kEpsilon`); the
+///   guard recovers the count from the kEpsilon-INCLUDED hessian, the written record
+///   subtracts kEpsilon first then re-recovers (an off-by-one between them is intended).
+/// - **Complement-from-parent** (Pitfall 4): the non-scanned side is
+///   `parent_total − scanned`, never a second scan; `reverse` flips only the default-bin
+///   scan direction (`fnbmo-1-t` read, `num_bin-2-t` threshold) and the scanned/complement
+///   left↔right assignment.
+/// - **`default_left = assume_out_default_left`** (Pitfall 3), written verbatim, NOT
+///   `reverse`.
+/// - **strict `>` argmax** (Pitfall 5): the lowest bin index survives a tie.
+///
+/// `reverse`/`use_l1`/`use_smoothing`/`use_rand` are runtime `u32` flags (0|1) inside
+/// the one shared body (research Pattern 2 — avoid a 16-way cubecl monomorphization).
+/// Honors the `split.rs:180-202` MLIR constraints: loop-carried mutables init from
+/// LITERALS, every conditional store is a branchless `select`, the scan is a bounded
+/// RANGE loop. `min_gain_shift = parent_gain + min_gain_to_split` is host-computed.
+/// The categorical eval is a Phase-22 seam (D-04) handled by the launcher, not here.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn split_eval_body(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    num_bin: i32,
+    mfb_offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,        // 0|1
+    reverse: u32,                 // 0|1
+    assume_out_default_left: u32, // 0|1 — written verbatim (Pitfall 3)
+    use_l1: u32,                  // 0|1
+    use_smoothing: u32,           // 0|1
+    use_rand: u32,                // 0|1
+    rand_threshold: i32,          // NextInt(0,num_bin-2) draw; -1 when use_rand off
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    path_smooth: f64,
+    parent_output: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    scan_count: i32, // host-computed = num_bin (covers every candidate threshold)
+) {
+    let eps = f64::cast_from(K_EPSILON);
+    let l1 = lambda_l1;
+    let l2 = lambda_l2;
+    let rev = reverse != 0;
+    let use_l1_b = use_l1 != 0;
+    let sm = use_smoothing != 0;
+    let use_rand_b = use_rand != 0;
+    let skip_def = skip_default_bin != 0;
+
+    // cnt_factor = num_data / sum_hessians (CUDA leaf-total division, cu:146). Note:
+    // sum_hessian is the RAW leaf total (NOT kEpsilon-bumped, unlike host split.rs).
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+    let fnbmo = num_bin - mfb_offset; // feature_num_bin_minus_offset
+    let fwd_end = fnbmo - 2; // forward candidate upper bound
+    let rev_end = num_bin - 2; // reverse candidate upper bound
+
+    // Serial inclusive prefix accumulators (LITERAL init — MLIR constraint #1).
+    let mut acc_g = 0.0f64;
+    let mut acc_h = 0.0f64;
+    // Winner state (LITERAL init). best_gain sentinel 0.0: every VALID local_gain is
+    // strictly > 0 (`current_gain > min_gain_shift`), so 0.0 rejects no valid candidate
+    // and "no split" is signalled by is_valid == 0.0 (as the launcher decodes).
+    let mut best_gain = 0.0f64;
+    let mut best_threshold = 0i32;
+    let mut best_scanned_g = 0.0f64;
+    let mut best_scanned_h = 0.0f64;
+    let mut is_valid = 0.0f64;
+
+    for t in 0..scan_count {
+        // ---- read this thread's bin (forward: bin t; reverse: bin fnbmo-1-t) ----
+        // skip_sum excludes the default bin from the accumulation (a `continue`).
+        let skip = (rev && skip_def && (num_bin - 1 - t) == default_bin)
+            || (!rev && skip_def && (t + mfb_offset) == default_bin);
+        // Only threads whose bin exists (t < fnbmo) and are not skipped load a value.
+        let read_active = t < fnbmo && !skip;
+        let bin_fwd = t;
+        let bin_rev = fnbmo - 1 - t;
+        let bin = select(rev, bin_rev, bin_fwd);
+        // Branchless clamp: an inactive thread reads bin 0 inertly (contributes 0).
+        let bin_safe = select(read_active, bin, 0i32);
+        let base = (bin_safe as usize) * 2;
+        let g = select(read_active, hist[base], 0.0);
+        let h_raw = select(read_active, hist[base + 1], 0.0);
+        // thread 0 seeds kEpsilon ONCE at the scan origin (cu:206, Pitfall 2).
+        let h = h_raw + select(t == 0, eps, 0.0);
+
+        // ---- serial inclusive prefix (the single-owner ShufflePrefixSum analog) ----
+        acc_g += g;
+        acc_h += h;
+
+        // ---- guard phase: scanned side = acc, complement = parent - scanned ----
+        let scanned_g = acc_g;
+        let scanned_h = acc_h; // kEpsilon-INCLUDED (guard-phase recovery, Pitfall 2)
+        let comp_g = sum_gradient - scanned_g;
+        let comp_h = sum_hessian - scanned_h;
+        let scanned_cnt = round_ties_even_cube(scanned_h * cnt_factor);
+        let comp_cnt = num_data - scanned_cnt;
+
+        // forward: left = scanned, right = complement; reverse: swapped.
+        let l_g = select(rev, comp_g, scanned_g);
+        let l_h = select(rev, comp_h, scanned_h);
+        let lc = select(rev, comp_cnt, scanned_cnt);
+        let r_g = select(rev, scanned_g, comp_g);
+        let r_h = select(rev, scanned_h, comp_h);
+        let rc = select(rev, scanned_cnt, comp_cnt);
+        // reverse records `num_bin-2-t`; forward records `t + mfb_offset` (cu:230/318).
+        let threshold = select(rev, rev_end - t, t + mfb_offset);
+
+        // candidate range: forward t<=fnbmo-2, reverse t<=num_bin-2; not skipped.
+        let in_range = (rev && t <= rev_end) || (!rev && t <= fwd_end);
+        let cand = in_range && !skip;
+
+        // guards (fixed order, cu:216-219 / 240-243) + USE_RAND single-threshold gate.
+        let guard = l_h >= min_sum_hessian_in_leaf
+            && lc >= min_data_in_leaf
+            && r_h >= min_sum_hessian_in_leaf
+            && rc >= min_data_in_leaf;
+        let rand_ok = !use_rand_b || threshold == rand_threshold;
+
+        // gain: dispatch on the runtime use_smoothing flag (both computed, selected).
+        let gain_ns = get_split_gains(use_l1_b, l_g, l_h, r_g, r_h, l1, l2);
+        let gain_sm = get_leaf_gain_smoothed(use_l1_b, l_g, l_h, l1, l2, path_smooth, lc, parent_output)
+            + get_leaf_gain_smoothed(use_l1_b, r_g, r_h, l1, l2, path_smooth, rc, parent_output);
+        let current_gain = select(sm, gain_sm, gain_ns);
+
+        let valid = cand && guard && rand_ok && current_gain > min_gain_shift;
+        let local_gain = current_gain - min_gain_shift;
+        // strict `>` keeps the FIRST (lowest index) winner on a tie (Pitfall 5).
+        let take = valid && local_gain > best_gain;
+        best_gain = select(take, local_gain, best_gain);
+        best_threshold = select(take, threshold, best_threshold);
+        best_scanned_g = select(take, scanned_g, best_scanned_g);
+        best_scanned_h = select(take, scanned_h, best_scanned_h);
+        is_valid = select(take, 1.0, is_valid);
+    }
+
+    // ---- write phase (winning bin): kEpsilon SUBTRACTED, count RE-recovered ----
+    // Reconstruct the scanned side from the winner's prefix, then complement.
+    let w_scanned_g = best_scanned_g;
+    let w_scanned_h = best_scanned_h - eps; // kEpsilon removed for the RECORD (cu:275/298)
+    let w_scanned_cnt = round_ties_even_cube(w_scanned_h * cnt_factor);
+    let w_comp_g = sum_gradient - w_scanned_g;
+    let w_comp_h = sum_hessian - w_scanned_h - eps; // the second kEpsilon subtraction
+    let w_comp_cnt = num_data - w_scanned_cnt;
+
+    let wl_g = select(rev, w_comp_g, w_scanned_g);
+    let wl_h = select(rev, w_comp_h, w_scanned_h);
+    let wl_c = select(rev, w_comp_cnt, w_scanned_cnt);
+    let wr_g = select(rev, w_scanned_g, w_comp_g);
+    let wr_h = select(rev, w_scanned_h, w_comp_h);
+    let wr_c = select(rev, w_scanned_cnt, w_comp_cnt);
+
+    // per-side output (value) with smoothing dispatch; per-side gain via given-output.
+    let l_out_ns = calculate_splitted_leaf_output(use_l1_b, wl_g, wl_h, l1, l2);
+    let l_out_sm =
+        calculate_splitted_leaf_output_smoothed(use_l1_b, wl_g, wl_h, l1, l2, path_smooth, wl_c, parent_output);
+    let left_output = select(sm, l_out_sm, l_out_ns);
+    let r_out_ns = calculate_splitted_leaf_output(use_l1_b, wr_g, wr_h, l1, l2);
+    let r_out_sm =
+        calculate_splitted_leaf_output_smoothed(use_l1_b, wr_g, wr_h, l1, l2, path_smooth, wr_c, parent_output);
+    let right_output = select(sm, r_out_sm, r_out_ns);
+    let left_gain = get_leaf_gain_given_output(use_l1_b, wl_g, wl_h, l1, l2, left_output);
+    let right_gain = get_leaf_gain_given_output(use_l1_b, wr_g, wr_h, l1, l2, right_output);
+
+    let default_left_f = select(assume_out_default_left != 0, 1.0, 0.0);
+
+    out[0] = is_valid;
+    out[1] = f64::cast_from(best_threshold);
+    out[2] = default_left_f;
+    out[3] = best_gain;
+    out[4] = wl_g;
+    out[5] = wl_h;
+    out[6] = f64::cast_from(wl_c);
+    out[7] = wr_g;
+    out[8] = wr_h;
+    out[9] = f64::cast_from(wr_c);
+    out[10] = left_output;
+    out[11] = right_output;
+    out[12] = left_gain;
+    out[13] = right_gain;
+}
+
+/// The f64 stage-1 launch wrapper (single-owner) — a thin `#[cube(launch)]` shell
+/// delegating to [`split_eval_body`] (mirrors `split.rs:393` `find_best_split_kernel`).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn split_eval_kernel_f64(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    num_bin: i32,
+    mfb_offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    reverse: u32,
+    assume_out_default_left: u32,
+    use_l1: u32,
+    use_smoothing: u32,
+    use_rand: u32,
+    rand_threshold: i32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    path_smooth: f64,
+    parent_output: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    scan_count: i32,
+) {
+    split_eval_body(
+        hist,
+        out,
+        num_bin,
+        mfb_offset,
+        default_bin,
+        skip_default_bin,
+        reverse,
+        assume_out_default_left,
+        use_l1,
+        use_smoothing,
+        use_rand,
+        rand_threshold,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        path_smooth,
+        parent_output,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        scan_count,
+    );
+}
+
+/// V5 launch-boundary validation (threat T-17-01/T-17-02) — reject the host scalars
+/// that would drive an out-of-bounds `launch_unchecked` BEFORE the launch (mirrors
+/// `split.rs::find_best_split_f64_on`'s pre-launch checks / `primitives.rs`
+/// `validate_scan_inputs`). Returns the required `2*num_bin` histogram length.
 ///
 /// # Errors
-/// [`ComputeError`] once the Wave-2 launch-boundary validation lands; the stub is
-/// infallible.
+/// [`ComputeError::Runtime`] if `num_bin == 0` or `2*num_bin` overflows `usize`;
+/// [`ComputeError::LengthMismatch`] if `hist.len() != 2*num_bin`.
+pub fn validate_stage1_inputs(num_bin: u32, hist_len: usize) -> Result<usize, ComputeError> {
+    if num_bin == 0 {
+        return Err(ComputeError::Runtime {
+            detail: "stage1: num_bin must be > 0".to_string(),
+        });
+    }
+    let expected = 2usize
+        .checked_mul(num_bin as usize)
+        .ok_or_else(|| ComputeError::Runtime {
+            detail: format!("stage1: num_bin {num_bin} overflows the histogram length"),
+        })?;
+    if hist_len != expected {
+        return Err(ComputeError::LengthMismatch {
+            expected,
+            actual: hist_len,
+        });
+    }
+    Ok(expected)
+}
+
+/// STAGE 1 — per-`(leaf,feature)` split evaluation (ODL-11, §8.1). Drives
+/// [`split_eval_body`] single-owner (`CubeDim(1)`) as the cpu f64 fold anchor and
+/// decodes the winning [`SplitScalars`] `CUDASplitInfo` record. `hist` is the
+/// interleaved `[g0,h0,g1,h1,…]` f64 histogram for the task's feature (already
+/// offset). Generic over `R` so the SAME body runs on cubecl-cpu (the anchor) and
+/// cubecl-hip (the f32 mirror is the separate [`split_eval_kernel_f32`] path, 17-03
+/// Task 2, anchored to THIS fold — never GPU-vs-GPU, def-f8u-01).
+///
+/// The categorical task is the Phase-22 dispatch seam (D-04): a categorical task
+/// returns the `is_valid=false` sentinel WITHOUT running the numerical core (no
+/// `BitonicArgSort`/`cat_threshold` eval).
+///
+/// # Errors
+/// [`ComputeError`] from [`validate_stage1_inputs`] (bad `num_bin` / histogram length)
+/// or the USE_RAND draw.
 pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
     hist: &[f64],
     task: &SplitFindTask,
     scalars: &Stage1Scalars,
 ) -> Result<SplitScalars, ComputeError> {
-    // Wave-0 stub: numerical core deferred to 17-03 (Wave 2). Thread the inputs so
-    // the signature is stable; return the `is_valid=false` sentinel.
-    let _ = (client, hist, task, scalars);
-    Ok(SplitScalars::default())
+    validate_stage1_inputs(task.num_bin, hist.len())?;
+
+    // Phase-22 categorical dispatch seam (D-04): the numerical core is continuous-only.
+    if task.is_categorical {
+        return Ok(SplitScalars::default());
+    }
+
+    let num_bin_i = task.num_bin as i32;
+    // USE_RAND: draw rand_threshold = CUDARandom.NextInt(0, num_bin-2) seeded
+    // `extra_seed + task_index` (Open Q1, carried in scalars.rng_seed). NextInt uses
+    // RandInt32 (cuda_random.hpp:42-44); route through the Phase-14 `random.rs` LCG so
+    // the draw is bit-identical to the verified device stream (key_link → random.rs).
+    let rand_threshold: i32 = if scalars.use_rand && num_bin_i - 2 > 0 {
+        let draw = draw_rand_int32_on(client, &[scalars.rng_seed as u32], 1)?;
+        draw[0] % (num_bin_i - 2)
+    } else {
+        -1
+    };
+
+    let min_gain_shift = scalars.parent_gain + scalars.min_gain_to_split;
+
+    let h_hist = client.create_from_slice(f64::as_bytes(hist));
+    // The kernel WRITES all STAGE1_OUT_LEN cells unconditionally (single owner), so
+    // `empty` needs no zero-init (the `split.rs` O1 idiom).
+    let h_out = client.empty(STAGE1_OUT_LEN * core::mem::size_of::<f64>());
+
+    // SAFETY: `h_hist` is sized exactly `hist.len() == 2*num_bin` (host-validated by
+    // `validate_stage1_inputs`) and `h_out` is `STAGE1_OUT_LEN` cells; both outlive the
+    // launch. The single-owner scan reads `hist[bin*2 (+1)]` with `bin` clamped to
+    // `[0, fnbmo)` (`bin_safe`), so every index stays in `[0, 2*num_bin)`. cubecl unsafe
+    // confined here (CMP-01, T-17-01).
+    unsafe {
+        split_eval_kernel_f64::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_hist, hist.len()),
+            ArrayArg::from_raw_parts(h_out.clone(), STAGE1_OUT_LEN),
+            num_bin_i,
+            task.mfb_offset as i32,
+            task.default_bin as i32,
+            if task.skip_default_bin { 1u32 } else { 0u32 },
+            if task.reverse { 1u32 } else { 0u32 },
+            if task.assume_out_default_left { 1u32 } else { 0u32 },
+            if scalars.use_l1 { 1u32 } else { 0u32 },
+            if scalars.use_smoothing { 1u32 } else { 0u32 },
+            if scalars.use_rand { 1u32 } else { 0u32 },
+            rand_threshold,
+            scalars.min_data_in_leaf,
+            scalars.min_sum_hessian_in_leaf,
+            scalars.lambda_l1,
+            scalars.lambda_l2,
+            scalars.path_smooth,
+            scalars.parent_output,
+            min_gain_shift,
+            scalars.sum_gradient,
+            scalars.sum_hessian,
+            scalars.num_data,
+            num_bin_i,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    let cells = f64::from_bytes(&bytes);
+
+    let is_valid = cells[0] != 0.0;
+    if !is_valid {
+        return Ok(SplitScalars::default());
+    }
+    Ok(SplitScalars {
+        is_valid: true,
+        leaf_index: -1,
+        gain: cells[3],
+        inner_feature_index: task.inner_feature_index,
+        threshold: cells[1] as u32,
+        default_left: cells[2] != 0.0,
+        left_sum_gradients: cells[4],
+        left_sum_hessians: cells[5],
+        left_sum_gh_quant: 0,
+        left_count: cells[6] as i32,
+        left_gain: cells[12],
+        left_value: cells[10],
+        right_sum_gradients: cells[7],
+        right_sum_hessians: cells[8],
+        right_sum_gh_quant: 0,
+        right_count: cells[9] as i32,
+        right_gain: cells[13],
+        right_value: cells[11],
+        num_cat_threshold: 0,
+    })
 }
 
 /// STAGE 2 (STUB — Wave 3 fills the cross-feature reduce, 17-04).
@@ -407,6 +807,25 @@ mod tests {
                 "branch-free fallback must match the intrinsic at {x}"
             );
         }
+    }
+
+    /// V5 launch-boundary validation (threat T-17-01): a zero `num_bin`, an
+    /// overflowing `num_bin`, and a histogram-length mismatch are all rejected with a
+    /// typed error BEFORE any launch.
+    #[test]
+    fn validate_stage1_inputs_rejects_bad_shapes() {
+        // num_bin == 0 -> Runtime error.
+        assert!(matches!(
+            validate_stage1_inputs(0, 0),
+            Err(ComputeError::Runtime { .. })
+        ));
+        // hist length mismatch (num_bin=4 wants 8 cells, given 6) -> LengthMismatch.
+        assert!(matches!(
+            validate_stage1_inputs(4, 6),
+            Err(ComputeError::LengthMismatch { expected: 8, actual: 6 })
+        ));
+        // Correct length is accepted (returns 2*num_bin).
+        assert_eq!(validate_stage1_inputs(4, 8).unwrap(), 8);
     }
 
     /// Helper: a non-categorical `FeatureMeta` with the given num_bin/missing_type.
