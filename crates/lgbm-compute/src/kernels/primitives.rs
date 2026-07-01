@@ -404,6 +404,193 @@ fn prefix_sum_f32_on<R: cubecl::Runtime>(
 }
 
 // =========================================================================
+// Phase-18 (18-01): integer-typed block prefix-sum launchers (ODL-13, A1/Open-Q1)
+//
+// §9 `GenDataToLeftBitVector` marks rows then block-scans with
+// `ShufflePrefixSum<uint16_t>` (`PrepareOffset`, per-block INCLUSIVE left-rank)
+// and `ShufflePrefixSum<uint32_t>` (`AggregateBlockOffset`, EXCLUSIVE block-totals
+// base). Both are INSTANTIATIONS of the existing `N: Numeric` bodies above — same
+// ascending single-owner fold + inclusive/exclusive branch, integer cell type,
+// integer equality (NO rounding). The wrapper+driver pairs below are byte-for-byte
+// copies of the f64 inclusive driver ([`prefix_sum_f64_on`]), swapping only the
+// cell type; `validate_scan_inputs` is REUSED unchanged for the block-count bounds
+// (T-18-02: rejects `block_size == 0`, `num_blocks > 1024`).
+//
+// A1 / Open-Q1 (u16 lowering on cubecl-hip 0.10): the per-block `PrepareOffset`
+// scan is instantiated as `u16` here. cubecl `Numeric` admits `u16` and the body
+// lowers on cubecl-cpu (the f64 bit-exact merge anchor — proven by the `int_scan`
+// unit test below) and on cubecl-hip. If a future hip toolchain regression stops
+// `u16` from lowering, route the per-block scan through the `u32`-widened
+// [`prefix_sum_exclusive_u32_on`] instead: u16-vs-u32-widen produce byte-identical
+// integer scan output (every per-block partial ≤ block_size ≤ 1024 fits both
+// widths), so the fallback is PARITY-NEUTRAL. The exclusive/inclusive distinction
+// is load-bearing (§17, Pitfall 2): PrepareOffset = inclusive + `[idx-1]`;
+// AggregateBlockOffset = exclusive block-totals.
+// =========================================================================
+
+#[cube(launch_unchecked)]
+fn block_scan_kernel_u16(
+    data: &Array<u16>,
+    out: &mut Array<u16>,
+    block_totals: &mut Array<u16>,
+    block_size: u32,
+    n: u32,
+    inclusive: u32,
+) {
+    block_scan_body::<u16>(data, out, block_totals, block_size, n, inclusive);
+}
+
+#[cube(launch_unchecked)]
+fn scan_block_totals_kernel_u16(block_totals: &mut Array<u16>, num_blocks: u32) {
+    scan_block_totals_body::<u16>(block_totals, num_blocks);
+}
+
+#[cube(launch_unchecked)]
+fn add_base_kernel_u16(out: &mut Array<u16>, block_bases: &Array<u16>, block_size: u32, n: u32) {
+    add_base_body::<u16>(out, block_bases, block_size, n);
+}
+
+#[cube(launch_unchecked)]
+fn block_scan_kernel_u32(
+    data: &Array<u32>,
+    out: &mut Array<u32>,
+    block_totals: &mut Array<u32>,
+    block_size: u32,
+    n: u32,
+    inclusive: u32,
+) {
+    block_scan_body::<u32>(data, out, block_totals, block_size, n, inclusive);
+}
+
+#[cube(launch_unchecked)]
+fn scan_block_totals_kernel_u32(block_totals: &mut Array<u32>, num_blocks: u32) {
+    scan_block_totals_body::<u32>(block_totals, num_blocks);
+}
+
+#[cube(launch_unchecked)]
+fn add_base_kernel_u32(out: &mut Array<u32>, block_bases: &Array<u32>, block_size: u32, n: u32) {
+    add_base_body::<u32>(out, block_bases, block_size, n);
+}
+
+/// Inclusive block+global prefix-sum on `u16` cells — the §9 `PrepareOffset`
+/// per-block left-rank scan (`ShufflePrefixSum<uint16_t>`). Integer-exact vs a
+/// serial Rust inclusive scan (no rounding). Same 3-launch structure + single
+/// reused block-totals scratch as [`prefix_sum_inclusive_f64_on`].
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `block_size == 0` or `num_blocks > 1024`.
+pub fn prefix_sum_inclusive_u16_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[u16],
+    block_size: u32,
+) -> Result<Vec<u16>, ComputeError> {
+    let n = data.len();
+    let num_blocks = validate_scan_inputs(n, block_size)?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let h_in = client.create_from_slice(u16::as_bytes(data));
+    let h_out = client.empty(n * core::mem::size_of::<u16>());
+    let h_totals = client.empty(num_blocks * core::mem::size_of::<u16>());
+
+    // SAFETY: identical bounds contract to `prefix_sum_f64_on`, u16 cells. Each
+    // cube owns block `CUBE_POS_X < num_blocks` and folds only indices in
+    // `[b*block_size, min((b+1)*block_size, n)) ⊆ [0, n)`; every `block_totals[b]`
+    // access is host-proven `< num_blocks`. cubecl unsafe confined here (CMP-01).
+    unsafe {
+        block_scan_kernel_u16::launch_unchecked(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_in, n),
+            ArrayArg::from_raw_parts(h_out.clone(), n),
+            ArrayArg::from_raw_parts(h_totals.clone(), num_blocks),
+            block_size,
+            n as u32,
+            1,
+        );
+        scan_block_totals_kernel_u16::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_totals.clone(), num_blocks),
+            num_blocks as u32,
+        );
+        add_base_kernel_u16::launch_unchecked(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_out.clone(), n),
+            ArrayArg::from_raw_parts(h_totals, num_blocks),
+            block_size,
+            n as u32,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(u16::from_bytes(&bytes).to_vec())
+}
+
+/// Exclusive block+global prefix-sum on `u32` cells — the §9 `AggregateBlockOffset`
+/// block-totals scan (`ShufflePrefixSum<uint32_t>`, exclusive). `out[i]` holds the
+/// sum of all cells strictly before `i` (`out[0] == 0`). Integer-exact vs a serial
+/// Rust exclusive scan. Same 3-launch structure as [`prefix_sum_inclusive_f64_on`].
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `block_size == 0` or `num_blocks > 1024`.
+pub fn prefix_sum_exclusive_u32_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    data: &[u32],
+    block_size: u32,
+) -> Result<Vec<u32>, ComputeError> {
+    let n = data.len();
+    let num_blocks = validate_scan_inputs(n, block_size)?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let h_in = client.create_from_slice(u32::as_bytes(data));
+    let h_out = client.empty(n * core::mem::size_of::<u32>());
+    let h_totals = client.empty(num_blocks * core::mem::size_of::<u32>());
+
+    // SAFETY: identical bounds contract to `prefix_sum_f64_on`, u32 cells (see the
+    // u16 driver above). cubecl unsafe confined here (CMP-01).
+    unsafe {
+        block_scan_kernel_u32::launch_unchecked(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_in, n),
+            ArrayArg::from_raw_parts(h_out.clone(), n),
+            ArrayArg::from_raw_parts(h_totals.clone(), num_blocks),
+            block_size,
+            n as u32,
+            0,
+        );
+        scan_block_totals_kernel_u32::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_totals.clone(), num_blocks),
+            num_blocks as u32,
+        );
+        add_base_kernel_u32::launch_unchecked(
+            client,
+            CubeCount::Static(num_blocks as u32, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_out.clone(), n),
+            ArrayArg::from_raw_parts(h_totals, num_blocks),
+            block_size,
+            n as u32,
+        );
+    }
+
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(u32::from_bytes(&bytes).to_vec())
+}
+
+// =========================================================================
 // Task 2: shuffle reductions (sum / max / min, dot-product)
 // =========================================================================
 
@@ -1588,4 +1775,99 @@ pub fn plane_dot_product_f32_on<R: cubecl::Runtime>(
         );
     }
     Ok(f32::from_bytes(&client.read_one_unchecked(h_out))[0])
+}
+
+// =========================================================================
+// Phase-18 (18-01) integer block-scan parity unit test (ODL-13, A1/Open-Q1).
+//
+// De-risks the single MEDIUM unknown before 18-02 commits the scatter to the
+// generic scan body: drive the u16 inclusive (`PrepareOffset`) and u32 exclusive
+// (`AggregateBlockOffset`) integer launchers on the cubecl-cpu client and assert
+// each equals a serial Rust reference scan element-for-element (integer equality,
+// no rounding). Includes the single-tile boundary (1024 blocks) and the
+// `validate_scan_inputs` rejection of `block_size == 0`.
+// =========================================================================
+#[cfg(test)]
+mod int_scan {
+    use super::{prefix_sum_exclusive_u32_on, prefix_sum_inclusive_u16_on};
+    use crate::runtime::cpu_client;
+
+    /// Serial reference inclusive scan (`out[i] = Σ_{j<=i} data[j]`).
+    fn serial_inclusive_u16(data: &[u16]) -> Vec<u16> {
+        let mut acc = 0u16;
+        data.iter()
+            .map(|&v| {
+                acc = acc.wrapping_add(v);
+                acc
+            })
+            .collect()
+    }
+
+    /// Serial reference exclusive scan (`out[i] = Σ_{j<i} data[j]`, `out[0] == 0`).
+    fn serial_exclusive_u32(data: &[u32]) -> Vec<u32> {
+        let mut acc = 0u32;
+        data.iter()
+            .map(|&v| {
+                let prev = acc;
+                acc = acc.wrapping_add(v);
+                prev
+            })
+            .collect()
+    }
+
+    #[test]
+    fn u16_inclusive_matches_serial() {
+        let client = cpu_client();
+        // A per-block left-mark vector (0/1 marks, PrepareOffset input) plus a
+        // richer small-integer vector spanning multiple blocks.
+        let data: Vec<u16> = vec![1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1];
+        let got = prefix_sum_inclusive_u16_on(&client, &data, 4).expect("u16 inclusive scan");
+        assert_eq!(got, serial_inclusive_u16(&data), "u16 inclusive scan mismatch");
+
+        let data2: Vec<u16> = (0..37u16).map(|i| (i * 3) % 7).collect();
+        let got2 = prefix_sum_inclusive_u16_on(&client, &data2, 8).expect("u16 inclusive scan 2");
+        assert_eq!(got2, serial_inclusive_u16(&data2), "u16 inclusive scan 2 mismatch");
+    }
+
+    #[test]
+    fn u32_exclusive_matches_serial() {
+        let client = cpu_client();
+        // Per-block counts (AggregateBlockOffset input): exclusive base per block.
+        let data: Vec<u32> = vec![3, 7, 0, 5, 2, 9, 4, 1, 6, 8];
+        let got = prefix_sum_exclusive_u32_on(&client, &data, 4).expect("u32 exclusive scan");
+        assert_eq!(got, serial_exclusive_u32(&data), "u32 exclusive scan mismatch");
+        assert_eq!(got[0], 0, "exclusive scan out[0] must be 0");
+
+        let data2: Vec<u32> = (0..50u32).map(|i| i % 11).collect();
+        let got2 = prefix_sum_exclusive_u32_on(&client, &data2, 16).expect("u32 exclusive scan 2");
+        assert_eq!(got2, serial_exclusive_u32(&data2), "u32 exclusive scan 2 mismatch");
+    }
+
+    #[test]
+    fn boundary_single_tile_1024_blocks() {
+        let client = cpu_client();
+        // block_size == 1 with n == 1024 => exactly 1024 blocks (the MAX_GLOBAL_SCAN
+        // single-tile cap). One more element would exceed it and reject.
+        let data: Vec<u32> = (0..1024u32).map(|i| i % 5).collect();
+        let got = prefix_sum_exclusive_u32_on(&client, &data, 1).expect("1024-block scan");
+        assert_eq!(got, serial_exclusive_u32(&data), "1024-block boundary mismatch");
+
+        // 1025 blocks (n=1025, block_size=1) must be rejected by the recursion guard.
+        let too_many: Vec<u32> = vec![1u32; 1025];
+        assert!(
+            prefix_sum_exclusive_u32_on(&client, &too_many, 1).is_err(),
+            "num_blocks > 1024 must be rejected"
+        );
+    }
+
+    #[test]
+    fn empty_and_zero_block_size_rejected() {
+        let client = cpu_client();
+        // Empty input: validated (num_blocks == 0) then returns empty — no launch.
+        assert!(prefix_sum_inclusive_u16_on(&client, &[], 4).unwrap().is_empty());
+        assert!(prefix_sum_exclusive_u32_on(&client, &[], 4).unwrap().is_empty());
+        // block_size == 0 rejected at the validate_scan_inputs boundary.
+        assert!(prefix_sum_inclusive_u16_on(&client, &[1, 2, 3], 0).is_err());
+        assert!(prefix_sum_exclusive_u32_on(&client, &[1, 2, 3], 0).is_err());
+    }
 }

@@ -48,3 +48,14 @@ pub mod histogram_arena;
 // (NOT `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor exercises the
 // host task-builder + count-recovery rounding in isolation (D-08).
 pub mod best_split;
+// Phase-18 on-device data-partition / tree-mutation / prediction (ODL-13/14/15):
+// the §9 `mark → prefix-sum → scatter` row router (`data_partition`), the flat
+// device `CUDATree` mutation kernels (`tree`), and the tree-walk prediction
+// kernel (`predict`). Declared here in Wave-0 (18-01) as empty compiling stubs so
+// each Wave-1/2 plan (18-02/03/04) fills exactly one owned file with NO `mod.rs`
+// contention. Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE` (D-13);
+// ungated like the other Phase-14/15/16/17 kernel modules (NOT
+// `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor exercises them (D-08).
+pub mod data_partition;
+pub mod predict;
+pub mod tree;
