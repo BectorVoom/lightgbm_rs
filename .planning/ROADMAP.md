@@ -178,7 +178,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
   3. **Tie-aware `default_left`** parity to the cpu anchor: a flip is accepted only on a verified f32 tie (same threshold + left_count + f32-equal gains); a flip on any non-tie split hard-fails; the empty / sparse-default-bin fixtures pass.
   4. The chosen split is anchor-pinned (structure bit-exact, values within ~1e-5); CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: 3/5 plans executed
+**Plans**: 4/5 plans executed
 
 Plans:
 **Wave 1**
@@ -192,7 +192,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 17-04-PLAN.md — Stage-1 _GlobalMemory >256-bin spill variant + pre-allocated scratch (D-05/D-11) [wave 3]
+- [x] 17-04-PLAN.md — Stage-1 _GlobalMemory >256-bin spill variant + pre-allocated scratch (D-05/D-11) [wave 3]
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -298,7 +298,7 @@ Plans:
 | 14. Foundation — Shared Device Primitives + Structs/RNG | v1.1 | 6/6 | Complete   | 2026-06-29 |
 | 15. On-Device Device Dataset + Row-Subset Gather | v1.1 | 5/5 | Complete    | 2026-06-29 |
 | 16. On-Device Histogram Constructor | v1.1 | 5/5 | Complete    | 2026-07-01 |
-| 17. On-Device Best-Split Finder | v1.1 | 3/5 | In Progress|  |
+| 17. On-Device Best-Split Finder | v1.1 | 4/5 | In Progress|  |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 0/? | Not started | - |
 | 19. On-Device Objectives | v1.1 | 0/? | Not started | - |
 | 20. On-Device Score Updater & Metrics | v1.1 | 0/? | Not started | - |
