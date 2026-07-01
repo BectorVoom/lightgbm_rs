@@ -453,6 +453,54 @@ mod tests {
     }
 
     #[test]
+    fn smoothing_blend_matches_reference() {
+        // Fixed inputs: no-L1, l2=0, path_smooth=2, num_data=10, parent_output=0.5.
+        let (use_l1, g, h, l1, l2) = (false, 4.0_f64, 2.0_f64, 0.0_f64, 0.0_f64);
+        let (ps, n, parent) = (2.0_f64, 10_i32, 0.5_f64);
+
+        // Hand-computed form-(B) blend, transcribed verbatim (verbatim precedence:
+        // `ret * nps / (nps+1)`, NOT `ret * (nps/(nps+1))`).
+        let base = calculate_splitted_leaf_output(use_l1, g, h, l1, l2); // -2.0
+        let nps = f64::from(n) / ps; // 5.0
+        let expected_out = base * nps / (nps + 1.0) + parent / (nps + 1.0);
+        assert_eq!(
+            calculate_splitted_leaf_output_smoothed(use_l1, g, h, l1, l2, ps, n, parent),
+            expected_out
+        );
+
+        // Form (D): gain = GetLeafGainGivenOutput at the blended output.
+        let expected_gain = get_leaf_gain_given_output(use_l1, g, h, l1, l2, expected_out);
+        assert_eq!(
+            get_leaf_gain_smoothed(use_l1, g, h, l1, l2, ps, n, parent),
+            expected_gain
+        );
+
+        // Directional sanity: small path_smooth (n/ps -> inf, weight -> 1) is
+        // base-dominated; large path_smooth (n/ps -> 0, weight -> 0) is parent-dominated.
+        let near_base =
+            calculate_splitted_leaf_output_smoothed(use_l1, g, h, l1, l2, 1e-3, n, parent);
+        assert!(
+            (near_base - base).abs() < 1e-2,
+            "small path_smooth should approach base output"
+        );
+        let near_parent =
+            calculate_splitted_leaf_output_smoothed(use_l1, g, h, l1, l2, 1e6, n, parent);
+        assert!(
+            (near_parent - parent).abs() < 1e-2,
+            "large path_smooth should approach parent output"
+        );
+
+        // f32 mirror consistency: form-(D) gain equals given-output at the f32 blend.
+        let (gf, hf, l2f, psf, parentf) = (4.0_f32, 2.0_f32, 0.0_f32, 2.0_f32, 0.5_f32);
+        let out_f32 =
+            calculate_splitted_leaf_output_smoothed_f32(use_l1, gf, hf, 0.0f32, l2f, psf, n, parentf);
+        assert_eq!(
+            get_leaf_gain_smoothed_f32(use_l1, gf, hf, 0.0f32, l2f, psf, n, parentf),
+            get_leaf_gain_given_output_f32(use_l1, gf, hf, 0.0f32, l2f, out_f32)
+        );
+    }
+
+    #[test]
     fn gain_config_from_default_config_is_noop_l1() {
         let cfg = lgbm_core::Config::default();
         let gc = GainConfig::from_config(&cfg);
