@@ -326,13 +326,24 @@ impl<R: cubecl::Runtime> HistArena<R> {
     /// takes a FRESH non-aliasing slot and rebuilds directly (§17, Pitfall 5).
     /// `smaller_is_left` picks the branch (`num_data[left] < num_data[right]`).
     ///
+    /// The fresh slot for the smaller child is drawn from the set of pool slots not
+    /// currently referenced by any live leaf in `leaf_to_slot` (the port of the
+    /// reference free-buffer pool, `cuda_data_partition.cu:827-906`). Picking
+    /// `(parent_slot + 1) % num_slots` is INSUFFICIENT in a real breadth-first grow
+    /// loop with more than two live leaves: that slot can already hold another live
+    /// leaf's histogram, and rebuilding the smaller child into it would silently
+    /// corrupt the aliased leaf (WR-01). The parent leaf becomes an internal node on
+    /// split, so its slot key is dropped from `leaf_to_slot` (the larger child now
+    /// owns that slot).
+    ///
     /// Reassigns leaf→slot INDICES only — ZERO `client.empty` (`device_allocations`
     /// frozen), NO bulk histogram copy. Mirrors [`Self::rotate`]'s no-alias
     /// discipline (T-16-02-02): the smaller child never aliases the larger's slot.
     ///
     /// # Errors
-    /// [`ComputeError::Runtime`] if `parent_leaf` has no slot assignment or the pool
-    /// has fewer than 2 slots (a non-aliasing fresh slot cannot be supplied).
+    /// [`ComputeError::Runtime`] if `parent_leaf` has no slot assignment, the pool
+    /// has fewer than 2 slots, or the pool is exhausted (every non-parent slot is
+    /// already referenced by a live leaf, so no non-aliasing fresh slot exists).
     pub fn swap(
         &mut self,
         parent_leaf: usize,
@@ -361,8 +372,24 @@ impl<R: cubecl::Runtime> HistArena<R> {
         };
 
         // Larger child inherits the parent buffer in-place (`larger = parent − smaller`).
-        // Smaller child takes a fresh slot distinct from the parent (== larger).
-        let fresh = (parent_slot + 1) % self.num_slots;
+        // Smaller child takes a fresh slot distinct from the parent (== larger) AND
+        // from every other live leaf's slot. Scanning the occupancy map (rather than
+        // the naive `(parent_slot + 1) % num_slots`) is what prevents aliasing a live
+        // sibling leaf's histogram once >2 leaves are live (WR-01). `parent_slot` is
+        // itself in `occupied` (parent_leaf still maps to it here), so the explicit
+        // `*s != parent_slot` guard is belt-and-suspenders.
+        let occupied: std::collections::HashSet<usize> =
+            self.leaf_to_slot.values().copied().collect();
+        let fresh = (0..self.num_slots)
+            .find(|s| *s != parent_slot && !occupied.contains(s))
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!(
+                    "HistArena::swap: no free non-aliasing slot for the smaller child \
+                     (pool of {} slots exhausted by {} live leaves)",
+                    self.num_slots,
+                    self.leaf_to_slot.len()
+                ),
+            })?;
 
         // T-16-02-02: never alias the smaller and larger children into one slot.
         assert_ne!(
@@ -372,6 +399,13 @@ impl<R: cubecl::Runtime> HistArena<R> {
 
         self.leaf_to_slot.insert(larger_leaf, parent_slot);
         self.leaf_to_slot.insert(smaller_leaf, fresh);
+        // The parent leaf is now an internal node — drop its (stale) slot key so it no
+        // longer counts as a live occupant of `parent_slot` (which the larger child now
+        // owns). Removed AFTER inserting the children so a hypothetical parent==child id
+        // could never erase a just-assigned child (children are always fresh ids).
+        if parent_leaf != larger_leaf && parent_leaf != smaller_leaf {
+            self.leaf_to_slot.remove(&parent_leaf);
+        }
         // Track the roles so `parent_handle`/`smaller_handle`/`larger_handle` and the
         // allocation-frozen invariant stay consistent with `rotate()`.
         self.parent_idx = parent_slot;
@@ -593,6 +627,71 @@ mod tests {
         assert_eq!(arena.leaf_slot(4).unwrap(), 1, "larger (left) inherits parent slot");
         assert_ne!(arena.leaf_slot(5).unwrap(), 1, "smaller (right) must be fresh");
         assert_eq!(arena.device_allocations(), before, "swap must not allocate");
+    }
+
+    /// WR-01 regression: in a breadth-first grow loop with >2 live leaves the smaller
+    /// child's fresh slot must be drawn from the free (unreferenced) slots — NOT the
+    /// naive `(parent_slot + 1) % num_slots`, which would alias a live sibling leaf's
+    /// histogram slot. Here splitting leaf 1 (slot 1) must NOT reuse slot 2, which is
+    /// live (held by leaf 3); the old `(1+1)%4 == 2` picker would have aliased it.
+    #[test]
+    fn swap_multileaf_never_aliases_live_sibling_slot() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 4, 16).unwrap();
+        arena.set_leaf_slot(0, 0).unwrap(); // root leaf 0 in slot 0
+
+        // Split leaf 0 → {1 (smaller), 2 (larger)}. larger inherits slot 0, smaller fresh.
+        arena.swap(0, 1, 2, true).unwrap();
+        // Parent leaf 0 is now internal — its slot key is dropped.
+        assert_eq!(arena.leaf_slot(0), None, "split parent leaf must be dropped");
+        assert_eq!(arena.leaf_slot(2).unwrap(), 0, "larger inherits parent slot");
+        let slot1 = arena.leaf_slot(1).unwrap();
+
+        // Split leaf 2 (slot 0) → {3 (smaller), 4 (larger)}. larger inherits slot 0.
+        arena.swap(2, 3, 4, true).unwrap();
+        assert_eq!(arena.leaf_slot(4).unwrap(), 0, "larger inherits parent slot");
+        let slot3 = arena.leaf_slot(3).unwrap();
+
+        // Now split leaf 1 (slot `slot1`) → {5 (smaller), 6 (larger)}. The fresh slot
+        // for leaf 5 must avoid every live leaf's slot — critically NOT slot3 (live,
+        // leaf 3) nor slot 0 (live, leaf 4).
+        arena.swap(1, 5, 6, true).unwrap();
+        let slot5 = arena.leaf_slot(5).unwrap();
+
+        // Collect the live leaves' slots and assert they are all distinct (no aliasing).
+        let live = [
+            (4usize, arena.leaf_slot(4).unwrap()),
+            (3, slot3),
+            (6, arena.leaf_slot(6).unwrap()),
+            (5, slot5),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (leaf, slot) in live {
+            assert!(
+                seen.insert(slot),
+                "leaf {leaf} slot {slot} aliases another live leaf's slot"
+            );
+        }
+        // And the earlier smaller child (leaf 1) is gone (split into 5/6).
+        assert_eq!(arena.leaf_slot(1), None);
+        let _ = slot1; // documented above; leaf 1 now internal
+    }
+
+    /// WR-01: when every non-parent slot is already referenced by a live leaf, `swap()`
+    /// returns a typed error instead of aliasing a live histogram. A 2-slot pool with
+    /// both slots live (parent in slot 0, another leaf in slot 1) has no free slot for
+    /// the smaller child.
+    #[test]
+    fn swap_errors_when_pool_exhausted() {
+        let client = cpu_client();
+        let mut arena = HistArena::new(&client, 2, 16).unwrap();
+        arena.set_leaf_slot(0, 0).unwrap(); // parent leaf 0 in slot 0
+        arena.set_leaf_slot(9, 1).unwrap(); // an unrelated live leaf pins slot 1
+        // Only slot 1 is non-parent, but it is occupied by leaf 9 → no free slot.
+        assert!(matches!(
+            arena.swap(0, 1, 2, true),
+            Err(ComputeError::Runtime { .. })
+        ));
     }
 
     /// A 1-slot pool cannot supply a non-aliasing fresh slot — `swap()` rejects it
