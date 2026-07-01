@@ -333,6 +333,11 @@ pub fn add_prediction_to_score_on_device<R: cubecl::Runtime>(
 /// each data index to its resident leaf; `leaf_value` the per-leaf output.
 /// `used_indices == None` adds every row (identity); else the used-index subset.
 ///
+/// # Preconditions (debug-checked)
+/// **IN-02:** `used_indices` must be unique — the kernel does `score[data_index] += ...`,
+/// so a duplicated index double-counts (and races on a real GPU backend). Reference
+/// bagging indices are unique; a `debug_assert` guards it with no release-mode cost.
+///
 /// # Errors
 /// [`ComputeError::LengthMismatch`] if `data_index_to_leaf.len() != num_data`;
 /// [`ComputeError::Runtime`] on a leaf/data index out of range.
@@ -369,6 +374,15 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
                     });
                 }
             }
+            // IN-02: `score[data_index] += ...` requires unique used indices — a
+            // duplicate double-counts (and races on a real GPU backend). Debug-only.
+            debug_assert!(
+                {
+                    let mut seen = std::collections::HashSet::with_capacity(idx.len());
+                    idx.iter().all(|&di| seen.insert(di))
+                },
+                "add_prediction_bagging: used_indices must be unique (a duplicate index double-counts)"
+            );
             (true, idx.to_vec(), idx.len())
         }
         None => (false, vec![0u32], num_data),
@@ -408,6 +422,18 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
 /// confined `unsafe` launch. Rejects a `rows`/`num_features` mismatch, an unequal
 /// per-feature meta length, an unequal per-node tree length, and a `num_data` too
 /// small for the walked data indices.
+///
+/// # Preconditions (debug-checked)
+/// - **IN-03 (identity path):** with `used_indices == None` the walk is the
+///   `USE_INDICES=false` semantics, which require `num_rows == num_data` — every data
+///   row is walked exactly once. A `num_rows < num_data` identity call silently scores
+///   only the `[0, num_rows)` prefix and leaves the tail at 0; a `debug_assert`
+///   rejects it. (Release builds keep the historical lenient behavior — this changes
+///   no hot-path numeric output.)
+/// - **IN-02 (uniqueness):** `used_indices` must be unique. `add_prediction_*_kernel`
+///   does `score[data_index] += ...`, so a duplicated index double-counts (and races
+///   on a real GPU backend). Reference bagging indices are unique; a `debug_assert`
+///   guards the precondition without a release-mode cost.
 fn validate_walk(
     tree: &PredictTree<'_>,
     rows: &[u32],
@@ -430,6 +456,14 @@ fn validate_walk(
             detail: format!("add_prediction_to_score: num_rows {num_rows} > num_data {num_data}"),
         });
     }
+    // IN-03: the identity (`USE_INDICES=false`) path requires num_rows == num_data. A
+    // shorter num_rows silently scores only a prefix. Debug-only guard (no release
+    // behavior change).
+    debug_assert!(
+        used_indices.is_some() || num_rows == num_data,
+        "add_prediction_to_score: identity walk requires num_rows ({num_rows}) == num_data ({num_data}); \
+         a shorter num_rows scores only the [0, num_rows) prefix"
+    );
     let nf = tree.feat_min.len();
     for (name, len) in [
         ("feat_max", tree.feat_max.len()),
@@ -477,6 +511,16 @@ fn validate_walk(
                 });
             }
         }
+        // IN-02: `score[data_index] += ...` requires unique used indices — a duplicate
+        // double-counts (and races on a real GPU backend). Debug-only check (no
+        // release-mode cost on the hot path).
+        debug_assert!(
+            {
+                let mut seen = std::collections::HashSet::with_capacity(idx.len());
+                idx.iter().all(|&di| seen.insert(di))
+            },
+            "add_prediction_to_score: used_indices must be unique (a duplicate index double-counts)"
+        );
     }
     Ok(())
 }
