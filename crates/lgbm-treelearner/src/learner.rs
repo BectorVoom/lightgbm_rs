@@ -505,6 +505,31 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
     }
 
+    /// Read-only view of the learner's [`ComputeClient`] (the same `&'b` client the
+    /// learner was constructed with). Phase-20 (20-04, ODL-16) seam: `GBDT`'s resident
+    /// score loop needs the `&ComputeClient<B::Runtime>` the score-updater's `*_on`
+    /// device delegates require, and the learner is the only holder of a client
+    /// generic over `B::Runtime` in the boosting call graph. Additive, read-only — no
+    /// behavior change to any existing path.
+    #[inline]
+    #[must_use]
+    pub fn client(&self) -> &ComputeClient<B::Runtime> {
+        self.client
+    }
+
+    /// Read-only view of the learner's per-feature columns (set via
+    /// [`with_features`](Self::with_features)). Phase-20 (20-04, ODL-16) seam: the
+    /// GBDT resident score loop reconstructs a `PredictTree` from the grown tree's
+    /// inner-bin arrays + these columns' bin metadata (min/max/default/most-freq-bin/
+    /// offset). The learner is the authoritative holder of the columns the tree was
+    /// grown over (so the split's inner feature index equals the column position).
+    /// Additive, read-only.
+    #[inline]
+    #[must_use]
+    pub fn features(&self) -> &[FeatureColumn] {
+        &self.features
+    }
+
     /// Grow one tree from fixed `gradients`/`hessians` (`SerialTreeLearner::Train`).
     ///
     /// `features` are the spine's per-feature columns (all used, `feature_fraction

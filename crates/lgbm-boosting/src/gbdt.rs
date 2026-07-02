@@ -73,6 +73,11 @@ use crate::error::BoostingError;
 use crate::objective::BoostObjective;
 use crate::sample_strategy::{BaggingSampleStrategy, GossSampleStrategy};
 use crate::score_updater::ScoreUpdater;
+// Phase-20 (20-04, ODL-16, D-01/D-06) resident cross-iteration score loop: the §11
+// per-leaf `AddScore` device delegate walks a `PredictTree` reconstructed from the
+// grown `Tree` + the spine's `FeatureColumn`s. Symbol only — the walk stays generic
+// over `B::Runtime` via the score-updater's `*_on` methods (no GPU runtime pulled in).
+use lgbm_compute::kernels::predict::PredictTree;
 
 /// The resolved Random Forest `Boosting()` output: the per-class init scores plus
 /// the ONCE-derived class-major gradients and hessians (`rf.hpp:90-109`
@@ -981,17 +986,45 @@ impl<'a> Gbdt<'a> {
                         );
                     }
                 }
+                // §16 ORDER (RESEARCH Pitfall 4): Shrinkage → UpdateScore(§11) →
+                // (optional RenewTreeOutput, §5.1) → Metric.Eval(§12). RenewTreeOutput
+                // already ran ABOVE this point (before shrinkage), a no-op for the L2
+                // slice (`is_renew_tree_output()==false`); Metric.Eval runs downstream
+                // in the facade over `score_updater.scores()` — the resident buffer's
+                // host mirror — composed with §12 ConvertOutput (Plan 20-02). The
+                // ORDERING CONTRACT for the L1/quantile follow-up: RenewTreeOutput MUST
+                // stay BEFORE shrinkage+UpdateScore (it reads the pre-update score), so
+                // any future device RenewTreeOutput refit slots in at the existing
+                // renew site above, NOT here — do not reorder.
+                //
                 // Shrinkage BEFORE UpdateScore.
                 tree.shrinkage(shrink_rate);
                 // UpdateScore: bit-exact training-path per-leaf scatter into score_.
                 // Spike-014b: time into the whole-train budget.
-                lgbm_treelearner::phase_prof::time(
-                    &lgbm_treelearner::phase_prof::SCORE_NS,
-                    || {
-                        self.score_updater
-                            .add_tree_train_path(learner, &tree, &partition, cur_tree_id)
-                    },
-                );
+                //
+                // Phase-20 (20-04, D-01/D-06 layer 2) RESIDENT slice: when the
+                // `boosting_on_cuda_` toggle is active (`LGBM_CUDA_ON_DEVICE=1`, or the
+                // driver seam forced it on) keep `cuda_score_` RESIDENT across the whole
+                // train — route the per-leaf `AddScore` through the Phase-18
+                // `add_prediction_to_score_on_device` tree-walk delegate (D-02, NO new
+                // kernel). On the identity-binned L2 continuous corpus the device
+                // tree-walk is bit-exact to the host partition scatter (the L2
+                // contract, proven in `score_updater_parity`/`resident_score_ab`). With
+                // the env unset the toggle is OFF and the host scatter below is
+                // byte-unchanged (D-09/ODL-19). OUT-OF-SLICE: the DART/RF per-row-predict
+                // paths (`add_tree_predict_path`/`add_tree_scaled_all`, RESEARCH
+                // Pitfall 5) stay on the host path this phase.
+                if self.score_updater.boosting_on_cuda() {
+                    self.update_score_resident::<B>(learner, &tree, cur_tree_id)?;
+                } else {
+                    lgbm_treelearner::phase_prof::time(
+                        &lgbm_treelearner::phase_prof::SCORE_NS,
+                        || {
+                            self.score_updater
+                                .add_tree_train_path(learner, &tree, &partition, cur_tree_id)
+                        },
+                    );
+                }
                 // AddBias AFTER UpdateScore — rewrites STORED tree values only
                 // (model text), NEVER score_ (Pitfall 5: no double-add).
                 let init = init_scores[cur_tree_id as usize];
@@ -1445,6 +1478,130 @@ impl<'a> Gbdt<'a> {
     /// Read-only view of the f64 score buffer (`score_`).
     pub fn scores(&self) -> &[f64] {
         self.score_updater.scores()
+    }
+
+    /// Phase-20 (20-04, D-06 layer 2) driver/test seam: force the resident
+    /// `boosting_on_cuda_` toggle on the internal score updater. The env-gated default
+    /// from [`ScoreUpdater::new`] already reflects `LGBM_CUDA_ON_DEVICE` (OFF unless
+    /// `=1`, D-09); this override lets the resident-score A/B run BOTH arms — the
+    /// resident (`true`) and the host reference (`false`) — inside one process (the
+    /// `cuda_on_device_enabled()` env is a process-global `OnceLock`, so per-arm env
+    /// toggling is not possible). Additive; unset-env default stays host.
+    pub fn set_boosting_on_cuda(&mut self, on: bool) {
+        self.score_updater.set_boosting_on_cuda(on);
+    }
+
+    /// Whether the internal score updater's resident `boosting_on_cuda_` path is active.
+    #[must_use]
+    pub fn boosting_on_cuda(&self) -> bool {
+        self.score_updater.boosting_on_cuda()
+    }
+
+    /// Phase-20 (20-04, ODL-16, D-01/D-06 layer 2) resident §11 UpdateScore: keep
+    /// `cuda_score_` RESIDENT by routing the grown tree's per-leaf `AddScore` through
+    /// the Phase-18 `add_prediction_to_score_on_device` tree-walk delegate (D-02, NO
+    /// new tree-walk kernel), mirroring the resident buffer back into `score_`.
+    ///
+    /// The `PredictTree` is reconstructed from the grown [`Tree`]'s INNER-bin arrays
+    /// (`split_feature_inner`/`threshold_in_bin`/`decision_type`/children/`leaf_value`)
+    /// plus the spine's [`FeatureColumn`] per-feature bin metadata; `rows` is the
+    /// row-major `[num_data × num_features]` bin matrix. On the identity-binned L2
+    /// continuous corpus this device tree-walk is bit-exact to the host partition
+    /// scatter (the L2 contract). SCOPE: the single-feature-per-group L2 spine, where
+    /// each split's inner feature index equals the feature's position in `self.features`
+    /// (so `feat_column[f] = f`, identity). Categorical bitsets are empty this slice.
+    ///
+    /// # Errors
+    /// Propagates the device delegate's [`lgbm_compute::ComputeError`] (length /
+    /// bit-type / index validation) wrapped through the tree-learner error boundary.
+    fn update_score_resident<B: Backend>(
+        &mut self,
+        learner: &SerialTreeLearner<'_, B>,
+        tree: &Tree,
+        cur_tree_id: i32,
+    ) -> Result<(), BoostingError> {
+        // The learner is the authoritative holder of the columns the tree was grown
+        // over (so each split's inner feature index equals the column position). The
+        // GBDT-spine `self.features` is only populated on the bagging/DART/RF builders
+        // (out-of-slice), so source the columns from the learner here.
+        let features = learner.features();
+        let nf = features.len();
+        let nd = self.num_data as usize;
+
+        // Per-(inner)feature bin metadata, indexed by inner feature index = the
+        // feature's position in the learner's columns (single-feature-per-group spine).
+        let feat_min: Vec<i32> = features.iter().map(|f| f.min_bin as i32).collect();
+        let feat_max: Vec<i32> = features.iter().map(|f| f.max_bin as i32).collect();
+        let feat_default: Vec<i32> = features.iter().map(|f| f.default_bin as i32).collect();
+        let feat_mfb: Vec<i32> = features.iter().map(|f| f.most_freq_bin as i32).collect();
+        // Predict-remap offset — the CUDA-tree walk remaps `bin = raw − min_bin + offset`
+        // and compares against the tree's `threshold_in_bin`. A grown tree's
+        // `threshold_in_bin` is recorded in the `min_bin`-relative PREDICT space (the
+        // compaction/most-freq-bin shift is already baked in), so this predict offset is
+        // 0 — matching the canonical `lib_lightgbm` predict golden (`predict.rs`
+        // `numeric_tree` uses `feat_offset = [0, 0]` even for non-zero `most_freq_bin`).
+        // This is DISTINCT from `FeatureColumn::offset` (the histogram-scan compaction
+        // offset); reusing that here double-counts the shift and mis-routes every split.
+        let feat_offset: Vec<i32> = vec![0i32; nf];
+        // Identity inner→row-matrix-column mapping (column `f` of `rows` holds
+        // feature `f`'s bins).
+        let feat_column: Vec<i32> = (0..nf as i32).collect();
+
+        // Row-major bin matrix [num_data × num_features]; the walk's `data_index`
+        // indexes `rows[i*nf + column]`.
+        let mut rows: Vec<u32> = Vec::with_capacity(nd * nf);
+        for i in 0..nd {
+            for f in features {
+                rows.push(f.bins.bin(i));
+            }
+        }
+        // Native column width for the walk (D-05): 8/16/32 by the widest feature.
+        let bit_type: u32 = features
+            .iter()
+            .map(|f| match &f.bins {
+                lgbm_compute::BinColumn::U8(_) => 8u32,
+                lgbm_compute::BinColumn::U16(_) => 16u32,
+                lgbm_compute::BinColumn::U32(_) => 32u32,
+            })
+            .max()
+            .unwrap_or(8);
+
+        // Widen the grown tree's `decision_type` (i8) to the walk's i32 array.
+        let decision_type: Vec<i32> = tree.decision_type.iter().map(|&d| i32::from(d)).collect();
+
+        let predict_tree = PredictTree {
+            feat_min: &feat_min,
+            feat_max: &feat_max,
+            feat_default: &feat_default,
+            feat_most_freq_bin: &feat_mfb,
+            feat_offset: &feat_offset,
+            feat_column: &feat_column,
+            split_feature_inner: &tree.split_feature_inner,
+            threshold_in_bin: &tree.threshold_in_bin,
+            decision_type: &decision_type,
+            left_child: &tree.left_child,
+            right_child: &tree.right_child,
+            leaf_value: &tree.leaf_value,
+            bitset_inner: &[],
+            cat_boundaries_inner: &[],
+        };
+
+        // Time into the whole-train SCORE budget, same as the host scatter branch.
+        let res = lgbm_treelearner::phase_prof::time(
+            &lgbm_treelearner::phase_prof::SCORE_NS,
+            || {
+                self.score_updater.add_tree_train_path_on_device::<B>(
+                    learner.client(),
+                    &predict_tree,
+                    &rows,
+                    nf,
+                    bit_type,
+                    cur_tree_id,
+                )
+            },
+        );
+        res.map_err(|e| BoostingError::TreeLearner(e.into()))?;
+        Ok(())
     }
 
     /// Read-only view of one class's score slice (`[num_data*k, num_data*(k+1))`).
