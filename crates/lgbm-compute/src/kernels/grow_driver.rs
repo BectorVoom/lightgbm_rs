@@ -887,10 +887,19 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         leaves[larger_leaf as usize].hist = larger_hist;
 
         // ---- BeforeFindBestSplit gates + scan each child (compute its best). ----
-        let both_too_small = left_count < min_data * 2 && right_count < min_data * 2;
+        // WR-04: mirror C++ `BeforeFindBestSplit`'s PER-LEAF `num_data <
+        // min_data_in_leaf * 2` gate — evaluate each child INDEPENDENTLY (a child
+        // with fewer than `2*min_data` rows cannot yield a split with both sides
+        // >= min_data, so it is skipped) rather than applying one combined
+        // predicate to both children. `saturating_mul` guards the `* 2` against a
+        // pathological `min_data > i32::MAX/2` overflow. Tree structure is unchanged
+        // vs the old combined gate: the small child's splits are already rejected by
+        // `scan_leaf`'s per-side `min_data_in_leaf` guards.
+        let min_data_x2 = min_data.saturating_mul(2);
         for &child in &[new_left, new_right] {
+            let too_small = (leaves[child as usize].rows.len() as i32) < min_data_x2;
             let depth_capped = max_depth > 0 && leaves[child as usize].depth >= max_depth;
-            if depth_capped || both_too_small {
+            if depth_capped || too_small {
                 leaves[child as usize].best = SplitInfo::none();
                 leaves[child as usize].best_fpos = -1;
                 leaves[child as usize].best_cat = Vec::new();
