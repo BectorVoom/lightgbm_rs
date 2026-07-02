@@ -2388,6 +2388,100 @@ fn on_device_proving_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i
     (vec![f0, f1], grad, hess, 4, -1)
 }
 
+// =========================================================================
+// 21-02 (ODL-18H): three TARGETED D-02 STRUCTURE parity cases that broaden the
+// on-device grow-driver evidence beyond the single 4-leaf `on_device_proving_corpus`
+// the Phase-20 gate proved. Each clones `learner_parity_on_device_structure_gate`
+// verbatim — swapping ONLY the corpus (and, for case C, the driver entry point +
+// cfg) — and reuses the tie-aware cpu-f64 comparator / anchor / mapper unchanged.
+// Every case pins to the cubecl-cpu f64 anchor (NEVER GPU-vs-GPU, def-f8u-01),
+// STRUCTURE bit-exact, leaf values within `ROCM_LEAF_VALUE_TOL`, tie-aware
+// `default_left`. NONE exercises the WR-01 `HistArena::swap` path (Pitfall 1): the
+// live driver keeps per-leaf `Vec<f64>` histograms and never consumes HistArena.
+// =========================================================================
+
+/// D-02 case A — a DEEP proving corpus that grows to 6 leaves so >2 leaves are live
+/// simultaneously at the final splits. Two continuous features + L2,
+/// `MissingType::None`, 16 rows. `f0` (8 bins, 2 rows/bin) carries strongly-separated
+/// MONOTONE gradients so each of the 5 splits has a distinct positive gain
+/// (near-tie-free ⇒ a genuine bit-exact assert, not a tie-tolerated pass); `f1`
+/// (4 bins) is scrambled so `f0` dominates every split. This broadens parity breadth
+/// ONLY — it is NOT a `HistArena::swap` exerciser (Pitfall 1).
+#[allow(clippy::type_complexity)]
+fn deep_multileaf_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
+    let grad = vec![
+        -40.0f32, -40.0, -25.0, -25.0, -12.0, -12.0, -4.0, -4.0, 4.0, 4.0, 12.0, 12.0, 25.0, 25.0,
+        40.0, 40.0,
+    ];
+    let hess = vec![1.0f32; 16];
+    let f0 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7], 8),
+        num_bin: 8,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 7,
+        default_bin: 8,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
+        real_feature_index: 0,
+        ..Default::default()
+    };
+    let f1 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], 4),
+        num_bin: 4,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 3,
+        default_bin: 4,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
+        real_feature_index: 1,
+        ..Default::default()
+    };
+    (vec![f0, f1], grad, hess, 6, -1)
+}
+
+/// ODL-18H case A — a DEEP (>2 simultaneously-live-leaf) on-device tree is proven
+/// STRUCTURE bit-exact to the cpu f64 anchor. Mirrors
+/// `learner_parity_on_device_structure_gate` exactly, swapping ONLY the corpus.
+#[test]
+fn learner_parity_on_device_deep_multileaf_gate() {
+    let backend = CpuBackend;
+    let (features, g, h, num_leaves, max_depth) = deep_multileaf_corpus();
+    let grow_features = grow_features_of(&features);
+    // The driver pins the proving-slice config; the anchor MUST use the identical one.
+    let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let grown = backend
+        .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+        .expect("grow_tree_on_device seam ok");
+
+    if env_on {
+        let (on_device_tree, layout) =
+            grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
+        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+        assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "deep-multileaf");
+        assert!(
+            on_device_tree.num_leaves >= 5,
+            "deep corpus must grow >2 simultaneously-live leaves (num_leaves >= 5), got {}",
+            on_device_tree.num_leaves
+        );
+        assert_eq!(
+            layout.leaf_count.iter().sum::<i32>(),
+            g.len() as i32,
+            "layout leaf_count partitions all rows"
+        );
+    } else {
+        assert!(
+            grown.is_none(),
+            "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
+        );
+    }
+}
+
 #[cfg(feature = "rocm")]
 mod hip {
     use super::*;
