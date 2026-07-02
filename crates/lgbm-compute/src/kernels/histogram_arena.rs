@@ -319,6 +319,13 @@ impl<R: cubecl::Runtime> HistArena<R> {
         self.slots[slot].clone()
     }
 
+    /// WR-01 (closed in `c9a7fd1`, Phase 18): the free-slot scan below picks the
+    /// smaller child's slot from the pool's *unoccupied* slots, which prevents
+    /// aliasing a live sibling leaf's histogram once >2 leaves are live. NOTE: the
+    /// live grow driver (`grow_tree_on_device_driver`) does NOT consume this arena —
+    /// it carries per-leaf `Vec<f64>` histograms — so this arena is unit-test-locked
+    /// (the three `swap_*` repro tests), not driver-wired.
+    ///
     /// The `SplitTreeStructureKernel` whole-pool swap (`cuda_data_partition.cu:827-906`,
     /// D-09): the leaf `parent_leaf` splits into `left_leaf` / `right_leaf`. The
     /// **larger** child inherits the parent's slot (so the subtraction trick derives
