@@ -29,7 +29,9 @@ use lgbm_dataset::{BinType, LeafPartitionLayout, MissingType};
 
 use crate::error::ComputeError;
 use crate::gain::{calculate_splitted_leaf_output, GainConfig, SplitInfo};
-use crate::kernels::categorical_split::{find_best_threshold_categorical, set_real_threshold};
+use crate::kernels::categorical_split::{
+    construct_bitset, construct_inner_bitset, find_best_threshold_categorical,
+};
 use crate::kernels::data_partition::{
     partition_categorical_on_device, partition_leaf_stable, update_data_index_to_leaf_on,
 };
@@ -707,15 +709,25 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
                     .expect("DeviceSplitInfo is allocated whenever categorical features exist");
                 dsi.set_cat_thresholds(best_leaf as usize, &win_bins, &win_real)?;
                 // (2) Materialize the real + inner bitsets FROM the slab-staged thresholds
-                //     (§6.3 set_real_threshold) — the host Vec<u32> bitsets are DERIVED
-                //     from the slab, not a parallel per-split allocation (SC #1).
+                //     (§6.3) — the host Vec<u32> bitsets are DERIVED from the slab, not a
+                //     parallel per-split allocation (SC #1). IN-01: the REAL bitset is built
+                //     by CONSUMING the `cat_threshold_real` slab (the `win_real` mapping
+                //     already staged above), not by re-mapping bin→category a second time;
+                //     the inner routing bitset carries the CR-01 `bin - min_bin + offset`
+                //     transform via `construct_inner_bitset`.
                 let slab_bins: Vec<i32> = dsi
                     .cat_threshold(best_leaf as usize)
                     .iter()
                     .map(|&b| b as i32)
                     .collect();
-                let (real_bitset, inner_bitset) =
-                    set_real_threshold(&slab_bins, &f.bin_to_category, f.min_bin as i32, f.offset);
+                let real_bitset = construct_bitset(
+                    &dsi.cat_threshold_real(best_leaf as usize)
+                        .iter()
+                        .map(|&v| v as u32)
+                        .collect::<Vec<u32>>(),
+                );
+                let inner_bitset =
+                    construct_inner_bitset(&slab_bins, f.min_bin as i32, f.offset);
                 // (3) Partition parent rows by categorical membership (§9). The INNER-bin
                 //     bitset is the routing key `route_to_left_categorical` expects
                 //     (`bin - min_bin + offset`, offset from most_freq_bin) — Open Q1 /

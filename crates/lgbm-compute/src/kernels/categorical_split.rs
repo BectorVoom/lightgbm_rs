@@ -150,18 +150,25 @@ pub fn set_real_threshold(
         })
         .collect();
     let real_bitset = construct_bitset(&cat_values);
+    let inner_bitset = construct_inner_bitset(cat_threshold_bins, min_bin, offset);
+    (real_bitset, inner_bitset)
+}
 
-    // Inner-bin bitset: place each winning bin's bit at the EXACT transformed key
-    // the router looks up for a member row — `bin - min_bin + offset`
-    // (route_to_left_categorical) — so device routing is key-consistent with the
-    // bitset for every offset, not only the `min_bin == offset` case (CR-01).
+/// Build ONLY the inner-bin routing bitset (the second element of
+/// [`set_real_threshold`]'s pair). Places each winning bin's bit at the EXACT
+/// transformed key `route_to_left_categorical` looks up for a member row —
+/// `bin - min_bin + offset` — so device routing is key-consistent with the bitset
+/// for every offset, not only the `min_bin == offset` case (CR-01). Extracted so
+/// the driver can build the inner bitset without recomputing the REAL category
+/// mapping (which it already has staged in the `cat_threshold_real` slab, IN-01)
+/// while keeping the CR-01 inner-key transform in ONE place.
+#[must_use]
+pub fn construct_inner_bitset(cat_threshold_bins: &[i32], min_bin: i32, offset: i32) -> Vec<u32> {
     let inner_keys: Vec<u32> = cat_threshold_bins
         .iter()
         .map(|&b| (b - min_bin + offset) as u32)
         .collect();
-    let inner_bitset = construct_bitset(&inner_keys);
-
-    (real_bitset, inner_bitset)
+    construct_bitset(&inner_keys)
 }
 
 /// `static_cast<int>(Common::RoundInt(x))` == `static_cast<int>(x + 0.5f)`
