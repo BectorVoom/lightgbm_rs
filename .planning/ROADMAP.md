@@ -262,10 +262,10 @@ Plans:
   5. *(pulled fwd, ODL-18)* The on-device driver runs the full per-leaf grow loop end-to-end and reconstitutes into `(Tree, DataPartition)`; the grown tree is STRUCTURE bit-exact to the cpu f64 anchor (tie-aware `default_left`), leaf values within ~1e-5. (§6, §16)
   6. *(pulled fwd, ODL-19)* Every new kernel keeps f32 + u64 fixed-point build with no f64 per-row hot loops; CPU / ROCm / host-CUDA byte-unchanged with `LGBM_CUDA_ON_DEVICE` unset. (§17)
 
-**Plans**: 5 plans
+**Plans**: 1/5 plans executed
 **Wave 1**
 
-- [ ] 20-00-PLAN.md — Wave 0 scaffolding: capture 4 missing metric goldens + register 3 new module stubs + metric_supported discriminator (ODL-17)
+- [x] 20-00-PLAN.md — Wave 0 scaffolding: capture 4 missing metric goldens + register 3 new module stubs + metric_supported discriminator (ODL-17)
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -337,7 +337,7 @@ Plans:
 | 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
 | 19. On-Device Objectives | v1.1 | 5/5 | Complete    | 2026-07-01 |
-| 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 0/5 | Planned | - |
+| 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 1/5 | In Progress|  |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
 | 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/? | Not started | - |

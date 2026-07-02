@@ -43,7 +43,7 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 ### Score updater & metrics (§11, §12)
 
 - [ ] **ODL-16**: On-device **score update** — resident cumulative `cuda_score_`, constant add / multiply (init score / shrinkage / no-split single-leaf / DART rescale), replacing the host `add_prediction_to_score` scatter, with a host-mirror toggle for non-resident consumers. (§11.)
-- [ ] **ODL-17**: On-device **pointwise metric evaluation** — `EvalKernel` + two-stage reduction over the 12 supported regression/binary losses, anchor-pinned; the CUDA-unsupported metrics (AUC / NDCG / MAP / multiclass / cross-entropy) honestly fall back to host. (§12.)
+- [x] **ODL-17**: On-device **pointwise metric evaluation** — `EvalKernel` + two-stage reduction over the 12 supported regression/binary losses, anchor-pinned; the CUDA-unsupported metrics (AUC / NDCG / MAP / multiclass / cross-entropy) honestly fall back to host. (§12.)
 
 ### Driver integration, feature coverage & parity
 
@@ -101,7 +101,7 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-14 | Phase 18 | Complete |
 | ODL-15 | Phase 18 | Complete |
 | ODL-16 | Phase 20 | Pending |
-| ODL-17 | Phase 20 | Pending |
+| ODL-17 | Phase 20 | Complete |
 | ODL-18 | Phase 21 | Pending |
 | ODL-19 | Phase 21 | Pending |
 | ODL-20 | Phase 23 | Pending |
