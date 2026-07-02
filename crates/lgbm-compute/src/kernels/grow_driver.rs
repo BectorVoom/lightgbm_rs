@@ -43,6 +43,43 @@ use crate::kernels::tree::DeviceCudaTree;
 use crate::BinColumn;
 use lgbm_core::types::K_EPSILON;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// Compute-owned ON-DEVICE per-launch counter (L-1, SC-2). The on-device grow
+/// driver bumps this at every real build/subtract/scan device dispatch so an
+/// on-device train can report a NON-ZERO `device_launches` figure through the
+/// `phase_prof` COUNTS line — even though `phase_prof` lives in `lgbm-treelearner`
+/// (ABOVE `lgbm-compute` in the crate DAG) and cannot be imported here without a
+/// crate cycle. `phase_prof::dump` reads/swaps it via [`on_device_launch_count_take`]
+/// (the learner depends on compute, so it may reference this symbol).
+pub static ON_DEVICE_LAUNCH_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read-once `LGBM_PHASE_PROF=="1"` gate (mirrors `phase_prof::enabled()`), so the
+/// launch counter is INERT and zero-overhead in the default merge gate — the bump
+/// never touches tree structure or values, keeping the on-device path parity-neutral
+/// and byte-unchanged (SC-4).
+fn launch_prof_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_PHASE_PROF").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Bump the on-device launch counter by one real device dispatch. No-op unless
+/// `LGBM_PHASE_PROF=="1"` (parity-neutral in the default build/tests).
+#[inline]
+fn bump_launch() {
+    if launch_prof_enabled() {
+        ON_DEVICE_LAUNCH_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the accumulated on-device launch count to zero and return the prior value.
+/// Called by `phase_prof::dump` (in `lgbm-treelearner`) to fold the on-device launch
+/// total into the `device_launches=` COUNTS field without a crate cycle.
+pub fn on_device_launch_count_take() -> u64 {
+    ON_DEVICE_LAUNCH_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// One feature column's ADDITIVE grow-loop input — the faithful lgbm-compute-local
 /// mirror of the fields the learner's spine feature column exposes to the
 /// Phase-16/17/18 device kernels, using ONLY lgbm-compute-reachable types so the
@@ -406,6 +443,7 @@ fn build_leaf_hist<R: cubecl::Runtime>(
     for (fpos, f) in features.iter().enumerate() {
         let binned: Vec<u32> = rows.iter().map(|&r| f.bins.bin(r as usize)).collect();
         // Phase-16 device build: RAW f64 histogram (2*num_bin cells).
+        bump_launch(); // L-1: one real on-device build dispatch.
         let mut region = construct_histograms_f64_on(client, &binned, &g, &h, f.num_bin)?;
         // FixHistogram (RAW leaf sums) then compact — O(num_bin) f64, bit-exact to
         // the host reference fold (mfb==0 ⇒ fix is a no-op; offset==1 ⇒ drop bin 0).
@@ -476,6 +514,7 @@ fn scan_leaf<R: cubecl::Runtime>(
             )?;
             (cat.split, cat.cat_threshold)
         } else {
+            bump_launch(); // L-1: one real on-device scan dispatch.
             let si = find_best_split_f64_on(
                 client,
                 region,
@@ -900,6 +939,7 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         )?;
         // LARGER = parent − smaller (Phase-16 subtract kernel), over the whole
         // concatenated compacted buffer (zeroed tails subtract to zero).
+        bump_launch(); // L-1: one real on-device subtraction-trick dispatch.
         let larger_hist = subtract_histograms_f64_on(client, &parent_hist, &smaller_hist)?;
         leaves[smaller_leaf as usize].hist = smaller_hist;
         leaves[larger_leaf as usize].hist = larger_hist;
