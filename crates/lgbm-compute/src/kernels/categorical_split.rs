@@ -163,6 +163,220 @@ pub fn find_best_threshold_categorical<R: cubecl::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gain::{get_leaf_gain, get_split_gains};
+    use crate::runtime::cpu_client;
+
+    /// Build a `2*num_bin` compacted histogram from per-bin (grad, hess) pairs
+    /// (`[grad0,hess0,grad1,hess1,...]`), exactly the shape the numeric scan uses.
+    fn hist_from(pairs: &[(f64, f64)]) -> Vec<f64> {
+        let mut h = Vec::with_capacity(pairs.len() * 2);
+        for &(g, he) in pairs {
+            h.push(g);
+            h.push(he);
+        }
+        h
+    }
+
+    /// The `cat_corpus` config convention (learner_parity.rs:1472-1481).
+    fn cat_cfg(cat_l2: f64, cat_smooth: f64, max_cat_to_onehot: i32) -> GainConfig {
+        let mut cfg = GainConfig::default();
+        cfg.min_data_in_leaf = 1;
+        cfg.min_sum_hessian_in_leaf = 1e-3;
+        cfg.lambda_l2 = 0.0;
+        cfg.cat_l2 = cat_l2;
+        cfg.cat_smooth = cat_smooth;
+        cfg.min_data_per_group = 1;
+        cfg.max_cat_threshold = 32;
+        cfg.max_cat_to_onehot = max_cat_to_onehot;
+        cfg
+    }
+
+    const EPS: f64 = 1e-15; // K_EPSILON widened; bump applied at the CALL site.
+
+    // -------------------------------------------------------------------------
+    // §8.1 evaluator — one-hot branch (num_bin <= max_cat_to_onehot).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn onehot_branch_picks_single_category() {
+        // num_bin=4 (<= max_cat_to_onehot=4) -> one-hot. offset=1.
+        // Mirrors the host `onehot_picks_a_single_category` fixture.
+        let client = cpu_client();
+        let mut cfg = cat_cfg(10.0, 10.0, 4);
+        cfg.min_sum_hessian_in_leaf = 0.0;
+        let hist = hist_from(&[(0.0, 0.0), (10.0, 5.0), (-10.0, 5.0), (1.0, 5.0)]);
+        // sum_hessian pre-bumped by +2*kEpsilon (caller contract, Pitfall 2).
+        let r =
+            find_best_threshold_categorical(&client, &hist, &cfg, 4, 1, 1.0, 15.0 + 2.0 * EPS, 30)
+                .unwrap();
+        assert!(r.is_splittable(), "expected a one-hot split");
+        assert_eq!(r.cat_threshold.len(), 1, "one-hot yields a single category");
+        assert!(!r.split.default_left, "categorical split never defaults left");
+    }
+
+    #[test]
+    fn onehot_branch_uses_original_l2_not_cat_l2() {
+        // One-hot uses lambda_l2 (0), NEVER + cat_l2. Proof: a huge cat_l2 must not
+        // change the one-hot gain (Pitfall 3).
+        let client = cpu_client();
+        let hist = hist_from(&[(0.0, 0.0), (10.0, 5.0), (-10.0, 5.0), (1.0, 5.0)]);
+        let mut cfg0 = cat_cfg(0.0, 10.0, 4);
+        cfg0.min_sum_hessian_in_leaf = 0.0;
+        let mut cfg_big = cat_cfg(1000.0, 10.0, 4);
+        cfg_big.min_sum_hessian_in_leaf = 0.0;
+        let g0 =
+            find_best_threshold_categorical(&client, &hist, &cfg0, 4, 1, 1.0, 15.0 + 2.0 * EPS, 30)
+                .unwrap();
+        let gb = find_best_threshold_categorical(
+            &client,
+            &hist,
+            &cfg_big,
+            4,
+            1,
+            1.0,
+            15.0 + 2.0 * EPS,
+            30,
+        )
+        .unwrap();
+        assert_eq!(
+            g0.split.gain, gb.split.gain,
+            "one-hot gain must be independent of cat_l2 (uses lambda_l2 only)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // §8.1 evaluator — many-vs-many branch, pinned to the committed goldens.
+    // -------------------------------------------------------------------------
+
+    /// cat_onehot fixture (num_bin=5 > max_cat_to_onehot=4 => many-vs-many path,
+    /// but the clear single-category winner reproduces the golden `cat_threshold=8`).
+    fn cat_onehot_hist() -> Vec<f64> {
+        hist_from(&[(0.0, 0.0), (0.0, 10.0), (0.0, 10.0), (0.0, 10.0), (-100.0, 10.0)])
+    }
+
+    /// cat_manyvsmany fixture: per-bin grad sums 0,-10,-20,-80,-90,-100, uniform
+    /// hess=10, cat_smooth=0 => ctr = 0,-1,-2,-8,-9,-10 (strictly distinct, A1).
+    fn cat_manyvsmany_hist() -> Vec<f64> {
+        hist_from(&[
+            (0.0, 0.0),
+            (0.0, 10.0),
+            (-10.0, 10.0),
+            (-20.0, 10.0),
+            (-80.0, 10.0),
+            (-90.0, 10.0),
+            (-100.0, 10.0),
+        ])
+    }
+
+    #[test]
+    fn manyvsmany_ctr_values_are_tie_free() {
+        // A1 / Pitfall 1: the f32-bitonic order equals the f64-stable order ONLY if
+        // ctr is tie-free. Assert strict distinctness before locking.
+        let hist = cat_manyvsmany_hist();
+        let cat_smooth = 0.0;
+        let mut ctr: Vec<f64> = (1..7)
+            .map(|t: i32| hist[(t as usize) << 1] / (hist[((t as usize) << 1) + 1] + cat_smooth))
+            .collect();
+        let n = ctr.len();
+        ctr.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for w in ctr.windows(2) {
+            assert!(w[0] != w[1], "cat_manyvsmany ctr must be tie-free");
+        }
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn onehot_fixture_matches_golden() {
+        // Winner = bin 4 alone -> real bitset [8]; net gain 250.0 (hand-verified).
+        let client = cpu_client();
+        let cfg = cat_cfg(10.0, 10.0, 4);
+        let hist = cat_onehot_hist();
+        let r =
+            find_best_threshold_categorical(&client, &hist, &cfg, 5, 0, -100.0, 40.0 + 2.0 * EPS, 40)
+                .unwrap();
+        assert!(r.is_splittable());
+        let bins: Vec<i32> = r.cat_threshold.iter().map(|&b| b as i32).collect();
+        let (real, _inner) = set_real_threshold(&bins, &[-1, 0, 1, 2, 3], 0);
+        assert_eq!(real, vec![8u32], "cat_onehot real bitset != golden (8)");
+        assert!(
+            (r.split.gain - 250.0).abs() < 1e-9,
+            "cat_onehot net gain {} != 250.0",
+            r.split.gain
+        );
+    }
+
+    #[test]
+    fn manyvsmany_fixture_root_matches_golden() {
+        // Root winner = bins {6,5,4} -> real bitset [56]; net gain 345.0.
+        let client = cpu_client();
+        let cfg = cat_cfg(10.0, 0.0, 4);
+        let hist = cat_manyvsmany_hist();
+        let r =
+            find_best_threshold_categorical(&client, &hist, &cfg, 7, 0, -300.0, 60.0 + 2.0 * EPS, 60)
+                .unwrap();
+        assert!(r.is_splittable());
+        let bins: Vec<i32> = r.cat_threshold.iter().map(|&b| b as i32).collect();
+        let (real, _inner) = set_real_threshold(&bins, &[-1, 0, 1, 2, 3, 4, 5], 0);
+        assert_eq!(real, vec![56u32], "cat_manyvsmany root real bitset != golden (56)");
+        assert!(
+            (r.split.gain - 345.0).abs() < 1e-9,
+            "cat_manyvsmany root net gain {} != 345.0",
+            r.split.gain
+        );
+    }
+
+    #[test]
+    fn manyvsmany_adds_cat_l2() {
+        // Many-vs-many uses lambda_l2 + cat_l2: a different cat_l2 must change the
+        // gain (Pitfall 3), unlike the one-hot path.
+        let client = cpu_client();
+        let hist = cat_manyvsmany_hist();
+        let r0 = find_best_threshold_categorical(
+            &client,
+            &hist,
+            &cat_cfg(0.0, 0.0, 4),
+            7,
+            0,
+            -300.0,
+            60.0 + 2.0 * EPS,
+            60,
+        )
+        .unwrap();
+        let r10 = find_best_threshold_categorical(
+            &client,
+            &hist,
+            &cat_cfg(10.0, 0.0, 4),
+            7,
+            0,
+            -300.0,
+            60.0 + 2.0 * EPS,
+            60,
+        )
+        .unwrap();
+        assert!(r0.is_splittable() && r10.is_splittable());
+        assert!(
+            r0.split.gain != r10.split.gain,
+            "many-vs-many gain must depend on cat_l2"
+        );
+    }
+
+    #[test]
+    fn manyvsmany_gain_uses_cat_l2_bit_exact() {
+        // Pin the winning-split gain to an independent computation with l2 =
+        // lambda_l2 + cat_l2 (bit-exact, same f64 ops as the evaluator).
+        let client = cpu_client();
+        let cfg = cat_cfg(10.0, 0.0, 4);
+        let hist = cat_manyvsmany_hist();
+        let sum_h = 60.0 + 2.0 * EPS;
+        let r =
+            find_best_threshold_categorical(&client, &hist, &cfg, 7, 0, -300.0, sum_h, 60).unwrap();
+        // Winner left = {6,5,4}: sum_left_grad = -270, sum_left_hess = 30 + eps.
+        let l2 = cfg.lambda_l2 + cfg.cat_l2;
+        let best_gain = get_split_gains(false, -270.0, 30.0 + EPS, -30.0, sum_h - (30.0 + EPS), 0.0, l2);
+        let gain_shift = get_leaf_gain(false, -300.0, sum_h, 0.0, cfg.lambda_l2);
+        let expected_net = best_gain - gain_shift;
+        assert_eq!(r.split.gain, expected_net, "gain not bit-exact vs +cat_l2 anchor");
+    }
 
     // -------------------------------------------------------------------------
     // §6.3 construct_bitset — bit-identical to the host packer.
