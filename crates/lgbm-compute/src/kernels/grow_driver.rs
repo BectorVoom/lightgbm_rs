@@ -29,13 +29,17 @@ use lgbm_dataset::{BinType, LeafPartitionLayout, MissingType};
 
 use crate::error::ComputeError;
 use crate::gain::{calculate_splitted_leaf_output, GainConfig, SplitInfo};
-use crate::kernels::data_partition::{partition_leaf_stable, update_data_index_to_leaf_on};
+use crate::kernels::categorical_split::{find_best_threshold_categorical, set_real_threshold};
+use crate::kernels::data_partition::{
+    partition_categorical_on_device, partition_leaf_stable, update_data_index_to_leaf_on,
+};
 use crate::kernels::histogram::construct_histograms_f64_on;
 use crate::kernels::split::find_best_split_f64_on;
-use crate::kernels::split_info::SplitScalars;
+use crate::kernels::split_info::{DeviceSplitInfo, SplitScalars, MAX_CAT_PER_SPLIT};
 use crate::kernels::subtract::subtract_histograms_f64_on;
 use crate::kernels::tree::DeviceCudaTree;
 use crate::BinColumn;
+use lgbm_core::types::K_EPSILON;
 
 /// One feature column's ADDITIVE grow-loop input — the faithful lgbm-compute-local
 /// mirror of the fields the learner's spine feature column exposes to the
@@ -279,8 +283,37 @@ struct DriverLeaf {
     /// The winning feature POSITION (`-1` when no split); its real index is
     /// `features[best_fpos].real_feature_index`.
     best_fpos: i32,
+    /// When the winning split is CATEGORICAL, the winning category bins
+    /// (`output->cat_threshold`, each `+ offset`) the driver body stages into the
+    /// pre-allocated `DeviceSplitInfo` cat slab (W-3/SC #1). Empty for a numeric win.
+    best_cat: Vec<u32>,
     /// The leaf's depth (root = 0), for the `max_depth` gate.
     depth: i32,
+}
+
+/// The SINGLE `+2*kEpsilon` categorical `sum_hessian` bump (W-4), mirroring the host
+/// call site `learner.rs:2760`. The `best_split.rs` dispatch seam PASSES THROUGH the
+/// bumped value and the §8.1 evaluator does NOT bump internally (22-03 caller
+/// contract, Pitfall 2), so the bump happens EXACTLY ONCE — here in the driver.
+/// A double-bump or missed-bump is a last-ULP silent divergence (DEF-07-11-01 class),
+/// so this is pinned bit-exact by `categorical_driver_bumps_sum_hessian_once`.
+#[inline]
+fn bump_sum_hessian_cat(sum_h: f64) -> f64 {
+    sum_h + 2.0 * f64::from(K_EPSILON)
+}
+
+/// Overlay a categorical feature's per-feature config scalars (`cat_l2`,
+/// `cat_smooth`, `max_cat_threshold`, `max_cat_to_onehot`, `min_data_per_group`)
+/// from its [`GrowFeature`] onto the leaf's base [`GainConfig`] for the §8.1
+/// evaluator. The numeric gain knobs (l1/l2/min_data/…) are inherited from `base`.
+fn categorical_feature_config(base: &GainConfig, f: &GrowFeature) -> GainConfig {
+    let mut c = *base;
+    c.cat_l2 = f.cat_l2;
+    c.cat_smooth = f.cat_smooth;
+    c.max_cat_threshold = f.max_cat_threshold;
+    c.max_cat_to_onehot = f.max_cat_to_onehot;
+    c.min_data_per_group = f.min_data_per_group;
+    c
 }
 
 /// `SerialTreeLearner`'s cross-feature / cross-leaf argmax tie rule
@@ -382,9 +415,18 @@ fn build_leaf_hist<R: cubecl::Runtime>(
     Ok(concat)
 }
 
-/// Scan one leaf's concatenated compacted histogram: per-feature Phase-4/17
-/// [`find_best_split_f64_on`] + the cross-feature `split_gt` argmax. Returns the
-/// winning `(SplitInfo, feature-position)` (`(-inf, -1)` when nothing is admissible).
+/// Scan one leaf's concatenated compacted histogram: per-feature best-split eval +
+/// the cross-feature `split_gt` argmax. NUMERIC features route into the Phase-4/17
+/// [`find_best_split_f64_on`] finder; CATEGORICAL features route into the §8.1
+/// [`find_best_threshold_categorical`] evaluator (Phase-22). Returns the winning
+/// `(SplitInfo, feature-position, cat_bins)` — `cat_bins` are the winning category
+/// bins when the winner is categorical (empty otherwise); `(-inf, -1, [])` when
+/// nothing is admissible.
+///
+/// **kEpsilon single-bump site (W-4):** for a categorical feature the driver applies
+/// the ONE `+2*kEpsilon` `sum_h` bump HERE (via [`bump_sum_hessian_cat`]) before the
+/// evaluator sees it, mirroring host `learner.rs:2760`. The numeric finder bumps
+/// internally, so numeric passes RAW `sum_h` (unchanged, SC #4).
 fn scan_leaf<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     features: &[GrowFeature],
@@ -394,13 +436,14 @@ fn scan_leaf<R: cubecl::Runtime>(
     num_data_in_leaf: i32,
     slot_off: &[usize],
     cfg: &GainConfig,
-) -> Result<(SplitInfo, i32), ComputeError> {
+) -> Result<(SplitInfo, i32, Vec<u32>), ComputeError> {
     let mut best = SplitInfo::none();
     let mut best_fpos: i32 = -1;
     let mut best_real: i32 = -1;
+    let mut best_cat: Vec<u32> = Vec::new();
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(sum_h > 0.0) || num_data_in_leaf <= 0 {
-        return Ok((best, best_fpos));
+        return Ok((best, best_fpos, best_cat));
     }
     for (fpos, f) in features.iter().enumerate() {
         // Proving slice: continuous MissingType::None ⇒ single REVERSE scan, no
@@ -408,34 +451,54 @@ fn scan_leaf<R: cubecl::Runtime>(
         let skip_default_bin = f.num_bin > 2 && f.missing_type == MissingType::Zero;
         let na_as_missing = f.num_bin > 2 && f.missing_type == MissingType::NaN;
         let run_forward = f.num_bin > 2 && f.missing_type == MissingType::Zero;
-        if na_as_missing || f.bin_type == BinType::Categorical {
-            // Deferred (proving slice is numeric + non-NA); the finder rejects NA.
+        if na_as_missing {
+            // NA-as-missing deferred on BOTH numeric and categorical (finder rejects NA).
             continue;
         }
         let cells = 2 * f.num_bin as usize;
         let region = &hist[slot_off[fpos]..slot_off[fpos] + cells];
-        let si = find_best_split_f64_on(
-            client,
-            region,
-            cfg,
-            f.num_bin,
-            f.offset,
-            f.default_bin,
-            f.most_freq_bin,
-            skip_default_bin,
-            na_as_missing,
-            run_forward,
-            sum_g,
-            sum_h,
-            num_data_in_leaf,
-        )?;
+        let (si, cat_bins) = if f.bin_type == BinType::Categorical {
+            // Phase-22 categorical branch (§8.1). W-4: bump sum_h ONCE here before the
+            // evaluator; best_split passes through, the evaluator does not bump.
+            let cat_cfg = categorical_feature_config(cfg, f);
+            let sum_h_bumped = bump_sum_hessian_cat(sum_h);
+            let cat = find_best_threshold_categorical(
+                client,
+                region,
+                &cat_cfg,
+                f.num_bin as i32,
+                f.offset,
+                sum_g,
+                sum_h_bumped,
+                num_data_in_leaf,
+            )?;
+            (cat.split, cat.cat_threshold)
+        } else {
+            let si = find_best_split_f64_on(
+                client,
+                region,
+                cfg,
+                f.num_bin,
+                f.offset,
+                f.default_bin,
+                f.most_freq_bin,
+                skip_default_bin,
+                na_as_missing,
+                run_forward,
+                sum_g,
+                sum_h,
+                num_data_in_leaf,
+            )?;
+            (si, Vec::new())
+        };
         if split_gt(&si, f.real_feature_index, &best, best_real) {
             best = si;
             best_fpos = fpos as i32;
             best_real = f.real_feature_index;
+            best_cat = cat_bins;
         }
     }
-    Ok((best, best_fpos))
+    Ok((best, best_fpos, best_cat))
 }
 
 /// Grow an ENTIRE continuous-feature + L2 tree ON-DEVICE by sequencing the
@@ -537,7 +600,7 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         client, features, gradients, hessians, &root_rows, root_sum_g, root_sum_h, &slot_off,
         hist_len,
     )?;
-    let (root_best, root_fpos) = scan_leaf(
+    let (root_best, root_fpos, root_cat) = scan_leaf(
         client, features, &root_hist, root_sum_g, root_sum_h, num_data as i32, &slot_off, &cfg,
     )?;
 
@@ -548,12 +611,31 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         hist: root_hist,
         best: root_best,
         best_fpos: root_fpos,
+        best_cat: root_cat,
         depth: 0,
     }];
 
     // ---- The device flat tree (Phase-18), pre-allocated once (D-15). ----
     // `num_leaves >= 1` is guaranteed by the guard above, so no `.max(1)` needed.
     let mut tree = DeviceCudaTree::<R>::new(client, num_leaves as usize, num_data as i32)?;
+
+    // ---- The pre-allocated categorical split-info slab (W-3 / SC #1), allocated
+    // ONCE (ODL-02, no per-split device alloc) and ONLY when the feature set has a
+    // categorical feature — so a pure-numeric grow allocates nothing new and stays
+    // byte-for-byte unchanged (SC #4). The runtime slab width is the D-03 max
+    // `max_cat_threshold` across the categorical features (default MAX_CAT_PER_SPLIT). ----
+    let has_categorical = features.iter().any(|f| f.bin_type == BinType::Categorical);
+    let mut split_info: Option<DeviceSplitInfo<R>> = if has_categorical {
+        let cat_width = features
+            .iter()
+            .filter(|f| f.bin_type == BinType::Categorical)
+            .map(|f| f.max_cat_threshold.max(1) as usize)
+            .max()
+            .unwrap_or(MAX_CAT_PER_SPLIT);
+        Some(DeviceSplitInfo::<R>::new(client, num_leaves as usize, cat_width)?)
+    } else {
+        None
+    };
     // Seed the root leaf value so a never-split root still matches the anchor.
     let root_output =
         calculate_splitted_leaf_output(cfg.use_l1(), root_sum_g, root_sum_h, cfg.lambda_l1, cfg.lambda_l2);
@@ -592,8 +674,7 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         let parent_hist = leaves[best_leaf as usize].hist.clone();
 
         // ---- Partition the parent leaf's rows (Phase-18 route), BEFORE the tree
-        // mutation reads the child ids. Single-feature-group min_bin convention
-        // (CR-01): partition_min_bin = min_bin + offset. ----
+        // mutation reads the child ids. ----
         let parent_rows = leaves[best_leaf as usize].rows.clone();
         let bins_sub = BinColumn::new(
             parent_rows.iter().map(|&r| f.bins.bin(r as usize)).collect(),
@@ -604,74 +685,157 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
             MissingType::Zero => 1,
             MissingType::NaN => 2,
         };
-        let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
-        let (reordered, split_point) = partition_leaf_stable(
-            &bins_sub,
-            &parent_rows,
-            f.num_bin,
-            partition_min_bin,
-            f.max_bin,
-            f.default_bin,
-            f.most_freq_bin,
-            missing_type_u8,
-            best.default_left,
-            best.threshold,
-        )?;
-        let left_rows: Vec<u32> = reordered[..split_point].to_vec();
-        let right_rows: Vec<u32> = reordered[split_point..].to_vec();
-        let left_count = left_rows.len() as i32;
-        let right_count = right_rows.len() as i32;
-
-        // ---- Grow the node ON DEVICE (Phase-18 DeviceCudaTree::split_on_device),
-        // consuming its right_leaf_index. The tree's leaf/internal counts take the
-        // ACTUAL partition counts (serial_tree_learner.cpp:788-791). ----
-        let new_left = best_leaf;
-        // IN-01: an out-of-range `best.threshold` would silently record the raw bin
-        // index cast to f64 as the tree's REAL threshold — a plausible-looking wrong
-        // value that would corrupt prediction routing and mask an off-by-one in the
-        // offset/compaction threshold space. Surface a typed error instead.
-        let real_threshold = *f.bin_upper_bound.get(best.threshold as usize).ok_or_else(|| {
-            ComputeError::Runtime {
-                detail: format!(
-                    "grow_tree_on_device_driver_with_cfg: split threshold bin index {} out of \
-                     range for feature {} bin_upper_bound (len {})",
-                    best.threshold,
-                    f.real_feature_index,
-                    f.bin_upper_bound.len()
-                ),
-            }
-        })?;
         let missing_type_code = i32::from(missing_type_u8);
-        let scalars = SplitScalars {
-            is_valid: true,
-            leaf_index: best_leaf,
-            gain: best.gain + cfg.min_gain_to_split,
-            inner_feature_index: f.real_feature_index,
-            threshold: best.threshold,
-            default_left: best.default_left,
-            left_sum_gradients: best.left_sum_gradient,
-            left_sum_hessians: best.left_sum_hessian,
-            left_sum_gh_quant: 0,
-            left_count,
-            left_gain: 0.0,
-            left_value: best.left_output,
-            right_sum_gradients: best.right_sum_gradient,
-            right_sum_hessians: best.right_sum_hessian,
-            right_sum_gh_quant: 0,
-            right_count,
-            right_gain: 0.0,
-            right_value: best.right_output,
-            num_cat_threshold: 0,
-        };
-        let result = tree.split_on_device(
-            client,
-            best_leaf,
-            f.real_feature_index,
-            real_threshold,
-            missing_type_code,
-            &scalars,
-        )?;
-        let new_right = result.right_leaf_index;
+        let new_left = best_leaf;
+
+        // The categorical and numeric branches differ ONLY in the partition + tree
+        // mutation (§9/§10 vs the numeric route/split); everything downstream (child
+        // seeding, subtract, scan) is shared. Each branch yields the child rows/counts
+        // and the new right-leaf id.
+        let (left_rows, right_rows, left_count, right_count, new_right) =
+            if f.bin_type == BinType::Categorical {
+                // ===== Categorical grow branch (Phase-22 §6.3 + §9 + §10). =====
+                // (1) Stage the winning thresholds into the pre-allocated DeviceSplitInfo
+                //     cat slab (W-3 / SC #1) — allocate-once, NO per-split device alloc.
+                let win_bins: Vec<u32> = leaves[best_leaf as usize].best_cat.clone();
+                let win_real: Vec<i32> = win_bins
+                    .iter()
+                    .map(|&b| f.bin_to_category.get(b as usize).copied().unwrap_or(b as i32))
+                    .collect();
+                let dsi = split_info
+                    .as_mut()
+                    .expect("DeviceSplitInfo is allocated whenever categorical features exist");
+                dsi.set_cat_thresholds(best_leaf as usize, &win_bins, &win_real)?;
+                // (2) Materialize the real + inner bitsets FROM the slab-staged thresholds
+                //     (§6.3 set_real_threshold) — the host Vec<u32> bitsets are DERIVED
+                //     from the slab, not a parallel per-split allocation (SC #1).
+                let slab_bins: Vec<i32> = dsi
+                    .cat_threshold(best_leaf as usize)
+                    .iter()
+                    .map(|&b| b as i32)
+                    .collect();
+                let (real_bitset, inner_bitset) =
+                    set_real_threshold(&slab_bins, &f.bin_to_category, f.offset);
+                // (3) Partition parent rows by categorical membership (§9). The INNER-bin
+                //     bitset is the routing key `route_to_left_categorical` expects
+                //     (`bin - min_bin + offset`, offset from most_freq_bin) — Open Q1 /
+                //     Pattern 3, isolation-tested in `categorical_partition_counts_match_host_stable`.
+                let (reordered, split_point) = partition_categorical_on_device(
+                    client,
+                    &bins_sub,
+                    &parent_rows,
+                    f.num_bin,
+                    f.min_bin,
+                    f.max_bin,
+                    f.most_freq_bin,
+                    &inner_bitset,
+                )?;
+                let left_rows: Vec<u32> = reordered[..split_point].to_vec();
+                let right_rows: Vec<u32> = reordered[split_point..].to_vec();
+                let left_count = left_rows.len() as i32;
+                let right_count = right_rows.len() as i32;
+                // (4) Grow the categorical node via the EXISTING §10 entrypoint
+                //     (`split_categorical_on_device`, tree.rs:765) — consuming BOTH the
+                //     real (`cat_threshold_`) and inner (routing) bitsets. `num_cat_threshold`
+                //     is the real winning count (numeric uses 0). `threshold` is unused.
+                let scalars = SplitScalars {
+                    is_valid: true,
+                    leaf_index: best_leaf,
+                    gain: best.gain + cfg.min_gain_to_split,
+                    inner_feature_index: f.real_feature_index,
+                    threshold: 0,
+                    default_left: best.default_left,
+                    left_sum_gradients: best.left_sum_gradient,
+                    left_sum_hessians: best.left_sum_hessian,
+                    left_sum_gh_quant: 0,
+                    left_count,
+                    left_gain: 0.0,
+                    left_value: best.left_output,
+                    right_sum_gradients: best.right_sum_gradient,
+                    right_sum_hessians: best.right_sum_hessian,
+                    right_sum_gh_quant: 0,
+                    right_count,
+                    right_gain: 0.0,
+                    right_value: best.right_output,
+                    num_cat_threshold: win_bins.len() as i32,
+                };
+                let result = tree.split_categorical_on_device(
+                    client,
+                    best_leaf,
+                    f.real_feature_index,
+                    missing_type_code,
+                    &scalars,
+                    &real_bitset,
+                    &inner_bitset,
+                )?;
+                (left_rows, right_rows, left_count, right_count, result.right_leaf_index)
+            } else {
+                // ===== Numeric grow branch (unchanged — SC #4 byte-for-byte). =====
+                // Single-feature-group min_bin convention (CR-01): min_bin + offset.
+                let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
+                let (reordered, split_point) = partition_leaf_stable(
+                    &bins_sub,
+                    &parent_rows,
+                    f.num_bin,
+                    partition_min_bin,
+                    f.max_bin,
+                    f.default_bin,
+                    f.most_freq_bin,
+                    missing_type_u8,
+                    best.default_left,
+                    best.threshold,
+                )?;
+                let left_rows: Vec<u32> = reordered[..split_point].to_vec();
+                let right_rows: Vec<u32> = reordered[split_point..].to_vec();
+                let left_count = left_rows.len() as i32;
+                let right_count = right_rows.len() as i32;
+                // IN-01: an out-of-range `best.threshold` would silently record the raw
+                // bin index cast to f64 as the tree's REAL threshold — a plausible-looking
+                // wrong value that would corrupt prediction routing and mask an off-by-one
+                // in the offset/compaction threshold space. Surface a typed error instead.
+                let real_threshold =
+                    *f.bin_upper_bound.get(best.threshold as usize).ok_or_else(|| {
+                        ComputeError::Runtime {
+                            detail: format!(
+                                "grow_tree_on_device_driver_with_cfg: split threshold bin index {} out of \
+                                 range for feature {} bin_upper_bound (len {})",
+                                best.threshold,
+                                f.real_feature_index,
+                                f.bin_upper_bound.len()
+                            ),
+                        }
+                    })?;
+                let scalars = SplitScalars {
+                    is_valid: true,
+                    leaf_index: best_leaf,
+                    gain: best.gain + cfg.min_gain_to_split,
+                    inner_feature_index: f.real_feature_index,
+                    threshold: best.threshold,
+                    default_left: best.default_left,
+                    left_sum_gradients: best.left_sum_gradient,
+                    left_sum_hessians: best.left_sum_hessian,
+                    left_sum_gh_quant: 0,
+                    left_count,
+                    left_gain: 0.0,
+                    left_value: best.left_output,
+                    right_sum_gradients: best.right_sum_gradient,
+                    right_sum_hessians: best.right_sum_hessian,
+                    right_sum_gh_quant: 0,
+                    right_count,
+                    right_gain: 0.0,
+                    right_value: best.right_output,
+                    num_cat_threshold: 0,
+                };
+                let result = tree.split_on_device(
+                    client,
+                    best_leaf,
+                    f.real_feature_index,
+                    real_threshold,
+                    missing_type_code,
+                    &scalars,
+                )?;
+                (left_rows, right_rows, left_count, right_count, result.right_leaf_index)
+            };
 
         // ---- Seed the two child leaves from the SplitInfo (NOT a re-fold): the
         // kEpsilon-carrying sums are load-bearing for the next split (Pitfall 2). ----
@@ -685,6 +849,7 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
             l.depth = child_depth;
             l.best = SplitInfo::none();
             l.best_fpos = -1;
+            l.best_cat = Vec::new();
         }
         // Append the new right child (leaf id == new_right).
         debug_assert_eq!(new_right as usize, leaves.len(), "right child takes the next leaf id");
@@ -695,6 +860,7 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
             hist: vec![0.0; hist_len],
             best: SplitInfo::none(),
             best_fpos: -1,
+            best_cat: Vec::new(),
             depth: child_depth,
         });
 
@@ -727,16 +893,18 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
             if depth_capped || both_too_small {
                 leaves[child as usize].best = SplitInfo::none();
                 leaves[child as usize].best_fpos = -1;
+                leaves[child as usize].best_cat = Vec::new();
                 continue;
             }
             let (cg, ch, cn, chist) = {
                 let c = &leaves[child as usize];
                 (c.sum_g, c.sum_h, c.rows.len() as i32, c.hist.clone())
             };
-            let (cbest, cfpos) =
+            let (cbest, cfpos, ccat) =
                 scan_leaf(client, features, &chist, cg, ch, cn, &slot_off, &cfg)?;
             leaves[child as usize].best = cbest;
             leaves[child as usize].best_fpos = cfpos;
+            leaves[child as usize].best_cat = ccat;
         }
     }
 
@@ -758,4 +926,91 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         leaf_count,
     };
     Ok((host_tree, layout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::categorical_split::construct_bitset;
+    use crate::kernels::data_partition::partition_categorical_stable;
+    use crate::runtime::cpu_client;
+
+    /// W-4 double-bump / missed-bump guard (DEF-07-11-01 class). The driver applies
+    /// the SINGLE `+2*kEpsilon` `sum_h` bump before the §8.1 evaluator (mirroring host
+    /// `learner.rs:2760`); `best_split.rs` passes through and the evaluator does not
+    /// bump. This pins the value the driver hands the evaluator to `raw + 2*kEpsilon`
+    /// BIT-EXACT for BOTH committed fixtures' leaf hessian sums, independently of the
+    /// end-to-end structure gate (which could pass while a last-ULP leaf value drifts).
+    #[test]
+    fn categorical_driver_bumps_sum_hessian_once() {
+        let two_eps = 2.0 * f64::from(K_EPSILON);
+        // The value the driver hands the §8.1 evaluator equals the host `learner.rs:2760`
+        // bumped value `raw + 2*kEpsilon`, BIT-EXACT, for BOTH committed fixtures' leaf
+        // hessian sums (cat_onehot = 40.0 = 0+10+10+10+10; cat_manyvsmany = 60.0 = 0+10*6).
+        for (name, raw) in [("cat_onehot", 40.0_f64), ("cat_manyvsmany", 60.0_f64)] {
+            assert_eq!(
+                bump_sum_hessian_cat(raw),
+                raw + two_eps,
+                "{name}: driver-supplied sum_h must equal raw + 2*kEpsilon bit-exact (W-4)"
+            );
+        }
+        // Double-bump / missed-bump guard (DEF-07-11-01 class). At the fixture magnitudes
+        // (40/60) `2*kEpsilon` (2e-15) sits below the f64 ULP (~7e-15), so it is absorbed —
+        // faithful to the host, but not a discriminating guard there. Exercise the guard at
+        // a magnitude where `2*kEpsilon` IS representable: a single bump must differ from
+        // raw (missed-bump) and from a two-bump chain (double-bump = `+4*kEpsilon`).
+        let tiny = 1e-13_f64;
+        let once = bump_sum_hessian_cat(tiny);
+        let twice = bump_sum_hessian_cat(bump_sum_hessian_cat(tiny));
+        assert_eq!(once, tiny + two_eps, "single bump == tiny + 2*kEpsilon");
+        assert_ne!(once, tiny, "missed-bump guard: one bump must change a representable sum_h");
+        assert_ne!(once, twice, "double-bump guard: one bump must differ from two");
+    }
+
+    /// Open Q1 routing-convention isolation (Pattern 3 / Pitfall 4). The on-device
+    /// categorical partition counts MUST equal the host `partition_categorical_stable`
+    /// reference for both fixtures' winning bitsets, isolating the real-value-vs-inner-bin
+    /// routing convention as a standalone signal BEFORE the full structure gate (22-05).
+    /// The driver feeds the INNER-bin bitset (the `construct_bitset` over the winning
+    /// bins) with `min_bin=0` and `most_freq_bin` supplied — both device and host derive
+    /// `offset = (most_freq_bin==0)?1:0` INTERNALLY (== `offset_for_most_freq_bin`), so
+    /// the same offset math is used on both sides (Pitfall 4).
+    #[test]
+    fn categorical_partition_counts_match_host_stable() {
+        let client = cpu_client();
+        // Fixture bin layout: 6 category values (bins 1..=6), 10 rows each; most_freq_bin=1
+        // (=> offset 0), min_bin=0, max_bin=6, num_bin=7 (bin 0 = NaN dummy).
+        let mut bins_vec: Vec<u32> = Vec::with_capacity(60);
+        for cat_bin in 1..=6u32 {
+            for _ in 0..10 {
+                bins_vec.push(cat_bin);
+            }
+        }
+        let bins = BinColumn::new(bins_vec, 7);
+        let di: Vec<u32> = (0..60).collect();
+
+        // cat_onehot winner = inner bin {4}; cat_manyvsmany winner = inner bins {4,5,6}.
+        let cases = [
+            ("cat_onehot", construct_bitset(&[4])),
+            ("cat_manyvsmany", construct_bitset(&[4, 5, 6])),
+        ];
+        for (name, inner_bitset) in cases {
+            let (dev_order, dev_split) = partition_categorical_on_device(
+                &client, &bins, &di, 7, 0, 6, 1, &inner_bitset,
+            )
+            .unwrap_or_else(|e| panic!("{name}: device partition errored: {e:?}"));
+            let (host_order, host_split) =
+                partition_categorical_stable(&bins, &di, 7, 0, 6, 1, &inner_bitset)
+                    .unwrap_or_else(|e| panic!("{name}: host stable partition errored: {e:?}"));
+            // (left_count, right_count) must match the host stable reference exactly.
+            assert_eq!(dev_split, host_split, "{name}: left count (split_point) device vs host");
+            assert_eq!(
+                dev_order.len() - dev_split,
+                host_order.len() - host_split,
+                "{name}: right count device vs host"
+            );
+            // Full stable order matches too (stronger than counts alone).
+            assert_eq!(dev_order, host_order, "{name}: full stable partition order device vs host");
+        }
+    }
 }
