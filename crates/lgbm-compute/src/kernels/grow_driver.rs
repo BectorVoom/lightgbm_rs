@@ -27,6 +27,8 @@
 
 use lgbm_dataset::{BinType, MissingType};
 
+use crate::error::ComputeError;
+use crate::kernels::data_partition::update_data_index_to_leaf_on;
 use crate::BinColumn;
 
 /// One feature column's ADDITIVE grow-loop input — the faithful lgbm-compute-local
@@ -66,4 +68,105 @@ pub struct GrowFeature {
     pub real_feature_index: i32,
     /// C++ `BinMapper::bin_type()` — numeric vs categorical dispatch flag.
     pub bin_type: BinType,
+}
+
+// =========================================================================
+// data->leaf map buffer-strategy A/B harness (Pitfall 3, ODL-19).
+//
+// The per-split `UpdateDataIndexToLeafIndex` rewrite reads the row->leaf map for
+// the split leaf's rows and writes the two child leaf ids. When the 20-03b driver
+// grows num_leaves>2 it applies this rewrite REPEATEDLY over one running map. The
+// open aliasing question (RESEARCH Pitfall 3 / phase18-wr01 HistArena::swap): does
+// the driver read+write ONE map buffer in place (ALIAS), or read a source buffer
+// and write a distinct destination then swap (DOUBLE-BUFFER)? A wrong alias choice
+// silently corrupts the partition at num_leaves>2. This helper exposes BOTH so the
+// oracle A/B can anchor each to the cpu f64 partition and LOCK the safe strategy
+// (double-buffer unless alias is proven bit-identical) BEFORE 20-03b writes the
+// driver body. Each step drives the REAL Phase-18 device kernel
+// (`update_data_index_to_leaf_on`); the strategies differ ONLY in how the running
+// map buffer is carried across steps.
+// =========================================================================
+
+/// The data->leaf map buffer strategy for the per-split rewrite (Pitfall 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafMapBufferStrategy {
+    /// (A) In-place alias — one running map buffer read AND written each step.
+    Alias,
+    /// (B) Ping-pong double-buffer — read the source map, write a distinct
+    /// destination, swap. The conservative default (no read/write aliasing).
+    DoubleBuffer,
+}
+
+/// One split's row->leaf rewrite input for [`build_leaf_map_on`]: the global row
+/// ids currently in the leaf being split, their `to_left` marks (1 = routes to
+/// `left_leaf`, 0 = routes to `right_leaf`, aligned to `data_indices`), and the two
+/// child leaf ids.
+#[derive(Clone, Copy, Debug)]
+pub struct LeafMapStep<'a> {
+    /// Global row ids in the leaf being split.
+    pub data_indices: &'a [u32],
+    /// Per-`data_indices` route marks (`1` = left child, `0` = right child).
+    pub to_left: &'a [u32],
+    /// The left child leaf id.
+    pub left_leaf: i32,
+    /// The right child leaf id.
+    pub right_leaf: i32,
+}
+
+/// Apply `steps` in order to build the final `num_data`-length row->leaf map,
+/// starting from `init_leaf` for every row, using the chosen buffer `strategy`
+/// (Pitfall 3). Each step drives the real Phase-18
+/// [`update_data_index_to_leaf_on`] device kernel (which writes the two child leaf
+/// ids for the leaf's rows into a fresh `-1` map); the running map is then carried
+/// forward either in place ([`LeafMapBufferStrategy::Alias`]) or via a swapped
+/// destination copy ([`LeafMapBufferStrategy::DoubleBuffer`]). Rows a step does not
+/// touch keep their prior leaf id. Both strategies MUST equal the cpu f64 partition
+/// anchor — the A/B proves it and locks the safe one.
+///
+/// # Errors
+/// [`ComputeError`] from [`update_data_index_to_leaf_on`] (length mismatch, or a
+/// `data_index >= num_data`).
+pub fn build_leaf_map_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    num_data: usize,
+    init_leaf: i32,
+    steps: &[LeafMapStep<'_>],
+    strategy: LeafMapBufferStrategy,
+) -> Result<Vec<i32>, ComputeError> {
+    let mut running = vec![init_leaf; num_data];
+    for step in steps {
+        // Real Phase-18 device kernel: a fresh -1 map with ONLY this leaf's rows set
+        // to their child leaf id (rest stay -1). This is the read-side result the
+        // buffer strategy then folds into the running map.
+        let per_split = update_data_index_to_leaf_on(
+            client,
+            step.data_indices,
+            step.to_left,
+            num_data,
+            step.left_leaf,
+            step.right_leaf,
+        )?;
+        match strategy {
+            LeafMapBufferStrategy::Alias => {
+                // (A) in-place: read AND write the SAME running buffer.
+                for (row, &v) in per_split.iter().enumerate() {
+                    if v != -1 {
+                        running[row] = v;
+                    }
+                }
+            }
+            LeafMapBufferStrategy::DoubleBuffer => {
+                // (B) ping-pong: read the source `running`, write a distinct `next`,
+                // then swap. No read/write aliasing of a single buffer.
+                let mut next = running.clone();
+                for (row, &v) in per_split.iter().enumerate() {
+                    if v != -1 {
+                        next[row] = v;
+                    }
+                }
+                running = next;
+            }
+        }
+    }
+    Ok(running)
 }

@@ -1962,6 +1962,179 @@ fn learner_parity_cegb_coupled() {
 /// two grown trees must match: topology / split_feature / threshold / decision_type
 /// BIT-EXACT (via `to_string` structural fields), and leaf values within ~1e-6. If
 /// they diverge, the resident wiring changed the tree → STOP (do NOT weaken the tol).
+/// Build the ADDITIVE `Vec<GrowFeature>` the on-device fork passes across the seam,
+/// field-by-field from the spine's `FeatureColumn`s (mirrors learner.rs). Shared by
+/// the default-cpu seam-defers cell and the migrated rocm Slice-0 cells (via
+/// `mod hip`'s `use super::*`).
+fn grow_features_of(features: &[FeatureColumn]) -> Vec<lgbm_compute::GrowFeature> {
+    features
+        .iter()
+        .map(|f| lgbm_compute::GrowFeature {
+            bins: f.bins.clone(),
+            num_bin: f.num_bin,
+            offset: f.offset,
+            min_bin: f.min_bin,
+            max_bin: f.max_bin,
+            default_bin: f.default_bin,
+            most_freq_bin: f.most_freq_bin,
+            missing_type: f.missing_type,
+            bin_upper_bound: f.bin_upper_bound.clone(),
+            real_feature_index: f.real_feature_index,
+            bin_type: f.bin_type,
+        })
+        .collect()
+}
+
+/// ODL-19 / Pitfall 3 — the data->leaf map buffer-strategy A/B, anchor-pinned. Runs
+/// BOTH candidate strategies (in-place ALIAS vs ping-pong DOUBLE-BUFFER) over the
+/// REAL Phase-18 `update_data_index_to_leaf_on` device kernel for a multi-split
+/// (`num_leaves > 2`) case on the cubecl-cpu runtime, and asserts EACH strategy's
+/// row->leaf assignment against the cpu f64 anchor partition (NEVER strategy-A vs
+/// strategy-B directly — def-f8u-01). Default cpu build (NOT rocm-gated). Both match
+/// the anchor here, so 20-03b LOCKS double-buffer as the conservative default (no
+/// read/write aliasing of a single map buffer).
+#[test]
+fn learner_parity_on_device_buffer_strategy_ab() {
+    use lgbm_compute::kernels::data_partition::partition_leaf_stable;
+    use lgbm_compute::kernels::grow_driver::{
+        build_leaf_map_on, LeafMapBufferStrategy, LeafMapStep,
+    };
+
+    let client = cpu_client();
+    let (features, _g, _h, _cfg, _nl, _md) = corpus();
+    let f = &features[0]; // 6 bins, 12 rows: [0,0,1,1,2,2,3,3,4,4,5,5]
+    let num_data = f.bins.len();
+
+    // Route `data_indices` on feature `f` at `threshold` via the cpu f64 anchor
+    // (partition_leaf_stable). Returns (to_left marks aligned to data_indices, the
+    // right-child ids). MissingType::None (=0) and no default-bin rows, so
+    // default_left is irrelevant to the routing.
+    let route = |data_indices: &[u32], threshold: u32| -> (Vec<u32>, Vec<u32>) {
+        let bins_sub = BinColumn::new(
+            data_indices.iter().map(|&di| f.bins.bin(di as usize)).collect(),
+            f.num_bin,
+        );
+        let (reordered, split_point) = partition_leaf_stable(
+            &bins_sub,
+            data_indices,
+            f.num_bin,
+            f.min_bin,
+            f.max_bin,
+            f.default_bin,
+            f.most_freq_bin,
+            0,    // MissingType::None
+            true, // default_left (irrelevant here)
+            threshold,
+        )
+        .expect("anchor partition ok");
+        let left_set: std::collections::HashSet<u32> =
+            reordered[..split_point].iter().copied().collect();
+        let to_left: Vec<u32> = data_indices
+            .iter()
+            .map(|&di| u32::from(left_set.contains(&di)))
+            .collect();
+        let right: Vec<u32> = reordered[split_point..].to_vec();
+        (to_left, right)
+    };
+
+    // Split 1: leaf 0 (all rows) at threshold 2 -> left stays leaf 0, right -> leaf 1.
+    let all: Vec<u32> = (0..num_data as u32).collect();
+    let (tl0, r0) = route(&all, 2);
+    // Split 2: leaf 1 (split-1 right rows) at threshold 3 -> left stays leaf 1,
+    // right -> leaf 2. This reaches num_leaves > 2 (the corruption-catcher regime).
+    let (tl1, _r1) = route(&r0, 3);
+
+    // ---- the cpu f64 anchor row->leaf map (the ONLY reference). ----
+    let mut anchor = vec![0i32; num_data];
+    for (i, &di) in all.iter().enumerate() {
+        anchor[di as usize] = if tl0[i] == 1 { 0 } else { 1 };
+    }
+    for (i, &di) in r0.iter().enumerate() {
+        anchor[di as usize] = if tl1[i] == 1 { 1 } else { 2 };
+    }
+    assert!(
+        anchor.iter().any(|&l| l == 2),
+        "A/B scenario must reach num_leaves > 2 (the aliasing corruption-catcher regime)"
+    );
+
+    let steps = [
+        LeafMapStep { data_indices: &all, to_left: &tl0, left_leaf: 0, right_leaf: 1 },
+        LeafMapStep { data_indices: &r0, to_left: &tl1, left_leaf: 1, right_leaf: 2 },
+    ];
+
+    // Drive BOTH strategies over the real Phase-18 kernel; anchor EACH to the cpu map.
+    let alias = build_leaf_map_on(&client, num_data, 0, &steps, LeafMapBufferStrategy::Alias)
+        .expect("alias strategy ok");
+    let double =
+        build_leaf_map_on(&client, num_data, 0, &steps, LeafMapBufferStrategy::DoubleBuffer)
+            .expect("double-buffer strategy ok");
+
+    assert_eq!(
+        alias, anchor,
+        "ALIAS row->leaf map must match the cpu f64 anchor partition (num_leaves>2)"
+    );
+    assert_eq!(
+        double, anchor,
+        "DOUBLE-BUFFER row->leaf map must match the cpu f64 anchor partition (num_leaves>2)"
+    );
+    // LOCKED (recorded in SUMMARY): 20-03b uses DOUBLE-BUFFER. Both matched the anchor,
+    // so alias is not proven UNSAFE — but double-buffer is the conservative default
+    // (no read/write aliasing of one map buffer), locked per RESEARCH Pitfall 3.
+}
+
+/// ODL-18/ODL-19 — the expanded 5-arg `grow_tree_on_device` seam DEFERS safely this
+/// plan. Default cpu build. Asserts (a) a direct call returns `Ok(None)` (the body
+/// is not wired until 20-03b), (b) the discriminator matches the env gate exactly
+/// (`on_device_growth_supported() == (LGBM_CUDA_ON_DEVICE=="1")` — false in the
+/// byte-unchanged merge gate, true & LIVE in the env-set run), and (c) a full learner
+/// train produces the byte-identical tree to the pure host path (the fork falls
+/// THROUGH on `Ok(None)`), so the output is correct whether the fork is live or dead.
+#[test]
+fn learner_parity_on_device_seam_defers() {
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, cfg, num_leaves, max_depth) = corpus();
+    let grow_features = grow_features_of(&features);
+
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+
+    // (a) the 5-arg seam still defers (Ok(None)) this plan — regardless of the env.
+    assert!(
+        matches!(
+            backend.grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth),
+            Ok(None)
+        ),
+        "grow_tree_on_device must still defer (Ok(None)) in 20-03a"
+    );
+
+    // (b) gated discriminator invariant: true IFF the env is set. When set, the fork
+    // is LIVE (on_device_eligible), and (a) is what keeps the train correct.
+    assert_eq!(
+        backend.on_device_growth_supported(),
+        env_on,
+        "on_device_growth_supported() must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip"
+    );
+
+    // (c) the env-set fork train == the host-path train (bit-identical, Tree: PartialEq).
+    // Both learners take the host path (the fork defers via Ok(None)), so the trees are
+    // deterministically equal — proving the fork falls through safely.
+    let mut fork_learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+        .with_features(features.clone());
+    let fork_tree = fork_learner.train(&g, &h, true).expect("fork train ok");
+
+    let host_backend = CpuBackend;
+    let host_client = cpu_client();
+    let (features2, g2, h2, cfg2, nl2, md2) = corpus();
+    let mut host_learner =
+        SerialTreeLearner::new(&host_backend, &host_client, cfg2, nl2, md2).with_features(features2);
+    let host_tree = host_learner.train(&g2, &h2, true).expect("host train ok");
+
+    assert_eq!(
+        fork_tree, host_tree,
+        "env-set fork tree must equal the host-path tree (the fork defers via Ok(None))"
+    );
+}
+
 #[cfg(feature = "rocm")]
 mod hip {
     use super::*;
@@ -2445,12 +2618,14 @@ mod hip {
         let num_leaves = 31i32;
         let max_depth = -1i32;
 
-        // D-01: obtain the on-device tree via the seam. Slice-0 returns Ok(None)
-        // (GpuBackend<R> explicit no-op override), so the unwrap_or_else host-fallback
-        // stand-in supplies the tree. This is the TEST's stand-in for the not-yet-
-        // existent on-device tree — never production behavior (D-02).
+        // D-01: obtain the on-device tree via the expanded 5-arg seam (20-03a adds
+        // the additive `&grow_features` metadata arg). The body still returns Ok(None)
+        // this plan (GpuBackend<R> explicit no-op override), so the unwrap_or_else
+        // host-fallback stand-in supplies the tree. This is the TEST's stand-in for
+        // the not-yet-existent on-device tree — never production behavior (D-02).
+        let grow_features = grow_features_of(&features);
         let tree = backend
-            .grow_tree_on_device(&g, &h, num_leaves, max_depth)
+            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("grow_tree_on_device seam ok")
             .map(|(t, _payload)| t)
             .unwrap_or_else(|| host_grow(&features, &g, &h, num_leaves, max_depth));
@@ -2469,34 +2644,50 @@ mod hip {
     /// unexercised until Slice 1. No env var is set, so no FORCE_ENV_LOCK is needed.
     #[test]
     fn learner_parity_on_device_seam_is_provable_noop_slice0() {
-        let (_features, g, h) = spine_corpus(256, 4, 16);
+        let (features, g, h) = spine_corpus(256, 4, 16);
         let num_leaves = 7i32;
         let max_depth = -1i32;
+        let grow_features = grow_features_of(&features);
 
         let cpu_backend = CpuBackend;
         let gpu_backend = RocmBackend::with_resident(false);
 
-        // (a) discriminator false on both backends.
-        assert!(
-            !cpu_backend.on_device_growth_supported(),
-            "CpuBackend on_device_growth_supported must be false in Slice 0"
+        // (a) GATED discriminator invariant (20-03a flipped it behind
+        // `cuda_on_device_enabled()`): `on_device_growth_supported()` must equal
+        // `(LGBM_CUDA_ON_DEVICE == "1")` on BOTH backends. When the env is unset (the
+        // byte-unchanged merge-gate contract) both are false, so the learner's
+        // eligibility AND-gate is dead and the host path is untouched.
+        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+        assert_eq!(
+            cpu_backend.on_device_growth_supported(),
+            env_on,
+            "CpuBackend on_device_growth_supported must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip"
         );
-        assert!(
-            !gpu_backend.on_device_growth_supported(),
-            "GpuBackend on_device_growth_supported must be false in Slice 0 (one generic \
-             GpuBackend<R> impl shared by ROCm/CUDA/WGPU; no kernel until Slice 1)"
+        assert_eq!(
+            gpu_backend.on_device_growth_supported(),
+            env_on,
+            "GpuBackend on_device_growth_supported must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip \
+             (one generic GpuBackend<R> impl shared by ROCm/CUDA/WGPU)"
         );
 
-        // (b) the seam is a no-op (Ok(None)) on both — CpuBackend via the trait
-        // default, GpuBackend<R> via its explicit override.
+        // (b) the expanded 5-arg seam still DEFERS (Ok(None)) on both this plan —
+        // CpuBackend via the trait default, GpuBackend<R> via its explicit override.
+        // The body is not wired until 20-03b; 20-03b retires this Ok(None) assertion
+        // when it activates the driver.
         assert!(
-            matches!(cpu_backend.grow_tree_on_device(&g, &h, num_leaves, max_depth), Ok(None)),
-            "CpuBackend grow_tree_on_device must be a no-op (Ok(None)) in Slice 0"
+            matches!(
+                cpu_backend.grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth),
+                Ok(None)
+            ),
+            "CpuBackend grow_tree_on_device must still defer (Ok(None)) in 20-03a"
         );
         assert!(
-            matches!(gpu_backend.grow_tree_on_device(&g, &h, num_leaves, max_depth), Ok(None)),
-            "GpuBackend grow_tree_on_device explicit override must be a no-op (Ok(None)) \
-             in Slice 0 — proves the default route is provably untouched"
+            matches!(
+                gpu_backend.grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth),
+                Ok(None)
+            ),
+            "GpuBackend grow_tree_on_device explicit override must still defer (Ok(None)) \
+             in 20-03a — proves the default route is provably untouched"
         );
     }
 }
