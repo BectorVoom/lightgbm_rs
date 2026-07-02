@@ -2482,6 +2482,87 @@ fn learner_parity_on_device_deep_multileaf_gate() {
     }
 }
 
+/// D-02 case B — a no-split / single-leaf corpus (RESEARCH A3 fallback). Two
+/// continuous features + L2, `MissingType::None`, 12 rows, all `g == 3.0`, `h == 1.0`.
+/// The pure L2 split gain of a constant-gradient corpus is analytically zero
+/// (`left_g²/left_h + right_g²/right_h == parent_g²/parent_h` when `g ∝ h`), BUT the
+/// reference-blessed `kEpsilon`-carrying hessian sums leave a residual DEGENERATE
+/// positive gain, so under the fixed `proving_slice_config` (`min_gain_to_split == 0`,
+/// which case B cannot override — it routes through the cfg-less trait seam) a
+/// constant-gradient root would still split. Per A3 we therefore pin `num_leaves = 1`:
+/// the driver's best-first loop is `for _ in 0..0` (never runs) and the anchor
+/// `SerialTreeLearner` grows the same root-only tree, whose single leaf value is the
+/// seeded root output (`calculate_splitted_leaf_output` + `add_bias`).
+#[allow(clippy::type_complexity)]
+fn nosplit_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
+    let grad = vec![3.0f32; 12];
+    let hess = vec![1.0f32; 12];
+    let f0 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], 6),
+        num_bin: 6,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 5,
+        default_bin: 6,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
+        real_feature_index: 0,
+        ..Default::default()
+    };
+    let f1 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3], 4),
+        num_bin: 4,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 3,
+        default_bin: 4,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
+        real_feature_index: 1,
+        ..Default::default()
+    };
+    (vec![f0, f1], grad, hess, 1, -1)
+}
+
+/// ODL-18H case B — the no-split break path grows a root-only tree bit-exact to the
+/// cpu f64 anchor (leaf value within `ROCM_LEAF_VALUE_TOL`). Mirrors the gate,
+/// swapping ONLY the corpus.
+#[test]
+fn learner_parity_on_device_nosplit_gate() {
+    let backend = CpuBackend;
+    let (features, g, h, num_leaves, max_depth) = nosplit_corpus();
+    let grow_features = grow_features_of(&features);
+    let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let grown = backend
+        .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+        .expect("grow_tree_on_device seam ok");
+
+    if env_on {
+        let (on_device_tree, layout) =
+            grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
+        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+        assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "no-split");
+        assert_eq!(
+            on_device_tree.num_leaves, 1,
+            "num_leaves=1 (A3) grows a root-only (1-leaf) tree — the loop never runs"
+        );
+        assert_eq!(
+            layout.leaf_count.iter().sum::<i32>(),
+            g.len() as i32,
+            "layout leaf_count partitions all rows (single root leaf)"
+        );
+    } else {
+        assert!(
+            grown.is_none(),
+            "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
+        );
+    }
+}
+
 #[cfg(feature = "rocm")]
 mod hip {
     use super::*;
