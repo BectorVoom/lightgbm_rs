@@ -1359,6 +1359,33 @@ impl Backend for CpuBackend {
         cuda_on_device_enabled()
     }
 
+    // ODL-18 (20-03b): the ACTIVATED on-device grow seam. When the discriminator is
+    // live ([`cuda_on_device_enabled`]) grow the ENTIRE continuous-feature + L2 tree
+    // on the cubecl-cpu runtime via the per-leaf best-first driver
+    // ([`kernels::grow_driver::grow_tree_on_device_driver`]) and return
+    // `Ok(Some((Tree, LeafPartitionLayout)))`. With the env unset the discriminator is
+    // `false`, so the learner's eligibility AND-gate never reaches here and the seam is
+    // a byte-unchanged `Ok(None)` (the merge-gate contract, D-09). The on-device tree is
+    // anchored STRUCTURE-bit-exact to the cpu f64 fold (the SAME cubecl-cpu runtime) —
+    // never a second GPU f32 path (def-f8u-01).
+    fn grow_tree_on_device(
+        &self,
+        gradients: &[f32],
+        hessians: &[f32],
+        features: &[GrowFeature],
+        num_leaves: i32,
+        max_depth: i32,
+    ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
+        if !cuda_on_device_enabled() {
+            return Ok(None);
+        }
+        let client = crate::runtime::cpu_client();
+        let (tree, layout) = kernels::grow_driver::grow_tree_on_device_driver(
+            &client, gradients, hessians, features, num_leaves, max_depth,
+        )?;
+        Ok(Some((tree, layout)))
+    }
+
     fn construct_histograms(
         &self,
         _client: &ComputeClient<Self::Runtime>,
@@ -2262,21 +2289,32 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         cuda_on_device_enabled()
     }
 
-    // ODL-01 (Phase 14 Slice 0) / ODL-18 (Phase 20, 20-03a): explicit no-op override
-    // of the on-device tree-growth seam, now carrying the ADDITIVE `features`
-    // metadata slice. The BODY still returns `Ok(None)` (the per-leaf driver lands in
-    // 20-03b) to PROVE (SC#2) the default tree path is provably untouched on the GPU
-    // backend — so even with the env SET the learner fork falls through to the host
-    // path. The override is retained (not inherited) as that explicit proof.
+    // ODL-01 (Phase 14 Slice 0) / ODL-18 (Phase 20, 20-03b): the ACTIVATED on-device
+    // grow seam on the GPU backend. When the discriminator is live
+    // ([`cuda_on_device_enabled`]) grow the ENTIRE continuous-feature + L2 tree on the
+    // GPU runtime `R` via the shared per-leaf best-first driver
+    // ([`kernels::grow_driver::grow_tree_on_device_driver`]) and return `Ok(Some(..))`.
+    // One generic `GpuBackend<R>` impl is shared by ROCm/CUDA/WGPU; the driver runs the
+    // SAME runtime-generic f64 kernels the histogram/split/partition paths use. With the
+    // env unset the discriminator is `false`, so the seam is a byte-unchanged `Ok(None)`
+    // (D-09). The grown GPU tree is anchored STRUCTURE-bit-exact to the cpu f64 fold —
+    // never a second GPU f32 path (def-f8u-01).
     fn grow_tree_on_device(
         &self,
-        _gradients: &[f32],
-        _hessians: &[f32],
-        _features: &[GrowFeature],
-        _num_leaves: i32,
-        _max_depth: i32,
+        gradients: &[f32],
+        hessians: &[f32],
+        features: &[GrowFeature],
+        num_leaves: i32,
+        max_depth: i32,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
-        Ok(None)
+        if !cuda_on_device_enabled() {
+            return Ok(None);
+        }
+        let client = R::client(&Default::default());
+        let (tree, layout) = kernels::grow_driver::grow_tree_on_device_driver(
+            &client, gradients, hessians, features, num_leaves, max_depth,
+        )?;
+        Ok(Some((tree, layout)))
     }
 
     fn construct_histograms(
