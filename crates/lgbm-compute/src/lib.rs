@@ -11,6 +11,7 @@
 //! re-exported [`ComputeError`]), never on `cubecl` directly — that is the whole
 //! point of the seam, and the `cmp01_containment` guard test enforces it.
 
+pub mod device_metric;
 pub mod device_objective;
 pub mod error;
 pub mod fusion_prof;

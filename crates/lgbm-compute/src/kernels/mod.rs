@@ -70,3 +70,11 @@ pub mod objective_binary;
 pub mod objective_multiclass;
 pub mod objective_rank;
 pub mod objective_regression;
+// Phase-20 score-updater (§11, ODL-16) + pointwise-metric (§12, ODL-17) kernels.
+// Declared here in Wave-0 (20-00) as empty compiling stubs so each Wave-2 plan
+// (20-01 score updater / 20-02 metric evaluator) fills exactly one owned file with
+// NO `mod.rs` contention. Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE`;
+// ungated like the other Phase-14..19 kernel modules (NOT `#[cfg(feature = "gpu")]`,
+// per D-08) so the default cpu f64 anchor exercises them.
+pub mod metric_pointwise;
+pub mod score_updater;
