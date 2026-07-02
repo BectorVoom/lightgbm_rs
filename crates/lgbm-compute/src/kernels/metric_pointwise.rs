@@ -37,6 +37,8 @@ use cubecl::prelude::*;
 
 use crate::device_metric::DeviceMetricKind;
 use crate::error::ComputeError;
+use crate::kernels::objective_binary::sigmoid_convert_output_on;
+use crate::kernels::objective_regression::{convert_output_on, CONVERT_EXP};
 use crate::kernels::primitives::reduce_sum_f64_on;
 
 // =========================================================================
@@ -346,6 +348,92 @@ pub fn eval_pointwise_on<R: cubecl::Runtime>(
     let sum_loss = reduce_sum_f64_on(client, loss_partials)?;
     let sum_weight = reduce_sum_f64_on(client, weight_partials)?;
     Ok(average_loss(metric, sum_loss, sum_weight))
+}
+
+// =========================================================================
+// ConvertOutput compose (D-04) — the inverse-link runs into a pre-allocated
+// score-convert buffer BEFORE the EvalKernel, keyed off the ORIGINAL metric
+// name (DeviceMetricKind), NEVER DeviceObjectiveKind.
+// =========================================================================
+
+/// The per-metric `config_` scalars the parametrized §12.1 arms read (the metric
+/// analog of `RegressionMetricParams` + the binary `sigmoid`). The non-param arms
+/// (l2/rmse/l1/mape/poisson/gamma/gamma_deviance) ignore every field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricEvalParams {
+    /// `config.alpha` — quantile / huber (C++ default 0.9).
+    pub alpha: f64,
+    /// `config.fair_c` — fair-loss `c` (C++ default 1.0).
+    pub fair_c: f64,
+    /// `config.tweedie_variance_power` — tweedie `rho` in `[1, 2)` (C++ default 1.5).
+    pub tweedie_variance_power: f64,
+    /// `config.sigmoid` — the binary-logloss `ConvertOutput` sigmoid (C++ default 1.0).
+    pub sigmoid: f64,
+}
+
+impl Default for MetricEvalParams {
+    fn default() -> Self {
+        // The C++ Config defaults for the metric-relevant fields.
+        Self {
+            alpha: 0.9,
+            fair_c: 1.0,
+            tweedie_variance_power: 1.5,
+            sigmoid: 1.0,
+        }
+    }
+}
+
+/// Evaluate one pointwise metric over RAW (pre-`ConvertOutput`) scores, composing
+/// the inverse-link into the Eval flow (D-04): the transform runs into a
+/// pre-allocated `score_convert_buffer` (D-11) BEFORE the `EvalKernel`, then
+/// [`eval_pointwise_on`] folds and finalizes.
+///
+/// The convert MODE is selected off the ORIGINAL metric name (`kind`), NEVER
+/// `DeviceObjectiveKind` (device_objective.rs:33-39 warning — the objective kind is
+/// a support classifier, not a ConvertOutput key):
+/// - poisson / gamma / gamma_deviance / tweedie → `convert_output_on` `CONVERT_EXP`
+///   (the `exp` log-mean inverse-link — `lgbm-metric::regression::eval` applies it
+///   before `loss_on_point`);
+/// - binary_logloss → the `objective_binary` sigmoid convert (`1/(1+exp(-σ·raw))`);
+/// - l2 / rmse / l1 / quantile / huber / fair / mape → pass-through (no transform).
+///
+/// # Errors
+/// Propagates [`convert_output_on`] / [`sigmoid_convert_output_on`] and
+/// [`eval_pointwise_on`] (length mismatch validated in the fold).
+pub fn eval_metric_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    kind: DeviceMetricKind,
+    raw_scores: &[f64],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    params: MetricEvalParams,
+) -> Result<f64, ComputeError> {
+    let metric = metric_tag(kind);
+    // The single per-metric scalar `metric_on_point` reads. gamma_deviance's epsilon
+    // is a host f64 literal (1e-9) routed through the kernel arg for bit-exactness.
+    let param = match kind {
+        DeviceMetricKind::Quantile | DeviceMetricKind::Huber => params.alpha,
+        DeviceMetricKind::Fair => params.fair_c,
+        DeviceMetricKind::Tweedie => params.tweedie_variance_power,
+        DeviceMetricKind::GammaDeviance => 1e-9,
+        _ => 0.0,
+    };
+
+    // ConvertOutput compose (D-04) into the pre-allocated convert buffer (D-11),
+    // keyed off the ORIGINAL metric name — BEFORE the EvalKernel.
+    let score_convert_buffer: Vec<f64> = match kind {
+        DeviceMetricKind::Poisson
+        | DeviceMetricKind::Gamma
+        | DeviceMetricKind::GammaDeviance
+        | DeviceMetricKind::Tweedie => convert_output_on(client, raw_scores, CONVERT_EXP)?,
+        DeviceMetricKind::BinaryLogloss => {
+            sigmoid_convert_output_on(client, raw_scores, params.sigmoid)?
+        }
+        // Pass-through: l2 / rmse / l1 / quantile / huber / fair / mape.
+        _ => raw_scores.to_vec(),
+    };
+
+    eval_pointwise_on(client, metric, &score_convert_buffer, labels, weights, param)
 }
 
 #[cfg(test)]

@@ -22,6 +22,9 @@
 
 use std::path::PathBuf;
 
+use lgbm_compute::device_metric::DeviceMetricKind;
+use lgbm_compute::kernels::metric_pointwise::{eval_metric_on, MetricEvalParams};
+use lgbm_compute::runtime::cpu_client;
 use lgbm_metric::{
     AucMu, BinaryMetric, Metric, MultiError, RegressionMetricParams, XentropyMetric,
 };
@@ -298,4 +301,105 @@ fn builder_accepts_extended_metric_names() {
     for n in ["cross_entropy", "cross_entropy_lambda", "kullback_leibler"] {
         assert!(XentropyMetric::parse(n).is_ok(), "xentropy metric {n} must parse");
     }
+}
+
+// =========================================================================
+// ON-DEVICE metric parity cells (Plan 20-02, ODL-17) — the §12 EvalKernel
+// value composed with ConvertOutput (D-04), anchored to the SAME real
+// lib_lightgbm 4.6 goldens on the cpu f64 anchor (D-03 / D-05). Only the
+// TWELVE device-supported pointwise losses get a device cell; the ranking /
+// AUC / multiclass / cross-entropy families stay host-fallback replay (above),
+// per the Plan-00 `metric_supported` discriminator.
+// =========================================================================
+
+/// Load a golden triplet, run the composed on-device Eval on the cpu f64 anchor,
+/// and assert it matches the captured `lib_lightgbm` value within `ORACLE_TOL`
+/// (SKIP if the golden is absent). Never GPU-vs-GPU — the cpu anchor is the gate.
+fn assert_device_metric(name: &str, kind: DeviceMetricKind, params: MetricEvalParams) {
+    let Some((scores, labels, captured)) = load_triplet(name) else {
+        return;
+    };
+    let client = cpu_client();
+    let device = eval_metric_on(&client, kind, &scores, &labels, None, params)
+        .expect("on-device EvalKernel");
+    assert_metric(&format!("device/{name}"), device, captured);
+}
+
+// --- pass-through cells (no ConvertOutput): l2 / rmse / l1 / quantile / huber /
+//     fair / mape. rmse/l2/l1 ASSERT (Plan 00 captured their goldens). ---
+
+#[test]
+fn device_l2_parity() {
+    assert_device_metric("l2", DeviceMetricKind::L2, MetricEvalParams::default());
+}
+
+#[test]
+fn device_rmse_parity() {
+    assert_device_metric("rmse", DeviceMetricKind::Rmse, MetricEvalParams::default());
+}
+
+#[test]
+fn device_l1_parity() {
+    assert_device_metric("l1", DeviceMetricKind::L1, MetricEvalParams::default());
+}
+
+#[test]
+fn device_quantile_parity() {
+    // The capture trains with default alpha = 0.9.
+    assert_device_metric("quantile", DeviceMetricKind::Quantile, MetricEvalParams::default());
+}
+
+#[test]
+fn device_huber_parity() {
+    assert_device_metric("huber", DeviceMetricKind::Huber, MetricEvalParams::default());
+}
+
+#[test]
+fn device_fair_parity() {
+    assert_device_metric("fair", DeviceMetricKind::Fair, MetricEvalParams::default());
+}
+
+#[test]
+fn device_mape_parity() {
+    assert_device_metric("mape", DeviceMetricKind::Mape, MetricEvalParams::default());
+}
+
+// --- exp-ConvertOutput cells (CONVERT_EXP composed BEFORE EvalKernel):
+//     poisson / gamma / gamma_deviance / tweedie. ---
+
+#[test]
+fn device_poisson_parity() {
+    assert_device_metric("poisson", DeviceMetricKind::Poisson, MetricEvalParams::default());
+}
+
+#[test]
+fn device_gamma_parity() {
+    assert_device_metric("gamma", DeviceMetricKind::Gamma, MetricEvalParams::default());
+}
+
+#[test]
+fn device_gamma_deviance_parity() {
+    assert_device_metric(
+        "gamma_deviance",
+        DeviceMetricKind::GammaDeviance,
+        MetricEvalParams::default(),
+    );
+}
+
+#[test]
+fn device_tweedie_parity() {
+    assert_device_metric("tweedie", DeviceMetricKind::Tweedie, MetricEvalParams::default());
+}
+
+// --- sigmoid-ConvertOutput cell (the binary sigmoid composed BEFORE EvalKernel).
+//     binary_logloss ASSERTS (Plan 00 captured its golden with objective binary,
+//     sigmoid = 1.0). ---
+
+#[test]
+fn device_binary_logloss_parity() {
+    assert_device_metric(
+        "binary_logloss",
+        DeviceMetricKind::BinaryLogloss,
+        MetricEvalParams::default(),
+    );
 }
