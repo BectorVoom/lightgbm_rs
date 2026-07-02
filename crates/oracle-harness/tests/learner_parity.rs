@@ -2098,41 +2098,294 @@ fn learner_parity_on_device_seam_defers() {
 
     let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
 
-    // (a) the 5-arg seam still defers (Ok(None)) this plan — regardless of the env.
-    assert!(
-        matches!(
-            backend.grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth),
-            Ok(None)
-        ),
-        "grow_tree_on_device must still defer (Ok(None)) in 20-03a"
+    // (a) 20-03b ACTIVATED the seam: it grows (Ok(Some)) when the env is set and defers
+    // (Ok(None)) when unset (the byte-unchanged merge-gate contract). The structure gate
+    // cell asserts the grown tree is bit-exact; here we only assert the Some/None gating.
+    let grown = backend
+        .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+        .expect("grow_tree_on_device seam ok");
+    assert_eq!(
+        grown.is_some(),
+        env_on,
+        "grow_tree_on_device grows (Ok(Some)) IFF LGBM_CUDA_ON_DEVICE==1 (else defers Ok(None))"
     );
 
     // (b) gated discriminator invariant: true IFF the env is set. When set, the fork
-    // is LIVE (on_device_eligible), and (a) is what keeps the train correct.
+    // is LIVE (on_device_eligible) and the on-device tree pins to the cpu f64 anchor.
     assert_eq!(
         backend.on_device_growth_supported(),
         env_on,
         "on_device_growth_supported() must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip"
     );
 
-    // (c) the env-set fork train == the host-path train (bit-identical, Tree: PartialEq).
-    // Both learners take the host path (the fork defers via Ok(None)), so the trees are
-    // deterministically equal — proving the fork falls through safely.
-    let mut fork_learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
-        .with_features(features.clone());
-    let fork_tree = fork_learner.train(&g, &h, true).expect("fork train ok");
+    // (c) BYTE-UNCHANGED merge-gate contract: with the env UNSET the fork defers (Ok(None))
+    // and the learner's tree is bit-identical (full Tree: PartialEq) to a pure host train.
+    // (When the env is SET the fork instead takes the on-device driver, whose tree is
+    // STRUCTURE-bit-exact — not full-field-identical — to the anchor; that stronger
+    // structural assertion lives in `learner_parity_on_device_structure_gate`, so (c) is
+    // scoped to the env-unset merge gate here.)
+    if !env_on {
+        let mut fork_learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
+            .with_features(features.clone());
+        let fork_tree = fork_learner.train(&g, &h, true).expect("fork train ok");
 
-    let host_backend = CpuBackend;
-    let host_client = cpu_client();
-    let (features2, g2, h2, cfg2, nl2, md2) = corpus();
-    let mut host_learner =
-        SerialTreeLearner::new(&host_backend, &host_client, cfg2, nl2, md2).with_features(features2);
-    let host_tree = host_learner.train(&g2, &h2, true).expect("host train ok");
+        let host_backend = CpuBackend;
+        let host_client = cpu_client();
+        let (features2, g2, h2, cfg2, nl2, md2) = corpus();
+        let mut host_learner = SerialTreeLearner::new(&host_backend, &host_client, cfg2, nl2, md2)
+            .with_features(features2);
+        let host_tree = host_learner.train(&g2, &h2, true).expect("host train ok");
 
+        assert_eq!(
+            fork_tree, host_tree,
+            "env-unset fork tree must equal the host-path tree (the fork defers via Ok(None))"
+        );
+    }
+}
+
+// =========================================================================
+// 20-03b: the cpu f64 anchor + tie-aware on-device comparator, hoisted to
+// MODULE scope (default cpu build) so the ACTIVATED default-build STRUCTURE gate
+// (`learner_parity_on_device_structure_gate`) and the rocm-gated cells (via
+// `mod hip`'s `use super::*`) share ONE definition. The anchor is ALWAYS the
+// cubecl-cpu f64 single-owner fold — never a second GPU f32 path (D-07, def-f8u-01).
+// =========================================================================
+
+/// f32-accumulation envelope for LEAF VALUES (DEF-f8u-01). Structural fields are
+/// asserted BIT-EXACT; leaf values carry this ~1e-5 f32-accumulation envelope.
+const ROCM_LEAF_VALUE_TOL: f64 = 1e-5;
+
+/// C++ `#define kDefaultLeftMask (2)` (`tree.h:21`) — bit1 of `decision_type`.
+const DEFAULT_LEFT_MASK: i8 = 2;
+
+/// Relative tolerance for the `split_gain` near-tie predicate that gates a
+/// `default_left` flip (WR-03). A non-tie flip hard-fails.
+const SPLIT_GAIN_TIE_TOL: f64 = 1e-3;
+
+/// The two child row counts of internal `node`: an internal child (`>= 0`) uses
+/// `internal_count[child]`, a leaf child (`< 0`, i.e. `~leaf`) uses
+/// `leaf_count[~child]`.
+#[allow(dead_code)]
+fn child_row_counts(tree: &lgbm_model::Tree, node: usize) -> (i32, i32) {
+    let count_of = |child: i32| -> i32 {
+        if child >= 0 {
+            tree.internal_count[child as usize]
+        } else {
+            tree.leaf_count[(!child) as usize]
+        }
+    };
+    (count_of(tree.left_child[node]), count_of(tree.right_child[node]))
+}
+
+/// Shared structural + leaf-envelope body: every BIT-EXACT field EXCEPT
+/// `decision_type`, plus the per-leaf `ROCM_LEAF_VALUE_TOL` envelope.
+#[allow(dead_code)]
+fn assert_tree_structure_and_leaves(
+    candidate: &lgbm_model::Tree,
+    anchor: &lgbm_model::Tree,
+    label: &str,
+) {
+    assert_eq!(candidate.num_leaves, anchor.num_leaves, "{label} vs cpu-anchor: num_leaves");
     assert_eq!(
-        fork_tree, host_tree,
-        "env-set fork tree must equal the host-path tree (the fork defers via Ok(None))"
+        candidate.split_feature, anchor.split_feature,
+        "{label} vs cpu-anchor: split_feature"
     );
+    assert_eq!(candidate.threshold, anchor.threshold, "{label} vs cpu-anchor: threshold");
+    assert_eq!(candidate.left_child, anchor.left_child, "{label} vs cpu-anchor: left_child");
+    assert_eq!(candidate.right_child, anchor.right_child, "{label} vs cpu-anchor: right_child");
+    assert_eq!(candidate.leaf_count, anchor.leaf_count, "{label} vs cpu-anchor: leaf_count");
+    assert_eq!(
+        candidate.internal_count, anchor.internal_count,
+        "{label} vs cpu-anchor: internal_count"
+    );
+    assert_eq!(
+        candidate.leaf_value.len(),
+        anchor.leaf_value.len(),
+        "{label} vs cpu-anchor: leaf_value length"
+    );
+    let mut max_abs = 0.0f64;
+    for (i, (&gv, &av)) in candidate.leaf_value.iter().zip(anchor.leaf_value.iter()).enumerate() {
+        let d = (gv - av).abs();
+        max_abs = max_abs.max(d);
+        assert!(
+            d <= ROCM_LEAF_VALUE_TOL,
+            "{label} leaf {i}: candidate={gv} cpu_anchor={av} abs_diff={d} > \
+             {ROCM_LEAF_VALUE_TOL} (f32 leaf-accumulation envelope) — structural \
+             fields are bit-exact, so this is a real value divergence; investigate"
+        );
+    }
+    let n_leaves = candidate.leaf_value.len();
+    eprintln!(
+        "{label}: {n_leaves} leaves match cpu f64 anchor (structure bit-exact, max leaf diff {max_abs:.3e})"
+    );
+}
+
+/// Strict-decision_type comparator (used by the rocm resident/fused cells).
+#[allow(dead_code)]
+fn assert_gpu_tree_matches_cpu_anchor(
+    gpu: &lgbm_model::Tree,
+    anchor: &lgbm_model::Tree,
+    label: &str,
+) {
+    assert_tree_structure_and_leaves(gpu, anchor, label);
+    assert_eq!(gpu.decision_type, anchor.decision_type, "{label} vs cpu-anchor: decision_type");
+}
+
+/// Tie-aware on-device comparator (Plan 14-03, ODL-02 / D-04): structure BIT-EXACT,
+/// leaves within `ROCM_LEAF_VALUE_TOL`, `decision_type` strict on every bit EXCEPT
+/// `default_left` (bit1), which may flip ONLY on a genuine f32-vs-f64 `split_gain`
+/// near-tie (corroborated by an identical threshold + identical child row-counts).
+#[allow(dead_code)]
+fn assert_on_device_tree_matches_cpu_anchor(
+    on_device: &lgbm_model::Tree,
+    anchor: &lgbm_model::Tree,
+    label: &str,
+) {
+    assert_tree_structure_and_leaves(on_device, anchor, label);
+    let n_internal = anchor.decision_type.len();
+    assert_eq!(
+        on_device.decision_type.len(),
+        n_internal,
+        "{label} vs cpu-anchor: decision_type length"
+    );
+    for node in 0..n_internal {
+        let od = on_device.decision_type[node];
+        let an = anchor.decision_type[node];
+        assert_eq!(
+            od & !DEFAULT_LEFT_MASK,
+            an & !DEFAULT_LEFT_MASK,
+            "{label} node {node}: decision_type (excluding default_left bit1) diverged \
+             (on_device={od} anchor={an}) — a categorical/missing_type mismatch is a real \
+             structural divergence, not a tolerated tie"
+        );
+        if (od & DEFAULT_LEFT_MASK) != (an & DEFAULT_LEFT_MASK) {
+            let g_od = on_device.split_gain[node] as f64;
+            let g_an = anchor.split_gain[node] as f64;
+            let gain_gap = (g_od - g_an).abs();
+            let gain_scale = g_od.abs().max(g_an.abs()).max(1.0);
+            let gain_near_tie = gain_gap <= SPLIT_GAIN_TIE_TOL * gain_scale;
+            let same_threshold = on_device.threshold[node] == anchor.threshold[node];
+            let same_child_counts =
+                child_row_counts(on_device, node) == child_row_counts(anchor, node);
+            assert!(
+                gain_near_tie && same_threshold && same_child_counts,
+                "{label} node {node}: default_left flip on a NON-tie split \
+                 (on_device={od} anchor={an}; gain_gap={gain_gap:.3e} \
+                 gain_scale={gain_scale:.3e} gain_near_tie={gain_near_tie} \
+                 same_threshold={same_threshold} same_child_counts={same_child_counts}) \
+                 — a real wrong-direction divergence, NOT the tolerated f32-vs-f64 near-tie"
+            );
+            eprintln!(
+                "{label} node {node}: default_left tie accepted (split_gain within \
+                 {SPLIT_GAIN_TIE_TOL:.0e} rel-tol; threshold + child counts identical)"
+            );
+        }
+    }
+}
+
+/// Grow the deterministic cpu f64 anchor tree for `features` under the EXPLICIT
+/// `cfg` (the STRUCTURE gate passes the driver's proving config; the rocm cells
+/// pass their spine `cfg()`). The bit-exact reference the on-device tree pins to.
+#[allow(dead_code)]
+fn cpu_anchor_tree(
+    features: &[FeatureColumn],
+    g: &[f32],
+    h: &[f32],
+    cfg: GainConfig,
+    num_leaves: i32,
+    max_depth: i32,
+) -> lgbm_model::Tree {
+    let cpu_backend = lgbm_compute::CpuBackend;
+    let cpu_client = lgbm_compute::runtime::cpu_client();
+    let mut cpu_learner =
+        SerialTreeLearner::new(&cpu_backend, &cpu_client, cfg, num_leaves, max_depth)
+            .with_features(features.to_vec());
+    cpu_learner.train(g, h, true).expect("cpu anchor train ok")
+}
+
+/// ODL-18 (20-03b): the ACTIVATED default-cpu-build STRUCTURE gate. With
+/// `LGBM_CUDA_ON_DEVICE=1` it grows a REAL continuous-feature + L2 tree through the
+/// on-device driver on the cubecl-cpu runtime (`CpuBackend::grow_tree_on_device`,
+/// 20-03a's gated CpuBackend flip) and asserts it is STRUCTURE bit-exact to the cpu
+/// f64 anchor (`assert_on_device_tree_matches_cpu_anchor` over `cpu_anchor_tree`),
+/// leaf values within `ROCM_LEAF_VALUE_TOL`, default_left tie-aware. With the env
+/// UNSET (the byte-unchanged merge-gate run) the seam returns `Ok(None)` and the
+/// cell asserts exactly that — so the SAME test is green in BOTH invocations and the
+/// `-- --exact` verify proves it ran (non-vacuous). NEVER GPU-vs-GPU (def-f8u-01).
+#[test]
+fn learner_parity_on_device_structure_gate() {
+    let backend = CpuBackend;
+    let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
+    let grow_features = grow_features_of(&features);
+    // The driver pins the proving-slice config; the anchor MUST use the identical one.
+    let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let grown = backend
+        .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+        .expect("grow_tree_on_device seam ok");
+
+    if env_on {
+        let (on_device_tree, layout) =
+            grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
+        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+        assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "on-device");
+        // The returned layout partitions every row across the grown leaves.
+        assert_eq!(layout.num_data as usize, g.len(), "layout covers every row");
+        assert_eq!(
+            layout.leaf_count.iter().sum::<i32>(),
+            g.len() as i32,
+            "layout leaf_count partitions all rows"
+        );
+        assert_eq!(
+            layout.leaf_begin.len(),
+            on_device_tree.num_leaves as usize,
+            "layout has one begin per grown leaf"
+        );
+    } else {
+        assert!(
+            grown.is_none(),
+            "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
+        );
+    }
+}
+
+/// The on-device proving corpus: continuous-feature + L2, `MissingType::None`,
+/// two monotone-ish numeric columns over 12 rows growing to 4 leaves — a clean,
+/// near-tie-free structure so the STRUCTURE gate is a genuine bit-exact assertion.
+#[allow(clippy::type_complexity)]
+fn on_device_proving_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
+    let grad = vec![
+        -6.0f32, -6.0, -5.0, -5.0, -1.0, -1.0, 1.0, 1.0, 5.0, 5.0, 6.0, 6.0,
+    ];
+    let hess = vec![1.0f32; 12];
+    let f0 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], 6),
+        num_bin: 6,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 5,
+        default_bin: 6,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
+        real_feature_index: 0,
+        ..Default::default()
+    };
+    let f1 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 1, 0, 1, 2, 3, 0, 1, 2, 3, 2, 3], 4),
+        num_bin: 4,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 3,
+        default_bin: 4,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
+        real_feature_index: 1,
+        ..Default::default()
+    };
+    (vec![f0, f1], grad, hess, 4, -1)
 }
 
 #[cfg(feature = "rocm")]
@@ -2200,250 +2453,6 @@ mod hip {
         }
     }
 
-    /// f32-accumulation envelope for LEAF VALUES on the ROCm path (DEF-f8u-01 fix,
-    /// 260609-fw1). A leaf value is `-sum_grad/(sum_hess+l2)`; `sum_grad` is an
-    /// f32-atomic sum over the leaf's rows whose error is ~`sqrt(R)·ε_f32·mean|g|` ⇒
-    /// up to ~1e-5 for these leaves (R≤3000, mean|g|~5). Comparing two
-    /// independently-nondeterministic GPU f32 paths to EACH OTHER at 1e-6 was flaky
-    /// (~4/6 runs; mutual diff observed to 3.1e-6) — the 1e-6 ABSOLUTE bound is below
-    /// the genuine f32 leaf-accumulation noise floor. The fix pins both GPU trees to
-    /// the DETERMINISTIC cpu f64 anchor instead: structural fields stay BIT-EXACT (the
-    /// real tree-change detector), and leaf VALUES use this f32-aware bound. Measured
-    /// single-path-vs-f64-anchor max ~1.4–1.75e-6, so 1e-5 carries ~6× headroom. The
-    /// histogram-cell ~1e-6 GPU-vs-f64 contract is UNCHANGED (kernel_parity oracles).
-    const ROCM_LEAF_VALUE_TOL: f64 = 1e-5;
-
-    /// C++ `#define kDefaultLeftMask (2)` (`tree.h:21`) — bit1 of `decision_type`.
-    /// Mirrors the `lgbm_model` private const; named locally so the comparator can
-    /// mask it out for the strict-everything-else `decision_type` compare (D-04).
-    const DEFAULT_LEFT_MASK: i8 = 2;
-
-    /// Relative tolerance for the `split_gain` near-tie predicate that gates a
-    /// `default_left` flip (WR-03 fix — the Tree-level lift of the SplitInfo gain
-    /// near-tie at `kernel_parity.rs:1597`). A genuine f32-vs-f64 near-tie flips
-    /// the missing-value direction precisely because the two competing
-    /// missing-direction gains were within f32 rounding of each other, so the
-    /// RECORDED `split_gain` of the chosen split differs only marginally between
-    /// the on-device tree and the f64 anchor. A real wrong-direction divergence
-    /// records a materially different gain and is REJECTED. `split_gain` is the
-    /// live discriminator here because it is the one node-level field the strict
-    /// structural body does NOT force bit-equal (it is predict-irrelevant
-    /// metadata), so this guard is genuinely reachable-as-failing — unlike a
-    /// guard keyed only on threshold + child counts, which the strict body
-    /// already pins equal. Conservative scaffold default; calibrate against real
-    /// kernel output when Phase 16 makes the assert binding. Dormant in Slice 0
-    /// (host fallback == anchor → identical gains, zero flips).
-    const SPLIT_GAIN_TIE_TOL: f64 = 1e-3;
-
-    /// The two child row counts of internal `node`: an internal child (`>= 0`) uses
-    /// `internal_count[child]`, a leaf child (`< 0`, i.e. `~leaf`) uses
-    /// `leaf_count[~child]`. This is the per-node analog of the kernel_parity
-    /// `same_left_count` tie predicate (kernel_parity.rs:1597) — on a `default_left`
-    /// flip, equal child counts (with an equal threshold) prove the two branches
-    /// recorded the SAME physical split.
-    fn child_row_counts(tree: &lgbm_model::Tree, node: usize) -> (i32, i32) {
-        let count_of = |child: i32| -> i32 {
-            if child >= 0 {
-                tree.internal_count[child as usize]
-            } else {
-                tree.leaf_count[(!child) as usize]
-            }
-        };
-        (count_of(tree.left_child[node]), count_of(tree.right_child[node]))
-    }
-
-    /// Shared structural + leaf-envelope body for the two cpu-anchor comparators:
-    /// every BIT-EXACT field EXCEPT `decision_type` (which the two callers compare
-    /// differently — strict vs tie-aware on bit1), plus the per-leaf
-    /// `ROCM_LEAF_VALUE_TOL` envelope. Factored so the 8-field block is not
-    /// duplicated (Plan 14-03 Task 1).
-    fn assert_tree_structure_and_leaves(
-        candidate: &lgbm_model::Tree,
-        anchor: &lgbm_model::Tree,
-        label: &str,
-    ) {
-        assert_eq!(candidate.num_leaves, anchor.num_leaves, "{label} vs cpu-anchor: num_leaves");
-        assert_eq!(
-            candidate.split_feature, anchor.split_feature,
-            "{label} vs cpu-anchor: split_feature"
-        );
-        assert_eq!(candidate.threshold, anchor.threshold, "{label} vs cpu-anchor: threshold");
-        assert_eq!(candidate.left_child, anchor.left_child, "{label} vs cpu-anchor: left_child");
-        assert_eq!(candidate.right_child, anchor.right_child, "{label} vs cpu-anchor: right_child");
-        assert_eq!(candidate.leaf_count, anchor.leaf_count, "{label} vs cpu-anchor: leaf_count");
-        assert_eq!(
-            candidate.internal_count, anchor.internal_count,
-            "{label} vs cpu-anchor: internal_count"
-        );
-        assert_eq!(
-            candidate.leaf_value.len(),
-            anchor.leaf_value.len(),
-            "{label} vs cpu-anchor: leaf_value length"
-        );
-        let mut max_abs = 0.0f64;
-        for (i, (&gv, &av)) in candidate.leaf_value.iter().zip(anchor.leaf_value.iter()).enumerate()
-        {
-            let d = (gv - av).abs();
-            max_abs = max_abs.max(d);
-            assert!(
-                d <= ROCM_LEAF_VALUE_TOL,
-                "{label} leaf {i}: candidate={gv} cpu_anchor={av} abs_diff={d} > \
-                 {ROCM_LEAF_VALUE_TOL} (f32 leaf-accumulation envelope) — structural \
-                 fields are bit-exact, so this is a real value divergence; investigate"
-            );
-        }
-        let n_leaves = candidate.leaf_value.len();
-        eprintln!(
-            "{label}: {n_leaves} leaves match cpu f64 anchor (structure bit-exact, max leaf diff {max_abs:.3e})"
-        );
-    }
-
-    /// Assert a GPU-built tree matches the deterministic cpu f64 anchor: structural
-    /// fields BIT-EXACT (topology / split_feature / threshold / decision_type /
-    /// children / counts), leaf values within [`ROCM_LEAF_VALUE_TOL`]. `decision_type`
-    /// is compared STRICTLY here (the resident/fused GPU build is bit-exact in
-    /// decision_type); the tie-aware variant is
-    /// [`assert_on_device_tree_matches_cpu_anchor`].
-    fn assert_gpu_tree_matches_cpu_anchor(
-        gpu: &lgbm_model::Tree,
-        anchor: &lgbm_model::Tree,
-        label: &str,
-    ) {
-        assert_tree_structure_and_leaves(gpu, anchor, label);
-        assert_eq!(gpu.decision_type, anchor.decision_type, "{label} vs cpu-anchor: decision_type");
-    }
-
-    /// Tie-aware generalization of [`assert_gpu_tree_matches_cpu_anchor`] (Plan 14-03,
-    /// ODL-02 / D-04). Structure is BIT-EXACT and leaves within `ROCM_LEAF_VALUE_TOL`
-    /// (the shared body), and `decision_type` is compared with bit1 (`default_left`)
-    /// treated TIE-AWARE per internal node:
-    /// - categorical (bit0) + missing_type (bits2-3) stay STRICT — compared via
-    ///   `decision_type & !DEFAULT_LEFT_MASK` (a mismatch is a real divergence);
-    /// - a `default_left` flip is accepted ONLY on a genuine f32-vs-f64 near-tie,
-    ///   detected via the `split_gain` near-tie predicate ([`SPLIT_GAIN_TIE_TOL`]):
-    ///   a near-tie flips the missing direction because the two competing
-    ///   missing-direction gains were within f32 rounding, so the recorded
-    ///   `split_gain` differs only marginally. `split_gain` is the LIVE
-    ///   discriminator because it is the one node-level field the strict structural
-    ///   body does NOT pin bit-equal; threshold (exact f64) + child row-count
-    ///   equality are re-checked as CORROBORATING invariants (a near-tie reuses the
-    ///   physically-identical split). This lifts the per-`SplitInfo` near-tie
-    ///   acceptance at kernel_parity.rs:1597 to a per-NODE index.
-    ///
-    /// A flip whose `split_gain` gap exceeds tolerance hard-fails (a real
-    /// wrong-direction divergence stays caught — the guard is genuinely
-    /// reachable-as-failing, not tautological). The tie branch is DORMANT in
-    /// Slice 0 (no kernel yet produces a flip) but compiles and is reachable. The
-    /// on-device tree is ALWAYS pinned to the cpu f64 anchor — never a second GPU
-    /// f32 path (def-f8u-01).
-    ///
-    /// ## Anchor discipline made explicit (14-06, D-10)
-    /// This is the phase's tie-aware on-device oracle, and its discipline is a
-    /// hard invariant for every future on-device-growth slice (Phase 21):
-    /// - The reference (`anchor`) is ALWAYS the cubecl-cpu f64 single-owner fold
-    ///   ([`cpu_anchor_tree`]) — the deterministic bit-exact merge gate.
-    /// - The ONLY tolerated divergence is a `default_left` flip on a genuine
-    ///   f32-vs-f64 `split_gain` near-tie (corroborated by an identical threshold
-    ///   and identical child row-counts); everything else is asserted bit-exact.
-    /// - It NEVER compares two GPU f32 paths to each other (def-f8u-01) — both the
-    ///   resident and the fused GPU trees are each pinned to the SAME cpu anchor.
-    /// The on-device tree this oracle will eventually receive is grown from the
-    /// Phase-14 foundation that 14-06 golden-validates against the committed C++
-    /// fixtures: the shared `lgbm_compute::kernels::primitives` device primitives
-    /// (prefix-sum / reductions / argsort / percentile), the `kernels::split_info`
-    /// device split/leaf-split structs, and the `kernels::random` on-device RNG —
-    /// the same building blocks `primitive_parity.rs` cross-checks. Until Slice 1
-    /// wires a kernel, the seam stays a no-op and this oracle runs against the
-    /// host-fallback stand-in ([`host_grow`], TEST-ONLY).
-    fn assert_on_device_tree_matches_cpu_anchor(
-        on_device: &lgbm_model::Tree,
-        anchor: &lgbm_model::Tree,
-        label: &str,
-    ) {
-        assert_tree_structure_and_leaves(on_device, anchor, label);
-        // decision_type: strict on every bit EXCEPT default_left (bit1).
-        let n_internal = anchor.decision_type.len();
-        assert_eq!(
-            on_device.decision_type.len(),
-            n_internal,
-            "{label} vs cpu-anchor: decision_type length"
-        );
-        for node in 0..n_internal {
-            let od = on_device.decision_type[node];
-            let an = anchor.decision_type[node];
-            // categorical (bit0) + missing_type (bits2-3) MUST be exactly equal.
-            assert_eq!(
-                od & !DEFAULT_LEFT_MASK,
-                an & !DEFAULT_LEFT_MASK,
-                "{label} node {node}: decision_type (excluding default_left bit1) diverged \
-                 (on_device={od} anchor={an}) — a categorical/missing_type mismatch is a real \
-                 structural divergence, not a tolerated tie"
-            );
-            // default_left (bit1): accept a flip ONLY on a genuine f32-vs-f64
-            // near-tie. The LIVE discriminator is split_gain — the one node-level
-            // field the strict structural body does NOT pin bit-equal, so this
-            // guard is genuinely reachable-as-failing (WR-03 fix). A near-tie flips
-            // the missing direction because the competing gains were within f32
-            // rounding, so the recorded gain gap is marginal; a real wrong-direction
-            // divergence records a materially different gain and HARD-FAILS here.
-            // threshold + child counts are re-checked as corroborating invariants.
-            if (od & DEFAULT_LEFT_MASK) != (an & DEFAULT_LEFT_MASK) {
-                let g_od = on_device.split_gain[node] as f64;
-                let g_an = anchor.split_gain[node] as f64;
-                let gain_gap = (g_od - g_an).abs();
-                let gain_scale = g_od.abs().max(g_an.abs()).max(1.0);
-                let gain_near_tie = gain_gap <= SPLIT_GAIN_TIE_TOL * gain_scale;
-                let same_threshold = on_device.threshold[node] == anchor.threshold[node];
-                let same_child_counts =
-                    child_row_counts(on_device, node) == child_row_counts(anchor, node);
-                assert!(
-                    gain_near_tie && same_threshold && same_child_counts,
-                    "{label} node {node}: default_left flip on a NON-tie split \
-                     (on_device={od} anchor={an}; gain_gap={gain_gap:.3e} \
-                     gain_scale={gain_scale:.3e} gain_near_tie={gain_near_tie} \
-                     same_threshold={same_threshold} same_child_counts={same_child_counts}) \
-                     — a real wrong-direction divergence, NOT the tolerated f32-vs-f64 near-tie"
-                );
-                eprintln!(
-                    "{label} node {node}: default_left tie accepted (split_gain within \
-                     {SPLIT_GAIN_TIE_TOL:.0e} rel-tol; threshold + child counts identical) \
-                     — documented f32-vs-f64 near-tie (D-04)"
-                );
-            }
-        }
-    }
-
-    /// Grow the deterministic cpu f64 anchor tree for the spine corpus (the bit-exact
-    /// reference both GPU paths are pinned to).
-    fn cpu_anchor_tree(
-        features: &[FeatureColumn],
-        g: &[f32],
-        h: &[f32],
-        num_leaves: i32,
-        max_depth: i32,
-    ) -> lgbm_model::Tree {
-        let cpu_backend = lgbm_compute::CpuBackend;
-        let cpu_client = lgbm_compute::runtime::cpu_client();
-        let mut cpu_learner =
-            SerialTreeLearner::new(&cpu_backend, &cpu_client, cfg(), num_leaves, max_depth)
-                .with_features(features.to_vec());
-        cpu_learner.train(g, h, true).expect("cpu anchor train ok")
-    }
-
-    /// The D-01/D-02 host-fallback stand-in for the not-yet-existent on-device tree.
-    /// Lives in THIS TEST HARNESS ONLY — production NEVER falls back (the Plan-02
-    /// learner uses `Ok(None) ⇒ fall through`, no `unwrap_or_else(host_grow)`). It is
-    /// the same deterministic cpu f64 construction as [`cpu_anchor_tree`], so when the
-    /// Slice-0 seam returns `Ok(None)` the supplied tree trivially matches the anchor.
-    fn host_grow(
-        features: &[FeatureColumn],
-        g: &[f32],
-        h: &[f32],
-        num_leaves: i32,
-        max_depth: i32,
-    ) -> lgbm_model::Tree {
-        cpu_anchor_tree(features, g, h, num_leaves, max_depth)
-    }
 
     #[test]
     fn learner_parity_resident_equals_host_tree_on_hip() {
@@ -2531,7 +2540,7 @@ mod hip {
         // other at 1e-6 was flaky (f32 leaf-accumulation noise, mutual diff to 3.1e-6);
         // structure-vs-anchor stays BIT-EXACT and leaf values use the f32-aware
         // ROCM_LEAF_VALUE_TOL. resident==host then follows transitively (both ==anchor).
-        let anchor = cpu_anchor_tree(&features, &g, &h, num_leaves, max_depth);
+        let anchor = cpu_anchor_tree(&features, &g, &h, cfg(), num_leaves, max_depth);
         assert_gpu_tree_matches_cpu_anchor(&resident_tree, &anchor, "resident");
         assert_gpu_tree_matches_cpu_anchor(&host_tree, &anchor, "host");
     }
@@ -2598,65 +2607,59 @@ mod hip {
 
         // ---- leaf values: pin BOTH GPU trees to the deterministic cpu f64 anchor
         // (DEF-f8u-01 fix — see learner_parity_resident_equals_host_tree_on_hip).
-        let anchor = cpu_anchor_tree(&features, &g, &h, num_leaves, max_depth);
+        let anchor = cpu_anchor_tree(&features, &g, &h, cfg(), num_leaves, max_depth);
         assert_gpu_tree_matches_cpu_anchor(&fused_tree, &anchor, "fused");
         assert_gpu_tree_matches_cpu_anchor(&host_tree, &anchor, "host");
     }
 
-    /// ODL-02 / SC#3 — the LIVE D-01 host-fallback oracle. Exercises the Plan-01
-    /// `grow_tree_on_device` seam end-to-end BEFORE any on-device kernel exists: the
-    /// seam returns `Ok(None)` in Slice 0, so `unwrap_or_else` supplies the host
-    /// stand-in tree ([`host_grow`], TEST-ONLY — D-02), and the tie-aware comparator
-    /// then pins it to the deterministic cpu f64 anchor and passes GREEN. This proves
-    /// the comparator + seam signature + plumbing are all wired and reachable now.
-    /// CRITICAL (def-f8u-01): the anchor is ALWAYS the cpu f64 tree — never a second
-    /// GPU f32 path.
+    /// ODL-18 (20-03b) — the ACTIVATED on-device oracle on the ROCm backend. With
+    /// `LGBM_CUDA_ON_DEVICE=1` the `GpuBackend<R>` seam grows a REAL continuous-feature
+    /// + L2 tree on the HIP runtime via the shared driver and returns `Ok(Some(..))`;
+    /// the tie-aware comparator pins it STRUCTURE-bit-exact to the cpu f64 anchor
+    /// (never a second GPU f32 path — def-f8u-01). With the env UNSET the seam defers
+    /// (`Ok(None)`), the byte-unchanged merge-gate contract. Uses the small robust
+    /// proving corpus + the driver's proving config so the anchor matches the driver.
     #[test]
     fn learner_parity_on_device_oracle_host_fallback_slice0() {
         let backend = RocmBackend::with_resident(false);
-        let (features, g, h) = spine_corpus(3000, 8, 48);
-        let num_leaves = 31i32;
-        let max_depth = -1i32;
-
-        // D-01: obtain the on-device tree via the expanded 5-arg seam (20-03a adds
-        // the additive `&grow_features` metadata arg). The body still returns Ok(None)
-        // this plan (GpuBackend<R> explicit no-op override), so the unwrap_or_else
-        // host-fallback stand-in supplies the tree. This is the TEST's stand-in for
-        // the not-yet-existent on-device tree — never production behavior (D-02).
+        let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
+        let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
         let grow_features = grow_features_of(&features);
-        let tree = backend
-            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
-            .expect("grow_tree_on_device seam ok")
-            .map(|(t, _payload)| t)
-            .unwrap_or_else(|| host_grow(&features, &g, &h, num_leaves, max_depth));
 
-        let anchor = cpu_anchor_tree(&features, &g, &h, num_leaves, max_depth);
-        assert_on_device_tree_matches_cpu_anchor(&tree, &anchor, "slice0-host-fallback");
+        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+        let grown = backend
+            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+            .expect("grow_tree_on_device seam ok");
+        if env_on {
+            let (on_device_tree, _payload) =
+                grown.expect("with LGBM_CUDA_ON_DEVICE=1 the ROCm seam must grow (Ok(Some))");
+            let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+            assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "rocm-on-device");
+        } else {
+            assert!(
+                grown.is_none(),
+                "with LGBM_CUDA_ON_DEVICE unset the ROCm seam MUST defer (Ok(None))"
+            );
+        }
     }
 
-    /// SC#2 / ODL-01 — the Plan-01 seam is a PROVABLE no-op so the default route is
-    /// untouched. On BOTH `CpuBackend` and a `GpuBackend` (`RocmBackend`):
-    /// (a) the `on_device_growth_supported()` discriminator is `false` (Slice 0, no
-    ///     kernel — Pitfall 2), and
-    /// (b) a direct `grow_tree_on_device(..)` returns `Ok(None)`.
-    /// The `GpuBackend<R>` `Ok(None)` is its EXPLICIT no-op override (not merely
-    /// inherited) — the proof the production fork's `Some`-branch is genuinely
-    /// unexercised until Slice 1. No env var is set, so no FORCE_ENV_LOCK is needed.
+    /// ODL-18 (20-03b) — the seam is a GATED activation, byte-unchanged with the env
+    /// unset. On BOTH `CpuBackend` and a `GpuBackend` (`RocmBackend`):
+    /// (a) `on_device_growth_supported()` == `(LGBM_CUDA_ON_DEVICE == "1")` (gated
+    ///     flip), and
+    /// (b) `grow_tree_on_device(..)` returns `Ok(Some)` IFF the env is set (else
+    ///     `Ok(None)`); when set, the grown tree is STRUCTURE-bit-exact to the cpu f64
+    ///     anchor (the driver's proving config) on BOTH backends.
     #[test]
     fn learner_parity_on_device_seam_is_provable_noop_slice0() {
-        let (features, g, h) = spine_corpus(256, 4, 16);
-        let num_leaves = 7i32;
-        let max_depth = -1i32;
+        let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
+        let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
         let grow_features = grow_features_of(&features);
 
         let cpu_backend = CpuBackend;
         let gpu_backend = RocmBackend::with_resident(false);
 
-        // (a) GATED discriminator invariant (20-03a flipped it behind
-        // `cuda_on_device_enabled()`): `on_device_growth_supported()` must equal
-        // `(LGBM_CUDA_ON_DEVICE == "1")` on BOTH backends. When the env is unset (the
-        // byte-unchanged merge-gate contract) both are false, so the learner's
-        // eligibility AND-gate is dead and the host path is untouched.
+        // (a) GATED discriminator invariant on BOTH backends.
         let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
         assert_eq!(
             cpu_backend.on_device_growth_supported(),
@@ -2670,24 +2673,29 @@ mod hip {
              (one generic GpuBackend<R> impl shared by ROCm/CUDA/WGPU)"
         );
 
-        // (b) the expanded 5-arg seam still DEFERS (Ok(None)) on both this plan —
-        // CpuBackend via the trait default, GpuBackend<R> via its explicit override.
-        // The body is not wired until 20-03b; 20-03b retires this Ok(None) assertion
-        // when it activates the driver.
-        assert!(
-            matches!(
-                cpu_backend.grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth),
-                Ok(None)
-            ),
-            "CpuBackend grow_tree_on_device must still defer (Ok(None)) in 20-03a"
-        );
-        assert!(
-            matches!(
-                gpu_backend.grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth),
-                Ok(None)
-            ),
-            "GpuBackend grow_tree_on_device explicit override must still defer (Ok(None)) \
-             in 20-03a — proves the default route is provably untouched"
-        );
+        // (b) the seam grows (Ok(Some)) IFF the env is set — else defers (Ok(None)),
+        // the byte-unchanged merge-gate contract. When set, both backends' trees pin
+        // STRUCTURE-bit-exact to the SAME cpu f64 anchor (never GPU-vs-GPU).
+        let cpu_grown = cpu_backend
+            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+            .expect("CpuBackend grow_tree_on_device seam ok");
+        let gpu_grown = gpu_backend
+            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+            .expect("GpuBackend grow_tree_on_device seam ok");
+        assert_eq!(cpu_grown.is_some(), env_on, "CpuBackend seam grows IFF env set");
+        assert_eq!(gpu_grown.is_some(), env_on, "GpuBackend seam grows IFF env set");
+        if env_on {
+            let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+            assert_on_device_tree_matches_cpu_anchor(
+                &cpu_grown.unwrap().0,
+                &anchor,
+                "cpu-on-device",
+            );
+            assert_on_device_tree_matches_cpu_anchor(
+                &gpu_grown.unwrap().0,
+                &anchor,
+                "rocm-on-device",
+            );
+        }
     }
 }
