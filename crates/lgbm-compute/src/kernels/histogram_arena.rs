@@ -196,12 +196,22 @@ impl<R: cubecl::Runtime> HistArena<R> {
     }
 
     /// The device `Handle` for the parent slot (clone — no allocation).
+    ///
+    /// IN-04: the single-triple role handles
+    /// ([`Self::parent_handle`]/[`Self::smaller_handle`]/[`Self::larger_handle`])
+    /// reflect only the MOST RECENT [`Self::rotate`]. They are the 2-leaf
+    /// subtraction-trick API; in the multi-leaf [`Self::swap`] loop they are
+    /// UNDEFINED (they record only the last swap) — use [`Self::leaf_handle`] to
+    /// address a specific leaf's slot.
     #[must_use]
     pub fn parent_handle(&self) -> Handle {
         self.slots[self.parent_idx].clone()
     }
 
     /// The device `Handle` for the smaller-child slot (clone — no allocation).
+    ///
+    /// IN-04: valid only after [`Self::rotate`]; UNDEFINED after multi-leaf
+    /// [`Self::swap`] (see [`Self::parent_handle`]).
     #[must_use]
     pub fn smaller_handle(&self) -> Handle {
         self.slots[self.smaller_idx].clone()
@@ -211,7 +221,8 @@ impl<R: cubecl::Runtime> HistArena<R> {
     ///
     /// After [`Self::rotate`] this is the SAME slot as [`Self::parent_handle`]
     /// (`larger_idx == parent_idx`): the larger child is derived in-place in the
-    /// parent's buffer (D-02 / §17).
+    /// parent's buffer (D-02 / §17). IN-04: valid only after [`Self::rotate`];
+    /// UNDEFINED after multi-leaf [`Self::swap`] (see [`Self::parent_handle`]).
     #[must_use]
     pub fn larger_handle(&self) -> Handle {
         self.slots[self.larger_idx].clone()
@@ -413,8 +424,12 @@ impl<R: cubecl::Runtime> HistArena<R> {
         if parent_leaf != larger_leaf && parent_leaf != smaller_leaf {
             self.leaf_to_slot.remove(&parent_leaf);
         }
-        // Track the roles so `parent_handle`/`smaller_handle`/`larger_handle` and the
-        // allocation-frozen invariant stay consistent with `rotate()`.
+        // IN-04: these single-triple role fields track only THIS swap, so after a
+        // multi-leaf swap loop `parent_handle`/`smaller_handle`/`larger_handle` are
+        // UNDEFINED (they reflect only the last swap) — only `leaf_handle(leaf)` is
+        // meaningful in the multi-leaf API. They are updated here solely to keep the
+        // allocation-frozen invariant consistent with `rotate()`; callers mixing the
+        // two APIs must NOT read the role handles after `swap`.
         self.parent_idx = parent_slot;
         self.larger_idx = parent_slot;
         self.smaller_idx = fresh;
