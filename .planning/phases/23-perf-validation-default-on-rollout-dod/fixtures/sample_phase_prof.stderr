@@ -1,0 +1,7 @@
+[LightGBM] [Info] Number of positive: 250000, number of negative: 250000
+[phase_prof:train] LOOP: train_one_iter=41.203ms (grad=1.100 learner=38.900 score=0.900 snapshot=0.300 in_iter_other=0.003) metric=0.500ms feature_infos_setup=2.100ms
+[phase_prof:train] COUNTS: device_launches=8570 (build_resident=2890 subtract_resident=2790 scan_resident=2890 fused=0 on_device=0) | scan_roundtrips(syncs)=2890
+--- ON-DEVICE ARM (LGBM_CUDA_ON_DEVICE=1) ---
+[LightGBM] [Info] Number of positive: 250000, number of negative: 250000
+[phase_prof:train] LOOP: train_one_iter=28.417ms (grad=1.100 learner=26.100 score=0.900 snapshot=0.300 in_iter_other=0.017) metric=0.500ms feature_infos_setup=2.100ms
+[phase_prof:train] COUNTS: device_launches=2900 (build_resident=0 subtract_resident=0 scan_resident=0 fused=0 on_device=2900) | scan_roundtrips(syncs)=0
