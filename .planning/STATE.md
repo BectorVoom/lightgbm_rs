@@ -5,9 +5,8 @@ milestone_name: — CUDA On-Device Training Backend
 current_phase: 22
 status: completed
 stopped_at: Phase 22 context gathered
-last_updated: "2026-07-02T10:19:05.484Z"
+last_updated: "2026-07-02T10:24:55.594Z"
 last_activity: 2026-07-02
-last_activity_desc: Phase 22 marked complete
 progress:
   total_phases: 10
   completed_phases: 9
@@ -32,7 +31,7 @@ Phase: 22 — COMPLETE
 Plan: 5 of 5
 Status: Phase 22 complete
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-02 — Phase 22 marked complete
+Last activity: 2026-07-02
 
 Next: `/gsd-plan-phase 14`
 
