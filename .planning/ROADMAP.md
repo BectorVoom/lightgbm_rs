@@ -83,7 +83,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 - [x] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict. (completed 2026-07-01)
 - [x] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned. (completed 2026-07-01)
 - [x] **Phase 20: On-Device Score Updater & Metrics (+ pulled-forward on-device driver, D-01)** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host; PLUS the pulled-forward end-to-end on-device grow loop (ODL-18/19) with STRUCTURE bit-exact gate. (5 plans) (completed 2026-07-02)
-- [ ] **Phase 21: Hardening/Slack (was End-to-End Driver — absorbed into Phase 20 per D-01)** — ODL-18/19 moved into Phase 20; Phase 21 reduces to hardening or folds into 22/23. Re-cut via `/gsd-phase` before planning.
+- [ ] **Phase 21: Harden the On-Device Driver (parity corpus + WR-01 confirmation + bookkeeping)** — ODL-18/19 delivered in Phase 20 per D-01; Phase 21 confirms the WR-01 `HistArena::swap` fix, broadens the targeted STRUCTURE parity corpus (cpu-f64-anchored), and reconciles the ODL-18/19 → ODL-18H bookkeeping. (ODL-18H)
 - [ ] **Phase 22: On-Device Categorical Splits (Feature Coverage)** — Bitset construction + categorical split eval + categorical partition + SplitCategorical, via the pre-allocated bitset.
 - [ ] **Phase 23: Perf-Validation + Default-On Rollout (DoD)** — Kaggle A/B (`device_launches` + wall-clock ratio); flip default-ON for CUDA contingent on parity + not-slower; host fallback retained.
 
@@ -286,17 +286,18 @@ Plans:
 
 **Notes**: Small kernel subsystems (§11 = 45 lines, §12 = 78 lines) but D-01 pulled Phase 21's full on-device grow loop (ODL-18/19) forward, making this a large, higher-risk end-to-end phase. The boosting-layer glue keeps the score resident across iterations (`boosting_on_cuda_`). The 12 pointwise losses are all regression/binary; everything else stays host-side per the reference's own `#ifdef USE_CUDA` branch. Anchored to the cpu f64 fold (never GPU-vs-GPU). Pitfalls at plan time: only 8/12 metric goldens existed (Wave 0 captures 4); `GpuBackend<R>` is one shared impl (gate the flip behind `cuda_on_device_enabled()` so ROCm-env-unset stays false); data→leaf map alias-vs-double-buffer resolved in 20-03a. **Replan (2026-07-02):** the original 20-03 was BLOCKED — a 2-file lgbm-compute-only scope could not deliver a bit-exact grow loop (grow_tree_on_device carried no feature metadata; LeafSplits/HistogramPool are lgbm-treelearner types unnameable from lgbm-compute → crate cycle; the verify cmd omitted `--features rocm` so the hip cell passed vacuously). Resolution (Option A, honors D-01): keep the driver body in lgbm-compute, add an additive `GrowFeature` metadata struct (BinColumn + lgbm-dataset BinType/MissingType — the kernels already consume `FeatureMeta`/`BinColumn`, never FeatureColumn) and a purpose-built native orchestration with its own bookkeeping; split into 20-03a (safe plumbing, byte-unchanged, verifiable now) + 20-03b (bit-exact body + STRUCTURE gate). The STRUCTURE gate runs on the cubecl-cpu runtime in the DEFAULT merge-gate lane (gated CpuBackend flip), non-vacuous without rocm hardware.
 
-#### Phase 21: End-to-End On-Device Driver Integration + Parity Gate
+#### Phase 21: Harden the On-Device Driver (parity corpus + WR-01 confirmation + bookkeeping)
 
-**Goal**: The single-GPU tree-learner driver orchestrates the full per-leaf grow loop end-to-end on device and reconstitutes into the `(Tree, DataPartition)` the boosting loop consumes — structure bit-exact to the cpu f64 anchor, with the no-f64-per-row kernel constraint verified across every new kernel.
-**Depends on**: Phase 18 (grow-loop chain) + Phase 19 (objectives) + Phase 20 (score/metrics)
-**Requirements**: ODL-18, ODL-19
+**Goal**: Harden the just-landed on-device grow loop on the continuous-feature slice — confirm the WR-01 `HistArena::swap` free-slot fix, broaden the STRUCTURE parity evidence with a small targeted set of risk cases (deep >2-live-leaf, no-split break, min-data/min-hessian-constrained) each pinned to the cpu f64 anchor, and reconcile the ODL-18/19 requirement/ROADMAP bookkeeping. **No driver re-implementation** — the end-to-end on-device driver (ODL-18/19) was delivered by Phase 20 per D-01.
+**Depends on**: Phase 18 (grow-loop chain) + Phase 19 (objectives) + Phase 20 (on-device driver, score/metrics)
+**Requirements**: ODL-18H *(ODL-18 and ODL-19 delivered in Phase 20 per D-01 — 20-VERIFICATION.md 6/6)*
 **Success Criteria** (what must be TRUE):
 
-  1. With `LGBM_CUDA_ON_DEVICE=1`, the on-device driver runs root init → build/subtract → best-split → tree split → partition, repeated up to `num_leaves−1` (break on `best_leaf == −1`), entirely on device, and reconstitutes into a valid `(Tree, DataPartition)` the boosting loop consumes (the continuous-feature path is the proving slice). (§6, §16)
-  2. The grown tree is STRUCTURE **bit-exact** to the cpu f64 anchor (tie-aware `default_left`), leaf values within ~1e-5 — never comparing two nondeterministic GPU f32 paths to each other.
-  3. Every new kernel keeps **f32 + the u64 fixed-point build with NO f64 per-row hot loops** (verified by grep + per-tree-ms, not a 6× sweep; the measured 5.4× consumer-NVIDIA f64 regression, spike-052); f64 only in scalar/gain math where the reference uses it. (§17)
-  4. CPU / ROCm / existing-host-CUDA paths are **byte-unchanged** with `LGBM_CUDA_ON_DEVICE` unset — the hard merge gate is green and unchanged. (§17)
+  1. The three targeted STRUCTURE gates (deep >2-live-leaf, no-split break, min-data/min-hessian-constrained) are **bit-exact** to the cpu f64 anchor (tie-aware `default_left`, leaves within ~1e-5) on the cubecl-cpu **default** merge-gate lane, non-vacuous under `LGBM_CUDA_ON_DEVICE=1`.
+  2. WR-01 is **confirmed closed** (fix landed Phase 18, commit `c9a7fd1`) with the repro + exhaustion tests green, documented as unit-test-locked: the live driver keeps per-leaf `Vec<f64>` row lists and does **not** consume `HistArena`, so the swap-aliasing scenario lives only in the arena unit test — not the grow loop.
+  3. An additive `grow_tree_on_device_driver_with_cfg` seam exists with the `Backend::grow_tree_on_device` trait seam untouched.
+  4. The `LGBM_CUDA_ON_DEVICE`-unset workspace stays **byte-unchanged** green — the hard merge gate is unchanged. (§17)
+  5. REQUIREMENTS.md / ROADMAP bookkeeping is reconciled (ODL-18/19 Complete under Phase 20; ODL-18H the new Phase-21 requirement).
 
 **Plans**: 1/3 plans executed
 
@@ -304,7 +305,7 @@ Plans:
 - [ ] 21-02-PLAN.md — targeted STRUCTURE parity corpus: deep >2-live-leaf, no-split break, min-data/min-hessian-constrained cases, cpu-f64-anchored (ODL-18H)
 - [ ] 21-03-PLAN.md — D-05 bookkeeping: mark ODL-18/19 Complete (Phase 20), add ODL-18H, re-cut this Phase 21 body (ODL-18, ODL-19, ODL-18H)
 
-**Notes**: The integration phase that ties the resident loop together. Highest-uncertainty for the *magnitude* of the win (the best-first loop still serializes per split) — but parity is the gate, not speed (speed is Phase 23's DoD). Verify at plan time: cubecl 0.10 `Handle` in-place aliasing vs ping-pong double-buffering for the data→leaf map; batched `client.read(vec![h])` readback semantics on cubecl-cuda.
+**Notes**: A parity-hardening re-cut — the end-to-end driver itself was pulled forward into Phase 20 (D-01), so this phase confirms + broadens rather than builds. Parity is the gate, not speed. **Out of scope:** on-device categorical splits → Phase 22 (ODL-22); perf-validation / default-ON rollout DoD → Phase 23 (ODL-20/21). **Resolved open question** (the old Phase-20/21 Notes flag): the data→leaf `Handle` in-place-aliasing vs ping-pong question is **MOOT** for the live driver — it carries host per-leaf rows and rebuilds `LeafPartitionLayout` at the end, so there is no running data→leaf device buffer in the grow loop (double-buffer was locked in 20-03a regardless); batched `client.read(vec![h])` readback is a **Phase-23 perf** concern only. **Neither affects the Phase-21 parity gate.**
 
 #### Phase 22: On-Device Categorical Splits (Feature Coverage)
 
