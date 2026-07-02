@@ -78,3 +78,13 @@ pub mod objective_regression;
 // per D-08) so the default cpu f64 anchor exercises them.
 pub mod metric_pointwise;
 pub mod score_updater;
+// Phase-20 on-device tree-growth driver seam (ODL-18/ODL-19): the additive
+// `GrowFeature` feature/bin metadata carrier the per-leaf grow loop consumes,
+// expressed in ONLY lgbm-compute-reachable types (BinColumn + lgbm-dataset
+// BinType/MissingType + primitives — NEVER an lgbm-treelearner type, which would
+// form the treelearner→compute→treelearner crate cycle this replan avoids).
+// The `grow_tree_on_device` driver BODY stays `Ok(None)` (20-03a plumbing slice);
+// the per-leaf orchestration lands in 20-03b. Ungated like the other Phase-14..19
+// kernel modules (NOT `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor
+// exercises the plumbing (D-08).
+pub mod grow_driver;

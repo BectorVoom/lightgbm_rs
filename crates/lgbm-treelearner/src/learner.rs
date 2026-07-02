@@ -712,9 +712,34 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // learner. On `Ok(None)` execution falls through UNCHANGED into the resident/host
         // path below.
         if self.on_device_eligible {
+            // Build the ADDITIVE `Vec<GrowFeature>` field-by-field from the spine's
+            // `FeatureColumn`s (ODL-18, D-01/Option A). `GrowFeature` is the
+            // lgbm-compute-local mirror over BinColumn + lgbm-dataset BinType/
+            // MissingType — never a treelearner type crossing the seam (no crate
+            // cycle). This build is inside the `on_device_eligible` block, so with
+            // `LGBM_CUDA_ON_DEVICE` unset it is DEAD (never allocated) and the host
+            // path below is byte-identical to master.
+            let grow_features: Vec<lgbm_compute::GrowFeature> = self
+                .features
+                .iter()
+                .map(|f| lgbm_compute::GrowFeature {
+                    bins: f.bins.clone(),
+                    num_bin: f.num_bin,
+                    offset: f.offset,
+                    min_bin: f.min_bin,
+                    max_bin: f.max_bin,
+                    default_bin: f.default_bin,
+                    most_freq_bin: f.most_freq_bin,
+                    missing_type: f.missing_type,
+                    bin_upper_bound: f.bin_upper_bound.clone(),
+                    real_feature_index: f.real_feature_index,
+                    bin_type: f.bin_type,
+                })
+                .collect();
             if let Some((tree, payload)) = self.backend.grow_tree_on_device(
                 gradients,
                 hessians,
+                &grow_features,
                 self.num_leaves,
                 self.max_depth,
             )? {

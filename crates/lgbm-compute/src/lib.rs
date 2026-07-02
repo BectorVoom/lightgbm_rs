@@ -22,6 +22,7 @@ pub mod runtime;
 pub use device_objective::{device_objective_supported, DeviceObjectiveKind};
 pub use error::ComputeError;
 pub use gain::{GainConfig, SplitInfo};
+pub use kernels::grow_driver::GrowFeature;
 pub use kernels::split::BatchedSplitFeature;
 
 use cubecl::prelude::ComputeClient;
@@ -1231,14 +1232,20 @@ pub trait Backend {
     // is Slice 1; the learner fork that consumes the seam is Plan 02.
     // ===================================================================
 
-    /// Whether this backend can grow an entire tree ON-DEVICE (ODL-01).
+    /// Whether this backend can grow an entire tree ON-DEVICE (ODL-01/ODL-19).
     ///
-    /// `false` (the default, mirroring [`resident_pool_supported`](Backend::resident_pool_supported))
-    /// means the learner's on-device eligibility gate (Plan 02) ANDs this in and
-    /// ALWAYS takes the byte-unchanged host/per-leaf path. [`CpuBackend`] inherits
-    /// the default. In Slice 0 `GpuBackend<R>` ALSO keeps `false`: that one generic
-    /// impl is shared by ROCm/CUDA/WGPU, so a `true` here would (wrongly) claim all
-    /// three support it — and no on-device kernel exists yet (activation is Slice 1).
+    /// The trait DEFAULT is `false` (a hypothetical future backend opts out until it
+    /// wires the driver). [`CpuBackend`] and `GpuBackend<R>` OVERRIDE this in 20-03a
+    /// to return [`cuda_on_device_enabled`] — GATED, not a bare `true` (Pitfall 2,
+    /// D-09): with `LGBM_CUDA_ON_DEVICE` unset every backend reports `false`, so the
+    /// learner's on-device eligibility gate ANDs this in and ALWAYS takes the
+    /// byte-unchanged host/per-leaf path (the hard merge gate stays byte-identical).
+    /// Extending the gated flip to `CpuBackend` is deliberate: the 20-03b STRUCTURE
+    /// gate must grow the on-device tree on the cubecl-cpu runtime so it runs in the
+    /// DEFAULT merge gate (the cpu-f64 anchor lane), not behind rocm hardware — the
+    /// env gate keeps the env-unset merge gate byte-unchanged either way. This plan
+    /// the driver body still returns `Ok(None)`, so even with the env SET the fork
+    /// safely falls through to the byte-identical host path (output still correct).
     fn on_device_growth_supported(&self) -> bool {
         false
     }
@@ -1250,10 +1257,12 @@ pub trait Backend {
     /// `Err(NotSupported)`: D-03 keeps the default route error-noise-free, so an
     /// unsupported backend is a quiet `None`, not an error the learner must filter.
     ///
-    /// The args (`gradients`, `hessians`, `num_leaves`, `max_depth`) are the
-    /// forward-looking MINIMUM the learner already holds at the `train_inner` fork
-    /// point. Richer feature/bin inputs (the binned store, per-feature metadata)
-    /// arrive in Slice 1 as ADDITIVE parameters; this signature does not lock them out.
+    /// The args are what the learner holds at the `train_inner` fork point:
+    /// `gradients`, `hessians`, the ADDITIVE `features` metadata slice
+    /// ([`GrowFeature`] — the per-feature bin layout the grow loop reads, expressed
+    /// in ONLY lgbm-compute-reachable types so no crate cycle is introduced,
+    /// D-01/Option A), `num_leaves`, and `max_depth`. The per-leaf orchestration
+    /// BODY that consumes `features` lands in 20-03b; this plan keeps `Ok(None)`.
     ///
     /// The return type names ONLY lgbm-compute-reachable crates
     /// (`lgbm_model::Tree` + `lgbm_dataset::LeafPartitionLayout`). It MUST NOT name
@@ -1286,6 +1295,7 @@ pub trait Backend {
         &self,
         _gradients: &[f32],
         _hessians: &[f32],
+        _features: &[GrowFeature],
         _num_leaves: i32,
         _max_depth: i32,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
@@ -1336,6 +1346,18 @@ pub struct CpuBackend;
 #[cfg(feature = "cpu")]
 impl Backend for CpuBackend {
     type Runtime = runtime::ActiveRuntime;
+
+    // ODL-19 (Phase 20, 20-03a): GATED on-device-growth discriminator. Returns
+    // [`cuda_on_device_enabled`] — `false` when `LGBM_CUDA_ON_DEVICE` is unset, so
+    // the learner's eligibility AND-gate is dead and the byte-unchanged host/per-leaf
+    // cpu-f64 anchor path runs (the hard merge gate). The gated flip lands on
+    // CpuBackend (not only GpuBackend) so the 20-03b STRUCTURE gate grows the
+    // on-device tree on the cubecl-cpu runtime, INSIDE the default merge gate. The
+    // `grow_tree_on_device` body still returns `Ok(None)` this plan (trait default),
+    // so even with the env SET the fork falls through to the byte-identical host path.
+    fn on_device_growth_supported(&self) -> bool {
+        cuda_on_device_enabled()
+    }
 
     fn construct_histograms(
         &self,
@@ -2230,16 +2252,27 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
     }
 
-    // ODL-01 (Phase 14 Slice 0): explicit no-op override of the on-device
-    // tree-growth seam. `on_device_growth_supported` keeps the trait default
-    // `false` here (one generic GpuBackend<R> impl shared by ROCm/CUDA/WGPU — a
-    // `true` would claim all three; no kernel exists until Slice 1), and this
-    // override returns `Ok(None)` to PROVE (SC#2) the default tree path is
-    // provably untouched on the GPU backend, not merely inherited-by-default.
+    // ODL-19 (Phase 20, 20-03a): GATED on-device-growth discriminator, mirroring
+    // CpuBackend. Returns [`cuda_on_device_enabled`] — `false` when
+    // `LGBM_CUDA_ON_DEVICE` is unset, so the ROCm/CUDA/WGPU host path is
+    // byte-unchanged (Pitfall 2, D-09). One generic GpuBackend<R> impl is shared by
+    // ROCm/CUDA/WGPU; the env gate (not a per-runtime `true`) is what keeps the flip
+    // safe until 20-03b wires the driver body (which still returns `Ok(None)` here).
+    fn on_device_growth_supported(&self) -> bool {
+        cuda_on_device_enabled()
+    }
+
+    // ODL-01 (Phase 14 Slice 0) / ODL-18 (Phase 20, 20-03a): explicit no-op override
+    // of the on-device tree-growth seam, now carrying the ADDITIVE `features`
+    // metadata slice. The BODY still returns `Ok(None)` (the per-leaf driver lands in
+    // 20-03b) to PROVE (SC#2) the default tree path is provably untouched on the GPU
+    // backend — so even with the env SET the learner fork falls through to the host
+    // path. The override is retained (not inherited) as that explicit proof.
     fn grow_tree_on_device(
         &self,
         _gradients: &[f32],
         _hessians: &[f32],
+        _features: &[GrowFeature],
         _num_leaves: i32,
         _max_depth: i32,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
