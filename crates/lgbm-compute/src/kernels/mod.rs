@@ -88,3 +88,15 @@ pub mod score_updater;
 // kernel modules (NOT `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor
 // exercises the plumbing (D-08).
 pub mod grow_driver;
+// Phase-22 on-device categorical splits (ODL-22): the §6.3 bitset construction
+// (`construct_bitset` + `set_real_threshold` two-bitset producer) and the §8.1
+// categorical split evaluator (one-hot + many-vs-many, D-02) — a byte-for-byte
+// transcription of the golden-proven host `feature_histogram_categorical`
+// (`lgbm-treelearner`, which CANNOT be imported: crate cycle, memory
+// `on-device-driver-crate-cycle-constraint`). Single-owner `CubeDim::new_1d(1)`
+// f64 anchor (def-f8u-01); the many-vs-many ctr sort reuses
+// `primitives::bitonic_argsort_on`. Ungated like the other Phase-14..21 kernel
+// modules (NOT `#[cfg(feature = "gpu")]`) so the default cpu f64 anchor exercises
+// it. This module produces the split decision + winner bitsets only; wiring into
+// the grow driver is 22-04.
+pub mod categorical_split;
