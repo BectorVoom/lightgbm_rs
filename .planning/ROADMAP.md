@@ -298,10 +298,12 @@ Plans:
   3. Every new kernel keeps **f32 + the u64 fixed-point build with NO f64 per-row hot loops** (verified by grep + per-tree-ms, not a 6× sweep; the measured 5.4× consumer-NVIDIA f64 regression, spike-052); f64 only in scalar/gain math where the reference uses it. (§17)
   4. CPU / ROCm / existing-host-CUDA paths are **byte-unchanged** with `LGBM_CUDA_ON_DEVICE` unset — the hard merge gate is green and unchanged. (§17)
 
-**Plans**: 3 plans
-- [ ] 21-01-PLAN.md — lgbm-compute hardening: WR-01 HistArena::swap fix confirmation + additive `grow_tree_on_device_driver_with_cfg` (ODL-18H)
+**Plans**: 1/3 plans executed
+
+- [x] 21-01-PLAN.md — lgbm-compute hardening: WR-01 HistArena::swap fix confirmation + additive `grow_tree_on_device_driver_with_cfg` (ODL-18H)
 - [ ] 21-02-PLAN.md — targeted STRUCTURE parity corpus: deep >2-live-leaf, no-split break, min-data/min-hessian-constrained cases, cpu-f64-anchored (ODL-18H)
 - [ ] 21-03-PLAN.md — D-05 bookkeeping: mark ODL-18/19 Complete (Phase 20), add ODL-18H, re-cut this Phase 21 body (ODL-18, ODL-19, ODL-18H)
+
 **Notes**: The integration phase that ties the resident loop together. Highest-uncertainty for the *magnitude* of the win (the best-first loop still serializes per split) — but parity is the gate, not speed (speed is Phase 23's DoD). Verify at plan time: cubecl 0.10 `Handle` in-place aliasing vs ping-pong double-buffering for the data→leaf map; batched `client.read(vec![h])` readback semantics on cubecl-cuda.
 
 #### Phase 22: On-Device Categorical Splits (Feature Coverage)
@@ -345,6 +347,6 @@ Plans:
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
 | 19. On-Device Objectives | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
-| 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
+| 21. End-to-End Driver Integration + Parity Gate | v1.1 | 1/3 | In Progress|  |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
 | 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/? | Not started | - |

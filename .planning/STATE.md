@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
-current_phase: 20
-status: completed
+current_phase: 21
+current_phase_name: end-to-end-on-device-driver-integration-parity-gate
+status: executing
 stopped_at: Phase 21 context gathered (re-cut to hardening)
-last_updated: "2026-07-02T06:00:31.608Z"
+last_updated: "2026-07-02T06:47:29.639Z"
 last_activity: 2026-07-02
-last_activity_desc: Phase 20 marked complete
+last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 10
   completed_phases: 7
-  total_plans: 36
-  completed_plans: 36
+  total_plans: 39
+  completed_plans: 37
   percent: 70
-current_phase_name: on-device-score-updater-metrics
 ---
 
 # Project State
@@ -24,15 +24,15 @@ current_phase_name: on-device-score-updater-metrics
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 20 — on-device-score-updater-metrics
+**Current focus:** Phase 21 — end-to-end-on-device-driver-integration-parity-gate
 
 ## Current Position
 
-Phase: 20 — COMPLETE
-Plan: 4 of 5
-Status: Phase 20 complete
+Phase: 21 (end-to-end-on-device-driver-integration-parity-gate) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-02 — Phase 20 marked complete
+Last activity: 2026-07-02 — Phase 21 execution started
 
 Next: `/gsd-plan-phase 14`
 
@@ -582,6 +582,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 19 P04 | 20min | 2 tasks | 2 files |
 | Phase 20 P00 | 18 | 2 tasks | 19 files |
 | Phase 20 P01 | 30 | 2 tasks | 3 files |
+| Phase 21 P01 | 15m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -691,6 +692,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 19-04: ranking kernels are single-owner deterministic f64 folds; CUDA atomicAdd_block layout documented as GPU f32 mirror residual (D-05)
 - [Phase ?]: 19-04: device replicates the 1M-bin sigmoid table lookup (not direct-exp) to match the rank.rs-derived lambdarank_gh golden within ORACLE_TOL
 - [Phase ?]: 20-01: §11 on-device score updater — AddScoreConstant/MultiplyScoreConstant #[cube] kernels over resident Array<f64> at offset=num_data*tree_id; per-leaf AddScore delegates to Phase-18 add_prediction_to_score_on_device (D-02); boosting_on_cuda_ host-mirror toggle OFF by default (D-09), bit-exact to host ScoreUpdater on cpu anchor
+- [Phase ?]: 21-01: WR-01 confirmed (not rebuilt) — live driver uses per-leaf Vec<f64>, never HistArena
+- [Phase ?]: 21-01: GainConfig threaded via additive _with_cfg variant, trait seam byte-unchanged
 
 ### Pending Todos
 
