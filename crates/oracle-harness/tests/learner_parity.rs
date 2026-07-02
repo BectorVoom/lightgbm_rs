@@ -1979,7 +1979,10 @@ fn learner_parity_cegb_coupled() {
 /// field-by-field from the spine's `FeatureColumn`s (mirrors learner.rs). Shared by
 /// the default-cpu seam-defers cell and the migrated rocm Slice-0 cells (via
 /// `mod hip`'s `use super::*`).
-fn grow_features_of(features: &[FeatureColumn]) -> Vec<lgbm_compute::GrowFeature> {
+fn grow_features_of(
+    features: &[FeatureColumn],
+    cfg: &GainConfig,
+) -> Vec<lgbm_compute::GrowFeature> {
     features
         .iter()
         .map(|f| lgbm_compute::GrowFeature {
@@ -1994,6 +1997,17 @@ fn grow_features_of(features: &[FeatureColumn]) -> Vec<lgbm_compute::GrowFeature
             bin_upper_bound: f.bin_upper_bound.clone(),
             real_feature_index: f.real_feature_index,
             bin_type: f.bin_type,
+            // Phase-22 additive categorical metadata (inert until 22-04 wires the
+            // categorical grow branch). `bin_to_category` is empty for numeric
+            // features and populated from `cat_corpus` for categorical ones; the
+            // five scalars come from the harness's `cfg` (the config `cat_corpus`
+            // fills from its sidecar). Numeric structure gate stays byte-unchanged.
+            bin_to_category: f.bin_to_category.clone(),
+            cat_smooth: cfg.cat_smooth,
+            cat_l2: cfg.cat_l2,
+            max_cat_threshold: cfg.max_cat_threshold,
+            max_cat_to_onehot: cfg.max_cat_to_onehot,
+            min_data_per_group: cfg.min_data_per_group,
         })
         .collect()
 }
@@ -2107,7 +2121,7 @@ fn learner_parity_on_device_seam_defers() {
     let backend = CpuBackend;
     let client = cpu_client();
     let (features, g, h, cfg, num_leaves, max_depth) = corpus();
-    let grow_features = grow_features_of(&features);
+    let grow_features = grow_features_of(&features, &cfg);
 
     let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
 
@@ -2330,7 +2344,7 @@ fn learner_parity_on_device_structure_gate() {
     let backend = CpuBackend;
     let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
-    let grow_features = grow_features_of(&features);
+    let grow_features = grow_features_of(&features, &GainConfig::default());
     // The driver pins the proving-slice config; the anchor MUST use the identical one.
     let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
     let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
@@ -2478,7 +2492,7 @@ fn learner_parity_on_device_deep_multileaf_gate() {
     let backend = CpuBackend;
     let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = deep_multileaf_corpus();
-    let grow_features = grow_features_of(&features);
+    let grow_features = grow_features_of(&features, &GainConfig::default());
     // The driver pins the proving-slice config; the anchor MUST use the identical one.
     let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
     let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
@@ -2570,7 +2584,7 @@ fn learner_parity_on_device_nosplit_gate() {
     let backend = CpuBackend;
     let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = nosplit_corpus();
-    let grow_features = grow_features_of(&features);
+    let grow_features = grow_features_of(&features, &GainConfig::default());
     let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
     let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
 
@@ -2641,7 +2655,7 @@ fn learner_parity_on_device_nosplit_gate() {
 fn learner_parity_on_device_mindata_structure_gate() {
     let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = mindata_corpus();
-    let grow_features = grow_features_of(&features);
+    let grow_features = grow_features_of(&features, &GainConfig::default());
     // md=2 binds yet still grows 4 leaves; md=3/4 bind harder and stop the tree at 2
     // leaves (each 4-row child is < min_data*2). All three must match the anchor.
     let mut any_bound = false;
@@ -2728,7 +2742,7 @@ fn learner_parity_on_device_mindata_gate() {
     let backend = CpuBackend;
     let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = mindata_corpus();
-    let grow_features = grow_features_of(&features);
+    let grow_features = grow_features_of(&features, &GainConfig::default());
 
     // Constrained cfg: proving-slice L2 + a BINDING min_sum_hessian_in_leaf (forbids a
     // child whose hessian mass — here == row count, h==1 — is below 3.0). The driver
@@ -3043,7 +3057,7 @@ mod hip {
         let backend = RocmBackend::with_resident(false);
         let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
         let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
-        let grow_features = grow_features_of(&features);
+        let grow_features = grow_features_of(&features, &cfg);
 
         let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
         let grown = backend
@@ -3073,7 +3087,7 @@ mod hip {
     fn learner_parity_on_device_seam_is_provable_noop_slice0() {
         let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
         let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
-        let grow_features = grow_features_of(&features);
+        let grow_features = grow_features_of(&features, &cfg);
 
         let cpu_backend = CpuBackend;
         let gpu_backend = RocmBackend::with_resident(false);
