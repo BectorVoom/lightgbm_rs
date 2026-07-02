@@ -23,14 +23,23 @@
 //! This module produces the split decision + the winner bitsets. It does NOT wire
 //! into the driver (22-04) and does NOT write `DeviceSplitInfo` slabs.
 //!
-//! ## 22-03 Task 1 (this slice): §6.3 bitset construction
-//! [`construct_bitset`] + the two-bitset [`set_real_threshold`] producer land here.
-//! The §8.1 [`find_best_threshold_categorical`] evaluator is a compiling stub
-//! (returns the "no split" sentinel) until Task 2 fills it under TDD.
+//! ## The deliberate `l2` asymmetry (feature_histogram_categorical.rs:126-130,223)
+//! One-hot uses the ORIGINAL `lambda_l2`; many-vs-many uses `lambda_l2 + cat_l2`.
+//! `gain_shift` (the `min_gain_to_split` baseline) always uses the ORIGINAL
+//! `lambda_l2`. Reproduced exactly below (Pitfall 3).
+//!
+//! ## `sum_hessian` pre-bump caller contract (Pitfall 2)
+//! [`find_best_threshold_categorical`] expects `sum_hessian` ALREADY bumped by
+//! `+2*kEpsilon` (mirroring the host learner call site, learner.rs:2813-2814). The
+//! evaluator does NOT bump internally; 22-04's driver branch MUST bump before the
+//! call.
 
 use crate::error::ComputeError;
-use crate::gain::{GainConfig, SplitInfo};
+use crate::gain::{
+    calculate_splitted_leaf_output, get_leaf_gain, get_split_gains, GainConfig, SplitInfo,
+};
 use cubecl::prelude::*;
+use lgbm_core::types::K_EPSILON;
 
 /// The categorical split result: the standard [`SplitInfo`] (gain/outputs/sums/
 /// counts/`default_left`) PLUS the chosen category set as a list of REAL BINS
@@ -138,26 +147,365 @@ pub fn set_real_threshold(
     (real_bitset, inner_bitset)
 }
 
-/// §8.1 categorical split evaluator — **Task 2 fills this under TDD**. Currently a
-/// compiling stub returning the "no split" sentinel so the Task-1 slice builds.
+/// `static_cast<int>(Common::RoundInt(x))` == `static_cast<int>(x + 0.5f)`
+/// (`common.h`), reproduced with the f32-rounding-then-truncate form the numeric
+/// spine uses (`learner.rs:1098`) so the count reconstruction is bit-identical.
+#[inline]
+fn round_int(x: f64) -> i32 {
+    (x + f64::from(0.5f32)) as i32
+}
+
+/// `FeatureHistogram::FindBestThresholdCategoricalInner<false,false,USE_L1,false,false>`
+/// (`feature_histogram.cpp:143-382`) — the byte-for-byte transcription of the host
+/// `find_best_threshold_categorical` (feature_histogram_categorical.rs:93-326),
+/// with the f64 stable-sort ctr order replaced by the anchor-pinned
+/// [`super::primitives::bitonic_argsort_on`] (index-only, single-block ≤1024).
 ///
-/// See the Task-2 doc for the full contract (`sum_hessian` pre-bump, the l2
-/// asymmetry, and the [`super::primitives::bitonic_argsort_on`] ctr sort).
+/// `hist` is the compacted+fixed per-feature histogram (`2*num_bin` cells,
+/// `[grad0,hess0,grad1,hess1,...]`), exactly as the numeric scan receives it.
+/// `offset` is `meta_->offset` (the categorical-feature offset; `most_freq_bin ==
+/// 0 -> 1`, else `0`). `sum_gradient` / `sum_hessian` are the leaf totals;
+/// **`sum_hessian` is ALREADY bumped by `+2*kEpsilon` by the caller** (Pitfall 2 —
+/// the evaluator does NOT bump internally) so `gain_shift`, `cnt_factor`, and the
+/// per-category gains see the same bumped value as the numeric path.
+///
+/// Runs on `CubeDim::new_1d(1)` (single-owner f64 anchor, def-f8u-01).
 ///
 /// # Errors
-/// [`ComputeError`] (Task 2) propagated from the ctr sort.
+/// [`ComputeError`] propagated from [`super::primitives::bitonic_argsort_on`]
+/// (only if the used-bin count exceeds its single-block cap — never for the
+/// fixture-scale categorical features this milestone targets).
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_threshold_categorical<R: cubecl::Runtime>(
-    _client: &ComputeClient<R>,
-    _hist: &[f64],
-    _cfg: &GainConfig,
-    _num_bin: i32,
-    _offset: i32,
-    _sum_gradient: f64,
-    _sum_hessian: f64,
-    _num_data: i32,
+    client: &ComputeClient<R>,
+    hist: &[f64],
+    cfg: &GainConfig,
+    num_bin: i32,
+    offset: i32,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
 ) -> Result<CategoricalSplit, ComputeError> {
-    Ok(CategoricalSplit::none())
+    let use_l1 = cfg.use_l1();
+    let l1 = cfg.lambda_l1;
+    let eps = f64::from(K_EPSILON);
+
+    let get_grad = |t: i32| hist[(t as usize) << 1];
+    let get_hess = |t: i32| hist[((t as usize) << 1) + 1];
+
+    let mut is_splittable = false;
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut best_left_count: i32 = 0;
+    let mut best_sum_left_gradient: f64 = 0.0;
+    let mut best_sum_left_hessian: f64 = 0.0;
+
+    // gain_shift uses the ORIGINAL l2 (the deliberate asymmetry,
+    // feature_histogram.cpp:164-168).
+    let gain_shift = get_leaf_gain(use_l1, sum_gradient, sum_hessian, l1, cfg.lambda_l2);
+    let min_gain_shift = gain_shift + cfg.min_gain_to_split;
+
+    let bin_start = 1 - offset;
+    let bin_end = num_bin - offset;
+    let cnt_factor = f64::from(num_data) / sum_hessian;
+
+    let use_onehot = num_bin <= cfg.max_cat_to_onehot;
+
+    // Carried out of the many-vs-many branch for the winner-bitset construction.
+    let mut sorted_idx: Vec<i32> = Vec::new();
+    let mut used_bin: i32 = -1;
+    let mut best_threshold: i32 = -1;
+    let mut best_dir: i32 = 1;
+
+    if use_onehot {
+        // one-hot: uses the ORIGINAL lambda_l2 (NOT + cat_l2).
+        let l2 = cfg.lambda_l2;
+        let mut t = bin_start;
+        while t < bin_end {
+            let grad = get_grad(t);
+            let hess = get_hess(t);
+            let cnt = round_int(hess * cnt_factor);
+            // if data not enough, or sum hessian too small
+            if cnt < cfg.min_data_in_leaf || hess < cfg.min_sum_hessian_in_leaf {
+                t += 1;
+                continue;
+            }
+            let other_count = num_data - cnt;
+            if other_count < cfg.min_data_in_leaf {
+                t += 1;
+                continue;
+            }
+            let sum_other_hessian = sum_hessian - hess - eps;
+            if sum_other_hessian < cfg.min_sum_hessian_in_leaf {
+                t += 1;
+                continue;
+            }
+            let sum_other_gradient = sum_gradient - grad;
+            // current split gain (other | this), this-side hess bumped by +kEpsilon.
+            let current_gain = get_split_gains(
+                use_l1,
+                sum_other_gradient,
+                sum_other_hessian,
+                grad,
+                hess + eps,
+                l1,
+                l2,
+            );
+            if current_gain <= min_gain_shift {
+                t += 1;
+                continue;
+            }
+            is_splittable = true;
+            if current_gain > best_gain {
+                best_threshold = t;
+                best_sum_left_gradient = grad;
+                best_sum_left_hessian = hess + eps;
+                best_left_count = cnt;
+                best_gain = current_gain;
+            }
+            t += 1;
+        }
+        return Ok(finalize(
+            is_splittable,
+            best_gain,
+            min_gain_shift,
+            best_sum_left_gradient,
+            best_sum_left_hessian,
+            best_left_count,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            use_l1,
+            l1,
+            l2,
+            eps,
+            true,
+            offset,
+            best_threshold,
+            best_dir,
+            &sorted_idx,
+            used_bin,
+        ));
+    }
+
+    // ---- many-vs-many ----
+    let mut l2 = cfg.lambda_l2;
+    for i in bin_start..bin_end {
+        // C++ `Common::RoundInt(...) >= meta_->config->cat_smooth`: the `int` is
+        // promoted to `double` for the comparison (cat_smooth is a double).
+        if f64::from(round_int(get_hess(i) * cnt_factor)) >= cfg.cat_smooth {
+            sorted_idx.push(i);
+        }
+    }
+    used_bin = sorted_idx.len() as i32;
+
+    // many-vs-many uses lambda_l2 + cat_l2 (feature_histogram.cpp:248) — the
+    // increment happens ONLY here, AFTER the one-hot branch returns (Pitfall 3).
+    l2 += cfg.cat_l2;
+
+    let cat_smooth = cfg.cat_smooth;
+    // ctr = grad / (hess + cat_smooth), ASCENDING. The host uses an f64
+    // std::stable_sort; here the anchor-pinned index-only bitonic argsort replaces
+    // it (BitonicArgSort_1024 comparator, f32 keys). The committed `cat_manyvsmany`
+    // fixture is TIE-FREE (ctr = 0,-1,-2,-8,-9,-10 — strictly distinct, A1), so the
+    // f32-bitonic order EQUALS the f64-stable order (Pitfall 1). For tied ctr the
+    // two orders could disagree — keep categorical fixtures tie-free.
+    if used_bin > 0 {
+        let ctr_keys: Vec<f32> = sorted_idx
+            .iter()
+            .map(|&t| (get_grad(t) / (get_hess(t) + cat_smooth)) as f32)
+            .collect();
+        let (perm, _keys_after) =
+            super::primitives::bitonic_argsort_on(client, &ctr_keys, /*ascending=*/ true)?;
+        // perm[r] = index (into sorted_idx / ctr_keys) of the r-th smallest ctr.
+        let reordered: Vec<i32> = perm.iter().map(|&p| sorted_idx[p as usize]).collect();
+        sorted_idx = reordered;
+    }
+
+    let find_direction = [1i32, -1i32];
+    let start_position = [0i32, used_bin - 1];
+    let max_num_cat = cfg.max_cat_threshold.min((used_bin + 1) / 2);
+
+    is_splittable = false;
+    for out_i in 0..find_direction.len() {
+        let dir = find_direction[out_i];
+        let mut start_pos = start_position[out_i];
+        let min_data_per_group = cfg.min_data_per_group;
+        let mut cnt_cur_group: i32 = 0;
+        let mut sum_left_gradient: f64 = 0.0;
+        let mut sum_left_hessian: f64 = eps;
+        let mut left_count: i32 = 0;
+        let mut i = 0i32;
+        while i < used_bin && i < max_num_cat {
+            let t = sorted_idx[start_pos as usize];
+            start_pos += dir;
+            let grad = get_grad(t);
+            let hess = get_hess(t);
+            let cnt = round_int(hess * cnt_factor);
+
+            sum_left_gradient += grad;
+            sum_left_hessian += hess;
+            left_count += cnt;
+            cnt_cur_group += cnt;
+
+            if left_count < cfg.min_data_in_leaf || sum_left_hessian < cfg.min_sum_hessian_in_leaf {
+                i += 1;
+                continue;
+            }
+            let right_count = num_data - left_count;
+            if right_count < cfg.min_data_in_leaf || right_count < min_data_per_group {
+                break;
+            }
+            let sum_right_hessian = sum_hessian - sum_left_hessian;
+            if sum_right_hessian < cfg.min_sum_hessian_in_leaf {
+                break;
+            }
+            if cnt_cur_group < min_data_per_group {
+                i += 1;
+                continue;
+            }
+            cnt_cur_group = 0;
+
+            let sum_right_gradient = sum_gradient - sum_left_gradient;
+            let current_gain = get_split_gains(
+                use_l1,
+                sum_left_gradient,
+                sum_left_hessian,
+                sum_right_gradient,
+                sum_right_hessian,
+                l1,
+                l2,
+            );
+            if current_gain <= min_gain_shift {
+                i += 1;
+                continue;
+            }
+            is_splittable = true;
+            if current_gain > best_gain {
+                best_left_count = left_count;
+                best_sum_left_gradient = sum_left_gradient;
+                best_sum_left_hessian = sum_left_hessian;
+                best_threshold = i;
+                best_gain = current_gain;
+                best_dir = dir;
+            }
+            i += 1;
+        }
+    }
+
+    Ok(finalize(
+        is_splittable,
+        best_gain,
+        min_gain_shift,
+        best_sum_left_gradient,
+        best_sum_left_hessian,
+        best_left_count,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        use_l1,
+        l1,
+        l2,
+        eps,
+        false,
+        offset,
+        best_threshold,
+        best_dir,
+        &sorted_idx,
+        used_bin,
+    ))
+}
+
+/// The `if (is_splittable_) { ... }` finalization block
+/// (`feature_histogram.cpp:342-381`): compute left/right outputs (with the
+/// per-category l2), counts, sums, the net gain, and build `output->cat_threshold`
+/// (one-hot: `[best_threshold + offset]`; many-vs-many: the first `best_threshold
+/// + 1` of `sorted_idx` in the winning direction, each `+ offset`).
+#[allow(clippy::too_many_arguments)]
+fn finalize(
+    is_splittable: bool,
+    best_gain: f64,
+    min_gain_shift: f64,
+    best_sum_left_gradient: f64,
+    best_sum_left_hessian: f64,
+    best_left_count: i32,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    use_l1: bool,
+    l1: f64,
+    l2: f64,
+    eps: f64,
+    use_onehot: bool,
+    offset: i32,
+    best_threshold: i32,
+    best_dir: i32,
+    sorted_idx: &[i32],
+    used_bin: i32,
+) -> CategoricalSplit {
+    if !is_splittable {
+        return CategoricalSplit::none();
+    }
+
+    let left_output = calculate_splitted_leaf_output(
+        use_l1,
+        best_sum_left_gradient,
+        best_sum_left_hessian,
+        l1,
+        l2,
+    );
+    let left_count = best_left_count;
+    let left_sum_gradient = best_sum_left_gradient;
+    let left_sum_hessian = best_sum_left_hessian - eps;
+
+    let right_output = calculate_splitted_leaf_output(
+        use_l1,
+        sum_gradient - best_sum_left_gradient,
+        sum_hessian - best_sum_left_hessian,
+        l1,
+        l2,
+    );
+    let right_count = num_data - best_left_count;
+    let right_sum_gradient = sum_gradient - best_sum_left_gradient;
+    let right_sum_hessian = sum_hessian - best_sum_left_hessian - eps;
+
+    let gain = best_gain - min_gain_shift;
+
+    let cat_threshold: Vec<u32> = if use_onehot {
+        vec![(best_threshold + offset) as u32]
+    } else {
+        let num_cat_threshold = best_threshold + 1;
+        let mut v = Vec::with_capacity(num_cat_threshold as usize);
+        if best_dir == 1 {
+            for i in 0..num_cat_threshold {
+                v.push((sorted_idx[i as usize] + offset) as u32);
+            }
+        } else {
+            for i in 0..num_cat_threshold {
+                v.push((sorted_idx[(used_bin - 1 - i) as usize] + offset) as u32);
+            }
+        }
+        v
+    };
+
+    let mut split = SplitInfo::none();
+    split.gain = gain;
+    split.left_count = left_count;
+    split.right_count = right_count;
+    split.left_sum_gradient = left_sum_gradient;
+    split.left_sum_hessian = left_sum_hessian;
+    split.right_sum_gradient = right_sum_gradient;
+    split.right_sum_hessian = right_sum_hessian;
+    split.left_output = left_output;
+    split.right_output = right_output;
+    // The categorical path always sets default_left = false.
+    split.default_left = false;
+    // `threshold` is unused for categorical splits (the bitset replaces it).
+    split.threshold = 0;
+
+    CategoricalSplit {
+        split,
+        cat_threshold,
+    }
 }
 
 #[cfg(test)]
@@ -274,15 +622,16 @@ mod tests {
         // ctr is tie-free. Assert strict distinctness before locking.
         let hist = cat_manyvsmany_hist();
         let cat_smooth = 0.0;
-        let mut ctr: Vec<f64> = (1..7)
+        let ctr: Vec<f64> = (1..7)
             .map(|t: i32| hist[(t as usize) << 1] / (hist[((t as usize) << 1) + 1] + cat_smooth))
             .collect();
-        let n = ctr.len();
-        ctr.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for w in ctr.windows(2) {
-            assert!(w[0] != w[1], "cat_manyvsmany ctr must be tie-free");
+        assert_eq!(ctr.len(), 6);
+        // Strict pairwise distinctness (no sort needed) — A1 / Pitfall 1.
+        for a in 0..ctr.len() {
+            for b in (a + 1)..ctr.len() {
+                assert!(ctr[a] != ctr[b], "cat_manyvsmany ctr must be tie-free");
+            }
         }
-        assert_eq!(n, 6);
     }
 
     #[test]
