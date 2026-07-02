@@ -1604,6 +1604,10 @@ fn metric_oracle_capture() -> Result<()> {
     )?;
 
     for metric in [
+        "rmse",
+        "l2",
+        "l1",
+        "binary_logloss",
         "quantile",
         "huber",
         "fair",

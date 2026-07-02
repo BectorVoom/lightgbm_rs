@@ -208,6 +208,19 @@ def main():
     pos = positive_labels()
     unit = unit_interval_labels()
 
+    # base regression losses (Pitfall 1 gap — these 4 device-supported goldens had
+    # never been captured; the discriminator marks rmse/l2/l1/binary_logloss as
+    # on-device supported so they MUST have a real lib_lightgbm anchor). Objective
+    # `regression` (identity ConvertOutput) with the matching metric name; the raw
+    # score IS the metric input for the pointwise regression losses.
+    train_and_capture(out_dir, "rmse", seed, "regression", "rmse", reg)
+    train_and_capture(out_dir, "l2", seed, "regression", "l2", reg)
+    train_and_capture(out_dir, "l1", seed, "regression", "l1", reg)
+    # binary_logloss uses objective `binary` (NOT regression) so its captured raw
+    # score is on the pre-sigmoid scale the binary metric's inverse-link consumes.
+    train_and_capture(out_dir, "binary_logloss", seed, "binary", "binary_logloss",
+                      binary_labels())
+
     # regression-family metrics (identity-ConvertOutput objective: regression).
     train_and_capture(out_dir, "quantile", seed, "regression", "quantile", reg)
     train_and_capture(out_dir, "huber", seed, "regression", "huber", reg)

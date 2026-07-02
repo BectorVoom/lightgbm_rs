@@ -1,0 +1,2 @@
+# rmse real-binary rmse value at round 5; f64 bits
+4615379197420025461
