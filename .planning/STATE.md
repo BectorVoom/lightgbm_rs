@@ -4,8 +4,8 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 22
 status: Phase 22 shipped — pushed to origin/master (direct, no PR)
-stopped_at: Phase 22 context gathered
-last_updated: "2026-07-02T10:44:38.416Z"
+stopped_at: Phase 23 context gathered
+last_updated: "2026-07-02T11:51:52.409Z"
 last_activity: 2026-07-02
 progress:
   total_phases: 10
@@ -728,9 +728,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-02T08:19:13.207Z
-Stopped at: Phase 22 context gathered
-Resume file: .planning/phases/22-on-device-categorical-splits-feature-coverage/22-CONTEXT.md
+Last session: 2026-07-02T11:51:52.399Z
+Stopped at: Phase 23 context gathered
+Resume file: .planning/phases/23-perf-validation-default-on-rollout-dod/23-CONTEXT.md
 
 ## Operator Next Steps
 
