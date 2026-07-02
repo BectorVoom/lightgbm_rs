@@ -2563,6 +2563,142 @@ fn learner_parity_on_device_nosplit_gate() {
     }
 }
 
+/// D-02 case C — a corpus where an UNCONSTRAINED tree splits to 4 leaves but a binding
+/// `min_sum_hessian_in_leaf` forbids the fine splits, so the constraint OBSERVABLY
+/// binds. One continuous feature + L2, `MissingType::None`, 8 rows, 4 bins × 2 rows,
+/// strongly monotone distinct gradients (`h == 1.0`, so a child's hessian mass equals
+/// its row count). Unconstrained the tree grows one leaf per bin (4 leaves); under
+/// `min_sum_hessian_in_leaf = 3.0` the ONLY admissible root split is the 4/4 midpoint
+/// (bins {0,1} vs {2,3}, each hessian mass 4 ≥ 3) and neither 4-row child can split
+/// again (a further split would make a hessian-mass-2 child < 3), so the tree stops at
+/// 2 leaves. We bind via `min_sum_hessian_in_leaf` (checked per-candidate identically
+/// in `split.rs` and the learner) rather than `min_data_in_leaf`, whose `min_data*2`
+/// both-too-small pre-gate takes a divergent child-leaf path on this small corpus.
+#[allow(clippy::type_complexity)]
+fn mindata_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
+    let grad = vec![-10.0f32, -10.0, -3.0, -3.0, 3.0, 3.0, 10.0, 10.0];
+    let hess = vec![1.0f32; 8];
+    let f0 = FeatureColumn {
+        bins: BinColumn::new(vec![0u32, 0, 1, 1, 2, 2, 3, 3], 4),
+        num_bin: 4,
+        offset: lgbm_treelearner::offset_for_most_freq_bin(0),
+        min_bin: 0,
+        max_bin: 3,
+        default_bin: 4,
+        most_freq_bin: 0,
+        missing_type: MissingType::None,
+        bin_upper_bound: vec![0.5, 1.5, 2.5, 3.5],
+        real_feature_index: 0,
+        ..Default::default()
+    };
+    (vec![f0], grad, hess, 4, -1)
+}
+
+/// ODL-18H case C — a `min_sum_hessian_in_leaf` constraint observably binds and the
+/// constrained on-device tree is STRUCTURE bit-exact to the constrained cpu f64 anchor.
+/// Because the `Backend::grow_tree_on_device` trait seam carries NO `GainConfig`, the
+/// constrained tree is grown via `grow_tree_on_device_driver_with_cfg` (plan 21-01)
+/// called DIRECTLY — that call is ENV-INDEPENDENT, so `driver_tree` is the constrained
+/// tree in BOTH lanes.
+///
+/// The constrained cpu f64 anchor (`cpu_anchor_tree`) can ONLY be built in the
+/// ENV-UNSET lane: with `LGBM_CUDA_ON_DEVICE=1`, `SerialTreeLearner` sets
+/// `on_device_eligible = on_device_growth_supported() && cuda_on_device_env()` = true
+/// and FORKS to the on-device driver via the cfg-less trait seam
+/// (`proving_slice_config`), so it silently DROPS the constrained cfg and grows the
+/// UNCONSTRAINED tree (`.planning/…/21-02` deviation — RESEARCH Pitfall 2/3 did not
+/// anticipate the learner's env-gated fork). Therefore:
+///   - ENV-UNSET lane (the constrained-parity home): `cpu_anchor_tree` honors the cfg;
+///     assert `driver_tree` STRUCTURE-bit-exact to the constrained anchor, assert the
+///     constraint binds (constrained anchor has fewer leaves than the unconstrained
+///     anchor), and assert the trait seam still defers (`Ok(None)`, byte-unchanged).
+///   - ENV=1 lane (the seam is LIVE): assert the direct constrained `driver_tree` has
+///     FEWER leaves than the unconstrained tree the LIVE trait seam grows (the
+///     constraint observably binds through the driver), plus layout row-conservation.
+#[test]
+fn learner_parity_on_device_mindata_gate() {
+    let backend = CpuBackend;
+    let client = cpu_client();
+    let (features, g, h, num_leaves, max_depth) = mindata_corpus();
+    let grow_features = grow_features_of(&features);
+
+    // Constrained cfg: proving-slice L2 + a BINDING min_sum_hessian_in_leaf (forbids a
+    // child whose hessian mass — here == row count, h==1 — is below 3.0). The driver
+    // and the constrained anchor MUST use the IDENTICAL cfg (Pitfall 3).
+    let mut constrained_cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+    constrained_cfg.min_sum_hessian_in_leaf = 3.0;
+
+    // The direct `_with_cfg` call threads the constraint through the driver without
+    // widening the trait seam (21-01 artifact). ENV-INDEPENDENT ⇒ the constrained tree
+    // in BOTH lanes.
+    let (driver_tree, layout) = lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+        &client,
+        &g,
+        &h,
+        &grow_features,
+        num_leaves,
+        max_depth,
+        constrained_cfg,
+    )
+    .expect("constrained driver must grow the tree");
+    assert_eq!(
+        layout.leaf_count.iter().sum::<i32>(),
+        g.len() as i32,
+        "layout leaf_count partitions all rows"
+    );
+
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+
+    if env_on {
+        // The trait seam is LIVE and grows on-device with the cfg-less
+        // `proving_slice_config` (UNCONSTRAINED). The constraint observably binds iff
+        // the direct constrained driver grows STRICTLY fewer leaves.
+        let (seam_tree, _seam_layout) = backend
+            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+            .expect("grow_tree_on_device seam ok")
+            .expect("with LGBM_CUDA_ON_DEVICE=1 the trait seam grows (Ok(Some))");
+        assert!(
+            driver_tree.num_leaves < seam_tree.num_leaves,
+            "min_sum_hessian_in_leaf must observably bind: constrained driver num_leaves \
+             ({}) must be fewer than the unconstrained seam ({})",
+            driver_tree.num_leaves,
+            seam_tree.num_leaves
+        );
+    } else {
+        // ENV-UNSET: `cpu_anchor_tree` takes the PURE HOST path and honors the
+        // constrained cfg — the meaningful STRUCTURE-parity home.
+        let anchor = cpu_anchor_tree(&features, &g, &h, constrained_cfg, num_leaves, max_depth);
+        assert_on_device_tree_matches_cpu_anchor(&driver_tree, &anchor, "min-hessian");
+
+        // Non-vacuity: the SAME corpus grows MORE leaves unconstrained, so the
+        // constraint observably binds (not a trivially-matching case).
+        let unconstrained = cpu_anchor_tree(
+            &features,
+            &g,
+            &h,
+            lgbm_compute::kernels::grow_driver::proving_slice_config(),
+            num_leaves,
+            max_depth,
+        );
+        assert!(
+            anchor.num_leaves < unconstrained.num_leaves,
+            "min_sum_hessian_in_leaf must observably bind: constrained anchor num_leaves \
+             ({}) must be fewer than unconstrained ({})",
+            anchor.num_leaves,
+            unconstrained.num_leaves
+        );
+
+        // The cfg-less trait seam still defers (byte-unchanged merge gate).
+        let grown = backend
+            .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
+            .expect("grow_tree_on_device seam ok");
+        assert!(
+            grown.is_none(),
+            "with LGBM_CUDA_ON_DEVICE unset the trait seam MUST defer (Ok(None)) — byte-unchanged"
+        );
+    }
+}
+
 #[cfg(feature = "rocm")]
 mod hip {
     use super::*;
