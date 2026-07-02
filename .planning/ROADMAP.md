@@ -299,11 +299,11 @@ Plans:
   4. The `LGBM_CUDA_ON_DEVICE`-unset workspace stays **byte-unchanged** green — the hard merge gate is unchanged. (§17)
   5. REQUIREMENTS.md / ROADMAP bookkeeping is reconciled (ODL-18/19 Complete under Phase 20; ODL-18H the new Phase-21 requirement).
 
-**Plans**: 1/3 plans executed
+**Plans**: 2/3 plans executed
 
 - [x] 21-01-PLAN.md — lgbm-compute hardening: WR-01 HistArena::swap fix confirmation + additive `grow_tree_on_device_driver_with_cfg` (ODL-18H)
 - [ ] 21-02-PLAN.md — targeted STRUCTURE parity corpus: deep >2-live-leaf, no-split break, min-data/min-hessian-constrained cases, cpu-f64-anchored (ODL-18H)
-- [ ] 21-03-PLAN.md — D-05 bookkeeping: mark ODL-18/19 Complete (Phase 20), add ODL-18H, re-cut this Phase 21 body (ODL-18, ODL-19, ODL-18H)
+- [x] 21-03-PLAN.md — D-05 bookkeeping: mark ODL-18/19 Complete (Phase 20), add ODL-18H, re-cut this Phase 21 body (ODL-18, ODL-19, ODL-18H)
 
 **Notes**: A parity-hardening re-cut — the end-to-end driver itself was pulled forward into Phase 20 (D-01), so this phase confirms + broadens rather than builds. Parity is the gate, not speed. **Out of scope:** on-device categorical splits → Phase 22 (ODL-22); perf-validation / default-ON rollout DoD → Phase 23 (ODL-20/21). **Resolved open question** (the old Phase-20/21 Notes flag): the data→leaf `Handle` in-place-aliasing vs ping-pong question is **MOOT** for the live driver — it carries host per-leaf rows and rebuilds `LeafPartitionLayout` at the end, so there is no running data→leaf device buffer in the grow loop (double-buffer was locked in 20-03a regardless); batched `client.read(vec![h])` readback is a **Phase-23 perf** concern only. **Neither affects the Phase-21 parity gate.**
 
@@ -348,6 +348,6 @@ Plans:
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
 | 19. On-Device Objectives | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
-| 21. End-to-End Driver Integration + Parity Gate | v1.1 | 1/3 | In Progress|  |
+| 21. End-to-End Driver Integration + Parity Gate | v1.1 | 2/3 | In Progress|  |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
 | 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/? | Not started | - |

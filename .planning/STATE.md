@@ -6,14 +6,14 @@ current_phase: 21
 current_phase_name: end-to-end-on-device-driver-integration-parity-gate
 status: executing
 stopped_at: Phase 21 context gathered (re-cut to hardening)
-last_updated: "2026-07-02T06:47:29.639Z"
+last_updated: "2026-07-02T06:52:33.014Z"
 last_activity: 2026-07-02
 last_activity_desc: Phase 21 execution started
 progress:
   total_phases: 10
   completed_phases: 7
   total_plans: 39
-  completed_plans: 37
+  completed_plans: 38
   percent: 70
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 21 (end-to-end-on-device-driver-integration-parity-gate) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-07-02 — Phase 21 execution started
@@ -583,6 +583,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 20 P00 | 18 | 2 tasks | 19 files |
 | Phase 20 P01 | 30 | 2 tasks | 3 files |
 | Phase 21 P01 | 15m | 2 tasks | 2 files |
+| Phase 21 P03 | 2m | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -694,6 +695,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 20-01: §11 on-device score updater — AddScoreConstant/MultiplyScoreConstant #[cube] kernels over resident Array<f64> at offset=num_data*tree_id; per-leaf AddScore delegates to Phase-18 add_prediction_to_score_on_device (D-02); boosting_on_cuda_ host-mirror toggle OFF by default (D-09), bit-exact to host ScoreUpdater on cpu anchor
 - [Phase ?]: 21-01: WR-01 confirmed (not rebuilt) — live driver uses per-leaf Vec<f64>, never HistArena
 - [Phase ?]: 21-01: GainConfig threaded via additive _with_cfg variant, trait seam byte-unchanged
+- [Phase ?]: D-05 reconciled (21-03): ODL-18/19 marked Complete under Phase 20 (delivered per D-01); new ODL-18H hardening req mapped to Phase 21; ROADMAP Phase 21 body re-cut to hardening scope
+- [Phase ?]: ROADMAP open question resolved (21-03): data->leaf Handle aliasing MOOT for live driver (host per-leaf rows); batched client.read is Phase-23 perf — neither affects Phase-21 parity gate
 
 ### Pending Todos
 
@@ -724,7 +727,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-02T06:00:31.598Z
+Last session: 2026-07-02T06:51:47.860Z
 Stopped at: Phase 21 context gathered (re-cut to hardening)
 Resume file: .planning/phases/21-end-to-end-on-device-driver-integration-parity-gate/21-CONTEXT.md
 
