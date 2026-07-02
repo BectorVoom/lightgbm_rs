@@ -267,9 +267,11 @@ data_partition.split_categorical(best_leaf, new_right, &f.bins, &cat_bitset_real
 | A4 | D-06's "has categorical && quantized" check belongs in the learner (`on_device_eligible`, learner.rs:498), since `on_device_growth_supported()` takes no config | Arch Map / D-06 | If placed in `lgbm-compute` it can't see `use_quantized_grad`/`bin_type` — wrong layer |
 | A5 | `xtask categorical-oracle-capture` regenerates the goldens and asserts `lib_lightgbm` 4.6 (main.rs:286, py/categorical_oracle_capture.py) — goldens already committed | Parity Harness | If the installed wheel version drifts, recapture would assert-fail; goldens are already present so recapture is optional |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Which routing bitset convention does the on-device structure gate anchor expect — real category-value or inner-bin?**
+> Dispositions recorded at planning (2026-07-02): OQ1 → resolved during execution by the 22-04 T3 partition-count isolation test (assert on-device counts == host `partition_categorical_stable` before the full gate; adjust 22-04 T2's chosen convention if counts diverge). OQ2 → resolved by the 22-01 T1 `max_cat_threshold > 32` unit test (width>32 slab + length-33 `set_cat_thresholds`). OQ3 → resolved: single-block bitonic this phase (`num_bin ≤ 1024`); `_GlobalMemory` variant deferred.
+
+1. **Which routing bitset convention does the on-device structure gate anchor expect — real category-value or inner-bin?** _(RESOLVED — 22-04 T3 isolation test)_
    - What we know: `split_categorical_on_device` takes both; host learner routes by real-value (learner.rs:3641-3647); reference §9 routes by inner-bin (data_partition.rs:153-171); `partition_categorical_on_device` uses the inner-bin `route_to_left_categorical`.
    - What's unclear: whether feeding `partition_categorical_on_device` the real-value bitset (as the host does) vs an inner-bin bitset yields the same partition for these fixtures.
    - Recommendation: In the plan's first categorical wiring task, assert the on-device partition counts equal the host `partition_categorical_stable` (data_partition.rs:525) for both fixtures BEFORE asserting the full structure gate — this isolates the convention.
