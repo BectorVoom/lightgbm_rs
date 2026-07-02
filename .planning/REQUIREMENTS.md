@@ -49,7 +49,7 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 
 - [x] **ODL-18**: The on-device **single-GPU tree-learner driver** orchestrates the per-leaf grow loop end-to-end on device — root init → build/subtract → best-split → tree split → partition, repeated up to `num_leaves−1` (break on `best_leaf == −1`) — and reconstitutes into the `(Tree, DataPartition)` the boosting loop consumes; STRUCTURE **bit-exact** to the cpu f64 anchor (tie-aware `default_left`), leaf values within ~1e-5. (§6, §16; the continuous-feature path is the first proving slice.) *(Delivered + verified in Phase 20 — 20-VERIFICATION.md 6/6, crit 5 STRUCTURE gate.)*
 - [x] **ODL-19**: Every new kernel keeps **f32 + the u64 fixed-point build with NO f64 per-row hot loops** (verified by grep + per-tree-ms, not a 6× sweep; the measured 5.4× consumer-NVIDIA f64 regression, spike-052); f64 permitted only in scalar/gain math where the reference uses it. CPU / ROCm / existing-host-CUDA paths stay **byte-unchanged** with `LGBM_CUDA_ON_DEVICE` unset. (§17 — the hard merge gate.) *(Delivered + verified in Phase 20 — 20-VERIFICATION.md 6/6, crit 6 no-f64-per-row.)*
-- [ ] **ODL-18H**: **Hardening of the on-device driver** — a targeted STRUCTURE parity corpus (deep >2-live-leaf, no-split break, min-data/min-hessian-constrained cases), the WR-01 `HistArena::swap` free-slot fix confirmation + repro tests, and the additive `grow_tree_on_device_driver_with_cfg` seam — all anchored to the cubecl-cpu f64 fold on the cubecl-cpu **default** merge-gate lane; additive + `LGBM_CUDA_ON_DEVICE`-gated (env-unset workspace byte-unchanged). Mapped to Phase 21. (Checked at phase completion.)
+- [x] **ODL-18H**: **Hardening of the on-device driver** — a targeted STRUCTURE parity corpus (deep >2-live-leaf, no-split break, min-data/min-hessian-constrained cases), the WR-01 `HistArena::swap` free-slot fix confirmation + repro tests, and the additive `grow_tree_on_device_driver_with_cfg` seam — all anchored to the cubecl-cpu f64 fold on the cubecl-cpu **default** merge-gate lane; additive + `LGBM_CUDA_ON_DEVICE`-gated (env-unset workspace byte-unchanged). Mapped to Phase 21. (Checked at phase completion.)
 - [ ] **ODL-22**: On-device **categorical splits** end-to-end — bitset construction (`SetRealThreshold` + length + construct, §6.3), categorical split evaluation (one-hot + many-vs-many bitonic-sorted, §8.1), categorical partition membership (§9), and `SplitCategorical` tree mutation (§10) — anchor-pinned, via the pre-allocated bitset representation (no per-`SplitInfo` device alloc).
 
 ### Performance & rollout (the DoD)
@@ -105,7 +105,7 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-17 | Phase 20 | Complete |
 | ODL-18 | Phase 20 | Complete |
 | ODL-19 | Phase 20 | Complete |
-| ODL-18H | Phase 21 | Pending |
+| ODL-18H | Phase 21 | Complete |
 | ODL-20 | Phase 23 | Pending |
 | ODL-21 | Phase 23 | Pending |
 | ODL-22 | Phase 22 | Pending |
