@@ -109,23 +109,36 @@ pub fn construct_bitset(vals: &[u32]) -> Vec<u32> {
 /// Pattern 3). Maps the winning inner bins → real category values via
 /// `bin_to_category`, and produces BOTH:
 /// - the REAL category-value bitset (`construct_bitset` over the mapped values —
-///   this is the serialized model `cat_threshold_` AND, on the single-group
-///   spine, the partition routing key), and
-/// - the INNER-bin bitset (`construct_bitset` over the winning bins as-is — the
-///   routing-key form consistent with `route_to_left_categorical`,
-///   `FindInBitset(bitset, bin - min_bin + offset)`, Pitfall 4).
+///   this is the serialized model `cat_threshold_`), and
+/// - the INNER-bin bitset — the routing-key form consumed by
+///   `route_to_left_categorical`, whose per-row lookup is
+///   `FindInBitset(bitset, bin - min_bin + offset)` (Pitfall 4). The bit for each
+///   winning bin is therefore placed at the SAME transformed key the router looks
+///   up: `winning_bin - min_bin + offset`.
 ///
-/// `cat_threshold_bins` are the finder's `output->cat_threshold` (each already
-/// `+ offset`; on the single-group categorical spine `min_bin == 0`, so the inner
-/// bin IS the routing key). Bounds handling mirrors the host exactly
+/// `cat_threshold_bins` are the finder's `output->cat_threshold`. Each value is a
+/// RAW winning bin (the finder emits `t + offset`, and the compacted histogram
+/// slot `t` corresponds to raw bin `t + offset`, so the emitted value equals the
+/// member row's raw bin). Because the router keys a member row's raw bin `bin` as
+/// `bin - min_bin + offset`, the inner bitset MUST set its bits at the matching
+/// transformed key `winning_bin - min_bin + offset` — NOT at the raw winning bin.
+/// (CR-01: the two coincide only when `min_bin == offset`, which holds for the
+/// two committed `most_freq_bin == 1 ⇒ offset 0, min_bin 0` fixtures but NOT for a
+/// `most_freq_bin == 0 ⇒ offset 1` feature, where the router would otherwise route
+/// members to the wrong child.)
+///
+/// Bounds handling for the REAL mapping mirrors the host exactly
 /// (`.get(bin).copied().unwrap_or(bin)`): an out-of-range bin does NOT panic and
 /// does NOT index out of bounds (threat T-22-06). Winning bins are never negative
-/// (the finder scans `bin_start = 1 - offset >= 0`, never the NaN dummy bin 0).
+/// (the finder scans `bin_start = 1 - offset >= 0`, never the NaN dummy bin 0), and
+/// `winning_bin >= min_bin` for any in-range member, so the transformed inner key
+/// is non-negative.
 #[must_use]
 pub fn set_real_threshold(
     cat_threshold_bins: &[i32],
     bin_to_category: &[i32],
-    _offset: i32,
+    min_bin: i32,
+    offset: i32,
 ) -> (Vec<u32>, Vec<u32>) {
     // Real category-value bitset: map each winning bin → RealThreshold
     // (`bin_2_categorical_[bin]`, C++ BinToValue) with host-faithful bounds.
@@ -138,10 +151,14 @@ pub fn set_real_threshold(
         .collect();
     let real_bitset = construct_bitset(&cat_values);
 
-    // Inner-bin bitset: the winning bins already carry `+ offset` (min_bin == 0 on
-    // the single-group spine), so they ARE the routing keys consumed by
-    // `route_to_left_categorical` (`FindInBitset(bitset, bin - 0 + 0)`).
-    let inner_keys: Vec<u32> = cat_threshold_bins.iter().map(|&b| b as u32).collect();
+    // Inner-bin bitset: place each winning bin's bit at the EXACT transformed key
+    // the router looks up for a member row — `bin - min_bin + offset`
+    // (route_to_left_categorical) — so device routing is key-consistent with the
+    // bitset for every offset, not only the `min_bin == offset` case (CR-01).
+    let inner_keys: Vec<u32> = cat_threshold_bins
+        .iter()
+        .map(|&b| (b - min_bin + offset) as u32)
+        .collect();
     let inner_bitset = construct_bitset(&inner_keys);
 
     (real_bitset, inner_bitset)
@@ -653,7 +670,7 @@ mod tests {
                 .unwrap();
         assert!(r.is_splittable());
         let bins: Vec<i32> = r.cat_threshold.iter().map(|&b| b as i32).collect();
-        let (real, _inner) = set_real_threshold(&bins, &[-1, 0, 1, 2, 3], 0);
+        let (real, _inner) = set_real_threshold(&bins, &[-1, 0, 1, 2, 3], 0, 0);
         assert_eq!(real, vec![8u32], "cat_onehot real bitset != golden (8)");
         assert!(
             (r.split.gain - 250.0).abs() < 1e-9,
@@ -673,7 +690,7 @@ mod tests {
                 .unwrap();
         assert!(r.is_splittable());
         let bins: Vec<i32> = r.cat_threshold.iter().map(|&b| b as i32).collect();
-        let (real, _inner) = set_real_threshold(&bins, &[-1, 0, 1, 2, 3, 4, 5], 0);
+        let (real, _inner) = set_real_threshold(&bins, &[-1, 0, 1, 2, 3, 4, 5], 0, 0);
         assert_eq!(real, vec![56u32], "cat_manyvsmany root real bitset != golden (56)");
         assert!(
             (r.split.gain - 345.0).abs() < 1e-9,
@@ -786,7 +803,8 @@ mod tests {
         // (the only bin with a non-zero gradient); bin_2_categorical[4] = 3, so the
         // real bitset is `1<<3 = 8`.
         let bin_2_categorical = [-1, 0, 1, 2, 3];
-        let (real, inner) = set_real_threshold(&[4], &bin_2_categorical, 0);
+        // min_bin == 0, offset == 0 ⇒ inner key == raw winning bin (4).
+        let (real, inner) = set_real_threshold(&[4], &bin_2_categorical, 0, 0);
         assert_eq!(real, vec![8u32], "cat_onehot real bitset != golden (8)");
         // inner bitset over the winning bin 4 itself: 1<<4 = 16.
         assert_eq!(inner, vec![16u32]);
@@ -799,8 +817,36 @@ mod tests {
         // bin_2_categorical maps them to {5,4,3}, so the real bitset is
         // (1<<5)|(1<<4)|(1<<3) = 56.
         let bin_2_categorical = [-1, 0, 1, 2, 3, 4, 5];
-        let (real, _inner) = set_real_threshold(&[6, 5, 4], &bin_2_categorical, 0);
+        let (real, _inner) = set_real_threshold(&[6, 5, 4], &bin_2_categorical, 0, 0);
         assert_eq!(real, vec![56u32], "cat_manyvsmany real bitset != golden (56)");
+    }
+
+    #[test]
+    fn set_real_threshold_inner_key_offset1_matches_router_key() {
+        // CR-01 regression: for a `most_freq_bin == 0 ⇒ offset 1` feature, the
+        // router (`route_to_left_categorical`) keys a member row's raw bin `bin` as
+        // `bin - min_bin + offset`. The inner bitset MUST set its bit at that same
+        // transformed key, NOT at the raw winning bin. With min_bin=0, offset=1 and
+        // a winning raw bin of 4, the router looks up 4 - 0 + 1 = 5, so the inner
+        // bit must be at 5 (`1<<5 = 32`), not at 4 (`1<<4 = 16`).
+        let bin_2_categorical = [-1, 0, 1, 2, 3];
+        let (_real, inner) = set_real_threshold(&[4], &bin_2_categorical, 0, 1);
+        assert_eq!(
+            inner,
+            vec![1u32 << 5],
+            "offset==1 inner bit must sit at the router's transformed key (bin+1)"
+        );
+        // The REAL (model) bitset is unaffected by the routing offset: bin 4 → cat 3.
+        assert_eq!(_real, vec![1u32 << 3]);
+    }
+
+    #[test]
+    fn set_real_threshold_inner_key_nonzero_min_bin() {
+        // General key-consistency: with min_bin=2, offset=0 and winning raw bin 5,
+        // the router looks up 5 - 2 + 0 = 3, so the inner bit must sit at 3.
+        let bin_2_categorical = [-1, 0, 1, 2, 3, 4, 5];
+        let (_real, inner) = set_real_threshold(&[5], &bin_2_categorical, 2, 0);
+        assert_eq!(inner, vec![1u32 << 3]);
     }
 
     #[test]
@@ -808,7 +854,7 @@ mod tests {
         // Host bounds handling: `.get(bin).unwrap_or(bin)` — an out-of-range bin
         // falls back to the bin index itself, no panic, no OOB (threat T-22-06).
         let bin_2_categorical = [-1, 0, 1];
-        let (real, _inner) = set_real_threshold(&[9], &bin_2_categorical, 0);
+        let (real, _inner) = set_real_threshold(&[9], &bin_2_categorical, 0, 0);
         assert_eq!(real, construct_bitset(&[9]));
     }
 }

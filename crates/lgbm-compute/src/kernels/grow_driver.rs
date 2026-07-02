@@ -715,7 +715,7 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
                     .map(|&b| b as i32)
                     .collect();
                 let (real_bitset, inner_bitset) =
-                    set_real_threshold(&slab_bins, &f.bin_to_category, f.offset);
+                    set_real_threshold(&slab_bins, &f.bin_to_category, f.min_bin as i32, f.offset);
                 // (3) Partition parent rows by categorical membership (§9). The INNER-bin
                 //     bitset is the routing key `route_to_left_categorical` expects
                 //     (`bin - min_bin + offset`, offset from most_freq_bin) — Open Q1 /
