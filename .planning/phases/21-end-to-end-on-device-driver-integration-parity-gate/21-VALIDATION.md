@@ -1,9 +1,9 @@
 ---
 phase: 21
 slug: end-to-end-on-device-driver-integration-parity-gate
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: approved
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-07-02
 ---
 
@@ -39,8 +39,10 @@ created: 2026-07-02
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
 | 21-01-01 | 01 | 1 | ODL-18H | — | N/A | unit | `cargo test -p lgbm-compute swap_multileaf_never_aliases_live_sibling_slot swap_errors_when_pool_exhausted` | ✅ | ⬜ pending |
-| 21-02-01 | 02 | 1 | ODL-18H | — | N/A | integration | `LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness learner_parity_on_device` | ✅ | ⬜ pending |
-| 21-03-01 | 03 | 2 | ODL-18, ODL-19 | — | N/A | doc/grep | `grep -q ODL-18H .planning/REQUIREMENTS.md` | ✅ | ⬜ pending |
+| 21-03-01 | 03 | 1 | ODL-18, ODL-19 | — | N/A | doc/grep | `grep -q ODL-18H .planning/REQUIREMENTS.md` | ✅ | ⬜ pending |
+| 21-02-01 | 02 | 2 | ODL-18H | — | N/A | integration | `LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness learner_parity_on_device` | ✅ | ⬜ pending |
+
+*Wave column matches plan frontmatter: Wave 1 = 21-01 + 21-03 (parallel, disjoint files_modified); Wave 2 = 21-02 (depends_on 21-01's `_with_cfg`).*
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -64,11 +66,11 @@ created: 2026-07-02
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 180s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references (none — existing infra covers all)
+- [x] No watch-mode flags
+- [x] Feedback latency < 180s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-07-02
