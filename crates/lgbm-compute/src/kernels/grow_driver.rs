@@ -704,9 +704,15 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
                     .iter()
                     .map(|&b| f.bin_to_category.get(b as usize).copied().unwrap_or(b as i32))
                     .collect();
-                let dsi = split_info
-                    .as_mut()
-                    .expect("DeviceSplitInfo is allocated whenever categorical features exist");
+                // IN-02: provably unreachable (this branch is entered only when
+                // `f.bin_type == Categorical`, which implies `has_categorical`, which
+                // implies `split_info == Some`), but surface a typed `ComputeError`
+                // rather than a raw panic to keep the grow loop's error boundary uniform.
+                let dsi = split_info.as_mut().ok_or_else(|| ComputeError::Runtime {
+                    detail: "grow_tree_on_device_driver: DeviceSplitInfo must be allocated for \
+                             a categorical grow branch (has_categorical invariant)"
+                        .to_string(),
+                })?;
                 dsi.set_cat_thresholds(best_leaf as usize, &win_bins, &win_real)?;
                 // (2) Materialize the real + inner bitsets FROM the slab-staged thresholds
                 //     (§6.3) — the host Vec<u32> bitsets are DERIVED from the slab, not a
