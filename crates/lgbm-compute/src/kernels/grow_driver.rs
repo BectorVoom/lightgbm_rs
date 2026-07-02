@@ -91,6 +91,15 @@ pub struct GrowFeature {
 // driver body. Each step drives the REAL Phase-18 device kernel
 // (`update_data_index_to_leaf_on`); the strategies differ ONLY in how the running
 // map buffer is carried across steps.
+//
+// WR-04 (Phase-21 review): this is a DECISION-RECORD A/B harness, NOT live driver
+// plumbing. The shipped driver (`grow_tree_on_device_driver_with_cfg`) carries NO
+// running leaf-map buffer and calls NEITHER strategy — it partitions each leaf into
+// a fresh `Vec<u32>` via `partition_leaf_stable`. `build_leaf_map_on` /
+// `LeafMapBufferStrategy` / `LeafMapStep` remain `pub` ONLY because the A/B oracle
+// lives in a separate crate (`oracle-harness`) and must reach them; they are not
+// consumed by any production path. Read the "LOCK" language above as "recorded the
+// A/B conclusion", not "the driver applies this strategy".
 // =========================================================================
 
 /// The data->leaf map buffer strategy for the per-split rewrite (Pitfall 3).
