@@ -1310,8 +1310,14 @@ pub trait Backend {
 /// single-owner ordered f64 fold in [`kernels::histogram`].
 /// THE production seam gate for the on-device histogram/tree path (D-07, ODL-10).
 ///
-/// `LGBM_CUDA_ON_DEVICE` is OFF by default (`"1"` ⇒ on), read ONCE (OnceLock-cached,
-/// mirroring [`split_2lane_enabled`]). While it is unset the on-device histogram entry
+/// `LGBM_CUDA_ON_DEVICE` is a TRI-STATE toggle (D-01), read ONCE (OnceLock-cached,
+/// mirroring [`split_2lane_enabled`]):
+/// - `"1"` ⇒ force ON,
+/// - `"0"` ⇒ force OFF (the explicit off-switch fallback),
+/// - unset / empty / any other value ⇒ follow the device default
+///   ([`on_device_default`], which is `false` this phase — D-09 pre-verdict).
+///
+/// While the resolver is `false` the on-device histogram entry
 /// ([`kernels::histogram::construct_histogram_for_leaf`]) and the Phase-18/21 tree-growth
 /// driver that will call it stay UNREACHABLE, so the CPU / ROCm / host-CUDA paths are
 /// byte-unchanged. This is the call-site gate the future growth loop checks, exactly as
@@ -1322,9 +1328,55 @@ pub trait Backend {
 /// directly by the anchor tests.
 #[must_use]
 pub fn cuda_on_device_enabled() -> bool {
+    cuda_on_device_override().unwrap_or_else(on_device_default)
+}
+
+/// Pure tri-state MAPPING for `LGBM_CUDA_ON_DEVICE` (D-01, V5 exact-match closed enum).
+///
+/// This is the testable core of [`cuda_on_device_override`]: it does NOT touch the
+/// process env or the OnceLock cache, so unit tests can exercise every branch without
+/// fighting the read-once semantics (Pitfall P-1). Exact-string match only — no eval,
+/// no path/format interpretation of the value (ASVS V5, T-23-01):
+/// - `Some("1")` ⇒ `Some(true)` (force on),
+/// - `Some("0")` ⇒ `Some(false)` (force off),
+/// - `None` / `Some("")` / any other string ⇒ `None` (follow the device default).
+#[doc(hidden)]
+#[must_use]
+pub fn cuda_on_device_override_from(s: Option<&str>) -> Option<bool> {
+    match s {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// The OnceLock-cached tri-state override read from `LGBM_CUDA_ON_DEVICE` (D-01).
+///
+/// Read ONCE per process (P-1) via [`cuda_on_device_override_from`]. Returns
+/// `Some(true)`/`Some(false)` when the operator forces the toggle, `None` when the
+/// env is unset/empty/malformed (defer to [`on_device_default`]). NOT
+/// `#[cfg(feature="cpu")]`-gated (unlike [`split_2lane_enabled`]) because cuda/rocm
+/// builds resolve it too.
+fn cuda_on_device_override() -> Option<bool> {
     use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("LGBM_CUDA_ON_DEVICE").map(|v| v == "1").unwrap_or(false))
+    static E: OnceLock<Option<bool>> = OnceLock::new();
+    *E.get_or_init(|| cuda_on_device_override_from(std::env::var("LGBM_CUDA_ON_DEVICE").ok().as_deref()))
+}
+
+/// The compile-time device default for on-device growth when the env is unset (D-09).
+///
+/// PRE-VERDICT SAFE STATE: returns the literal `false` in THIS plan (23-01), so
+/// cpu / rocm / cuda builds are ALL byte-unchanged vs today (SC-4). Plan 23-04 flips
+/// this body to `cfg!(feature = "cuda")` ONLY after the Kaggle A/B PASS verdict, so
+/// that on-device-default-true can never be reached on a non-cuda build (D-03).
+///
+/// Pitfall P-3 caveat for the future flip: `cfg!(feature = "cuda")` is evaluated in
+/// THIS crate's feature set — a mono-feature (`cuda`-only) build resolves it `true`,
+/// a dual-feature (`cpu`+`cuda`) build resolves it `true` as well, so the 23-04 flip
+/// must keep the `LGBM_CUDA_ON_DEVICE="0"` off-switch as the escape hatch.
+#[must_use]
+fn on_device_default() -> bool {
+    false
 }
 
 /// quick-260620-8v4 opt-in gate for the additive 2-lane native split scan. Read
