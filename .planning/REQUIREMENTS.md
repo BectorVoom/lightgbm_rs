@@ -54,7 +54,7 @@ Scope (locked 2026-06-29): the **entire** on-device CUDA training path mirroring
 
 ### Performance & rollout (the DoD)
 
-- [ ] **ODL-20**: A real-CUDA **Kaggle A/B harness** measures the on-device path's `device_launches/tree` (target well below the 8,570 / 100-trees baseline) and the lgb_rs / official wall-clock ratio at 500k×50 and a wide shape.
+- [x] **ODL-20**: A real-CUDA **Kaggle A/B harness** measures the on-device path's `device_launches/tree` (target well below the 8,570 / 100-trees baseline) and the lgb_rs / official wall-clock ratio at 500k×50 and a wide shape.
 - [x] **ODL-21**: The on-device learner becomes the **DEFAULT** CUDA tree-learner path — contingent on anchor-pinned parity (~1e-6) AND not-slower than the current host-CUDA path on the Kaggle A/B — with the host path retained as the `LGBM_CUDA_ON_DEVICE=0` off-switch fallback.
 
 ## v2 Requirements
@@ -106,7 +106,7 @@ Which phases cover which requirements. Phases renumber from 14 (post-v1.0 perf p
 | ODL-18 | Phase 20 | Complete |
 | ODL-19 | Phase 20 | Complete |
 | ODL-18H | Phase 21 | Complete |
-| ODL-20 | Phase 23 | Pending |
+| ODL-20 | Phase 23 | Complete |
 | ODL-21 | Phase 23 | Complete |
 | ODL-22 | Phase 22 | Pending |
 

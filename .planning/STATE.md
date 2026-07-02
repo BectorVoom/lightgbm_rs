@@ -6,14 +6,14 @@ current_phase: 23
 current_phase_name: perf-validation-default-on-rollout-dod
 status: executing
 stopped_at: Phase 23 context gathered
-last_updated: "2026-07-02T20:37:57.311Z"
+last_updated: "2026-07-02T20:45:53.477Z"
 last_activity: 2026-07-02
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 10
   completed_phases: 9
   total_plans: 48
-  completed_plans: 45
+  completed_plans: 46
   percent: 90
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 ## Current Position
 
 Phase: 23 (perf-validation-default-on-rollout-dod) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
 Last activity: 2026-07-02 — Phase 23 execution started
@@ -587,6 +587,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 21 P03 | 2m | 2 tasks | 2 files |
 | Phase 21 P02 | 40m | 3 tasks | 1 files |
 | Phase 23 P01 | 4min | 3 tasks | 3 files |
+| Phase 23 P02 | 16min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -700,6 +701,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 21-01: GainConfig threaded via additive _with_cfg variant, trait seam byte-unchanged
 - [Phase ?]: D-05 reconciled (21-03): ODL-18/19 marked Complete under Phase 20 (delivered per D-01); new ODL-18H hardening req mapped to Phase 21; ROADMAP Phase 21 body re-cut to hardening scope
 - [Phase ?]: ROADMAP open question resolved (21-03): data->leaf Handle aliasing MOOT for live driver (host per-leaf rows); batched client.read is Phase-23 perf — neither affects Phase-21 parity gate
+- [Phase ?]: 23-02: on-device launch counter lives in lgbm-compute (owner of dispatch sites); phase_prof reads it via public take() accessor — respects crate DAG, no cycle
+- [Phase ?]: 23-02: on_device= folded INSIDE the device_launches= parens so the 23-03 harness short regex captures the total unchanged (Open-Q2)
 
 ### Pending Todos
 
@@ -730,7 +733,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-02T20:37:52.971Z
+Last session: 2026-07-02T20:45:37.312Z
 Stopped at: Phase 23 context gathered
 Resume file: .planning/phases/23-perf-validation-default-on-rollout-dod/23-CONTEXT.md
 
