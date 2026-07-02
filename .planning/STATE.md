@@ -4,14 +4,15 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 20
 current_phase_name: on-device-score-updater-metrics
-status: blocked
+status: executing
 stopped_at: Phase 20 context gathered
-last_updated: "2026-07-02T03:14:04.466Z"
+last_updated: "2026-07-02T04:05:54.246Z"
 last_activity: 2026-07-02
+last_activity_desc: Phase 20 planning complete
 progress:
   total_phases: 10
   completed_phases: 6
-  total_plans: 35
+  total_plans: 36
   completed_plans: 33
   percent: 60
 ---
@@ -29,9 +30,9 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 Phase: 20 (on-device-score-updater-metrics) — EXECUTING
 Plan: 4 of 5
-Status: blocked
+Status: executing
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-02
+Last activity: 2026-07-02 — Phase 20 planning complete
 
 Next: `/gsd-plan-phase 14`
 
@@ -706,7 +707,6 @@ None yet.
 
 - [Phase 7 / 07-02 checkpoint:human-verify, 2026-06-07 — RESOLVED]: the human chose the "ship green, defer blocked cells" disposition. The capture ran (byte-idempotent, 87 fixtures), huber/mape/quantile-spine shipped faithful GREEN (committed), and fair (all) + quantile bagged/iterated were `#[ignore]`'d under DEF-07-02 (07-01-class learner-level split-gain knife-edge; g/h bit-exact ⇒ not an objective bug). 07-02 is COMPLETE. The remaining cells are tracked by DEF-07-02 for a dedicated source-built lib_lightgbm 4.6 FP-trace learner-fix plan. NEVER git-add LightGBM/.
 - Phase-14 percentile skeleton (percentile_{un,}weighted_f32_on) convention unvalidated (no percentile.txt fixture) and diverges from CPU PercentileFun (median 10 vs 11) — reconcile before other consumers rely on it
-- 20-03 scope defect (BLOCKED, replan): grow_tree_on_device in lgbm-compute cannot deliver a bit-exact per-leaf grow loop within its 2-file scope. Needs (a) additive feature/bin-metadata params on the driver signature (currently only gradients/hessians/num_leaves/max_depth) and (b) the per-leaf bookkeeping types LeafSplits/HistogramPool/feature_slot_layout/FeatureColumn which live in lgbm-treelearner (crate ABOVE lgbm-compute -> naming them = crate cycle). Replan 20-03/20-04 with lgbm-treelearner/src/learner.rs added to files_modified and a type-locality decision (relocate metadata to a lower crate OR thread primitive arrays). Also: plan verify cmd omits --features rocm so the hip cell would pass vacuously. 20-00/01/02 shipped.
 
 ## Deferred Items
 
