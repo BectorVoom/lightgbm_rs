@@ -321,11 +321,13 @@ Plans:
 
 **Plans**: 5 plans (4 waves)
 Plans:
+
 - [ ] 22-01-PLAN.md — D-03 runtime categorical slab width + D-06 categorical+quantized host-fallback gate (Wave 1)
 - [ ] 22-02-PLAN.md — GrowFeature categorical metadata + harness grow_features_of plumbing (Wave 1)
 - [ ] 22-03-PLAN.md — Transcribe §6.3 bitset construction + §8.1 categorical evaluator (one-hot + many-vs-many) (Wave 2)
 - [ ] 22-04-PLAN.md — Wire best_split dispatch + grow_driver categorical branch (§9/§10 calls) + Open-Q1 routing isolation (Wave 3)
 - [ ] 22-05-PLAN.md — Real-4.6-golden bit-exact device cells + cpu-f64 structure gate + predict-through (Wave 4)
+
 **Notes**: Layered on the proven Slice (Phases 14–21) numerical driver. The pre-allocated bitset slab (ODL-02 `AllocateCatVectorsKernel` analog) avoids the per-`SplitInfo` `cudaMalloc` that has no clean CubeCL analog. ~70% wiring (§9/§10/predict already exist + anchor-tested); the only new code is the §8.1 eval + §6.3 bitset, both byte-for-byte transcriptions of the golden-proven host `feature_histogram_categorical.rs` (crate-cycle forbids importing). D-01 makes categorical the first on-device subsystem pinned to a REAL 4.6 reference anchor, not a re-transcription.
 
 #### Phase 23: Perf-Validation + Default-On Rollout (DoD)
@@ -342,10 +344,19 @@ Plans:
 
 **Plans**: 4 plans (3 waves)
 Plans:
+**Wave 1**
+
 - [ ] 23-01-PLAN.md — Tri-state `LGBM_CUDA_ON_DEVICE` resolver + `on_device_default()` stub (returns false, pre-verdict D-09) + L-2 learner single-source reconcile (ODL-21) (Wave 1)
 - [ ] 23-02-PLAN.md — L-1 on-device launch instrumentation (compute-owned counter, no crate cycle) surfaced in the phase_prof COUNTS line + local non-zero test (ODL-20) (Wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 23-03-PLAN.md — Committed Kaggle A/B harness (3×2×2 matrix, device_launches parse, D-11 real-CUDA parity, results.{md,json} evidence) + local dry-run parse test over a fixture (ODL-20) (Wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 23-04-PLAN.md — Verdict-gated default-on flip: `on_device_default()`→`cfg!(feature="cuda")` as a SEPARATE commit blocked on the results.md PASS verdict (ODL-21) (Wave 3)
+
 **Notes**: Pure routing/perf, deferred until the win is measured — never auto-engaged before proof (the audit-before-wire value). The improvement magnitude is the genuine empirical unknown. Default-on flips ONLY where the real-CUDA A/B shows a sign-stable not-slower result (the fused-kernel default-off precedent). Multi-stream overlap is a stretch to spike only if launch-count reduction underdelivers. Kaggle CLI authenticated as `boomvector` is the only path to real discrete-CUDA numbers (local GPU is a spoofed APU). **Wave shape:** 1 (tri-state+L-2 ∥ L-1 instrumentation, disjoint files) → 2 (Kaggle harness, needs the `"0"` off-switch + non-zero device_launches) → 3 (verdict-gated flip). SC-4 (ROCm/CPU byte-unchanged) is the hard LOCAL gate; SC-1/SC-2/SC-3-real-numbers + D-11-real-CUDA-parity are Kaggle-only/manual (see 23-VALIDATION.md).
 
 ### Progress (v1.1)
