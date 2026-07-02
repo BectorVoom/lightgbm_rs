@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
-current_phase: 21
-current_phase_name: end-to-end-on-device-driver-integration-parity-gate
+current_phase: 22
+current_phase_name: Feature Coverage
 status: verifying
 stopped_at: Phase 21 context gathered (re-cut to hardening)
-last_updated: "2026-07-02T07:17:44.196Z"
+last_updated: "2026-07-02T07:27:45.127Z"
 last_activity: 2026-07-02
-last_activity_desc: Phase 21 execution started
+last_activity_desc: Phase 21 complete, transitioned to Phase 22
 progress:
   total_phases: 10
   completed_phases: 8
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 ## Current Position
 
-Phase: 21 (end-to-end-on-device-driver-integration-parity-gate) — EXECUTING
-Plan: 3 of 3
+Phase: 22 — On-Device Categorical Splits (Feature Coverage)
+Plan: Not started
 Status: Phase complete — ready for verification
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-02 — Phase 21 execution started
+Last activity: 2026-07-02 — Phase 21 complete, transitioned to Phase 22
 
 Next: `/gsd-plan-phase 14`
 
@@ -476,7 +476,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 
 **Velocity:**
 
-- Total plans completed: 73 (tracked)
+- Total plans completed: 76 (tracked)
 - Average duration: ~3 min
 - Total execution time: <1 hour
 
@@ -499,6 +499,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | 17 | 5 | - | - |
 | 18 | 4 | - | - |
 | 19 | 5 | - | - |
+| 21 | 3 | - | - |
 
 **Plan 01-02:** 3 tasks, 11 files (9 created + 2 modified), 29 new tests; `cargo test --workspace` green.
 **Plan 01-03:** 2 TDD tasks, 3 files modified, 7 new tests (49 → 56); deterministic alias resolution + empty==absent reads; `cargo test --workspace` green.

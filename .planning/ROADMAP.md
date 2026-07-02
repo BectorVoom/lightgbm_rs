@@ -348,6 +348,6 @@ Plans:
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
 | 19. On-Device Objectives | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
-| 21. End-to-End Driver Integration + Parity Gate | v1.1 | 3/3 | Complete   | 2026-07-02 |
+| 21. End-to-End Driver Integration + Parity Gate | v1.1 | 3/3 | Complete    | 2026-07-02 |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
 | 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/? | Not started | - |
