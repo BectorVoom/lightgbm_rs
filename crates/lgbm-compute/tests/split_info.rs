@@ -41,7 +41,7 @@ fn distinct_scalars(seed: i64) -> SplitScalars {
 #[test]
 fn new_allocates_one_buffer_per_field_exactly_once() {
     let client = cpu_client();
-    let split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 8).unwrap();
+    let split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 8, MAX_CAT_PER_SPLIT).unwrap();
     // 18 numeric + num_cat_threshold + 2 reserved categorical slabs = 21 buffers,
     // allocated entirely in `new` (no per-slot / per-record alloc anywhere else).
     assert_eq!(split.device_allocations(), NUM_FIELD_BUFFERS);
@@ -53,7 +53,7 @@ fn allocation_count_unchanged_by_copy_and_writes() {
     // The "allocated exactly once" invariant (D-08): exercising the copy/index/set
     // paths must NOT allocate any new device buffer.
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 4).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 4, MAX_CAT_PER_SPLIT).unwrap();
     split.set_scalars(0, &distinct_scalars(11)).unwrap();
     split.set_cat_thresholds(0, &[1, 2, 3], &[10, 20, 30]).unwrap();
     for _ in 0..50 {
@@ -72,7 +72,7 @@ fn allocation_count_unchanged_by_copy_and_writes() {
 #[test]
 fn set_and_read_scalars_roundtrip() {
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 3).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 3, MAX_CAT_PER_SPLIT).unwrap();
     let s = distinct_scalars(42);
     split.set_scalars(1, &s).unwrap();
     assert_eq!(split.scalars(1), s);
@@ -81,7 +81,7 @@ fn set_and_read_scalars_roundtrip() {
 #[test]
 fn copy_slot_deep_copies_every_field_and_leaves_others_untouched() {
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 4).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 4, MAX_CAT_PER_SPLIT).unwrap();
 
     // Write distinct values into every slot so an accidental cross-slot write is
     // detectable.
@@ -121,7 +121,7 @@ fn cat_thresholds_reserved_to_max_cat_per_split() {
     // The reserved slab accepts exactly MAX_CAT_PER_SPLIT thresholds and rejects one
     // more (Open Q3 — the cap is the only thing that changes the slab length).
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2, MAX_CAT_PER_SPLIT).unwrap();
 
     let full: Vec<u32> = (0..MAX_CAT_PER_SPLIT as u32).collect();
     let full_real: Vec<i32> = (0..MAX_CAT_PER_SPLIT as i32).collect();
@@ -141,7 +141,7 @@ fn cat_thresholds_reserved_to_max_cat_per_split() {
 fn out_of_range_slot_is_rejected() {
     // V5 boundary (threat T-14-04-01): out-of-bounds slot indices error, never UB.
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2, MAX_CAT_PER_SPLIT).unwrap();
     assert!(split.set_scalars(2, &distinct_scalars(1)).is_err());
     assert!(split.copy_slot(0, 2).is_err());
     assert!(split.copy_slot(2, 0).is_err());
@@ -151,20 +151,20 @@ fn out_of_range_slot_is_rejected() {
 #[test]
 fn cat_threshold_length_mismatch_is_rejected() {
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2, MAX_CAT_PER_SPLIT).unwrap();
     assert!(split.set_cat_thresholds(0, &[1, 2], &[1]).is_err());
 }
 
 #[test]
 fn zero_slots_is_rejected() {
     let client = cpu_client();
-    assert!(DeviceSplitInfo::<ActiveRuntime>::new(&client, 0).is_err());
+    assert!(DeviceSplitInfo::<ActiveRuntime>::new(&client, 0, MAX_CAT_PER_SPLIT).is_err());
 }
 
 #[test]
 fn copy_slot_to_self_is_noop() {
     let client = cpu_client();
-    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2).unwrap();
+    let mut split = DeviceSplitInfo::<ActiveRuntime>::new(&client, 2, MAX_CAT_PER_SPLIT).unwrap();
     let s = distinct_scalars(9);
     split.set_scalars(0, &s).unwrap();
     split.copy_slot(0, 0).unwrap();
