@@ -62,9 +62,8 @@ use crate::gain::{
     calculate_splitted_leaf_output, calculate_splitted_leaf_output_f32,
     calculate_splitted_leaf_output_smoothed, calculate_splitted_leaf_output_smoothed_f32,
     get_leaf_gain_given_output, get_leaf_gain_given_output_f32, get_leaf_gain_smoothed,
-    get_leaf_gain_smoothed_f32, get_split_gains, get_split_gains_f32, GainConfig,
+    get_leaf_gain_smoothed_f32, get_split_gains, get_split_gains_f32,
 };
-use crate::kernels::categorical_split::{find_best_threshold_categorical, CategoricalSplit};
 use crate::kernels::random::draw_rand_int32_on;
 use crate::kernels::split_info::SplitScalars;
 
@@ -615,56 +614,25 @@ pub fn validate_stage1_inputs(num_bin: u32, hist_len: usize) -> Result<usize, Co
     Ok(expected)
 }
 
-/// Build the §8.1 categorical evaluator's [`GainConfig`] from the stage-1 scalars
-/// (Phase-22 dispatch seam). The per-feature categorical knobs
-/// (`cat_l2`/`cat_smooth`/`max_cat_threshold`/`max_cat_to_onehot`/`min_data_per_group`)
-/// are NOT carried by [`Stage1Scalars`]: the CUDA-mirror stage-1 seam is not fed
-/// per-feature categorical config — the LIVE grow driver threads those through
-/// `GrowFeature` (22-04 Task 2, `grow_driver.rs`) — so the [`GainConfig`] defaults
-/// apply on this seam. The numeric gain knobs are threaded through verbatim.
-fn categorical_gain_config(scalars: &Stage1Scalars) -> GainConfig {
-    GainConfig {
-        min_data_in_leaf: scalars.min_data_in_leaf,
-        min_sum_hessian_in_leaf: scalars.min_sum_hessian_in_leaf,
-        lambda_l1: scalars.lambda_l1,
-        lambda_l2: scalars.lambda_l2,
-        min_gain_to_split: scalars.min_gain_to_split,
-        path_smooth: scalars.path_smooth,
-        ..GainConfig::default()
-    }
-}
-
-/// Map a [`CategoricalSplit`] (§8.1 evaluator, 22-03) into the numeric
-/// [`SplitScalars`] shape, mirroring the numeric mapping in the stage-1 launchers.
-/// `num_cat_threshold` carries the real winning-category count (the numeric path
-/// leaves it `0`); `threshold` is unused for categorical splits (the bitset
-/// replaces it). `is_valid` semantics are preserved — a categorical result with no
-/// admissible gain maps to the `is_valid=false` default (never manufacture a split).
-fn categorical_split_scalars(cat: &CategoricalSplit, inner_feature_index: i32) -> SplitScalars {
-    if !cat.is_splittable() {
-        return SplitScalars::default();
-    }
-    let s = &cat.split;
-    SplitScalars {
-        is_valid: true,
-        leaf_index: -1,
-        gain: s.gain,
-        inner_feature_index,
-        threshold: 0,
-        default_left: s.default_left,
-        left_sum_gradients: s.left_sum_gradient,
-        left_sum_hessians: s.left_sum_hessian,
-        left_sum_gh_quant: 0,
-        left_count: s.left_count,
-        left_gain: 0.0,
-        left_value: s.left_output,
-        right_sum_gradients: s.right_sum_gradient,
-        right_sum_hessians: s.right_sum_hessian,
-        right_sum_gh_quant: 0,
-        right_count: s.right_count,
-        right_gain: 0.0,
-        right_value: s.right_output,
-        num_cat_threshold: cat.cat_threshold.len() as i32,
+/// WR-02: the stage-1 CUDA-mirror launchers are NOT fed the five per-feature
+/// categorical knobs (`cat_l2`/`cat_smooth`/`max_cat_threshold`/`max_cat_to_onehot`/
+/// `min_data_per_group`) — [`Stage1Scalars`] carries only the numeric gain knobs.
+/// Evaluating a categorical task here previously fell back to `GainConfig::default()`
+/// (10.0 / 10.0 / 32 / 4 / 100) SILENTLY, so any categorical split found on this seam
+/// used the wrong config regardless of the user's actual settings (e.g. the
+/// `min_data_per_group = 100` default would suppress many-vs-many on small leaves).
+/// The LIVE grow driver (`grow_driver::scan_leaf`) does NOT use this seam — it calls
+/// [`find_best_threshold_categorical`] directly with the per-feature
+/// `categorical_feature_config` threaded through `GrowFeature`. Rather than silently
+/// produce wrong answers, the stage-1 categorical branch returns this typed error.
+fn categorical_seam_unsupported() -> ComputeError {
+    ComputeError::Runtime {
+        detail: "stage1 seam: categorical config not supplied — the CUDA-mirror stage-1 \
+                 launchers do not carry the per-feature categorical knobs (cat_l2/cat_smooth/\
+                 max_cat_threshold/max_cat_to_onehot/min_data_per_group). Evaluate categorical \
+                 features through grow_driver::scan_leaf (find_best_threshold_categorical with \
+                 the per-feature categorical config), not this seam (WR-02)."
+            .to_string(),
     }
 }
 
@@ -676,13 +644,17 @@ fn categorical_split_scalars(cat: &CategoricalSplit, inner_feature_index: i32) -
 /// cubecl-hip (the f32 mirror is the separate [`split_eval_kernel_f32`] path, 17-03
 /// Task 2, anchored to THIS fold — never GPU-vs-GPU, def-f8u-01).
 ///
-/// The categorical task is the Phase-22 dispatch seam (D-04): a categorical task
-/// returns the `is_valid=false` sentinel WITHOUT running the numerical core (no
-/// `BitonicArgSort`/`cat_threshold` eval).
+/// The categorical task is the numeric-only stage-1 seam's out-of-scope case: this
+/// CUDA-mirror launcher is NOT fed the per-feature categorical config, so a
+/// categorical task returns a typed [`ComputeError`] ([`categorical_seam_unsupported`],
+/// WR-02) rather than silently evaluating with `GainConfig` defaults. Categorical
+/// features are evaluated by the live grow driver (`grow_driver::scan_leaf`), which
+/// calls [`find_best_threshold_categorical`](crate::kernels::categorical_split::find_best_threshold_categorical)
+/// directly with the per-feature config.
 ///
 /// # Errors
-/// [`ComputeError`] from [`validate_stage1_inputs`] (bad `num_bin` / histogram length)
-/// or the USE_RAND draw.
+/// [`ComputeError`] from [`validate_stage1_inputs`] (bad `num_bin` / histogram length),
+/// the USE_RAND draw, or [`categorical_seam_unsupported`] for a categorical task.
 pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
     hist: &[f64],
@@ -691,25 +663,10 @@ pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
 ) -> Result<SplitScalars, ComputeError> {
     validate_stage1_inputs(task.num_bin, hist.len())?;
 
-    // Phase-22 categorical dispatch seam (D-04→22-04): the numerical core is
-    // continuous-only; a categorical task evaluates via the §8.1 finder and maps into
-    // `SplitScalars` (with `num_cat_threshold`). W-4 kEpsilon single-bump contract:
-    // `scalars.sum_hessian` arrives ALREADY `+2*kEpsilon` bumped by the driver
-    // (learner.rs:2760 analog) — this seam PASSES IT THROUGH and does NOT bump here
-    // (the evaluator's caller contract, 22-03 Pitfall 2). Double-bump/missed-bump is a
-    // last-ULP silent divergence (DEF-07-11-01 guard).
     if task.is_categorical {
-        let cat = find_best_threshold_categorical(
-            client,
-            hist,
-            &categorical_gain_config(scalars),
-            task.num_bin as i32,
-            i32::from(task.mfb_offset),
-            scalars.sum_gradient,
-            scalars.sum_hessian,
-            scalars.num_data,
-        )?;
-        return Ok(categorical_split_scalars(&cat, task.inner_feature_index));
+        // WR-02: this seam is not fed the per-feature categorical config; fail loudly
+        // instead of silently evaluating with GainConfig defaults.
+        return Err(categorical_seam_unsupported());
     }
 
     let num_bin_i = task.num_bin as i32;
@@ -1025,23 +982,12 @@ pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
     scalars: &Stage1Scalars,
 ) -> Result<SplitScalars, ComputeError> {
     validate_stage1_inputs(task.num_bin, hist.len())?;
-    // Phase-22 categorical dispatch seam (D-04→22-04). Categorical is ALWAYS the f64
-    // single-owner anchor (def-f8u-01 — never a second GPU f32 categorical path), so
-    // widen the f32 histogram to f64 and evaluate via the §8.1 finder. W-4: sum_hessian
-    // arrives pre-bumped by the driver; this seam PASSES IT THROUGH (does NOT bump).
+    // Phase-22 categorical seam (D-04→22-04): this CUDA-mirror launcher is not fed the
+    // per-feature categorical config, so a categorical task fails loudly (WR-02) rather
+    // than silently evaluating with GainConfig defaults. Categorical is ALWAYS the f64
+    // single-owner anchor (def-f8u-01) — the live driver's `scan_leaf` handles it.
     if task.is_categorical {
-        let hist_f64: Vec<f64> = hist.iter().map(|&x| f64::from(x)).collect();
-        let cat = find_best_threshold_categorical(
-            client,
-            &hist_f64,
-            &categorical_gain_config(scalars),
-            task.num_bin as i32,
-            i32::from(task.mfb_offset),
-            scalars.sum_gradient,
-            scalars.sum_hessian,
-            scalars.num_data,
-        )?;
-        return Ok(categorical_split_scalars(&cat, task.inner_feature_index));
+        return Err(categorical_seam_unsupported());
     }
     let num_bin_i = task.num_bin as i32;
     let rand_threshold: i32 = if scalars.use_rand && num_bin_i - 2 > 0 {
@@ -1896,22 +1842,12 @@ pub fn find_best_splits_stage1_globalmem_f32_on<R: cubecl::Runtime>(
     plane_dim: u32,
 ) -> Result<SplitScalars, ComputeError> {
     validate_stage1_inputs(task.num_bin, hist.len())?;
-    // Phase-22 categorical dispatch seam (D-04→22-04). Categorical always uses the f64
-    // single-owner anchor (def-f8u-01); widen the f32 histogram to f64 and evaluate via
-    // the §8.1 finder. W-4: sum_hessian arrives pre-bumped by the driver; PASS THROUGH.
+    // Phase-22 categorical seam (D-04→22-04): this CUDA-mirror launcher is not fed the
+    // per-feature categorical config, so a categorical task fails loudly (WR-02) rather
+    // than silently evaluating with GainConfig defaults. Categorical is ALWAYS the f64
+    // single-owner anchor (def-f8u-01) — the live driver's `scan_leaf` handles it.
     if task.is_categorical {
-        let hist_f64: Vec<f64> = hist.iter().map(|&x| f64::from(x)).collect();
-        let cat = find_best_threshold_categorical(
-            client,
-            &hist_f64,
-            &categorical_gain_config(scalars),
-            task.num_bin as i32,
-            i32::from(task.mfb_offset),
-            scalars.sum_gradient,
-            scalars.sum_hessian,
-            scalars.num_data,
-        )?;
-        return Ok(categorical_split_scalars(&cat, task.inner_feature_index));
+        return Err(categorical_seam_unsupported());
     }
     let num_bin_i = task.num_bin as i32;
     let fnbmo = (task.num_bin as usize).saturating_sub(task.mfb_offset as usize);
