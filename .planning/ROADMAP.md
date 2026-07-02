@@ -82,7 +82,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 - [x] **Phase 17: On-Device Best-Split Finder** — Per-feature split evaluation + cross-feature/cross-leaf argmax with a single small readback; tie-aware `default_left`. (completed 2026-07-01)
 - [x] **Phase 18: On-Device Data Partition, Tree Mutation & Prediction** — mark→prefix-sum→scatter row routing + pool pointer swap; Split-before-partition; tree-walk predict. (completed 2026-07-01)
 - [x] **Phase 19: On-Device Objectives** — Regression-family / binary / multiclass / ranking grad-hess + ConvertOutput/BoostFromScore/RenewTreeOutput, all anchor-pinned. (completed 2026-07-01)
-- [ ] **Phase 20: On-Device Score Updater & Metrics (+ pulled-forward on-device driver, D-01)** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host; PLUS the pulled-forward end-to-end on-device grow loop (ODL-18/19) with STRUCTURE bit-exact gate. (5 plans)
+- [x] **Phase 20: On-Device Score Updater & Metrics (+ pulled-forward on-device driver, D-01)** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host; PLUS the pulled-forward end-to-end on-device grow loop (ODL-18/19) with STRUCTURE bit-exact gate. (5 plans) (completed 2026-07-02)
 - [ ] **Phase 21: Hardening/Slack (was End-to-End Driver — absorbed into Phase 20 per D-01)** — ODL-18/19 moved into Phase 20; Phase 21 reduces to hardening or folds into 22/23. Re-cut via `/gsd-phase` before planning.
 - [ ] **Phase 22: On-Device Categorical Splits (Feature Coverage)** — Bitset construction + categorical split eval + categorical partition + SplitCategorical, via the pre-allocated bitset.
 - [ ] **Phase 23: Perf-Validation + Default-On Rollout (DoD)** — Kaggle A/B (`device_launches` + wall-clock ratio); flip default-ON for CUDA contingent on parity + not-slower; host fallback retained.
@@ -262,7 +262,7 @@ Plans:
   5. *(pulled fwd, ODL-18)* The on-device driver runs the full per-leaf grow loop end-to-end and reconstitutes into `(Tree, DataPartition)`; the grown tree is STRUCTURE bit-exact to the cpu f64 anchor (tie-aware `default_left`), leaf values within ~1e-5. (§6, §16)
   6. *(pulled fwd, ODL-19)* Every new kernel keeps f32 + u64 fixed-point build with no f64 per-row hot loops; CPU / ROCm / host-CUDA byte-unchanged with `LGBM_CUDA_ON_DEVICE` unset. (§17)
 
-**Plans**: 3/6 plans executed *(20-03 split into 20-03a/20-03b on replan — see below)*
+**Plans**: 6/6 plans complete
 **Wave 1**
 
 - [x] 20-00-PLAN.md — Wave 0 scaffolding: capture 4 missing metric goldens + register 3 new module stubs + metric_supported discriminator (ODL-17)
@@ -274,15 +274,15 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 20-03a-PLAN.md — Pulled-forward driver, SAFE slice: additive GrowFeature metadata on grow_tree_on_device (reachable types only, no crate cycle) + gated discriminator flip (CpuBackend + GpuBackend<R>) + learner call-site wiring + data→leaf Handle buffer A/B lock; body still Ok(None), byte-unchanged (ODL-18, ODL-19)
+- [x] 20-03a-PLAN.md — Pulled-forward driver, SAFE slice: additive GrowFeature metadata on grow_tree_on_device (reachable types only, no crate cycle) + gated discriminator flip (CpuBackend + GpuBackend<R>) + learner call-site wiring + data→leaf Handle buffer A/B lock; body still Ok(None), byte-unchanged (ODL-18, ODL-19)
 
 **Wave 4** *(blocked on Wave 3)*
 
-- [ ] 20-03b-PLAN.md — Pulled-forward driver, BODY: minimal per-leaf best-first grow orchestration in lgbm-compute grow_driver.rs (own bookkeeping, no LeafSplits/HistogramPool) + grow_tree_on_device returns Some + activated STRUCTURE bit-exact gate vs cpu f64 anchor (non-vacuous, default cpu build) + no-f64 review (ODL-18, ODL-19)
+- [x] 20-03b-PLAN.md — Pulled-forward driver, BODY: minimal per-leaf best-first grow orchestration in lgbm-compute grow_driver.rs (own bookkeeping, no LeafSplits/HistogramPool) + grow_tree_on_device returns Some + activated STRUCTURE bit-exact gate vs cpu f64 anchor (non-vacuous, default cpu build) + no-f64 review (ODL-18, ODL-19)
 
 **Wave 5** *(blocked on Wave 4)*
 
-- [ ] 20-04-PLAN.md — Resident-loop integration: GBDT §16 sequencing + resident-score A/B (ODL-16, ODL-19)
+- [x] 20-04-PLAN.md — Resident-loop integration: GBDT §16 sequencing + resident-score A/B (ODL-16, ODL-19)
 
 **Notes**: Small kernel subsystems (§11 = 45 lines, §12 = 78 lines) but D-01 pulled Phase 21's full on-device grow loop (ODL-18/19) forward, making this a large, higher-risk end-to-end phase. The boosting-layer glue keeps the score resident across iterations (`boosting_on_cuda_`). The 12 pointwise losses are all regression/binary; everything else stays host-side per the reference's own `#ifdef USE_CUDA` branch. Anchored to the cpu f64 fold (never GPU-vs-GPU). Pitfalls at plan time: only 8/12 metric goldens existed (Wave 0 captures 4); `GpuBackend<R>` is one shared impl (gate the flip behind `cuda_on_device_enabled()` so ROCm-env-unset stays false); data→leaf map alias-vs-double-buffer resolved in 20-03a. **Replan (2026-07-02):** the original 20-03 was BLOCKED — a 2-file lgbm-compute-only scope could not deliver a bit-exact grow loop (grow_tree_on_device carried no feature metadata; LeafSplits/HistogramPool are lgbm-treelearner types unnameable from lgbm-compute → crate cycle; the verify cmd omitted `--features rocm` so the hip cell passed vacuously). Resolution (Option A, honors D-01): keep the driver body in lgbm-compute, add an additive `GrowFeature` metadata struct (BinColumn + lgbm-dataset BinType/MissingType — the kernels already consume `FeatureMeta`/`BinColumn`, never FeatureColumn) and a purpose-built native orchestration with its own bookkeeping; split into 20-03a (safe plumbing, byte-unchanged, verifiable now) + 20-03b (bit-exact body + STRUCTURE gate). The STRUCTURE gate runs on the cubecl-cpu runtime in the DEFAULT merge-gate lane (gated CpuBackend flip), non-vacuous without rocm hardware.
 
@@ -341,7 +341,7 @@ Plans:
 | 17. On-Device Best-Split Finder | v1.1 | 5/5 | Complete    | 2026-07-01 |
 | 18. On-Device Data Partition, Tree Mutation & Prediction | v1.1 | 4/4 | Complete    | 2026-07-01 |
 | 19. On-Device Objectives | v1.1 | 5/5 | Complete    | 2026-07-01 |
-| 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 3/5 | In Progress|  |
+| 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 0/? | Not started | - |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
 | 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/? | Not started | - |
