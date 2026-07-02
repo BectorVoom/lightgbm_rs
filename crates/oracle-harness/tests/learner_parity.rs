@@ -1540,6 +1540,141 @@ fn learner_parity_categorical_manyvsmany() {
     run_categorical_cell("cat_manyvsmany");
 }
 
+/// 22-05 (D-01 #2): grow `name`'s categorical fixture through the DEVICE driver
+/// (`grow_tree_on_device_driver_with_cfg`) on the cubecl-cpu f64 lane and assert the
+/// resulting tree is STRUCTURE bit-exact to the cpu f64 anchor (`cpu_anchor_tree`),
+/// tie-aware on `default_left`. Because `CpuBackend` runs f64-vs-f64 there are no f32
+/// near-ties in practice, but the tie-aware comparator is the contract (must_have #2).
+/// NEVER GPU-vs-GPU (def-f8u-01): both trees are the f64 fold. SKIP-passes only if the
+/// in-repo sidecar is absent (it is present → the case runs). Callers gate on
+/// `LGBM_CUDA_ON_DEVICE` so the env-unset merge-gate run is byte-unchanged (SC #4).
+fn assert_categorical_device_structure_gate(name: &str) {
+    let Some(sidecar) = load_cat_sidecar(name) else {
+        return;
+    };
+    let client = cpu_client();
+    let (features, g, h, cfg, nl, md) = cat_corpus(&sidecar);
+    let grow_features = grow_features_of(&features, &cfg);
+    let (device_tree, layout) =
+        lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+            &client, &g, &h, &grow_features, nl, md, cfg,
+        )
+        .expect("device categorical grow ok");
+    let anchor = cpu_anchor_tree(&features, &g, &h, cfg, nl, md);
+    assert!(
+        device_tree.num_cat >= 1,
+        "{name}: a categorical split must be grown on device"
+    );
+    assert_on_device_tree_matches_cpu_anchor(
+        &device_tree,
+        &anchor,
+        &format!("on-device-cat:{name}"),
+    );
+    assert_eq!(
+        layout.num_data as usize,
+        g.len(),
+        "{name}: device layout covers every row"
+    );
+    assert_eq!(
+        layout.leaf_count.iter().sum::<i32>(),
+        g.len() as i32,
+        "{name}: device layout partitions all rows across leaves"
+    );
+}
+
+/// 22-05 (D-01 #1 + SC #3): the FIDELITY UPGRADE — pin the DEVICE-grown categorical
+/// tree bit-exact to the REAL lib_lightgbm 4.6 golden (the same four asserts as
+/// `run_categorical_cell`: `num_cat`, the `kCategoricalMask` decision bit, `cat_boundaries`,
+/// and the REAL category bitset `cat_threshold`), plus the full learner-authoritative
+/// fields, then round-trip PREDICTION through the categorical bitset on the device tree
+/// (SC #3). Categorical is thereby the FIRST on-device subsystem anchored to a real
+/// reference (not a host re-transcription). Gated behind `LGBM_CUDA_ON_DEVICE`; the
+/// sidecar/golden loaders SKIP-pass when absent (both are present in-repo → runs).
+fn run_categorical_cell_on_device(name: &str) {
+    if std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("1") {
+        eprintln!(
+            "learner_parity: SKIP {name} on-device categorical cell (LGBM_CUDA_ON_DEVICE unset)"
+        );
+        return;
+    }
+    let Some(sidecar) = load_cat_sidecar(name) else {
+        return;
+    };
+    let Some(golden) = load_real_tree(&categorical_dir().join(format!("{name}.txt"))) else {
+        return;
+    };
+    let client = cpu_client();
+    let (features, g, h, cfg, nl, md) = cat_corpus(&sidecar);
+    let grow_features = grow_features_of(&features, &cfg);
+    let (tree, _layout) =
+        lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+            &client, &g, &h, &grow_features, nl, md, cfg,
+        )
+        .expect("device categorical grow ok");
+
+    // (1) DEVICE tree: decision_type categorical bit + num_cat match the real golden.
+    assert!(tree.num_cat >= 1, "{name}: a categorical split was grown on device");
+    assert_eq!(tree.num_cat, golden.num_cat, "{name}: device num_cat != golden");
+    for (i, &dt) in tree.decision_type.iter().enumerate() {
+        assert_eq!(
+            dt & 1,
+            golden.decision_type[i] & 1,
+            "{name}: device node {i} CATEGORICAL_MASK bit != golden"
+        );
+    }
+    // (2) DEVICE tree: cat_boundaries + the REAL category bitset bit-exact vs golden.
+    assert_eq!(
+        tree.cat_boundaries, golden.cat_boundaries,
+        "{name}: device cat_boundaries != golden"
+    );
+    assert_eq!(
+        tree.cat_threshold, golden.cat_threshold,
+        "{name}: device cat_threshold (real category bitset) != golden"
+    );
+    // (3) DEVICE tree: full learner-authoritative fields bit-exact (incl. shrinkage'd leaf).
+    assert_real_tree_parity(
+        &format!("on-device:{name}"),
+        &tree,
+        &golden,
+        sidecar.shrinkage_or_default(),
+    );
+    // (4) SC #3 predict-through: route EVERY training row through the categorical bitset
+    // on the DEVICE tree (`find_in_bitset` via `predict_leaf_index`), and through the
+    // model-text round-trip, asserting the leaf assignment survives serialization AND
+    // matches the golden's routing. This exercises the real bitset routing code path.
+    let txt = tree.to_string();
+    let reparsed = Tree::parse(&txt).expect("device categorical tree round-trips");
+    assert_eq!(reparsed.to_string(), txt, "{name}: device model-text round-trip");
+    for (row, &bin) in sidecar.bins.iter().enumerate() {
+        let cat = sidecar.bin_2_categorical[bin as usize];
+        let fv = [f64::from(cat)];
+        let leaf_dev = tree.predict_leaf_index(&fv);
+        assert_eq!(
+            leaf_dev,
+            reparsed.predict_leaf_index(&fv),
+            "{name}: row {row} leaf changed across device model-text round-trip"
+        );
+        assert_eq!(
+            leaf_dev,
+            golden.predict_leaf_index(&fv),
+            "{name}: row {row} device categorical bitset routing != golden"
+        );
+    }
+}
+
+/// D-01 #1 / SC #3 (device): one-hot fixture, DEVICE tree pinned to the real 4.6 golden.
+#[test]
+fn learner_parity_categorical_onehot_on_device() {
+    run_categorical_cell_on_device("cat_onehot");
+}
+
+/// D-01 #1 / SC #3 (device): many-vs-many fixture (the sorted-eval linchpin), DEVICE
+/// tree pinned to the real 4.6 golden through the full device grow loop.
+#[test]
+fn learner_parity_categorical_manyvsmany_on_device() {
+    run_categorical_cell_on_device("cat_manyvsmany");
+}
+
 /// D-06 NO-REGRESSION GATE (plan 07-08): an EXPLICIT assertion in this wave that
 /// the bit-exact numeric-spine goldens still replay bit-exact AFTER the additive
 /// categorical re-open. The categorical branch is purely additive and must not
@@ -2388,6 +2523,16 @@ fn learner_parity_on_device_structure_gate() {
             grown.is_none(),
             "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
         );
+    }
+
+    // 22-05 (D-01 #2): extend the STRUCTURE gate to the categorical device path. Gated
+    // behind LGBM_CUDA_ON_DEVICE so the default env-unset merge-gate run stays byte-green
+    // (numeric path only, SC #4). Both fixtures drive the DEVICE driver on the cubecl-cpu
+    // f64 lane and pin STRUCTURE bit-exact to the cpu f64 anchor, tie-aware on default_left.
+    // NEVER GPU-vs-GPU (def-f8u-01): both trees are the f64 fold.
+    if env_on {
+        assert_categorical_device_structure_gate("cat_onehot");
+        assert_categorical_device_structure_gate("cat_manyvsmany");
     }
 }
 
