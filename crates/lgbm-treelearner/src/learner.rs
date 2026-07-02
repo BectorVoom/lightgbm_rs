@@ -293,8 +293,12 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// (default, ALWAYS on CpuBackend) takes the existing resident/host routing.
     fused_eligible: bool,
     /// ODL-01 (Phase 14, D-05): whether THIS learner is eligible to grow whole
-    /// trees on-device. Computed ONCE at [`new`](Self::new) as
-    /// `backend.on_device_growth_supported() && cuda_on_device_env()` and read at
+    /// trees on-device. The base gate is computed at [`new`](Self::new) as
+    /// `backend.on_device_growth_supported() && cuda_on_device_env()`, then
+    /// [`refresh_on_device_eligibility`](Self::refresh_on_device_eligibility)
+    /// re-applies the D-06 categorical+quantized host-fallback gate
+    /// ([`on_device_eligible_gate`]) from [`with_features`](Self::with_features) /
+    /// [`with_quantized_grad`](Self::with_quantized_grad) (setup-time, once) — read at
     /// the TOP of `train_inner` to route the decide-once on-device fork. Unlike
     /// [`resident_eligible`](Self::resident_eligible) (recomputed per train), this
     /// is NOT recomputed in `train_inner` — on-device eligibility has no per-train,
@@ -304,6 +308,20 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// means CpuBackend (false) — and GpuBackend<R> (false in Slice 0) — can NEVER
     /// be eligible regardless of the env, so the host path is byte-unchanged.
     on_device_eligible: bool,
+    /// D-06 (Phase 22): whether `config.use_quantized_grad` is on. Set via
+    /// [`with_quantized_grad`](Self::with_quantized_grad) (default `false` — the spine
+    /// path). The CUDA reference `asm("trap;")`s on the categorical + quantized combo
+    /// (it has NO on-device categorical+quantized path), so when this is `true` AND any
+    /// feature is [`BinType::Categorical`], the on-device eligibility gate demotes to
+    /// the host (see [`on_device_eligible_gate`]). Read only inside
+    /// [`refresh_on_device_eligibility`](Self::refresh_on_device_eligibility); the
+    /// numeric+quantized and categorical-without-quantized combos are UNCHANGED.
+    use_quantized_grad: bool,
+    /// D-06: one-shot guard so the categorical+quantized host-fallback notice is
+    /// logged EXACTLY once (the eligibility recompute may run from more than one
+    /// builder). With `LGBM_CUDA_ON_DEVICE` unset the base gate is `false`, so the
+    /// notice never fires and the default lane emits nothing (SC #4).
+    cat_quant_fallback_logged: bool,
     /// quick-260621-p9v (spike-014b lever): whether the per-train resident-bin device
     /// upload has already run THIS train. The binned columns are immutable for the whole
     /// train and `RocmBackend` is one instance per `train()` (its `resident_bins` cache
@@ -454,6 +472,25 @@ fn cuda_on_device_env() -> bool {
     matches!(std::env::var("LGBM_CUDA_ON_DEVICE").as_deref(), Ok("1"))
 }
 
+/// D-06 host-fallback gate (Phase 22): the CUDA reference `asm("trap;")`s on the
+/// categorical + `use_quantized_grad` combo — it has NO on-device categorical+quantized
+/// path. Mirror that non-support HONESTLY by ANDing `!(has_categorical_feature &&
+/// use_quantized_grad)` into `on_device_eligible`, so the combo routes to the host
+/// (no silent wrong answer). This lives in the learner (not `lgbm-compute`) because
+/// `on_device_growth_supported()` takes no config args and cannot see
+/// `use_quantized_grad` / per-feature `bin_type` (RESEARCH A4).
+///
+/// Every OTHER combo is unchanged: numeric-only + quantized stays eligible, and
+/// categorical-without-quantized stays eligible (when the device is otherwise on).
+#[must_use]
+pub(crate) fn on_device_eligible_gate(
+    base_eligible: bool,
+    has_categorical_feature: bool,
+    use_quantized_grad: bool,
+) -> bool {
+    base_eligible && !(has_categorical_feature && use_quantized_grad)
+}
+
 impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// Construct the learner over a `Backend` + its client and the gain/cap config.
     ///
@@ -495,7 +532,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // and GpuBackend<R> (false in Slice 0) — ineligible regardless of the
             // env, so with `LGBM_CUDA_ON_DEVICE` unset every backend is false and
             // the host path is byte-unchanged.
+            // D-06 base gate: features are empty here and `use_quantized_grad` defaults
+            // false, so the categorical+quantized negation is a no-op at construction —
+            // it is (re)applied in `refresh_on_device_eligibility`, called from
+            // `with_features` / `with_quantized_grad` once the inputs are known.
             on_device_eligible: backend.on_device_growth_supported() && cuda_on_device_env(),
+            // D-06 (Phase 22): default OFF (spine path); set via `with_quantized_grad`.
+            use_quantized_grad: false,
+            cat_quant_fallback_logged: false,
             // quick-260621-p9v: no upload yet; first tree of the train uploads once.
             resident_bins_uploaded: false,
             // R3 (260614-p0n): filled lazily on the first leaf-histogram build.
@@ -3762,7 +3806,48 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // quick-260621-p9v: a new feature set makes the device-resident bin cache stale,
         // so force the next train to re-upload (the once-per-train guard re-arms).
         self.resident_bins_uploaded = false;
+        // D-06: the feature set determines `has_categorical_feature`, so re-apply the
+        // categorical+quantized host-fallback gate now that the columns are known.
+        self.refresh_on_device_eligibility();
         self
+    }
+
+    /// D-06 (Phase 22): declare whether `config.use_quantized_grad` is on. Default
+    /// `false` (the spine path — NOT calling this is byte-identical to the pre-D-06
+    /// behavior). When `true` AND any attached feature is [`BinType::Categorical`], the
+    /// on-device eligibility gate demotes to the host (mirroring the reference
+    /// `asm("trap;")` non-support), logging one line. Every other combo is unchanged.
+    #[must_use]
+    pub fn with_quantized_grad(mut self, use_quantized_grad: bool) -> Self {
+        self.use_quantized_grad = use_quantized_grad;
+        self.refresh_on_device_eligibility();
+        self
+    }
+
+    /// D-06: recompute [`on_device_eligible`](Self::on_device_eligible) from the base
+    /// backend/env gate ANDed with the categorical+quantized host-fallback
+    /// ([`on_device_eligible_gate`]). Called from [`with_features`](Self::with_features)
+    /// and [`with_quantized_grad`](Self::with_quantized_grad) (each runs once at setup,
+    /// before any `train`), preserving the "compute once, NOT per-train" property (D-05).
+    /// With `LGBM_CUDA_ON_DEVICE` unset the base gate is `false`, so the result is
+    /// `false` and NOTHING is logged (SC #4 byte-unchanged default lane).
+    fn refresh_on_device_eligibility(&mut self) {
+        let base = self.backend.on_device_growth_supported() && cuda_on_device_env();
+        let has_categorical_feature =
+            self.features.iter().any(|f| f.bin_type == BinType::Categorical);
+        let eligible =
+            on_device_eligible_gate(base, has_categorical_feature, self.use_quantized_grad);
+        // D-06 host-fallback notice: log EXACTLY once, only when the combo actually
+        // demotes an otherwise-eligible device (base true). Guarded so re-running the
+        // recompute from a second builder does not double-log.
+        if base && !eligible && !self.cat_quant_fallback_logged {
+            eprintln!(
+                "[LightGBM] [Info] on-device categorical + use_quantized_grad is unsupported \
+                 (mirrors the CUDA reference asm(\"trap;\")); training on the host."
+            );
+            self.cat_quant_fallback_logged = true;
+        }
+        self.on_device_eligible = eligible;
     }
 
     /// Set the W10 advanced learner constraints (ADV-01..05). The `Default`
@@ -4127,6 +4212,50 @@ mod tests {
             ..Default::default()
         };
         (f, gradients, hessians)
+    }
+
+    /// D-06 (Phase 22): the categorical + `use_quantized_grad` combo must route to the
+    /// host — the CUDA reference `asm("trap;")`s on it (no on-device path). The gate
+    /// [`on_device_eligible_gate`] ANDs `!(has_categorical_feature && use_quantized_grad)`
+    /// into eligibility; every OTHER combo is unchanged. The three-case truth table is
+    /// asserted with `base_eligible = true` (deterministic — no env manipulation), and a
+    /// real learner (env unset ⇒ base false) confirms the field wiring + the
+    /// `has_categorical_feature` predicate.
+    #[test]
+    fn on_device_eligible_false_for_categorical_plus_quantized() {
+        // --- Truth table on the pure gate (base_eligible = device otherwise ON) ---
+        // (a) categorical + quantized => host fallback (INELIGIBLE).
+        assert!(
+            !on_device_eligible_gate(true, true, true),
+            "(a) categorical + quantized must be ineligible (host fallback)"
+        );
+        // (b) categorical WITHOUT quantized => UNCHANGED (eligible when base on).
+        assert!(
+            on_device_eligible_gate(true, true, false),
+            "(b) categorical-without-quantized must stay eligible"
+        );
+        // (c) numeric-only + quantized => UNCHANGED (eligible when base on).
+        assert!(
+            on_device_eligible_gate(true, false, true),
+            "(c) numeric-only + quantized must stay eligible"
+        );
+        // A base-ineligible device stays ineligible for every combo.
+        assert!(!on_device_eligible_gate(false, true, true));
+        assert!(!on_device_eligible_gate(false, false, false));
+
+        // --- Learner wiring: env unset ⇒ base false ⇒ eligible false for the combo. ---
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (mut cat, _g, _h) = splittable_feature();
+        cat.bin_type = BinType::Categorical;
+        let learner = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 8, -1)
+            .with_features(vec![cat])
+            .with_quantized_grad(true);
+        assert!(
+            !learner.on_device_eligible,
+            "categorical + quantized learner must not be on-device eligible"
+        );
+        assert!(learner.use_quantized_grad, "with_quantized_grad must set the flag");
     }
 
     #[test]
