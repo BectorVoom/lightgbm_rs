@@ -2525,15 +2525,19 @@ fn learner_parity_on_device_structure_gate() {
         );
     }
 
-    // 22-05 (D-01 #2): extend the STRUCTURE gate to the categorical device path. Gated
-    // behind LGBM_CUDA_ON_DEVICE so the default env-unset merge-gate run stays byte-green
-    // (numeric path only, SC #4). Both fixtures drive the DEVICE driver on the cubecl-cpu
-    // f64 lane and pin STRUCTURE bit-exact to the cpu f64 anchor, tie-aware on default_left.
-    // NEVER GPU-vs-GPU (def-f8u-01): both trees are the f64 fold.
-    if env_on {
-        assert_categorical_device_structure_gate("cat_onehot");
-        assert_categorical_device_structure_gate("cat_manyvsmany");
-    }
+    // 22-05 (D-01 #2): extend the STRUCTURE gate to the categorical device path. Both
+    // fixtures drive the DEVICE driver (`grow_tree_on_device_driver_with_cfg`) on the
+    // cubecl-cpu f64 lane and pin STRUCTURE bit-exact to the cpu f64 anchor, tie-aware
+    // on default_left. NEVER GPU-vs-GPU (def-f8u-01): both trees are the f64 fold.
+    //
+    // WR-01: this gate is a pure f64-vs-f64 comparison — it needs NO GPU and NO env
+    // (it calls the direct driver entrypoint, not the env-gated `grow_tree_on_device`
+    // trait seam). Run it UNCONDITIONALLY so the DEFAULT merge-gate run exercises the
+    // on-device categorical grow-driver wiring (partition routing, slab staging,
+    // bitset construction) — the coverage gap that let CR-01 ship green. Only the
+    // real-4.6-golden FIDELITY gate (`run_categorical_cell_on_device`) stays env-gated.
+    assert_categorical_device_structure_gate("cat_onehot");
+    assert_categorical_device_structure_gate("cat_manyvsmany");
 }
 
 /// The on-device proving corpus: continuous-feature + L2, `MissingType::None`,
