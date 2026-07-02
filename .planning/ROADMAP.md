@@ -340,8 +340,13 @@ Plans:
   3. The on-device learner becomes the **DEFAULT** CUDA tree-learner path — contingent on anchor-pinned ~1e-6 parity AND not-slower-than-the-current-host-CUDA path on the Kaggle A/B — with `LGBM_CUDA_ON_DEVICE=0` retained as the off-switch fallback.
   4. ROCm + CPU routing stay host-driven / byte-unchanged; the CPU f64 merge gate is green.
 
-**Plans**: TBD
-**Notes**: Pure routing/perf, deferred until the win is measured — never auto-engaged before proof (the audit-before-wire value). The improvement magnitude is the genuine empirical unknown. Default-on flips ONLY where the real-CUDA A/B shows a sign-stable not-slower result (the fused-kernel default-off precedent). Multi-stream overlap is a stretch to spike only if launch-count reduction underdelivers. Kaggle CLI authenticated as `boomvector` is the only path to real discrete-CUDA numbers (local GPU is a spoofed APU).
+**Plans**: 4 plans (3 waves)
+Plans:
+- [ ] 23-01-PLAN.md — Tri-state `LGBM_CUDA_ON_DEVICE` resolver + `on_device_default()` stub (returns false, pre-verdict D-09) + L-2 learner single-source reconcile (ODL-21) (Wave 1)
+- [ ] 23-02-PLAN.md — L-1 on-device launch instrumentation (compute-owned counter, no crate cycle) surfaced in the phase_prof COUNTS line + local non-zero test (ODL-20) (Wave 1)
+- [ ] 23-03-PLAN.md — Committed Kaggle A/B harness (3×2×2 matrix, device_launches parse, D-11 real-CUDA parity, results.{md,json} evidence) + local dry-run parse test over a fixture (ODL-20) (Wave 2)
+- [ ] 23-04-PLAN.md — Verdict-gated default-on flip: `on_device_default()`→`cfg!(feature="cuda")` as a SEPARATE commit blocked on the results.md PASS verdict (ODL-21) (Wave 3)
+**Notes**: Pure routing/perf, deferred until the win is measured — never auto-engaged before proof (the audit-before-wire value). The improvement magnitude is the genuine empirical unknown. Default-on flips ONLY where the real-CUDA A/B shows a sign-stable not-slower result (the fused-kernel default-off precedent). Multi-stream overlap is a stretch to spike only if launch-count reduction underdelivers. Kaggle CLI authenticated as `boomvector` is the only path to real discrete-CUDA numbers (local GPU is a spoofed APU). **Wave shape:** 1 (tri-state+L-2 ∥ L-1 instrumentation, disjoint files) → 2 (Kaggle harness, needs the `"0"` off-switch + non-zero device_launches) → 3 (verdict-gated flip). SC-4 (ROCm/CPU byte-unchanged) is the hard LOCAL gate; SC-1/SC-2/SC-3-real-numbers + D-11-real-CUDA-parity are Kaggle-only/manual (see 23-VALIDATION.md).
 
 ### Progress (v1.1)
 
@@ -356,4 +361,4 @@ Plans:
 | 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 3/3 | Complete    | 2026-07-02 |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
-| 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/? | Not started | - |
+| 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/4 | Planned | - |
