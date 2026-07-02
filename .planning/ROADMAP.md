@@ -262,7 +262,7 @@ Plans:
   5. *(pulled fwd, ODL-18)* The on-device driver runs the full per-leaf grow loop end-to-end and reconstitutes into `(Tree, DataPartition)`; the grown tree is STRUCTURE bit-exact to the cpu f64 anchor (tie-aware `default_left`), leaf values within ~1e-5. (§6, §16)
   6. *(pulled fwd, ODL-19)* Every new kernel keeps f32 + u64 fixed-point build with no f64 per-row hot loops; CPU / ROCm / host-CUDA byte-unchanged with `LGBM_CUDA_ON_DEVICE` unset. (§17)
 
-**Plans**: 3/5 plans executed
+**Plans**: 3/6 plans executed *(20-03 split into 20-03a/20-03b on replan — see below)*
 **Wave 1**
 
 - [x] 20-00-PLAN.md — Wave 0 scaffolding: capture 4 missing metric goldens + register 3 new module stubs + metric_supported discriminator (ODL-17)
@@ -274,13 +274,17 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 20-03-PLAN.md — Pulled-forward driver: grow_tree_on_device body + gated discriminator flip + STRUCTURE bit-exact gate + no-f64 review (ODL-18, ODL-19)
+- [ ] 20-03a-PLAN.md — Pulled-forward driver, SAFE slice: additive GrowFeature metadata on grow_tree_on_device (reachable types only, no crate cycle) + gated discriminator flip (CpuBackend + GpuBackend<R>) + learner call-site wiring + data→leaf Handle buffer A/B lock; body still Ok(None), byte-unchanged (ODL-18, ODL-19)
 
 **Wave 4** *(blocked on Wave 3)*
 
+- [ ] 20-03b-PLAN.md — Pulled-forward driver, BODY: minimal per-leaf best-first grow orchestration in lgbm-compute grow_driver.rs (own bookkeeping, no LeafSplits/HistogramPool) + grow_tree_on_device returns Some + activated STRUCTURE bit-exact gate vs cpu f64 anchor (non-vacuous, default cpu build) + no-f64 review (ODL-18, ODL-19)
+
+**Wave 5** *(blocked on Wave 4)*
+
 - [ ] 20-04-PLAN.md — Resident-loop integration: GBDT §16 sequencing + resident-score A/B (ODL-16, ODL-19)
 
-**Notes**: Small kernel subsystems (§11 = 45 lines, §12 = 78 lines) but D-01 pulled Phase 21's full on-device grow loop (ODL-18/19) forward, making this a large, higher-risk end-to-end phase. The boosting-layer glue keeps the score resident across iterations (`boosting_on_cuda_`). The 12 pointwise losses are all regression/binary; everything else stays host-side per the reference's own `#ifdef USE_CUDA` branch. Anchored to the cpu f64 fold (never GPU-vs-GPU). Pitfalls at plan time: only 8/12 metric goldens existed (Wave 0 captures 4); `GpuBackend<R>` is one shared impl (gate the flip behind `cuda_on_device_enabled()` so ROCm-env-unset stays false); data→leaf map alias-vs-double-buffer resolved in Plan 03.
+**Notes**: Small kernel subsystems (§11 = 45 lines, §12 = 78 lines) but D-01 pulled Phase 21's full on-device grow loop (ODL-18/19) forward, making this a large, higher-risk end-to-end phase. The boosting-layer glue keeps the score resident across iterations (`boosting_on_cuda_`). The 12 pointwise losses are all regression/binary; everything else stays host-side per the reference's own `#ifdef USE_CUDA` branch. Anchored to the cpu f64 fold (never GPU-vs-GPU). Pitfalls at plan time: only 8/12 metric goldens existed (Wave 0 captures 4); `GpuBackend<R>` is one shared impl (gate the flip behind `cuda_on_device_enabled()` so ROCm-env-unset stays false); data→leaf map alias-vs-double-buffer resolved in 20-03a. **Replan (2026-07-02):** the original 20-03 was BLOCKED — a 2-file lgbm-compute-only scope could not deliver a bit-exact grow loop (grow_tree_on_device carried no feature metadata; LeafSplits/HistogramPool are lgbm-treelearner types unnameable from lgbm-compute → crate cycle; the verify cmd omitted `--features rocm` so the hip cell passed vacuously). Resolution (Option A, honors D-01): keep the driver body in lgbm-compute, add an additive `GrowFeature` metadata struct (BinColumn + lgbm-dataset BinType/MissingType — the kernels already consume `FeatureMeta`/`BinColumn`, never FeatureColumn) and a purpose-built native orchestration with its own bookkeeping; split into 20-03a (safe plumbing, byte-unchanged, verifiable now) + 20-03b (bit-exact body + STRUCTURE gate). The STRUCTURE gate runs on the cubecl-cpu runtime in the DEFAULT merge-gate lane (gated CpuBackend flip), non-vacuous without rocm hardware.
 
 #### Phase 21: End-to-End On-Device Driver Integration + Parity Gate
 
