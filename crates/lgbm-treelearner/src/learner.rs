@@ -803,6 +803,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     bin_upper_bound: f.bin_upper_bound.clone(),
                     real_feature_index: f.real_feature_index,
                     bin_type: f.bin_type,
+                    // Phase-22 additive categorical metadata (inert on the numeric
+                    // path; consumed by the 22-04 categorical grow branch). Empty
+                    // `bin_to_category` + config scalars from the learner's `cfg`.
+                    bin_to_category: f.bin_to_category.clone(),
+                    cat_smooth: self.cfg.cat_smooth,
+                    cat_l2: self.cfg.cat_l2,
+                    max_cat_threshold: self.cfg.max_cat_threshold,
+                    max_cat_to_onehot: self.cfg.max_cat_to_onehot,
+                    min_data_per_group: self.cfg.min_data_per_group,
                 })
                 .collect();
             if let Some((tree, payload)) = self.backend.grow_tree_on_device(

@@ -42,10 +42,14 @@ use crate::BinColumn;
 /// Phase-16/17/18 device kernels, using ONLY lgbm-compute-reachable types so the
 /// seam never names a treelearner type (no crate cycle, D-01/Option A).
 ///
-/// Field-for-field parity with the learner's spine column (minus the categorical
-/// `bin_to_category` table, which the on-device numeric grow loop does not consume
-/// this milestone). Every field is a plain value / `lgbm-dataset` enum / narrow
-/// [`BinColumn`] — nothing here reaches up into `lgbm-treelearner`.
+/// Field-for-field parity with the learner's spine column. Phase 22 adds the
+/// categorical metadata (`bin_to_category` + the five categorical config scalars)
+/// the §6.3 bitset construction and §8.1 evaluator consume for the categorical
+/// grow branch (wired in 22-04); this milestone lands them as inert carriers so
+/// the transcription (22-03) and wiring (22-04) build on a settled struct. Every
+/// field is a plain value / `lgbm-dataset` enum / narrow [`BinColumn`] / native
+/// primitive (`Vec<i32>`/`f64`/`i32`) — nothing here reaches up into
+/// `lgbm-treelearner` (no crate cycle, D-01/Option A, RESEARCH A3).
 #[derive(Debug, Clone)]
 pub struct GrowFeature {
     /// Per-GLOBAL-ROW bin index, length `num_data`, in the narrowest unsigned type
@@ -74,6 +78,29 @@ pub struct GrowFeature {
     pub real_feature_index: i32,
     /// C++ `BinMapper::bin_type()` — numeric vs categorical dispatch flag.
     pub bin_type: BinType,
+    /// C++ `BinMapper::bin_2_categorical_` — bin index → ORIGINAL category value
+    /// (`BinToValue(bin)`, bin.h:138-143). Populated ONLY for categorical features;
+    /// the categorical grow branch (22-04) converts each winning REAL BIN to its
+    /// category value to build the model-text (`cat_threshold`) bitset via
+    /// SetRealThreshold. Empty (`Vec::new()`) for numeric features — inert on the
+    /// numeric grow path. Native `Vec<i32>` (no crate cycle, A3).
+    pub bin_to_category: Vec<i32>,
+    /// `double cat_smooth` (config default 10.0) — categorical CTR smoothing +
+    /// the many-vs-many filter. Inert on the numeric path (§8.1, 22-03/22-04).
+    pub cat_smooth: f64,
+    /// `double cat_l2` (config default 10.0) — extra l2 ADDED to lambda_l2 in the
+    /// per-category gain (NOT the `gain_shift` baseline). Inert on the numeric path.
+    pub cat_l2: f64,
+    /// `int max_cat_threshold` (config default 32) — many-vs-many cap on the number
+    /// of categories on one side. Inert on the numeric path.
+    pub max_cat_threshold: i32,
+    /// `int max_cat_to_onehot` (config default 4) — categorical features with
+    /// `num_bin <= max_cat_to_onehot` use the one-hot (one-vs-rest) path. Inert on
+    /// the numeric path.
+    pub max_cat_to_onehot: i32,
+    /// `int min_data_per_group` (config default 100) — many-vs-many minimum rows per
+    /// accumulated category group. Inert on the numeric path.
+    pub min_data_per_group: i32,
 }
 
 // =========================================================================
