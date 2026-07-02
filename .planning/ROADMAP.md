@@ -342,11 +342,11 @@ Plans:
   3. The on-device learner becomes the **DEFAULT** CUDA tree-learner path — contingent on anchor-pinned ~1e-6 parity AND not-slower-than-the-current-host-CUDA path on the Kaggle A/B — with `LGBM_CUDA_ON_DEVICE=0` retained as the off-switch fallback.
   4. ROCm + CPU routing stay host-driven / byte-unchanged; the CPU f64 merge gate is green.
 
-**Plans**: 4 plans (3 waves)
+**Plans**: 1/4 plans executed
 Plans:
 **Wave 1**
 
-- [ ] 23-01-PLAN.md — Tri-state `LGBM_CUDA_ON_DEVICE` resolver + `on_device_default()` stub (returns false, pre-verdict D-09) + L-2 learner single-source reconcile (ODL-21) (Wave 1)
+- [x] 23-01-PLAN.md — Tri-state `LGBM_CUDA_ON_DEVICE` resolver + `on_device_default()` stub (returns false, pre-verdict D-09) + L-2 learner single-source reconcile (ODL-21) (Wave 1)
 - [ ] 23-02-PLAN.md — L-1 on-device launch instrumentation (compute-owned counter, no crate cycle) surfaced in the phase_prof COUNTS line + local non-zero test (ODL-20) (Wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
@@ -372,4 +372,4 @@ Plans:
 | 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 3/3 | Complete    | 2026-07-02 |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
-| 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 0/4 | Planned | - |
+| 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 1/4 | In Progress|  |

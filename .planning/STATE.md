@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
-current_phase: 22
-status: Phase 22 shipped — pushed to origin/master (direct, no PR)
+current_phase: 23
+current_phase_name: perf-validation-default-on-rollout-dod
+status: executing
 stopped_at: Phase 23 context gathered
-last_updated: "2026-07-02T12:29:45.447Z"
+last_updated: "2026-07-02T20:37:57.311Z"
 last_activity: 2026-07-02
-last_activity_desc: Phase 23 planning complete
+last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 10
   completed_phases: 9
-  total_plans: 44
-  completed_plans: 44
+  total_plans: 48
+  completed_plans: 45
   percent: 90
-current_phase_name: on-device-categorical-splits-feature-coverage
 ---
 
 # Project State
@@ -24,15 +24,15 @@ current_phase_name: on-device-categorical-splits-feature-coverage
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 22 — on-device-categorical-splits-feature-coverage
+**Current focus:** Phase 23 — perf-validation-default-on-rollout-dod
 
 ## Current Position
 
-Phase: 22 — COMPLETE
-Plan: 5 of 5
-Status: Phase 22 shipped — pushed to origin/master (direct, no PR)
+Phase: 23 (perf-validation-default-on-rollout-dod) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-02 — Phase 23 planning complete
+Last activity: 2026-07-02 — Phase 23 execution started
 
 Next: `/gsd-plan-phase 14`
 
@@ -586,6 +586,7 @@ Verified PASS (prior): SC#2 (ingest + immutable store), SC#3 (missing/categorica
 | Phase 21 P01 | 15m | 2 tasks | 2 files |
 | Phase 21 P03 | 2m | 2 tasks | 2 files |
 | Phase 21 P02 | 40m | 3 tasks | 1 files |
+| Phase 23 P01 | 4min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -729,7 +730,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-02T11:51:52.399Z
+Last session: 2026-07-02T20:37:52.971Z
 Stopped at: Phase 23 context gathered
 Resume file: .planning/phases/23-perf-validation-default-on-rollout-dod/23-CONTEXT.md
 
