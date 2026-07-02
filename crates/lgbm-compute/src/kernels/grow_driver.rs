@@ -1013,4 +1013,100 @@ mod tests {
             assert_eq!(dev_order, host_order, "{name}: full stable partition order device vs host");
         }
     }
+
+    /// WR-03 / CR-01 full-chain regression: a `most_freq_bin == 0 ⇒ offset 1`
+    /// categorical feature driven through the WHOLE evaluator → `set_real_threshold`
+    /// → `partition_categorical_on_device` chain, pinned to the CATEGORY-MEMBERSHIP
+    /// golden (a row routes LEFT iff its raw bin is a winning category; one-hot with
+    /// `most_freq_bin == 0` defaults non-members RIGHT). This is independent of the
+    /// router's internal `bin - min_bin + offset` key arithmetic and therefore fails
+    /// under the pre-CR-01 inner bitset (which set bits at the raw winning bin, so
+    /// the router — looking up `bin + 1` for offset 1 — missed every member and sent
+    /// the whole winning category to the WRONG child). No committed fixture covered
+    /// `offset == 1`, which is exactly how CR-01 hid.
+    #[test]
+    fn categorical_offset1_full_chain_routes_by_membership() {
+        use crate::gain::GainConfig;
+        use crate::kernels::categorical_split::{find_best_threshold_categorical, set_real_threshold};
+        let client = cpu_client();
+
+        // One-hot categorical config (num_bin <= max_cat_to_onehot).
+        let mut cfg = GainConfig::default();
+        cfg.min_data_in_leaf = 1;
+        cfg.min_sum_hessian_in_leaf = 1e-3;
+        cfg.lambda_l2 = 0.0;
+        cfg.cat_l2 = 0.0;
+        cfg.cat_smooth = 0.0;
+        cfg.min_data_per_group = 1;
+        cfg.max_cat_threshold = 32;
+        cfg.max_cat_to_onehot = 4;
+
+        // Feature: num_bin=4, most_freq_bin=0 (=> offset 1), min_bin=0, max_bin=3.
+        // Compacted histogram (offset 1): slot 0 = dummy, then bins 1..=3. Bin with
+        // raw index 3 carries the dominant gradient magnitude, so it is the unique
+        // one-hot winner => cat_threshold == [3] (raw winning bin).
+        let num_bin = 4i32;
+        let offset = 1i32;
+        let min_bin = 0i32;
+        let hist: Vec<f64> = vec![
+            0.0, 0.0, // slot 0 (dummy / mfb)
+            5.0, 5.0, // raw bin 1
+            -40.0, 5.0, // raw bin 3 winner (large |grad|) lands at compacted slot 2
+            5.0, 5.0, // raw bin (unused-scan tail)
+        ];
+        let sum_g = 0.0 + 5.0 - 40.0 + 5.0;
+        let sum_h = 15.0 + 2.0 * f64::from(K_EPSILON);
+        let num_data = 15;
+        let r = find_best_threshold_categorical(
+            &client, &hist, &cfg, num_bin, offset, sum_g, sum_h, num_data,
+        )
+        .unwrap();
+        assert!(r.is_splittable(), "offset==1 one-hot must find a split");
+        let winning_bins: Vec<i32> = r.cat_threshold.iter().map(|&b| b as i32).collect();
+        assert_eq!(winning_bins, vec![3], "unique one-hot winner is raw bin 3");
+
+        // Build the inner routing bitset via the (CR-01-fixed) set_real_threshold.
+        let bin_to_category = [-1, 0, 1, 2]; // bins 0..=3 -> category values.
+        let (_real, inner_bitset) =
+            set_real_threshold(&winning_bins, &bin_to_category, min_bin, offset);
+
+        // 5 rows in each of raw bins 1, 2, 3 (bin 0 = mfb / not present here).
+        let mut bins_vec: Vec<u32> = Vec::with_capacity(15);
+        for raw_bin in 1..=3u32 {
+            for _ in 0..5 {
+                bins_vec.push(raw_bin);
+            }
+        }
+        let bins = BinColumn::new(bins_vec.clone(), num_bin as u32);
+        let di: Vec<u32> = (0..15).collect();
+
+        let (order, split_point) = partition_categorical_on_device(
+            &client,
+            &bins,
+            &di,
+            num_bin as u32,
+            min_bin as u32,
+            3, // max_bin
+            0, // most_freq_bin
+            &inner_bitset,
+        )
+        .unwrap();
+
+        // MEMBERSHIP golden: left = exactly the rows whose raw bin is a winner (3).
+        let winning_set: std::collections::HashSet<u32> =
+            winning_bins.iter().map(|&b| b as u32).collect();
+        let expected_left: std::collections::HashSet<u32> = di
+            .iter()
+            .copied()
+            .filter(|&row| winning_set.contains(&bins_vec[row as usize]))
+            .collect();
+        let got_left: std::collections::HashSet<u32> = order[..split_point].iter().copied().collect();
+        assert_eq!(
+            got_left, expected_left,
+            "offset==1 one-hot must route exactly the winning-category rows LEFT"
+        );
+        // Concretely: 5 rows (raw bin 3) LEFT, 10 rows RIGHT.
+        assert_eq!(split_point, 5, "winning category (bin 3) has 5 rows -> left");
+        assert_eq!(order.len() - split_point, 10, "non-winners route right");
+    }
 }
