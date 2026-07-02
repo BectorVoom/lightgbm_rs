@@ -407,6 +407,12 @@ fn scan_leaf<R: cubecl::Runtime>(
 /// driver's OWN [`DriverLeaf`] bookkeeping (D-01/ODL-18). Returns the grown
 /// [`lgbm_model::Tree`] and the final row→leaf [`LeafPartitionLayout`].
 ///
+/// Thin delegator to [`grow_tree_on_device_driver_with_cfg`] pinned to the fixed
+/// [`proving_slice_config`] the [`crate::Backend::grow_tree_on_device`] trait seam
+/// grows under (the seam carries no `GainConfig`, so the default merge-gate anchor
+/// is unchanged). Tests that need a constrained gain config (e.g. binding
+/// `min_data_in_leaf`) call the `_with_cfg` variant directly.
+///
 /// Runs on ANY `R` (the STRUCTURE gate drives it on the cubecl-cpu runtime, anchored
 /// to the cpu f64 fold — never GPU-vs-GPU, def-f8u-01). `max_depth <= 0` ⇒ no depth
 /// cap.
@@ -422,6 +428,39 @@ pub fn grow_tree_on_device_driver<R: cubecl::Runtime>(
     features: &[GrowFeature],
     num_leaves: i32,
     max_depth: i32,
+) -> Result<(lgbm_model::Tree, LeafPartitionLayout), ComputeError> {
+    grow_tree_on_device_driver_with_cfg(
+        client,
+        gradients,
+        hessians,
+        features,
+        num_leaves,
+        max_depth,
+        proving_slice_config(),
+    )
+}
+
+/// Extract-parameter variant of [`grow_tree_on_device_driver`] that grows the tree
+/// under an EXPLICIT `cfg: GainConfig` instead of the pinned [`proving_slice_config`].
+/// The body is otherwise identical to the delegator (same length/num_leaves guards,
+/// ordered-f64 root fold, build/subtract/scan/partition sequence, break path, and
+/// typed `ComputeError` boundaries). Additive: the `Backend::grow_tree_on_device`
+/// trait seam is untouched, so the default `LGBM_CUDA_ON_DEVICE`-unset merge gate is
+/// byte-unchanged. Threading `cfg` here lets a test make a constraint (e.g.
+/// `min_data_in_leaf`) observably bind through the driver without widening the seam.
+///
+/// # Errors
+/// [`ComputeError`] from any sequenced kernel (bad num_bin / histogram length,
+/// out-of-range bin, device launch), or an empty feature set / non-positive
+/// `num_leaves`.
+pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    gradients: &[f32],
+    hessians: &[f32],
+    features: &[GrowFeature],
+    num_leaves: i32,
+    max_depth: i32,
+    cfg: GainConfig,
 ) -> Result<(lgbm_model::Tree, LeafPartitionLayout), ComputeError> {
     if num_leaves < 1 {
         return Err(ComputeError::Runtime {
@@ -440,7 +479,6 @@ pub fn grow_tree_on_device_driver<R: cubecl::Runtime>(
             actual: hessians.len(),
         });
     }
-    let cfg = proving_slice_config();
     let min_data = cfg.min_data_in_leaf;
 
     // Per-feature concatenated-histogram offsets (2*num_bin cells each).
