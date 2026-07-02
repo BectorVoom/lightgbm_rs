@@ -308,13 +308,20 @@ const STALE_SELF_TRANSCRIPTION_NOTE: &str =
      different (now self-consistent) tree. Routing parity is asserted by \
      learner_parity_routing_self_consistency.";
 
+// WR-02 (Phase-21 review): this stub asserts NOTHING — it only prints the stale-note
+// and would otherwise report green in CI while covering nothing. `#[ignore]` so it
+// reports as ignored (not passed); full-tree parity is now the live real-binary gate
+// `learner_parity_spine_real_binary`.
 #[test]
+#[ignore = "superseded by real-binary oracle learner_parity_spine_real_binary (05-06); asserts nothing"]
 fn learner_parity_spine_full_tree() {
     // Superseded by 05-06's real-binary oracle (see STALE_SELF_TRANSCRIPTION_NOTE).
     eprintln!("{STALE_SELF_TRANSCRIPTION_NOTE}");
 }
 
+// WR-02: asserts nothing (stale-note only) — `#[ignore]` so it does not report green.
 #[test]
+#[ignore = "pre-D-09 self-transcription golden superseded by 05-06 real-binary oracle; asserts nothing"]
 fn learner_parity_spine_per_bin_gains() {
     // The spine.txt PSPLIT golden is the pre-D-09 self-transcription (CR-02); the
     // D-09 convention change grows a different (self-consistent) tree, so the
@@ -420,7 +427,10 @@ fn learner_parity_missing_routing() {
     assert_eq!(total, 8, "rows conserved across the split");
 }
 
+// WR-02: asserts nothing (stale-note only) — `#[ignore]` so it does not report green.
+// The kernel-vs-host gain primitive is still exercised by `kernel_parity_split_bit_exact_on_cpu`.
 #[test]
+#[ignore = "pre-D-09 self-transcription cross-check superseded by 05-06 real-binary oracle; asserts nothing"]
 fn learner_parity_transcription_crosscheck() {
     // D-02a cross-check against the spine.txt PSPLIT golden — a pre-D-09
     // self-transcription (CR-02). The D-09 convention change grows a different
@@ -771,7 +781,10 @@ fn parse_real_gh(text: &str) -> Vec<GhCorpus> {
 /// iteration-1 g/h (regression-l2 + binary-logloss, realistic distribution). Each
 /// corpus block's grown tree `to_string()` must be byte-identical to the C++
 /// reference tree (the shared `%.17g` formatter is the arbiter).
+// WR-02: asserts nothing (stale-note only) — `#[ignore]` so it does not report green.
+// real_gh routing self-consistency is still asserted live by `learner_parity_routing_self_consistency`.
 #[test]
+#[ignore = "pre-D-09 self-transcription full-tree golden superseded by 05-06 real-binary oracle; asserts nothing"]
 fn learner_parity_real_gh_full_tree() {
     // real_gh.txt is the pre-D-09 self-transcription full-tree golden (CR-02); its
     // most_freq_bin==0 features now grow a different (self-consistent) tree under
