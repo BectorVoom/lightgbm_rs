@@ -157,9 +157,11 @@ fn round_int(x: f64) -> i32 {
 
 /// `FeatureHistogram::FindBestThresholdCategoricalInner<false,false,USE_L1,false,false>`
 /// (`feature_histogram.cpp:143-382`) — the byte-for-byte transcription of the host
-/// `find_best_threshold_categorical` (feature_histogram_categorical.rs:93-326),
-/// with the f64 stable-sort ctr order replaced by the anchor-pinned
-/// [`super::primitives::bitonic_argsort_on`] (index-only, single-block ≤1024).
+/// `find_best_threshold_categorical` (feature_histogram_categorical.rs:93-326).
+/// The many-vs-many ctr ordering is the host's f64 `std::stable_sort` transcribed
+/// verbatim (the def-f8u-01 single-owner f64 anchor must match the golden bit-exact,
+/// including NaN ctr on degenerate child leaves — an f32 bitonic argsort diverged on
+/// ties/NaN and leaked padding indices out of bounds; see the sort site).
 ///
 /// `hist` is the compacted+fixed per-feature histogram (`2*num_bin` cells,
 /// `[grad0,hess0,grad1,hess1,...]`), exactly as the numeric scan receives it.
@@ -169,12 +171,12 @@ fn round_int(x: f64) -> i32 {
 /// the evaluator does NOT bump internally) so `gain_shift`, `cnt_factor`, and the
 /// per-category gains see the same bumped value as the numeric path.
 ///
-/// Runs on `CubeDim::new_1d(1)` (single-owner f64 anchor, def-f8u-01).
+/// Single-owner f64 anchor (def-f8u-01): all arithmetic is host-serial f64.
 ///
 /// # Errors
-/// [`ComputeError`] propagated from [`super::primitives::bitonic_argsort_on`]
-/// (only if the used-bin count exceeds its single-block cap — never for the
-/// fixture-scale categorical features this milestone targets).
+/// Returns [`ComputeError`] only for a malformed histogram slice; the evaluator
+/// itself is infallible. `client` is retained for API symmetry with the numeric
+/// finders (and future on-device dispatch) — the f64 anchor sort is host-serial.
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_threshold_categorical<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
@@ -186,6 +188,9 @@ pub fn find_best_threshold_categorical<R: cubecl::Runtime>(
     sum_hessian: f64,
     num_data: i32,
 ) -> Result<CategoricalSplit, ComputeError> {
+    // Retained for API symmetry with the numeric finders; the f64 anchor sort is
+    // host-serial (no device dispatch), so `client` is currently unused in the body.
+    let _ = client;
     let use_l1 = cfg.use_l1();
     let l1 = cfg.lambda_l1;
     let eps = f64::from(K_EPSILON);
@@ -303,23 +308,26 @@ pub fn find_best_threshold_categorical<R: cubecl::Runtime>(
     l2 += cfg.cat_l2;
 
     let cat_smooth = cfg.cat_smooth;
-    // ctr = grad / (hess + cat_smooth), ASCENDING. The host uses an f64
-    // std::stable_sort; here the anchor-pinned index-only bitonic argsort replaces
-    // it (BitonicArgSort_1024 comparator, f32 keys). The committed `cat_manyvsmany`
-    // fixture is TIE-FREE (ctr = 0,-1,-2,-8,-9,-10 — strictly distinct, A1), so the
-    // f32-bitonic order EQUALS the f64-stable order (Pitfall 1). For tied ctr the
-    // two orders could disagree — keep categorical fixtures tie-free.
-    if used_bin > 0 {
-        let ctr_keys: Vec<f32> = sorted_idx
-            .iter()
-            .map(|&t| (get_grad(t) / (get_hess(t) + cat_smooth)) as f32)
-            .collect();
-        let (perm, _keys_after) =
-            super::primitives::bitonic_argsort_on(client, &ctr_keys, /*ascending=*/ true)?;
-        // perm[r] = index (into sorted_idx / ctr_keys) of the r-th smallest ctr.
-        let reordered: Vec<i32> = perm.iter().map(|&p| sorted_idx[p as usize]).collect();
-        sorted_idx = reordered;
-    }
+    // ctr = grad / (hess + cat_smooth), ASCENDING. Transcribed VERBATIM from the host
+    // anchor (feature_histogram_categorical.rs:226-232): an f64 `std::stable_sort`.
+    // `categorical_split.rs` IS the single-owner f64 anchor (def-f8u-01), so its ctr
+    // order MUST match the host (== the real lib_lightgbm 4.6 golden) bit-exact — for
+    // BOTH the tie-free top-level split AND the degenerate deeper child leaves the
+    // full grow loop reaches, where a zero-hessian bin yields ctr = 0/0 = NaN
+    // (`partial_cmp -> Equal` keeps NaN stable in place, exactly as the host).
+    //
+    // An earlier f32 `bitonic_argsort_on` substitution here was UNSAFE on the real
+    // grow loop: it (a) diverged from the f64-stable order on ties/NaN, and (b) on
+    // NaN keys leaked its power-of-two padding indices into the truncated permutation,
+    // indexing `sorted_idx` out of bounds (panic). 22-05's D-01 #1 many-vs-many gate
+    // (the linchpin) drives the full device grow loop and surfaced both. The f64
+    // stable sort is the faithful transcription and is crash-free by construction.
+    let ctr = |t: i32| -> f64 { get_grad(t) / (get_hess(t) + cat_smooth) };
+    sorted_idx.sort_by(|&a, &b| {
+        ctr(a)
+            .partial_cmp(&ctr(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let find_direction = [1i32, -1i32];
     let start_position = [0i32, used_bin - 1];
