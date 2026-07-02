@@ -464,12 +464,12 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
 ) -> Result<(lgbm_model::Tree, LeafPartitionLayout), ComputeError> {
     if num_leaves < 1 {
         return Err(ComputeError::Runtime {
-            detail: format!("grow_tree_on_device_driver: num_leaves must be >= 1, got {num_leaves}"),
+            detail: format!("grow_tree_on_device_driver_with_cfg: num_leaves must be >= 1, got {num_leaves}"),
         });
     }
     if features.is_empty() {
         return Err(ComputeError::Runtime {
-            detail: "grow_tree_on_device_driver: at least one feature is required".to_string(),
+            detail: "grow_tree_on_device_driver_with_cfg: at least one feature is required".to_string(),
         });
     }
     let num_data = gradients.len();
@@ -516,7 +516,8 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
     }];
 
     // ---- The device flat tree (Phase-18), pre-allocated once (D-15). ----
-    let mut tree = DeviceCudaTree::<R>::new(client, num_leaves.max(1) as usize, num_data as i32)?;
+    // `num_leaves >= 1` is guaranteed by the guard above, so no `.max(1)` needed.
+    let mut tree = DeviceCudaTree::<R>::new(client, num_leaves as usize, num_data as i32)?;
     // Seed the root leaf value so a never-split root still matches the anchor.
     let root_output =
         calculate_splitted_leaf_output(cfg.use_l1(), root_sum_g, root_sum_h, cfg.lambda_l1, cfg.lambda_l2);
@@ -589,11 +590,21 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
         // consuming its right_leaf_index. The tree's leaf/internal counts take the
         // ACTUAL partition counts (serial_tree_learner.cpp:788-791). ----
         let new_left = best_leaf;
-        let real_threshold = f
-            .bin_upper_bound
-            .get(best.threshold as usize)
-            .copied()
-            .unwrap_or(best.threshold as f64);
+        // IN-01: an out-of-range `best.threshold` would silently record the raw bin
+        // index cast to f64 as the tree's REAL threshold — a plausible-looking wrong
+        // value that would corrupt prediction routing and mask an off-by-one in the
+        // offset/compaction threshold space. Surface a typed error instead.
+        let real_threshold = *f.bin_upper_bound.get(best.threshold as usize).ok_or_else(|| {
+            ComputeError::Runtime {
+                detail: format!(
+                    "grow_tree_on_device_driver_with_cfg: split threshold bin index {} out of \
+                     range for feature {} bin_upper_bound (len {})",
+                    best.threshold,
+                    f.real_feature_index,
+                    f.bin_upper_bound.len()
+                ),
+            }
+        })?;
         let missing_type_code = i32::from(missing_type_u8);
         let scalars = SplitScalars {
             is_valid: true,
