@@ -294,7 +294,9 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     fused_eligible: bool,
     /// ODL-01 (Phase 14, D-05): whether THIS learner is eligible to grow whole
     /// trees on-device. The base gate is computed at [`new`](Self::new) as
-    /// `backend.on_device_growth_supported() && cuda_on_device_env()`, then
+    /// `backend.on_device_growth_supported()` alone (L-2, 23-01: that method already
+    /// returns the resolved tri-state `lgbm_compute::cuda_on_device_enabled()`, so the
+    /// learner no longer parses `LGBM_CUDA_ON_DEVICE` a second time), then
     /// [`refresh_on_device_eligibility`](Self::refresh_on_device_eligibility)
     /// re-applies the D-06 categorical+quantized host-fallback gate
     /// ([`on_device_eligible_gate`]) from [`with_features`](Self::with_features) /
@@ -452,26 +454,6 @@ pub struct ColSamplerTrace {
     pub bynode_selected: Vec<Vec<i32>>,
 }
 
-/// ODL-01 (Phase 14, D-05): read the `LGBM_CUDA_ON_DEVICE` toggle ONCE at
-/// [`SerialTreeLearner::new`]. This is the INVERSE default of `autotune_enabled`
-/// (`!matches!(env::var(..), Ok("0"))`, ON unless `=0`): on-device growth is OFF
-/// unless the value is EXACTLY `"1"`. Any other value — unset, empty, `"0"`,
-/// `"true"`, malformed — yields `false`, guaranteeing the byte-unchanged merge
-/// gate when the env is unset (SC#1). No path/format/injection surface (T-14-02).
-///
-/// Phase 14 closes (14-06) with the env still an opt-in `"1"` AND-gate that is
-/// ANDed with `backend.on_device_growth_supported()` (FROZEN `false` in Slice 0,
-/// D-09): with `LGBM_CUDA_ON_DEVICE` unset, `on_device_eligible` is `false` on
-/// every backend and the host/per-leaf path is byte-unchanged. The foundation the
-/// future on-device grow loop (Phase 21) consumes already exists and is
-/// golden-validated — the shared `lgbm_compute::kernels::primitives` device
-/// primitives, `kernels::split_info` split/leaf structs, and `kernels::random`
-/// on-device RNG — but NONE of it is wired into this gate yet (the seam is a
-/// strict no-op until Slice 1).
-fn cuda_on_device_env() -> bool {
-    matches!(std::env::var("LGBM_CUDA_ON_DEVICE").as_deref(), Ok("1"))
-}
-
 /// D-06 host-fallback gate (Phase 22): the CUDA reference `asm("trap;")`s on the
 /// categorical + `use_quantized_grad` combo — it has NO on-device categorical+quantized
 /// path. Mirror that non-support HONESTLY by ANDing `!(has_categorical_feature &&
@@ -536,7 +518,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // false, so the categorical+quantized negation is a no-op at construction —
             // it is (re)applied in `refresh_on_device_eligibility`, called from
             // `with_features` / `with_quantized_grad` once the inputs are known.
-            on_device_eligible: backend.on_device_growth_supported() && cuda_on_device_env(),
+            on_device_eligible: backend.on_device_growth_supported(),
             // D-06 (Phase 22): default OFF (spine path); set via `with_quantized_grad`.
             use_quantized_grad: false,
             cat_quant_fallback_logged: false,
@@ -3841,7 +3823,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// With `LGBM_CUDA_ON_DEVICE` unset the base gate is `false`, so the result is
     /// `false` and NOTHING is logged (SC #4 byte-unchanged default lane).
     fn refresh_on_device_eligibility(&mut self) {
-        let base = self.backend.on_device_growth_supported() && cuda_on_device_env();
+        let base = self.backend.on_device_growth_supported();
         let has_categorical_feature =
             self.features.iter().any(|f| f.bin_type == BinType::Categorical);
         let eligible =
