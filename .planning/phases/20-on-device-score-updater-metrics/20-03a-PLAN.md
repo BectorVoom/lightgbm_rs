@@ -151,32 +151,49 @@ new `kernels/grow_driver.rs`, the call-site wiring in `learner.rs`, and the two 
     Add a `grow_driver` helper that exposes the two candidate data->leaf map update strategies for the
     per-split partition rewrite: (A) in-place alias (the kernel reads and writes the same `Handle`) and
     (B) ping-pong double-buffer (read source `Handle`, write a distinct destination `Handle`, swap). In
-    `learner_parity.rs`, add an anchor-pinned A/B cell that drives BOTH strategies over the existing
-    Phase-18 `update_data_index_to_leaf_on` / `partition_leaf_stable` kernels for a multi-split case
-    (`num_leaves > 2`) on the cubecl-cpu runtime, reconstructs the resulting `LeafPartitionLayout`, and
-    asserts each strategy's row->leaf assignment matches the cpu f64 anchor's partition (NEVER strategy-A
-    vs strategy-B directly — anchor ONLY to the host/cpu-fold layout, def-f8u-01). PREFER double-buffer:
-    lock it as the strategy 20-03b's driver uses UNLESS the alias strategy is proven bit-identical to the
-    anchor across the A/B (record the decision + the evidence in the SUMMARY). Also add a cell that, with
-    `LGBM_CUDA_ON_DEVICE=1`, calls the expanded `grow_tree_on_device(&g,&h,&grow_features,num_leaves,max_depth)`
-    directly on CpuBackend and asserts it returns `Ok(None)` this plan (the safe-defer contract), and that
-    a full `SerialTreeLearner` train with the env set produces the byte-identical tree to the env-unset
-    host path (the fork falls through). Keep both cells in the default cpu build (no `--features rocm`).
+    `learner_parity.rs`, add an anchor-pinned A/B cell named EXACTLY
+    `learner_parity_on_device_buffer_strategy_ab` (default cpu build, NOT rocm-gated) that drives BOTH
+    strategies over the existing Phase-18 `update_data_index_to_leaf_on` / `partition_leaf_stable` kernels
+    for a multi-split case (`num_leaves > 2`) on the cubecl-cpu runtime, reconstructs the resulting
+    `LeafPartitionLayout`, and asserts each strategy's row->leaf assignment matches the cpu f64 anchor's
+    partition (NEVER strategy-A vs strategy-B directly — anchor ONLY to the host/cpu-fold layout,
+    def-f8u-01). PREFER double-buffer: lock it as the strategy 20-03b's driver uses UNLESS the alias
+    strategy is proven bit-identical to the anchor across the A/B (record the decision + the evidence in
+    the SUMMARY). Also add a cell named EXACTLY `learner_parity_on_device_seam_defers` (default cpu build)
+    that, with `LGBM_CUDA_ON_DEVICE=1`, calls the expanded
+    `grow_tree_on_device(&g,&h,&grow_features,num_leaves,max_depth)` directly on CpuBackend and asserts it
+    returns `Ok(None)` this plan (the safe-defer contract), and that a full `SerialTreeLearner` train with
+    the env set produces the byte-identical tree to the env-unset host path (the fork falls through).
+
+    ALSO (WARNING 2 — the two obsolete rocm-gated Slice-0 seam cells): migrate BOTH
+    `learner_parity_on_device_oracle_host_fallback_slice0` (learner_parity.rs:2442) and
+    `learner_parity_on_device_seam_is_provable_noop_slice0` (:2471), which live in
+    `#[cfg(feature="rocm")] mod hip` and call the OLD 4-arg `grow_tree_on_device(&g,&h,num_leaves,max_depth)`.
+    Update both to the new 5-arg signature (passing `&grow_features`). Replace the now-invalid
+    UNCONDITIONAL `on_device_growth_supported()==false` assertion with the GATED invariant — assert it is
+    `false` when `LGBM_CUDA_ON_DEVICE` is unset (the byte-unchanged merge-gate contract), which is still
+    true after 20-03a's gated flip. Keep the `grow_tree_on_device == Ok(None)` assertion valid for THIS
+    plan (the body still defers); 20-03b will retire that assertion when it activates the driver. This
+    keeps `cargo test --features rocm` compiling and green — leave no known-broken cell.
   </action>
   <verify>
-    <automated>cargo test -p oracle-harness --test learner_parity buffer_strategy && LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness --test learner_parity on_device_seam</automated>
+    <automated>LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness --test learner_parity -- --exact learner_parity_on_device_buffer_strategy_ab 2>&1 | tee /dev/stderr | grep -q 'test result: ok. 1 passed' && LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness --test learner_parity -- --exact learner_parity_on_device_seam_defers 2>&1 | tee /dev/stderr | grep -q 'test result: ok. 1 passed'</automated>
   </verify>
   <acceptance_criteria>
-    - The A/B cell runs BOTH buffer strategies over the real Phase-18 partition kernels at `num_leaves>2`
-      and asserts each against the cpu f64 anchor's partition (not against each other); the chosen
-      strategy (double-buffer unless alias proven safe) is recorded in the SUMMARY with the A/B evidence.
-    - `LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness --test learner_parity on_device_seam` passes:
-      `grow_tree_on_device` returns `Ok(None)` this plan and the env-set learner train equals the
-      env-unset host tree (the fork defers safely).
-    - Both cells EXECUTE in the default cpu build (they are not `#[cfg(feature="rocm")]`-gated to 0 tests);
-      the verify commands each run >=1 test.
+    - The A/B cell `learner_parity_on_device_buffer_strategy_ab` runs BOTH buffer strategies over the real
+      Phase-18 partition kernels at `num_leaves>2` and asserts each against the cpu f64 anchor's partition
+      (not against each other); the chosen strategy (double-buffer unless alias proven safe) is recorded in
+      the SUMMARY with the A/B evidence.
+    - Each verify command uses `-- --exact <cell_name>` and pipes through `grep -q 'test result: ok. 1 passed'`,
+      so a zero-match (vacuous) run FAILS the gate; both cells exist in the default cpu build (NOT
+      `#[cfg(feature="rocm")]`) and each command proves exactly 1 test ran.
+    - `learner_parity_on_device_seam_defers` proves `grow_tree_on_device` returns `Ok(None)` this plan and the
+      env-set learner train equals the env-unset host tree (the fork defers safely).
+    - Under `cargo test --features rocm`, the two migrated Slice-0 cells compile against the 5-arg signature
+      and pass: the discriminator is asserted `false` when the env is unset (gated invariant), and the seam
+      still returns `Ok(None)` this plan — no known-broken cell remains.
   </acceptance_criteria>
-  <done>The data->leaf map buffer strategy is A/B-verified against the cpu anchor and LOCKED for 20-03b, and the expanded seam is proven to defer safely with the env set — the two Pitfall-3 / crate-cycle risks are retired before the bit-exact body is written.</done>
+  <done>The data->leaf map buffer strategy is A/B-verified against the cpu anchor and LOCKED for 20-03b (self-verifying, non-vacuous), the expanded seam is proven to defer safely with the env set, and the two obsolete rocm Slice-0 cells are migrated to the 5-arg signature + gated invariant — no broken cell in any build.</done>
 </task>
 
 </tasks>
@@ -201,9 +218,10 @@ new `kernels/grow_driver.rs`, the call-site wiring in `learner.rs`, and the two 
 
 <verification>
 - `cargo test --workspace` green with LGBM_CUDA_ON_DEVICE unset (byte-unchanged merge gate; no crate cycle).
-- `grep -n 'FeatureColumn' crates/lgbm-compute/src` finds nothing (no treelearner type named in lgbm-compute).
-- A/B buffer-strategy cell green (both strategies anchored to the cpu f64 partition); chosen strategy recorded.
-- `LGBM_CUDA_ON_DEVICE=1 cargo test -p oracle-harness --test learner_parity on_device_seam` green (fork defers safely; env-set tree == env-unset host tree).
+- `grep -rn 'lgbm_treelearner' crates/lgbm-compute/src` finds nothing (no treelearner dependency edge from lgbm-compute — GrowFeature uses BinColumn + lgbm-dataset types only).
+- `learner_parity_on_device_buffer_strategy_ab` green via `-- --exact ... | grep -q 'test result: ok. 1 passed'` (both strategies anchored to the cpu f64 partition; non-vacuous; chosen strategy recorded).
+- `learner_parity_on_device_seam_defers` green via `-- --exact ... | grep -q 'test result: ok. 1 passed'` (fork defers safely; env-set tree == env-unset host tree; non-vacuous).
+- `cargo test --features rocm` compiles + passes the two MIGRATED Slice-0 cells (5-arg signature; discriminator asserted false only when env unset).
 </verification>
 
 <success_criteria>
@@ -224,9 +242,12 @@ and independently verified, with the body deferring safely until 20-03b.
   CpuBackend AND GpuBackend<R> (gated).
 - `crates/lgbm-treelearner/src/learner.rs`: the fork builds `Vec<GrowFeature>` from `self.features` and
   passes it to the expanded seam.
-- `crates/oracle-harness/tests/learner_parity.rs`: anchor-pinned buffer-strategy A/B cell + a
-  safe-defer cell (env-set returns Ok(None) and env-set train == env-unset host tree). Both in the
-  default cpu build.
+- `crates/oracle-harness/tests/learner_parity.rs`: anchor-pinned buffer-strategy A/B cell
+  (`learner_parity_on_device_buffer_strategy_ab`) + a safe-defer cell
+  (`learner_parity_on_device_seam_defers`: env-set returns Ok(None) and env-set train == env-unset host
+  tree), both in the default cpu build; PLUS the two migrated rocm-gated Slice-0 cells
+  (`..._host_fallback_slice0`, `..._seam_is_provable_noop_slice0`) updated to the 5-arg signature +
+  gated-false invariant.
 - Locked decision (SUMMARY): data->leaf map buffer strategy (double-buffer unless alias proven safe) +
   A/B evidence.
 - Env behavior: on-device growth still unreachable (body defers); env unset = byte-unchanged; no crate cycle.
