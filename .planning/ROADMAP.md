@@ -319,8 +319,14 @@ Plans:
   3. `SplitCategorical` **tree mutation** (§10) writes the categorical node (`num_cat`, `cat_boundaries`) and predicts correctly, anchor-pinned to the host categorical tree.
   4. The numerical spine stays byte-untouched and anchor-pinned; CPU / ROCm / host-CUDA byte-unchanged; merge gate green.
 
-**Plans**: TBD
-**Notes**: Layered on the proven Slice (Phases 14–21) numerical driver. The pre-allocated bitset slab (ODL-02 `AllocateCatVectorsKernel` analog) avoids the per-`SplitInfo` `cudaMalloc` that has no clean CubeCL analog.
+**Plans**: 5 plans (4 waves)
+Plans:
+- [ ] 22-01-PLAN.md — D-03 runtime categorical slab width + D-06 categorical+quantized host-fallback gate (Wave 1)
+- [ ] 22-02-PLAN.md — GrowFeature categorical metadata + harness grow_features_of plumbing (Wave 1)
+- [ ] 22-03-PLAN.md — Transcribe §6.3 bitset construction + §8.1 categorical evaluator (one-hot + many-vs-many) (Wave 2)
+- [ ] 22-04-PLAN.md — Wire best_split dispatch + grow_driver categorical branch (§9/§10 calls) + Open-Q1 routing isolation (Wave 3)
+- [ ] 22-05-PLAN.md — Real-4.6-golden bit-exact device cells + cpu-f64 structure gate + predict-through (Wave 4)
+**Notes**: Layered on the proven Slice (Phases 14–21) numerical driver. The pre-allocated bitset slab (ODL-02 `AllocateCatVectorsKernel` analog) avoids the per-`SplitInfo` `cudaMalloc` that has no clean CubeCL analog. ~70% wiring (§9/§10/predict already exist + anchor-tested); the only new code is the §8.1 eval + §6.3 bitset, both byte-for-byte transcriptions of the golden-proven host `feature_histogram_categorical.rs` (crate-cycle forbids importing). D-01 makes categorical the first on-device subsystem pinned to a REAL 4.6 reference anchor, not a re-transcription.
 
 #### Phase 23: Perf-Validation + Default-On Rollout (DoD)
 
