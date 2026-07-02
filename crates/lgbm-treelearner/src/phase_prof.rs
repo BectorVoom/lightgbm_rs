@@ -191,10 +191,19 @@ pub fn dump(label: &str) {
     let sub_cnt = SUBTRACT_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let scn_cnt = SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let fus_cnt = FUSED_CNT.swap(0, Ordering::Relaxed);
-    if bld_cnt + sub_cnt + scn_cnt + fus_cnt > 0 {
-        let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt;
+    // L-1/SC-2: fold the on-device driver's own launch count (bumped in lgbm-compute
+    // at every real build/subtract/scan dispatch — the host `*_RESIDENT_CNT` counters
+    // stay 0 on the on-device path) into the SAME `device_launches=` total. The
+    // consumer (23-03 harness) captures the total via the SHORT regex
+    // `device_launches=(?P<launches>\d+)`, so `on_device=` MUST live INSIDE the
+    // parenthesized breakdown (never before the total) to keep that capture stable
+    // (Open-Q2). Without this fold an on-device train emits `device_launches=0` and the
+    // whole line is suppressed by the `> 0` guard (P-2).
+    let on_dev = lgbm_compute::kernels::grow_driver::on_device_launch_count_take();
+    if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
+        let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt}) | scan_roundtrips(syncs)={scn_cnt}"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev}) | scan_roundtrips(syncs)={scn_cnt}"
         );
     }
     // Spike-049: in_learner_other sub-breakdown.
