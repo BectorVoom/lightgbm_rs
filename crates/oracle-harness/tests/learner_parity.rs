@@ -2574,6 +2574,69 @@ fn learner_parity_on_device_nosplit_gate() {
 /// 2 leaves. We bind via `min_sum_hessian_in_leaf` (checked per-candidate identically
 /// in `split.rs` and the learner) rather than `min_data_in_leaf`, whose `min_data*2`
 /// both-too-small pre-gate takes a divergent child-leaf path on this small corpus.
+/// CR-01 (Phase-21 review) — the min_data_in_leaf STRUCTURE gate the earlier suite
+/// deliberately AVOIDED (see `mindata_corpus` doc). This gate proves the driver's
+/// `both_too_small` pre-scan gate is a FAITHFUL match to the cpu f64 anchor's
+/// `before_find_best_split` (learner.rs:1490-1502) — which in turn transcribes C++
+/// `SerialTreeLearner::BeforeFindBestSplit` (serial_tree_learner.cpp:353-363). Both
+/// use the SAME combined-AND `num < min_data*2` gate on the two children, and both
+/// rely on the DOWNSTREAM per-candidate `min_data_in_leaf` / `min_sum_hessian_in_leaf`
+/// enforcement inside the split finder (`split.rs` / `find_best_split`) — NOT on this
+/// pre-gate — for correctness when only one child is too small.
+///
+/// The review's CR-01 proposed rewriting this gate to an INDEPENDENT per-child check
+/// (plus an extra `min_sum_hessian_in_leaf` term). That rewrite was NOT applied: it
+/// would diverge the driver's gate from the anchor/C++ transcription (which have no
+/// per-child skip and no hessian term in this gate), while producing the identical
+/// tree (a too-small child yields no admissible downstream split anyway). This gate
+/// binds `min_data_in_leaf` across a range and asserts STRUCTURE bit-exactness to the
+/// anchor — env-independent, so it runs in the DEFAULT hard merge gate (also addresses
+/// WR-01's default-coverage concern for the constrained path).
+#[test]
+fn learner_parity_on_device_mindata_structure_gate() {
+    let client = cpu_client();
+    let (features, g, h, num_leaves, max_depth) = mindata_corpus();
+    let grow_features = grow_features_of(&features);
+    // md=2 binds yet still grows 4 leaves; md=3/4 bind harder and stop the tree at 2
+    // leaves (each 4-row child is < min_data*2). All three must match the anchor.
+    let mut any_bound = false;
+    for md in [2i32, 3, 4] {
+        let mut cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+        cfg.min_data_in_leaf = md;
+        let (driver_tree, layout) =
+            lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+                &client, &g, &h, &grow_features, num_leaves, max_depth, cfg,
+            )
+            .expect("constrained driver must grow the tree");
+        assert_eq!(
+            layout.leaf_count.iter().sum::<i32>(),
+            g.len() as i32,
+            "md={md}: layout leaf_count partitions all rows"
+        );
+        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+        assert_on_device_tree_matches_cpu_anchor(&driver_tree, &anchor, &format!("min-data md={md}"));
+        if md >= 3 {
+            // The constraint observably binds: fewer leaves than the unconstrained tree.
+            let unconstrained = cpu_anchor_tree(
+                &features,
+                &g,
+                &h,
+                lgbm_compute::kernels::grow_driver::proving_slice_config(),
+                num_leaves,
+                max_depth,
+            );
+            assert!(
+                driver_tree.num_leaves < unconstrained.num_leaves,
+                "md={md}: min_data_in_leaf must observably bind (driver {} < unconstrained {})",
+                driver_tree.num_leaves,
+                unconstrained.num_leaves
+            );
+            any_bound = true;
+        }
+    }
+    assert!(any_bound, "at least one min_data_in_leaf setting must observably bind");
+}
+
 #[allow(clippy::type_complexity)]
 fn mindata_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
     let grad = vec![-10.0f32, -10.0, -3.0, -3.0, 3.0, 3.0, 10.0, 10.0];
