@@ -2315,33 +2315,47 @@ fn cpu_anchor_tree(
 #[test]
 fn learner_parity_on_device_structure_gate() {
     let backend = CpuBackend;
+    let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = on_device_proving_corpus();
     let grow_features = grow_features_of(&features);
     // The driver pins the proving-slice config; the anchor MUST use the identical one.
     let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+    let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
 
+    // WR-01: drive the on-device grow driver DIRECTLY (ENV-INDEPENDENT, as the mindata
+    // gate does) so the broad multi-feature growth path has STRUCTURE parity coverage
+    // in the DEFAULT `cargo test` merge-gate run — not only when LGBM_CUDA_ON_DEVICE=1.
+    let (driver_tree, layout) =
+        lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+            &client, &g, &h, &grow_features, num_leaves, max_depth, cfg,
+        )
+        .expect("driver must grow the tree");
+    // IN-02: the CpuBackend driver runs f64-vs-f64 (no f32 accumulation), so
+    // `default_left` is bit-exact — use the STRICT `decision_type`-equality comparator,
+    // not the f32-vs-f64 tie-aware one (reserved for the `mod hip` cells).
+    assert_gpu_tree_matches_cpu_anchor(&driver_tree, &anchor, "on-device");
+    // The returned layout partitions every row across the grown leaves.
+    assert_eq!(layout.num_data as usize, g.len(), "layout covers every row");
+    assert_eq!(
+        layout.leaf_count.iter().sum::<i32>(),
+        g.len() as i32,
+        "layout leaf_count partitions all rows"
+    );
+    assert_eq!(
+        layout.leaf_begin.len(),
+        driver_tree.num_leaves as usize,
+        "layout has one begin per grown leaf"
+    );
+
+    // The cfg-less trait seam remains env-gated (byte-unchanged merge gate when unset).
     let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
-
     if env_on {
-        let (on_device_tree, layout) =
+        let (seam_tree, _seam_layout) =
             grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
-        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
-        assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "on-device");
-        // The returned layout partitions every row across the grown leaves.
-        assert_eq!(layout.num_data as usize, g.len(), "layout covers every row");
-        assert_eq!(
-            layout.leaf_count.iter().sum::<i32>(),
-            g.len() as i32,
-            "layout leaf_count partitions all rows"
-        );
-        assert_eq!(
-            layout.leaf_begin.len(),
-            on_device_tree.num_leaves as usize,
-            "layout has one begin per grown leaf"
-        );
+        assert_gpu_tree_matches_cpu_anchor(&seam_tree, &anchor, "on-device-seam");
     } else {
         assert!(
             grown.is_none(),
@@ -2449,31 +2463,40 @@ fn deep_multileaf_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32)
 #[test]
 fn learner_parity_on_device_deep_multileaf_gate() {
     let backend = CpuBackend;
+    let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = deep_multileaf_corpus();
     let grow_features = grow_features_of(&features);
     // The driver pins the proving-slice config; the anchor MUST use the identical one.
     let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+    let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+
+    // WR-01: drive the deep (>2 live-leaf) growth path DIRECTLY, env-independent, so it
+    // is covered in the DEFAULT merge-gate run. IN-02: strict f64 comparator.
+    let (driver_tree, layout) =
+        lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+            &client, &g, &h, &grow_features, num_leaves, max_depth, cfg,
+        )
+        .expect("driver must grow the tree");
+    assert_gpu_tree_matches_cpu_anchor(&driver_tree, &anchor, "deep-multileaf");
+    assert!(
+        driver_tree.num_leaves >= 5,
+        "deep corpus must grow >2 simultaneously-live leaves (num_leaves >= 5), got {}",
+        driver_tree.num_leaves
+    );
+    assert_eq!(
+        layout.leaf_count.iter().sum::<i32>(),
+        g.len() as i32,
+        "layout leaf_count partitions all rows"
+    );
 
     let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
-
     if env_on {
-        let (on_device_tree, layout) =
+        let (seam_tree, _seam_layout) =
             grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
-        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
-        assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "deep-multileaf");
-        assert!(
-            on_device_tree.num_leaves >= 5,
-            "deep corpus must grow >2 simultaneously-live leaves (num_leaves >= 5), got {}",
-            on_device_tree.num_leaves
-        );
-        assert_eq!(
-            layout.leaf_count.iter().sum::<i32>(),
-            g.len() as i32,
-            "layout leaf_count partitions all rows"
-        );
+        assert_gpu_tree_matches_cpu_anchor(&seam_tree, &anchor, "deep-multileaf-seam");
     } else {
         assert!(
             grown.is_none(),
@@ -2532,29 +2555,38 @@ fn nosplit_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
 #[test]
 fn learner_parity_on_device_nosplit_gate() {
     let backend = CpuBackend;
+    let client = cpu_client();
     let (features, g, h, num_leaves, max_depth) = nosplit_corpus();
     let grow_features = grow_features_of(&features);
     let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
+    let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
+
+    // WR-01: drive the no-split (root-only) break path DIRECTLY, env-independent.
+    // IN-02: strict f64 comparator.
+    let (driver_tree, layout) =
+        lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
+            &client, &g, &h, &grow_features, num_leaves, max_depth, cfg,
+        )
+        .expect("driver must grow the tree");
+    assert_gpu_tree_matches_cpu_anchor(&driver_tree, &anchor, "no-split");
+    assert_eq!(
+        driver_tree.num_leaves, 1,
+        "num_leaves=1 (A3) grows a root-only (1-leaf) tree — the loop never runs"
+    );
+    assert_eq!(
+        layout.leaf_count.iter().sum::<i32>(),
+        g.len() as i32,
+        "layout leaf_count partitions all rows (single root leaf)"
+    );
 
     let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
-
     if env_on {
-        let (on_device_tree, layout) =
+        let (seam_tree, _seam_layout) =
             grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
-        let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
-        assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "no-split");
-        assert_eq!(
-            on_device_tree.num_leaves, 1,
-            "num_leaves=1 (A3) grows a root-only (1-leaf) tree — the loop never runs"
-        );
-        assert_eq!(
-            layout.leaf_count.iter().sum::<i32>(),
-            g.len() as i32,
-            "layout leaf_count partitions all rows (single root leaf)"
-        );
+        assert_gpu_tree_matches_cpu_anchor(&seam_tree, &anchor, "no-split-seam");
     } else {
         assert!(
             grown.is_none(),
