@@ -4,8 +4,8 @@ milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 20
 status: completed
-stopped_at: Phase 20 context gathered
-last_updated: "2026-07-02T05:24:44.350Z"
+stopped_at: Phase 21 context gathered (re-cut to hardening)
+last_updated: "2026-07-02T06:00:31.608Z"
 last_activity: 2026-07-02
 last_activity_desc: Phase 20 marked complete
 progress:
@@ -721,9 +721,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-02T00:20:54.704Z
-Stopped at: Phase 20 context gathered
-Resume file: .planning/phases/20-on-device-score-updater-metrics/20-CONTEXT.md
+Last session: 2026-07-02T06:00:31.598Z
+Stopped at: Phase 21 context gathered (re-cut to hardening)
+Resume file: .planning/phases/21-end-to-end-on-device-driver-integration-parity-gate/21-CONTEXT.md
 
 ## Operator Next Steps
 
