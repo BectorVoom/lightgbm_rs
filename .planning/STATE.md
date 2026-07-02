@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
 current_phase: 22
-current_phase_name: Feature Coverage
-status: verifying
+current_phase_name: on-device-categorical-splits-feature-coverage
+status: executing
 stopped_at: Phase 22 context gathered
-last_updated: "2026-07-02T08:19:13.217Z"
+last_updated: "2026-07-02T09:25:03.781Z"
 last_activity: 2026-07-02
-last_activity_desc: Phase 21 complete, transitioned to Phase 22
+last_activity_desc: Phase 22 execution started
 progress:
   total_phases: 10
   completed_phases: 8
-  total_plans: 39
-  completed_plans: 39
+  total_plans: 44
+  completed_plans: 41
   percent: 80
 ---
 
@@ -24,15 +24,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-21 after v1.0 milestone)
 
 **Core value:** For identical inputs and config, reproduce C++ LightGBM outputs to within ~1e-6 absolute difference on every backend (CPU and ROCm), using f32 (single-precision) data types matching the C++ reference defaults.
-**Current focus:** Phase 21 — end-to-end-on-device-driver-integration-parity-gate
+**Current focus:** Phase 22 — on-device-categorical-splits-feature-coverage
 
 ## Current Position
 
-Phase: 22 — On-Device Categorical Splits (Feature Coverage)
-Plan: Not started
-Status: Phase complete — ready for verification
+Phase: 22 (on-device-categorical-splits-feature-coverage) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
 Progress: [..........] 0/10 phases (v1.1)
-Last activity: 2026-07-02 — Phase 21 complete, transitioned to Phase 22
+Last activity: 2026-07-02 — Phase 22 execution started
 
 Next: `/gsd-plan-phase 14`
 
