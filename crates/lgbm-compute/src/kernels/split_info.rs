@@ -245,6 +245,13 @@ pub struct DeviceSplitInfo<R: cubecl::Runtime> {
     host: HostSlots,
     /// Number of leaf slots the record is sized for.
     num_leaf_slots: usize,
+    /// Runtime categorical slab width (D-03): the reserved `cat_threshold` /
+    /// `cat_threshold_real` per-slot length, read ONCE from `config.max_cat_threshold`
+    /// at [`Self::new`] (default [`MAX_CAT_PER_SPLIT`] = 32). `MAX_CAT_PER_SPLIT` is the
+    /// DEFAULT, not a hard cap — a `max_cat_threshold > 32` config is honored with NO
+    /// silent truncation and NO per-split alloc (the slab is sized once here). The SoA
+    /// layout is invariant to the width; only the slab length changes.
+    cat_width: usize,
     /// Count of `client.empty` device allocations performed — must equal
     /// [`NUM_FIELD_BUFFERS`] (every allocation happens in [`Self::new`]).
     device_allocations: usize,
@@ -256,29 +263,40 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
     /// per field, exactly once** (D-05/D-08). No allocation happens anywhere else
     /// (no per-split / per-record device alloc).
     ///
-    /// The categorical slabs are reserved at `num_leaf_slots * MAX_CAT_PER_SPLIT`
-    /// (D-06). Slab sizing is computed in `usize` and overflow-checked at the V5
-    /// boundary (threat T-14-04-03).
+    /// The categorical slabs are reserved at `num_leaf_slots * cat_width`, where
+    /// `cat_width` is the runtime slab width read ONCE from `max_cat_threshold`
+    /// (D-03; default [`MAX_CAT_PER_SPLIT`] = 32, no hard clamp, no silent
+    /// truncation). Slab sizing is computed in `usize` and overflow-checked at the V5
+    /// boundary (threat T-22-01, formerly T-14-04-03).
+    ///
+    /// `max_cat_threshold` is `config.max_cat_threshold` (pass [`MAX_CAT_PER_SPLIT`]
+    /// for the default). Callers wanting the historical fixed-32 behavior pass
+    /// `MAX_CAT_PER_SPLIT`.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] if `num_leaf_slots == 0`, or if the reserved
-    /// categorical slab length `num_leaf_slots * MAX_CAT_PER_SPLIT` overflows
-    /// `usize`.
+    /// categorical slab length `num_leaf_slots * cat_width` overflows `usize`.
     pub fn new(
         client: &ComputeClient<R>,
         num_leaf_slots: usize,
+        max_cat_threshold: usize,
     ) -> Result<Self, ComputeError> {
         if num_leaf_slots == 0 {
             return Err(ComputeError::Runtime {
                 detail: "DeviceSplitInfo::new: num_leaf_slots must be >= 1".to_string(),
             });
         }
-        // T-14-04-03: slab sizing in usize, checked for overflow before any alloc.
-        let cat_slab_len = num_leaf_slots.checked_mul(MAX_CAT_PER_SPLIT).ok_or_else(|| {
+        // D-03: the categorical slab WIDTH is a runtime value read once from
+        // `config.max_cat_threshold` (default `MAX_CAT_PER_SPLIT` = 32). NO hard
+        // clamp-to-32 (D-03 rejects it), NO silent truncation, NO per-split alloc.
+        let cat_width = max_cat_threshold;
+        // T-22-01 (was T-14-04-03): slab sizing in usize, checked for overflow before
+        // any alloc — now multiplied by the runtime `cat_width` (V5 mitigation intact).
+        let cat_slab_len = num_leaf_slots.checked_mul(cat_width).ok_or_else(|| {
             ComputeError::Runtime {
                 detail: format!(
                     "DeviceSplitInfo::new: categorical slab length \
-                     {num_leaf_slots} * {MAX_CAT_PER_SPLIT} overflows usize"
+                     {num_leaf_slots} * {cat_width} overflows usize"
                 ),
             }
         })?;
@@ -351,6 +369,7 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
             device,
             host,
             num_leaf_slots,
+            cat_width,
             device_allocations,
             _runtime: PhantomData,
         })
@@ -360,6 +379,16 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
     #[must_use]
     pub fn num_leaf_slots(&self) -> usize {
         self.num_leaf_slots
+    }
+
+    /// The runtime categorical slab width (D-03) — `config.max_cat_threshold` read
+    /// once at [`Self::new`] (default [`MAX_CAT_PER_SPLIT`] = 32). The reserved
+    /// `cat_threshold` / `cat_threshold_real` slabs are `num_leaf_slots * cat_width`
+    /// elements long; a `set_cat_thresholds` of up to `cat_width` thresholds fits with
+    /// no truncation.
+    #[must_use]
+    pub fn cat_width(&self) -> usize {
+        self.cat_width
     }
 
     /// The number of device buffers allocated — equals [`NUM_FIELD_BUFFERS`] after
@@ -442,12 +471,13 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
 
     /// Write the active categorical thresholds of `slot` into the reserved slabs and
     /// set `num_cat_threshold[slot]` to their length (no allocation). The two slices
-    /// must be the same length and fit the reserved [`MAX_CAT_PER_SPLIT`] width.
+    /// must be the same length and fit the reserved runtime [`Self::cat_width`] (D-03,
+    /// default [`MAX_CAT_PER_SPLIT`]).
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] if `slot >= num_leaf_slots`.
     /// [`ComputeError::LengthMismatch`] if the two slices differ in length.
-    /// [`ComputeError::Runtime`] if `thresholds.len() > MAX_CAT_PER_SPLIT`.
+    /// [`ComputeError::Runtime`] if `thresholds.len() > cat_width`.
     pub fn set_cat_thresholds(
         &mut self,
         slot: usize,
@@ -461,16 +491,17 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
                 actual: thresholds_real.len(),
             });
         }
-        if thresholds.len() > MAX_CAT_PER_SPLIT {
+        if thresholds.len() > self.cat_width {
             return Err(ComputeError::Runtime {
                 detail: format!(
                     "DeviceSplitInfo::set_cat_thresholds: {} thresholds exceed the reserved \
-                     MAX_CAT_PER_SPLIT = {MAX_CAT_PER_SPLIT} slab width (Phase-22-tunable)",
-                    thresholds.len()
+                     cat_width = {} slab width (D-03 runtime, config.max_cat_threshold)",
+                    thresholds.len(),
+                    self.cat_width
                 ),
             });
         }
-        let base = slot * MAX_CAT_PER_SPLIT;
+        let base = slot * self.cat_width;
         let len = thresholds.len();
         self.host.cat_threshold[base..base + len].copy_from_slice(thresholds);
         self.host.cat_threshold_real[base..base + len].copy_from_slice(thresholds_real);
@@ -490,7 +521,7 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
     pub fn cat_threshold(&self, slot: usize) -> &[u32] {
         assert!(slot < self.num_leaf_slots, "slot index out of range");
         let len = self.host.num_cat_threshold[slot].max(0) as usize;
-        let base = slot * MAX_CAT_PER_SPLIT;
+        let base = slot * self.cat_width;
         &self.host.cat_threshold[base..base + len]
     }
 
@@ -506,7 +537,7 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
     pub fn cat_threshold_real(&self, slot: usize) -> &[i32] {
         assert!(slot < self.num_leaf_slots, "slot index out of range");
         let len = self.host.num_cat_threshold[slot].max(0) as usize;
-        let base = slot * MAX_CAT_PER_SPLIT;
+        let base = slot * self.cat_width;
         &self.host.cat_threshold_real[base..base + len]
     }
 
@@ -546,9 +577,9 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
         h.right_gain[dst] = h.right_gain[src];
         h.right_value[dst] = h.right_value[src];
         h.num_cat_threshold[dst] = h.num_cat_threshold[src];
-        // Categorical reserved slabs: copy the whole MAX_CAT_PER_SPLIT-wide window
-        // in place (`copy_within` — no allocation).
-        let w = MAX_CAT_PER_SPLIT;
+        // Categorical reserved slabs: copy the whole cat_width-wide window (D-03
+        // runtime width) in place (`copy_within` — no allocation).
+        let w = self.cat_width;
         h.cat_threshold.copy_within(src * w..src * w + w, dst * w);
         h.cat_threshold_real.copy_within(src * w..src * w + w, dst * w);
         Ok(())
@@ -567,5 +598,85 @@ impl<R: cubecl::Runtime> DeviceSplitInfo<R> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod tests {
+    use super::*;
+    use crate::runtime::cpu_client;
+
+    /// D-03 (RESEARCH Open Q2): a `max_cat_threshold = 40` config sizes the reserved
+    /// categorical slabs at `num_leaf_slots * 40` with NO silent truncation — a
+    /// 33-long `set_cat_thresholds` (which the OLD fixed-32 guard would reject) and a
+    /// full 40-long write both SUCCEED, while a 41-long write returns the typed
+    /// overflow/length error. Both committed goldens use `max_cat_threshold = 32`
+    /// (the default), so this width>32 case is what proves D-03 NON-vacuously.
+    #[test]
+    fn cat_slab_width_gt_32_no_truncation() {
+        let client = cpu_client();
+        let num_leaf_slots = 3usize;
+        let mut info =
+            DeviceSplitInfo::<cubecl::cpu::CpuRuntime>::new(&client, num_leaf_slots, 40)
+                .expect("construct DeviceSplitInfo with cat_width = 40");
+
+        // The runtime width is honored (no clamp-to-32).
+        assert_eq!(info.cat_width(), 40, "cat_width must be the runtime max_cat_threshold");
+
+        // The reserved slab length equals num_leaf_slots * cat_width (allocate-once).
+        assert_eq!(info.host.cat_threshold.len(), num_leaf_slots * 40);
+        assert_eq!(info.host.cat_threshold_real.len(), num_leaf_slots * 40);
+
+        // A 33-long write SUCCEEDS (the old MAX_CAT_PER_SPLIT=32 guard would reject it).
+        let t33: Vec<u32> = (0..33u32).collect();
+        let r33: Vec<i32> = (0..33i32).collect();
+        info.set_cat_thresholds(0, &t33, &r33)
+            .expect("33 thresholds must fit a width-40 slab (no truncation)");
+        assert_eq!(info.scalars(0).num_cat_threshold, 33);
+        assert_eq!(info.cat_threshold(0), t33.as_slice());
+        assert_eq!(info.cat_threshold_real(0), r33.as_slice());
+
+        // A full-width 40-long write SUCCEEDS.
+        let t40: Vec<u32> = (0..40u32).collect();
+        let r40: Vec<i32> = (0..40i32).collect();
+        info.set_cat_thresholds(1, &t40, &r40)
+            .expect("40 thresholds must fit a width-40 slab");
+        assert_eq!(info.cat_threshold(1).len(), 40);
+
+        // A 41-long write EXCEEDS the runtime width => typed error (T-22-02).
+        let t41: Vec<u32> = (0..41u32).collect();
+        let r41: Vec<i32> = (0..41i32).collect();
+        assert!(
+            info.set_cat_thresholds(2, &t41, &r41).is_err(),
+            "41 thresholds must exceed the width-40 slab and return a typed error"
+        );
+    }
+
+    /// The default constructor path (`max_cat_threshold = MAX_CAT_PER_SPLIT`) is
+    /// byte-unchanged: `cat_width == 32`, and a 33-long write still returns the typed
+    /// error (the historical fixed-32 behavior, now expressed via the runtime width).
+    #[test]
+    fn cat_slab_default_width_is_32_and_guards_at_32() {
+        // The DEFAULT constant is preserved, not deleted.
+        assert_eq!(MAX_CAT_PER_SPLIT, 32);
+
+        let client = cpu_client();
+        let mut info =
+            DeviceSplitInfo::<cubecl::cpu::CpuRuntime>::new(&client, 2, MAX_CAT_PER_SPLIT)
+                .expect("construct DeviceSplitInfo with the default cat_width");
+        assert_eq!(info.cat_width(), 32);
+        assert_eq!(info.host.cat_threshold.len(), 2 * 32);
+
+        let t33: Vec<u32> = (0..33u32).collect();
+        let r33: Vec<i32> = (0..33i32).collect();
+        assert!(
+            info.set_cat_thresholds(0, &t33, &r33).is_err(),
+            "33 thresholds must exceed the default width-32 slab"
+        );
+
+        let t32: Vec<u32> = (0..32u32).collect();
+        let r32: Vec<i32> = (0..32i32).collect();
+        info.set_cat_thresholds(0, &t32, &r32)
+            .expect("32 thresholds must fit the default width-32 slab");
     }
 }
