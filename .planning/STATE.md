@@ -5,8 +5,8 @@ milestone_name: — CUDA On-Device Training Backend
 current_phase: 22
 current_phase_name: Feature Coverage
 status: verifying
-stopped_at: Phase 21 context gathered (re-cut to hardening)
-last_updated: "2026-07-02T07:27:45.127Z"
+stopped_at: Phase 22 context gathered
+last_updated: "2026-07-02T08:19:13.217Z"
 last_activity: 2026-07-02
 last_activity_desc: Phase 21 complete, transitioned to Phase 22
 progress:
@@ -729,9 +729,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-02T07:17:44.186Z
-Stopped at: Phase 21 context gathered (re-cut to hardening)
-Resume file: .planning/phases/21-end-to-end-on-device-driver-integration-parity-gate/21-CONTEXT.md
+Last session: 2026-07-02T08:19:13.207Z
+Stopped at: Phase 22 context gathered
+Resume file: .planning/phases/22-on-device-categorical-splits-feature-coverage/22-CONTEXT.md
 
 ## Operator Next Steps
 
