@@ -220,10 +220,22 @@ def _setup_kaggle_build():
 
 def _emit_results(results, out_dir):
     """Write results.json + results.md UNCONDITIONALLY (D-09 — the committed evidence
-    artifact ALWAYS lands, even on a parity/run failure)."""
+    artifact ALWAYS lands, even on a parity/run failure).
+
+    ALSO echo the full results.json to stdout bracketed by unique sentinels so the
+    numbers survive in the Kaggle LOG even if Kaggle drops the output files under its
+    output-size cap (the phase-23 first-run capture bug: the large /kaggle/working —
+    cloned repo + Rust target/ + 500k-row .npy preds — blew the output cap and the tiny
+    results.{md,json} were dropped, so the exact ratios/parity were lost while the log
+    survived). The stdout echo is the durable capture; the files stay best-effort."""
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
+
+    # Durable log-borne capture (survives the Kaggle output-size cap that drops files).
+    print("<<<AB_RESULTS_JSON")
+    json.dump(results, sys.stdout)
+    print("\nAB_RESULTS_JSON>>>")
 
     lines = []
     lines.append(f"# Phase 23 On-Device A/B Results — verdict: **{results['verdict']}**")
