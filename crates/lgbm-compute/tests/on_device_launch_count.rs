@@ -18,10 +18,14 @@ use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::{BinColumn, GrowFeature};
 use lgbm_dataset::bin_mapper::{BinType, MissingType};
 
-/// The host-path launch denominator SC-2 targets: 8,570 launches / 100 trees. This
-/// tiny single-tree corpus must sit FAR below it — proving the on-device path collapses
-/// launches relative to the host baseline (RESEARCH A1).
+/// The host-path launch denominator SC-2 targets: 8,570 launches / 100 trees.
 const HOST_BASELINE_LAUNCHES: u64 = 8570;
+/// The per-TREE host baseline (WR-02): 8,570 / 100 trees ≈ 86 leaf-level launches per
+/// tree. The old test compared a SINGLE tiny tree against the whole 100-tree denominator,
+/// so the bound was ~100× loose and could not fail for the very launch-non-collapse
+/// regression SC-2 exists to detect. Comparing like-for-like on a per-tree basis makes
+/// the bound meaningful.
+const HOST_BASELINE_PER_TREE: u64 = HOST_BASELINE_LAUNCHES / 100;
 
 /// `offset_for_most_freq_bin(0)` == 1 (drop bin 0 under the compacted convention). We
 /// hardcode it here because the helper lives in `lgbm-treelearner`, ABOVE this crate.
@@ -71,7 +75,10 @@ fn tiny_corpus(num_features: usize, num_data: usize) -> (Vec<GrowFeature>, Vec<f
 }
 
 /// L-1 / SC-2: an on-device grow bumps the compute-owned launch counter to a non-zero
-/// value that is far below the 8,570/100-trees host baseline scale.
+/// value that (a) sits at or below the PER-TREE host baseline and (b) matches the exact
+/// PER-LEAF collapse bound — a per-feature regression (the WR-01 failure mode) would
+/// scale with `num_features` and blow past this bound, so the test can actually fail for
+/// launch non-collapse.
 #[test]
 fn on_device_grow_bumps_nonzero_launch_count() {
     // P-1: enable the read-once phase-prof gate BEFORE the FIRST counter read (the
@@ -116,10 +123,32 @@ fn on_device_grow_bumps_nonzero_launch_count() {
         launches > 0,
         "on-device grow must bump a non-zero device launch count, got {launches}"
     );
-    // The single-tiny-tree count sits FAR below the 8,570/100-trees host denominator —
-    // structurally demonstrating the on-device launch collapse SC-2 measures on Kaggle.
+
+    // WR-02: the EXACT per-leaf collapse bound. The driver bumps ONCE PER LEAF-LEVEL
+    // build/subtract/scan (WR-01), independent of `num_features`. For a grow of
+    // `num_leaves` leaves (`num_leaves - 1` splits) the maximum leaf-level launches are:
+    //   builds   = 1 (root) + (num_leaves - 1) smaller-child builds
+    //   subtracts = (num_leaves - 1)   (one larger-child subtract per split)
+    //   scans    = 1 (root) + 2*(num_leaves - 1)  (both children per split, at most)
+    // i.e. `2 + 4*(num_leaves - 1)`. A per-FEATURE regression (the WR-01 failure mode)
+    // would multiply the build+scan terms by `num_features` and exceed this bound, so
+    // this assertion actually fails for launch non-collapse — unlike the old ~100×-loose
+    // `< 8570` check.
+    let per_leaf_collapse_bound = 2 + 4 * (num_leaves as u64 - 1);
     assert!(
-        launches < HOST_BASELINE_LAUNCHES,
-        "tiny single-tree launch count {launches} must be below the host baseline scale {HOST_BASELINE_LAUNCHES}"
+        launches <= per_leaf_collapse_bound,
+        "on-device launch count {launches} must be <= the per-leaf collapse bound \
+         {per_leaf_collapse_bound} (= 2 + 4*(num_leaves-1), num_leaves={num_leaves}); \
+         exceeding it means the counter scaled with num_features (per-feature, not \
+         per-leaf) — the WR-01 launch non-collapse regression"
+    );
+
+    // Like-for-like per-TREE sanity vs the host baseline (WR-02): a single collapsed
+    // tree stays at or below the per-tree host denominator (8570/100 ≈ 86), not merely
+    // below the whole 100-tree figure.
+    assert!(
+        launches <= HOST_BASELINE_PER_TREE,
+        "on-device single-tree launch count {launches} must be <= the per-tree host \
+         baseline {HOST_BASELINE_PER_TREE} (= {HOST_BASELINE_LAUNCHES}/100 trees)"
     );
 }
