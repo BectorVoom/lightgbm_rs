@@ -47,25 +47,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Compute-owned ON-DEVICE per-launch counter (L-1, SC-2). The on-device grow
-/// driver bumps this at every real build/subtract/scan device dispatch so an
+/// driver bumps this once per LEAF-LEVEL build / subtract / scan operation so an
 /// on-device train can report a NON-ZERO `device_launches` figure through the
 /// `phase_prof` COUNTS line — even though `phase_prof` lives in `lgbm-treelearner`
 /// (ABOVE `lgbm-compute` in the crate DAG) and cannot be imported here without a
 /// crate cycle. `phase_prof::dump` reads/swaps it via [`on_device_launch_count_take`]
 /// (the learner depends on compute, so it may reference this symbol).
+///
+/// **Granularity contract (WR-01):** this MUST match the host resident counters'
+/// unit so `phase_prof::dump` can legitimately sum them into one `device_launches=`
+/// total. The host `BUILD_RESIDENT_CNT` / `SUBTRACT_RESIDENT_CNT` / `SCAN_RESIDENT_CNT`
+/// bump ONCE PER LEAF (a single batched launch over all features); this counter is
+/// therefore bumped once per `build_leaf_hist` / per subtract / per `scan_leaf`
+/// invocation — NOT once per feature — so a per-feature figure is never summed with a
+/// per-leaf-batched one (which would inflate the on-device total by ~`num_features`
+/// and bias the SC-2 launch-collapse A/B against the on-device path).
 pub static ON_DEVICE_LAUNCH_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Read-once `LGBM_PHASE_PROF=="1"` gate (mirrors `phase_prof::enabled()`), so the
 /// launch counter is INERT and zero-overhead in the default merge gate — the bump
 /// never touches tree structure or values, keeping the on-device path parity-neutral
 /// and byte-unchanged (SC-4).
+///
+/// IN-01: this is a deliberate verbatim TWIN of `lgbm_treelearner::phase_prof::enabled()`
+/// — the two crates cannot share a helper without a crate cycle (`phase_prof` lives
+/// ABOVE `lgbm-compute` in the DAG). If the env interpretation ever changes here (e.g.
+/// accepting `"true"`), update the canonical twin `phase_prof::enabled()` in lockstep,
+/// and vice-versa, so the two independent process caches never diverge.
 fn launch_prof_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("LGBM_PHASE_PROF").map(|v| v == "1").unwrap_or(false))
 }
 
-/// Bump the on-device launch counter by one real device dispatch. No-op unless
-/// `LGBM_PHASE_PROF=="1"` (parity-neutral in the default build/tests).
+/// Bump the on-device launch counter by one LEAF-LEVEL device operation (one
+/// `build_leaf_hist`, one subtract, or one `scan_leaf` — matching the host per-leaf
+/// resident counters, WR-01). No-op unless `LGBM_PHASE_PROF=="1"` (parity-neutral in
+/// the default build/tests).
 #[inline]
 fn bump_launch() {
     if launch_prof_enabled() {
@@ -440,10 +457,12 @@ fn build_leaf_hist<R: cubecl::Runtime>(
     // Gather the leaf's ordered grad/hess ONCE (shared across features).
     let g: Vec<f32> = rows.iter().map(|&r| gradients[r as usize]).collect();
     let h: Vec<f32> = rows.iter().map(|&r| hessians[r as usize]).collect();
+    // L-1/WR-01: one leaf-level build launch (bumped ONCE per leaf, NOT per feature,
+    // to match the host per-leaf `BUILD_RESIDENT_CNT` unit `phase_prof::dump` sums with).
+    bump_launch();
     for (fpos, f) in features.iter().enumerate() {
         let binned: Vec<u32> = rows.iter().map(|&r| f.bins.bin(r as usize)).collect();
         // Phase-16 device build: RAW f64 histogram (2*num_bin cells).
-        bump_launch(); // L-1: one real on-device build dispatch.
         let mut region = construct_histograms_f64_on(client, &binned, &g, &h, f.num_bin)?;
         // FixHistogram (RAW leaf sums) then compact — O(num_bin) f64, bit-exact to
         // the host reference fold (mfb==0 ⇒ fix is a no-op; offset==1 ⇒ drop bin 0).
@@ -485,6 +504,9 @@ fn scan_leaf<R: cubecl::Runtime>(
     if !(sum_h > 0.0) || num_data_in_leaf <= 0 {
         return Ok((best, best_fpos, best_cat));
     }
+    // L-1/WR-01: one leaf-level scan launch (bumped ONCE per leaf that is actually
+    // scanned, NOT per feature, to match the host per-leaf `SCAN_RESIDENT_CNT` unit).
+    bump_launch();
     for (fpos, f) in features.iter().enumerate() {
         // Proving slice: continuous MissingType::None ⇒ single REVERSE scan, no
         // default-bin skip, no NA forward preamble.
@@ -514,7 +536,6 @@ fn scan_leaf<R: cubecl::Runtime>(
             )?;
             (cat.split, cat.cat_threshold)
         } else {
-            bump_launch(); // L-1: one real on-device scan dispatch.
             let si = find_best_split_f64_on(
                 client,
                 region,
@@ -908,8 +929,26 @@ pub fn grow_tree_on_device_driver_with_cfg<R: cubecl::Runtime>(
             l.best_fpos = -1;
             l.best_cat = Vec::new();
         }
-        // Append the new right child (leaf id == new_right).
-        debug_assert_eq!(new_right as usize, leaves.len(), "right child takes the next leaf id");
+        // Append the new right child (leaf id == new_right). WR-03: the kernel's
+        // `right_leaf_index` (== the tree's internal `num_leaves`) and the driver's
+        // `leaves.len()` are kept in lockstep only by construction. In release the old
+        // `debug_assert_eq!` was compiled out, so a kernel/driver desync would either
+        // panic on the later `leaves[new_right]` index or — worse — silently write the
+        // derived histogram into the wrong leaf slot, corrupting the partition with no
+        // typed error. Fail loudly with a typed `ComputeError` in ALL build profiles,
+        // BEFORE the `push` and any `leaves[new_right]` access, matching the driver's
+        // other invariant boundaries (IN-01/IN-02 at the split sites above).
+        if new_right as usize != leaves.len() {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "grow_tree_on_device_driver: leaf-id desync — kernel right_leaf_index {} \
+                     must equal the next driver leaf slot {} (tree num_leaves and driver \
+                     leaves.len() out of lockstep)",
+                    new_right,
+                    leaves.len()
+                ),
+            });
+        }
         leaves.push(DriverLeaf {
             rows: right_rows,
             sum_g: best.right_sum_gradient,
