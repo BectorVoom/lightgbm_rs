@@ -109,6 +109,11 @@ pub fn guard(c: &'static AtomicU64) -> Guard {
     Guard { c, t: Instant::now(), on: enabled() }
 }
 
+// IN-01: this is the CANONICAL `LGBM_PHASE_PROF` gate. It has a deliberate verbatim
+// TWIN, `lgbm_compute::kernels::grow_driver::launch_prof_enabled()`, which cannot
+// share this helper without a crate cycle (`phase_prof` lives ABOVE `lgbm-compute` in
+// the DAG). Keep the two in lockstep: any change to the env interpretation here (e.g.
+// accepting `"true"`) must be mirrored in the compute-side twin, and vice-versa.
 fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("LGBM_PHASE_PROF").map(|v| v == "1").unwrap_or(false))
@@ -187,12 +192,22 @@ pub fn dump(label: &str) {
     }
     // Spike-023 per-train LAUNCH/ROUND-TRIP COUNTS. `scan_resident` is the blocking
     // host round-trip (sync) count; build+subtract+fused+scan ≈ total device launches.
+    //
+    // UNIT CONTRACT (WR-01/IN-02): EVERY term summed into `device_launches=` counts
+    // PER-LEAF build / subtract / scan operations (one batched launch over all
+    // features per leaf), NOT per-feature. The on-device `on_device=` term
+    // (`on_device_launch_count_take`) is bumped at the same per-leaf granularity in
+    // `grow_driver` so the sum is apples-to-apples across the host and on-device paths.
+    // NOTE (IN-02): this is a build+subtract+scan SUBTOTAL, not a true total device
+    // count — per-split tree-mutation / partition / add_bias device dispatches are
+    // intentionally excluded (both host and on-device omit them, so the A/B is not
+    // skewed); read `device_launches=` as "histogram build+subtract+scan launches".
     let bld_cnt = BUILD_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let sub_cnt = SUBTRACT_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let scn_cnt = SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let fus_cnt = FUSED_CNT.swap(0, Ordering::Relaxed);
     // L-1/SC-2: fold the on-device driver's own launch count (bumped in lgbm-compute
-    // at every real build/subtract/scan dispatch — the host `*_RESIDENT_CNT` counters
+    // once per leaf-level build/subtract/scan — the host `*_RESIDENT_CNT` counters
     // stay 0 on the on-device path) into the SAME `device_launches=` total. The
     // consumer (23-03 harness) captures the total via the SHORT regex
     // `device_launches=(?P<launches>\d+)`, so `on_device=` MUST live INSIDE the
@@ -202,8 +217,14 @@ pub fn dump(label: &str) {
     let on_dev = lgbm_compute::kernels::grow_driver::on_device_launch_count_take();
     if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
         let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
+        // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
+        // (WR-01/IN-02): both the host `*_resident=` terms and `on_device=` use the same
+        // per-leaf unit, and tree-mutation/partition dispatches are excluded on both paths.
+        // The `device_launches=` KEY is kept verbatim (no rename) so the 23-03 harness
+        // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
+        // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev}) | scan_roundtrips(syncs)={scn_cnt}"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev}) | scan_roundtrips(syncs)={scn_cnt} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // Spike-049: in_learner_other sub-breakdown.
