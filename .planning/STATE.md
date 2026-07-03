@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — CUDA On-Device Training Backend
-current_phase: 23
-status: milestone-complete
-stopped_at: Phase 23 complete — milestone v1.1 100% (10/10 phases), ready to complete-milestone
-last_updated: "2026-07-03T11:37:08.778Z"
+current_phase: 1
+status: Awaiting next milestone
+stopped_at: Phase 23 complete + verified (UAT 5/5, security 0 open); milestone v1.1 100% — ready to complete-milestone
+last_updated: "2026-07-03T12:33:48.661Z"
 last_activity: 2026-07-03
-last_activity_desc: Phase 23 complete
+last_activity_desc: Milestone v1.1 completed and archived
 progress:
   total_phases: 10
   completed_phases: 10
@@ -28,28 +28,10 @@ See: .planning/PROJECT.md (updated 2026-07-03 after Phase 23 / milestone v1.1 cl
 
 ## Current Position
 
-Phase: 23 (perf-validation-default-on-rollout-dod) — COMPLETE
-Plan: 4/4 complete
-Status: Milestone v1.1 complete — all 10 phases finished; verified (UAT 5/5, security 0 open)
-Progress: [██████████] 10/10 phases (v1.1)
-Last activity: 2026-07-03 — Phase 23 complete, milestone v1.1 closed
-
-Next: `/gsd-complete-milestone v1.1` — archive milestone and prepare for next
-
-The v1.1 roadmap (rewritten 2026-06-29) ports the full single-GPU CUDA training pipeline on-device per `docs/cuda-kernel-design.md`, dependency-ordered across 10 anchor-gated phases:
-
-- Phase 14 — Foundation: shared device primitives + device split-record/RNG (ODL-01/02); re-establish the on-device seam + tie-aware oracle (code already in git)
-- Phase 15 — Device dataset + row-subset gather (ODL-03/04)
-- Phase 16 — Histogram constructor: build + subtraction trick (ODL-09/10)
-- Phase 17 — Best-split finder (ODL-11/12)
-- Phase 18 — Data partition, tree mutation & prediction (ODL-13/14/15)
-- Phase 19 — On-device objectives (ODL-05/06/07/08)
-- Phase 20 — Score updater & metrics (ODL-16/17)
-- Phase 21 — End-to-end driver integration + parity gate (ODL-18/19)
-- Phase 22 — Categorical splits (ODL-22)
-- Phase 23 — Perf-validation + default-on rollout DoD (ODL-20/21)
-
-Non-negotiables threaded into every phase: anchor-pinned to the cpu f64 fold (never GPU-vs-GPU), additive + off by default behind `LGBM_CUDA_ON_DEVICE`, NO f64 per-row hot loops (u64 fixed-point), subtraction-trick/most-freq-bin-fix/mark→prefix-sum→scatter as correctness, CUDATree.Split before DataPartition.Split.
+Phase: Milestone v1.1 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-07-03 — Milestone v1.1 completed and archived
 
 ## Deferred Items
 
@@ -91,6 +73,20 @@ Items acknowledged and deferred at milestone v1.0 close on 2026-06-21. The v1.0 
 | todo | register-row-batching-histogram (medium) | pending |
 | todo | spike-gpu-cpu-crossover (high) | pending |
 | todo | spike-lowrow-phase-ab (high) | pending |
+
+### Deferred at milestone v1.1 close (2026-07-03)
+
+Items acknowledged and deferred at milestone v1.1 close. The v1.1 audit (`gaps_found`) confirmed these are intentional v2 deferrals + pre-existing perf carryover, **not v1.1 requirement gaps** (21/23 satisfied; every backend byte-unchanged with the env unset). Before close, the two ROCm perf phases (11, 12) were hardware-confirmed on the local gfx1100 and flipped `human_needed → passed`, and 30 shipped-but-unflipped quick-task markers were reconciled to `complete`.
+
+| Category | Item | Status |
+|----------|------|--------|
+| requirement | ODL-21 (on-device becomes default CUDA learner) | Partial / deferred v2 — default-on flip WITHHELD by design on the real-CUDA A/B FAIL (launch-bound); ships opt-in via `LGBM_CUDA_ON_DEVICE=1`. Primary v2 carry-forward: the per-leaf launch-bound perf work. |
+| requirement | ODL-20 (real-CUDA A/B numbers) | Partial — harness ran, FAIL verdict definitive; exact per-shape numbers dropped by Kaggle output-cap. Re-run with the sentinel-echo fix to record. |
+| tech_debt | 7 anchor-pinned-but-unwired kernels (ODL-03/04/05/06/07/08/17) | Deferred v2 — verified reusable, no production consumer; gradients/metric-eval/leaf-row-gather still round-trip host each iteration. |
+| phase | Phase 23 VERIFICATION.md | `gaps_found` — the honest verdict (ODL-20/21 partial); resolves the audit's unverified-phase blocker. |
+| quick_task | 260608-lad-abstract-backend-parallel-prefix-sum | partial (genuinely open perf spike) |
+| quick_task | 260608-nn7-eliminate-gpu-host-device-round-trips | checkpoint-pending — task-3 human-verify never run (runnable on local GPU) |
+| todo | establish-large-data-benchmark-fixture / profile-gpu-training-loop-large-data / spike-gpu-cpu-crossover / spike-lowrow-phase-ab / verify-lds-atomic-lowering-gfx1100 | pending (next-milestone perf candidates) |
 
 ### Plan 08-03 result (PYB-02 input widening — COMPLETE)
 

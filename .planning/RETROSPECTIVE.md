@@ -44,6 +44,39 @@
 
 ---
 
+## Milestone: v1.1 — CUDA On-Device Training Backend
+
+**Shipped:** 2026-07-03
+**Phases:** 10 (14–23) | **Plans:** 48 | **Audit:** `gaps_found` (21/23 satisfied)
+
+### What Was Built
+The full LightGBM single-GPU CUDA training pipeline ported on-device (design-doc §-grounded): shared device primitives + `CUDASplitInfo`/`CUDARandom` structs, a resident columnar device dataset + row-subset gather, the on-device histogram build/fix/subtract (u64 fixed-point, no f64 per-row loop), the 3-stage best-split finder, mark→prefix-sum→scatter data partition + device tree mutation + tree-walk predict, on-device objectives (regression-family/binary/multiclass/ranking), score-updater + pointwise metrics, the end-to-end grow driver, on-device categorical splits (anchored to real `lib_lightgbm` 4.6 goldens), and the real-CUDA perf-validation/rollout DoD. Fully additive behind `LGBM_CUDA_ON_DEVICE`.
+
+### What Worked
+- **Anchor-before-kernel discipline scaled to a 10-phase GPU port.** Every kernel pinned STRUCTURE bit-exact to the cubecl-cpu f64 fold (never GPU-vs-GPU, def-f8u-01), so the hard merge gate stayed green and byte-unchanged the entire milestone despite 41k LOC of new device code.
+- **Audit-before-wire on the rollout DoD paid off.** Phase 23's contingent default-on flip caught a severe launch-bound regression on real discrete NVIDIA (~23 min/100-tree arm) and correctly WITHHELD the flip instead of shipping a slow default. The gate did its job.
+- **Wave-0 scaffolding (goldens + task tables + Nyquist stubs before kernels)** locked the riskiest parity landmines (count-rounding, `default_left != reverse`) as tested units before any kernel was written.
+
+### What Was Inefficient
+- **7 kernels shipped anchor-pinned but unwired** (objectives, metric-eval, device dataset row-gather) — verified reusable but with no production consumer, so gradients/metric-eval/row-gather still round-trip host each iteration. The "host only orchestrates" DoD intent is only partially realized; wiring is a v2 carry-forward.
+- **Phase 23 closed on the human-verify FAIL branch without a VERIFICATION.md**, surfacing as the sole audit blocker at milestone close (resolved by a verifier pass during close).
+- **Kaggle's output-size cap dropped the A/B results files**, so exact per-shape numbers weren't captured on the definitive run — harness fixed to self-evidence, but a re-run is needed.
+
+### Patterns Established
+- The **tri-state env gate** (`unset⇒default / "0"⇒off / "1"⇒on`) with a compile-time `on_device_default()` stub as the single source of truth for an opt-in behavior-changing path.
+- **Real-hardware verification at milestone close**: ROCm-gated tests deferred as `human_needed` during headless verification, then batch-run on the local GPU at close — parity halves are load-bearing, perf halves judged on sign only (spoofed 8-CU APU, throughput APU-confounded).
+
+### Key Lessons
+1. A *contingent* DoD (ship X only if measured-not-slower) is more honest than an unconditional one — encode the contingency in the plan (D-09 FAIL branch) so a bad result withholds the change automatically instead of forcing a judgment call under pressure.
+2. "Anchor-pinned + verified" ≠ "wired": a kernel can be correct and reusable yet have no production consumer. Track wiring as a distinct requirement, or the "host only orchestrates" intent silently under-delivers.
+3. Reconcile status *markers* at ship time — 30 shipped quick-tasks re-flagged the milestone audit purely because their `status:` field was never flipped, not because work was open.
+
+### Cost Observations
+- Model mix: not instrumented (single-developer + agent sessions).
+- Notable: the 10-phase port ran on parallel wave-based execution under the bit-exact merge gate; hardware confirmation was batched to one GPU session at close rather than per-phase.
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -51,12 +84,14 @@
 | Milestone | Phases | Plans | Key Change |
 |-----------|--------|-------|------------|
 | v1.0 | 8 | 55 | Established the dependency-forced bottom-up parity spine + real-binary FP-trace tiebreak + bit-exact cpu anchor |
+| v1.1 | 10 | 48 | Scaled the anchor-before-kernel discipline to a full on-device GPU port; added the contingent audit-before-wire rollout DoD (withheld a slow default) |
 
 ### Cumulative Quality
 
 | Milestone | Requirements | Audit | LOC |
 |-----------|--------------|-------|-----|
 | v1.0 | 69/69 | PASSED | ~68.7k (65.5k Rust + 3.2k Py) |
+| v1.1 | 21/23 | gaps_found (2 intentional v2 deferrals) | ~105.4k Rust |
 
 ### Top Lessons (Verified Across Milestones)
 

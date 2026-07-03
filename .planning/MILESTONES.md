@@ -1,5 +1,35 @@
 # Milestones
 
+## v1.1 CUDA On-Device Training Backend (Shipped: 2026-07-03)
+
+**Phases completed:** 10 phases (14–23), 48 plans, 105 tasks
+
+**Definition of done:** Port the full LightGBM single-GPU CUDA training pipeline on-device (per `docs/cuda-kernel-design.md`) — training state resident on device, host only orchestrates — anchor-pinned bit-exact to the cubecl-cpu f64 fold with CUDA/ROCm f32 within ~1e-6, fully additive and off by default behind `LGBM_CUDA_ON_DEVICE`. Milestone audit: **`gaps_found`** (21/23 requirements satisfied; 2 partial — both Phase 23, both intentional v2 deferrals). All 10 phases verified; every backend byte-unchanged with the env unset (merge gate green). See `milestones/v1.1-MILESTONE-AUDIT.md`.
+
+**Known gaps (intentional, carried to v2):**
+- **ODL-21 — on-device NOT made the default CUDA learner.** Contingent on the real-CUDA A/B being not-slower; the discrete-NVIDIA A/B returned **FAIL** (launch-bound, ~23 min/100-tree arm), so the default-on flip was correctly WITHHELD per plan D-09. Ships opt-in via `LGBM_CUDA_ON_DEVICE=1`; `on_device_default()` stays `false`. The per-leaf launch-bound perf work is the primary v2 carry-forward.
+- **ODL-20 — exact A/B numbers not captured.** The harness ran and the FAIL verdict is definitive, but Kaggle's output-size cap dropped `results.{md,json}` (harness fixed to self-evidence on re-run).
+- **7 anchor-pinned kernels unwired** (ODL-03/04/05/06/07/08/17) — verified reusable, no production consumer yet; gradients/metric-eval/leaf-row-gather still round-trip host each iteration.
+
+**Known deferred items at close:** 8 (Phase 23 `gaps_found` intentional deferral + 2 open perf-spike quick-tasks [`260608-lad` partial, `260608-nn7` task-3 human-verify] + 5 next-milestone perf todos — see STATE.md Deferred Items).
+
+**Stats:** ~105.4k Rust LOC (up from ~65.5k at v1.0) · 559 commits · ~12 days (2026-06-21 → 2026-07-03). Post-close: the two ROCm perf phases (11 fixed-point int-atomics, 12 sibling-scan co-pack) were hardware-confirmed on the local gfx1100 (spoofed 8-CU APU) and flipped to `passed`.
+
+**Key accomplishments:**
+
+- **Phase 14 — Foundation:** the shared device primitives every subsystem builds on (block + multi-kernel global prefix-sum, shuffle reductions, index-only bitonic argsort, weighted percentile) + a CubeCL-safe pre-allocated `CUDASplitInfo` device split-record (zero per-split alloc) + a `CUDARandom` LCG bit-identical to the host RNG stream — each single-owner serial-f64 cpu-anchor-tested with an f32/plane GPU leg (ODL-01/02).
+- **Phase 15 — Device dataset + row-subset gather:** the resident columnar binned dataset in the §13 feature-partition layout (`CudaColumnData` + `CudaRowData`, u8/16/32 dispatch, dense + 3×3 CSR sparse re-lay, large-bin spill) + `CopySubrow` row-subset gather + on-device bagging draw anchored bit-for-bit to the host reference; code review caught 2 latent Critical parity bugs before Phase 16 (ODL-03/04).
+- **Phase 16 — Histogram constructor:** the hot-path build→fix→subtract on device — two-tier §13 `u64` fixed-point BUILD (shared-LDS + global-memory spill, no f64 per-row loop, no `Atomic<i64>`), `FixHistogram` most-freq-bin omit-and-repair, and the `hist_t**` pointer-rotation subtraction trick via `HistArena` — anchor-pinned to the cpu f64 fold (ODL-09/10).
+- **Phase 17 — Best-split finder:** the 3-stage §8 pipeline — per-`(leaf,feature)` split evaluation (prefix-sum → complement → two-phase kEpsilon count recovery → guards → gain → strict-`>` argmax), cross-feature reduce + cross-leaf argmax with a single 8-int readback per split, tie-aware `default_left` parity — bit-exact to C++-transcribed goldens + hip f32 mirror (ODL-11/12).
+- **Phase 18 — Data partition, tree mutation & prediction:** the §9 `mark → prefix-sum → scatter` row router (never sorting), the device-resident flat `CUDATree` SoA + `Split`/`SplitCategorical`/`Shrinkage`/`AddBias` mutation kernels (Split ordered before partition), and the `AddPredictionToScoreKernel` device tree-walk predict — anchor-pinned (ODL-13/14/15).
+- **Phase 19 — On-device objectives:** regression-family (L2/L1/Quantile/Huber/Fair/Poisson), binary-logloss, multiclass (softmax/OVA), and ranking (LambdaRank-NDCG + RankXENDCG, per-item RNG) grad/hess as standalone CubeCL kernels — anchor-pinned to the cpu f64 folds and real `lib_lightgbm` grad/hess goldens (ODL-05/06/07/08).
+- **Phase 20 — Score updater, metrics & driver integration:** resident `cuda_score_` add/multiply score update + `EvalKernel` pointwise metrics with honest host fallback for CUDA-unsupported metrics, PLUS (pulled forward per D-01) the minimal per-leaf best-first on-device grow driver — sequences the Phase-16/17/18 kernels to grow a full continuous+L2 tree STRUCTURE-bit-exact to the cpu f64 anchor, `cuda_score_` resident across the whole train (ODL-16/17/18/19).
+- **Phase 21 — On-device driver hardening:** a targeted STRUCTURE parity corpus (deep >2-live-leaf, no-split break, min-data/min-hessian cases) + the WR-01 `HistArena::swap` slot-aliasing fix confirmation + the additive `grow_tree_on_device_driver_with_cfg` seam — all anchored to the cpu f64 fold, env-unset workspace byte-unchanged (ODL-18H).
+- **Phase 22 — On-device categorical splits:** bitset construction + categorical split evaluation (one-hot + many-vs-many bitonic-sorted) + categorical partition membership + `SplitCategorical` via a pre-allocated bitset (no per-`SplitInfo` device alloc) — the DEVICE-grown categorical tree pinned bit-exact to real `lib_lightgbm` 4.6 goldens, the first on-device subsystem anchored to a REAL reference (ODL-22).
+- **Phase 23 — Perf-validation + rollout DoD (audit-before-wire capstone):** a tri-state `LGBM_CUDA_ON_DEVICE` single-source resolver + a phase-prof-gated on-device launch counter (ODL-20) + a committed credential-free Kaggle A/B harness; the real-discrete-NVIDIA A/B returned **FAIL** (launch-bound), so the default-on flip (ODL-21) was intentionally WITHHELD — the gate caught the launch-bound regression before it shipped as a default; 10/10 security threats closed.
+
+---
+
 ## v1.0 Full Single-Machine Parity (Shipped: 2026-06-21)
 
 **Phases completed:** 8 phases, 55 plans, 129 tasks
@@ -59,3 +89,4 @@
 - The Python surface now saves/loads the Phase-3 C++-compatible model text (`save_model`/`model_to_string`/`from_model_string`/`from_model_file`) and pickles a `Booster` and a fitted `LGBMClassifier` over the model string — and a model trained by real `lightgbm` 4.6, saved to text, loads in `lightgbm_rs` and predicts within ~1e-6 (the D-10 cross-format contract). This closes Phase 8.
 
 ---
+
