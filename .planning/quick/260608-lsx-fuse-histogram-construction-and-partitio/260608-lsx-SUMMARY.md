@@ -1,4 +1,5 @@
 ---
+status: complete
 quick_id: 260608-lsx
 slug: fuse-histogram-construction-and-partition-search
 type: execute

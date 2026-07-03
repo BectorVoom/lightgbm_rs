@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: quick-260622-jcr
 plan: 01
 subsystem: lgbm-compute (rocm row-partition occupancy tuning)

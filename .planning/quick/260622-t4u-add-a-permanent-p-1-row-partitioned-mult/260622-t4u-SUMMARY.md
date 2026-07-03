@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: quick-260622-t4u
 plan: 01
 subsystem: gpu-histogram-parity

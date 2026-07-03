@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: 260608-t3t
 plan: 01
 subsystem: lgbm-compute / lgbm-treelearner (GPU split-finding)

@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: quick-260619-ol8
 plan: 01
 subsystem: lgbm-compute (rocm histogram kernels — measurement only)

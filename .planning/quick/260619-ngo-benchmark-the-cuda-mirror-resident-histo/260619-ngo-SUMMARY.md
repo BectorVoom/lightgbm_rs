@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: 260619-ngo
 plan: 01
 subsystem: lgbm-compute (GPU histogram kernels)

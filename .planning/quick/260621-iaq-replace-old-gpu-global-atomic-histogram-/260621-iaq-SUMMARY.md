@@ -3,7 +3,7 @@ phase: quick-260621-iaq
 plan: 01
 subsystem: lgbm-compute (GPU histogram kernels)
 tags: [gpu, rocm, histogram, lds, parity, dead-code-removal]
-status: paused-at-checkpoint
+status: complete
 requires: []
 provides:
   - "GPU parity seam (RocmBackend::construct_histograms) driven by the LDS kernel"

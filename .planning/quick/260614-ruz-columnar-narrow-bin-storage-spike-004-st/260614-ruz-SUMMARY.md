@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: quick-260614-ruz
 plan: 01
 subsystem: treelearner / compute (histogram build hot path)

@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: quick-260608-mc5
 plan: 01
 subsystem: lgbm-compute (split-finding kernels)

@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: 260608-s2b-fuse-gpu-build-kernels-fold-f32-f64-wide
 plan: 01
 subsystem: infra

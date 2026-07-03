@@ -1,30 +1,31 @@
 ---
 phase: 11-gpu-fixedpoint-int-atomics
 verified: 2026-06-22T00:00:00Z
-status: human_needed
-score: 8/8 must-haves verified (codebase) — 3 device-runtime truths await hardware confirmation
+status: passed
+human_verified: 2026-07-03T21:20:00Z
+score: 8/8 must-haves verified (3 device-runtime truths confirmed on local ROCm 2026-07-03; see 11-UAT.md)
 re_verification:
   previous_status: none
   previous_score: n/a
-human_verification:
+human_verification_completed:
   - test: "Run the re-pinned resident parity gate on the ROCm GPU"
     expected: "kernel_parity_resident_build_fix_compact_equals_host_on_hip PASSES: max_rel vs CPU f64 anchor <= FIXEDPOINT_REL_GATE (1e-7), and the 2-runs to_bits() determinism sub-assert holds"
-    why_human: "The test is #[cfg(feature=rocm)] and requires the (spoofed 8-CU) ROCm GPU to execute; running it is not a fast grep and cannot run in this verifier env. Goal truth 'parity within ~1e-6 + deterministic' is a device-runtime behavior."
+    result: "PASS (2026-07-03, local ROCm gfx1100 spoofed 8-CU gfx1152 APU, HSA_OVERRIDE=11.0.0). Both P=1 and P>1 cells: max_rel_vs_cpu_f64_anchor=0.000e0 (bit-exact, gate 1e-7); P>1 row_partition_count(3,300000)=10 multi-cube merge also 0.000e0 — closes review WR-05. Determinism sub-assert holds."
   - test: "Run the device-time A/B example >=2x on the ROCm GPU"
-    expected: "cargo run --release --features rocm --example gpu_fixedpoint_resident_ab prints, in the HEAVY wide 16x1M regime, u64 median ratio >= 1.0x at every P (SEP-WIN at >=1 P), sign-stable across two process runs; LIGHT regime overlap acceptable"
-    why_human: "Device-time proxy on the spoofed 8-CU APU is wall-clock unvalidatable in this env; the 'not-slower in the wide regime' truth is the printed SEP/ratio sign, which must be observed on hardware. APU-confounded — judge the sign + methodology, not absolute Mr/s."
+    expected: "HEAVY wide 16x1M regime, u64 median ratio >= 1.0x (SEP-WIN at >=1 P), sign-stable across two process runs; LIGHT overlap acceptable"
+    result: "PASS (2026-07-03, ≥2 process runs). HEAVY wide NOT-SLOWER both runs — run1 SEP-WIN at P=1 (1.64×) & P=8 (1.34×); run2 SEP-WIN every P (1.06×–1.41×). LIGHT not-regressed. SEP sign stable. Absolute Mr/s APU-confounded and disregarded per methodology."
   - test: "Confirm the unchanged non-resident f32 + bit-exact f64 subtract/construct pins stay green on the GPU"
-    expected: "rocm_row_partition (2/2) and rocm_backend_parity (4/4 bit-exact) PASS at their existing tolerances after the phase-11 changes"
-    why_human: "These are #[cfg(feature=rocm)] GPU tests; the goal requires the integer build NOT to disturb the post-dequant f64 paths, which is a runtime parity assertion. (DEF-11-OOS-01 cuda_mirror flake is a documented pre-existing f32-atomic nondeterminism in a DIFFERENT kernel, not a phase-11 regression.)"
+    expected: "rocm_row_partition (2/2) and rocm_backend_parity (bit-exact) PASS at their existing tolerances after the phase-11 changes"
+    result: "PASS (2026-07-03). rocm_backend_parity 5/5 green (construct/subtract/find_best_split bit-exact + data_partition + default_left_tie); rocm_row_partition 2/2 green. Integer build did not disturb the post-dequant f64 paths."
 ---
 
 # Phase 11: Fixed-point integer-atomic GPU histogram build Verification Report
 
 **Phase Goal:** Replace the ROCm resident histogram BUILD's f32 atomics with wide fixed-point u64 (S=2^30) integer LDS atomics — targeting ~1.3–1.7× faster on the wide large-leaves regime, ~3600× more accurate, and deterministic, within the ~1e-6 ROCm parity gate. Must NOT change CPU routing or the CPU f64 deterministic anchor. Re-pin the resident-build parity gate to compare the LIVE u64 GPU path against the CPU f64 anchor, add a determinism assert, and add a device-time A/B harness confirming the integer build is not-slower in the wide regime.
 
-**Verified:** 2026-06-22
-**Status:** human_needed
-**Re-verification:** No — initial verification
+**Verified:** 2026-06-22 (codebase) · **Hardware-confirmed:** 2026-07-03 (local ROCm)
+**Status:** passed
+**Re-verification:** No — initial verification; the 3 device-runtime truths were confirmed on hardware 2026-07-03 (see 11-UAT.md), flipping human_needed → passed
 
 ## Goal Achievement
 
@@ -78,8 +79,9 @@ human_verification:
 | CPU-only build (zero fixed-point codegen leak) | `cargo build -p lgbm-compute` | Finished, EXIT=0 | ✓ PASS |
 | rocm-feature compile (u64 kernel + dequant + guard lower on cubecl-hip) | `cargo check -p lgbm-compute --features rocm` | Finished, EXIT=0 | ✓ PASS |
 | A/B example CPU-only stub compiles | `cargo build -p lgbm-compute --example gpu_fixedpoint_resident_ab` | Finished, EXIT=0 | ✓ PASS |
-| Resident parity PASS on GPU (1e-7 + determinism) | `cargo test -p oracle-harness --features rocm kernel_parity_resident_build_fix_compact_equals_host_on_hip` | requires ROCm GPU | ? SKIP → human |
-| A/B not-slower sign on GPU (>=2 runs) | `cargo run --release --features rocm --example gpu_fixedpoint_resident_ab` | requires ROCm GPU | ? SKIP → human |
+| Resident parity PASS on GPU (1e-7 + determinism) | `cargo test -p oracle-harness --features rocm kernel_parity_resident_build_fix_compact...` | max_rel=0.000e0 (P=1 & P=10), determinism holds (2026-07-03) | ✓ PASS (hardware) |
+| A/B not-slower sign on GPU (>=2 runs) | `cargo run --release --features rocm --example gpu_fixedpoint_resident_ab` | HEAVY wide NOT-SLOWER, SEP sign stable across 2 runs (2026-07-03) | ✓ PASS (hardware) |
+| Unchanged f64 pins on GPU | `cargo test -p lgbm-compute --features rocm --test rocm_backend_parity --test rocm_row_partition` | 5/5 + 2/2 green (2026-07-03) | ✓ PASS (hardware) |
 
 ### Probe Execution
 
@@ -121,9 +123,9 @@ The three device-runtime items (frontmatter `human_verification`) gate the goal'
 
 No BLOCKER gaps. Every phase must-have is realized in the codebase as a substantive, wired artifact: the live ROCm resident BUILD now accumulates in u64 two's-complement fixed-point via `Atomic<u64>` LDS atomics, dequantized at the fix-compact seam, with a typed overflow guard; the CPU f64 anchor and CPU routing are byte-untouched; the parity gate is correctly re-pinned to the CPU f64 anchor (resolving def-f8u-01) with a determinism sub-assert; and the device-time A/B harness drives the live u64 kernel against an explicitly-labelled f32 twin using the spike-018/019 discipline. CPU-only and rocm-feature builds both compile.
 
-Status is **human_needed** (not passed) because three of the eight must-haves assert device-runtime behaviors — parity within ~1e-6, two-runs determinism, and not-slower-in-the-wide-regime — that require the ROCm GPU to execute and cannot be exercised in this verifier environment. The SUMMARYs report these PASS on hardware, but per the verifier mandate (SUMMARY claims are not evidence) the hardware result must be observed before the goal's numerical/perf contract is certified.
+Status is **passed**. The three device-runtime must-haves — parity within ~1e-6, two-runs determinism, and not-slower-in-the-wide-regime — were confirmed on the local ROCm GPU on 2026-07-03 (see 11-UAT.md), so the goal's numerical/perf contract is now hardware-certified rather than SUMMARY-claimed.
 
-**Review-warning weighing (per context note):** WR-05 is the most goal-relevant warning — the single live-path correctness gate uses a 10-row P=1 leaf, so the multi-cube row-partition (P>1) merge this phase enables is never anchor-checked at P>1. Integer add is order-independent (the determinism rationale), so the result *should* be exact at P>1, but that is exactly the claim a P>1 anchor comparison would PROVE and it is currently untested. This is a **WARNING, not a BLOCKER**: it does not falsify any must-have (the P=1 live-path gate passes and the A/B example does exercise P up to 16 at the device-time layer), but it leaves a real correctness-coverage gap for the phase's headline regime. Recommend the human, when running item 1, also force P>1 through the u64 resident chain (`LGBM_ROWPART_MIN=0` with a >=256k-row leaf) and confirm the read-back still matches the CPU f64 anchor — closing WR-05 would let a future re-verification reach `passed` outright.
+**Review-warning WR-05 — CLOSED (2026-07-03):** The most goal-relevant warning was that the live-path correctness gate only exercised a P=1 leaf, leaving the multi-cube row-partition (P>1) merge unproven at the anchor. The hardware re-run exercised the `kernel_parity_resident_build_fix_compact_p_gt_1_equals_host_on_hip` cell — `row_partition_count(3,300000)=10`, and the P=10 multi-cube read-back matches the CPU f64 anchor bit-exactly (`max_rel=0.000e0`). The order-independence of integer add is now proven at P>1, not just argued. WR-05 no longer leaves a coverage gap.
 
 ---
 

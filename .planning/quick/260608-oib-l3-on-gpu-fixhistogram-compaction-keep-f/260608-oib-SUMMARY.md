@@ -1,4 +1,5 @@
 ---
+status: complete
 phase: quick-260608-oib
 plan: 01
 subsystem: compute
