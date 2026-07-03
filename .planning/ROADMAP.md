@@ -85,7 +85,7 @@ Candidate themes deferred to v2: on-device quantized training (QGD-01..03 — th
 - [x] **Phase 20: On-Device Score Updater & Metrics (+ pulled-forward on-device driver, D-01)** — Resident cumulative `cuda_score_` + the 12 supported pointwise metrics (EvalKernel); unsupported metrics fall back to host; PLUS the pulled-forward end-to-end on-device grow loop (ODL-18/19) with STRUCTURE bit-exact gate. (5 plans) (completed 2026-07-02)
 - [x] **Phase 21: Harden the On-Device Driver (parity corpus + WR-01 confirmation + bookkeeping)** — ODL-18/19 delivered in Phase 20 per D-01; Phase 21 confirms the WR-01 `HistArena::swap` fix, broadens the targeted STRUCTURE parity corpus (cpu-f64-anchored), and reconciles the ODL-18/19 → ODL-18H bookkeeping. (ODL-18H) (completed 2026-07-02)
 - [ ] **Phase 22: On-Device Categorical Splits (Feature Coverage)** — Bitset construction + categorical split eval + categorical partition + SplitCategorical, via the pre-allocated bitset.
-- [ ] **Phase 23: Perf-Validation + Default-On Rollout (DoD)** — Kaggle A/B (`device_launches` + wall-clock ratio); flip default-ON for CUDA contingent on parity + not-slower; host fallback retained.
+- [x] **Phase 23: Perf-Validation + Default-On Rollout (DoD)** — Kaggle A/B (`device_launches` + wall-clock ratio); flip default-ON for CUDA contingent on parity + not-slower; host fallback retained. (completed 2026-07-03)
 
 ### Phase Details
 
@@ -342,7 +342,7 @@ Plans:
   3. The on-device learner becomes the **DEFAULT** CUDA tree-learner path — contingent on anchor-pinned ~1e-6 parity AND not-slower-than-the-current-host-CUDA path on the Kaggle A/B — with `LGBM_CUDA_ON_DEVICE=0` retained as the off-switch fallback.
   4. ROCm + CPU routing stay host-driven / byte-unchanged; the CPU f64 merge gate is green.
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans complete
 Plans:
 **Wave 1**
 
@@ -355,7 +355,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 23-04-PLAN.md — Verdict-gated default-on flip: `on_device_default()`→`cfg!(feature="cuda")` as a SEPARATE commit blocked on the results.md PASS verdict (ODL-21) (Wave 3)
+- [x] 23-04-PLAN.md — Verdict-gated default-on flip: `on_device_default()`→`cfg!(feature="cuda")` as a SEPARATE commit blocked on the results.md PASS verdict (ODL-21) (Wave 3)
 
 **Notes**: Pure routing/perf, deferred until the win is measured — never auto-engaged before proof (the audit-before-wire value). The improvement magnitude is the genuine empirical unknown. Default-on flips ONLY where the real-CUDA A/B shows a sign-stable not-slower result (the fused-kernel default-off precedent). Multi-stream overlap is a stretch to spike only if launch-count reduction underdelivers. Kaggle CLI authenticated as `boomvector` is the only path to real discrete-CUDA numbers (local GPU is a spoofed APU). **Wave shape:** 1 (tri-state+L-2 ∥ L-1 instrumentation, disjoint files) → 2 (Kaggle harness, needs the `"0"` off-switch + non-zero device_launches) → 3 (verdict-gated flip). SC-4 (ROCm/CPU byte-unchanged) is the hard LOCAL gate; SC-1/SC-2/SC-3-real-numbers + D-11-real-CUDA-parity are Kaggle-only/manual (see 23-VALIDATION.md).
 
@@ -372,4 +372,4 @@ Plans:
 | 20. On-Device Score Updater & Metrics (+ driver, D-01) | v1.1 | 6/6 | Complete   | 2026-07-02 |
 | 21. End-to-End Driver Integration + Parity Gate | v1.1 | 3/3 | Complete    | 2026-07-02 |
 | 22. On-Device Categorical Splits | v1.1 | 0/? | Not started | - |
-| 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 3/4 | In Progress|  |
+| 23. Perf-Validation + Default-On Rollout (DoD) | v1.1 | 4/4 | Complete   | 2026-07-03 |
