@@ -1,0 +1,18 @@
+[package]
+name = "lgbm-dataset"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# `src/bin/` is the Cargo binary-target dir by convention; here it is the bin-
+# STORAGE module (`bin/mod.rs` etc.), not executables. Disable binary auto-
+# discovery so Cargo does not try to compile the module files as `main`-bearing
+# binaries (this crate ships no binaries).
+autobins = false
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+oracle-harness = { path = "../oracle-harness" }

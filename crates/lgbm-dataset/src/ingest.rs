@@ -1,0 +1,499 @@
+//! The minimal internal-facing ingestion API (D-05): `from_mat` / `from_csr` /
+//! `from_csc`. Wires the full pipeline VERBATIM from the C-API in-memory path
+//! (`LightGBM/src/c_api.cpp` `SampleCount`/`CreateSampleIndices` 974-982,
+//! `LGBM_DatasetCreateFromMat`/`FromCSR`/`FromCSC`):
+//!
+//! ```text
+//! sample row indices (Phase-1 RNG, data_random_seed)
+//!   -> gather per-column sampled values (f32 -> f64 at ONE widen site)
+//!   -> find_bin per column (sequential, D-03)
+//!   -> Dataset::construct
+//!   -> push each row's features (FeatureGroup::PushData)
+//!   -> finish_load (the immutability boundary)
+//! ```
+//!
+//! Follows `lgbm-core/src/config/set.rs`'s validated-entry-point discipline:
+//! each `from_*` is a SINGLE public entry that VALIDATES all caller input at the
+//! boundary FIRST (Security V5 — typed [`DatasetError`], never a panic), then
+//! runs the fixed-order pipeline. No `unsafe` indexing on caller data.
+//!
+//! # The single f32 -> f64 widen site
+//!
+//! Caller feature data is `&[f32]` (the public dense/sparse value type). Binning
+//! arithmetic is entirely f64 (`bin_mapper.rs` contract). The widen happens at
+//! exactly ONE documented point: [`widen`]. Do NOT scatter `as f64` casts —
+//! every value flows through `widen` so the conversion site is auditable.
+//!
+//! # Sampling routes through the Phase-1 RNG
+//!
+//! `create_sample_indices` builds `Random::new(cfg.data_random_seed)` and calls
+//! `.sample(total_nrow, min(total_nrow, bin_construct_sample_cnt))` — the exact
+//! C-API path. There is NO new RNG here (the function is re-exported from
+//! `bin_mapper`).
+
+use lgbm_core::config::Config;
+use lgbm_core::types::K_ZERO_THRESHOLD;
+
+pub use crate::bin_mapper::{create_sample_indices, sample_count};
+use crate::bin_mapper::{scaled_filter_cnt, BinMapper};
+use crate::dataset::{EfbSamples, FinishedDataset};
+use crate::error::DatasetError;
+use crate::metadata::Metadata;
+
+/// The SINGLE f32 -> f64 widen site for caller feature data. Every feature value
+/// that crosses from the caller's `f32` buffers into the f64 binning arithmetic
+/// passes through here (audit point; do NOT scatter `as f64`).
+#[inline]
+fn widen(v: f32) -> f64 {
+    v as f64
+}
+
+/// Validate the shared binning config knobs (Security V5 / T-02-12): reject a
+/// non-positive `max_bin` (C++ `CHECK_GT(max_bin, 0)`) and a negative
+/// `min_data_in_bin` / `bin_construct_sample_cnt` BEFORE allocating.
+fn validate_binning_config(cfg: &Config) -> Result<(), DatasetError> {
+    if cfg.max_bin <= 0 {
+        return Err(DatasetError::InvalidConfig {
+            detail: format!("max_bin must be > 0, got {}", cfg.max_bin),
+        });
+    }
+    if cfg.min_data_in_bin < 0 {
+        return Err(DatasetError::InvalidConfig {
+            detail: format!("min_data_in_bin must be >= 0, got {}", cfg.min_data_in_bin),
+        });
+    }
+    if cfg.bin_construct_sample_cnt < 0 {
+        return Err(DatasetError::InvalidConfig {
+            detail: format!(
+                "bin_construct_sample_cnt must be >= 0, got {}",
+                cfg.bin_construct_sample_cnt
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Build the numeric `BinMapper` for one column from its full per-row values,
+/// returning BOTH the mapper AND the sampled per-row values (in sampled-set
+/// order) that share the same `create_sample_indices` draw.
+///
+/// Mirrors the C-API path: sample row indices via the Phase-1 RNG, gather the
+/// sampled rows' values, then `find_bin_numeric` with `total_sample_cnt = k`.
+/// `column` is already f64-widened. This is the per-feature constructor (D-03):
+/// no shared mutable state, so a later `par_iter` over columns is a one-line swap.
+///
+/// The returned `sampled` Vec is reused to build the `EfbSamples` the Construct
+/// dispatch consumes — the SAME single `create_sample_indices` draw used to bin,
+/// so NO second RNG draw is introduced (the seed is `cfg.data_random_seed` and
+/// the per-column sample positions `0..k` are identical across columns).
+fn build_mapper(column: &[f64], cfg: &Config) -> (BinMapper, Vec<f64>) {
+    let total_nrow = column.len() as i32;
+    let indices = create_sample_indices(
+        total_nrow,
+        cfg.bin_construct_sample_cnt,
+        cfg.data_random_seed,
+    );
+    let sampled: Vec<f64> = indices.iter().map(|&i| column[i as usize]).collect();
+    let total_sample_cnt = sampled.len();
+    // SCALED pre-filter threshold via the SINGLE source-of-truth helper (shared
+    // with bin_mapper.rs::find_bin_from_column) — C++ feeds the SCALED filter_cnt,
+    // NOT the raw min_data_in_leaf, to FindBin (dataset_loader.cpp:623-624). Here
+    // total_sample_cnt = k (the sampled count) and num_rows = total_nrow, matching
+    // the dense c_api convention (CSR/CSC use the identical convention).
+    let filter_cnt = scaled_filter_cnt(cfg.min_data_in_leaf, total_sample_cnt as i32, total_nrow);
+    let mapper = BinMapper::find_bin_numeric(
+        sampled.clone(),
+        cfg.max_bin,
+        cfg.min_data_in_bin,
+        filter_cnt,
+        cfg.feature_pre_filter,
+        cfg.use_missing,
+        cfg.zero_as_missing,
+        total_sample_cnt,
+        &[],
+    );
+    (mapper, sampled)
+}
+
+/// Build the per-column [`EfbSamples`] the `enable_bundle` Construct dispatch
+/// consumes, to the EXACT C++ `c_api.cpp:1352-1374` SAMPLED-SET convention:
+///
+/// - the outer index `i` runs `0..sample_cnt` — the position WITHIN the sampled
+///   set, NOT the raw row index (`c_api.cpp:1352`, `sample_idx[k].emplace_back(i)`);
+/// - per column `k`, a sampled value `v` is kept ONLY when
+///   `v.abs() > kZeroThreshold || v.is_nan()` (`c_api.cpp:1361`);
+/// - `total_sample_cnt` = the SAMPLED-SET size `sample_cnt`
+///   (`= sampled_columns[*].len()`), NOT `num_rows` (`c_api.cpp:1372` `sample_cnt`
+///   arg, distinct from the `total_nrow` arg that only drives `num_rows`);
+/// - `num_per_col[k]` = `sample_values[k].len()` (the kept non-zero/NaN count).
+///
+/// This is DELIBERATELY NOT the `efb_grouping.rs` full-row convention
+/// (total_sample_cnt = num_rows, raw row indices): on the ingest path the sample
+/// is `bin_construct_sample_cnt` rows, so the sampled-set positions `0..sample_cnt`
+/// are the correct indices.
+///
+/// `sampled_columns[k]` is the sampled per-row values for column `k`, in
+/// sampled-set order, as returned by [`build_mapper`] — i.e. all columns share
+/// the same single `create_sample_indices` draw (no second RNG draw).
+fn build_efb_samples(sampled_columns: &[Vec<f64>], num_cols: i32) -> EfbSamples {
+    // sample_cnt is the SAMPLED-SET size, identical across columns (one draw).
+    let sample_cnt = sampled_columns.first().map(|c| c.len()).unwrap_or(0) as i32;
+    let mut sample_indices: Vec<Vec<i32>> = vec![Vec::new(); num_cols as usize];
+    let mut sample_values: Vec<Vec<f64>> = vec![Vec::new(); num_cols as usize];
+    let mut num_per_col: Vec<i32> = vec![0; num_cols as usize];
+    for k in 0..num_cols as usize {
+        let col = &sampled_columns[k];
+        for (i, &v) in col.iter().enumerate() {
+            // c_api.cpp:1361 non-zero/NaN filter; `i` is the sampled-set POSITION.
+            if v.abs() > K_ZERO_THRESHOLD || v.is_nan() {
+                sample_values[k].push(v);
+                sample_indices[k].push(i as i32);
+            }
+        }
+        num_per_col[k] = sample_values[k].len() as i32;
+    }
+    EfbSamples {
+        sample_indices,
+        sample_values,
+        num_per_col,
+        num_sample_col: num_cols,
+        total_sample_cnt: sample_cnt,
+    }
+}
+
+/// Run the shared tail of every ingestion path: build one mapper per column,
+/// dispatch through the single C++ `Dataset::Construct` (the `enable_bundle`
+/// branch, [`Dataset::construct_bundled`]), push every row, attach the validated
+/// metadata, and `finish_load` (the immutability boundary).
+///
+/// `columns[c]` is the full f64-widened per-row column for feature `c`; every
+/// column has the same length `num_rows`.
+///
+/// CRITICAL (CR-01 fix): this routes through `construct_bundled` — the faithful
+/// port of the SINGLE C++ `Dataset::Construct` (dataset.cpp:325-441) — instead of
+/// the prior store-everything non-bundled path. With the default
+/// `cfg.enable_bundle = true` it filters trivial features (used_features =
+/// `!is_trivial_`, dataset.cpp:337-343) AND runs `FastFeatureBundling`
+/// (dataset.cpp:362-369); with `enable_bundle = false` it falls back to
+/// `one_feature_per_group(used_features)` — STILL trivial-filtered. The
+/// `EfbSamples` it consumes is built to the exact c_api.cpp:1352-1374 sampled-set
+/// convention (see [`build_efb_samples`]).
+fn finish_from_columns(
+    columns: &[Vec<f64>],
+    num_rows: i32,
+    cfg: &Config,
+    mut metadata: Metadata,
+) -> Result<(FinishedDataset, Metadata), DatasetError> {
+    let num_cols = columns.len() as i32;
+    // One pass: build each mapper AND capture its sampled per-row values (the
+    // SAME create_sample_indices draw — no second RNG draw).
+    let mut mappers: Vec<BinMapper> = Vec::with_capacity(columns.len());
+    let mut sampled_columns: Vec<Vec<f64>> = Vec::with_capacity(columns.len());
+    for col in columns {
+        let (mapper, sampled) = build_mapper(col, cfg);
+        mappers.push(mapper);
+        sampled_columns.push(sampled);
+    }
+    // EfbSamples built to the c_api.cpp:1352-1374 sampled-set convention.
+    let samples = build_efb_samples(&sampled_columns, num_cols);
+    let mut ds = crate::dataset::Dataset::construct_bundled(mappers, num_rows, cfg, &samples)?;
+    for row in 0..num_rows {
+        for (feature, col) in columns.iter().enumerate() {
+            ds.push_value(feature, row, col[row as usize]);
+        }
+    }
+    let finished = ds.finish_load();
+    metadata.finish_load();
+    Ok((finished, metadata))
+}
+
+/// Ingest a DENSE row-major matrix (`data[row*num_cols + col]`) + metadata into
+/// an immutable [`FinishedDataset`].
+///
+/// VALIDATES first (Security V5 / T-02-11): `num_rows`/`num_cols` non-negative,
+/// `data.len() == num_rows * num_cols`, and the binning config. Returns a typed
+/// [`DatasetError`] on any violation — never a panic. The returned [`Metadata`]
+/// has run `finish_load` (query weights derived).
+pub fn from_mat(
+    data: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    cfg: &Config,
+    metadata: Metadata,
+) -> Result<(FinishedDataset, Metadata), DatasetError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    let expected = (num_rows as i64) * (num_cols as i64);
+    if data.len() as i64 != expected {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!(
+                "data.len()={} must equal num_rows*num_cols={expected}",
+                data.len()
+            ),
+        });
+    }
+    validate_binning_config(cfg)?;
+    if metadata.num_data() != num_rows {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!(
+                "metadata num_rows={} must equal num_rows={num_rows}",
+                metadata.num_data()
+            ),
+        });
+    }
+
+    // Gather columns (widen f32 -> f64 at the single widen site).
+    let mut columns: Vec<Vec<f64>> = vec![Vec::with_capacity(num_rows as usize); num_cols as usize];
+    for row in 0..num_rows as usize {
+        let base = row * num_cols as usize;
+        for col in 0..num_cols as usize {
+            columns[col].push(widen(data[base + col]));
+        }
+    }
+
+    finish_from_columns(&columns, num_rows, cfg, metadata)
+}
+
+/// Validate a CSR/CSC `indptr` (monotone non-decreasing, `indptr[0] == 0`,
+/// `indptr.len() == outer + 1`, `last == nnz`) — Security V5 / T-02-10. Returns
+/// the nnz on success.
+fn validate_indptr(indptr: &[i64], outer: i64, nnz: usize) -> Result<(), DatasetError> {
+    if indptr.len() as i64 != outer + 1 {
+        return Err(DatasetError::MalformedSparse {
+            detail: format!(
+                "indptr.len()={} must equal outer+1={}",
+                indptr.len(),
+                outer + 1
+            ),
+        });
+    }
+    if indptr[0] != 0 {
+        return Err(DatasetError::MalformedSparse {
+            detail: format!("indptr[0]={} must be 0", indptr[0]),
+        });
+    }
+    for w in indptr.windows(2) {
+        if w[1] < w[0] {
+            return Err(DatasetError::MalformedSparse {
+                detail: format!("indptr not monotone non-decreasing: {} then {}", w[0], w[1]),
+            });
+        }
+    }
+    let last = *indptr.last().unwrap();
+    if last != nnz as i64 {
+        return Err(DatasetError::MalformedSparse {
+            detail: format!("indptr last={last} must equal nnz={nnz}"),
+        });
+    }
+    Ok(())
+}
+
+/// Ingest a CSR (Compressed Sparse Row) matrix + metadata. `indptr` has
+/// `num_rows + 1` entries; for row `r`, the stored `(col, value)` pairs are
+/// `indices[indptr[r]..indptr[r+1]]` / `values[...]`. Absent entries are zero.
+///
+/// VALIDATES (Security V5 / T-02-10): `indices.len() == values.len() == nnz`,
+/// `indptr` well-formed, and every `indices[k] < num_cols` — BEFORE any indexing
+/// into `values`/columns. Returns a typed [`DatasetError`], never panics.
+pub fn from_csr(
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    cfg: &Config,
+    metadata: Metadata,
+) -> Result<(FinishedDataset, Metadata), DatasetError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    if indices.len() != values.len() {
+        return Err(DatasetError::MalformedSparse {
+            detail: format!(
+                "indices.len()={} must equal values.len()={}",
+                indices.len(),
+                values.len()
+            ),
+        });
+    }
+    validate_indptr(indptr, num_rows as i64, values.len())?;
+    for &c in indices {
+        if c < 0 || c >= num_cols {
+            return Err(DatasetError::MalformedSparse {
+                detail: format!("column index {c} out of range [0, {num_cols})"),
+            });
+        }
+    }
+    validate_binning_config(cfg)?;
+    if metadata.num_data() != num_rows {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!(
+                "metadata num_rows={} must equal num_rows={num_rows}",
+                metadata.num_data()
+            ),
+        });
+    }
+
+    // Dense-by-column gather: absent entries default to 0.0 (zero_cnt-aware,
+    // Open Q2). Widen f32 -> f64 at the single widen site.
+    let mut columns: Vec<Vec<f64>> = vec![vec![0.0f64; num_rows as usize]; num_cols as usize];
+    for row in 0..num_rows as usize {
+        let start = indptr[row] as usize;
+        let end = indptr[row + 1] as usize;
+        for k in start..end {
+            let col = indices[k] as usize;
+            columns[col][row] = widen(values[k]);
+        }
+    }
+
+    finish_from_columns(&columns, num_rows, cfg, metadata)
+}
+
+/// Ingest a CSC (Compressed Sparse Column) matrix + metadata. `indptr` has
+/// `num_cols + 1` entries; for column `c`, the stored `(row, value)` pairs are
+/// `indices[indptr[c]..indptr[c+1]]` / `values[...]`. Absent entries are zero.
+///
+/// VALIDATES (Security V5 / T-02-10): `indices.len() == values.len() == nnz`,
+/// `indptr` well-formed, and every `indices[k] < num_rows` — BEFORE any indexing.
+/// Returns a typed [`DatasetError`], never panics.
+pub fn from_csc(
+    indptr: &[i64],
+    indices: &[i32],
+    values: &[f32],
+    num_rows: i32,
+    num_cols: i32,
+    cfg: &Config,
+    metadata: Metadata,
+) -> Result<(FinishedDataset, Metadata), DatasetError> {
+    if num_rows < 0 || num_cols < 0 {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!("num_rows={num_rows} / num_cols={num_cols} must be >= 0"),
+        });
+    }
+    if indices.len() != values.len() {
+        return Err(DatasetError::MalformedSparse {
+            detail: format!(
+                "indices.len()={} must equal values.len()={}",
+                indices.len(),
+                values.len()
+            ),
+        });
+    }
+    validate_indptr(indptr, num_cols as i64, values.len())?;
+    for &r in indices {
+        if r < 0 || r >= num_rows {
+            return Err(DatasetError::MalformedSparse {
+                detail: format!("row index {r} out of range [0, {num_rows})"),
+            });
+        }
+    }
+    validate_binning_config(cfg)?;
+    if metadata.num_data() != num_rows {
+        return Err(DatasetError::ShapeMismatch {
+            detail: format!(
+                "metadata num_rows={} must equal num_rows={num_rows}",
+                metadata.num_data()
+            ),
+        });
+    }
+
+    // Dense-by-column gather: absent entries default to 0.0 (Open Q2). Widen at
+    // the single widen site.
+    let mut columns: Vec<Vec<f64>> = vec![vec![0.0f64; num_rows as usize]; num_cols as usize];
+    for col in 0..num_cols as usize {
+        let start = indptr[col] as usize;
+        let end = indptr[col + 1] as usize;
+        for k in start..end {
+            let row = indices[k] as usize;
+            columns[col][row] = widen(values[k]);
+        }
+    }
+
+    finish_from_columns(&columns, num_rows, cfg, metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        // Use a small sample cnt so sampling is exercised; defaults otherwise.
+        let mut c = Config::default();
+        c.max_bin = 16;
+        c.min_data_in_bin = 1;
+        c.bin_construct_sample_cnt = 100000; // sample all rows for determinism
+        c.feature_pre_filter = false;
+        c
+    }
+
+    fn meta(n: i32) -> Metadata {
+        Metadata::new(vec![0.0f32; n as usize], Vec::new(), Vec::new(), Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn from_mat_shape_mismatch_is_typed_error() {
+        let c = cfg();
+        let err = from_mat(&[1.0, 2.0, 3.0], 2, 2, &c, meta(2)).unwrap_err();
+        assert!(matches!(err, DatasetError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn from_mat_invalid_max_bin_is_typed_error() {
+        let mut c = cfg();
+        c.max_bin = 0;
+        let err = from_mat(&[1.0, 2.0, 3.0, 4.0], 2, 2, &c, meta(2)).unwrap_err();
+        assert!(matches!(err, DatasetError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn from_csr_non_monotone_indptr_is_typed_error() {
+        let c = cfg();
+        // indptr 0,2,1 — not monotone.
+        let err = from_csr(
+            &[0, 2, 1],
+            &[0, 1, 0],
+            &[1.0, 2.0, 3.0],
+            2,
+            2,
+            &c,
+            meta(2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DatasetError::MalformedSparse { .. }));
+    }
+
+    #[test]
+    fn from_csr_out_of_range_index_is_typed_error() {
+        let c = cfg();
+        // column index 5 >= num_cols 2.
+        let err = from_csr(&[0, 1], &[5], &[1.0], 1, 2, &c, meta(1)).unwrap_err();
+        assert!(matches!(err, DatasetError::MalformedSparse { .. }));
+    }
+
+    #[test]
+    fn from_csc_out_of_range_row_is_typed_error() {
+        let c = cfg();
+        // row index 9 >= num_rows 2.
+        let err = from_csc(&[0, 1, 1], &[9], &[1.0], 2, 2, &c, meta(2)).unwrap_err();
+        assert!(matches!(err, DatasetError::MalformedSparse { .. }));
+    }
+
+    #[test]
+    fn from_mat_builds_finished_dataset() {
+        let c = cfg();
+        // 3 rows, 2 cols, row-major.
+        let data = vec![
+            0.0, 10.0, //
+            1.0, 20.0, //
+            2.0, 30.0, //
+        ];
+        let (ds, _md) = from_mat(&data, 3, 2, &c, meta(3)).unwrap();
+        assert_eq!(ds.num_data(), 3);
+        assert_eq!(ds.num_features(), 2);
+    }
+}

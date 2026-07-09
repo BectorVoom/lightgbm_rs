@@ -1,0 +1,9 @@
+# Phase-7 Wave-0 (D-05) bagged-subset split-gain determinism FP-trace fixtures.
+#
+# Populated by `cargo run -p xtask -- subset-determinism-capture` (version-pinned
+# to lightgbm==4.6.0; human-gated capture — the wheel is not installed in CI).
+# The committed `*_subset_trace.txt` traces are replayed by
+# `boosting_parity::subset_determinism_diagnostic` to localize the bagged-subset
+# split-gain knife-edge cell-for-cell (sum_hessian -> cnt_factor ->
+# current_gain/min_gain_shift -> leaf count). Until capture, the diagnostic test
+# skip-passes (the read_golden Option shape). NEVER git-add the LightGBM/ tree.

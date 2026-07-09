@@ -1,0 +1,28 @@
+[package]
+name = "lgbm-boosting"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+lgbm-model = { path = "../lgbm-model" }
+# The boosting loop drives the Phase-5 SerialTreeLearner via its existing public
+# API. CMP-01 containment: this crate names NO GPU compute runtime — the compute
+# seam stays isolated below the learner.
+lgbm-treelearner = { path = "../lgbm-treelearner" }
+lgbm-objective = { path = "../lgbm-objective" }
+lgbm-metric = { path = "../lgbm-metric" }
+# Backend TRAIT BOUND + Phase-20 (§11, ODL-16) resident device score path: the
+# learner's score-scatter `SerialTreeLearner<'_, B: Backend>::add_prediction_to_score`
+# appears in the `ScoreUpdater` signature, and the §11 `boosting_on_cuda_` toggle
+# routes to the `kernels::score_updater` / `kernels::predict` launchers generic over
+# `B::Runtime` (via the re-exported `ComputeClient`). This names lgbm-compute
+# TRAITS/TYPES/FUNCTIONS only — never a GPU compute runtime — so CMP-01's no-runtime
+# gate still holds (exactly the `lgbm-treelearner` discipline).
+lgbm-compute = { path = "../lgbm-compute" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

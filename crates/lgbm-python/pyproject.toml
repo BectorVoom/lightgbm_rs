@@ -1,0 +1,44 @@
+# maturin packaging for the `lightgbm-rs` distribution (D-11 import name
+# `lightgbm_rs`, D-12 mixed Rust/Python layout, D-13 single abi3 wheel).
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "lightgbm-rs"
+# abi3-py311 floor (08-RESEARCH A4 / D-13): one stable-ABI wheel covers 3.11+.
+requires-python = ">=3.11"
+description = "Pure-Rust LightGBM (CubeCL) — Python bindings mirroring the official lightgbm API"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+    "numpy>=2.0.0",
+    "scipy",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+polars = ["polars>=0.20"]
+sklearn = ["scikit-learn>=0.24.2"]
+pandas = ["pandas"]
+plotting = ["graphviz", "matplotlib"]
+
+[tool.maturin]
+# GPU wheels are opt-in via cargo features forwarded to `lgbm` (see Cargo.toml
+# `[features]`). The default build is CPU-only; build a CUDA wheel (NVIDIA host
+# with the CUDA toolkit, e.g. Colab/Kaggle) with:
+#   maturin build --release --features cuda
+# then Python `device_type="cuda"` dispatches to the CudaBackend. (rocm/wgpu
+# analogous.) CLI `--features` merge with the `pyo3/extension-module` below.
+#
+# The thin pure-Python package lives under python/; the compiled engine is
+# nested as `lightgbm_rs._core` (D-11/D-12).
+python-source = "python"
+module-name = "lightgbm_rs._core"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]

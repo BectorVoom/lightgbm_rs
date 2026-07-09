@@ -1,0 +1,2 @@
+# l2 real-binary l2 value at round 5; f64 bits
+4623648893446057949

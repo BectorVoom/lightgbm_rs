@@ -1,0 +1,46 @@
+[package]
+name = "lgbm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+lgbm-model = { path = "../lgbm-model" }
+lgbm-treelearner = { path = "../lgbm-treelearner" }
+lgbm-objective = { path = "../lgbm-objective" }
+lgbm-metric = { path = "../lgbm-metric" }
+lgbm-boosting = { path = "../lgbm-boosting" }
+# Backend + GainConfig + CpuBackend to drive the learner from the facade train()
+# (the trait/types + the CPU anchor only — the facade names no cubecl runtime).
+lgbm-compute = { path = "../lgbm-compute" }
+thiserror = { workspace = true }
+# spike-050: feature-parallel raw-corpus binning (per-feature BinMapper build + bin
+# assignment are independent). Same version as the sibling compute/treelearner crates.
+rayon = "1.10"
+# Optional drop-in global allocator (parity-neutral) for the bench harness and any
+# downstream binary that opts in via `--features mimalloc`. Off by default so the
+# library imposes no allocator on consumers.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+# Route the process global allocator through mimalloc. Enabled for the optimized
+# benchmark runs (M2/M3) and intended for the shipped binaries.
+mimalloc = ["dep:mimalloc"]
+# Dispatch training compute to the ROCm/HIP GPU (f64 kernels on the local gfx1100)
+# instead of the native CPU backend. Opt-in: the default build stays on the CPU
+# anchor and never references the HIP runtime. Forwards to lgbm-compute/rocm.
+rocm = ["lgbm-compute/rocm"]
+# Dispatch training compute to a CUDA GPU (cubecl-cuda). Opt-in; forwards to
+# lgbm-compute/cuda. Selected only when `rocm` is NOT also enabled (see booster.rs
+# cascade: rocm > cuda > wgpu > cpu).
+cuda = ["lgbm-compute/cuda"]
+# Dispatch training compute to a WGPU/WGSL target (cubecl-wgpu). Opt-in; forwards to
+# lgbm-compute/wgpu. NOTE (locked decision #3): the shared f32-atomic histogram
+# kernel may not lower to WGSL at runtime (no f32 atomics); the compile-gated wiring
+# still builds. Selected only when neither `rocm` nor `cuda` is enabled.
+wgpu = ["lgbm-compute/wgpu"]
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

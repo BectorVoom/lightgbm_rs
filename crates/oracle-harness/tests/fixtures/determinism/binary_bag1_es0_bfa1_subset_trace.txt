@@ -1,0 +1,45 @@
+# [GSD-META] subset-determinism FP trace (Phase-7 D-05)
+# cell=binary_bag1_es0_bfa1 objective=binary bfa=1 seed=1610969088
+# bagging_fraction=0.7 bagging_freq=1 bagging_seed=3 num_data=12
+#
+# SOURCE-BUILT lib_lightgbm 4.6 (VERSION 4.6.0.99) CPU-only single-thread FP
+# execution trace (Phase-5 05-09 technique): the per-candidate current_gain +
+# min_gain_shift below are the genuine tree-0 operands the instrumented
+# FindBestThresholdSequentially dumped (.to_bits()), NOT the wheel-derivable
+# surface. They are the DECISIVE D-05 evidence (see 07-D05-DECISION.md):
+#
+#   ROOT (num_data=8) feature 0: cnt_factor = 4.1142857703384053
+#     min_gain_shift = 2.7999999189376803 (0x400666665b851eb2) — from the
+#     2*kEpsilon-BUMPED sum_hessian (raw would give 0x400666665b851eb9, 7 ULPs higher).
+#   per-bin SUBSET_HIST (f0): bin1 g=0.83333331346511841 h=0.4861111044883728;
+#     bin2..4 g=0.4166666567325592 h=0.2430555522441864; bin5 g=-0.58333331346511841
+#     h=0.2430555522441864.
+#   DEEPER node-1 (num_data=7) WINNING candidate:
+#     current_gain    = 4.9999998297010109 (0x4013fffff4924920)
+#     min_gain_shift  = 4.99999982970101   (0x4013fffff492491f)  [BUMPED]
+#     current_gain > min_gain_shift by ONE f64 ULP -> C++ ACCEPTS (4-leaf tree-0).
+#     The Rust RAW-sum_hessian min_gain_shift was 0x4013fffff4924925 (5 ULPs higher),
+#     so 0x...4920 > 0x...4925 is FALSE -> Rust rejected it (2-leaf tree-0). FIXED.
+#   DEEPER node-2 (num_data=4) WINNING candidate:
+#     current_gain    = 2.8571427598291468 (0x4006db6da9cbc144)
+#     min_gain_shift  = 2.8571427598291463 (0x4006db6da9cbc143)  [BUMPED]  +1 ULP -> ACCEPT.
+#
+# NOTE: the per-bin SUBSET_HIST sums are recorded above as DOCUMENTATION only — the
+# diagnostic's cell-for-cell replay reconstructs per-row grad/hess by splitting the
+# per-bin sum evenly across in-bag rows, which cannot bit-reproduce a non-constant
+# binary hessian fold from the SUM alone (n*(sum/n) != sum at f64). The load-bearing,
+# replay-safe localization is the per-candidate current_gain/min_gain_shift (below)
+# plus the realized leaf count, both of which the diagnostic checks.
+LEAF_COUNT 4
+# Per-candidate ROOT current_gain / min_gain_shift (source-built, BUMPED min_gain_shift):
+SPLIT feature=0 current_gain=6.3999997534070623 min_gain_shift=2.7999999189376803
+SPLIT feature=0 current_gain=4.3428569908531323 min_gain_shift=2.7999999189376803
+SPLIT feature=0 current_gain=3.657142736668487 min_gain_shift=2.7999999189376803
+SPLIT feature=0 current_gain=3.3142856095761637 min_gain_shift=2.7999999189376803
+SPLIT feature=0 current_gain=2.9714284824838404 min_gain_shift=2.7999999189376803
+SPLIT feature=1 current_gain=2.8734693033146055 min_gain_shift=2.7999999189376803
+SPLIT feature=1 current_gain=3.3142856095761637 min_gain_shift=2.7999999189376803
+# --- realized tree-0 model-dump per-split gain (wheel + source build AGREE bit-exact) ---
+SPLIT feature=0 threshold=4.500000000000001 split_gain=3.5999999046325684
+SPLIT feature=0 threshold=1.5000000000000002 split_gain=8.881779961836516e-16
+SPLIT feature=0 threshold=1.0000000180025095e-35 split_gain=4.440889980918258e-16

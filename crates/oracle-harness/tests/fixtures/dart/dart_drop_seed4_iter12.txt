@@ -1,0 +1,24 @@
+# DART (BST-05) drop RNG-replay golden (plan 07-06).
+#
+# The dropped tree indices PER ITERATION that DART::DroppingTrees
+# (dart.hpp:97-147) produces over the EXACT C++ Random LCG (random.h), with the
+# tree_weight/sum_weight evolution mirroring Normalize (dart.hpp:158-197). The
+# wheel cannot expose the internal drop indices, so this freezes the algorithm
+# spec over the bit-exact LCG (identical posture to the GOSS goss_rng_replay).
+# The Rust dart_reference_drop reproduces it bit-exact
+# (boosting_parity::dart_drop_rng_replay). tree_weight/sum_weight are f64 bit
+# patterns; dropped indices i32 (or `-` for an empty set).
+#
+# drop_seed=<S> drop_rate=<R> max_drop=<M> skip_drop=<SD> uniform_drop=<0|1> iter=<I> sum_weight=<f64 bits> tree_weight=<csv f64 bits | -> dropped=<csv i32 | ->
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=0 sum_weight=0 tree_weight=- dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=1 sum_weight=4591870180066957722 tree_weight=4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=2 sum_weight=4596373779694328218 tree_weight=4591870180066957722,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=3 sum_weight=4599075939470750516 tree_weight=4591870180066957722,4591870180066957722,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=4 sum_weight=4600877379321698714 tree_weight=4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=5 sum_weight=4602678819172646912 tree_weight=4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=6 sum_weight=4603579539098121011 tree_weight=4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=7 sum_weight=4604480259023595110 tree_weight=4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722,4591870180066957722 dropped=1,5
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=8 sum_weight=4604180019048437077 tree_weight=4591870180066957722,4589468260265693457,4591870180066957722,4591870180066957722,4591870180066957722,4589468260265693457,4591870180066957722,4584964660638322961 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=9 sum_weight=4605080738973911176 tree_weight=4591870180066957722,4589468260265693457,4591870180066957722,4591870180066957722,4591870180066957722,4589468260265693457,4591870180066957722,4584964660638322961,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=10 sum_weight=4605981458899385275 tree_weight=4591870180066957722,4589468260265693457,4591870180066957722,4591870180066957722,4591870180066957722,4589468260265693457,4591870180066957722,4584964660638322961,4591870180066957722,4591870180066957722 dropped=-
+drop_seed=4 drop_rate=0.1 max_drop=50 skip_drop=0.5 uniform_drop=0 iter=11 sum_weight=4606882178824859374 tree_weight=4591870180066957722,4589468260265693457,4591870180066957722,4591870180066957722,4591870180066957722,4589468260265693457,4591870180066957722,4584964660638322961,4591870180066957722,4591870180066957722,4591870180066957722 dropped=4,10

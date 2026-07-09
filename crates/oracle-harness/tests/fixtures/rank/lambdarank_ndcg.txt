@@ -1,0 +1,4 @@
+# lambdarank ndcg@k (real lib_lightgbm 4.6), one per eval_at.
+ndcg@1=4607182418800017408
+ndcg@3=4607156661554682169
+ndcg@5=4607061910351605084

@@ -1,0 +1,17 @@
+[package]
+name = "lgbm-metric"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+# Prob-space metrics (binary_logloss/binary_error/multi_logloss) call
+# `lgbm-model::ObjectiveKind::convert_output` first — do NOT duplicate the
+# transform (RESEARCH binary_metric.hpp:80-83).
+lgbm-model = { path = "../lgbm-model" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }

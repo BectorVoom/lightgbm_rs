@@ -1,0 +1,69 @@
+[package]
+name = "lgbm-python"
+version = "0.0.5"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# GPU backends are opt-in and FORWARD to the `lgbm` crate's compile-time backend
+# selection (booster.rs cascade: rocm > cuda > wgpu > cpu). The default wheel is
+# CPU-only. Without this forwarding the extension module can NEVER include a GPU
+# backend, so Python `device_type="cuda"` has nothing to dispatch to.
+# Build a CUDA wheel with:  maturin build --release --features cuda
+default = []
+rocm = ["lgbm/rocm"]
+cuda = ["lgbm/cuda"]
+wgpu = ["lgbm/wgpu"]
+
+[dependencies]
+lgbm = { path = "../lgbm" }
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+lgbm-model = { path = "../lgbm-model" }
+# Process global allocator for the shipped extension module. Parity-neutral —
+# governs only Rust-side allocations inside the cdylib (not CPython's pymalloc),
+# the same pattern polars-python uses. Cuts the small-allocation churn of the
+# boosting → tree-learner gather loops under the GIL-released train/predict.
+mimalloc = { version = "0.1", default-features = false }
+# The PyO3 / numpy / pyo3-polars version triangle (08-RESEARCH Pitfall 1, BLOCKING):
+# pyo3 0.27 is the floor required by pyo3-polars 0.26; numpy 0.27 is the
+# pyo3-0.27-compatible rust-numpy release. Mixing numpy 0.28 (needs pyo3 0.28)
+# with pyo3-polars 0.26 will NOT compile — these three must move together.
+# NOTE: `extension-module` is deliberately NOT enabled here. It tells pyo3 to
+# leave libpython unlinked (the host interpreter provides the symbols at import
+# time) — correct for the maturin wheel build, which adds it via
+# `[tool.maturin].features = ["pyo3/extension-module"]`, but it makes a
+# `cargo test` binary fail to link (no interpreter → undefined Py* symbols).
+# Enabling it ONLY through maturin lets `cargo test` link libpython and run the
+# Rust units (08-05 D-08 coercion seam), while the wheel still builds as a
+# proper extension module.
+pyo3 = { version = "0.27", features = ["abi3-py311"] }
+numpy = "0.27"
+# `dtype-categorical` makes the polars `DataType::Categorical`/`Enum` variants
+# available so the Arrow-stream ingest can faithfully route Categorical/Enum
+# columns to LightGBM categorical features (D-04). It propagates `polars/dtype-
+# categorical` to the same polars 0.53 core pyo3-polars already pulls (one tree).
+pyo3-polars = { version = "0.26", features = ["dtype-categorical"] }
+# Direct `polars` dep for `DataType` / `Column` introspection in marshalling.
+# Pinned to the SAME 0.53 core pyo3-polars resolves so the Arrow C-stream
+# `PyDataFrame -> polars::DataFrame` types are identical (no version-bridge gap).
+# `dtype-u8`/`dtype-u16` are REQUIRED alongside `dtype-categorical`: polars 0.53
+# picks the narrowest physical code width for a categorical (u8 for <=256 cats),
+# and `to_physical_repr()` panics with `unimplemented!()` if that width's Series
+# impl is feature-gated off. Enabling both makes category codes of ANY cardinality
+# materializable to the f64 codes the facade `find_bin_categorical` path consumes.
+polars = { version = "0.53", default-features = false, features = [
+    "dtype-categorical",
+    "dtype-u8",
+    "dtype-u16",
+] }
+
+[dev-dependencies]
+# `auto-initialize` boots a CPython interpreter for `cargo test` so the Rust
+# units can drive a live `PyDict`/`Python::attach` (the D-08 coercion paths).
+pyo3 = { version = "0.27", features = ["abi3-py311", "auto-initialize"] }
+
+[lib]
+# The compiled extension module (`lightgbm_rs._core`, D-11/D-12). `rlib` is added
+# so the `cargo test` harness can link the crate as a normal Rust library.
+crate-type = ["cdylib", "rlib"]

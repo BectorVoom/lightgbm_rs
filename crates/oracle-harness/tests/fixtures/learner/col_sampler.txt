@@ -1,0 +1,13 @@
+# LightGBM-rs ColSampler RNG-parity golden (Phase 5, Plan 05-04, TRL-08).
+# Drives the GENUINE header-only reference Random::Sample (col_sampler.hpp
+# transcription): ResetByTree once (CS_BYTREE), GetByNode per node in DRAW
+# ORDER (CS_NODE, smaller-leaf then larger-leaf per split). The Rust
+# ColSampler reproduces the exact selected feature indices.
+LEARNER_MASTER_SEED 514219757
+CS_CONFIG feature_fraction_bits=4607182418800017408 feature_fraction_bynode_bits=4602678819172646912 seed=514219757 num_features=4
+CS_BYTREE 0;1;2;3
+CS_NODE order=0 1;3
+CS_NODE order=1 0;1
+CS_NODE order=2 2;3
+CS_NODE order=3 0;1
+CS_NODE order=4 1;3

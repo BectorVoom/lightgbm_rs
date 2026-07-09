@@ -1,0 +1,73 @@
+# LightGBM-rs data_partition golden (Phase 4 04-03 + Phase 18 18-01).
+# VERBATIM SplitInner routing (dense_bin.hpp:314-394) with the D-02 full
+# flag fan-out (missing-zero/NA, default_left, MFB coincidence, min==max,
+# max-to-left) + stable two-pass gather. PCAT = categorical membership
+# (SplitCategoricalInner<true>, D-03). PPACKET = the 16-int
+# SplitTreeStructure child-stats packet (host-reconstructed, D-08/A4).
+KERNEL_MASTER_SEED 1096282125
+COUNTS partition=12 cat=3 packet=2
+PCASE name=basic num_bin=8 min_bin=0 max_bin=7 threshold=3 most_freq_bin=8 missing_type=0 default_bin=0 default_left=0 note=in-range-thr3
+PBINS 1;5;3;7;0;4;2;6
+PORDER 0;2;4;6;1;3;5;7
+PSPLIT 4
+PCASE name=default_left num_bin=10 min_bin=1 max_bin=6 threshold=4 most_freq_bin=2 missing_type=0 default_bin=0 default_left=0 note=oor-go-left
+PBINS 0;2;9;1;5;9;3
+PORDER 0;1;2;3;4;5;6
+PSPLIT 7
+PCASE name=default_right num_bin=10 min_bin=1 max_bin=6 threshold=2 most_freq_bin=7 missing_type=0 default_bin=0 default_left=0 note=oor-go-right
+PBINS 0;2;9;1;5;9;3
+PORDER 1;3;6;0;2;4;5
+PSPLIT 3
+PCASE name=random num_bin=16 min_bin=0 max_bin=15 threshold=7 most_freq_bin=16 missing_type=0 default_bin=0 default_left=0 note=random-40-rows
+PBINS 15;6;1;0;3;10;5;4;7;14;9;8;11;2;13;12;15;6;1;0;3;10;5;4;7;14;9;8;11;2;13;12;15;6;1;0;3;10;5;4
+PORDER 1;2;3;4;6;7;8;13;17;18;19;20;22;23;24;29;33;34;35;36;38;39;0;5;9;10;11;12;14;15;16;21;25;26;27;28;30;31;32;37
+PSPLIT 22
+PCASE name=missing_zero_dl0 num_bin=8 min_bin=1 max_bin=6 threshold=3 most_freq_bin=5 missing_type=1 default_bin=2 default_left=0 note=MISS_IS_ZERO-defbin2-dl0
+PBINS 1;3;2;5;3;6;4;3
+PORDER 0;2;6;1;3;4;5;7
+PSPLIT 3
+PCASE name=missing_zero_dl1 num_bin=8 min_bin=1 max_bin=6 threshold=3 most_freq_bin=5 missing_type=1 default_bin=2 default_left=1 note=MISS_IS_ZERO-defbin2-dl1
+PBINS 1;3;2;5;3;6;4;3
+PORDER 0;1;2;4;6;7;3;5
+PSPLIT 6
+PCASE name=missing_na_dl0 num_bin=8 min_bin=1 max_bin=6 threshold=3 most_freq_bin=2 missing_type=2 default_bin=0 default_left=0 note=MISS_IS_NA-maxNA-dl0
+PBINS 2;6;3;6;4;1;5;6
+PORDER 0;2;4;5;1;3;6;7
+PSPLIT 4
+PCASE name=missing_na_dl1 num_bin=8 min_bin=1 max_bin=6 threshold=3 most_freq_bin=2 missing_type=2 default_bin=0 default_left=1 note=MISS_IS_NA-maxNA-dl1
+PBINS 2;6;3;6;4;1;5;6
+PORDER 0;1;2;3;4;5;7;6
+PSPLIT 7
+PCASE name=mfb_is_zero num_bin=10 min_bin=2 max_bin=6 threshold=3 most_freq_bin=3 missing_type=1 default_bin=3 default_left=1 note=MFB_IS_ZERO-oor-folds-missing
+PBINS 2;3;0;9;4;2;5;3
+PORDER 0;1;2;3;4;5;6;7
+PSPLIT 8
+PCASE name=mfb_is_na num_bin=10 min_bin=1 max_bin=5 threshold=2 most_freq_bin=4 missing_type=2 default_bin=0 default_left=0 note=MFB_IS_NA-oor-folds-missing
+PBINS 2;5;0;9;3;5;4;2
+PORDER 0;4;7;1;2;3;5;6
+PSPLIT 3
+PCASE name=min_eq_max num_bin=9 min_bin=4 max_bin=4 threshold=0 most_freq_bin=8 missing_type=0 default_bin=0 default_left=0 note=MIN_IS_MAX-degenerate
+PBINS 4;0;4;7;4;2;4;4
+PORDER 0;2;4;6;7;1;3;5
+PSPLIT 5
+PCASE name=max_to_left num_bin=9 min_bin=3 max_bin=3 threshold=5 most_freq_bin=0 missing_type=0 default_bin=0 default_left=0 note=MAX_TO_LEFT-degenerate-mfb0
+PBINS 3;3;1;3;8;3;0;3
+PORDER 0;1;2;3;4;5;6;7
+PSPLIT 8
+PCAT name=cat_onehot num_bin=6 min_bin=1 max_bin=5 most_freq_bin=0 num_threshold=1 note=one-hot-local1
+PCATBITSET 2
+PCATBINS 1;2;3;1;4;1;5;2
+PCATORDER 0;3;5;1;2;4;6;7
+PCATSPLIT 3
+PCAT name=cat_manyvsmany num_bin=9 min_bin=2 max_bin=7 most_freq_bin=3 num_threshold=1 note=many-vs-many-mfb3
+PCATBITSET 44
+PCATBINS 2;3;4;5;6;2;7;4
+PCATORDER 2;3;6;7;0;1;4;5
+PCATSPLIT 4
+PCAT name=cat_oor_default num_bin=10 min_bin=2 max_bin=7 most_freq_bin=3 num_threshold=1 note=oor-default-member
+PCATBITSET 10
+PCATBINS 2;9;4;0;5;3;8;6
+PCATORDER 1;3;4;5;6;0;2;7
+PCATSPLIT 5
+PPACKET name=left_smaller left_leaf=0 left_num_data=7 left_data_start=0 right_leaf=1 right_num_data=13 right_data_start=7 smaller=0 larger=1 left_sum_hessians=4615063718147915776 right_sum_hessians=4619004367821864960 left_sum_gradients=13835058055282163712 right_sum_gradients=4616189618054758400 note=left-smaller-branch
+PPACKET name=right_smaller left_leaf=2 left_num_data=20 left_data_start=5 right_leaf=3 right_num_data=8 right_data_start=25 smaller=3 larger=2 left_sum_hessians=4621256167635550208 right_sum_hessians=4616189618054758400 left_sum_gradients=4609434218613702656 right_sum_gradients=13838435755002691584 note=right-smaller-branch

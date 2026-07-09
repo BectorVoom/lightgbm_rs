@@ -1,0 +1,2 @@
+# quantile real-binary quantile value at round 5; f64 bits
+4609548756391069835

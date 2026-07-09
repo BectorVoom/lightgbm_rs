@@ -1,0 +1,38 @@
+[package]
+name = "oracle-harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[features]
+# Opt-in ROCm/HIP parity gate: forwards to `lgbm-compute/rocm` so
+# `cargo test -p oracle-harness --features rocm` brings up the hip runtime and
+# runs the SEPARATE ~1e-6 hip-vs-cpu-anchor parity layer in `kernel_parity.rs`.
+# A default (CPU-only) build never enables this — the cpu bit-exact layers are
+# the hard gate (SC#1, D-03a).
+rocm = ["lgbm-compute/rocm"]
+
+[dev-dependencies]
+lgbm-core = { path = "../lgbm-core" }
+# Test-only: the kernel-parity replay drives the cubecl-cpu backend against the
+# committed histogram golden. The LIBRARY crate (`[dependencies]`) stays
+# cubecl-free so the CMP-01 containment guard holds — cubecl is pulled in only
+# for `cargo test` of this crate, never by downstream consumers of the harness.
+lgbm-compute = { path = "../lgbm-compute" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+# Test-only: the learner-parity replay drives the spine learner + reconstructs the
+# reference Tree from the committed golden's raw-bit fields, comparing via the
+# shared lgbm-model %.17g formatter (D-07).
+lgbm-model = { path = "../lgbm-model" }
+lgbm-treelearner = { path = "../lgbm-treelearner" }
+# Test-only: the boosting-parity replay (Phase 6) drives the GBDT spine + the
+# objective/metric layers against the committed boosting goldens. Pulled in only
+# under `[dev-dependencies]` so the LIBRARY crate stays free of any GPU compute
+# runtime (CMP-01) — same isolation idiom as the cubecl/treelearner dev-deps.
+lgbm-objective = { path = "../lgbm-objective" }
+lgbm-metric = { path = "../lgbm-metric" }
+lgbm-boosting = { path = "../lgbm-boosting" }
+lgbm = { path = "../lgbm" }

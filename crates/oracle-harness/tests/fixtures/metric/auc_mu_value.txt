@@ -1,0 +1,2 @@
+# auc_mu real-binary auc_mu value at round 5; f64 bits
+4607182418800017408

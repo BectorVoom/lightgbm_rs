@@ -1,0 +1,2 @@
+# fair real-binary fair value at round 5; f64 bits
+4610848338461506932

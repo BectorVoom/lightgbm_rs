@@ -1,0 +1,25 @@
+[package]
+name = "lgbm-objective"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lgbm-core = { path = "../lgbm-core" }
+lgbm-dataset = { path = "../lgbm-dataset" }
+# Reuse `lgbm-model::ObjectiveKind::convert_output` for the predict-side transform
+# (Open-Q1: ConvertOutput stays in lgbm-model; this crate owns the training side).
+lgbm-model = { path = "../lgbm-model" }
+# The shared init-once `DcgCalculator` (gain/discount tables) lives in lgbm-metric
+# and is consumed by BOTH the ranking objectives (here) and the ranking metrics
+# (D-02/D-03: one coherent group sharing query infrastructure). No cycle —
+# lgbm-metric does not depend on lgbm-objective.
+lgbm-metric = { path = "../lgbm-metric" }
+thiserror = { workspace = true }
+# spike-068: rayon-parallel get_gradients (independent-per-row grad/hess). Already a
+# resolved workspace dependency (lgbm-treelearner, lgbm-compute) — no new crate enters
+# the lockfile (threat T-sk7-SC: no package-legitimacy checkpoint required).
+rayon = "1.10"
+
+[dev-dependencies]
+oracle-harness = { path = "../oracle-harness" }
