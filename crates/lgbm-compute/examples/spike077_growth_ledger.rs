@@ -1,16 +1,16 @@
-//! Spike 077 — the on-device growth loop's PHASE LEDGER, measured locally.
+//! The on-device growth loop's per-phase ledger, measured locally.
 //!
-//! Post-spike-076 the on-device-vs-host-cuda residual (~4.9s @500k×50 on real CUDA) is
-//! ~95% UNATTRIBUTED inside `grow_tree_on_device_resident` — a `phase_prof` black box
+//! The on-device-vs-host-cuda residual (~4.9s @500k×50 on real CUDA) is ~95%
+//! UNATTRIBUTED inside `grow_tree_on_device_resident` — a `phase_prof` black box
 //! (`in_learner_other=100%` by design). This example drives the resident lane directly
-//! (the spike-071 harness shape) and reads the new SPIKE-077 per-phase ledger after every
-//! grow: setup / upload / rootfold / build / subtract / scan / pick / partition /
-//! treesplit / reduce / tail, plus `host_other = wall − Σ` (the honesty check).
+//! and reads the per-phase ledger after every grow: setup / upload / rootfold / build /
+//! subtract / scan / pick / partition / treesplit / reduce / tail, plus
+//! `host_other = wall − Σ` (the honesty check).
 //!
 //! Two modes:
 //!   free-run (default)      — TRUE wall decomposition; async phases hold submission time
-//!                             only (their device time drains inside scan/pick — the
-//!                             spike-015 aliasing contract).
+//!                             only (their device time drains inside scan/pick, per the
+//!                             kernel-chaining aliasing contract).
 //!   LGBM_GROW_DRAIN=1       — de-aliased device attribution (queue blocked empty inside
 //!                             each phase's own timer); ranks phases, distorts the wall.
 //!
@@ -31,11 +31,11 @@ use std::time::Instant;
 /// `offset_for_most_freq_bin(0)` == 1 (compacted convention; helper lives above this crate).
 const OFFSET_MFB_0: i32 = 1;
 const NUM_BIN: u32 = 255; // U8 production-default width
-const NUM_LEAVES: i32 = 31; // the A/B default
+const NUM_LEAVES: i32 = 31; // default leaf count
 const WARMUP: usize = 2;
 const REPS: usize = 10;
 
-/// Deterministic LCG (no rand dep, spike convention).
+/// Deterministic LCG (no rand dependency).
 struct Lcg(u64);
 impl Lcg {
     fn next_u32(&mut self) -> u32 {

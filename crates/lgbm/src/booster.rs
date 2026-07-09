@@ -1,4 +1,4 @@
-//! The public [`Booster`] (D-05) — the trained ensemble + eval history, plus the
+//! The public [`Booster`] — the trained ensemble + eval history, plus the
 //! `train` / `predict` entry points.
 //!
 //! `train` drives the full spine: builder→Config → identity-binned feature
@@ -6,10 +6,6 @@
 //! per-class tree → Shrinkage → UpdateScore → AddBias) → [`GbdtModel`]. `predict`
 //! delegates to [`GbdtModel::predict_raw`] then the predict-side
 //! [`lgbm_model::ObjectiveKind::convert`] transform (identity for regression).
-//!
-//! 06-02 scope: the regression L2 single-output spine on an identity-binned dense
-//! corpus (the capture's exact binning). Per-objective / bagging / early-stopping
-//! widen in 06-03..06-05.
 
 use lgbm_boosting::objective::BoostObjective;
 use lgbm_boosting::{Gbdt, IterSnapshot};
@@ -54,7 +50,7 @@ use crate::error::LgbmError;
 /// across objectives.
 /// A user-supplied custom-metric (feval) closure: `(raw_scores, labels) ->
 /// (name, value, is_higher_better)`, mirroring the C++ `_EvalFunctionWrapper`
-/// contract the Python `feval` marshals into (08-06). The closure is called once
+/// contract the Python `feval` marshals into. The closure is called once
 /// per eval cadence with the SAME `(scores, labels)` the built-in metrics see,
 /// so it feeds the SAME eval-history loop.
 pub type CustomMetricClosure = Box<dyn Fn(&[f64], &[f32]) -> (String, f64, bool) + Send>;
@@ -66,7 +62,7 @@ enum EvalMetric {
     Bin(BinaryMetric),
     /// The `multi_logloss` metric over the class-major score buffer.
     Multi(MultiLogloss),
-    /// A user custom-metric (feval) closure (PYB-04). Its `name()` and value come
+    /// A user custom-metric (feval) closure. Its `name()` and value come
     /// from the closure; it feeds the SAME eval-history loop as the built-ins.
     Custom(CustomMetricClosure),
 }
@@ -94,8 +90,8 @@ impl EvalMetric {
             EvalMetric::Multi(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
             EvalMetric::Custom(f) => {
                 let (_name, value, _higher) = f(scores, labels);
-                // A NaN / non-finite custom value is surfaced as a typed error
-                // (T-08-01-04), never silently recorded.
+                // A NaN / non-finite custom value is surfaced as a typed error,
+                // never silently recorded.
                 if !value.is_finite() {
                     return Err(LgbmError::CustomMetric {
                         detail: "custom metric (feval) returned a non-finite value".into(),
@@ -117,7 +113,7 @@ impl EvalMetric {
     }
 
     /// C++ `factor_to_bigger_better` — `+1` for AUC, `-1` for the losses. Drives
-    /// the early-stopping comparison direction (BST-07).
+    /// the early-stopping comparison direction.
     fn factor_to_bigger_better(&self) -> f64 {
         match self {
             EvalMetric::Reg(m) => m.factor_to_bigger_better(),
@@ -134,10 +130,10 @@ impl EvalMetric {
 /// A dense, identity-binned training corpus: raw integer-valued features (one
 /// column per feature, bin index == raw value) + f32 labels.
 ///
-/// This is the 06-02 spine training input — it mirrors the capture's identity
-/// binning (distinct consecutive integers `0..K-1` per feature) so the Rust-grown
-/// trees are bit-comparable to the real-binary goldens. (Full arbitrary-value
-/// binning via the Phase-2 `Dataset` path widens later.)
+/// This is the identity-binned spine training input — it mirrors the capture's
+/// identity binning (distinct consecutive integers `0..K-1` per feature) so the
+/// Rust-grown trees are bit-comparable to the real-binary goldens. Arbitrary-value
+/// binning is handled by the `RawCorpus`/`BinMapper` path below.
 #[derive(Debug, Clone)]
 pub struct DenseCorpus {
     /// Row-major raw feature values, `num_data` rows × `num_features` columns.
@@ -149,7 +145,7 @@ pub struct DenseCorpus {
 /// LightGBM's real per-bin upper bound for an identity-binned integer feature:
 /// the `(b + 0.5)` midpoint nudged up by exactly one ULP — LightGBM's
 /// `GetDoubleUpperBound`, matching the `2.5000000000000004` /
-/// `1.5000000000000002` values the capture emits (verified against the Phase-5
+/// `1.5000000000000002` values the capture emits (verified against
 /// `learner_parity::real_upper_bounds`).
 fn real_upper_bounds(num_bin: u32) -> Vec<f64> {
     (0..num_bin)
@@ -184,14 +180,12 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
             ),
         });
     }
-    // quick-260621-rsh: ONE cache-friendly pass over rows (each `row` is contiguous),
-    // SCATTERING `row[j] as u32` into per-feature bin vectors — instead of `num_features`
-    // STRIDED column passes (`row[j]` jumped `num_features*8` bytes/read, ~⅓ of train
-    // wall-clock at 1M×500). Streaming reads (bandwidth-bound) + the ~`num_features*64B`
-    // hot Vec tails stay L2-resident (single-threaded ⇒ no spike-011 false-sharing). The
-    // HAPPY-PATH bins are byte-identical (same values, same per-feature row order) ⇒
-    // FeatureColumns byte-identical ⇒ bit-exact. Validation is now in row-major DISCOVERY
-    // order — same `LgbmError::InvalidCorpus` variant + same checks (only `is_err()` is
+    // ONE cache-friendly pass over rows (each `row` is contiguous), SCATTERING
+    // `row[j] as u32` into per-feature bin vectors — instead of `num_features`
+    // STRIDED column passes. The resulting bins are byte-identical regardless of
+    // pass order (same values, same per-feature row order) ⇒ FeatureColumns
+    // byte-identical ⇒ bit-exact. Validation runs in row-major discovery order —
+    // same `LgbmError::InvalidCorpus` variant + same checks (only `is_err()` is
     // asserted, booster.rs test, not the specific (feature,row)).
     let mut cols_bins: Vec<Vec<u32>> =
         (0..num_features).map(|_| Vec::with_capacity(num_data)).collect();
@@ -256,19 +250,19 @@ fn build_feature_columns(corpus: &DenseCorpus) -> Result<Vec<FeatureColumn>, Lgb
             bin_upper_bound: real_upper_bounds(num_bin),
             real_feature_index: j as i32,
             // This identity-binned facade builds NUMERIC features only; the
-            // categorical path is driven via the parity harness / builder
-            // (07-08). bin_type defaults to Numerical so the spine is unchanged.
+            // categorical path is driven via the parity harness / builder.
+            // bin_type defaults to Numerical so the spine is unchanged.
             ..FeatureColumn::default()
         });
     }
     Ok(columns)
 }
 
-/// A dense training corpus of RAW (arbitrary real-valued) features — the D-02
+/// A dense training corpus of RAW (arbitrary real-valued) features — the
 /// raw→bin→train input. Unlike [`DenseCorpus`] (which requires identity-binnable
 /// integer columns), `RawCorpus` carries arbitrary continuous (or categorical)
 /// values that are binned internally by the bit-exact [`BinMapper`]
-/// (`find_bin_from_column` / `find_bin_categorical`, Phase-2) before training.
+/// (`find_bin_from_column` / `find_bin_categorical`) before training.
 ///
 /// This is the slice the Python wrapper depends on: a Python user passes a numpy
 /// matrix of real values, which marshals into a `RawCorpus`; the facade bins it
@@ -291,7 +285,7 @@ pub struct RawCorpus {
     /// Per-row labels (length `num_data`).
     pub labels: Vec<f32>,
     /// Real-feature indices (columns) to bin as CATEGORICAL via
-    /// [`BinMapper::find_bin_categorical`] (D-04). Empty ⇒ all numeric.
+    /// [`BinMapper::find_bin_categorical`]. Empty ⇒ all numeric.
     pub categorical_features: Vec<usize>,
     /// The binning + training [`Config`] (`max_bin`, `min_data_in_bin`,
     /// `bin_construct_sample_cnt`, `data_random_seed`, `use_missing`,
@@ -310,7 +304,7 @@ impl RawCorpus {
     /// A RAGGED `rows` (rows of differing length) leaves `col_major` empty so the
     /// `col_major.len() == num_rows * num_cols` invariant fails and
     /// [`build_feature_columns_from_raw`] surfaces a typed
-    /// [`LgbmError::InvalidCorpus`] (never panics — T-08-01-01).
+    /// [`LgbmError::InvalidCorpus`] (never panics).
     pub fn new(rows: Vec<Vec<f64>>, labels: Vec<f32>) -> Self {
         let num_rows = rows.len();
         let num_cols = rows.first().map_or(0, Vec::len);
@@ -404,29 +398,27 @@ impl RawCorpus {
 }
 
 /// Build [`FeatureColumn`]s from a RAW corpus by binning each column with the
-/// bit-exact [`BinMapper`] (D-02). This is the raw→bin→train bridge: it mirrors
+/// bit-exact [`BinMapper`]. This is the raw→bin→train bridge: it mirrors
 /// the EXACT `FeatureColumn { .. }` construction shape of [`build_feature_columns`]
 /// but drives every bin-layout field from a per-column `BinMapper` instead of the
 /// identity-binning assumption. The authoritative
 /// [`offset_for_most_freq_bin`](lgbm_treelearner::offset_for_most_freq_bin) helper
-/// is REUSED unchanged (the single offset source, D-09).
+/// is REUSED unchanged (the single offset source).
 ///
-/// Route A (RESEARCH Open-Q 2): the per-column mapper is built via
-/// [`BinMapper::find_bin_from_column`] (numeric) or
-/// [`BinMapper::find_bin_categorical`] (categorical), then each row's raw value is
-/// mapped with [`BinMapper::value_to_bin`].
+/// The per-column mapper is built via [`BinMapper::find_bin_from_column`] (numeric)
+/// or [`BinMapper::find_bin_categorical`] (categorical), then each row's raw value
+/// is mapped with [`BinMapper::value_to_bin`].
 ///
 /// # Errors
 /// [`LgbmError::InvalidCorpus`] for an empty corpus, a labels/num_data mismatch,
-/// a ragged row, or a non-finite categorical index — validated BEFORE any binning
-/// (Security V5, T-08-01-01).
+/// a ragged row, or a non-finite categorical index — validated BEFORE any binning.
 pub fn build_feature_columns_from_raw(
     corpus: &RawCorpus,
 ) -> Result<Vec<FeatureColumn>, LgbmError> {
     // Back-compat shim: bin with the corpus's OWN config. The train paths instead call
     // `_with_config` with the TRAINING config so a `config` passed to `train_raw`/`train`
     // is authoritative for binning (max_bin/min_data_in_bin), not silently shadowed by the
-    // `RawCorpus::new` default (the phase-10 RawCorpus-gap root cause).
+    // `RawCorpus::new` default.
     build_feature_columns_from_raw_with_config(corpus, &corpus.config)
 }
 
@@ -438,7 +430,7 @@ pub fn build_feature_columns_from_raw_with_config(
     corpus: &RawCorpus,
     bin_config: &Config,
 ) -> Result<Vec<FeatureColumn>, LgbmError> {
-    // ---- shape validation BEFORE any binning / indexing (T-08-01-01) ----
+    // ---- shape validation BEFORE any binning / indexing ----
     let num_data = corpus.num_data();
     if num_data == 0 {
         return Err(LgbmError::InvalidCorpus {
@@ -486,14 +478,11 @@ pub fn build_feature_columns_from_raw_with_config(
     // bins) for the facade — matching the in-memory sample path. The BinMapper
     // builders take care of scaling internally.
     let pre_filter = false;
-    // spike-050: each feature's BinMapper construction + bin assignment is INDEPENDENT,
-    // so bin all features in parallel (matches C++ LightGBM's OpenMP-over-features
-    // binning). Single-threaded this was ~614ms at 500k×50 — the dominant cost of the
-    // Python `fit()` raw→bin→train path (binning was the unattributed bulk of spike-049's
-    // "Python marshalling ~25%"; numpy→Vec<Vec> marshalling itself is only ~43ms).
+    // Each feature's BinMapper construction + bin assignment is INDEPENDENT, so bin
+    // all features in parallel (matches C++ LightGBM's OpenMP-over-features binning).
     // Order-preserving: `map(j).collect()` keeps `columns[j]` == feature j, and each
     // BinMapper is per-feature deterministic (fixed `data_random_seed`) ⇒ BIT-EXACT vs
-    // the serial path. Env A/B: LGBM_PAR_BIN=0 forces the serial path.
+    // the serial path. Env var LGBM_PAR_BIN=0 forces the serial path.
     let bin_feature = |j: usize| -> FeatureColumn {
         // Read the raw column as a CONTIGUOUS slice (O2 — no per-row gather; the
         // column-major store already lays feature j out contiguously).
@@ -563,14 +552,14 @@ pub fn build_feature_columns_from_raw_with_config(
     Ok(columns)
 }
 
-/// Train a [`Booster`] from a RAW corpus (the D-02 raw→bin→train entry point).
+/// Train a [`Booster`] from a RAW corpus (the raw→bin→train entry point).
 /// Bins each feature with the bit-exact [`BinMapper`] via
 /// [`build_feature_columns_from_raw`], then drives the SAME `train_inner_full`
 /// consumer used by [`train`]. The objective/metric resolution mirrors `train`.
 ///
 /// # Errors
 /// [`LgbmError`] for an invalid corpus, an unsupported objective/metric, or a
-/// loop/learner failure — never a panic (Security V5).
+/// loop/learner failure — never a panic.
 pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmError> {
     let first = config.objective.split_whitespace().next().unwrap_or("");
     // Resolve the objective over a thin DenseCorpus view (labels only are used by
@@ -582,10 +571,8 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
     };
     let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
     let metrics = eval_metrics_for(first, config);
-    // spike-050: the RAW→bin step on the Python/`train_raw` path (numpy fit). Wrap it
-    // in BINNING_NS so the phase_prof BUDGET attributes it — previously uninstrumented
-    // (the BINNING_NS wrap only covered the DenseCorpus path's build_feature_columns),
-    // which is why the Kaggle BUDGET showed binning=0 despite real per-feature binning.
+    // Wrap the RAW→bin step in BINNING_NS so phase_prof attributes it correctly
+    // (previously only the DenseCorpus path's build_feature_columns was wrapped).
     let features = lgbm_treelearner::phase_prof::time(
         &lgbm_treelearner::phase_prof::BINNING_NS,
         || build_feature_columns_from_raw_with_config(corpus, config),
@@ -602,25 +589,21 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
     )
 }
 
-/// The trained ensemble + eval history (D-05). Mirrors the Python `Booster`'s
-/// `best_iteration_` / `best_score_` / `record_evaluation` surface; the full
-/// early-stopping population lands in 06-05 (here `best_iteration` is the last
-/// trained iteration and the eval history is the per-round metric values).
+/// The trained ensemble + eval history. Mirrors the Python `Booster`'s
+/// `best_iteration_` / `best_score_` / `record_evaluation` surface.
 #[derive(Debug, Clone)]
 pub struct Booster {
-    /// The serializable ensemble (Phase-3 container).
+    /// The serializable ensemble container.
     model: GbdtModel,
     /// The parsed predict-side objective transform.
     objective_kind: ObjectiveKind,
-    /// C++ `best_iteration_` (1-based round). 06-02: the last trained iteration
-    /// (no early stopping yet).
+    /// C++ `best_iteration_` (1-based round).
     pub best_iteration: i32,
     /// Per-metric eval history (metric name → per-round value), mirroring Python
-    /// `record_evaluation` / `evals_result_`. 06-02: populated with the training
-    /// l2/rmse per round when a valid metric is configured.
+    /// `record_evaluation` / `evals_result_`.
     pub eval_history: Vec<(String, Vec<f64>)>,
     /// The per-iteration L2 raw-score snapshots (the internal `score_` after each
-    /// iter) — exposed for the L2 golden replay + Open-Q2/A4 verification.
+    /// iter) — exposed for golden-replay verification.
     pub iter_scores: Vec<Vec<f64>>,
     /// The per-iteration L1 grad/hess snapshots — exposed for the L1 golden replay.
     pub iter_grad_hess: Vec<(Vec<f32>, Vec<f32>)>,
@@ -659,7 +642,7 @@ impl Booster {
 
     /// Raw (untransformed) accumulated score for one feature row, over the first
     /// `num_iteration` trees (`<= 0` = all). This is the public mirror of
-    /// `predict(raw_score=True, num_iteration=k)` (Open-Q2/A4).
+    /// `predict(raw_score=True, num_iteration=k)`.
     pub fn predict_row_raw(&self, features: &[f64], num_iteration: i32) -> Vec<f64> {
         self.model.predict_raw(features, 0, num_iteration)
     }
@@ -685,23 +668,23 @@ impl Booster {
             .collect()
     }
 
-    /// Per-feature split-count importance (ADV-07). Delegates to the C++-faithful
+    /// Per-feature split-count importance. Delegates to the C++-faithful
     /// [`GbdtModel::feature_importance_split_count_guarded`], which counts a split
     /// toward its feature ONLY when `split_gain > 0` (`gbdt_model_text.cpp:636-642`,
     /// `importance_type=0`) — matching the official `Booster.feature_importance`
-    /// 'split' semantics (code-review WR-01).
+    /// 'split' semantics.
     pub fn feature_importance_split(&self) -> Vec<u64> {
         self.model.feature_importance_split_count_guarded()
     }
 
-    /// Per-feature gain-sum importance (ADV-07). Delegates to
+    /// Per-feature gain-sum importance. Delegates to
     /// [`GbdtModel::feature_importance_gain`].
     pub fn feature_importance_gain(&self) -> Vec<f64> {
         self.model.feature_importance_gain()
     }
 
-    /// Refit one tree's leaf values to new data/gradients (PYB-04 enabling,
-    /// ADV-06). Delegates to [`GbdtModel::refit_one_tree`].
+    /// Refit one tree's leaf values to new data/gradients. Delegates to
+    /// [`GbdtModel::refit_one_tree`].
     #[allow(clippy::too_many_arguments)]
     pub fn refit(
         &mut self,
@@ -720,8 +703,8 @@ impl Booster {
     }
 
     /// Whole-ensemble leaf-refit on new `(rows, labels)` for the regression (L2)
-    /// default objective — the high-level mirror of `Booster.refit(data, label)`
-    /// (PYB-04 / ADV-06). Delegates to [`GbdtModel::refit_ensemble_l2`], which
+    /// default objective — the high-level mirror of `Booster.refit(data, label)`.
+    /// Delegates to [`GbdtModel::refit_ensemble_l2`], which
     /// reproduces the C++ `RefitTree` iterative loop (grad/hess on the score
     /// accumulated from the refit trees, per-tree leaf blend by `decay`). In place.
     pub fn refit_data(
@@ -737,7 +720,7 @@ impl Booster {
             .refit_ensemble_l2(rows, labels, decay, use_l1, l1, l2);
     }
 
-    /// Serialize the model to LightGBM-compatible v4 model text (Phase-3
+    /// Serialize the model to LightGBM-compatible v4 model text (the
     /// byte-stable `%.17g`/`%g` formatter). Delegates to
     /// [`lgbm_model::model_text::save`].
     pub fn model_to_string(&self) -> String {
@@ -756,14 +739,14 @@ impl Booster {
         })
     }
 
-    /// Reconstruct a [`Booster`] from LightGBM model text (Phase-3
+    /// Reconstruct a [`Booster`] from LightGBM model text (via
     /// [`lgbm_model::model_text::load`]). Carries the loaded model's objective so
     /// `predict` applies the same transform. The eval history / iter snapshots are
     /// empty (a loaded model carries no training trace).
     ///
     /// # Errors
-    /// [`LgbmError::Model`] when the text fails to parse (untrusted-text boundary,
-    /// T-08-01-03) — never a panic.
+    /// [`LgbmError::Model`] when the text fails to parse (untrusted-text boundary)
+    /// — never a panic.
     pub fn model_from_string(text: &str) -> Result<Booster, LgbmError> {
         let model = lgbm_model::model_text::load(text).map_err(LgbmError::Model)?;
         let objective_string = model
@@ -785,7 +768,7 @@ impl Booster {
 }
 
 /// Train a regression spine [`Booster`] from a [`Config`] + a dense identity-binned
-/// corpus (the 06-02 public entry point).
+/// corpus (the public entry point).
 ///
 /// Drives the full vertical spine: objective/metric resolution → identity-binned
 /// feature columns → the [`Gbdt`] loop → [`GbdtModel`]. The eval history is
@@ -793,7 +776,7 @@ impl Booster {
 ///
 /// # Errors
 /// [`LgbmError`] for an unsupported objective/metric, an invalid corpus, or a
-/// loop/learner failure — never a panic (Security V5).
+/// loop/learner failure — never a panic.
 pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError> {
     // Resolve the training-side objective from config.objective. The custom-closure
     // path is `train_custom`.
@@ -830,7 +813,7 @@ fn resolve_objective(
                 .map_err(LgbmError::Objective)?;
             (BoostObjective::MulticlassOva(o), corpus.labels.clone())
         }
-        // cross_entropy / cross_entropy_lambda (OBJ-05): single-output xentropy with
+        // cross_entropy / cross_entropy_lambda: single-output xentropy with
         // an Init `[0, 1]` label guard.
         "cross_entropy" | "xentropy" | "cross_entropy_lambda" | "xentlambda" => {
             let x = Xentropy::parse(&config.objective).map_err(LgbmError::Objective)?;
@@ -849,16 +832,16 @@ fn resolve_objective(
     })
 }
 
-/// Train a [`Booster`] with an optional validation set (BST-07 early stopping +
-/// MET-02 valid-metric eval history). When `config.early_stopping_round > 0` a
+/// Train a [`Booster`] with an optional validation set, enabling early stopping
+/// and valid-metric eval history. When `config.early_stopping_round > 0` a
 /// validation set is REQUIRED (else a typed error); when bagging is configured
 /// (`bagging_freq > 0 && bagging_fraction < 1`) the per-iter loop draws the bag
-/// over the RNG (D-13) and scores in-bag + OOB rows.
+/// over the RNG and scores in-bag + OOB rows.
 ///
 /// # Errors
 /// [`LgbmError`] for an unsupported objective/metric, an invalid corpus,
-/// early stopping without a valid set, `bagging_by_query = true` (Phase-7
-/// deferral), or a loop/learner failure — never a panic (Security V5).
+/// early stopping without a valid set, `bagging_by_query = true` (not supported
+/// by this training facade), or a loop/learner failure — never a panic.
 pub fn train_with_valid(
     config: &Config,
     corpus: &DenseCorpus,
@@ -870,13 +853,13 @@ pub fn train_with_valid(
     train_inner_full(config, corpus, Some(valid), boost_obj, transformed_labels, metrics)
 }
 
-/// Train with a user-supplied `custom` objective closure (OBJ-02 / D-04). The
+/// Train with a user-supplied `custom` objective closure. The
 /// closure maps the current raw scores (f32) to `(grad, hess)`; `boost_from_average`
 /// is forced OFF for custom (mirroring the C++ `obj == null` path).
 ///
 /// # Errors
 /// [`LgbmError`] for an invalid corpus or a loop/learner failure; a wrong-length
-/// closure return surfaces as `LgbmError::Objective` (T-06-03-01), never a panic.
+/// closure return surfaces as `LgbmError::Objective`, never a panic.
 pub fn train_custom<'a, F>(
     config: &Config,
     corpus: &DenseCorpus,
@@ -888,15 +871,15 @@ where
     train_custom_with_metric(config, corpus, closure, None)
 }
 
-/// Train with a user-supplied `custom` objective closure (OBJ-02 / D-04) AND an
-/// OPTIONAL custom-metric (feval) closure (PYB-04 custom-metric half). The feval
+/// Train with a user-supplied `custom` objective closure AND an OPTIONAL
+/// custom-metric (feval) closure. The feval
 /// closure maps `(raw_scores, labels) -> (name, value, is_higher_better)`
 /// (mirroring C++ `_EvalFunctionWrapper`); when supplied it REPLACES the built-in
 /// `l2` eval metric and feeds the SAME eval-history loop, recording the
 /// closure-supplied name. When `feval` is `None` this behaves identically to
 /// [`train_custom`] (the built-in `l2` over the raw score).
 ///
-/// This is the upstream hook the 08-06 Python `feval` marshalling consumes: the
+/// This is the upstream hook the Python `feval` marshalling consumes: the
 /// Python layer wraps the user's `feval` into a [`CustomMetricClosure`] and calls
 /// this entry, so a user metric is wired into eval history without disturbing the
 /// built-in path.
@@ -904,7 +887,7 @@ where
 /// # Errors
 /// [`LgbmError`] for an invalid corpus or a loop/learner failure; a wrong-length
 /// objective-closure return surfaces as `LgbmError::Objective`, a non-finite
-/// feval value as `LgbmError::CustomMetric` (T-08-01-04), never a panic.
+/// feval value as `LgbmError::CustomMetric`, never a panic.
 pub fn train_custom_with_metric<'a, F>(
     config: &Config,
     corpus: &DenseCorpus,
@@ -932,8 +915,8 @@ where
 }
 
 /// Train with a user-supplied `custom` objective closure AND an OPTIONAL custom
-/// metric over a RAW (arbitrary-valued) corpus — the D-02 raw→bin→train bridge for
-/// the custom path (PYB-04). This is [`train_custom_with_metric`]'s sibling for
+/// metric over a RAW (arbitrary-valued) corpus — the raw→bin→train bridge for
+/// the custom path. This is [`train_custom_with_metric`]'s sibling for
 /// raw input: it bins each feature with the bit-exact [`BinMapper`] via
 /// [`build_feature_columns_from_raw`] (exactly like [`train_raw`]) and then drives
 /// the SAME custom-objective + custom-metric eval-history loop the identity-binned
@@ -979,8 +962,8 @@ where
 
 /// The shared training driver: identity-binned columns → the [`Gbdt`] loop →
 /// per-round eval history → [`Booster`]. Generic over the [`BoostObjective`].
-/// Delegates to [`train_inner_full`] with no validation set / no early stopping
-/// (the 06-02..06-04 behavior, preserved byte-for-byte).
+/// Delegates to [`train_inner_full`] with no validation set / no early stopping,
+/// preserved byte-for-byte.
 fn train_inner(
     config: &Config,
     corpus: &DenseCorpus,
@@ -991,12 +974,11 @@ fn train_inner(
     train_inner_full(config, corpus, None, boost_obj, labels, metrics)
 }
 
-/// The full training driver (06-05): per-iteration loop with bagging (BST-03),
-/// metric-eval cadence (`metric_freq`, multi-metric, `is_provide_training_metric`;
-/// MET-02), early stopping over an optional validation set (BST-07), and the
-/// trailing-tree pop. When `valid` is `None`, `early_stopping_round == 0`,
-/// `bagging_freq == 0` / `bagging_fraction == 1`, this reproduces the prior-wave
-/// loop exactly.
+/// The full training driver: per-iteration loop with bagging, metric-eval cadence
+/// (`metric_freq`, multi-metric, `is_provide_training_metric`), early stopping over
+/// an optional validation set, and the trailing-tree pop. When `valid` is `None`,
+/// `early_stopping_round == 0`, `bagging_freq == 0` / `bagging_fraction == 1`, this
+/// reproduces the simple no-bagging/no-early-stopping loop exactly.
 fn train_inner_full(
     config: &Config,
     corpus: &DenseCorpus,
@@ -1008,8 +990,8 @@ fn train_inner_full(
     // The identity path builds its feature columns from the integer-binnable
     // corpus, then delegates to the shared column-based driver. The raw→bin→train
     // path (train_raw) supplies pre-binned columns to `train_inner_columns` directly.
-    // Spike-014b: time the once-per-train binning into the whole-train budget (the
-    // fixed-setup bucket; bench-repeated, amortizes in bin-once-train-many usage).
+    // Time the once-per-train binning into the whole-train budget (the fixed-setup
+    // bucket; amortizes in bin-once-train-many usage).
     let features = lgbm_treelearner::phase_prof::time(
         &lgbm_treelearner::phase_prof::BINNING_NS,
         || build_feature_columns(corpus),
@@ -1095,7 +1077,7 @@ fn train_inner_columns_full(
         .max()
         .unwrap_or(-1);
 
-    // T-07-11-02: per-feature constraint/penalty vectors must match num_features
+    // Per-feature constraint/penalty vectors must match num_features
     // when non-empty — mirrors the C++ length CHECKs in GBDT::Init (gbdt.cpp:58)
     // and CostEfficientGradientBoosting::Init (cost_effective_gradient_boosting.hpp
     // :47-60). Validate BEFORE any tree grows; a wrong-length vector is otherwise
@@ -1134,7 +1116,7 @@ fn train_inner_columns_full(
     let backend = CpuBackend;
     #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
     let client = cpu_client();
-    // nn7 (L1): RocmBackend now carries interior-mutable device-resident state, so it
+    // RocmBackend carries interior-mutable device-resident state, so it
     // is constructed via Default (no longer a unit struct). One instance per train()
     // call (outside the GBDT iter loop) ⇒ the resident-bin cache persists across all
     // trees in the train.
@@ -1142,7 +1124,7 @@ fn train_inner_columns_full(
     let backend = RocmBackend::default();
     #[cfg(feature = "rocm")]
     let client = rocm_client();
-    // CudaBackend/WgpuBackend are `GpuBackend<R>` aliases (quick-260627-qxl) carrying
+    // CudaBackend/WgpuBackend are `GpuBackend<R>` aliases carrying
     // the SAME on-device resident histogram pool RocmBackend uses — `::default()`
     // enables residency, reaching ROCm-parity speed.
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
@@ -1163,7 +1145,7 @@ fn train_inner_columns_full(
     )
     .with_features(features.clone());
 
-    // ---- the GBDT loop (optionally with bagging BST-03 / GOSS BST-04) ----
+    // ---- the GBDT loop (optionally with bagging / GOSS) ----
     // GOSS (data_sample_strategy=goss) and bagging are mutually exclusive — GOSS
     // forbids bagging (goss.hpp:87-89). The `boosting=goss` alias-expansion sets
     // data_sample_strategy=goss + boosting=gbdt (set.rs:472-476).
@@ -1178,7 +1160,7 @@ fn train_inner_columns_full(
         config.boost_from_average,
         None,
     );
-    // Opt-in `use_quantized_grad` APPROXIMATE mode (phase-10): quantizes grad/hess each iter
+    // Opt-in `use_quantized_grad` APPROXIMATE mode: quantizes grad/hess each iter
     // before the learner. No-op when false (the default) — the exact path is untouched.
     gbdt = gbdt
         .with_quantized_grad(
@@ -1187,7 +1169,7 @@ fn train_inner_columns_full(
             config.stochastic_rounding,
         )
         .with_quant_renew_leaf(config.quant_train_renew_leaf, config.lambda_l1, config.lambda_l2);
-    // DART (BST-05, RESEARCH Pattern 1 — an enum field on Gbdt): `boosting=dart`
+    // DART (an enum field on Gbdt): `boosting=dart`
     // selects the DART drop+normalize variant. DART subclasses GBDT in C++ and can
     // coexist with bagging (the sample strategy is independent); the spine validates
     // plain DART. DroppingTrees runs BEFORE GetGradients each iter, Normalize after the
@@ -1206,14 +1188,14 @@ fn train_inner_columns_full(
         };
         gbdt = gbdt.with_dart(dart_cfg, features.clone());
     }
-    // Random Forest (BST-06, RESEARCH Pattern 1 — an enum field on Gbdt):
+    // Random Forest (an enum field on Gbdt):
     // `boosting=rf` selects the averaged-tree variant with mandatory randomization
     // (rf.hpp). RF re-derives grad/hess once from a constant init-score buffer,
     // averages trees (no learning-rate accumulation), and renews leaves to the mean
     // residual. The two RF CHECKs (objective != null; bagging OR feature_fraction
     // active) surface as a typed BoostingError::RfConfig at the top of the RF train
-    // path. RF reuses the proven BaggingSampleStrategy (the 07-01 bit-exact bagging
-    // RNG golden carries over); the `with_bagging` call below also fires when
+    // path. RF reuses the proven BaggingSampleStrategy (the same bit-exact bagging
+    // RNG the training path uses); the `with_bagging` call below also fires when
     // bagging is active so the strategy is attached.
     let rf_on = config.boosting == "rf";
     if rf_on {
@@ -1239,7 +1221,7 @@ fn train_inner_columns_full(
         .map_err(LgbmError::Boosting)?;
         gbdt = gbdt.with_goss(goss, features.clone());
     } else if bagging_on {
-        // bagging_by_query (07-09): the query-grouped draw + expansion is implemented
+        // bagging_by_query: the query-grouped draw + expansion is implemented
         // in BaggingSampleStrategy::bagging_by_query and proven by the rank_parity
         // RNG-replay golden, but it requires query/group boundaries to bag by. The
         // `DenseCorpus` facade carries no query metadata yet (ranking end-to-end
@@ -1270,7 +1252,7 @@ fn train_inner_columns_full(
         gbdt = gbdt.with_bagging(strat, features.clone());
     }
 
-    // ---- early stopping setup (BST-07) ----
+    // ---- early stopping setup ----
     let es_enabled = config.early_stopping_round > 0;
     if es_enabled && valid.is_none() {
         return Err(LgbmError::Boosting(
@@ -1310,12 +1292,9 @@ fn train_inner_columns_full(
     );
 
     // eval history: training metrics (when is_provide_training_metric) + valid metrics.
-    // C++-faithful (quick-260628-f57): the training metric is computed ONLY when
-    // `is_provide_training_metric` is set, matching gbdt.cpp (default false ⇒ empty
-    // training history, even with no valid set). The old `|| valid.is_none()` clause
-    // forced a per-iter training-metric eval over all rows whenever there was no
-    // eval_set — a divergence from C++ AND ~26% of the CUDA train wall at 500k×50
-    // (spike-048). Callers that want training-metric history without a valid set must
+    // The training metric is computed ONLY when `is_provide_training_metric` is set,
+    // matching gbdt.cpp (default false ⇒ empty training history, even with no valid
+    // set). Callers that want training-metric history without a valid set must
     // opt in via `is_provide_training_metric=true` (the C++ behavior).
     let provide_train = config.is_provide_training_metric;
     let metric_freq = config.metric_freq.max(1);
@@ -1327,7 +1306,7 @@ fn train_inner_columns_full(
         .iter()
         .map(|m| (format!("valid_0 {}", m.name()), Vec::new()))
         .collect();
-    // The legacy training-only eval history (06-02..06-04 keyed by bare metric name).
+    // The legacy training-only eval history (keyed by bare metric name).
     let mut legacy_eval_history: Vec<(String, Vec<f64>)> = metrics
         .iter()
         .map(|m| (m.name(), Vec::new()))
@@ -1339,15 +1318,15 @@ fn train_inner_columns_full(
     let total_iters = config.num_iterations.max(0);
     let mut ran_iters = 0i32;
     for it in 0..total_iters {
-        // quick-260621-rdu: time the whole train_one_iter (⊇ grad+learner+score+snapshot)
-        // so the booster-loop tail (metric/valid/accumulation) is isolated as loop_other.
+        // Time the whole train_one_iter (grad+learner+score+snapshot) so the
+        // booster-loop tail (metric/valid/accumulation) is isolated as loop_other.
         let snap: IterSnapshot = lgbm_treelearner::phase_prof::time(
             &lgbm_treelearner::phase_prof::TRAIN_ONE_ITER_NS,
             || gbdt.train_one_iter(&mut learner, &labels, num_features),
         )
         .map_err(LgbmError::Boosting)?;
 
-        // DEF-07-13-01: a NON-FIRST no-split bagged round is POPPED by
+        // A NON-FIRST no-split bagged round is POPPED by
         // `train_one_iter` (C++ gbdt.cpp:440-447): no tree emitted, `self.iter` not
         // advanced, score unchanged. Mirror the wheel/`lgb.train` driver: do NOT count
         // it as an emitted iteration. Skip the per-iter score/grad-hess accumulation
@@ -1386,25 +1365,22 @@ fn train_inner_columns_full(
             prev_tree_count = trees.len();
         }
 
-        // Metric eval cadence (metric_freq gate; MET-02). Always eval on the LAST
+        // Metric eval cadence (metric_freq gate). Always eval on the LAST
         // iter and on every freq multiple, matching the C++ OutputMetric cadence.
         //
-        // CR-02 (06-06): `metric_freq` gates ONLY the recorded eval-HISTORY (the
+        // `metric_freq` gates ONLY the recorded eval-HISTORY (the
         // pushes into train/valid/legacy_eval_history and any future logging). The
         // valid-score eval that FEEDS the early-stop DECISION + the `early.update`
         // call run EVERY iteration when ES is on, INDEPENDENT of metric_freq —
         // mirroring gbdt.cpp:574 where the valid-metric+ES block is
         // `if (need_output || early_stopping_round_ > 0)` and `need_output`
-        // (= `iter % metric_freq == 0`) only guards the `Log::Info`. The pre-06-06
-        // port gated `early.update` behind `do_eval`, so a `metric_freq > 1` run
-        // skipped ES evaluation on the off-cadence iters and diverged from C++ on
-        // best_iteration / trailing-trim.
+        // (= `iter % metric_freq == 0`) only guards the `Log::Info`.
         let do_eval = (it + 1) % metric_freq == 0 || it + 1 == total_iters;
 
-        // Training metrics: history is metric_freq-gated (MET-02 unchanged).
+        // Training metrics: history is metric_freq-gated.
         if do_eval && provide_train {
             for (mi, m) in metrics.iter().enumerate() {
-                // quick-260621-rdu: time the per-iter training-metric eval over all rows.
+                // Time the per-iter training-metric eval over all rows.
                 let v = lgbm_treelearner::phase_prof::time(
                     &lgbm_treelearner::phase_prof::METRIC_NS,
                     || m.eval(cur_score, corpus_labels),
@@ -1412,7 +1388,7 @@ fn train_inner_columns_full(
                 // A custom-metric (feval) key is resolved lazily from the closure
                 // (the placeholder "custom" set at history-setup is overwritten on
                 // the first eval with the user-supplied name) so the recorded
-                // history key matches the user's metric name (PYB-04).
+                // history key matches the user's metric name.
                 if matches!(m, EvalMetric::Custom(_)) {
                     let name = m.resolved_name(cur_score, corpus_labels);
                     legacy_eval_history[mi].0 = name.clone();
@@ -1425,9 +1401,9 @@ fn train_inner_columns_full(
 
         // Valid metrics: eval whenever we either record history (`do_eval`) OR need
         // the ES decision this iter (`es_enabled`). Push to valid_eval_history ONLY
-        // on `do_eval` (so metric_freq still thins the RECORDED history per MET-02
-        // and the metric_freq_thins_eval_history test stays green); feed `row` to
-        // `early.update` whenever ES is on (EVERY iter — the CR-02 fix).
+        // on `do_eval` (so metric_freq still thins the RECORDED history, and the
+        // metric_freq_thins_eval_history test stays green); feed `row` to
+        // `early.update` whenever ES is on (EVERY iteration).
         if valid_nd > 0 && (do_eval || es_enabled) {
             let mut row = Vec::with_capacity(metrics.len());
             for (mi, m) in metrics.iter().enumerate() {
@@ -1446,7 +1422,7 @@ fn train_inner_columns_full(
         }
     }
 
-    // best_iteration + trailing-tree pop (BST-07).
+    // best_iteration + trailing-tree pop.
     let best_iteration = if es_enabled {
         let pop = early.trailing_trees_to_pop(ran_iters);
         if pop > 0 {
@@ -1457,8 +1433,8 @@ fn train_inner_columns_full(
         gbdt.num_iteration()
     };
 
-    // Assemble the public eval_history: legacy bare-name training metrics (so the
-    // 06-02..06-04 replay keys still resolve) PLUS the valid_0 metrics when present.
+    // Assemble the public eval_history: legacy bare-name training metrics (so
+    // existing replay keys still resolve) PLUS the valid_0 metrics when present.
     let mut eval_history: Vec<(String, Vec<f64>)> = legacy_eval_history;
     if valid_nd > 0 {
         eval_history.extend(valid_eval_history);
@@ -1472,11 +1448,9 @@ fn train_inner_columns_full(
         feature_infos,
     );
 
-    // Spike-046: emit the per-phase BUDGET/LOOP/COUNTS attribution for the SHIPPED
-    // train path (the one the Python wheel drives). Inert unless LGBM_PHASE_PROF=1;
-    // until now `dump()` was only wired into the Rust bench examples, so the Python
-    // path was a profiling black box. Parity-neutral (prints to stderr + resets the
-    // accumulators; never touches train semantics).
+    // Emit the per-phase BUDGET/LOOP/COUNTS attribution for the shipped train path
+    // (the one the Python wheel drives). Inert unless LGBM_PHASE_PROF=1. Parity-neutral
+    // (prints to stderr + resets the accumulators; never touches train semantics).
     lgbm_treelearner::phase_prof::dump("train");
 
     Ok(Booster {
@@ -1562,11 +1536,10 @@ fn feature_names(num_features: usize) -> String {
 /// print without a decimal point (matching the capture's `[0:5] [0:2]`); the
 /// raw→bin→train path's continuous values print with their real value.
 fn feature_infos_from_rows(feature_rows: &[Vec<f64>], num_features: usize) -> String {
-    // quick-260621-rdu: ONE cache-friendly pass over the row-major matrix (each `row` is
-    // contiguous) accumulating per-feature min/max — instead of `num_features` strided
-    // COLUMN passes (`row[j]` jumped `num_features*8` bytes per read, ~24% of train
-    // wall-clock at 1M×500). Same `f64::min`/`f64::max` calls, only loop order changed;
-    // min/max are commutative+associative ⇒ BYTE-IDENTICAL per-feature bounds (the
+    // ONE cache-friendly pass over the row-major matrix (each `row` is contiguous)
+    // accumulating per-feature min/max — instead of `num_features` strided COLUMN
+    // passes. Same `f64::min`/`f64::max` calls, only loop order changed; min/max
+    // are commutative+associative ⇒ BYTE-IDENTICAL per-feature bounds (the
     // `feature_infos` model-text line is parity-checked).
     let mut min = vec![f64::INFINITY; num_features];
     let mut max = vec![f64::NEG_INFINITY; num_features];
@@ -1639,8 +1612,8 @@ mod tests {
             .min_data_in_leaf(1)
             .boost_from_average(true)
             .metric("l2,rmse")
-            // quick-260628-f57: training-metric history is now opt-in (C++-faithful),
-            // so request it explicitly (this test asserts training l2/rmse history).
+            // Training-metric history is opt-in (C++-faithful), so request it
+            // explicitly (this test asserts training l2/rmse history).
             .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
@@ -1663,7 +1636,7 @@ mod tests {
 
     #[test]
     fn dart_train_predict_uses_normalized_tree_weights() {
-        // BST-05: boosting=dart trains end-to-end, and predict() applies the normalized
+        // boosting=dart trains end-to-end, and predict() applies the normalized
         // DART tree weights — which DART bakes into the STORED leaf values via its
         // Shrinkage sequence (DroppingTrees + Normalize). So predict() must equal the
         // plain sum of the stored trees' per-row outputs (the integration proof that the
@@ -1710,7 +1683,7 @@ mod tests {
 
     #[test]
     fn rf_train_predict_averages_tree_outputs() {
-        // BST-06: boosting=rf trains end-to-end (averaged trees, mandatory bagging,
+        // boosting=rf trains end-to-end (averaged trees, mandatory bagging,
         // no shrinkage) and predict() AVERAGES the stored RAW tree outputs (the
         // average_output path divides the per-tree sum by num_iteration). The
         // integration proof: predict() == (sum of stored trees' per-row outputs) /
@@ -1758,7 +1731,7 @@ mod tests {
 
     #[test]
     fn rf_without_randomization_is_typed_error() {
-        // BST-06 CHECK: boosting=rf with neither bagging nor feature_fraction<1 must
+        // CHECK: boosting=rf with neither bagging nor feature_fraction<1 must
         // surface a typed error (not a panic, not a silent collapse to one tree).
         let cfg = TrainingBuilder::new()
             .objective("regression")
@@ -1784,7 +1757,7 @@ mod tests {
 
     #[test]
     fn wrong_length_constraint_vectors_are_typed_errors() {
-        // T-07-11-02: a per-feature constraint/penalty vector whose length != the
+        // A per-feature constraint/penalty vector whose length != the
         // 2-feature corpus must surface a typed InvalidConstraintLength BEFORE any
         // tree grows — mirroring the C++ GBDT::Init / CEGB::Init length CHECKs —
         // rather than silently applying constraints to the wrong features.
@@ -1857,7 +1830,7 @@ mod tests {
 
     #[test]
     fn predict_raw_equals_internal_score_open_q2() {
-        // Open-Q2/A4: predict(raw_score=True, num_iteration=k) == the internal
+        // predict(raw_score=True, num_iteration=k) == the internal
         // score_ after k iters, for every training row.
         let cfg = TrainingBuilder::new()
             .objective("regression")
@@ -1878,7 +1851,7 @@ mod tests {
                 let raw = booster.predict_row_raw(row, k)[0];
                 // The internal score_ folds the init via BoostFromAverage→AddScore;
                 // predict_row_raw folds it via AddBias into tree 0. They must agree
-                // bit-for-bit on this cell (the GATE for the phase-wide L2 contract).
+                // bit-for-bit on this cell (the gate for the L2 bit-exactness contract).
                 assert_eq!(
                     raw.to_bits(),
                     internal[i].to_bits(),
@@ -1926,7 +1899,7 @@ mod tests {
             booster.best_iteration,
             "trailing trees must be popped to best_iteration"
         );
-        // valid_0 metrics are in the eval history (MET-02).
+        // valid_0 metrics are in the eval history.
         assert!(
             booster.eval_history.iter().any(|(n, _)| n.starts_with("valid_0")),
             "valid metrics must be recorded: {:?}",
@@ -1952,7 +1925,7 @@ mod tests {
 
     #[test]
     fn bagging_by_query_rejected_via_facade() {
-        // 07-09: the query-grouped draw is implemented + RNG-replay tested
+        // The query-grouped draw is implemented + RNG-replay tested
         // (rank_parity), but the DenseCorpus facade carries no query/group boundaries
         // to bag by, so bagging_by_query=true here surfaces as a typed error (honest
         // "query information required"), NOT a silent fall-through to row bagging.
@@ -1981,7 +1954,7 @@ mod tests {
             .min_data_in_leaf(1)
             .boost_from_average(true)
             .metric_freq(3)
-            // quick-260628-f57: opt in to training-metric history (now C++-faithful).
+            // Opt in to training-metric history (C++-faithful).
             .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
@@ -2007,7 +1980,7 @@ mod tests {
         assert!(build_feature_columns(&corpus).is_err());
     }
 
-    // ---- Task 1 (D-02 raw→bin→train bridge) ----
+    // ---- raw→bin→train bridge ----
 
     /// A deterministic binning config: single-thread, fixed seed, large sample
     /// count so every row is sampled (so `find_bin_from_column` sees the full
@@ -2155,7 +2128,7 @@ mod tests {
         ));
     }
 
-    // ---- Task 2 (Booster facade methods + custom-metric feval hook) ----
+    // ---- Booster facade methods + custom-metric feval hook ----
 
     fn trained_spine() -> Booster {
         let cfg = TrainingBuilder::new()
@@ -2191,7 +2164,7 @@ mod tests {
     #[test]
     fn booster_facade_importance_delegates() {
         let booster = trained_spine();
-        // WR-01: the facade 'split' importance is the C++-faithful GUARDED count
+        // The facade 'split' importance is the C++-faithful GUARDED count
         // (split_gain > 0), matching the official Booster.feature_importance.
         assert_eq!(
             booster.feature_importance_split(),
@@ -2247,7 +2220,7 @@ mod tests {
         // The custom-metric (feval) hook records a user-supplied metric in eval
         // history under the closure name, and its per-iteration values bit-match
         // the built-in Metric::L2 over the same scores/labels — proving the hook
-        // feeds the SAME eval-history loop, not a parallel one (PYB-04).
+        // feeds the SAME eval-history loop, not a parallel one.
         let cfg = TrainingBuilder::new()
             .objective("regression")
             .num_iterations(8)
@@ -2255,7 +2228,7 @@ mod tests {
             .num_leaves(4)
             .min_data_in_leaf(1)
             .boost_from_average(false) // custom forces bfa OFF
-            // quick-260628-f57: opt in to training-metric history (now C++-faithful).
+            // Opt in to training-metric history (C++-faithful).
             .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)
@@ -2326,7 +2299,7 @@ mod tests {
             .num_leaves(4)
             .min_data_in_leaf(1)
             .boost_from_average(false)
-            // quick-260628-f57: opt in to training-metric history (now C++-faithful).
+            // Opt in to training-metric history (C++-faithful).
             .is_provide_training_metric(true)
             .seed(1)
             .deterministic(true)

@@ -1,15 +1,15 @@
-//! Spike 079 — A/B the resident-bin upload HOIST (the spike-078 ledger's #1 lever).
+//! A/B harness for the resident-bin upload HOIST optimization.
 //!
-//! Spike-078 priced the on-device driver's per-grow re-upload of the IMMUTABLE binned
-//! columns at 67–78% of the WHOLE remaining on-device-vs-host-cuda gap on real CUDA.
-//! The fix mirrors quick-260621-p9v: the learner uploads ONCE per train (guarded by its
-//! existing `resident_bins_uploaded` flag, re-armed by `with_features`) and PINS the
-//! cache; the driver skips its per-grow upload only for a pinned, geometry-matching cache.
+//! Profiling found the on-device driver's per-grow re-upload of the IMMUTABLE binned
+//! columns cost 67-78% of the whole remaining on-device-vs-host-cuda gap on real CUDA.
+//! The fix: the learner uploads ONCE per train (guarded by its existing
+//! `resident_bins_uploaded` flag, re-armed by `with_features`) and PINS the cache; the
+//! driver skips its per-grow upload only for a pinned, geometry-matching cache.
 //!
 //! This harness drives the FULL learner path (SerialTreeLearner::train, the production
 //! seam — the pin only engages through the learner) and A/Bs via the escape hatch:
 //!
-//!   baseline: LGBM_ONDEVICE_BIN_HOIST=0  (per-grow re-upload, the 073/076/078 behavior)
+//!   baseline: LGBM_ONDEVICE_BIN_HOIST=0  (per-grow re-upload, the pre-fix behavior)
 //!   hoist   : (default)                  (once-per-train upload + pinned skip)
 //!
 //! Gates:

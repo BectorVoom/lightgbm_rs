@@ -3,9 +3,9 @@
 //!
 //! Faithful-mirror citations (read directly from the in-tree C++ source):
 //! - `LightGBM/src/boosting/gbdt.cpp`:
-//!   - `TrainOneIter` (the exact per-iteration order — RESEARCH Pattern 1):
+//!   - `TrainOneIter` (the exact per-iteration order):
 //!     (1) `BoostFromAverage(class)` on iter 0; (2) `Boosting()` →
-//!     `obj->GetGradients(train_score, grad, hess)`; (3) bagging (06-05);
+//!     `obj->GetGradients(train_score, grad, hess)`; (3) bagging;
 //!     (4) per `cur_tree_id`: `learner->Train` → `RenewTreeOutput` →
 //!     `tree.Shrinkage(learning_rate)` → `UpdateScore` →
 //!     `if |init|>kEpsilon tree.AddBias(init)`; push to `models_`.
@@ -13,22 +13,22 @@
 //!     `!has_init_score`, `obj != null`, and `(boost_from_average ||
 //!     num_features == 0)`: `init = obj->BoostFromScore(class)`; if
 //!     `|init| > kEpsilon` `AddScore(init, class)` to the TRAIN score updater
-//!     (and every valid updater — 06-05); return `init` (else 0).
+//!     (and every valid updater); return `init` (else 0).
 //!   - the per-class loop offset `= cur_tree_id * num_data` (single class K=1
-//!     here; per-class is 06-04).
+//!     here).
 //!
-//! **Critical ordering note** (RESEARCH Pattern 1 + Pitfall 5): `Shrinkage` is
+//! **Critical ordering note**: `Shrinkage` is
 //! applied to the tree's leaf/internal values BEFORE `UpdateScore`; `AddBias` is
 //! applied AFTER `UpdateScore` and rewrites only the STORED tree values (for model
 //! text) — it does NOT touch `score_`. The init score enters `score_` exactly ONCE
 //! via `BoostFromAverage → AddScore`, never via `AddBias` (no double-add).
 
 use lgbm_compute::Backend;
-// Phase-31 (31-04, ODS-01) GBDT-owned train-lifetime resident score. `ResidentScore`
+// GBDT-owned train-lifetime resident score. `ResidentScore`
 // is generic over the runtime `R`; the GBDT struct is NOT generic over a `Backend`, so
 // the instance is stored type-erased (`Box<dyn Any>`) and downcast to
 // `ResidentScore<B::Runtime>` inside the already-`B`-generic methods (one `B` per train).
-// This names lgbm-compute TYPES only — never a GPU compute runtime (CMP-01).
+// This names lgbm-compute TYPES only — never a GPU compute runtime.
 use lgbm_compute::ResidentScore;
 use lgbm_dataset::LeafPartitionLayout;
 use std::any::Any;
@@ -37,8 +37,8 @@ use lgbm_model::{GbdtModel, Tree};
 use lgbm_objective::Objective;
 use lgbm_treelearner::{FeatureColumn, GradientDiscretizer, SerialTreeLearner};
 
-/// Quantize one class's `grad`/`hess` IN PLACE to their de-quantized int8 values (phase-10
-/// W3b). `is_constant_hessian` is inferred from the buffer (L2 → constant, binary/etc → varies)
+/// Quantize one class's `grad`/`hess` IN PLACE to their de-quantized int8 values.
+/// `is_constant_hessian` is inferred from the buffer (L2 → constant, binary/etc → varies)
 /// so no objective surgery is needed. Each row's grad/hess is replaced by `int8 × scale` (f32),
 /// the quantized value the learner then builds histograms from. Deterministic rounding only.
 fn quantize_grad_hess_in_place(
@@ -81,10 +81,10 @@ use crate::error::BoostingError;
 use crate::objective::BoostObjective;
 use crate::sample_strategy::{BaggingSampleStrategy, GossSampleStrategy};
 use crate::score_updater::ScoreUpdater;
-// Phase-20 (20-04, ODL-16, D-01/D-06) resident cross-iteration score loop: the §11
-// per-leaf `AddScore` device delegate walks a `PredictTree` reconstructed from the
-// grown `Tree` + the spine's `FeatureColumn`s. Symbol only — the walk stays generic
-// over `B::Runtime` via the score-updater's `*_on` methods (no GPU runtime pulled in).
+// Resident cross-iteration score loop: the per-leaf `AddScore` device delegate walks a
+// `PredictTree` reconstructed from the grown `Tree` + the spine's `FeatureColumn`s.
+// Symbol only — the walk stays generic over `B::Runtime` via the score-updater's
+// `*_on` methods (no GPU runtime pulled in).
 use lgbm_compute::kernels::predict::PredictTree;
 
 /// The resolved Random Forest `Boosting()` output: the per-class init scores plus
@@ -93,8 +93,8 @@ use lgbm_compute::kernels::predict::PredictTree;
 /// [`Gbdt::rf_boosting`] signature readable.
 type RfBoosting = (Vec<f64>, Vec<f32>, Vec<f32>);
 
-/// The boosting strategy variant (RESEARCH Pattern 1 — an ENUM FIELD on [`Gbdt`],
-/// NOT trait objects). In C++ these are subclasses of `GBDT` (`DART`, `RF`);
+/// The boosting strategy variant (an ENUM FIELD on [`Gbdt`], NOT trait objects).
+/// In C++ these are subclasses of `GBDT` (`DART`, `RF`);
 /// the Rust port keeps the single [`Gbdt`] driver and branches on this discriminant
 /// in [`Gbdt::train_one_iter`], which is the faithful, allocation-free seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,7 +105,7 @@ pub enum BoostingVariant {
     /// DART (`dart.hpp`) — Dropouts meet Multiple Additive Regression Trees: each
     /// iteration drops a random subset of already-grown trees (via an advancing
     /// `Random(drop_seed)`), trains the new tree against the post-drop score, then
-    /// re-adds + normalizes the dropped trees' weights (BST-05).
+    /// re-adds + normalizes the dropped trees' weights.
     Dart,
     /// Random Forest (`rf.hpp`) — AVERAGED (not accumulated) trees with MANDATORY
     /// randomization (bagging or feature sub-sampling) and NO learning-rate
@@ -115,7 +115,7 @@ pub enum BoostingVariant {
     /// init_score` (`rf.hpp:149-152`), and folds the tree into `score_` as a running
     /// average via `MultiplyScore(iter); AddScore; MultiplyScore(1/(iter+1))`
     /// (`rf.hpp:157-159`). Prediction divides the tree sum by `num_iteration`
-    /// (`average_output_`, gbdt_prediction.cpp:57-59). State in [`Gbdt::rf`] (BST-06).
+    /// (`average_output_`, gbdt_prediction.cpp:57-59). State in [`Gbdt::rf`].
     Rf,
 }
 
@@ -142,7 +142,7 @@ pub struct DartConfig {
 }
 
 /// Random Forest (`rf.hpp`) configuration — the parity-relevant `Config` subset
-/// for the two mandatory-randomization CHECKs (`rf.hpp:35-40`). RF requires EITHER
+/// for the two mandatory-randomization checks (`rf.hpp:35-40`). RF requires EITHER
 /// active row bagging OR active feature sub-sampling; the facade resolves these
 /// from `Config` and the [`Gbdt`] driver enforces them at the top of the RF path.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -229,9 +229,8 @@ impl std::fmt::Debug for DartState {
 /// Grows `K = objective.num_model_per_iteration()` trees per iteration over the
 /// class-major score/grad/hess layout (`offset = num_data * cur_tree_id`): `K = 1`
 /// for the single-output objectives (regression/regression_l1/binary/custom) and
-/// `K = num_class` for `multiclass`/`multiclassova` (06-04). Single-threaded
-/// deterministic core, bagging OFF, early-stopping OFF, `boost_from_average`
-/// honored per class (the C++ default). Bagging + early stopping land in 06-05.
+/// `K = num_class` for `multiclass`/`multiclassova`. Single-threaded
+/// deterministic core, `boost_from_average` honored per class (the C++ default).
 pub struct Gbdt<'a> {
     /// The f64 score accumulator (`score_`).
     score_updater: ScoreUpdater,
@@ -250,27 +249,27 @@ pub struct Gbdt<'a> {
     trees: Vec<Tree>,
     /// `iter_` — the completed-iteration count.
     iter: i32,
-    /// Optional bagging / row-subsampling strategy (BST-03). `None` ⇒ no bagging
+    /// Optional bagging / row-subsampling strategy. `None` ⇒ no bagging
     /// (`bagging_fraction == 1` / `bagging_freq == 0`), the full-corpus train-path
-    /// scatter (the byte-unchanged 06-02..06-04 path). `Some` ⇒ each iter draws the
-    /// bag (over the RNG, D-13), trains on the in-bag subset, and scores in-bag +
-    /// out-of-bag rows (OOB rows STILL get the tree prediction added — Pitfall 4).
+    /// scatter. `Some` ⇒ each iter draws the
+    /// bag (over the RNG), trains on the in-bag subset, and scores in-bag +
+    /// out-of-bag rows (OOB rows STILL get the tree prediction added).
     ///
-    /// EXPLICIT SCOPE BOUNDARY (BST-03): only pos/neg ROW bagging. The query-grouped
-    /// path (`bagging_by_query`) is an explicit, decision-backed Phase-7 deferral —
+    /// SCOPE BOUNDARY: only pos/neg ROW bagging. The query-grouped
+    /// path (`bagging_by_query`) is out of scope —
     /// the strategy's [`BaggingConfig::new`](crate::sample_strategy::BaggingConfig::new)
-    /// rejects `bagging_by_query = true` with a typed error (06-CONTEXT.md BST-03
-    /// scope note), so the loop NEVER silently row-bags a query request.
+    /// rejects `bagging_by_query = true` with a typed error, so the loop NEVER
+    /// silently row-bags a query request.
     bagging: Option<BaggingSampleStrategy>,
-    /// Optional GOSS sample strategy (BST-04). Mutually exclusive with [`Self::bagging`]
+    /// Optional GOSS sample strategy. Mutually exclusive with [`Self::bagging`]
     /// (GOSS forbids bagging — `goss.hpp:87-89`; the facade enforces this). `Some` ⇒
     /// each iter past the `1/learning_rate` skip window AMPLIFIES the sampled rows'
     /// grad/hess in place (`IsHessianChange`), trains on the kept (top ++ sampled)
-    /// subset, and scores kept + dropped rows predict-side (Pitfall 4 — dropped rows
+    /// subset, and scores kept + dropped rows predict-side (dropped rows
     /// STILL get the tree prediction added, exactly like bagging OOB). Inside the skip
     /// window GOSS keeps every row with grad/hess unmodified (the full-corpus path).
     goss: Option<GossSampleStrategy>,
-    /// The boosting variant discriminant (RESEARCH Pattern 1). [`BoostingVariant::Gbdt`]
+    /// The boosting variant discriminant. [`BoostingVariant::Gbdt`]
     /// for the spine; [`BoostingVariant::Dart`] activates the DART drop+normalize path
     /// (state in [`Self::dart`]).
     variant: BoostingVariant,
@@ -286,9 +285,9 @@ pub struct Gbdt<'a> {
     /// (`Tree::predict` over each row's real feature values). Empty when bagging is
     /// off (the caller drives the learner's features directly).
     features: Vec<FeatureColumn>,
-    /// `config_->use_quantized_grad` (phase-10). When true, each iteration's gradients
+    /// `config_->use_quantized_grad`. When true, each iteration's gradients
     /// and hessians are quantized in-place (deterministic int8) before the learner — the
-    /// opt-in APPROXIMATE mode (spike-008). Default false → the exact path is untouched.
+    /// opt-in APPROXIMATE mode. Default false → the exact path is untouched.
     use_quantized_grad: bool,
     /// `config_->num_grad_quant_bins` (MUST be ≤254 for the i8 discretized storage).
     num_grad_quant_bins: i32,
@@ -302,46 +301,28 @@ pub struct Gbdt<'a> {
     /// `lambda_l1` / `lambda_l2` for the renewed-leaf formula `-ThresholdL1(ΣG,l1)/(ΣH+l2)`.
     quant_l1: f64,
     quant_l2: f64,
-    /// Phase-31 (31-04, ODS-01) — the GBDT-owned, TRAIN-LIFETIME resident f64 score
+    /// The GBDT-owned, TRAIN-LIFETIME resident f64 score
     /// buffer ([`lgbm_compute::ResidentScore`]<`B::Runtime`>), type-erased because
     /// `Gbdt` is not `Backend`-generic (downcast inside the `B`-generic methods). Built
     /// ONCE — lazily, on the first `train_one_iter` grad/hess call, uploading the host
     /// score AFTER `BoostFromAverage` — and accumulated in place across trees
     /// ([`ResidentScore::add_tree_on_device`], mirrored alongside the host scatter). The
-    /// on-device grad/hess branch (`gbdt.rs:679`) reads its Handle directly, so the host
-    /// score is never round-tripped to compute grad/hess (31-RESEARCH Pitfall 2). `None`
+    /// on-device grad/hess branch reads its Handle directly, so the host
+    /// score is never round-tripped to compute grad/hess. `None`
     /// whenever [`Self::resident_active`] is `Some(false)` (the whole out-of-envelope
     /// class) — never constructed there, so those trains are byte-unchanged.
     ///
-    /// ## The `.scores()` / `.to_vec()` call-site classification (31-04 acceptance)
-    /// Every host read of the score buffer, and whether this plan moves it to the
-    /// resident path:
-    /// 1. grad/hess compute (`self.objective.get_gradients(self.score_updater.scores(), …)`)
-    ///    — **NOT-YET-DEFERRED / partially moved**: the new on-device branch reads the
-    ///    resident Handle for the L2/L1/binary envelope; this literal host read remains as
-    ///    the byte-unchanged fallback for every other case.
-    /// 2. `train_score_pre` snapshot for `RenewTreeOutput` (spine loop) — **KEPT**: a
-    ///    genuine host boundary (the residual getter reads the pre-update host score;
-    ///    regression_l1/quantile only).
-    /// 3. `train_score_pre` snapshot (multiclass per-class loop) — **KEPT** (same reason;
-    ///    multiclass is out of this plan's `num_class==1` envelope anyway).
-    /// 4. `train_score_pre` snapshot (RF `train_one_iter_rf`) — **KEPT** (RF host path,
-    ///    out of envelope).
-    /// 5. public `scores()` accessor — **KEPT**: the public host boundary (Metric::Eval /
-    ///    model dump / callers) reads the mirrored host `score_`.
-    /// 6. RF `const_scores` grad/hess derivation — **KEPT** (RF host path).
-    /// 7. `boosting_on_cuda()` getter — **KEPT**: the env-gated resident toggle, unchanged.
-    /// 8. `update_score_resident` host-scatter `add_tree_train_path` — **KEPT**: the
-    ///    spike-074 cheap default that keeps `score_updater.scores()` authoritative for
-    ///    Metric::Eval; this plan ADDS the resident `add_tree_on_device` mirror ALONGSIDE
-    ///    it (wraps, does not replace), so the host branch body is untouched.
+    /// The public `scores()` accessor and the `train_score_pre` snapshots used by
+    /// `RenewTreeOutput` (spine and multiclass loops) and by the RF path always read
+    /// the host-mirrored `score_` buffer directly; only the on-device grad/hess branch
+    /// reads the resident Handle.
     resident_score: Option<Box<dyn Any>>,
-    /// Phase-31 (31-04) — the ONCE-evaluated activation decision for [`Self::resident_score`]
+    /// The ONCE-evaluated activation decision for [`Self::resident_score`]
     /// (`None` = not yet decided; `Some(true/false)` = decided on the first
     /// `train_one_iter`). The guard is `num_class == 1 && bagging.is_none() &&
     /// goss.is_none() && device_objective_supported(objective.name()) && boosting_on_cuda()`
-    /// (Assumptions A1/A2 — bagging/GOSS/multiclass are excluded entirely rather than
-    /// tracking a variable-length resident buffer). Evaluated once and frozen for the whole
+    /// — bagging/GOSS/multiclass are excluded entirely rather than
+    /// tracking a variable-length resident buffer. Evaluated once and frozen for the whole
     /// train (bagging/goss/num_class are construction constants; `boosting_on_cuda` is set
     /// before train), so a mid-train change never re-derives a stale length assumption.
     resident_active: Option<bool>,
@@ -373,8 +354,8 @@ pub struct IterSnapshot {
 }
 
 impl<'a> Gbdt<'a> {
-    /// Construct the boosting driver from a built-in regression objective (the
-    /// 06-02 spine constructor — kept for the existing callers/tests).
+    /// Construct the boosting driver from a built-in regression objective
+    /// (kept for the existing callers/tests).
     pub fn new(
         objective: Objective,
         learning_rate: f64,
@@ -442,7 +423,7 @@ impl<'a> Gbdt<'a> {
         self
     }
 
-    /// Enable the opt-in `use_quantized_grad` APPROXIMATE training mode (phase-10): each
+    /// Enable the opt-in `use_quantized_grad` APPROXIMATE training mode: each
     /// iteration's gradients/hessians are quantized to int8 before the learner. `num_grad_quant_bins`
     /// MUST be ≤254 (i8 storage). `stochastic` selects stochastic rounding (C++ default) vs
     /// deterministic (the C++ parity gate). The default exact path is unaffected unless `enabled`.
@@ -459,7 +440,7 @@ impl<'a> Gbdt<'a> {
         self
     }
 
-    /// Enable the DART boosting variant (BST-05, RESEARCH Pattern 1 — an enum field,
+    /// Enable the DART boosting variant (an enum field,
     /// not a trait object). `dart_config` carries the resolved `drop_rate` / `max_drop`
     /// / `skip_drop` / `xgboost_dart_mode` / `uniform_drop` / `drop_seed`; `features`
     /// is the full-corpus feature columns (DART re-scores dropped trees over the WHOLE
@@ -483,7 +464,7 @@ impl<'a> Gbdt<'a> {
         self
     }
 
-    /// Enable the Random Forest boosting variant (BST-06, RESEARCH Pattern 1 — an
+    /// Enable the Random Forest boosting variant (an
     /// enum field, not a trait object). `rf_config` carries the resolved
     /// mandatory-randomization flags (`bagging_active` / `feature_subsampling_active`);
     /// `features` is the full-corpus feature columns (RF re-scores each grown tree
@@ -495,8 +476,8 @@ impl<'a> Gbdt<'a> {
     /// enforced at the top of the RF train path in [`Self::train_one_iter`] (iter 0)
     /// so they surface as a typed [`BoostingError::RfConfig`] rather than a panic.
     /// Builder-style; chains after a constructor. The caller MUST also enable bagging
-    /// via [`Self::with_bagging`] when `bagging_active` is true (RF reuses the proven
-    /// [`BaggingSampleStrategy`]; the 07-01 bit-exact bagging RNG golden carries over).
+    /// via [`Self::with_bagging`] when `bagging_active` is true (RF reuses the
+    /// bit-exact [`BaggingSampleStrategy`] RNG).
     #[must_use]
     pub fn with_rf(mut self, rf_config: RfConfig, features: Vec<FeatureColumn>) -> Self {
         self.variant = BoostingVariant::Rf;
@@ -514,8 +495,8 @@ impl<'a> Gbdt<'a> {
         self
     }
 
-    /// Set the boosting [`BoostingVariant`] discriminant directly (RESEARCH Pattern 1
-    /// `with_variant` shape). DART requires its state — prefer [`Self::with_dart`],
+    /// Set the boosting [`BoostingVariant`] discriminant directly.
+    /// DART requires its state — prefer [`Self::with_dart`],
     /// which sets the variant AND constructs the drop RNG. This setter is the generic
     /// chained entry point used by callers that already hold a configured variant
     /// (e.g. `Gbdt`/`Rf`); calling it with `Dart` WITHOUT [`Self::with_dart`] leaves
@@ -531,7 +512,7 @@ impl<'a> Gbdt<'a> {
         self.variant
     }
 
-    /// Enable bagging / row subsampling (BST-03). `bagging` is the
+    /// Enable bagging / row subsampling. `bagging` is the
     /// [`BaggingSampleStrategy`] (already `reset_sample_config`'d over the corpus);
     /// `features` is the full-corpus feature columns (for subset training + OOB
     /// predict-side scoring). Builder-style — chains after a constructor.
@@ -550,7 +531,7 @@ impl<'a> Gbdt<'a> {
         self
     }
 
-    /// Enable GOSS / gradient-based one-side sampling (BST-04). `goss` is the
+    /// Enable GOSS / gradient-based one-side sampling. `goss` is the
     /// [`GossSampleStrategy`] (already `reset_sample_config`'d over the corpus);
     /// `features` is the full-corpus feature columns (for subset training + dropped-row
     /// predict-side scoring). Mutually exclusive with [`with_bagging`](Self::with_bagging)
@@ -568,12 +549,12 @@ impl<'a> Gbdt<'a> {
     }
 
     /// Whether this driver already carried `init_score` metadata (C++
-    /// `train_score_updater_->has_init_score()`). 06-02 spine has no init-score
+    /// `train_score_updater_->has_init_score()`). The spine has no init-score
     /// metadata; the gate is wired for fidelity.
     fn has_init_score(&self) -> bool {
-        // 06-02: init_score metadata is not yet plumbed from the public API; the
+        // init_score metadata is not yet plumbed from the public API; the
         // spine corpus has none, so BoostFromAverage always runs. When the
-        // facade plumbs init_score (later wave), thread the flag here.
+        // facade plumbs init_score, thread the flag here.
         false
     }
 
@@ -660,7 +641,7 @@ impl<'a> Gbdt<'a> {
         labels: &[f32],
         num_features: usize,
     ) -> Result<IterSnapshot, BoostingError> {
-        // V5: validate lengths up front, before any FP work (T-06-02-02).
+        // Validate lengths up front, before any FP work.
         let nd = self.num_data as usize;
         if labels.len() != nd {
             return Err(BoostingError::LengthMismatch {
@@ -668,20 +649,12 @@ impl<'a> Gbdt<'a> {
                 actual: labels.len(),
             });
         }
-        // UN-DEFERRED in Phase-7 07-01 (D-05 faithful-fix): regression_l1 + bagging
-        // is no longer typed-rejected. The Phase-6 06-06 rejection assumed the L1
-        // sign-gradient split-gain over the bagged subset diverged from C++ in leaf
-        // STRUCTURE (rust:0.0 vs cpp:11.0 at regression_l1_bag1_es0_bfa0 tree 0). A
-        // source-built lib_lightgbm 4.6 FP execution trace (07-D05-DECISION.md)
-        // showed the divergence was a SPLIT-GAIN OPERAND bug, not an irreducible
-        // structure flip: the Rust `min_gain_shift` used the RAW leaf `sum_hessian`
-        // where C++ uses the `2*kEpsilon`-BUMPED value (feature_histogram.hpp:174),
-        // making the Rust gain-shift ULPs too high and rejecting the borderline
-        // bagged-subset splits C++ accepts. With that fixed (lgbm-compute
-        // `find_best_split`) plus the retained subset-path median-residual
-        // `RenewTreeOutput` (8330cee), regression_l1 + bagging now reproduces the
-        // real-binary tree structure (the `regression_l1_bag1_*` matrix cells assert
-        // real-binary parity, not the typed error). DEF-06-01 family cleared.
+        // regression_l1 + bagging is not typed-rejected: `find_best_split`'s
+        // `min_gain_shift` uses the `2*kEpsilon`-BUMPED `sum_hessian`
+        // (feature_histogram.hpp:174), not the RAW leaf `sum_hessian` — using the raw
+        // value made the Rust gain-shift ULPs too high and rejected borderline
+        // bagged-subset splits that C++ accepts. With that fixed, regression_l1 +
+        // bagging reproduces the real-binary tree structure.
 
         // K = num_model_per_iteration (num_class for multiclass/ova, 1 otherwise).
         // The objective is authoritative — it MUST agree with self.num_class for the
@@ -689,7 +662,7 @@ impl<'a> Gbdt<'a> {
         let k = self.objective.num_model_per_iteration().max(1);
         let total = nd * k as usize;
 
-        // ---- RANDOM FOREST branch (BST-06, rf.hpp) ----
+        // ---- RANDOM FOREST branch (rf.hpp) ----
         // RF is structurally distinct from the GBDT spine: grad/hess are derived ONCE
         // from a constant init-score buffer (not the accumulated score), trees are
         // AVERAGED (running-average score buffer) instead of accumulated with a
@@ -701,8 +674,8 @@ impl<'a> Gbdt<'a> {
         }
 
         // ---- (1) BoostFromAverage FIRST, per class, only on iter 0 ----
-        // K trees/iter over the class-major layout (offset = num_data * cur_tree_id,
-        // Pattern 4). For multiclass each class gets its own init score.
+        // K trees/iter over the class-major layout (offset = num_data * cur_tree_id).
+        // For multiclass each class gets its own init score.
         let mut init_scores = vec![0.0f64; k as usize];
         for cur_tree_id in 0..k {
             init_scores[cur_tree_id as usize] =
@@ -719,8 +692,8 @@ impl<'a> Gbdt<'a> {
             self.dropping_trees(k);
         }
 
-        // ---- Phase-31 (31-04, ODS-01/ODS-02x) resident-score activation decision ----
-        // Evaluate the envelope guard ONCE and freeze it for the whole train (A1/A2).
+        // ---- resident-score activation decision ----
+        // Evaluate the envelope guard ONCE and freeze it for the whole train.
         // Only the num_class==1 GBDT spine with no bagging/GOSS and an on-device-supported
         // objective, under the env-gated `boosting_on_cuda_` toggle, keeps the score
         // resident and computes grad/hess on device; every other case (multiclass, bagging,
@@ -741,14 +714,13 @@ impl<'a> Gbdt<'a> {
         let mut hessians = vec![0.0f32; total];
         // The objective receives the WHOLE class-major score buffer. Single-output
         // objectives treat it as their one class; the multiclass softmax gathers
-        // strided `rec[k]=score[num_data*k+i]` across classes (Pattern 4 — a
+        // strided `rec[k]=score[num_data*k+i]` across classes (a
         // row-major layout would silently diverge), and multiclassova dispatches to
         // each per-class binary at offset `num_data*i`.
-        // Spike-014b: time per-iter grad/hess compute into the whole-train budget.
+        // Time per-iter grad/hess compute into the whole-train budget.
         if self.resident_active == Some(true) {
-            // ON-DEVICE grad/hess from the resident score Handle — no host score snapshot
-            // (31-RESEARCH Pitfall 2: the REAL ~37% cost is THIS call's unconditional host
-            // `get_gradients(self.score_updater.scores(), …)`). Build the GBDT-owned
+            // ON-DEVICE grad/hess from the resident score Handle — no host score snapshot.
+            // Build the GBDT-owned
             // ResidentScore ONCE (lazily, uploading the host score AFTER BoostFromAverage so
             // the iter-0 init constant is captured); update_score_resident then accumulates
             // it in place across trees, so the score is uploaded exactly once per train.
@@ -816,13 +788,13 @@ impl<'a> Gbdt<'a> {
             })?;
         }
 
-        // ---- (3) sampling (BST-03 bagging / BST-04 GOSS): draw the bag over the RNG ----
+        // ---- (3) sampling (bagging / GOSS): draw the bag over the RNG ----
         // C++ `sample_strategy_->Bagging(iter_, …)` BEFORE the per-class tree loop.
-        // The draw consumes the per-block Random sequence verbatim (Pitfall 4). When the
+        // The draw consumes the per-block Random sequence verbatim. When the
         // strategy actually subsets (`is_use_subset`), the per-class trees train on the
         // kept (in-bag) rows and BOTH kept and dropped rows are scored predict-side below.
         //
-        // GOSS (BST-04) additionally AMPLIFIES the sampled rows' grad/hess IN PLACE
+        // GOSS additionally AMPLIFIES the sampled rows' grad/hess IN PLACE
         // (`IsHessianChange`) here, BEFORE the tree learner sees them (goss.hpp:30-74).
         // It is mutually exclusive with bagging (GOSS forbids bagging, goss.hpp:87-89).
         // The kept/dropped index arrays come from whichever strategy is active.
@@ -868,12 +840,12 @@ impl<'a> Gbdt<'a> {
             _ => self.learning_rate,
         };
 
-        // ---- (3b) quantize gradients (use_quantized_grad, phase-10 W3b) ----
-        // APPROXIMATE mode (spike-008): replace each class's grad/hess in place with their
+        // ---- (3b) quantize gradients (use_quantized_grad) ----
+        // APPROXIMATE mode: replace each class's grad/hess in place with their
         // de-quantized int8 quantization, so the UNCHANGED learner builds the quantized model.
         // Runs AFTER GetGradients + bagging/GOSS amplification (mirroring C++ DiscretizeGradients
         // at the start of the learner's Train), and only here — the exact path never enters this
-        // branch. Deterministic rounding only (stochastic is W6).
+        // branch. Deterministic rounding only.
         // Preserve the ORIGINAL (non-quantized) grad/hess for leaf renewal (quant_train_renew_leaf)
         // — the in-place quantization below would otherwise overwrite them.
         let orig_grad_hess: Option<(Vec<f32>, Vec<f32>)> =
@@ -914,8 +886,8 @@ impl<'a> Gbdt<'a> {
 
             // class_need_train gate (gbdt.cpp:390): when false (a class is absent /
             // is the entire corpus), DO NOT train — push a constant 1-leaf tree
-            // carrying this class's init score so models_.len() stays iter*K
-            // (Pitfall 6). The init was already injected into score_ via
+            // carrying this class's init score so models_.len() stays iter*K.
+            // The init was already injected into score_ via
             // BoostFromAverage→AddScore on iter 0, so no further score change.
             if !self.objective.class_need_train(cur_tree_id, labels) {
                 let init = init_scores[cur_tree_id as usize];
@@ -937,8 +909,8 @@ impl<'a> Gbdt<'a> {
             let is_first_tree = self.trees.len() < k as usize;
 
             // BAGGING SUBSET PATH (use_subset): train on the in-bag rows (C++
-            // tmp_subset_), then score in-bag + OOB rows predict-side (Pitfall 4 —
-            // OOB rows STILL get the tree prediction added). The full-corpus path
+            // tmp_subset_), then score in-bag + OOB rows predict-side —
+            // OOB rows STILL get the tree prediction added. The full-corpus path
             // (no bagging / fraction==1) uses the bit-exact partition scatter.
             if use_subset {
                 let in_bag: Vec<i32> = sample_in_bag.clone();
@@ -953,18 +925,12 @@ impl<'a> Gbdt<'a> {
                     // A real split this class → C++ `should_continue = true`
                     // (gbdt.cpp:407): this round emits trees and advances `iter_`.
                     should_continue = true;
-                    // RenewTreeOutput on the SUBSET path (WR-03 fix, mirrors C++
-                    // serial_tree_learner.cpp:920-958 + gbdt.cpp:430): no-op for L2
+                    // RenewTreeOutput on the SUBSET path, mirrors C++
+                    // serial_tree_learner.cpp:920-958 + gbdt.cpp:430: no-op for L2
                     // (IsRenewTreeOutput()==false), ACTIVE for regression_l1.
                     //
-                    // RETAINED-BUT-CURRENTLY-UNEXERCISED (06-06 Task 2b): the ONLY
-                    // renew+bagging combination today is regression_l1 + bagging, which
-                    // is typed-rejected at the top of `train_one_iter` (the L1 bagged-
-                    // subset leaf STRUCTURE diverges from C++; deferred past Phase 6).
-                    // This renewal closure is therefore unreachable for regression_l1 +
-                    // bagging right now, but it is KEPT faithful to C++ for any FUTURE
-                    // renew objective that bags — do NOT delete it. (Not reverting
-                    // 8330cee.)
+                    // This renewal closure is kept faithful to C++ for any FUTURE
+                    // renew objective that bags — do NOT delete it.
                     //
                     // subset partition's `indices_in_leaf` are subset-row indices; map
                     // each through `in_bag[sr]` to the FULL-corpus row (the C++
@@ -1006,7 +972,7 @@ impl<'a> Gbdt<'a> {
                     tree.shrinkage(shrink_rate);
                     // Score BOTH in-bag and OOB rows predict-side over the real feature
                     // values (bit-exact to the partition scatter on the identity-binned
-                    // corpus — the L2 contract). OOB rows STILL get scored (Pitfall 4).
+                    // corpus). OOB rows STILL get scored.
                     // The identity-binned real feature value IS the bin index (raw
                     // value 0..K-1); Tree::predict traverses the real-value thresholds
                     // (the bin upper bounds) so feeding the bin index as the real value
@@ -1056,7 +1022,7 @@ impl<'a> Gbdt<'a> {
 
             // learner.train() builds + returns the partition for the bit-exact
             // training-path score scatter (C++ data_partition_).
-            // Spike-014b: time the per-iter tree-train call (SUPERSET of the growth-loop
+            // Times the per-iter tree-train call (a superset of the growth-loop
             // phases) into the budget — (learner − phases) is the in-learner GPU
             // upload / resident-pool / partition setup the phase guards never saw.
             let (mut tree, partition) = lgbm_treelearner::phase_prof::time(
@@ -1071,7 +1037,7 @@ impl<'a> Gbdt<'a> {
                 // RenewTreeOutput: no-op for L2 (IsRenewTreeOutput()==false), active
                 // for regression_l1 — overwrite each leaf's output with the median
                 // RESIDUAL (`label[row] - train_score[offset+row]`) of its rows
-                // (Pitfall 2/3; gbdt.cpp:409-411 + serial_tree_learner.cpp:920-940).
+                // (gbdt.cpp:409-411 + serial_tree_learner.cpp:920-940).
                 if self.objective.is_renew_tree_output() {
                     let obj = &self.objective;
                     let labels_ref = labels;
@@ -1097,7 +1063,7 @@ impl<'a> Gbdt<'a> {
                         }),
                     );
                 }
-                // Quantized leaf renewal (quant_train_renew_leaf, phase-10 W6): recompute each
+                // Quantized leaf renewal (quant_train_renew_leaf): recompute each
                 // leaf output from the ORIGINAL gradients (RenewIntGradTreeOutput). Mutually
                 // exclusive-in-practice with the objective renew above (that is regression_l1;
                 // quantized renew is the gradient-sum formula). Full-corpus path only.
@@ -1118,12 +1084,12 @@ impl<'a> Gbdt<'a> {
                         );
                     }
                 }
-                // §16 ORDER (RESEARCH Pitfall 4): Shrinkage → UpdateScore(§11) →
-                // (optional RenewTreeOutput, §5.1) → Metric.Eval(§12). RenewTreeOutput
+                // ORDER: Shrinkage → UpdateScore →
+                // (optional RenewTreeOutput). RenewTreeOutput
                 // already ran ABOVE this point (before shrinkage), a no-op for the L2
                 // slice (`is_renew_tree_output()==false`); Metric.Eval runs downstream
                 // in the facade over `score_updater.scores()` — the resident buffer's
-                // host mirror — composed with §12 ConvertOutput (Plan 20-02). The
+                // host mirror — composed with ConvertOutput. The
                 // ORDERING CONTRACT for the L1/quantile follow-up: RenewTreeOutput MUST
                 // stay BEFORE shrinkage+UpdateScore (it reads the pre-update score), so
                 // any future device RenewTreeOutput refit slots in at the existing
@@ -1132,20 +1098,20 @@ impl<'a> Gbdt<'a> {
                 // Shrinkage BEFORE UpdateScore.
                 tree.shrinkage(shrink_rate);
                 // UpdateScore: bit-exact training-path per-leaf scatter into score_.
-                // Spike-014b: time into the whole-train budget.
+                // Times into the whole-train budget.
                 //
-                // Phase-20 (20-04, D-01/D-06 layer 2) RESIDENT slice: when the
+                // RESIDENT slice: when the
                 // `boosting_on_cuda_` toggle is active (`LGBM_CUDA_ON_DEVICE=1`, or the
                 // driver seam forced it on) keep `cuda_score_` RESIDENT across the whole
-                // train — route the per-leaf `AddScore` through the Phase-18
-                // `add_prediction_to_score_on_device` tree-walk delegate (D-02, NO new
+                // train — route the per-leaf `AddScore` through the
+                // `add_prediction_to_score_on_device` tree-walk delegate (no new
                 // kernel). On the identity-binned L2 continuous corpus the device
-                // tree-walk is bit-exact to the host partition scatter (the L2
-                // contract, proven in `score_updater_parity`/`resident_score_ab`). With
+                // tree-walk is bit-exact to the host partition scatter (proven in
+                // `score_updater_parity`/`resident_score_ab`). With
                 // the env unset the toggle is OFF and the host scatter below is
-                // byte-unchanged (D-09/ODL-19). OUT-OF-SLICE: the DART/RF per-row-predict
-                // paths (`add_tree_predict_path`/`add_tree_scaled_all`, RESEARCH
-                // Pitfall 5) stay on the host path this phase.
+                // byte-unchanged. OUT-OF-SLICE: the DART/RF per-row-predict
+                // paths (`add_tree_predict_path`/`add_tree_scaled_all`) stay on the host
+                // path.
                 if self.score_updater.boosting_on_cuda() {
                     self.update_score_resident::<B>(learner, &tree, &partition, cur_tree_id)?;
                 } else {
@@ -1158,7 +1124,7 @@ impl<'a> Gbdt<'a> {
                     );
                 }
                 // AddBias AFTER UpdateScore — rewrites STORED tree values only
-                // (model text), NEVER score_ (Pitfall 5: no double-add).
+                // (model text), NEVER score_ (no double-add).
                 let init = init_scores[cur_tree_id as usize];
                 if Objective::init_score_is_significant(init) {
                     tree.add_bias(init);
@@ -1171,8 +1137,8 @@ impl<'a> Gbdt<'a> {
                 // boost_from_average=false it applies the ObtainAutomaticInitialScore
                 // fallback (the label median for regression_l1) and AddScores it once;
                 // otherwise the BoostFromAverage init (already in score_ from iter 0)
-                // is the constant. Pushing the constant keeps models_.len() == iter * K
-                // (Pitfall 6). See `no_split_constant_value`.
+                // is the constant. Pushing the constant keeps models_.len() == iter * K.
+                // See `no_split_constant_value`.
                 let init = init_scores[cur_tree_id as usize];
                 let const_val = self.no_split_constant_value(cur_tree_id, labels, init);
                 self.trees.push(Tree::as_constant(const_val, self.num_data));
@@ -1191,9 +1157,8 @@ impl<'a> Gbdt<'a> {
         // next boost round (`bagging_freq=1` re-bags every call regardless of `iter_`;
         // the discarded round's bag draw already advanced the RNG so the next round
         // draws the NEXT bag — the C++-faithful cadence) and grows a real tree. This
-        // is the DEF-07-13-01 fix: it closes the quantile_bag1_es0_bfa0 12→10-tree
-        // structural divergence WITHOUT touching the bagging draw, the learner, the
-        // histogram, or RenewTreeOutput (all verified bit-exact).
+        // pop is required to match C++'s tree count WITHOUT touching the bagging draw,
+        // the learner, the histogram, or RenewTreeOutput.
         //
         // The FIRST iteration (`tree_count_before == 0`, mirroring C++
         // `models_.size() <= num_tree_per_iteration_`) is NOT popped: its no-split
@@ -1353,8 +1318,8 @@ impl<'a> Gbdt<'a> {
         };
 
         // ---- mandatory bagging (rf.hpp:113-117) ----
-        // RF MUST bag (or feature-subsample). The bag is drawn over the proven
-        // BaggingSampleStrategy (07-01 bit-exact RNG golden). When feature
+        // RF MUST bag (or feature-subsample). The bag is drawn over the
+        // bit-exact BaggingSampleStrategy RNG. When feature
         // sub-sampling is the randomization source (no row bagging), there is no
         // subset and trees train on the full corpus (the col-sampler differs per
         // tree — that wiring lives in the learner; here use_subset is false).
@@ -1612,10 +1577,10 @@ impl<'a> Gbdt<'a> {
         self.score_updater.scores()
     }
 
-    /// Phase-20 (20-04, D-06 layer 2) driver/test seam: force the resident
+    /// Driver/test seam: force the resident
     /// `boosting_on_cuda_` toggle on the internal score updater. The env-gated default
     /// from [`ScoreUpdater::new`] already reflects `LGBM_CUDA_ON_DEVICE` (OFF unless
-    /// `=1`, D-09); this override lets the resident-score A/B run BOTH arms — the
+    /// `=1`); this override lets the resident-score A/B run BOTH arms — the
     /// resident (`true`) and the host reference (`false`) — inside one process (the
     /// `cuda_on_device_enabled()` env is a process-global `OnceLock`, so per-arm env
     /// toggling is not possible). Additive; unset-env default stays host.
@@ -1629,7 +1594,7 @@ impl<'a> Gbdt<'a> {
         self.score_updater.boosting_on_cuda()
     }
 
-    /// Phase-31 (31-04) test/inspection seam: whether this train activated the GBDT-owned
+    /// Test/inspection seam: whether this train activated the GBDT-owned
     /// resident score + on-device grad/hess path (the num_class==1 / no-bagging / no-GOSS /
     /// GBDT-spine / on-device-supported-objective / `boosting_on_cuda()` envelope). `None`
     /// until the first [`Self::train_one_iter`] freezes the decision; `Some(true)` only
@@ -1639,9 +1604,9 @@ impl<'a> Gbdt<'a> {
         self.resident_active
     }
 
-    /// Phase-20 (20-04, ODL-16, D-01/D-06 layer 2) resident §11 UpdateScore: keep
+    /// Resident UpdateScore: keep
     /// `cuda_score_` RESIDENT by routing the grown tree's per-leaf `AddScore` through
-    /// the Phase-18 `add_prediction_to_score_on_device` tree-walk delegate (D-02, NO
+    /// the `add_prediction_to_score_on_device` tree-walk delegate (no
     /// new tree-walk kernel), mirroring the resident buffer back into `score_`.
     ///
     /// The `PredictTree` is reconstructed from the grown [`Tree`]'s INNER-bin arrays
@@ -1663,21 +1628,20 @@ impl<'a> Gbdt<'a> {
         partition: &lgbm_treelearner::DataPartition,
         cur_tree_id: i32,
     ) -> Result<(), BoostingError> {
-        // Phase-25 (25-03, ODP2-04, §11): if the tree was grown ON-DEVICE, the grow
+        // If the tree was grown ON-DEVICE, the grow
         // already produced the resident row→leaf `partition`, returned as a HOST
         // `DataPartition`. Apply the per-leaf `AddScore` via the HOST partition scatter
-        // (`add_tree_train_path`) — the SAME call the non-on-device arm uses (~gbdt.rs:1024).
+        // (`add_tree_train_path`) — the SAME call the non-on-device arm uses.
         //
-        // WHY (spike-074, Bug 1): the score buffer is NOT actually device-resident —
+        // WHY: the score buffer is NOT actually device-resident —
         // `self.score` IS the buffer (`score_updater.rs:270-272`), and every score op
-        // already mirrors to it on the host. So the prior eager per-tree device round-trip
+        // already mirrors to it on the host. So an eager per-tree device round-trip
         // (fresh `ResidentScore` alloc + `num_data` zero-upload + on-device scatter of the
-        // leaf values + BLOCKING full-buffer f64 readback via
-        // `add_prediction_to_score_on_device_resident`) preserved NO residency benefit — it
-        // was pure overhead. Spike-074 measured it at 41.5ms/tree on real CUDA @500k rows
-        // (~4.0s/100-tree train, ~37% of the spike-073 on-device A/B gap). The host already
-        // holds the tree's post-shrinkage `leaf_value` and the resident partition, so the
-        // AddScore runs on the host in ~1.6ms. Bit-exact by construction: an integer-indexed
+        // leaf values + a BLOCKING full-buffer f64 readback via
+        // `add_prediction_to_score_on_device_resident`) preserves NO residency benefit — it
+        // is pure overhead relative to the host scatter, which is cheap because the host
+        // already holds the tree's post-shrinkage `leaf_value` and the resident partition.
+        // Bit-exact by construction: an integer-indexed
         // f64 `+=` of the same leaf values, each row written exactly once (a row is in
         // exactly one leaf) — no reduction, no accumulation-order dependence.
         //
@@ -1686,7 +1650,7 @@ impl<'a> Gbdt<'a> {
         // but are no longer called from this seam. Reached only under `boosting_on_cuda_`
         // (env-gated), so with `LGBM_CUDA_ON_DEVICE` unset this is dead and the host score
         // path is unchanged. The fallback device-tree-walk arm below is untouched.
-        // Phase-31 (31-04, ODS-01) — mirror this tree's per-leaf AddScore onto the
+        // Mirror this tree's per-leaf AddScore onto the
         // GBDT-owned resident score buffer (ON DEVICE, no readback), keeping it in lockstep
         // with the host `score_updater.scores()` so the NEXT iteration's on-device grad/hess
         // branch reads a resident score bit-identical to the host accumulation. Only the
@@ -1694,8 +1658,8 @@ impl<'a> Gbdt<'a> {
         // inert everywhere else. The host scatter below is UNCHANGED (it keeps
         // `score_updater.scores()` authoritative for Metric::Eval / the model text); this
         // ADDS the resident mirror ALONGSIDE it — never a silent partial-resident state
-        // (spike-074: residency only pays off WITH the matching resident grad/hess path,
-        // which is exactly why they are wired together here). Bit-exact by construction: an
+        // (residency only pays off WITH the matching resident grad/hess path, which is
+        // exactly why they are wired together here). Bit-exact by construction: an
         // integer-indexed f64 scatter of the SAME post-shrinkage `tree.leaf_value` over the
         // SAME partition ranges the host scatter uses (`add_tree_on_device` ↔
         // `add_prediction_to_score`), each row written exactly once.
@@ -1768,7 +1732,7 @@ impl<'a> Gbdt<'a> {
                 rows.push(f.bins.bin(i));
             }
         }
-        // Native column width for the walk (D-05): 8/16/32 by the widest feature.
+        // Native column width for the walk: 8/16/32 by the widest feature.
         let bit_type: u32 = features
             .iter()
             .map(|f| match &f.bins {
@@ -1870,7 +1834,7 @@ impl<'a> Gbdt<'a> {
         if !is_skip {
             let mut drop_rate = cfg.drop_rate;
             if !cfg.uniform_drop {
-                // WR-04: DELIBERATE 0/0 = NaN, byte-for-byte with C++ dart.hpp:104
+                // DELIBERATE 0/0 = NaN, byte-for-byte with C++ dart.hpp:104
                 // (`static_cast<double>(tree_weight_.size()) / sum_weight_`). On the
                 // first drop-eligible iteration `sum_weight == 0`, so both this and
                 // the `max_drop` cap term below are NaN. This is SAFE only because on
@@ -1896,7 +1860,7 @@ impl<'a> Gbdt<'a> {
                         // never fires (unbounded drops); `max_drop == 0` casts to 0
                         // so it breaks after the first push. `i32 as usize` sign-
                         // extends to 64-bit identically — do NOT clamp with `.max(0)`,
-                        // which would cap a negative `max_drop` at 1 drop (WR-01).
+                        // which would cap a negative `max_drop` at 1 drop.
                         if dart.drop_index.len() >= cfg.max_drop as usize {
                             break;
                         }
@@ -1910,7 +1874,7 @@ impl<'a> Gbdt<'a> {
                     let draw = dart.random_for_drop.next_float() as f64;
                     if draw < drop_rate {
                         dart.drop_index.push(i);
-                        // See the non-uniform branch above (WR-01): `i32 as usize`
+                        // See the non-uniform branch above: `i32 as usize`
                         // reproduces C++ `static_cast<size_t>(config_->max_drop)`
                         // exactly — negative => unbounded, 0 => break after first.
                         if dart.drop_index.len() >= cfg.max_drop as usize {
@@ -2009,7 +1973,7 @@ impl<'a> Gbdt<'a> {
         &self.trees
     }
 
-    /// ADV-06 leaf-refit (`GBDT::RefitTree`, gbdt.cpp:258-294 + the Python
+    /// Leaf-refit (`GBDT::RefitTree`, gbdt.cpp:258-294 + the Python
     /// `Booster.refit`). Re-fits the LEAF OUTPUTS of the already-loaded ensemble on
     /// new `(features, labels)` WITHOUT changing tree STRUCTURE, blending each leaf by
     /// `refit_decay_rate` (`new = decay*old + (1-decay)*shrunk_newton`).
@@ -2122,7 +2086,7 @@ impl<'a> Gbdt<'a> {
         }
     }
 
-    /// ADV-06 continue-training (`input_model`): seed this driver with the trees of
+    /// Continue-training (`input_model`): seed this driver with the trees of
     /// a previously-trained ensemble so subsequent [`Self::train_one_iter`] calls
     /// APPEND new trees on top (C++ `GBDT::InitTrain` with `num_init_iteration_ =
     /// models_.size() / num_tree_per_iteration_`, gbdt.cpp:38-40 + the
@@ -2180,7 +2144,7 @@ impl<'a> Gbdt<'a> {
     }
 
     /// Assemble the grown ensemble into a [`GbdtModel`] for serialization /
-    /// predict (the Phase-3 container). `objective_string` is the verbatim
+    /// predict. `objective_string` is the verbatim
     /// `objective=` line; `max_feature_idx` is `max real_feature_index` across
     /// all features.
     pub fn into_model(
@@ -2224,7 +2188,7 @@ mod tests {
     /// learner_parity spine shape. 8 rows, 2 binary-ish features.
     fn corpus() -> (Vec<FeatureColumn>, Vec<f32>, GainConfig) {
         // offset MUST come from the authoritative rule (most_freq_bin==0 -> 1),
-        // matching the learner_parity spine corpus convention (D-09). Hand-setting
+        // matching the learner_parity spine corpus convention. Hand-setting
         // offset=0 for a most_freq_bin==0 feature mis-routes the partition.
         let off0 = lgbm_treelearner::offset_for_most_freq_bin(0);
         let f0 = FeatureColumn {
@@ -2386,7 +2350,7 @@ mod tests {
         );
     }
 
-    // ===================== 06-04: multiclass loop =====================
+    // ===================== multiclass loop =====================
 
     use lgbm_objective::MulticlassSoftmax;
 
@@ -2461,13 +2425,13 @@ mod tests {
         }
     }
 
-    // ===================== 06-05: bagging / OOB score update =====================
+    // ===================== bagging / OOB score update =====================
 
     use crate::sample_strategy::{BaggingConfig, BaggingSampleStrategy};
 
     #[test]
     fn bagging_oob_rows_are_still_scored() {
-        // Pitfall 4: out-of-bag rows STILL get the tree prediction added each iter.
+        // Out-of-bag rows STILL get the tree prediction added each iter.
         // Train ONE iter with bagging at fraction 0.5 over the 8-row corpus; assert
         // EVERY row's score changed from the init (none skipped), proving OOB rows
         // were scored predict-side, not skipped.
@@ -2510,7 +2474,7 @@ mod tests {
         assert_eq!(gbdt.trees.len(), 1);
     }
 
-    // ===================== 07-05: GOSS sample strategy (BST-04) =====================
+    // ===================== GOSS sample strategy =====================
 
     use crate::sample_strategy::GossSampleStrategy;
 
@@ -2518,8 +2482,8 @@ mod tests {
     fn goss_selected_amplifies_and_scores_all_rows() {
         // GOSS runs INSIDE train_one_iter after get_gradients: it amplifies the
         // sampled rows' grad/hess in place, trains on the kept subset, and scores
-        // BOTH kept and dropped rows predict-side (Pitfall 4 — dropped rows still
-        // get the tree prediction). With a 12-row corpus, top_rate+other_rate=0.3
+        // BOTH kept and dropped rows predict-side — dropped rows still
+        // get the tree prediction. With a 12-row corpus, top_rate+other_rate=0.3
         // (subset path) and lr small enough that iter 0 is past the skip window, the
         // first iter must subsample and still move every row's score from init.
         let backend = CpuBackend;
@@ -2566,8 +2530,8 @@ mod tests {
             gbdt.trees[0].num_leaves > 1,
             "GOSS kept subset must grow a real split on the separable corpus"
         );
-        // init = label mean. Every row (kept + dropped) must be scored predict-side
-        // (Pitfall 4: dropped rows STILL get the tree prediction), so every row's
+        // init = label mean. Every row (kept + dropped) must be scored predict-side —
+        // dropped rows STILL get the tree prediction — so every row's
         // post-iter score differs from the constant init.
         let init = labels.iter().map(|&l| l as f64).sum::<f64>() / num_data as f64;
         let changed = snap
@@ -2652,7 +2616,7 @@ mod tests {
         );
         gbdt.train_one_iter(&mut learner, &labels, features.len())
             .unwrap();
-        // Still exactly 3 trees (Pitfall 6); class 2's is a constant 1-leaf tree.
+        // Still exactly 3 trees; class 2's is a constant 1-leaf tree.
         assert_eq!(gbdt.trees.len(), 3);
         assert_eq!(
             gbdt.trees[2].num_leaves, 1,
@@ -2660,7 +2624,7 @@ mod tests {
         );
     }
 
-    // ===================== 07-06: DART boosting variant (BST-05) =====================
+    // ===================== DART boosting variant =====================
 
     use lgbm_core::random::Random as DartRandom;
 
@@ -2726,7 +2690,7 @@ mod tests {
             for i in 0..iter {
                 if (rng.next_float() as f64) < drop_rate * tree_weight[i as usize] * inv_avg {
                     drop.push(i);
-                    // WR-01: mirror C++ `static_cast<size_t>(config_->max_drop)` —
+                    // Mirror C++ `static_cast<size_t>(config_->max_drop)` —
                     // `i32 as usize` (no `.max(0)` clamp).
                     if drop.len() >= cfg.max_drop as usize {
                         break;
@@ -2740,7 +2704,7 @@ mod tests {
             for i in 0..iter {
                 if (rng.next_float() as f64) < drop_rate {
                     drop.push(i);
-                    // WR-01: mirror C++ `static_cast<size_t>(config_->max_drop)`.
+                    // Mirror C++ `static_cast<size_t>(config_->max_drop)`.
                     if drop.len() >= cfg.max_drop as usize {
                         break;
                     }
@@ -2919,7 +2883,7 @@ mod tests {
         );
     }
 
-    // ===================== 07-07: Random Forest boosting variant (BST-06) =========
+    // ===================== Random Forest boosting variant =====================
 
     fn rf_config_bagging() -> RfConfig {
         RfConfig {
@@ -2929,7 +2893,7 @@ mod tests {
     }
 
     /// A bagging strategy over the test corpus (fraction 0.7, freq 1) — RF's
-    /// mandatory randomization, reusing the proven BaggingSampleStrategy (07-01).
+    /// mandatory randomization, reusing the bit-exact BaggingSampleStrategy.
     fn rf_bagging_strategy(num_data: i32, labels: &[f32]) -> BaggingSampleStrategy {
         let cfg = BaggingConfig::new(0.7, 1.0, 1.0, 1, 3, false).expect("bagging config");
         BaggingSampleStrategy::reset_sample_config(cfg, num_data, labels)
@@ -3112,7 +3076,7 @@ mod tests {
 
     #[test]
     fn refit_decay_one_leaves_model_unchanged() {
-        // ADV-06: refit with decay=1.0 must leave every leaf value unchanged
+        // Refit with decay=1.0 must leave every leaf value unchanged
         // (all-old), regardless of the new data's gradients.
         let backend = CpuBackend;
         let client = cpu_client();
@@ -3149,7 +3113,7 @@ mod tests {
 
     #[test]
     fn refit_decay_zero_changes_leaves() {
-        // ADV-06: refit with decay=0.0 replaces leaves with the fresh shrunk Newton
+        // Refit with decay=0.0 replaces leaves with the fresh shrunk Newton
         // output on the (same) data — the values must change from the base.
         let backend = CpuBackend;
         let client = cpu_client();
@@ -3191,7 +3155,7 @@ mod tests {
 
     #[test]
     fn continue_training_seeds_num_init_iteration_and_appends() {
-        // ADV-06 continue-training: a baseline model of N trees, loaded via
+        // Continue-training: a baseline model of N trees, loaded via
         // with_loaded_model, must set num_init_iteration to N and APPEND on train.
         let backend = CpuBackend;
         let client = cpu_client();
@@ -3240,7 +3204,7 @@ mod tests {
         assert_eq!(cont.num_iteration(), 5);
     }
 
-    // ========= Phase-31 (31-04, ODS-01/ODS-02x) resident score + on-device grad/hess =========
+    // ========= resident score + on-device grad/hess =========
 
     use lgbm_objective::Binary;
 
@@ -3255,7 +3219,7 @@ mod tests {
 
     /// Train `iters` binary trees on a FRESH learner/GBDT and return `(trees, scores,
     /// resident_active)`. `on` selects the arm via the `set_boosting_on_cuda` seam: `true`
-    /// is the Phase-31 resident-score + on-device grad/hess path, `false` the host path.
+    /// is the resident-score + on-device grad/hess path, `false` the host path.
     fn train_binary_arm(
         features: &[FeatureColumn],
         labels: &[f32],
@@ -3283,7 +3247,7 @@ mod tests {
         (gbdt.trees().to_vec(), gbdt.scores().to_vec(), active)
     }
 
-    /// 31-04 Task 1 — the num_class==1 / no-bagging / no-GOSS / binary / `boosting_on_cuda`
+    /// The num_class==1 / no-bagging / no-GOSS / binary / `boosting_on_cuda`
     /// envelope ACTIVATES the GBDT-owned resident score + on-device grad/hess branch and
     /// produces a model + score BIT-IDENTICAL to the host path over a multi-iteration train.
     #[test]
@@ -3319,7 +3283,7 @@ mod tests {
             .expect("resident-arm score must equal the host score bit-for-bit (cpu f64 anchor)");
     }
 
-    /// 31-04 Task 1 — every case OUTSIDE the envelope (multiclass, bagging, GOSS, an
+    /// Every case OUTSIDE the envelope (multiclass, bagging, GOSS, an
     /// on-device-unsupported objective) leaves `resident_active` `Some(false)` — the
     /// resident path is NEVER activated (complete, not partial, host fallback), even with
     /// `boosting_on_cuda=true`.
@@ -3328,7 +3292,7 @@ mod tests {
         let backend = CpuBackend;
         let client = cpu_client();
 
-        // (a) MULTICLASS (num_class=3) — excluded by A2.
+        // (a) MULTICLASS (num_class=3) — excluded from the envelope.
         {
             let (features, labels, cfg) = multiclass_corpus();
             let num_data = labels.len() as i32;
@@ -3347,7 +3311,7 @@ mod tests {
             );
         }
 
-        // (b) BAGGING — excluded by A1. Also prove byte-identical: the true/false arms
+        // (b) BAGGING — excluded from the envelope. Also prove byte-identical: the true/false arms
         // (both host subset path, no resident branch) grow the SAME model.
         {
             let (features, labels, cfg) = corpus();
@@ -3381,7 +3345,7 @@ mod tests {
             );
         }
 
-        // (c) GOSS — excluded by A1 (goss.is_some()).
+        // (c) GOSS — excluded from the envelope (goss.is_some()).
         {
             let (features, labels, cfg) = corpus();
             let num_data = labels.len() as i32;

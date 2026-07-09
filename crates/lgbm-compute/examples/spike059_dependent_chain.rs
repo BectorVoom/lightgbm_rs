@@ -1,12 +1,12 @@
-//! Spike 059 — cubecl-dependent-chain-no-sync.
+//! cubecl-dependent-chain-no-sync feasibility probe.
 //!
-//! Feasibility question (make-or-break for the on-device CUDA learner, 4 A/B fails):
-//! can cubecl 0.10 grow a *data-dependent* kernel chain (build→scan→argmax→partition
-//! →next-build) with ZERO per-leaf blocking device→host readback?
+//! Feasibility question for the on-device CUDA learner: can cubecl 0.10 grow a
+//! *data-dependent* kernel chain (build→scan→argmax→partition→next-build) with ZERO
+//! per-leaf blocking device→host readback?
 //!
 //! The per-leaf `bump_sync()` readbacks in `grow_driver.rs` (scan SplitInfo, tree
 //! right_leaf_index, partition split-point) are the pinned root cause of the on-device
-//! slowdown (Phase 26: 6044/9044 blocking readbacks/grow vs host-cuda's 0). This spike
+//! slowdown (thousands of blocking readbacks per grow vs host-cuda's 0). This probe
 //! isolates the cubecl *programming model* to see whether those readbacks are REMOVABLE
 //! or STRUCTURALLY FORCED by the runtime.
 //!

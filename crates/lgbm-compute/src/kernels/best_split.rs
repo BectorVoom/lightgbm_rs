@@ -22,11 +22,10 @@ use crate::kernels::split_info::SplitScalars;
 /// One inner feature emits ONE or TWO tasks (forward+reverse) per
 /// [`build_split_find_tasks`]. The stage-1 kernel reads a task's scalars to index
 /// the resident histogram (`hist_offset`), scan its bins (`num_bin`, `mfb_offset`,
-/// `default_bin`, `reverse`, `skip_default_bin`, `na_as_missing`), and — the D-01
-/// landmine — writes `default_left = assume_out_default_left` VERBATIM (NOT
-/// `reverse`; 17-RESEARCH Pitfall 3). `is_categorical`/`is_one_hot` are the Phase-22
-/// dispatch seam (D-04). `rand_threshold` carries the USE_RAND drawn threshold
-/// (`-1` when extra-trees is off).
+/// `default_bin`, `reverse`, `skip_default_bin`, `na_as_missing`), and writes
+/// `default_left = assume_out_default_left` VERBATIM (NOT `reverse`).
+/// `is_categorical`/`is_one_hot` select the categorical dispatch path.
+/// `rand_threshold` carries the USE_RAND drawn threshold (`-1` when extra-trees is off).
 ///
 /// Widths are faithful to the C++ struct: `inner_feature_index`/`rand_threshold`
 /// are `data_size_t` (`i32`), `hist_offset`/`num_bin`/`default_bin` are `u32`,
@@ -42,11 +41,11 @@ pub struct SplitFindTask {
     /// Whether NaN occupies the top bin as the missing marker (`na_as_missing`).
     pub na_as_missing: bool,
     /// The `default_left` value written VERBATIM into the split record
-    /// (`assume_out_default_left`) — decoupled from `reverse` (Pitfall 3).
+    /// (`assume_out_default_left`) — decoupled from `reverse`.
     pub assume_out_default_left: bool,
-    /// Phase-22 dispatch seam: this task's feature is categorical (`is_categorical`).
+    /// Whether this task's feature is categorical (`is_categorical`).
     pub is_categorical: bool,
-    /// Phase-22 dispatch seam: categorical one-hot (`is_one_hot`, `num_bin <=
+    /// Categorical one-hot dispatch (`is_one_hot`, `num_bin <=
     /// max_cat_to_onehot`).
     pub is_one_hot: bool,
     /// This feature's start offset into the resident histogram (`hist_offset`, u32).
@@ -83,8 +82,8 @@ pub struct FeatureMeta {
     /// The feature's default bin (`feature_default_bins_[i]`).
     pub default_bin: u32,
     /// The USE_RAND drawn threshold to stamp (`-1` when extra-trees off). The actual
-    /// draw (`CUDARandom.NextInt(0, num_bin-2)` seeded `extra_seed + task_index`) is
-    /// a Wave-2 concern; the host builder only carries the value through.
+    /// draw (`CUDARandom.NextInt(0, num_bin-2)` seeded `extra_seed + task_index`) happens
+    /// elsewhere; the host builder only carries the value through.
     pub rand_threshold: i32,
 }
 
@@ -93,16 +92,13 @@ pub struct FeatureMeta {
 /// cnt_factor)`, `cuda_best_split_finder.cu`).
 ///
 /// This DIVERGES from [`super::split::round_int`] (`(int)(x + 0.5f)` =
-/// round-half-up-then-truncate, the host `Common::RoundInt`). D-01 mandates a
-/// SEPARATE fold precisely because these two round differently at exact half-values
-/// (17-RESEARCH Pitfall 1). Hessian·cnt_factor ≥ 0 here, so the `x >= 0` domain is
-/// sufficient.
+/// round-half-up-then-truncate, the host `Common::RoundInt`). A separate fold is
+/// needed because these two round differently at exact half-values. Hessian·cnt_factor
+/// ≥ 0 here, so the `x >= 0` domain is sufficient.
 ///
-/// Primary body uses the stable [`f64::round_ties_even`] intrinsic. Because
-/// research Assumption A1 (does cubecl-cpu `#[cube]` lowering support
-/// `round_ties_even`?) is UNVERIFIED, [`round_ties_even_branchfree`] provides the
-/// branch-free even-round identity as the fallback; Wave 2 selects whichever
-/// cubecl-cpu lowers inside `#[cube]` (both are proven equivalent on `x >= 0` by
+/// Uses the stable [`f64::round_ties_even`] intrinsic. [`round_ties_even_branchfree`]
+/// provides an equivalent branch-free even-round identity as a fallback for contexts
+/// where the intrinsic isn't available (both are proven equivalent on `x >= 0` by
 /// the unit test below).
 #[inline]
 pub fn round_ties_even(x: f64) -> i32 {
@@ -110,8 +106,8 @@ pub fn round_ties_even(x: f64) -> i32 {
 }
 
 /// Branch-free round-half-to-even for `x >= 0` (the `#[cube]`-lowering fallback for
-/// [`round_ties_even`], 17-RESEARCH §"Count Recovery"). Kept byte-equivalent to the
-/// intrinsic on the non-negative domain (hessian·cnt_factor ≥ 0).
+/// [`round_ties_even`]). Kept byte-equivalent to the intrinsic on the non-negative
+/// domain (hessian·cnt_factor ≥ 0).
 #[inline]
 pub fn round_ties_even_branchfree(x: f64) -> i32 {
     let f = x.floor();
@@ -125,7 +121,7 @@ pub fn round_ties_even_branchfree(x: f64) -> i32 {
 /// (`cuda_best_split_finder.cpp:137-227`) EXACTLY.
 ///
 /// Emits, per inner feature, in C++ order (so task indices line up with the
-/// smaller/larger stream split the Wave-3 stage-2 reader expects — smaller task `t`
+/// smaller/larger stream split the stage-2 reader expects — smaller task `t`
 /// ↔ record `[t]`, larger task `t` ↔ `[t + num_tasks]`):
 ///
 /// | Feature condition | Tasks emitted | `assume_out_default_left` |
@@ -133,13 +129,13 @@ pub fn round_ties_even_branchfree(x: f64) -> i32 {
 /// | `num_bin>2 && missing==Zero && !cat` | forward (skip_default_bin) THEN reverse (skip_default_bin) | fwd=**false**, rev=**true** |
 /// | `num_bin>2 && missing==NaN && !cat` | forward (na_as_missing) THEN reverse (na_as_missing) | fwd=**false**, rev=**true** |
 /// | `num_bin<=2 or missing==None`, non-cat | single reverse task | `(missing != NaN) ? **true** : **false**` |
-/// | categorical | single forward task (`is_one_hot = num_bin <= max_cat_to_onehot`) | **false** (Phase-22 seam, D-04) |
+/// | categorical | single forward task (`is_one_hot = num_bin <= max_cat_to_onehot`) | **false** |
 ///
-/// The D-01 landmine (Pitfall 3): `default_left` is precomputed here at task-gen
-/// time from the missing type, NOT from `reverse` — a `MissingType::None` feature
-/// yields a single `reverse=true` task with `assume_out_default_left=false`
-/// (`default_left != reverse`). No categorical eval math lives here (D-04 wires the
-/// `is_categorical`/`is_one_hot` dispatch seam only; Phase 22 fills the eval).
+/// Important: `default_left` is precomputed here at task-gen time from the missing
+/// type, NOT from `reverse` — a `MissingType::None` feature yields a single
+/// `reverse=true` task with `assume_out_default_left=false` (`default_left !=
+/// reverse`). No categorical eval math lives here — only the `is_categorical`/
+/// `is_one_hot` dispatch flags are set.
 pub fn build_split_find_tasks(features: &[FeatureMeta]) -> Vec<SplitFindTask> {
     let mut tasks = Vec::new();
     for f in features {
@@ -215,8 +211,8 @@ pub fn build_split_find_tasks(features: &[FeatureMeta]) -> Vec<SplitFindTask> {
 /// `CUDALeafSplitsStruct` leaf totals (`sum_gradient`/`sum_hessian`/`num_data`/
 /// `parent_output`/`parent_gain`) + the `Config` guard/gain scalars. Carried as the
 /// flattened literal-friendly widths (u32 flags, i32 counts, f64 scalars) so the
-/// Wave-2 `#[cube]` body does not have to reshape them (`split.rs:180-202` MLIR
-/// lowering constraints).
+/// `#[cube]` body does not have to reshape them (`split.rs:180-202` MLIR lowering
+/// constraints).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stage1Scalars {
     /// `USE_L1` dispatch flag (`lambda_l1 > 0`).
@@ -249,8 +245,8 @@ pub struct Stage1Scalars {
     pub num_data: i32,
     /// The leaf gain (`parent_gain`) — `min_gain_shift = parent_gain + min_gain_to_split`.
     pub parent_gain: f64,
-    /// The per-task RNG seed `extra_seed + task_index` (Open Q1) — consumed by the
-    /// Wave-2 USE_RAND path; ignored when `use_rand == false`.
+    /// The per-task RNG seed `extra_seed + task_index` — consumed by the USE_RAND
+    /// path; ignored when `use_rand == false`.
     pub rng_seed: i32,
 }
 
@@ -262,14 +258,14 @@ pub struct Stage1Scalars {
 const STAGE1_OUT_LEN: usize = 14;
 
 /// `__double2int_rn` inside `#[cube]` — round to nearest, ties to EVEN, using only
-/// `f64::floor` (a cubecl `Float` intrinsic) so it lowers on cubecl-cpu AND hip
-/// (research Assumption A1: `f64::round_ties_even` is NOT relied on inside `#[cube]`).
+/// `f64::floor` (a cubecl `Float` intrinsic) so it lowers on cubecl-cpu AND hip;
+/// `f64::round_ties_even` is not relied on inside `#[cube]`.
 ///
 /// Branch-free even-round identity for `x >= 0` (hessian·cnt_factor ≥ 0 here):
 /// `f = floor(x)`, tie when `x - f == 0.5` rounds toward the EVEN neighbour; `f`'s
 /// parity is `f - 2·floor(f/2)` (0 even, 1 odd) — pure float, no `i64` bit-ops. This
-/// DIVERGES from [`super::split::round_int`]'s round-half-up (the D-01 landmine,
-/// 17-RESEARCH Pitfall 1) — it is byte-equivalent to the host [`round_ties_even`].
+/// DIVERGES from [`super::split::round_int`]'s round-half-up — it is byte-equivalent
+/// to the host [`round_ties_even`].
 #[cube]
 fn round_ties_even_cube(x: f64) -> i32 {
     let f = f64::floor(x);
@@ -284,32 +280,31 @@ fn round_ties_even_cube(x: f64) -> i32 {
 
 /// The stage-1 numerical core — a VERBATIM `#[cube]` transcription of
 /// `FindBestSplitsForLeafKernelInner` (`cuda_best_split_finder.cu:146-320`) driven
-/// SINGLE-OWNER (`CubeDim(1)`) as the deterministic cpu f64 fold (D-01/D-08). One
+/// SINGLE-OWNER (`CubeDim(1)`) as the deterministic cpu f64 fold. One
 /// call evaluates one `(leaf,feature)` task: serial inclusive prefix-sum → cumulative
 /// scanned side → complement-from-parent → two-phase count recovery
 /// ([`round_ties_even_cube`]) → guards → gain (smoothing dispatch) → strict-`>`
 /// argmax → the winning `CUDASplitInfo` record.
 ///
-/// Landmines reproduced 1:1 (17-RESEARCH §"Common Pitfalls"):
-/// - **Count recovery** is round-ties-EVEN, NOT `split.rs`'s round-half-up (Pitfall 1).
-/// - **kEpsilon two-phase** (Pitfall 2): thread-0 adds `kEpsilon` ONCE at the scan
+/// Subtle behaviors reproduced exactly from the C++ reference:
+/// - **Count recovery** is round-ties-EVEN, NOT `split.rs`'s round-half-up.
+/// - **kEpsilon two-phase**: thread-0 adds `kEpsilon` ONCE at the scan
 ///   origin (the CUDA single-kEpsilon placement, NOT `split.rs`'s `2·kEpsilon`); the
 ///   guard recovers the count from the kEpsilon-INCLUDED hessian, the written record
 ///   subtracts kEpsilon first then re-recovers (an off-by-one between them is intended).
-/// - **Complement-from-parent** (Pitfall 4): the non-scanned side is
+/// - **Complement-from-parent**: the non-scanned side is
 ///   `parent_total − scanned`, never a second scan; `reverse` flips only the default-bin
 ///   scan direction (`fnbmo-1-t` read, `num_bin-2-t` threshold) and the scanned/complement
 ///   left↔right assignment.
-/// - **`default_left = assume_out_default_left`** (Pitfall 3), written verbatim, NOT
-///   `reverse`.
-/// - **strict `>` argmax** (Pitfall 5): the lowest bin index survives a tie.
+/// - **`default_left = assume_out_default_left`**, written verbatim, NOT `reverse`.
+/// - **strict `>` argmax**: the lowest bin index survives a tie.
 ///
 /// `reverse`/`use_l1`/`use_smoothing`/`use_rand` are runtime `u32` flags (0|1) inside
-/// the one shared body (research Pattern 2 — avoid a 16-way cubecl monomorphization).
+/// the one shared body, avoiding a many-way cubecl monomorphization.
 /// Honors the `split.rs:180-202` MLIR constraints: loop-carried mutables init from
 /// LITERALS, every conditional store is a branchless `select`, the scan is a bounded
 /// RANGE loop. `min_gain_shift = parent_gain + min_gain_to_split` is host-computed.
-/// The categorical eval is a Phase-22 seam (D-04) handled by the launcher, not here.
+/// The categorical eval is handled by the launcher, not here.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 pub fn split_eval_body(
@@ -320,7 +315,7 @@ pub fn split_eval_body(
     default_bin: i32,
     skip_default_bin: u32,        // 0|1
     reverse: u32,                 // 0|1
-    assume_out_default_left: u32, // 0|1 — written verbatim (Pitfall 3)
+    assume_out_default_left: u32, // 0|1 — written verbatim
     use_l1: u32,                  // 0|1
     use_smoothing: u32,           // 0|1
     use_rand: u32,                // 0|1
@@ -381,7 +376,7 @@ pub fn split_eval_body(
         let base = (bin_safe as usize) * 2;
         let g = select(read_active, hist[base], 0.0);
         let h_raw = select(read_active, hist[base + 1], 0.0);
-        // thread 0 seeds kEpsilon ONCE at the scan origin (cu:206, Pitfall 2).
+        // thread 0 seeds kEpsilon ONCE at the scan origin (cu:206).
         let h = h_raw + select(t == 0, eps, 0.0);
 
         // ---- serial inclusive prefix (the single-owner ShufflePrefixSum analog) ----
@@ -390,7 +385,7 @@ pub fn split_eval_body(
 
         // ---- guard phase: scanned side = acc, complement = parent - scanned ----
         let scanned_g = acc_g;
-        let scanned_h = acc_h; // kEpsilon-INCLUDED (guard-phase recovery, Pitfall 2)
+        let scanned_h = acc_h; // kEpsilon-INCLUDED (guard-phase recovery)
         let comp_g = sum_gradient - scanned_g;
         let comp_h = sum_hessian - scanned_h;
         let scanned_cnt = round_ties_even_cube(scanned_h * cnt_factor);
@@ -435,7 +430,7 @@ pub fn split_eval_body(
 
         let valid = cand && guard && rand_ok && current_gain > min_gain_shift;
         let local_gain = current_gain - min_gain_shift;
-        // strict `>` keeps the FIRST (lowest index) winner on a tie (Pitfall 5).
+        // strict `>` keeps the FIRST (lowest index) winner on a tie.
         let take = valid && local_gain > best_gain;
         best_gain = select(take, local_gain, best_gain);
         best_threshold = select(take, threshold, best_threshold);
@@ -562,8 +557,8 @@ pub fn split_eval_kernel_f64(
     );
 }
 
-/// V5 launch-boundary validation (threat T-17-01/T-17-02) — reject the host scalars
-/// that would drive an out-of-bounds `launch_unchecked` BEFORE the launch (mirrors
+/// Launch-boundary validation — reject the host scalars that would drive an
+/// out-of-bounds `launch_unchecked` BEFORE the launch (mirrors
 /// `split.rs::find_best_split_f64_on`'s pre-launch checks / `primitives.rs`
 /// `validate_scan_inputs`). Returns the required `2*num_bin` histogram length.
 ///
@@ -590,7 +585,7 @@ pub fn validate_stage1_inputs(num_bin: u32, hist_len: usize) -> Result<usize, Co
     Ok(expected)
 }
 
-/// WR-02: the stage-1 CUDA-mirror launchers are NOT fed the five per-feature
+/// The stage-1 CUDA-mirror launchers are NOT fed the five per-feature
 /// categorical knobs (`cat_l2`/`cat_smooth`/`max_cat_threshold`/`max_cat_to_onehot`/
 /// `min_data_per_group`) — [`Stage1Scalars`] carries only the numeric gain knobs.
 /// Evaluating a categorical task here previously fell back to `GainConfig::default()`
@@ -607,23 +602,23 @@ fn categorical_seam_unsupported() -> ComputeError {
                  launchers do not carry the per-feature categorical knobs (cat_l2/cat_smooth/\
                  max_cat_threshold/max_cat_to_onehot/min_data_per_group). Evaluate categorical \
                  features through grow_driver::scan_leaf (find_best_threshold_categorical with \
-                 the per-feature categorical config), not this seam (WR-02)."
+                 the per-feature categorical config), not this seam."
             .to_string(),
     }
 }
 
-/// STAGE 1 — per-`(leaf,feature)` split evaluation (ODL-11, §8.1). Drives
+/// STAGE 1 — per-`(leaf,feature)` split evaluation. Drives
 /// [`split_eval_body`] single-owner (`CubeDim(1)`) as the cpu f64 fold anchor and
 /// decodes the winning [`SplitScalars`] `CUDASplitInfo` record. `hist` is the
 /// interleaved `[g0,h0,g1,h1,…]` f64 histogram for the task's feature (already
 /// offset). Generic over `R` so the SAME body runs on cubecl-cpu (the anchor) and
-/// cubecl-hip (the f32 mirror is the separate [`split_eval_kernel_f32`] path, 17-03
-/// Task 2, anchored to THIS fold — never GPU-vs-GPU, def-f8u-01).
+/// cubecl-hip (the f32 mirror is the separate [`split_eval_kernel_f32`] path,
+/// always anchored to this f64 fold, never compared GPU-vs-GPU).
 ///
 /// The categorical task is the numeric-only stage-1 seam's out-of-scope case: this
 /// CUDA-mirror launcher is NOT fed the per-feature categorical config, so a
-/// categorical task returns a typed [`ComputeError`] ([`categorical_seam_unsupported`],
-/// WR-02) rather than silently evaluating with `GainConfig` defaults. Categorical
+/// categorical task returns a typed [`ComputeError`] ([`categorical_seam_unsupported`])
+/// rather than silently evaluating with `GainConfig` defaults. Categorical
 /// features are evaluated by the live grow driver (`grow_driver::scan_leaf`), which
 /// calls [`find_best_threshold_categorical`](crate::kernels::categorical_split::find_best_threshold_categorical)
 /// directly with the per-feature config.
@@ -640,16 +635,16 @@ pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
     validate_stage1_inputs(task.num_bin, hist.len())?;
 
     if task.is_categorical {
-        // WR-02: this seam is not fed the per-feature categorical config; fail loudly
+        // This seam is not fed the per-feature categorical config; fail loudly
         // instead of silently evaluating with GainConfig defaults.
         return Err(categorical_seam_unsupported());
     }
 
     let num_bin_i = task.num_bin as i32;
     // USE_RAND: draw rand_threshold = CUDARandom.NextInt(0, num_bin-2) seeded
-    // `extra_seed + task_index` (Open Q1, carried in scalars.rng_seed). NextInt uses
-    // RandInt32 (cuda_random.hpp:42-44); route through the Phase-14 `random.rs` LCG so
-    // the draw is bit-identical to the verified device stream (key_link → random.rs).
+    // `extra_seed + task_index` (carried in scalars.rng_seed). NextInt uses
+    // RandInt32 (cuda_random.hpp:42-44); routed through `random.rs`'s LCG so
+    // the draw is bit-identical to the verified device stream.
     let rand_threshold: i32 = if scalars.use_rand && num_bin_i - 2 > 0 {
         let draw = draw_rand_int32_on(client, &[scalars.rng_seed as u32], 1)?;
         draw[0] % (num_bin_i - 2)
@@ -668,7 +663,7 @@ pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
     // `validate_stage1_inputs`) and `h_out` is `STAGE1_OUT_LEN` cells; both outlive the
     // launch. The single-owner scan reads `hist[bin*2 (+1)]` with `bin` clamped to
     // `[0, fnbmo)` (`bin_safe`), so every index stays in `[0, 2*num_bin)`. cubecl unsafe
-    // confined here (CMP-01, T-17-01).
+    // confined here.
     unsafe {
         split_eval_kernel_f64::launch(
             client,
@@ -735,22 +730,20 @@ pub fn find_best_splits_stage1_on<R: cubecl::Runtime>(
 }
 
 // ===========================================================================
-// hip f32 mirror (17-03 Task 2) — the f32 numerical core.
+// hip f32 mirror — the f32 numerical core.
 //
-// TWO paths, mirroring the codebase convention (Phases 14-16): the cpu-testable
-// SINGLE-OWNER f32 fold ([`split_eval_kernel_f32`]) that drives through cubecl-cpu
-// (which has NO plane support — primitives.rs:1182) so the f32 numerics are anchored
-// to the Task-1 f64 fold (structure bit-exact, values within the ~1e-5 f32 envelope,
-// def-f8u-01 — NEVER GPU-vs-GPU); AND the block-parallel hip path
-// ([`split_eval_block_kernel_f32`]) built on the NET-NEW two-level LDS scan
-// ([`stage1_block_scan`], D-03) + [`reduce_best_gain`] block argmax, `#[cfg(feature =
-// "gpu")]` like every rocm kernel in `histogram.rs`/`primitives.rs`. The block path's
-// on-device rocm parity assertion is added in 17-05 (this task ships + compiles it).
-// NO f64 anywhere in the f32 path (D-10, WR-05 literal pinning throughout).
+// TWO paths: the cpu-testable SINGLE-OWNER f32 fold ([`split_eval_kernel_f32`])
+// that drives through cubecl-cpu (which has NO plane support — primitives.rs:1182)
+// so the f32 numerics are anchored to the f64 fold (structure bit-exact, values
+// within the ~1e-5 f32 envelope, never compared GPU-vs-GPU); AND the block-parallel
+// hip path ([`split_eval_block_kernel_f32`]) built on a two-level LDS scan
+// ([`stage1_block_scan`]) + [`reduce_best_gain`] block argmax, `#[cfg(feature =
+// "gpu")]` like every rocm kernel in `histogram.rs`/`primitives.rs`.
+// NO f64 anywhere in the f32 path (every literal pinned f32).
 // ===========================================================================
 
 /// f32 mirror of [`round_ties_even_cube`] (`__double2int_rn`, round-ties-EVEN) — the
-/// no-f64 hip path. Uses `f32::floor` only; every literal pinned f32 (WR-05).
+/// no-f64 hip path. Uses `f32::floor` only; every literal pinned f32.
 #[cube]
 fn round_ties_even_f32_cube(x: f32) -> i32 {
     let f = f32::floor(x);
@@ -762,10 +755,10 @@ fn round_ties_even_f32_cube(x: f32) -> i32 {
     i32::cast_from(r)
 }
 
-/// The f32 single-owner mirror of [`split_eval_body`] — the SAME §8.1 accumulation in
-/// f32 (all literals pinned f32, WR-05; the `*_f32` gain mirrors), driven single-owner
-/// so it runs on the cubecl-cpu anchor. Anchored to the Task-1 f64 fold within ~1e-5
-/// (def-f8u-01). Structure (threshold/counts/default_left/is_valid) is bit-exact; the
+/// The f32 single-owner mirror of [`split_eval_body`] — the same accumulation in
+/// f32 (all literals pinned f32; the `*_f32` gain mirrors), driven single-owner
+/// so it runs on the cubecl-cpu anchor. Anchored to the f64 fold within ~1e-5.
+/// Structure (threshold/counts/default_left/is_valid) is bit-exact; the
 /// per-side sums/value/gain absorb the f32-vs-f64 accumulation gap (~1e-5).
 #[cube]
 #[allow(clippy::too_many_arguments)]
@@ -996,8 +989,8 @@ pub fn split_eval_kernel_f32(
 
 /// STAGE 1 f32 mirror launcher (single-owner) — drives [`split_eval_kernel_f32`] on
 /// the cubecl-cpu anchor and decodes the [`SplitScalars`] record (f32 widened to the
-/// f64 storage fields). Anchored to [`find_best_splits_stage1_on`] within ~1e-5
-/// (def-f8u-01); the on-device rocm f32 path is [`split_eval_block_kernel_f32`] (17-05).
+/// f64 storage fields). Anchored to [`find_best_splits_stage1_on`] within ~1e-5;
+/// the on-device rocm f32 path is [`split_eval_block_kernel_f32`].
 ///
 /// # Errors
 /// [`ComputeError`] from [`validate_stage1_inputs`] or the USE_RAND draw.
@@ -1008,10 +1001,10 @@ pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
     scalars: &Stage1Scalars,
 ) -> Result<SplitScalars, ComputeError> {
     validate_stage1_inputs(task.num_bin, hist.len())?;
-    // Phase-22 categorical seam (D-04→22-04): this CUDA-mirror launcher is not fed the
-    // per-feature categorical config, so a categorical task fails loudly (WR-02) rather
-    // than silently evaluating with GainConfig defaults. Categorical is ALWAYS the f64
-    // single-owner anchor (def-f8u-01) — the live driver's `scan_leaf` handles it.
+    // This CUDA-mirror launcher is not fed the per-feature categorical config, so a
+    // categorical task fails loudly rather than silently evaluating with GainConfig
+    // defaults. Categorical is always evaluated via the f64 single-owner anchor —
+    // the live driver's `scan_leaf` handles it.
     if task.is_categorical {
         return Err(categorical_seam_unsupported());
     }
@@ -1027,8 +1020,8 @@ pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
     let h_hist = client.create_from_slice(f32::as_bytes(hist));
     let h_out = client.empty(STAGE1_OUT_LEN * core::mem::size_of::<f32>());
 
-    // SAFETY: identical sizing/index contract as `find_best_splits_stage1_on` (T-17-01),
-    // f32 cells. cubecl unsafe confined here (CMP-01).
+    // SAFETY: identical sizing/index contract as `find_best_splits_stage1_on`,
+    // f32 cells. cubecl unsafe confined here.
     unsafe {
         split_eval_kernel_f32::launch(
             client,
@@ -1092,7 +1085,7 @@ pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
 }
 
 // ===========================================================================
-// _GlobalMemory stage-1 spill variant (17-04, D-05/D-11) — the >256-bin path.
+// _GlobalMemory stage-1 spill variant — the >256-bin path.
 //
 // For features whose bin count exceeds the block's thread count, the C++
 // `FindBestSplitsForLeafKernel_GlobalMemory` (`cuda_best_split_finder.cu:1051-1273`)
@@ -1100,49 +1093,47 @@ pub fn find_best_splits_stage1_f32_on<R: cubecl::Runtime>(
 // and scans it with `GlobalMemoryPrefixSum` (a chunked two-level in-place scan,
 // `cuda_algorithms.hpp:169-185`) over STRIDED thread loops (each thread owns bins
 // `t, t+blockDim, t+2·blockDim, …`). The gain / count-recovery / guard / argmax
-// semantics are IDENTICAL to the in-block two-level path (17-03) — only the scan
-// carrier (global scratch vs LDS) and the strided iteration differ (A4).
+// semantics are IDENTICAL to the in-block two-level path — only the scan
+// carrier (global scratch vs LDS) and the strided iteration differ.
 //
 // The cpu single-owner f64 fold ([`split_eval_body`]) needs NO separate >256
 // implementation: its serial body has no register/LDS cap, so a `num_bin=300`
 // feature is handled by a larger loop bound — that is why the `globalmem_spill`
 // golden (num_bin=300) already passes bit-exact on the cpu fold. This section adds
-// the NET-NEW hip strided f32 kernel (gpu-gated, compile-verified; its on-device
-// rocm parity assertion lands in 17-05, the same deferral as the block kernel) plus
-// the alloc-once scratch (D-11) and the launch-boundary size validation (V5).
+// the hip strided f32 kernel (gpu-gated, compile-verified) plus the alloc-once
+// scratch and the launch-boundary size validation.
 // ===========================================================================
 
 /// The stage-1 block thread width (256 = the C++
 /// `NUM_THREADS_PER_BLOCK_BEST_SPLIT_FINDER`). The dispatch boundary: a feature with
 /// `num_bin` bins beyond this width spills to the [`split_eval_globalmem_kernel_f32`]
-/// strided path; at or below it uses the 17-03 in-block two-level scan. Ungated so the
+/// strided path; at or below it uses the in-block two-level scan. Ungated so the
 /// cpu-side dispatch decision ([`stage1_needs_globalmem`]) and validation are testable
 /// without the `gpu` feature.
 pub const STAGE1_BLOCK_THREADS: usize = 256;
 
 /// The number of pre-allocated global-memory scratch buffers the `_GlobalMemory`
-/// spill path reserves ONCE in [`Stage1GlobalMemScratch::new`] (D-11): the grad / hess
+/// spill path reserves ONCE in [`Stage1GlobalMemScratch::new`]: the grad / hess
 /// scan carriers plus the `stat` / `index` buffers reserved for the discretized &
-/// categorical `_GlobalMemory` variants (C++ TODO / Phase-22 seam — reserved, not used
+/// categorical `_GlobalMemory` variants (C++ TODO — reserved, not used
 /// by the continuous kernel, mirroring how `DeviceSplitInfo` reserves its categorical
 /// slabs). Used by the "allocated exactly once" counter assertion.
 pub const NUM_STAGE1_SCRATCH_BUFFERS: usize = 4;
 
-/// Stage-1 spill dispatch (D-05): does this feature's bin count exceed the block
+/// Stage-1 spill dispatch: does this feature's bin count exceed the block
 /// thread width, requiring the `_GlobalMemory` strided path? `num_bin > block_threads`
-/// spills; at or below stays on the in-block two-level scan (17-03). The cpu
+/// spills; at or below stays on the in-block two-level scan. The cpu
 /// single-owner fold ([`find_best_splits_stage1_on`]) handles BOTH via the same serial
-/// body (A4), so this only routes the gpu block/globalmem kernels (wired on-device in
-/// 17-05).
+/// body, so this only routes the gpu block/globalmem kernels.
 #[must_use]
 pub fn stage1_needs_globalmem(num_bin: u32, block_threads: usize) -> bool {
     (num_bin as usize) > block_threads
 }
 
-/// V5 launch-boundary validation for the `_GlobalMemory` scratch slab (threat
-/// T-17-01/T-17-02): reject a `largest_feature_bin_count × num_concurrent_blocks`
-/// product that would overflow `usize` BEFORE any `client.empty` / strided
-/// `launch_unchecked`. Returns the validated per-buffer slab length (in elements).
+/// Launch-boundary validation for the `_GlobalMemory` scratch slab: reject a
+/// `largest_feature_bin_count × num_concurrent_blocks` product that would overflow
+/// `usize` BEFORE any `client.empty` / strided `launch_unchecked`. Returns the
+/// validated per-buffer slab length (in elements).
 ///
 /// Mirrors `split_info.rs`'s `checked_mul` categorical-slab guard and `random.rs`'s
 /// `validate_draw_inputs` overflow guard.
@@ -1175,7 +1166,7 @@ pub fn validate_globalmem_scratch(
         })
 }
 
-/// The pre-allocated `_GlobalMemory` stage-1 scratch (D-11) — the grad / hess scan
+/// The pre-allocated `_GlobalMemory` stage-1 scratch — the grad / hess scan
 /// carriers plus the reserved `stat` / `index` buffers, each a CubeCL [`Handle`]
 /// allocated **once** in [`Self::new`] via the counted `alloc` closure (the
 /// `DeviceSplitInfo::new` idiom, `split_info.rs:289-293`). There is NO per-split /
@@ -1191,10 +1182,10 @@ pub struct Stage1GlobalMemScratch<R: cubecl::Runtime> {
     /// `feature_hist_hess_buffer` — the strided hessian scan carrier (f32).
     pub feature_hist_hess_buffer: Handle,
     /// `feature_hist_stat_buffer` — reserved for the discretized `_GlobalMemory`
-    /// variant (C++ TODO / v2 QGD-02); allocated but unused by the continuous kernel.
+    /// variant (C++ TODO); allocated but unused by the continuous kernel.
     pub feature_hist_stat_buffer: Handle,
     /// `feature_hist_index_buffer` — reserved for the categorical `_GlobalMemory`
-    /// variant (Phase-22 seam); allocated but unused by the continuous kernel.
+    /// variant; allocated but unused by the continuous kernel.
     pub feature_hist_index_buffer: Handle,
     /// The largest per-feature bin count the scratch is sized for.
     largest_feature_bin_count: usize,
@@ -1204,15 +1195,15 @@ pub struct Stage1GlobalMemScratch<R: cubecl::Runtime> {
     /// (`largest_feature_bin_count * num_concurrent_blocks`).
     slab_len: usize,
     /// Count of `client.empty` allocations — equals [`NUM_STAGE1_SCRATCH_BUFFERS`]
-    /// after [`Self::new`] and never changes (proves "allocated exactly once", D-11).
+    /// after [`Self::new`] and never changes (proves "allocated exactly once").
     device_allocations: usize,
     _runtime: PhantomData<R>,
 }
 
 impl<R: cubecl::Runtime> Stage1GlobalMemScratch<R> {
     /// Pre-allocate the four `_GlobalMemory` scratch buffers — **one `client.empty`
-    /// per buffer, exactly once** (D-11). No allocation happens anywhere else (no
-    /// per-split / in-kernel device alloc). The slab length is V5-validated
+    /// per buffer, exactly once**. No allocation happens anywhere else (no
+    /// per-split / in-kernel device alloc). The slab length is validated
     /// ([`validate_globalmem_scratch`]) for overflow before any allocation.
     ///
     /// # Errors
@@ -1228,7 +1219,7 @@ impl<R: cubecl::Runtime> Stage1GlobalMemScratch<R> {
 
         // The counted alloc closure is the ONLY caller of `client.empty` in the spill
         // path, and it runs only here in `new` — so `device_allocations` structurally
-        // proves the alloc-once invariant (D-11), exactly like `DeviceSplitInfo::new`.
+        // proves the alloc-once invariant, exactly like `DeviceSplitInfo::new`.
         let mut device_allocations = 0usize;
         let mut alloc = |elem_size: usize| -> Handle {
             device_allocations += 1;
@@ -1271,7 +1262,7 @@ impl<R: cubecl::Runtime> Stage1GlobalMemScratch<R> {
     }
 
     /// The number of device buffers allocated — equals [`NUM_STAGE1_SCRATCH_BUFFERS`]
-    /// after [`Self::new`] and never changes (proves the D-11 alloc-once invariant: no
+    /// after [`Self::new`] and never changes (proves the alloc-once invariant: no
     /// per-split / in-kernel alloc).
     #[must_use]
     pub fn device_allocations(&self) -> usize {
@@ -1289,7 +1280,7 @@ const STAGE1_BLOCK_MAX: usize = STAGE1_BLOCK_THREADS;
 #[cfg(feature = "gpu")]
 const STAGE1_N_PLANES_MAX: usize = 32;
 
-/// NET-NEW two-level within-block inclusive scan (D-03) — the hip stage-1 scan, built
+/// Two-level within-block inclusive scan — the hip stage-1 scan, built
 /// on the cubecl-0.10 plane intrinsics + a `SharedMemory` cross-plane carry under
 /// `sync_cube()` (the idiom borrowed from `primitives.rs`, NOT the generic `block_scan`
 /// segment contract). Returns unit `UNIT_POS`'s block-wide inclusive prefix of `v`.
@@ -1335,9 +1326,9 @@ fn stage1_block_scan(v: f32, plane_dim: u32) -> f32 {
 /// indices are non-negative, so a valid leaf encodes as `leaf_index as u32` and "no valid
 /// leaf" as the `block_size` sentinel (u32 throughout — cubecl lowers the u32 shared-read
 /// return, matching `reduce_best_gain`; the caller maps `block_size` → `-1`). Strict `>`
-/// keeps the LOWEST leaf index on a tie, matching the Task-2 cpu fold. gpu-gated f32 (D-10 —
+/// keeps the LOWEST leaf index on a tie, matching the cpu fold. gpu-gated f32 —
 /// the leaf gains are widened to f32 on the hip path; the cpu anchor argmax is the host f64
-/// fold in [`find_best_from_all_splits_on`]); compile-verified, on-device asserted in 17-05.
+/// fold in [`find_best_from_all_splits_on`].
 #[cfg(feature = "gpu")]
 #[cube]
 fn reduce_best_gain_for_leaves(local_gain: f32, leaf_index: i32, block_size: u32) -> u32 {
@@ -1369,7 +1360,7 @@ fn reduce_best_gain_for_leaves(local_gain: f32, leaf_index: i32, block_size: u32
 }
 
 /// `PrepareLeafBestSplitInfo` + the `FindBestFromAllSplitsKernel` `[6]`/`[7]` writes
-/// (`cu:2113-2159`) — the single-owner 8-int export packer (SC#2, the ONLY device→host
+/// (`cu:2113-2159`) — the single-owner 8-int export packer (the ONLY device→host
 /// transfer per iteration). `inp` carries the pre-read scalars
 /// `[0]=smaller.inner_feature_index [1]=smaller.threshold [2]=smaller.default_left
 ///  [3]=larger.inner_feature_index [4]=larger.threshold [5]=larger.default_left
@@ -1391,10 +1382,10 @@ fn prepare_leaf_best_split_info_kernel(inp: &Array<i32>, out: &mut Array<i32>) {
 }
 
 /// `ReduceBestGain` block argmax over `(local_gain, found, thread_index)` — the winning
-/// thread index, tie-break by the LOWEST index via strict `>` (Pitfall 5, matching the
-/// Task-1 cpu fold's first-max-wins). Stages each unit's `(gain, found)` into
+/// thread index, tie-break by the LOWEST index via strict `>` (matching the
+/// cpu fold's first-max-wins). Stages each unit's `(gain, found)` into
 /// `SharedMemory`, `sync_cube()`, then unit 0 folds with strict `>`; a `block_size`
-/// sentinel means "no thread found a split". D-03 borrows the LDS idiom, not the
+/// sentinel means "no thread found a split". Borrows the LDS idiom, not the
 /// generic reduction.
 #[cfg(feature = "gpu")]
 #[cube]
@@ -1424,14 +1415,13 @@ fn reduce_best_gain(local_gain: f32, found: bool, block_size: u32) -> u32 {
     sh_win[0]
 }
 
-/// The hip block-parallel stage-1 kernel (D-03/D-06) — one block per `(leaf,feature)`
+/// The hip block-parallel stage-1 kernel — one block per `(leaf,feature)`
 /// task, 256 threads: each unit loads its bin, the two-level [`stage1_block_scan`]
 /// produces the cumulative scanned side, complement-from-parent + two-phase count
 /// recovery + guards + gain (smoothing dispatch) per unit, [`reduce_best_gain`] picks
 /// the winner (strict `>`), and the winning unit writes the record (kEpsilon-subtracted).
-/// Byte-for-byte the §8.1 math of [`split_eval_body_f32`], parallelized. Anchored to the
-/// Task-1 cpu f64 fold; the on-device rocm parity assertion lands in 17-05 (def-f8u-01,
-/// NEVER GPU-vs-GPU). NO f64 (D-10, WR-05).
+/// Byte-for-byte the same math as [`split_eval_body_f32`], parallelized. Anchored to the
+/// cpu f64 fold, never compared GPU-vs-GPU. NO f64 (every literal pinned f32).
 #[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
@@ -1630,13 +1620,13 @@ pub fn split_eval_block_kernel_f32(
 }
 
 /// `GlobalMemoryPrefixSum` (`cuda_algorithms.hpp:169-185`) — a chunked two-level
-/// IN-PLACE inclusive scan over a global-memory scratch `array[0..len]` (D-05). Each
+/// IN-PLACE inclusive scan over a global-memory scratch `array[0..len]`. Each
 /// unit owns a contiguous chunk of `ceil(len / blockDim)` elements: it sums its chunk,
 /// the block exclusive-scans the per-chunk sums (the `ShufflePrefixSumExclusive`
 /// analog, here `stage1_block_scan(sum) - sum`), each unit adds that base to its first
-/// element, then serially propagates within its chunk. NO f64 (D-10, WR-05). Every
-/// unit must reach both `sync_cube()`s (the C++ `__syncthreads()` after each scan is
-/// issued by the caller).
+/// element, then serially propagates within its chunk. NO f64 (every literal pinned
+/// f32). Every unit must reach both `sync_cube()`s (the C++ `__syncthreads()` after
+/// each scan is issued by the caller).
 #[cfg(feature = "gpu")]
 #[cube]
 #[allow(clippy::manual_div_ceil)] // `.div_ceil()` does not lower in cubecl `#[cube]`
@@ -1676,7 +1666,7 @@ fn global_memory_prefix_sum(array: &mut Array<f32>, len: u32, plane_dim: u32) {
     }
 }
 
-/// The hip `_GlobalMemory` stage-1 strided kernel (D-05/D-06) — one block per
+/// The hip `_GlobalMemory` stage-1 strided kernel — one block per
 /// `(leaf,feature)` task, 256 threads, for features whose `num_bin` exceeds the block
 /// width. A VERBATIM strided port of `FindBestSplitsForLeafKernelInner_GlobalMemory`
 /// (`cuda_best_split_finder.cu:1051-1273`, the continuous non-`na_as_missing`-mfb1
@@ -1686,16 +1676,16 @@ fn global_memory_prefix_sum(array: &mut Array<f32>, len: u32, plane_dim: u32) {
 /// evaluates guards + gain (smoothing dispatch) exactly as [`split_eval_body_f32`],
 /// [`reduce_best_gain`] picks the winner (strict `>`, lowest index), and the winning
 /// unit writes the record (kEpsilon-subtracted). SAME gain / count / guard / argmax
-/// math as 17-03 — only the scan carrier (global scratch) and the strided iteration
-/// differ (A4). Anchored to the cpu f64 fold; the on-device rocm assertion lands in
-/// 17-05 (def-f8u-01, NEVER GPU-vs-GPU). NO f64 (D-10, WR-05).
+/// math as the in-block path — only the scan carrier (global scratch) and the strided
+/// iteration differ. Anchored to the cpu f64 fold, never compared GPU-vs-GPU.
+/// NO f64 (every literal pinned f32).
 ///
 /// Faithful-scope note: the `na_as_missing && mfb_offset == 1` special reduction
 /// subcase (`cu:1095-1114`, a `ShuffleReduceSum` of the non-default bins) is NOT
-/// exercised by the D-07 fixture (the `globalmem_spill` golden is forward, `mfb=0`,
-/// `na=0`); it is a `_GlobalMemory` sub-branch to complete when a golden needs it,
-/// tracked as a known limitation, not a silent stub (the continuous forward/reverse
-/// branches this kernel ports are the ones the fixture drives).
+/// exercised by the fixture used here (the `globalmem_spill` golden is forward,
+/// `mfb=0`, `na=0`); it is a `_GlobalMemory` sub-branch to complete when a golden
+/// needs it, tracked as a known limitation, not a silent stub (the continuous
+/// forward/reverse branches this kernel ports are the ones the fixture drives).
 #[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
@@ -1943,10 +1933,9 @@ pub fn split_eval_globalmem_kernel_f32(
 /// STAGE 1 `_GlobalMemory` spill launcher (hip f32, gpu-gated) — drives
 /// [`split_eval_globalmem_kernel_f32`] over one `(leaf,feature)` task whose bin count
 /// exceeds the block width, using the PRE-ALLOCATED [`Stage1GlobalMemScratch`] handles
-/// (D-11 — never allocates the scan scratch here). The output packet is the standard
-/// 14-cell [`SplitScalars`] readback (SC#2 single transfer). Anchored to
-/// [`find_best_splits_stage1_on`] within the ~1e-5 f32 envelope; the on-device rocm
-/// parity assertion lands in 17-05 (def-f8u-01).
+/// (never allocates the scan scratch here). The output packet is the standard
+/// 14-cell [`SplitScalars`] readback (a single transfer). Anchored to
+/// [`find_best_splits_stage1_on`] within the ~1e-5 f32 envelope.
 ///
 /// `block_threads` is the launch width (≤ [`STAGE1_BLOCK_THREADS`]); `plane_dim` is the
 /// device plane/warp width for the two-level per-chunk scan.
@@ -1966,10 +1955,10 @@ pub fn find_best_splits_stage1_globalmem_f32_on<R: cubecl::Runtime>(
     plane_dim: u32,
 ) -> Result<SplitScalars, ComputeError> {
     validate_stage1_inputs(task.num_bin, hist.len())?;
-    // Phase-22 categorical seam (D-04→22-04): this CUDA-mirror launcher is not fed the
-    // per-feature categorical config, so a categorical task fails loudly (WR-02) rather
-    // than silently evaluating with GainConfig defaults. Categorical is ALWAYS the f64
-    // single-owner anchor (def-f8u-01) — the live driver's `scan_leaf` handles it.
+    // This CUDA-mirror launcher is not fed the per-feature categorical config, so a
+    // categorical task fails loudly rather than silently evaluating with GainConfig
+    // defaults. Categorical is always evaluated via the f64 single-owner anchor —
+    // the live driver's `scan_leaf` handles it.
     if task.is_categorical {
         return Err(categorical_seam_unsupported());
     }
@@ -1997,7 +1986,7 @@ pub fn find_best_splits_stage1_globalmem_f32_on<R: cubecl::Runtime>(
     // SAFETY: `h_hist` is host-validated to `2*num_bin` cells; the scan scratch slab is
     // `>= fnbmo` (checked above) and pre-allocated once in `Stage1GlobalMemScratch::new`;
     // `h_out` is `STAGE1_OUT_LEN` cells. All indices derive from the validated bin count.
-    // cubecl unsafe confined here (CMP-01, T-17-01/T-17-02).
+    // cubecl unsafe confined here.
     unsafe {
         split_eval_globalmem_kernel_f32::launch_unchecked(
             client,
@@ -2066,7 +2055,7 @@ pub fn find_best_splits_stage1_globalmem_f32_on<R: cubecl::Runtime>(
 /// The C++ `NUM_TASKS_PER_SYNC_BLOCK` (`cuda_best_split_finder.hpp:24`) — the stage-2
 /// sync-block width. `num_blocks_per_leaf = ceil(num_tasks / NUM_TASKS_PER_SYNC_BLOCK)`;
 /// for the anchor fixtures `num_tasks << 1024` so `num_blocks_per_leaf == 1` (the common
-/// case the `…AllBlocks` fold collapses to — Claude's Discretion per 17-CONTEXT).
+/// case the `…AllBlocks` fold collapses to).
 pub const NUM_TASKS_PER_SYNC_BLOCK: usize = 1024;
 
 /// The number of stage-2 sync blocks per leaf for `num_tasks` tasks
@@ -2077,7 +2066,7 @@ pub fn stage2_num_blocks_per_leaf(num_tasks: usize) -> usize {
     num_tasks.div_ceil(NUM_TASKS_PER_SYNC_BLOCK).max(1)
 }
 
-/// V5 launch-boundary validation for stage-2/3 (threat T-17-01/T-17-02): the
+/// Launch-boundary validation for stage-2/3: the
 /// leaf-best-split slab is indexed at `leaf_index + block·num_leaves`, so
 /// `num_leaves × num_blocks_per_leaf` must be non-zero and must not overflow BEFORE
 /// the reduce writes the per-leaf winner. Returns the required slab length.
@@ -2106,11 +2095,11 @@ pub fn validate_stage2_inputs(
         })
 }
 
-/// STAGE 2 — `SyncBestSplitForLeafKernel` cross-feature reduce per leaf (ODL-12, §8.2).
+/// STAGE 2 — `SyncBestSplitForLeafKernel` cross-feature reduce per leaf.
 ///
 /// Reduces the per-task `(is_valid, gain)` records for ONE leaf via the `ReduceBestGain`
-/// family (strict `>` ⇒ the FIRST / lowest task index survives a tie, 17-RESEARCH
-/// Pitfall 5) into that leaf's best split. `per_task` is the full `2·num_tasks` record
+/// family (strict `>` ⇒ the FIRST / lowest task index survives a tie) into that leaf's
+/// best split. `per_task` is the full `2·num_tasks` record
 /// slab stage-1 produced (smaller-leaf records `[0, num_tasks)`, larger-leaf records
 /// `[num_tasks, 2·num_tasks)`); the reader indexes `read_index = is_smaller ? task_index
 /// : task_index + num_tasks` (the IS_LARGER duality, `cu:1943`). The winner is copied
@@ -2120,12 +2109,12 @@ pub fn validate_stage2_inputs(
 ///
 /// The reduction is a RESIDENT fold over records that already live from stage-1: the
 /// deterministic strict-`>` order is the parity contract, and it performs **no device→host
-/// readback** — the single readback is stage-3's 8-int export ONLY (SC#2). `client` is
-/// unused here (reserved for the Phase-18 device-resident path).
+/// readback** — the single readback is stage-3's 8-int export ONLY. `client` is
+/// unused here (reserved for a future device-resident path).
 ///
 /// For `num_blocks_per_leaf > 1` (num_tasks > `NUM_TASKS_PER_SYNC_BLOCK`) the per-block
 /// winners are reduced by [`sync_best_split_all_blocks`]; the common
-/// `num_blocks_per_leaf == 1` case is folded in here (Claude's Discretion, parity-neutral).
+/// `num_blocks_per_leaf == 1` case is folded in here (parity-neutral).
 ///
 /// # Errors
 /// [`ComputeError::LengthMismatch`] if `per_task` is shorter than the read window
@@ -2136,7 +2125,7 @@ pub fn sync_best_split_for_leaf_on<R: cubecl::Runtime>(
     num_tasks: usize,
     is_smaller: bool,
 ) -> Result<SplitScalars, ComputeError> {
-    let _ = client; // reserved for the Phase-18 device-resident path (no readback here, SC#2).
+    let _ = client; // reserved for a future device-resident path (no readback here).
     let base = if is_smaller { 0usize } else { num_tasks };
     let needed = base
         .checked_add(num_tasks)
@@ -2150,7 +2139,7 @@ pub fn sync_best_split_for_leaf_on<R: cubecl::Runtime>(
         });
     }
 
-    // ReduceBestGain: strict `>` keeps the FIRST (lowest task index) on a tie (Pitfall 5).
+    // ReduceBestGain: strict `>` keeps the FIRST (lowest task index) on a tie.
     let mut best: Option<usize> = None;
     let mut best_gain = f64::NEG_INFINITY;
     for t in 0..num_tasks {
@@ -2233,7 +2222,7 @@ pub fn set_invalid_leaf_split_info(
     }
 }
 
-/// V5 launch-boundary validation for stage-3 (threat T-17-01/T-17-02): the export reads
+/// Launch-boundary validation for stage-3: the export reads
 /// `per_leaf[smaller_leaf_index]` / `[larger_leaf_index]` and the argmax + self-invalidation
 /// index `[0, cur_num_leaves]` plus the freshly-created leaf slot `[cur_num_leaves]`, so
 /// every index must be in range BEFORE the export launch.
@@ -2272,7 +2261,7 @@ fn validate_stage3_inputs(
     Ok(())
 }
 
-/// STAGE 3 — `FindBestFromAllSplitsKernel` + `PrepareLeafBestSplitInfo` (ODL-12, §8.3).
+/// STAGE 3 — `FindBestFromAllSplitsKernel` + `PrepareLeafBestSplitInfo`.
 ///
 /// Cross-leaf argmax over `(gain, leaf_index)` for the `[0, cur_num_leaves)` per-leaf best
 /// splits (strict `>` ⇒ the LOWEST leaf index survives a tie, matching
@@ -2281,25 +2270,25 @@ fn validate_stage3_inputs(
 /// freshly-created leaf slot (`cur_num_leaves`) are marked `is_valid=false` so neither is
 /// re-picked next iteration. Finally the 8-int `cuda_best_split_info_buffer` is packed via
 /// [`prepare_leaf_best_split_info_kernel`] — the ONLY device→host transfer per iteration
-/// (SC#2, a single `read_one_unchecked`); the full per-side records stay RESIDENT for
-/// Phase 18.
+/// (a single `read_one_unchecked`); the full per-side records stay RESIDENT on the device.
 ///
-/// Field layout (17-RESEARCH §"3-Stage Reduction & Export"):
+/// Field layout:
 /// `[0]=smaller.inner_feature_index [1]=smaller.threshold [2]=smaller.default_left
 ///  [3]=larger.inner_feature_index  [4]=larger.threshold  [5]=larger.default_left
-///  [6]=best_leaf_index [7]=best_leaf.num_cat_threshold` (0 for continuous — Phase-22 fills
-/// categorical). The larger triple `[3..6]` is written only when `larger_leaf_index >= 0`;
-/// `[7]` only when `best_leaf_index != -1` (else 0). `per_leaf` is mutated in place by the
-/// self-invalidation (observable to the caller / a two-iteration golden).
+///  [6]=best_leaf_index [7]=best_leaf.num_cat_threshold` (0 for continuous; filled for
+/// categorical elsewhere). The larger triple `[3..6]` is written only when
+/// `larger_leaf_index >= 0`; `[7]` only when `best_leaf_index != -1` (else 0). `per_leaf`
+/// is mutated in place by the self-invalidation (observable to the caller / a
+/// two-iteration golden).
 ///
 /// # Errors
 /// [`ComputeError`] from [`validate_stage3_inputs`] (out-of-range leaf indices) or the
 /// export launch.
-/// The §8.3 per-iteration pick export (28-01 + 31-03). Carries the ORIGINAL 8 export
-/// cells (byte-identical in meaning/order to the pre-31-03 `[i64; 8]` return) PLUS the
+/// The per-iteration pick export. Carries the ORIGINAL 8 export
+/// cells (byte-identical in meaning/order to the historical `[i64; 8]` return) PLUS the
 /// WINNING leaf's own full record so the resident grow driver can source the picked leaf's
 /// partition/build/seed fields FRESH from the device frontier instead of a separately-
-/// maintained host cache (spike-081 D-081-1, ODS-02). Both the host twin
+/// maintained host cache. Both the host twin
 /// ([`find_best_from_all_splits_on`]) and the device path ([`find_best_from_all_splits_device`])
 /// produce the identical shape — the existing `frontier_device_argmax_bit_exact_to_host_fold`
 /// parity test asserts `assert_eq!(dev, host)` on the WHOLE struct.
@@ -2307,9 +2296,9 @@ fn validate_stage3_inputs(
 pub struct PickExport {
     /// The existing 8 export cells: `[0..3]`=smaller feat/thr/dleft, `[3..6]`=larger
     /// feat/thr/dleft (gated on `has_larger`), `[6]`=`best_leaf` (`-1` = stop signal),
-    /// `[7]`=the picked leaf's `num_cat_threshold`. Unchanged from the pre-31-03 return.
+    /// `[7]`=the picked leaf's `num_cat_threshold`. Unchanged from the historical return.
     pub cells: [i64; 8],
-    /// The WINNING leaf's own record (31-03, D-081-1; extended 31-08, ODS-02), all `f64`
+    /// The WINNING leaf's own record, all `f64`
     /// (small integer field values are exact in `f64`): `[0]`=feature index (REAL on the
     /// device frontier — the `reduce_winner_into_frontier` fold / device reduce stores
     /// `real_feat_of(...)` in `feat`; the host twin mirrors whatever `inner_feature_index`
@@ -2317,8 +2306,8 @@ pub struct PickExport {
     /// `[3]`=left_sum_gradients, `[4]`=left_sum_hessians, `[5]`=right_sum_gradients,
     /// `[6]`=right_sum_hessians, `[7]`=gain (NET, i.e. `(raw - min_gain_shift) * penalty` —
     /// the short-circuit + node-recording key), `[8]`=left_output (child leaf value),
-    /// `[9]`=right_output. Cells `[7..10)` were added by 31-08 so the resident driver sources
-    /// the tree-record `gain`/`left_output`/`right_output` device→device (retiring the host
+    /// `[9]`=right_output. Cells `[7..10)` let the resident driver source
+    /// the tree-record `gain`/`left_output`/`right_output` device→device (avoiding a host
     /// `leaves[best_leaf].best` cache read and the per-split scan `bump_sync`). ALL `0.0` when
     /// `cells[6] < 0` (no leaf pickable) — the caller MUST NOT read these when `best_leaf < 0`.
     pub winner: [f64; 10],
@@ -2342,8 +2331,8 @@ pub fn find_best_from_all_splits_on<R: cubecl::Runtime>(
     // tie rule (the cpu-f64 merge-gate anchor, `grow_driver::split_gt`): strictly-greater
     // gain wins; on an EXACT gain tie the LOWER real feature index wins (`-1 ⇒ i32::MAX`),
     // then the lower leaf index (ascending iteration, replace only on strictly-better). This
-    // MUST match the device `find_best_leaf_kernel` (28-07, WR-01) — a gain-only lowest-leaf
-    // pick silently grows a different tree than the anchor on any exact tie (ODF-06).
+    // MUST match the device `find_best_leaf_kernel` — a gain-only lowest-leaf
+    // pick silently grows a different tree than the anchor on any exact tie.
     let mut best_leaf: i32 = -1;
     let mut best_gain = f64::NEG_INFINITY;
     let mut best_feat = i32::MAX;
@@ -2408,8 +2397,7 @@ pub fn find_best_from_all_splits_on<R: cubecl::Runtime>(
 
     // SAFETY: `h_in` is exactly 9 i32 cells, `h_out` 8 i32 cells; both outlive the launch.
     // The single-owner kernel indexes only `inp[0..9]` / `out[0..8]` (constant indices).
-    // This is the ONLY device→host readback per iteration (SC#2). cubecl unsafe confined
-    // here (CMP-01, T-17-01/T-17-03).
+    // This is the ONLY device→host readback per iteration. cubecl unsafe confined here.
     unsafe {
         prepare_leaf_best_split_info_kernel::launch_unchecked(
             client,
@@ -2426,7 +2414,7 @@ pub fn find_best_from_all_splits_on<R: cubecl::Runtime>(
     for (k, slot) in cells.iter_mut().enumerate() {
         *slot = i64::from(raw[k]);
     }
-    // 31-03 (D-081-1): carry the WINNING leaf's own record so the resident driver seeds the
+    // Carry the WINNING leaf's own record so the resident driver seeds the
     // next partition/build directly off this pick export. `is_valid` was flipped by the
     // self-invalidation above, but the winner's feature/threshold/default_left/sum fields are
     // untouched by it — read them from the chosen slot.
@@ -2437,7 +2425,7 @@ pub fn find_best_from_all_splits_on<R: cubecl::Runtime>(
 /// Extract the winning leaf's 10-cell record (feat, thr, dleft, 4 child sums, gain,
 /// left_output, right_output) as `f64`s from a host per-leaf slab, or the all-`0.0` sentinel
 /// when `best_leaf < 0`. Shared by the host twin and its tests so the layout stays
-/// single-sourced (31-03, D-081-1; cells `[7..10)` added 31-08, ODS-02).
+/// single-sourced.
 fn winner_record_on(per_leaf: &[SplitScalars], best_leaf: i32) -> [f64; 10] {
     if best_leaf < 0 {
         return [0.0f64; 10];
@@ -2458,29 +2446,27 @@ fn winner_record_on(per_leaf: &[SplitScalars], best_leaf: i32) -> [f64; 10] {
 }
 
 // =============================================================================
-// 28-01 (ODF-01/ODF-05, §8.2/§8.3): DEVICE-RESIDENT frontier reductions.
+// DEVICE-RESIDENT frontier reductions.
 //
-// Today `sync_best_split_for_leaf_on` / `find_best_from_all_splits_on` (above) are
-// HOST folds behind the seam (spike-071 R1: "the seam moved; the work didn't"; the
-// `client` param was explicitly "reserved for the Phase-18 device-resident path").
-// The functions below realise that path: the per-leaf best-split records live in
-// DEVICE buffers (a small SoA — [`SplitSoa`]) and the §8.2 cross-feature reduce +
-// §8.3 cross-leaf argmax run as single-owner `#[cube]` SERIAL folds (CubeDim(1),
-// static Route-C launch geometry — never the dynamic cube-count trap of spike-059)
-// that write their result INTO device buffers readable by handle. NO device→host
-// readback happens inside the reduction — the ONLY transfer is §8.3's single 8-int
-// export (SC#2). On the cubecl-cpu f64 anchor the serial fold is BIT-EXACT to the
-// host folds (gains are copied verbatim — no arithmetic — so the strict-`>`
-// first-max/lowest-index tie-break decides everything, T-lsx-01).
+// `sync_best_split_for_leaf_on` / `find_best_from_all_splits_on` (above) are
+// HOST folds behind the seam (the `client` param is reserved for a device-resident
+// path). The functions below realise that path: the per-leaf best-split records live
+// in DEVICE buffers (a small SoA — [`SplitSoa`]) and the cross-feature reduce +
+// cross-leaf argmax run as single-owner `#[cube]` SERIAL folds (CubeDim(1),
+// static launch geometry) that write their result INTO device buffers readable by
+// handle. NO device→host readback happens inside the reduction — the ONLY transfer
+// is the single 8-int export. On the cubecl-cpu f64 anchor the serial fold is
+// BIT-EXACT to the host folds (gains are copied verbatim — no arithmetic — so the
+// strict-`>` first-max/lowest-index tie-break decides everything).
 // =============================================================================
 
 /// The device-side Structure-of-Arrays for a slab of [`SplitScalars`] best-split
-/// records (28-01). Carries the fields the §8.2/§8.3 reductions read/export
+/// records. Carries the fields the cross-feature/cross-leaf reductions read/export
 /// (`is_valid`, `gain`, `inner_feature_index`, `threshold`, `default_left`,
 /// `num_cat_threshold`) PLUS the winning split's 4 child grad/hess sums
 /// (`left_sum_gradients`, `left_sum_hessians`, `right_sum_gradients`,
-/// `right_sum_hessians`) so the resident frontier can hand Plan 03 the child seed-sums
-/// without a per-split scan readback (31-01, ODS-02 D-081-1). The 4 sum fields obey the
+/// `right_sum_hessians`) so the resident frontier can hand the child seed-sums onward
+/// without a per-split scan readback. The 4 sum fields obey the
 /// SAME all-`f64` convention as the other 6 (no `i32`/count-packed forms — the cubecl-cpu
 /// MLIR limits documented on `valid` below apply identically). Each `Handle` is a
 /// `len`-element device buffer of the noted element type. `Handle` is cheaply clonable
@@ -2492,7 +2478,7 @@ pub struct SplitSoa {
     /// values are exact in `f64`): the cubecl-cpu MLIR pass rejects both mutable-`i32`-local
     /// carries in `select` ("i32: From<NativeExpand<i32>>") AND array indexing by a value
     /// produced after a runtime loop ("operand does not dominate this use"). Keeping the whole
-    /// SoA `f64` lets the §8.2/§8.3 reductions carry the winning field VALUES in `f64` locals
+    /// SoA `f64` lets the cross-feature/cross-leaf reductions carry the winning field VALUES in `f64` locals
     /// (the proven [`split_eval_body`] accumulator shape) — no `i32` locals, no post-loop
     /// array indexing.
     pub valid: Handle,
@@ -2514,12 +2500,12 @@ pub struct SplitSoa {
     pub right_sum_gradients: Handle,
     /// `right_sum_hessians` as `f64` — the winning split's right-child hessian sum.
     pub right_sum_hessians: Handle,
-    /// `left_output` as `f64` — the winning split's LEFT child leaf value (31-08, ODS-02).
+    /// `left_output` as `f64` — the winning split's LEFT child leaf value.
     /// Carried device→device (from `SplitScalars::left_value` / the scan's `cells[10]`) so
-    /// the §8.3 pick export can hand the driver the tree-record `left_output` FRESH, retiring
-    /// the host `leaves[best_leaf].best.left_output` cache read.
+    /// the pick export can hand the driver the tree-record `left_output` FRESH, avoiding
+    /// a host `leaves[best_leaf].best.left_output` cache read.
     pub left_output: Handle,
-    /// `right_output` as `f64` — the winning split's RIGHT child leaf value (31-08, ODS-02),
+    /// `right_output` as `f64` — the winning split's RIGHT child leaf value,
     /// the counterpart of `left_output` (from `SplitScalars::right_value` / `cells[11]`).
     pub right_output: Handle,
     /// Number of records (all twelve buffers are this length).
@@ -2556,9 +2542,9 @@ impl SplitSoa {
         let lsum_h: Vec<f64> = recs.iter().map(|r| r.left_sum_hessians).collect();
         let rsum_g: Vec<f64> = recs.iter().map(|r| r.right_sum_gradients).collect();
         let rsum_h: Vec<f64> = recs.iter().map(|r| r.right_sum_hessians).collect();
-        // The child leaf OUTPUTS are ALREADY f64 on SplitScalars (`left_value`/`right_value`,
-        // 31-08) — no cast. Carried so the §8.2 reduce / §8.3 export can hand the driver the
-        // tree-record outputs FRESH (device→device).
+        // The child leaf OUTPUTS are ALREADY f64 on SplitScalars (`left_value`/`right_value`)
+        // — no cast. Carried so the cross-feature reduce / pick export can hand the driver
+        // the tree-record outputs FRESH (device→device).
         let lval: Vec<f64> = recs.iter().map(|r| r.left_value).collect();
         let rval: Vec<f64> = recs.iter().map(|r| r.right_value).collect();
         Self {
@@ -2603,7 +2589,7 @@ impl SplitSoa {
 
     /// Read back one record (TEST/DEBUG helper — issues device→host readbacks; NOT on
     /// the no-readback reduction path). Reconstructs the carried subset of a
-    /// [`SplitScalars`], including the 4 child grad/hess sums (31-01).
+    /// [`SplitScalars`], including the 4 child grad/hess sums.
     #[must_use]
     pub fn read_record<R: cubecl::Runtime>(
         &self,
@@ -2641,7 +2627,7 @@ impl SplitSoa {
     }
 }
 
-/// §8.2 reduce BODY — the runtime loop + winner write live in a plain `#[cube]` helper (NOT
+/// Cross-feature reduce BODY — the runtime loop + winner write live in a plain `#[cube]` helper (NOT
 /// directly in the launch kernel), mirroring the proven [`split_eval_body`] shape. The winning
 /// FIELD VALUES are carried in `f64` locals (`split_eval_body`'s accumulator idiom) and written
 /// after the loop; NOTHING is indexed by a reduced value after the loop. This sidesteps BOTH
@@ -2650,7 +2636,7 @@ impl SplitSoa {
 /// fields are `f64`). Strict-`>` first-max: `!found` admits the FIRST valid (matches
 /// `sync_best_split_for_leaf_on`'s `best.is_none()`); the sentinel row (gain=neg_inf, feat=-1)
 /// is the no-valid-split record.
-/// §8.2 device kernel — cross-feature reduce of ONE leaf's per-task records into device
+/// Cross-feature reduce device kernel — reduces ONE leaf's per-task records into device
 /// frontier slot `out_slot`. cubecl 0.10 will not unify an array-element load
 /// (`NativeExpand<f64>`) with a plain-`f64` local in a `select`, and cubecl-cpu's MLIR pass
 /// rejects a loop-carried scalar used after the loop ("operand does not dominate this use").
@@ -2732,7 +2718,7 @@ fn sync_best_split_leaf_kernel(
     }
 }
 
-/// §8.3 device kernel — cross-leaf argmax → `best_leaf_out[0]` (a device `f64` slot holding the
+/// Cross-leaf argmax device kernel → `best_leaf_out[0]` (a device `f64` slot holding the
 /// winning leaf index, `-1.0` = none), then the behavioral SELF-INVALIDATION (cu:2131-2135):
 /// the chosen leaf's slot AND the freshly-created leaf slot (`cur_num_leaves`) are marked
 /// `valid=0`. Same array-only-`select` discipline as [`sync_best_split_leaf_kernel`]: the
@@ -2740,7 +2726,7 @@ fn sync_best_split_leaf_kernel(
 /// leaf index is read from a precomputed `idx_f64` array (so the write is array-vs-array). The
 /// invalidation second loop is indexed by the loop variable (`valid[leaf]`, which dominates)
 /// and compares `idx_f64[leaf] == best_leaf_out[0]` (array-vs-array). The tie-break mirrors
-/// `SerialTreeLearner::split_gt` (the cpu-f64 merge-gate anchor, 28-07 WR-01): strictly-
+/// `SerialTreeLearner::split_gt` (the cpu-f64 merge-gate anchor): strictly-
 /// greater gain wins; on an EXACT gain tie the LOWER real feature key (`feat_key`) wins, then
 /// the lower leaf index. `bg` is seeded `neg_inf` (first valid finite gain wins) and
 /// `best_feat` seeded `i32::MAX` (the split_gt `-1 ⇒ i32::MAX` sentinel). `feat_key` holds the
@@ -2771,7 +2757,7 @@ fn find_best_leaf_kernel(
     best_feat[0] = 2147483647.0;
     for leaf in 0..n {
         let v = valid[leaf] > 0.5;
-        // Two-key split_gt compare, array-only operands (28-01 single-owner select discipline):
+        // Two-key split_gt compare, array-only operands (single-owner select discipline):
         // strictly-greater gain OR (exact gain tie AND strictly-lower real feature key).
         let strictly_gain = gain[leaf] > bg[0];
         let tie_gain = gain[leaf] == bg[0];
@@ -2796,8 +2782,8 @@ fn find_best_leaf_kernel(
     }
 }
 
-/// §8.3 device export kernel — the single-owner 8-int `cuda_best_split_info_buffer`
-/// packer (SC#2, the ONLY device→host transfer per iteration), reading the
+/// Device export kernel — the single-owner 8-int `cuda_best_split_info_buffer`
+/// packer (the ONLY device→host transfer per iteration), reading the
 /// smaller/larger leaf records + `best_leaf` slot DIRECTLY from the resident frontier
 /// (no host `inp` staging, unlike [`prepare_leaf_best_split_info_kernel`]). Layout
 /// identical to [`find_best_from_all_splits_on`]: `[0..3]`=smaller triple,
@@ -2838,10 +2824,10 @@ fn prepare_export_device_kernel(
     let has_best = best > -0.5;
     let bi = select(has_best, best, 0.0) as usize;
     out[7] = select(has_best, ncat[bi], 0.0);
-    // 31-03 (D-081-1): the WINNING leaf's own record — its REAL feature index (the frontier
+    // The WINNING leaf's own record — its REAL feature index (the frontier
     // `feat` already stores real, via `reduce_winner_into_frontier`), threshold, default_left,
     // and 4 child grad/hess sums. Reuse the SAME `bi`/`has_best` guard computed for `out[7]`
-    // (bounds-safe by construction) — no new unchecked index arithmetic (T-31-03). Sentinel
+    // (bounds-safe by construction) — no new unchecked index arithmetic. Sentinel
     // `0.0` when no leaf is pickable; the caller never reads these when `out[6] < 0`.
     out[8] = select(has_best, feat[bi], 0.0);
     out[9] = select(has_best, thr[bi], 0.0);
@@ -2850,7 +2836,7 @@ fn prepare_export_device_kernel(
     out[12] = select(has_best, lsum_h[bi], 0.0);
     out[13] = select(has_best, rsum_g[bi], 0.0);
     out[14] = select(has_best, rsum_h[bi], 0.0);
-    // 31-08 (ODS-02): the WINNING leaf's node-recording values — NET gain (the frontier
+    // The WINNING leaf's node-recording values — NET gain (the frontier
     // stores net, folded by the reduce launcher / `reduce_winner_into_frontier`) + the two
     // child leaf OUTPUTS. Same bounds-safe `bi`/`has_best` guard (no new index arithmetic).
     // Carried so the resident driver seeds the tree record device→device (retires the host
@@ -2860,8 +2846,8 @@ fn prepare_export_device_kernel(
     out[17] = select(has_best, rval[bi], 0.0);
 }
 
-/// STAGE 2 device-resident variant of [`sync_best_split_for_leaf_on`] (28-01, ODF-01,
-/// §8.2). Reduces one leaf's per-task records (the `in_slab` `2·num_tasks` device slab;
+/// STAGE 2 device-resident variant of [`sync_best_split_for_leaf_on`].
+/// Reduces one leaf's per-task records (the `in_slab` `2·num_tasks` device slab;
 /// smaller records `[0, num_tasks)`, larger records `[num_tasks, 2·num_tasks)`) into the
 /// resident frontier slot `out_leaf` via a single-owner device fold — the winner lives on
 /// device, no readback. Bit-exact to the host fold on the cpu f64 anchor.
@@ -2940,13 +2926,13 @@ pub fn sync_best_split_for_leaf_device<R: cubecl::Runtime>(
     Ok(())
 }
 
-/// STAGE 3 device-resident variant of [`find_best_from_all_splits_on`] (28-01, ODF-01,
-/// §8.3). Cross-leaf argmax over the resident frontier `[0, cur_num_leaves)` → the device
+/// STAGE 3 device-resident variant of [`find_best_from_all_splits_on`].
+/// Cross-leaf argmax over the resident frontier `[0, cur_num_leaves)` → the device
 /// `best_leaf_slot` (an `f64` 1-element slot holding the winning leaf index, `-1.0` = none),
 /// performs the SAME self-invalidation of the chosen leaf slot + the freshly-created slot IN
 /// the device `frontier`, then exports the identical 8-int buffer. The best-leaf pick +
 /// self-invalidation issue NO readback; the export is the ONLY device→host transfer (a single
-/// `read_one_unchecked`, SC#2).
+/// `read_one_unchecked`).
 ///
 /// # Errors
 /// [`ComputeError`] from [`validate_stage3_inputs`] (out-of-range leaf indices).
@@ -2977,8 +2963,8 @@ pub fn find_best_from_all_splits_device<R: cubecl::Runtime>(
     let idx_vec: Vec<f64> = (0..frontier.len).map(|i| i as f64).collect();
     let idx_f64 = client.create_from_slice(f64::as_bytes(&idx_vec));
     let bg = client.empty(core::mem::size_of::<f64>());
-    // The running winner's real feature key scratch (the §8.3 split_gt tie-break, 28-07
-    // WR-01). `feat_key` IS `frontier.feat` — the resident SoA already stores the winner's
+    // The running winner's real feature key scratch (the split_gt tie-break).
+    // `feat_key` IS `frontier.feat` — the resident SoA already stores the winner's
     // REAL feature index (`reduce_winner_into_frontier` folds `real_feat_of(...)` into it),
     // so the device pick and the cpu-f64 anchor `split_gt` consult the identical key.
     let best_feat = client.empty(core::mem::size_of::<f64>());
@@ -3008,7 +2994,7 @@ pub fn find_best_from_all_splits_device<R: cubecl::Runtime>(
 
     // 2) Pack the 18-cell export (f64 buffer — the resident SoA is f64) from the frontier +
     // best_leaf slot. Cells [0..8) are exact integers (decoded to i64 on the host); cells
-    // [8..18) are the WINNING leaf's own record (31-03, D-081-1; extended 31-08): feat/thr/dleft
+    // [8..18) are the WINNING leaf's own record: feat/thr/dleft
     // are exact integers, the 4 sums + net gain + 2 child outputs are genuine f64 values (NOT
     // truncated to i64).
     let h_out = client.empty(18 * core::mem::size_of::<f64>());
@@ -3039,7 +3025,7 @@ pub fn find_best_from_all_splits_device<R: cubecl::Runtime>(
             u32::from(has_larger),
         );
     }
-    // The ONLY device→host transfer per iteration (SC#2).
+    // The ONLY device→host transfer per iteration.
     let bytes = client.read_one_unchecked(h_out);
     let raw = f64::from_bytes(&bytes);
     let mut cells = [0i64; 8];
@@ -3052,31 +3038,28 @@ pub fn find_best_from_all_splits_device<R: cubecl::Runtime>(
 }
 
 // =============================================================================
-// 29-01 (OCX-01, §6.1): on-device ROOT grad/hess sum over the resident buffers.
+// On-device ROOT grad/hess sum over the resident buffers.
 //
-// Replaces the host `root_grad_hess_fold` on the GpuBackend arm (spike-071: a host O(rows)
+// Replaces the host `root_grad_hess_fold` on the GpuBackend arm (a host O(rows)
 // serial f64 fold). This is a FLOAT reduction (NOT the u64 integer path); f64 addition is
 // non-associative, so the reduction ORDER — not just the accumulator width — decides
 // bit-exactness. The serial ascending f64 fold runs on EVERY GPU lane (`0..num_data`,
 // single-owner `CubeDim(1)`), so it is BIT-EXACT vs `root_grad_hess_fold` on both the
 // cpu-anchor lane AND the hip lane: same IEEE f64 adds in the same ascending order are
-// deterministic. f64 codegen is PROVEN to run on gfx1100 despite
-// `probe_capabilities().has_f64 == false` (spike-072 fix-probe: 100/100 trees, root recon
-// exactly 0.0; the project's f64 anchor kernels have always run on this GPU, and the resident
-// scan/subtract chain already computes in f64 on hip in production). The pre-29 serial f32
-// accumulator lane (spike-072 item 13: ~+382 hessian bias / 3e-3 rel at |acc|~1e5, silently
-// truncating the on-device model to 13 trees at 500k rows) has been DELETED. Static Route-C
-// geometry.
+// deterministic. f64 codegen is PROVEN to run on this GPU despite
+// `probe_capabilities().has_f64 == false` (the project's f64 anchor kernels have always run
+// on this GPU, and the resident scan/subtract chain already computes in f64 on hip in
+// production). An earlier serial f32 accumulator lane had a hessian bias (~+382 at
+// |acc|~1e5) that silently truncated the on-device model at scale; it has been DELETED.
+// Static single-owner geometry.
 //
-// Spike-075 (task 260706-ta8): as of that task, `GpuBackend::root_grad_hess_sum` (lib.rs) no
-// longer calls this kernel in production — it routes directly through the host
-// `root_grad_hess_fold` anchor instead (12.9ms/tree measured on real CUDA at 500k rows vs
-// 0.32-0.75ms for the host fold, ~20-130× cheaper, parity-neutral by construction). The
-// functions below remain exercised only by their own anchor tests and the
-// `spike075_rootfold_cost` example harness.
+// NOTE: `GpuBackend::root_grad_hess_sum` (lib.rs) does NOT call this kernel in
+// production — it routes directly through the host `root_grad_hess_fold` anchor instead,
+// which measured substantially cheaper on real CUDA. The functions below remain exercised
+// only by their own anchor tests and an example harness.
 // =============================================================================
 
-/// §6.1 root grad/hess sum — serial ASCENDING f64 fold, run on EVERY lane. `out[0]`/`out[1]`
+/// Root grad/hess sum — serial ASCENDING f64 fold, run on EVERY lane. `out[0]`/`out[1]`
 /// accumulate in the output slot (indexed by the constant 0/1, so the accumulator always
 /// dominates — the same array-accumulator discipline as [`sync_best_split_leaf_kernel`]).
 /// `f64::cast_from(grad[i])` is the exact f32→f64 widening `f64::from(*g)` performs on the host,
@@ -3092,10 +3075,10 @@ fn root_grad_hess_kernel_f64(grad: &Array<f32>, hess: &Array<f32>, out: &mut Arr
     }
 }
 
-/// §6.1 device root grad/hess sum over device grad/hess `Handle`s (29-01, OCX-01). Returns
+/// Device root grad/hess sum over device grad/hess `Handle`s. Returns
 /// `(sum_gradient, sum_hessian)` as `f64`. Launches the serial ascending f64 fold
 /// UNCONDITIONALLY on every lane (no `probe_capabilities` call, no capability branch, no f32
-/// fallback): f64 codegen runs on gfx1100 despite `has_f64 == false` (spike-072 fix-probe), so
+/// fallback): f64 codegen runs on this GPU despite `has_f64 == false`, so
 /// the result is BIT-EXACT vs [`kernels::grow_driver::root_grad_hess_fold`] on BOTH the cpu
 /// f64 anchor and the hip lane. Reads the resident buffers (no host re-upload); the ONLY
 /// device→host transfer is the single scalar-pair result. The `Result` signature is retained
@@ -3159,7 +3142,7 @@ pub fn root_grad_hess_sum_device_slices<R: cubecl::Runtime>(
 mod tests {
     use super::*;
 
-    /// The D-01 count-recovery landmine (17-RESEARCH Pitfall 1): `round_ties_even`
+    /// The count-recovery rounding: `round_ties_even`
     /// rounds `k.5` to the nearest EVEN integer, DIVERGING from `split.rs::round_int`
     /// (round-half-up). Proven for both the intrinsic and the branch-free fallback.
     #[test]
@@ -3174,8 +3157,8 @@ mod tests {
         assert_eq!(round_ties_even(2.6), 3, "2.6 → 3");
 
         // The load-bearing divergence: round-half-up (`(int)(x + 0.5f)`) would give
-        // 3 for 2.5; ties-to-even gives 2. This is exactly why D-01 mandates a
-        // separate fold from `split.rs::round_int`.
+        // 3 for 2.5; ties-to-even gives 2. This is exactly why a
+        // separate fold from `split.rs::round_int` is needed.
         let round_half_up = |x: f64| (x + 0.5_f32 as f64) as i32;
         assert_eq!(round_half_up(2.5), 3, "round-half-up gives 3 for 2.5");
         assert_ne!(
@@ -3194,7 +3177,7 @@ mod tests {
         }
     }
 
-    /// V5 launch-boundary validation (threat T-17-01): a zero `num_bin`, an
+    /// Launch-boundary validation: a zero `num_bin`, an
     /// overflowing `num_bin`, and a histogram-length mismatch are all rejected with a
     /// typed error BEFORE any launch.
     #[test]
@@ -3216,7 +3199,7 @@ mod tests {
         assert_eq!(validate_stage1_inputs(4, 8).unwrap(), 8);
     }
 
-    /// D-05 dispatch boundary: `num_bin > block_threads` spills to `_GlobalMemory`.
+    /// Dispatch boundary: `num_bin > block_threads` spills to `_GlobalMemory`.
     #[test]
     fn stage1_dispatch_globalmem_boundary() {
         // At or below the block width → in-block two-level path.
@@ -3227,7 +3210,7 @@ mod tests {
         assert!(stage1_needs_globalmem(300, STAGE1_BLOCK_THREADS));
     }
 
-    /// V5 (T-17-01/T-17-02): the `_GlobalMemory` scratch-slab sizing rejects a
+    /// The `_GlobalMemory` scratch-slab sizing rejects a
     /// zero/overflowing `largest_feature_bin_count × num_concurrent_blocks` product
     /// with a typed error BEFORE any allocation.
     #[test]
@@ -3250,7 +3233,7 @@ mod tests {
         assert_eq!(validate_globalmem_scratch(300, 4).unwrap(), 1200);
     }
 
-    /// D-11 alloc-once: the scratch constructor allocates EXACTLY
+    /// Alloc-once: the scratch constructor allocates EXACTLY
     /// [`NUM_STAGE1_SCRATCH_BUFFERS`] (+4) device buffers, once, and never more — the
     /// structural "no per-split device alloc" invariant (the `DeviceSplitInfo` counter
     /// idiom). Runs on the cubecl-cpu client (no `gpu` feature needed).
@@ -3263,13 +3246,13 @@ mod tests {
         assert_eq!(
             scratch.device_allocations(),
             NUM_STAGE1_SCRATCH_BUFFERS,
-            "the 4 scan/reserved buffers are allocated exactly once (D-11)"
+            "the 4 scan/reserved buffers are allocated exactly once"
         );
         assert_eq!(scratch.device_allocations(), 4);
         assert_eq!(scratch.slab_len(), 1200);
         assert_eq!(scratch.largest_feature_bin_count(), 300);
         assert_eq!(scratch.num_concurrent_blocks(), 4);
-        // Overflowing construction is rejected (V5) before any alloc.
+        // Overflowing construction is rejected before any alloc.
         assert!(Stage1GlobalMemScratch::new(&client, usize::MAX, 2).is_err());
     }
 
@@ -3286,7 +3269,7 @@ mod tests {
         }
     }
 
-    /// V5 stage-2 launch-boundary validation (T-17-01/T-17-02): zero operands and
+    /// Stage-2 launch-boundary validation: zero operands and
     /// overflowing `num_leaves × num_blocks_per_leaf` are rejected before any reduce;
     /// `num_blocks_per_leaf` derivation is `ceil(num_tasks / 1024)` (≥ 1).
     #[test]
@@ -3343,7 +3326,7 @@ mod tests {
         );
         assert_eq!(larger.gain, 9.0);
 
-        // A short slab (missing the larger half) is rejected (V5).
+        // A short slab (missing the larger half) is rejected.
         assert!(matches!(
             sync_best_split_for_leaf_on(&client, &per_task[..3], 3, false),
             Err(ComputeError::LengthMismatch { .. })
@@ -3375,16 +3358,16 @@ mod tests {
         assert!(leaf_best[1].is_valid, "no larger leaf → no invalidation");
     }
 
-    /// Stage-3 cross-leaf argmax + 8-int export + self-invalidation (ODL-12, §8.3):
+    /// Stage-3 cross-leaf argmax + 8-int export + self-invalidation:
     /// the field layout, the strict-`>` lowest-leaf tie-break, the behavioral
     /// self-invalidation (chosen leaf + cur_num_leaves slot), and the no-split path.
-    /// Runs on the cubecl-cpu client with the single 8-int readback (SC#2).
+    /// Runs on the cubecl-cpu client with the single 8-int readback.
     #[test]
     fn stage3_cross_leaf_argmax_export_and_self_invalidation() {
         use crate::runtime::cpu_client;
         let client = cpu_client();
 
-        // V5: out-of-range leaf indices rejected before the export.
+        // Out-of-range leaf indices rejected before the export.
         assert!(validate_stage3_inputs(2, 5, -1, 2).is_err());
         assert!(validate_stage3_inputs(2, 0, 9, 2).is_err());
         assert!(validate_stage3_inputs(2, 0, -1, 3).is_err());
@@ -3475,8 +3458,8 @@ mod tests {
     }
 
     /// The `assume_out_default_left` task-gen table
-    /// (`cuda_best_split_finder.cpp:137-227`) — all four rows, including the D-01
-    /// load-bearing divergence `default_left != reverse` (17-RESEARCH Pitfall 3).
+    /// (`cuda_best_split_finder.cpp:137-227`) — all four rows, including the
+    /// load-bearing divergence `default_left != reverse`.
     #[test]
     fn assume_out_default_left_table() {
         // Row 1: num_bin>2 && Zero → forward(assume=false) THEN reverse(assume=true),
@@ -3538,7 +3521,7 @@ mod tests {
             "num_bin<=2 Zero-missing reverse: reverse==true AND assume_out_default_left==true"
         );
 
-        // Row 3c: THE load-bearing divergence `default_left != reverse` (Pitfall 3):
+        // Row 3c: THE load-bearing divergence `default_left != reverse`:
         // num_bin<=2 NaN, non-categorical → single reverse task, assume = (NaN != NaN)
         // = **false**. reverse==true WHILE assume_out_default_left==false — proving
         // default_left is decoupled from reverse (host split.rs would wrongly emit
@@ -3552,7 +3535,7 @@ mod tests {
         assert!(
             small_nan[0].reverse && !small_nan[0].assume_out_default_left,
             "num_bin<=2 NaN reverse: reverse==true AND assume_out_default_left==false \
-             (default_left != reverse — Pitfall 3)"
+             (default_left != reverse)"
         );
 
         // Row 4: categorical → single forward task, is_categorical=true,
@@ -3573,7 +3556,7 @@ mod tests {
         );
         assert!(
             !cat_tasks[0].assume_out_default_left,
-            "categorical assume=false (Phase-22 seam)"
+            "categorical assume=false"
         );
         // Above the one-hot cap → is_one_hot=false.
         let mut cat_many = feat(0, 10, MissingType::None);
@@ -3585,7 +3568,7 @@ mod tests {
         );
     }
 
-    // ----- 28-01 (ODF-01/ODF-05): device-resident frontier reduction tests -----
+    // ----- device-resident frontier reduction tests -----
 
     /// A small pseudo-random `SplitScalars` fixture generator (deterministic LCG) for the
     /// frontier parity fixture — varies gain, feature index, threshold, default_left,
@@ -3606,8 +3589,8 @@ mod tests {
         }
     }
 
-    /// The device §8.2 + §8.3 reductions produce winners / best_leaf / 8-int export
-    /// BIT-IDENTICAL to the host folds ([`sync_best_split_for_leaf_on`] /
+    /// The device cross-feature + cross-leaf reductions produce winners / best_leaf / 8-int
+    /// export BIT-IDENTICAL to the host folds ([`sync_best_split_for_leaf_on`] /
     /// [`find_best_from_all_splits_on`]) on the cubecl-cpu f64 anchor, across a randomized
     /// 64-leaf × 32-feature fixture that includes gain ties, an all-invalid leaf, and the
     /// self-invalidation. Bit-exact on the gain (f64 bits) + integer equality on indices.
@@ -3621,7 +3604,7 @@ mod tests {
         let mut seed = 0x1234_5678_9abc_def0u64;
 
         // Build one resident frontier + host per-leaf records, one leaf at a time via the
-        // §8.2 reduce over a per-leaf `2·num_tasks` slab (smaller records used, is_smaller).
+        // cross-feature reduce over a per-leaf `2·num_tasks` slab (smaller records used, is_smaller).
         let frontier = SplitSoa::zeroed(&client, num_leaves);
         let mut host_leaf_best: Vec<SplitScalars> = Vec::with_capacity(num_leaves);
 
@@ -3679,7 +3662,7 @@ mod tests {
             }
         }
 
-        // §8.3 cross-leaf: pick the best leaf, self-invalidate, and export the 8-int buffer.
+        // Cross-leaf: pick the best leaf, self-invalidate, and export the 8-int buffer.
         let smaller_leaf_index = 5i32;
         let larger_leaf_index = 9i32;
         let cur_num_leaves = 40usize; // < num_leaves so the freshly-created slot exists
@@ -3740,7 +3723,7 @@ mod tests {
         }
     }
 
-    /// 31-03 (ODS-02, D-081-1): the §8.3 device pick export carries the WINNING leaf's OWN
+    /// The device pick export carries the WINNING leaf's OWN
     /// record (feat/thr/dleft + 4 child grad/hess sums) in cells `[8..15)`, bit-exact vs a
     /// direct [`SplitSoa::read_record`] on the winning slot — so the resident grow driver can
     /// seed the next partition/build FRESH from this single pick export instead of a host cache.
@@ -3785,7 +3768,7 @@ mod tests {
             left_sum_hessians: 2.5,
             right_sum_gradients: -3.5,
             right_sum_hessians: 4.5,
-            // 31-08 (ODS-02): distinct node-recording values so the export cells [15..18) are
+            // Distinct node-recording values so the export cells [15..18) are
             // checked against a direct read of the winning slot.
             left_value: 0.125,
             right_value: -0.375,
@@ -3840,7 +3823,7 @@ mod tests {
             w.right_sum_hessians.to_bits(),
             "winner right_sum_hessians"
         );
-        // 31-08 (ODS-02): the winning leaf's NET gain + child leaf outputs.
+        // The winning leaf's NET gain + child leaf outputs.
         assert_eq!(export.winner[7].to_bits(), w.gain.to_bits(), "winner gain");
         assert_eq!(
             export.winner[8].to_bits(),
@@ -3874,7 +3857,7 @@ mod tests {
         );
     }
 
-    /// 28-01 (ODF-05/ODF-06, §6.1): the ascending/serial `CubeDim(1)` device root grad/hess
+    /// The ascending/serial `CubeDim(1)` device root grad/hess
     /// reduction is BIT-IDENTICAL (f64 bit compare) to the ordered host fold
     /// [`crate::kernels::grow_driver::root_grad_hess_fold`] on the cpu-anchor lane. The ORDER,
     /// not just the accumulator width, is load-bearing (f64 add is non-associative).
@@ -3911,13 +3894,13 @@ mod tests {
         );
     }
 
-    /// 29-01 (OCX-01, §6.1) HIP lane: the device root sum runs the SAME serial ascending f64
-    /// fold as the cpu anchor (f64 codegen is proven to run on gfx1100 despite
-    /// `probe_capabilities().has_f64 == false` — spike-072 fix-probe), so it is BIT-EXACT
+    /// HIP lane: the device root sum runs the SAME serial ascending f64
+    /// fold as the cpu anchor (f64 codegen is proven to run on this GPU despite
+    /// `probe_capabilities().has_f64 == false`), so it is BIT-EXACT
     /// (f64 bit compare) vs the ascending host fold [`root_grad_hess_fold`] — NOT a ~1e-6
     /// envelope. This is a GPU-f64-vs-host-f64 SAME-ORDER compare, NOT a GPU-f32-vs-GPU-f32
-    /// pairing, so def-f8u-01 is not violated. The fixture is ≥500k elements with NON-UNIFORM
-    /// binary-logloss-like hessians — the exact regime where spike-072 caught the old f32 lane
+    /// pairing. The fixture is ≥500k elements with NON-UNIFORM
+    /// binary-logloss-like hessians — the exact regime that previously caught an old f32 lane
     /// biasing ~+382 hessian (3e-3 rel) at the root seed; the uniform-0.25/small-corpus blind
     /// spot that hid the bug is deliberately avoided. Runs only on `--features rocm`.
     #[cfg(feature = "rocm")]
@@ -3929,8 +3912,8 @@ mod tests {
 
         // ≥500k rows with NON-UNIFORM magnitudes. Binary-logloss-like hessians live in
         // [0.19, 0.25] (p·(1−p) for varied p) and gradients span [-0.5, 0.5] — the mixed
-        // magnitude/sign spread where a serial f32 accumulator at |acc|~1e5 accrues the
-        // ~+382 bias spike-072 pinned, while the f64 fold is exact in ascending order.
+        // magnitude/sign spread where a serial f32 accumulator at |acc|~1e5 accrues a
+        // ~+382 bias, while the f64 fold is exact in ascending order.
         let n = 500_000usize;
         let gradients: Vec<f32> = (0..n)
             .map(|r| {
@@ -3969,7 +3952,7 @@ mod tests {
     /// [`SplitSoa`] carries the 4 child gradient/hessian sum fields end-to-end:
     /// `from_records` (upload) → `read_record` (readback) preserves DISTINCT nonzero
     /// left/right sums bit-exact (`to_bits()` equal), and `zeroed` leaves them at 0.0
-    /// (31-01, ODS-02 D-081-1 — the "silently dropped to 0.0" carrier fix).
+    /// (guards against these fields being silently dropped to 0.0).
     #[test]
     fn split_soa_round_trips_child_sums() {
         use crate::runtime::cpu_client;
@@ -3986,7 +3969,7 @@ mod tests {
             left_sum_hessians: 2.5,
             right_sum_gradients: -3.5,
             right_sum_hessians: 4.5,
-            // 31-08 (ODS-02): child leaf outputs carried alongside the sums.
+            // Child leaf outputs carried alongside the sums.
             left_value: 0.625,
             right_value: -0.875,
             ..SplitScalars::default()
@@ -4048,10 +4031,9 @@ mod tests {
         }
     }
 
-    /// The §8.2 device reduce ([`sync_best_split_for_leaf_device`]) carries the WINNER's
+    /// The device cross-feature reduce ([`sync_best_split_for_leaf_device`]) carries the WINNER's
     /// 4 child grad/hess sums (not the loser's) through the fold, bit-exact; when every
-    /// task is invalid the output slot's sums stay at the seeded 0.0 sentinel
-    /// (31-01, ODS-02 D-081-1).
+    /// task is invalid the output slot's sums stay at the seeded 0.0 sentinel.
     #[test]
     fn sync_best_split_leaf_kernel_carries_child_sums() {
         use crate::runtime::cpu_client;
@@ -4156,7 +4138,7 @@ mod tests {
 
     /// The reduce-only path ([`sync_best_split_for_leaf_device`]) issues NO device→host
     /// readback — the blocking-readback sync counter stays 0 across a reduce-only call
-    /// (SC#2; the winner lives on device, handed off by handle).
+    /// (the winner lives on device, handed off by handle).
     #[test]
     fn frontier_reduce_only_no_readback() {
         use crate::kernels::grow_driver::on_device_sync_count_take;
@@ -4179,7 +4161,7 @@ mod tests {
         assert_eq!(
             on_device_sync_count_take(),
             0,
-            "the §8.2 device reduce must not issue a blocking readback (SC#2)"
+            "the device cross-feature reduce must not issue a blocking readback"
         );
     }
 }

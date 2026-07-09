@@ -1,4 +1,4 @@
-//! `find_best_split` cube kernel — the gain math lives INSIDE the kernel (D-01a).
+//! `find_best_split` cube kernel — the gain math lives INSIDE the kernel.
 //!
 //! VERBATIM transcription of `FindBestThresholdSequentially`
 //! (`LightGBM/src/treelearner/feature_histogram.hpp:830-1057`, commit 195c26fc,
@@ -7,14 +7,14 @@
 //! USE_SMOOTHING=false, SKIP_DEFAULT_BIN=?, NA_AS_MISSING=false>`. Both the
 //! REVERSE branch (`:854-936`, records `t-1+offset`) and the FORWARD branch
 //! (`:937-1029`, records `t+offset`) are transcribed 1:1 — NO loop
-//! restructuring, NO gate reordering (RESEARCH Pitfall 5).
+//! restructuring, NO gate reordering.
 //!
 //! The gain primitives ([`get_split_gains`] / [`get_leaf_gain`] /
 //! [`calculate_splitted_leaf_output`] / [`threshold_l1`]) are `#[cube]`
 //! functions in [`crate::gain`] called from inside this scan — the gain formula
-//! is computed in the kernel, not pre-supplied (D-01a).
+//! is computed in the kernel, not pre-supplied.
 //!
-//! ## Epsilon placements (RESEARCH Pitfall 4 — load-bearing, verbatim)
+//! ## Epsilon placements (load-bearing, verbatim)
 //! - `FindBestThreshold` adds `2 * kEpsilon` to `sum_hessian` at scan entry
 //!   (`feature_histogram.hpp:172`). The launcher passes `sum_hessian` already
 //!   bumped, mirroring `find_best_threshold_fun_(sum_gradient, sum_hessian + 2 *
@@ -64,8 +64,8 @@ use cubecl::prelude::*;
 use lgbm_core::types::K_EPSILON;
 
 /// Plain per-feature parameter record for the batched per-leaf split scan
-/// ([`Backend::find_best_splits_batched`](crate::Backend::find_best_splits_batched),
-/// 260608-lad Part 2). Carries EXACTLY the per-feature args the single-feature
+/// ([`Backend::find_best_splits_batched`](crate::Backend::find_best_splits_batched)).
+/// Carries EXACTLY the per-feature args the single-feature
 /// [`Backend::find_best_split`](crate::Backend::find_best_split) takes today
 /// (`lib.rs`), plus the feature's `slot_off` into the concatenated leaf histogram
 /// buffer (so each feature reads only `[slot_off, slot_off + 2*num_bin)` —
@@ -114,7 +114,7 @@ fn round_int_f32(x: f32) -> i32 {
 }
 
 /// The single shared `#[cube]` REVERSE+FORWARD best-split scan body — the SINGLE
-/// SOURCE OF TRUTH for the f64 split math (260608-mc5 THE MERGE).
+/// SOURCE OF TRUTH for the f64 split math.
 ///
 /// Both the single-feature launch kernel ([`find_best_split_kernel`], bases 0,0)
 /// AND the fused per-leaf batched kernel ([`find_best_splits_fused_kernel`], cube
@@ -123,8 +123,7 @@ fn round_int_f32(x: f32) -> i32 {
 /// `t-1+offset` / `t+offset` threshold arithmetic, the branchless-`select`
 /// encoding, the monotone `done` flag, and the finalization (subtract eps off the
 /// reported hessians) exist exactly ONCE. NO f64 op is reordered relative to the
-/// pre-extraction `find_best_split_kernel` body (RESEARCH Pitfall 5 / CLAUDE.md
-/// non-negotiable #1).
+/// pre-extraction `find_best_split_kernel` body (CLAUDE.md non-negotiable #1).
 ///
 /// `hist_base` is the feature's start cell in the (possibly concatenated) stride-2
 /// `[g0,h0,g1,h1,...]` f64 histogram buffer; bin index `bi` reads
@@ -209,7 +208,7 @@ pub fn split_scan_body(
     // `left_count < min_data_in_leaf` or `sum_left_hessian <
     // min_sum_hessian_in_leaf` holds it holds for every smaller t too — gating
     // those-and-all-later iterations off (`done`) yields the IDENTICAL winner the
-    // C++ `break` produces. (RESEARCH Pitfall 5: gate ORDER preserved exactly.)
+    // C++ `break` produces. (Gate ORDER preserved exactly.)
     {
         let mut sum_right_gradient = 0.0f64;
         let mut sum_right_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:856)
@@ -382,9 +381,9 @@ pub fn split_scan_body(
 
 /// The single-feature `find_best_split` launch kernel — a THIN `#[cube(launch)]`
 /// wrapper that delegates to the shared [`split_scan_body`] with bases `0, 0` (the
-/// whole histogram is one feature; the 12-cell `out` window starts at 0). After the
-/// 260608-mc5 merge this kernel holds NO scan logic of its own — the math lives
-/// once in `split_scan_body`, shared with the fused per-leaf batched kernel.
+/// whole histogram is one feature; the 12-cell `out` window starts at 0). This
+/// kernel holds NO scan logic of its own — the math lives once in
+/// `split_scan_body`, shared with the fused per-leaf batched kernel.
 ///
 /// Launched single-owner (`CubeDim::new_1d(1)`): the scan is inherently sequential.
 #[cube(launch)]
@@ -441,14 +440,15 @@ pub fn find_best_split_kernel(
 /// `FindBestThreshold` finalization accept-gate + `- min_gain_shift` net-gain.
 ///
 /// `penalty` (feature splitting penalty, `meta_->penalty`, `output->gain *=
-/// penalty` at `:174`) defaults to `1.0` here (Phase-7+ feature-penalty scope).
+/// penalty` at `:174`) defaults to `1.0` here (feature-penalty support is not yet
+/// implemented).
 ///
 /// # Errors
 /// - [`ComputeError::LengthMismatch`] if `hist.len() != 2 * num_bin`.
 /// - [`ComputeError::Runtime`] if `num_bin == 0` or `sum_hessian` is non-positive
 ///   (the C++ `cnt_factor = num_data / sum_hessian` would divide by ~0), or if
 ///   unsupported non-default gain params are supplied (max_delta_step /
-///   path_smooth — Phase-7+).
+///   path_smooth are not yet implemented).
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_split_cpu(
     client: &cubecl::prelude::ComputeClient<ActiveRuntime>,
@@ -506,11 +506,11 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     num_data: i32,
 ) -> Result<SplitInfo, ComputeError> {
     // --- V5 boundary validation (T-04-01) ---
-    // NA_AS_MISSING forward-branch (feature_histogram.hpp:945-961) is deferred
-    // (RESEARCH A5) — this layer threads the flag and validates it false on every
-    // captured case, but the NaN-missing forward preamble kernel body is NOT yet
-    // transcribed. Surface a TYPED error rather than silently mis-computing
-    // (T-05-01-01): the unimplemented branch can never produce a wrong SplitInfo.
+    // NA_AS_MISSING forward-branch (feature_histogram.hpp:945-961) is deferred —
+    // this layer threads the flag and validates it false on every captured case,
+    // but the NaN-missing forward preamble kernel body is NOT yet transcribed.
+    // Surface a TYPED error rather than silently mis-computing (T-05-01-01): the
+    // unimplemented branch can never produce a wrong SplitInfo.
     if na_as_missing {
         return Err(ComputeError::Runtime {
             detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
@@ -543,13 +543,13 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
                 .to_string(),
         });
     }
-    // Phase-4 scope: only the default no-op output-clamp / smoothing path is
-    // transcribed. Reject non-default values rather than silently mis-computing.
+    // Only the default no-op output-clamp / smoothing path is transcribed. Reject
+    // non-default values rather than silently mis-computing.
     //
-    // OCX-02 (29-02): now that the PRODUCTION on-device seam binds the learner's REAL
-    // `GainConfig` (not the permissive proving slice), this loud rejection is load-bearing —
-    // if a learner cfg carries a non-zero max_delta_step / path_smooth the driver's scans must
-    // keep ERRORING here rather than silently enabling unimplemented semantics on device.
+    // This rejection is load-bearing: the on-device seam binds the learner's REAL
+    // `GainConfig` (not a permissive proving slice), so a learner cfg carrying a
+    // non-zero max_delta_step / path_smooth must keep ERRORING here rather than
+    // silently enabling unimplemented semantics on device.
     if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_split: max_delta_step / path_smooth are Phase-7+ scope \
@@ -572,17 +572,15 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     // min_gain_shift = gain_shift + min_gain_to_split. Computed on the host with
     // the SAME f64 gain primitive the kernel uses (so it is bit-identical).
     //
-    // PARITY FIX (Phase-7 D-05, faithful-fix branch): `gain_shift` MUST use the
-    // `2*kEpsilon`-BUMPED `sum_hessian`, not the raw value. In C++ the lambda
-    // receives the already-bumped `sum_hessian` and passes it straight into
-    // `BeforeNumerical(... sum_hessian ...)` (feature_histogram.hpp:400-401,
-    // 411-413, 424-425), so `GetLeafGain`'s denominator is `sum_hessian + 2*kEpsilon
-    // + lambda_l2`. Using the raw `sum_hessian` here made the Rust `min_gain_shift`
-    // ~7 ULPs HIGHER than C++, which rejected the bagged-subset deeper splits whose
-    // `current_gain` exceeds the C++ `min_gain_shift` by a single f64 ULP — the
-    // DEF-06-01 / regression_l1+bagging knife-edge (binary_bag1_es0_bfa1 tree-0:
-    // rust 2 vs cpp 4 leaves). Source-built lib_lightgbm 4.6 FP trace confirmed:
-    // `min_gain_shift` from the bumped sum_hessian is bit-exact to the real binary.
+    // `gain_shift` MUST use the `2*kEpsilon`-BUMPED `sum_hessian`, not the raw
+    // value. In C++ the lambda receives the already-bumped `sum_hessian` and
+    // passes it straight into `BeforeNumerical(... sum_hessian ...)`
+    // (feature_histogram.hpp:400-401, 411-413, 424-425), so `GetLeafGain`'s
+    // denominator is `sum_hessian + 2*kEpsilon + lambda_l2`. Using the raw
+    // `sum_hessian` here makes `min_gain_shift` a few ULPs higher than C++, which
+    // can incorrectly reject splits whose `current_gain` exceeds the true
+    // `min_gain_shift` by only a single f64 ULP. `min_gain_shift` computed from the
+    // bumped sum_hessian is bit-exact to the reference implementation.
     let use_l1 = cfg.use_l1();
     let gain_shift = crate::gain::get_leaf_gain(
         use_l1,
@@ -617,8 +615,8 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
 
     let out_len = 12usize;
     let h_hist = client.create_from_slice(f64::as_bytes(hist));
-    // O1 (260609-aqy): the kernel WRITES (never `+=`) all 12 `out` cells
-    // unconditionally (single unit, no early return), so `out` needs no zero-init.
+    // The kernel WRITES (never `+=`) all 12 `out` cells unconditionally (single
+    // unit, no early return), so `out` needs no zero-init.
     // `empty()` skips the host zero-alloc + upload. Contrast the accumulate/atomic
     // buffers in histogram.rs:161 which MUST stay zeroed.
     let h_out = client.empty(out_len * core::mem::size_of::<f64>());
@@ -698,16 +696,13 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
 }
 
 
-/// Default scan cube width on rocm (spike-021). The fused split-scan was launched
+/// Default scan cube width on rocm. The fused split-scan was originally launched
 /// `CubeCount=(num_features,1,1) × CubeDim(1)` — one SINGLE-THREADED cube per feature,
 /// using 1 lane of each wave32 (~1/32 ALU utilization). Packing one feature per LANE
 /// (`CubeDim(W)`, `CubeCount=ceil(num_features/W)`) keeps each feature's scan sequential
-/// (bit-exact, no spike-016 reorder) but fills the wave. Measured on the wide shape
-/// (250k×500, gfx1152 8-CU APU, build drained so this is pure scan launch+readback):
-///   W=1 → 11.8s · W=32 → 5.74s (2.05×) · W=64 → 3.99s (2.96×) · W=128 → 3.33s (3.54×).
-/// W=64 = 1 cube/CU × 2 waves at 500 feats — the robust ~3× knee, not over-fit to
-/// W=128's APU-specific latency-hiding peak. APU-confounded magnitude; the SIGN is the
-/// deliverable (CONVENTIONS). Override with `LGBM_SCAN_CUBEDIM`.
+/// (bit-exact, no reorder) but fills the wave. Measurement showed W=64 as a robust
+/// occupancy knee across GPU shapes without over-fitting to any one device's
+/// latency-hiding peak. Override with `LGBM_SCAN_CUBEDIM`.
 #[cfg(feature = "gpu")]
 const SCAN_CUBE_DIM_DEFAULT: u32 = 64;
 
@@ -734,16 +729,15 @@ fn scan_cube_dim() -> u32 {
     1
 }
 
-// ===================== phase-13 (13-03): SCAN-W autotune =====================
+// ===================== SCAN-W autotune =====================
 //
 // CubeCL autotune for the split-SCAN `CubeDim` width `W`. The fused feature-per-lane
-// scan (spike-021) is BIT-EXACT across every `W` — each feature's scan stays
-// sequential (lane `f = ABSOLUTE_POS`, guarded `< n_feats`); `W` only changes which
-// lane runs each still-sequential per-feature scan, NOT the result (no spike-016
-// reorder). So the tuner is free to pick the measured-fastest `W` per occupancy
-// regime. Default-ON on rocm; `LGBM_AUTOTUNE=0` and an explicit `LGBM_SCAN_CUBEDIM`
-// both fall back to `scan_cube_dim()` (the documented bound + the 13-04 all-W parity
-// seam). Mirrors the 13-02 build-`P` machinery in `histogram.rs`.
+// scan is BIT-EXACT across every `W` — each feature's scan stays sequential (lane
+// `f = ABSOLUTE_POS`, guarded `< n_feats`); `W` only changes which lane runs each
+// still-sequential per-feature scan, NOT the result. So the tuner is free to pick the
+// measured-fastest `W` per occupancy regime. Default-ON on rocm; `LGBM_AUTOTUNE=0` and
+// an explicit `LGBM_SCAN_CUBEDIM` both fall back to `scan_cube_dim()` (the documented
+// bound + the all-W parity seam). Mirrors the build-`P` machinery in `histogram.rs`.
 #[cfg(feature = "gpu")]
 use crate::kernels::autotune::{self, LaunchKey};
 #[cfg(feature = "gpu")]
@@ -751,27 +745,26 @@ use cubecl::tune::{local_tuner, CloneInputGenerator, LocalTuner, Tunable, Tunabl
 
 /// The scan-`W` candidate set the SCAN tuner sweeps (`CubeDim::new_1d(W)`,
 /// `CubeCount = ceil(n_slots / W)`). Each entry is clamped `[1, 256]` (a wavefront is
-/// 32/64 lanes; `>256` just wastes a too-large cube). spike-021 found `W=64` the robust
-/// ~3× knee on the 8-CU APU; the SET only needs to SPAN the occupancy regimes
-/// (`{32,64,128,256}`) so the tuner re-derives the per-GPU winner on any future GPU
-/// (measure-don't-model). `W=1` is intentionally NOT in the set — it is the
-/// one-cube-per-feature degenerate the lever exists to AVOID; it stays reachable as the
-/// `LGBM_SCAN_CUBEDIM=1` / non-rocm bit-exact oracle.
+/// 32/64 lanes; `>256` just wastes a too-large cube). The SET only needs to SPAN the
+/// occupancy regimes (`{32,64,128,256}`) so the tuner re-derives the per-GPU winner on
+/// any future GPU (measure-don't-model). `W=1` is intentionally NOT in the set — it is
+/// the one-cube-per-feature degenerate the lever exists to AVOID; it stays reachable as
+/// the `LGBM_SCAN_CUBEDIM=1` / non-rocm bit-exact oracle.
 ///
-/// `pub` so the 13-04 parity gate (`oracle-harness/tests/kernel_parity.rs`) imports the
-/// SAME source of truth it sweeps (WR-02): a hand-copied mirror would silently stop
-/// covering a newly-added `W`. Stays `#[cfg(feature = "rocm")]` so the default build is
+/// `pub` so the parity gate (`oracle-harness/tests/kernel_parity.rs`) imports the SAME
+/// source of truth it sweeps (WR-02): a hand-copied mirror would silently stop covering
+/// a newly-added `W`. Stays `#[cfg(feature = "rocm")]` so the default build is
 /// byte-unchanged.
 #[cfg(feature = "gpu")]
 pub const SCAN_WSET: &[u32] = &[32, 64, 128, 256];
 
 /// The SINGLE-LEAF SCAN cache namespace — `local_tuner!("scan")` ⇒
-/// `LocalTuner<LaunchKey, String>`, distinct from the build tuner's `"build"` namespace
-/// (13-02). Holds the persistent key→fastest_index map (mirrored to disk via `std_io`).
+/// `LocalTuner<LaunchKey, String>`, distinct from the build tuner's `"build"` namespace.
+/// Holds the persistent key→fastest_index map (mirrored to disk via `std_io`).
 #[cfg(feature = "gpu")]
 static SCAN_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("scan");
 
-/// The CO-PACK 2-slot sibling-scan cache namespace (the phase-12 sibling-scan launcher).
+/// The CO-PACK 2-slot sibling-scan cache namespace (the sibling-scan launcher).
 /// A SEPARATE tuner from [`SCAN_TUNER`] so the two kernel families never share a cache
 /// entry — their [`LaunchKey`] would otherwise collide on `(0, feats, bins)` yet
 /// benchmark different kernels. Each tuner caches its own winner over the SHARED
@@ -845,10 +838,10 @@ fn launch_scan_at<R: cubecl::Runtime>(
 /// `bucket: 0` (NOT `size_band(rows)`): the scan width depends on the feature/bin SHAPE
 /// (how many sequential per-feature scans pack into a wave), NOT the per-leaf row count —
 /// so the key is STABLE across a train and the cache amortizes without a per-leaf tuning
-/// storm (spike-039). `num_bins` is the widest feature's bin count (the per-feature
-/// slot-width driver, matching 13-02's `bins`).
+/// storm. `num_bins` is the widest feature's bin count (the per-feature slot-width
+/// driver, matching the build tuner's `bins`).
 ///
-/// `CloneInputGenerator` is CORRECT here (spike-038 OVERWRITE class): the scan kernel
+/// `CloneInputGenerator` is CORRECT here (an OVERWRITE-class kernel): the scan kernel
 /// WRITES each feature's 12-cell `out` window FRESH every run (a `store`, NOT the
 /// accumulating BUILD kernel's `fetch_add`), so re-running a benchmark rep on the shared
 /// `out` handle recomputes the IDENTICAL window. Do NOT "fix" this to a fresh-output
@@ -1044,17 +1037,17 @@ fn scan_wset_siblings_tunable_set<R: cubecl::Runtime>(
     }
     set
 }
-// ================== end phase-13 (13-03): SCAN-W autotune ====================
+// ================== end SCAN-W autotune ====================
 
-/// FUSED per-leaf batched best-split kernel (260608-mc5 THE COLLAPSE). ONE launch
-/// finds EVERY feature's best split for a leaf: lane `f` (`ABSOLUTE_POS`, guarded
-/// `< n_feats`) scans only its `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of
-/// the concatenated f64 histogram `hist` and writes only its 12-cell window
-/// `out[f*12 .. f*12+12]` (threat T-mc5-02). The per-feature scan is sequential; the
-/// launch packs one feature per LANE (`CubeCount=ceil(num_feats/W), CubeDim(W)`,
-/// spike-021 scan-occupancy lever). `W=1` reproduces the original one-cube-per-feature
-/// shape byte-for-byte; `W>1` only changes which thread runs each (still-sequential,
-/// bit-identical) per-feature scan.
+/// FUSED per-leaf batched best-split kernel. ONE launch finds EVERY feature's best
+/// split for a leaf: lane `f` (`ABSOLUTE_POS`, guarded `< n_feats`) scans only its
+/// `[slot_off[f], slot_off[f] + 2*num_bin[f])` region of the concatenated f64
+/// histogram `hist` and writes only its 12-cell window `out[f*12 .. f*12+12]`
+/// (threat T-mc5-02). The per-feature scan is sequential; the launch packs one
+/// feature per LANE (`CubeCount=ceil(num_feats/W), CubeDim(W)`, the scan-occupancy
+/// lever). `W=1` reproduces the original one-cube-per-feature shape byte-for-byte;
+/// `W>1` only changes which thread runs each (still-sequential, bit-identical)
+/// per-feature scan.
 ///
 /// The leaf-level scalars (`use_l1` .. `num_data`) are identical across features
 /// (the leaf totals + cfg + the host-computed `min_gain_shift`), so they are passed
@@ -1086,14 +1079,14 @@ pub fn find_best_splits_fused_kernel(
     // tail cube has lanes with `ABSOLUTE_POS >= n_feats`; those lanes must no-op.
     n_feats: u32,
 ) {
-    // Scan-occupancy lever (spike-021): the feature index is the GLOBAL lane index
+    // Scan-occupancy lever: the feature index is the GLOBAL lane index
     // `ABSOLUTE_POS = CUBE_POS_X * CUBE_DIM + UNIT_POS`. With `CubeDim::new_1d(1)`
     // this is byte-identical to the original one-cube-per-feature launch
     // (`ABSOLUTE_POS == CUBE_POS_X`); with `CubeDim::new_1d(W)` it packs W features
     // per cube, ONE per lane. Each lane runs the SAME sequential `split_scan_body`
     // for its own feature over a DISJOINT histogram region — no shared state, no
-    // reorder (unlike spike-016's within-feature parallel scan) — so the per-feature
-    // f64 result is bit-identical regardless of W; only wave ALU utilization changes.
+    // reorder of the per-feature scan itself — so the per-feature f64 result is
+    // bit-identical regardless of W; only wave ALU utilization changes.
     // `ABSOLUTE_POS` is `usize` in cubecl; cast to u32 so the `f * 12u32` window
     // offset and the `f < n_feats` guard keep the original kernel's exact types.
     let f = ABSOLUTE_POS as u32;
@@ -1123,7 +1116,7 @@ pub fn find_best_splits_fused_kernel(
     }
 }
 
-/// CO-PACKED 2-slot per-leaf best-split kernel (spike-024, Phase 12). ONE launch
+/// CO-PACKED 2-slot per-leaf best-split kernel. ONE launch
 /// scans BOTH siblings of a split: the smaller child's histogram `hist_a` and the
 /// larger child's `hist_b`, over `2*n_feats` feature-slots. Global lane
 /// `g = ABSOLUTE_POS` (guarded `< 2*n_feats`): `g < n_feats` ⇒ sibling-A (smaller)
@@ -1138,13 +1131,13 @@ pub fn find_best_splits_fused_kernel(
 /// `num_data`/`min_gain_shift` differ — the smaller child is built, the larger is
 /// subtract-derived). Each lane runs the SHARED [`split_scan_body`] over its
 /// sibling's DISJOINT histogram region — the SAME sequential reverse+forward scan as
-/// the single-slot kernel, no reorder (NOT spike-016) — so each feature's f64 result
+/// the single-slot kernel, no reorder — so each feature's f64 result
 /// is BIT-IDENTICAL to two separate single-slot scans; co-packing only changes WHICH
 /// launch a feature's scan runs in, not its math.
 ///
 /// `split_scan_body` takes ONE `hist: &Array<f64>` and cannot select between two
-/// Array refs into a binding (spike-024 gotcha), so the body is called in EACH arm
-/// with that sibling's histogram + that sibling's leaf scalars.
+/// Array refs into a binding, so the body is called in EACH arm with that sibling's
+/// histogram + that sibling's leaf scalars.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_splits_fused_siblings_kernel(
@@ -1235,8 +1228,8 @@ pub fn find_best_splits_fused_siblings_kernel(
     }
 }
 
-/// FUSED batched per-leaf best-split launcher (260608-mc5 THE MERGE + THE COLLAPSE),
-/// **generic over the runtime** `R`. Finds the best split for EVERY feature in
+/// FUSED batched per-leaf best-split launcher, **generic over the runtime** `R`.
+/// Finds the best split for EVERY feature in
 /// `feats` in ONE launch of [`find_best_splits_fused_kernel`], returning one
 /// [`SplitInfo`] per input feature **in input order** (T-lsx-01).
 ///
@@ -1272,8 +1265,8 @@ pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
         return Ok(Vec::new());
     }
     // Upload the host histogram buffer ONCE and delegate to the Handle-consuming
-    // body — the SINGLE SOURCE of the fused-scan validation/launch/decode (260608-p90:
-    // the resident scan reuses the SAME body with a device-resident Handle instead of
+    // body — the SINGLE SOURCE of the fused-scan validation/launch/decode (the
+    // resident scan reuses the SAME body with a device-resident Handle instead of
     // this fresh upload, guaranteeing byte-identical numerics between the host-buf and
     // resident scans). `as_bytes` is the same `CubeElement` call the kernel uses.
     let h_hist = client.create_from_slice(f64::as_bytes(buf));
@@ -1289,7 +1282,7 @@ pub fn find_best_splits_batched_fused_f64_on<R: cubecl::Runtime>(
     )
 }
 
-/// Upload a host f64 slice to a device `Handle` and return it (260608-p90) — a thin
+/// Upload a host f64 slice to a device `Handle` and return it — a thin
 /// CMP-01-respecting helper so cubecl-free callers (the oracle-harness resident-scan
 /// parity test) can feed a raw Handle to
 /// [`find_best_splits_batched_fused_f64_from_handle_on`] without naming `cubecl`
@@ -1301,7 +1294,7 @@ pub fn upload_f64_buffer<R: cubecl::Runtime>(
     client.create_from_slice(f64::as_bytes(buf))
 }
 
-/// Read an f64 device `Handle` back to a `Vec<f64>` (260608-t3t) — a thin
+/// Read an f64 device `Handle` back to a `Vec<f64>` — a thin
 /// CMP-01-respecting helper so cubecl-free callers (the fused==host oracle) can read
 /// a resident histogram Handle without naming `cubecl` types. `len` is the cell
 /// count the Handle describes. `read_one_unchecked` is the same readback the kernel
@@ -1317,8 +1310,8 @@ pub fn read_f64_handle<R: cubecl::Runtime>(
     v
 }
 
-/// Handle-consuming sibling of [`find_best_splits_batched_fused_f64_on`] (260608-p90
-/// Task 1A) — the device-resident fused per-leaf split scan. IDENTICAL to the
+/// Handle-consuming sibling of [`find_best_splits_batched_fused_f64_on`] —
+/// the device-resident fused per-leaf split scan. IDENTICAL to the
 /// host-buf launcher EXCEPT it CONSUMES a device `Handle` for the concatenated
 /// stride-2 f64 histogram buffer (NO `client.create_from_slice` upload), so the
 /// resident chain's fixed+compacted histogram never leaves the device. The SAME
@@ -1363,8 +1356,8 @@ pub fn find_best_splits_batched_fused_f64_from_handle_on<R: cubecl::Runtime>(
     )
 }
 
-/// Shared inner body for the fused per-leaf split scan (260608-p90 Task 1A — the
-/// single source of the validation / scalar pre-step / launch / decode). Both the
+/// Shared inner body for the fused per-leaf split scan — the
+/// single source of the validation / scalar pre-step / launch / decode. Both the
 /// host-buf launcher (after a one-time upload) and the resident
 /// Handle-consuming launcher call this with an already-allocated `hist_handle`
 /// describing `buf_len` f64 cells, so the host-buf and resident scans are
@@ -1388,8 +1381,8 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         return Ok(Vec::new());
     }
 
-    // Phase-4 scope (leaf-level, checked once): only the default smoothing/clamp
-    // path is transcribed. Reject non-default values rather than mis-compute.
+    // Leaf-level, checked once: only the default smoothing/clamp path is
+    // transcribed. Reject non-default values rather than mis-compute.
     if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_splits_batched: max_delta_step / path_smooth are Phase-7+ scope \
@@ -1407,7 +1400,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         });
     }
 
-    // spike-015: env-gated (`LGBM_SCAN_PROF=1`) per-leaf scan round-trip timers. Inert
+    // Env-gated (`LGBM_SCAN_PROF=1`) per-leaf scan round-trip timers. Inert
     // when off (the `Instant`s are still taken but never read — negligible, and parity
     // is untouched since no value/order changes). Marshal starts here.
     let _scan_prof = crate::fusion_prof::scan_enabled();
@@ -1483,7 +1476,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
-    // spike-015: marshal done; upload begins.
+    // Marshal done; upload begins.
     if _scan_prof {
         crate::fusion_prof::SCAN_MARSHAL_NS.fetch_add(
             _t_marshal.elapsed().as_nanos() as u64,
@@ -1507,14 +1500,14 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
 
-    // spike-015: upload done.
+    // Upload done.
     if _scan_prof {
         crate::fusion_prof::SCAN_UPLOAD_NS.fetch_add(
             _t_upload.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    // spike-015 DIAGNOSTIC (LGBM_SCAN_DRAIN=1): force-drain the async-queued f32-atomic
+    // DIAGNOSTIC (`LGBM_SCAN_DRAIN=1`): force-drain the async-queued f32-atomic
     // build by reading the resident histogram handle BEFORE the scan launch, so build
     // device-compute is attributed to `build_drain` instead of materializing inside the
     // scan's readback sync. Removes build/scan overlap → diagnostic only, off by default.
@@ -1528,12 +1521,12 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     }
     let _t_launch = std::time::Instant::now();
 
-    // phase-13 (13-03): autotune-or-fallback selection of the scan width W.
+    // Autotune-or-fallback selection of the scan width W.
     //   (a) autotune default-ON UNLESS `LGBM_AUTOTUNE=0` OR an explicit
     //       `LGBM_SCAN_CUBEDIM` override (the override always wins — it is the documented
-    //       escape hatch + the 13-04 all-W parity seam). The tuner drives the launch over
+    //       escape hatch + the all-W parity seam). The tuner drives the launch over
     //       `SCAN_WSET`; its winner writes the real `h_out` (CloneInputGenerator → the
-    //       final winning run uses the ORIGINAL handles, OVERWRITE class spike-038).
+    //       final winning run uses the ORIGINAL handles, an OVERWRITE-class kernel).
     //   (b) else → the EXISTING `scan_cube_dim()` direct launch, byte-for-byte unchanged
     //       (covers `LGBM_AUTOTUNE=0`, an explicit `LGBM_SCAN_CUBEDIM`, and the non-rocm
     //       `scan_cube_dim()==1` bit-exact oracle path).
@@ -1579,12 +1572,12 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     }
 
     if !autotuned {
-        // spike-021 scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
+        // Scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
         // (env `LGBM_SCAN_CUBEDIM`; rocm default W=64, W=1 = byte-identical to the
         // original) is the cube width W; `CubeCount = ceil(n / W)`. The kernel indexes
-        // features by the
-        // global lane `ABSOLUTE_POS` and guards `f < n_feats`, so the tail cube's spare
-        // lanes no-op and the result is bit-identical to W=1 for every W.
+        // features by the global lane `ABSOLUTE_POS` and guards `f < n_feats`, so the
+        // tail cube's spare lanes no-op and the result is bit-identical to W=1 for
+        // every W.
         let scan_w = scan_cube_dim();
         let cube_count = (n as u32).div_ceil(scan_w);
 
@@ -1663,7 +1656,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
             out.push(SplitInfo::none());
         }
     }
-    // spike-015: launch+readback+decode done.
+    // Launch+readback+decode done.
     if _scan_prof {
         crate::fusion_prof::SCAN_LAUNCH_NS.fetch_add(
             _t_launch.elapsed().as_nanos() as u64,
@@ -1673,13 +1666,13 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     Ok(out)
 }
 
-/// CO-PACKED 2-slot resident best-split launcher (spike-024, Phase 12) — scans BOTH
+/// CO-PACKED 2-slot resident best-split launcher — scans BOTH
 /// siblings of a split (the smaller child `hist_a_handle` and the larger child
 /// `hist_b_handle`) in ONE launch of [`find_best_splits_fused_siblings_kernel`] with
 /// ONE `read_one_unchecked` readback, returning `(vec_a, vec_b)` — one
 /// [`SplitInfo`] per input feature, in input order, per sibling.
 ///
-/// This is the device-launch-structural win of spike-024: it replaces the TWO
+/// This is the device-launch-structural win of co-packing: it replaces the TWO
 /// separate `find_best_splits_fused_inner` calls (two launches, two blocking
 /// readbacks / syncs) the fall-back uses with ONE launch + ONE sync. The per-feature
 /// V5 validation + device-array assembly is done ONCE (the feature/region layout is
@@ -1720,12 +1713,12 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // spike-015: env-gated (`LGBM_SCAN_PROF=1`) scan round-trip profiling. Bound here so the
+    // Env-gated (`LGBM_SCAN_PROF=1`) scan round-trip profiling. Bound here so the
     // LGBM_SCAN_DRAIN co-pack analog below can gate identically to the single-leaf path
-    // (find_best_splits_fused_inner :1342). Inert when off (parity untouched).
+    // (find_best_splits_fused_inner). Inert when off (parity untouched).
     let _scan_prof = crate::fusion_prof::scan_enabled();
 
-    // Phase-4 scope (leaf-level, checked once on the shared cfg).
+    // Leaf-level, checked once on the shared cfg.
     if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_splits_siblings: max_delta_step / path_smooth are Phase-7+ scope \
@@ -1850,10 +1843,10 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
 
-    // spike-015 DIAGNOSTIC (LGBM_SCAN_DRAIN=1) — co-pack analog (quick-260625-tw1): drain
+    // DIAGNOSTIC (`LGBM_SCAN_DRAIN=1`) — co-pack analog: drain
     // BOTH sibling resident histogram handles before the scan launch so each child's async
-    // f32-atomic build is attributed to SCAN_DRAIN_NS, not the scan readback. Phase-12 co-pack
-    // bypassed the single-leaf drain (split.rs:1450); this restores it on the production path.
+    // f32-atomic build is attributed to SCAN_DRAIN_NS, not the scan readback, mirroring
+    // the single-leaf drain on the production co-pack path.
     // Gated identically (`_scan_prof && scan_drain_enabled()`) → off by default, parity-neutral.
     if _scan_prof && crate::fusion_prof::scan_drain_enabled() {
         let t_drain = std::time::Instant::now();
@@ -1865,9 +1858,9 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         );
     }
 
-    // phase-13 (13-03): autotune-or-fallback selection of the scan width W — the SAME
+    // Autotune-or-fallback selection of the scan width W — the SAME
     // guard as the single-leaf `find_best_splits_fused_inner`, here for the co-pack
-    // 2-slot sibling scan (the phase-12 production hot path). The sibling kernel is the
+    // 2-slot sibling scan (the production hot path). The sibling kernel is the
     // SAME OVERWRITE class (each lane writes a fresh 12-cell window), so its tunable set
     // also uses CloneInputGenerator; it runs under the SEPARATE `SCAN_SIBLINGS_TUNER`
     // namespace so its cache never collides with the single-leaf scan's.
@@ -2011,24 +2004,23 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
 }
 
 // ============================================================================
-// 31-07 (ODS-02 / D-081-1): DEVICE-SIDE cross-feature reduce of a leaf's raw
-// per-feature scan output DIRECTLY into a target `SplitSoa` leaf slot — the
-// zero-per-feature-array-readback path Plan 08 wires into the resident grow loop
-// to retire the 3 `bump_sync` host-argmax readbacks.
+// DEVICE-SIDE cross-feature reduce of a leaf's raw per-feature scan output
+// DIRECTLY into a target `SplitSoa` leaf slot — a zero-per-feature-array-readback
+// path wired into the resident grow loop to retire host-argmax readbacks.
 //
-// Decision D-31-C (planning): the §8.2 reduce kernel `sync_best_split_leaf_kernel`
-// (best_split.rs) is NOT reused here. Its `take` condition is strict-gain-only
-// (first-task-index-wins-on-a-tie) — correct for its OWN 2-record winner+pad
-// frontier-fold, but WRONG for a genuine N-feature cross-feature reduce where an
-// EXACT gain tie must be broken by the LOWER real feature index (the cpu-f64
-// `SerialTreeLearner::split_gt` anchor `argmax_over_resident_splits` implements).
-// So this builds ONE NEW kernel that reuses BOTH proven idioms verbatim: the
-// array-only output-slot-as-accumulator SHAPE (`sync_best_split_leaf_kernel`) AND
-// the two-key (gain, real-feature-index) tie-break FORMULA (`find_best_leaf_kernel`,
-// §8.3, the SAME formula proven bit-exact for the cross-LEAF pick, 28-07/WR-01).
+// The reduce kernel `sync_best_split_leaf_kernel` (best_split.rs) is NOT reused
+// here. Its `take` condition is strict-gain-only (first-task-index-wins-on-a-tie)
+// — correct for its OWN 2-record winner+pad frontier-fold, but WRONG for a genuine
+// N-feature cross-feature reduce where an EXACT gain tie must be broken by the
+// LOWER real feature index (the cpu-f64 `SerialTreeLearner::split_gt` anchor
+// `argmax_over_resident_splits` implements). So this builds ONE NEW kernel that
+// reuses BOTH proven idioms verbatim: the array-only output-slot-as-accumulator
+// SHAPE (`sync_best_split_leaf_kernel`) AND the two-key (gain, real-feature-index)
+// tie-break FORMULA (`find_best_leaf_kernel`, the SAME formula proven bit-exact
+// for the cross-LEAF pick).
 // ============================================================================
 
-/// §8.2 cross-FEATURE reduce BODY (31-07). Decodes one leaf's raw `n*12`-cell scan
+/// Cross-FEATURE reduce BODY. Decodes one leaf's raw `n*12`-cell scan
 /// window (`find_best_splits_fused_kernel` / `find_best_splits_fused_siblings_kernel`
 /// / `build_fix_scan_fused_kernel` all emit the SAME layout) with the SAME
 /// accept-gate + net-gain + `split_gt` tie-break as the host `argmax_over_resident_splits`,
@@ -2041,7 +2033,7 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
 /// `[9]`=default_left flag (0.0/1.0). Cells `[3]`/`[4]` (counts), `[10]`/`[11]`
 /// (outputs) are NOT carried by `SplitSoa` (it stores the 4 sums, not counts/outputs).
 ///
-/// Array-only-`select` discipline (28-01, `sync_best_split_leaf_kernel`): the running
+/// Array-only-`select` discipline (matching `sync_best_split_leaf_kernel`): the running
 /// winner lives in `out_*[slot]` (indexed by the constant `slot`, always dominates);
 /// every `select` operand is an array load or a literal — the only unification cubecl
 /// 0.10 accepts. Selection compares the RAW gain (`raw[dbase+2]`) directly (monotone in
@@ -2120,7 +2112,7 @@ fn reduce_scan_output_into_leaf_kernel(
         out_lsum_h[slot] = select(take, raw[dbase + 6], out_lsum_h[slot]);
         out_rsum_g[slot] = select(take, raw[dbase + 7], out_rsum_g[slot]);
         out_rsum_h[slot] = select(take, raw[dbase + 8], out_rsum_h[slot]);
-        // 31-08 (ODS-02): carry the winning feature's child leaf OUTPUTS device→device
+        // Carry the winning feature's child leaf OUTPUTS device→device
         // (raw cells [10]/[11], the SAME `left_output`/`right_output` the host decode reads —
         // NOT recomputed from the eps-adjusted sums). Same array-only-`select` discipline.
         out_lval[slot] = select(take, raw[dbase + 10], out_lval[slot]);
@@ -2188,14 +2180,14 @@ pub(crate) fn launch_reduce_into_leaf<R: cubecl::Runtime>(
 }
 
 /// Shared V5 validation + `min_gain_shift` pre-step + fused-scan launch for the
-/// no-readback reduce launchers (31-07). Byte-for-byte the SAME per-feature V5
+/// no-readback reduce launchers. Byte-for-byte the SAME per-feature V5
 /// validation + the SAME `2*kEpsilon` bump + `min_gain_shift` + the SAME
 /// [`find_best_splits_fused_kernel`] launch as [`find_best_splits_fused_inner`], but it
 /// RETURNS the raw `h_out` Handle (n*12 cells) + `min_gain_shift` INSTEAD of reading it
 /// back — the reduce kernel folds it on device. The direct `scan_cube_dim()` launch is
-/// used (NOT the autotune path): `W` is bit-neutral (spike-021, every `W` byte-identical),
+/// used (NOT the autotune path): `W` is bit-neutral (every `W` byte-identical),
 /// so skipping the tuner here keeps the reduce launchers self-contained and leaves the
-/// shipped host-readback `find_best_splits_fused_inner` byte-unchanged (D-31-C — additive
+/// shipped host-readback `find_best_splits_fused_inner` byte-unchanged (additive
 /// only). Empty `feats` → `Ok(None)` (no launch). Mirrors `find_best_splits_fused_inner`'s
 /// error contract exactly.
 #[allow(clippy::type_complexity)]
@@ -2347,7 +2339,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     Ok(Some((h_out, out_len, min_gain_shift)))
 }
 
-/// SINGLE-LEAF no-readback reduce-into-leaf launcher (31-07, ODS-02). Mirrors
+/// SINGLE-LEAF no-readback reduce-into-leaf launcher. Mirrors
 /// [`find_best_splits_batched_fused_f64_from_handle_on`]'s signature + validation but
 /// takes `real_feats: &[i32]` (feature-position → real feature index, the tie-break key)
 /// + a target [`SplitSoa`] + `out_leaf` INSTEAD of returning `Vec<SplitInfo>`. Runs the
@@ -2420,14 +2412,14 @@ pub fn find_best_splits_fused_reduce_into_leaf_on<R: cubecl::Runtime>(
 }
 
 /// Shared V5 validation + per-sibling `min_gain_shift` pre-step + co-packed sibling scan
-/// launch for the no-readback co-pack reduce launcher (31-07). Byte-for-byte the SAME
+/// launch for the no-readback co-pack reduce launcher. Byte-for-byte the SAME
 /// validation + the SAME per-sibling `2*kEpsilon` bump + the SAME
 /// [`find_best_splits_fused_siblings_kernel`] launch as
 /// [`find_best_splits_fused_siblings_from_handles_on`], but RETURNS the raw `2*n*12`
 /// `h_out` Handle + `(min_gain_shift_a, min_gain_shift_b)` INSTEAD of reading it back. Uses
 /// the direct `scan_cube_dim()` launch (bit-neutral `W`; no autotune) so the reduce launcher
 /// is self-contained and the shipped `find_best_splits_fused_siblings_from_handles_on` stays
-/// byte-unchanged (D-31-C — additive only). Empty `feats` → `Ok(None)`.
+/// byte-unchanged (additive only). Empty `feats` → `Ok(None)`.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
@@ -2599,10 +2591,10 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)))
 }
 
-/// CO-PACK (2-sibling) no-readback reduce-into-leaves launcher (31-07, ODS-02). Mirrors
+/// CO-PACK (2-sibling) no-readback reduce-into-leaves launcher. Mirrors
 /// [`find_best_splits_fused_siblings_from_handles_on`]'s signature but writes BOTH siblings'
 /// winners DIRECTLY into two target [`SplitSoa`] slots (`out_leaf_a` / `out_leaf_b`) via TWO
-/// invocations of Task 1's shared [`reduce_scan_output_into_leaf_kernel`] on the SAME
+/// invocations of the shared [`reduce_scan_output_into_leaf_kernel`] on the SAME
 /// `2*n*12` `h_out` (raw_base `0` for sibling A, `n*12` for sibling B), issuing ZERO
 /// device→host transfer of the per-feature array. Each half is bit-exact to
 /// `argmax_over_resident_splits` over that sibling's `Vec<SplitInfo>`.
@@ -3119,7 +3111,7 @@ fn scan_forward_pass(
     w
 }
 
-/// **ADDITIVE** 2-lane native f64 best-split scan (quick-260620-8v4) — a
+/// **ADDITIVE** 2-lane native f64 best-split scan — a
 /// bit-identical alternative to [`find_best_split_cpu_native`] that runs the
 /// REVERSE and FORWARD passes on two `rayon::join` lanes and combines their
 /// standalone winners with a final argmax. The serial
@@ -3320,16 +3312,14 @@ pub fn find_best_split_cpu_native_2lane(
 }
 
 
-// The Phase-4 `cfg_skip_default_bin(default_bin, num_bin)` heuristic
-// (`default_bin < num_bin`) was REMOVED in Phase-5 (Plan 05-01, RESEARCH
-// Pitfall 1). The authoritative `SKIP_DEFAULT_BIN`/`NA_AS_MISSING` flags
-// (`feature_histogram.hpp:284-285`: `num_bin > 2 && missing_type == Zero` for
+// A `cfg_skip_default_bin(default_bin, num_bin)` heuristic (`default_bin < num_bin`)
+// is deliberately NOT used here. The authoritative `SKIP_DEFAULT_BIN`/`NA_AS_MISSING`
+// flags (`feature_histogram.hpp:284-285`: `num_bin > 2 && missing_type == Zero` for
 // skip, `num_bin > 2 && missing_type == NaN` for na_as_missing, both false for
-// `missing_type == None`) are now derived in the learner from
-// `bin_mapper.missing_type()` and threaded through `Backend::find_best_split` /
-// `find_best_split_cpu` / `find_best_split_raw_f32_on` as explicit params, so the
-// kernel dispatch matches C++ exactly instead of approximating it from the bin
-// layout.
+// `missing_type == None`) are derived in the learner from `bin_mapper.missing_type()`
+// and threaded through `Backend::find_best_split` / `find_best_split_cpu` /
+// `find_best_split_raw_f32_on` as explicit params, so the kernel dispatch matches
+// C++ exactly instead of approximating it from the bin layout.
 
 #[cfg(test)]
 mod tests {
@@ -3447,9 +3437,9 @@ mod tests {
     }
 
     /// `na_as_missing == true` is a TYPED error (the NA_AS_MISSING forward branch
-    /// is deferred, RESEARCH A5) — never a panic, never a wrong SplitInfo
-    /// (T-05-01-01). This is asserted BEFORE any length/num_bin validation so the
-    /// deferral is unambiguous even on otherwise-valid input.
+    /// is deferred) — never a panic, never a wrong SplitInfo (T-05-01-01). This is
+    /// asserted BEFORE any length/num_bin validation so the deferral is
+    /// unambiguous even on otherwise-valid input.
     #[test]
     fn find_best_split_na_as_missing_is_typed_error() {
         let client = cpu_client();
@@ -3493,11 +3483,11 @@ mod tests {
     }
 
     // ===================================================================
-    // quick-260620-8v4: the additive 2-lane native scan
-    // (`find_best_split_cpu_native_2lane`) MUST be byte-for-byte identical to the
-    // serial source of truth (`find_best_split_cpu_native`) across the full
-    // parameter matrix. Parity is the non-negotiable gate; the 2-lane variant is
-    // only a latency lever, never a numeric change.
+    // The additive 2-lane native scan (`find_best_split_cpu_native_2lane`) MUST be
+    // byte-for-byte identical to the serial source of truth
+    // (`find_best_split_cpu_native`) across the full parameter matrix. Parity is
+    // the non-negotiable gate; the 2-lane variant is only a latency lever, never a
+    // numeric change.
     // ===================================================================
 
     /// Bit-compare two `SplitInfo`s: every f64 field by its raw bit pattern (so a
@@ -3684,7 +3674,7 @@ mod tests {
         );
     }
 
-    // ===================== 31-07 split_reduce_into_leaf =====================
+    // ===================== split_reduce_into_leaf =====================
 
     /// A `BatchedSplitFeature` with only `na_as_missing` varying (the rest are inert for
     /// the reduce, which reads the raw scan cells not the feature layout).
@@ -3789,7 +3779,7 @@ mod tests {
             want.right_sum_hessian.to_bits(),
             "right_sum_hessians bit-exact"
         );
-        // 31-08 (ODS-02): the child leaf OUTPUTS carried device→device (raw cells [10]/[11]).
+        // The child leaf OUTPUTS carried device→device (raw cells [10]/[11]).
         // On the host-readback parity tests `want` is a REAL scan winner, so this proves the
         // reduce carries the SAME `left_output`/`right_output` the host decode reads.
         assert_eq!(
@@ -3804,7 +3794,7 @@ mod tests {
         );
     }
 
-    /// 31-07 (T-31-11): the raw-cell-level engineered TIE fixture — mirrors
+    /// The raw-cell-level engineered TIE fixture — mirrors
     /// `on_device_argmax_reduce_matches_host_argmax_bit_for_bit`'s Case B at the kernel-decode
     /// level: real feats `[7, 2, 5, 2]`, net gains `[8, 8, 4, 8]` (min_gain_shift = 0). The new
     /// reduce kernel must resolve the 3-way max-gain tie to fpos 1 (real index 2 — the LOWEST
@@ -3905,7 +3895,7 @@ mod tests {
         }
     }
 
-    /// 31-07: the single-leaf no-readback launcher folds a winner into the target `SplitSoa`
+    /// The single-leaf no-readback launcher folds a winner into the target `SplitSoa`
     /// slot BIT-EXACT to `find_best_splits_batched_fused_f64_from_handle_on` (host readback) +
     /// `argmax_over_resident_splits`, on a real (non-tied) multi-feature histogram batch.
     #[test]
@@ -3938,7 +3928,7 @@ mod tests {
         assert_slot_eq(&got, &host_best, real_feats[host_fpos as usize]);
     }
 
-    /// 31-07: the na_as_missing whole-batch reject is PRESERVED — the reduce launcher returns
+    /// The na_as_missing whole-batch reject is PRESERVED — the reduce launcher returns
     /// the SAME typed `ComputeError::Runtime` the host-readback launcher returns for the
     /// identical input (not silently bypassed).
     #[test]
@@ -3971,9 +3961,9 @@ mod tests {
         );
     }
 
-    // ================= 31-07 Task 2: co-pack siblings_reduce_into_leaves =================
+    // ================= co-pack siblings_reduce_into_leaves =================
 
-    /// 31-07 (T-31-11, co-pack): the raw-cell-level fixture — sibling A's features TIE at the
+    /// The raw-cell-level fixture (co-pack) — sibling A's features TIE at the
     /// max gain across out-of-fpos-order real indices (fpos 1 wins, real 2), sibling B has a
     /// single clear winner (fpos 2, real 5). Two invocations of the shared reduce kernel
     /// (raw_base 0 for A, n*12 for B) fold each winner into its own `SplitSoa` slot, bit-exact
@@ -4047,7 +4037,7 @@ mod tests {
         (buf, 0.0, 12.0, 12)
     }
 
-    /// 31-07 (Task 2): the co-pack no-readback launcher matches
+    /// The co-pack no-readback launcher matches
     /// `find_best_splits_fused_siblings_from_handles_on` + `argmax_over_resident_splits` on BOTH
     /// sibling halves, bit-exact, on a real (non-tied) synthetic batch.
     #[test]

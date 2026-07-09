@@ -17,7 +17,7 @@
 
 use lgbm_treelearner::{DataPartition, SerialTreeLearner};
 use lgbm_compute::Backend;
-// Phase-20 (§11, ODL-16) resident device score path. These are the kernel/type
+// Resident device score path. These are the kernel/type
 // SYMBOLS the boosting toggle routes to — NOT a GPU compute runtime (the methods
 // stay generic over `B::Runtime` via the re-exported `ComputeClient`), so the
 // CMP-01 no-runtime gate still holds.
@@ -30,9 +30,9 @@ use lgbm_model::Tree;
 /// C++ `ScoreUpdater::score_` — the f64 accumulated raw score buffer.
 ///
 /// Length is `num_data * num_class` (class-major: class `k`'s rows occupy
-/// `[k*num_data, (k+1)*num_data)`). For the 06-02 single-output spine `num_class
-/// = 1`, but the layout/offset arithmetic is the multiclass-ready form so 06-04
-/// reuses it unchanged.
+/// `[k*num_data, (k+1)*num_data)`). The current single-output spine uses `num_class
+/// = 1`, but the layout/offset arithmetic is the multiclass-ready form so a future
+/// multiclass path reuses it unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoreUpdater {
     /// `std::vector<double> score_` — the f64 accumulator.
@@ -41,13 +41,13 @@ pub struct ScoreUpdater {
     num_data: i32,
     /// `num_class` — number of class-major score blocks.
     num_class: i32,
-    /// Phase-20 (§11, ODL-16) `boosting_on_cuda_` seam: when `true`, the resident
+    /// The `boosting_on_cuda_` seam: when `true`, the resident
     /// device score path (`*_on` methods below) runs the constant/per-leaf ops on
     /// the device buffer and mirrors back to `self.score`; when `false` those
     /// methods delegate to the byte-unchanged host path. Keyed on
     /// `lgbm_compute::cuda_on_device_enabled()` at construction (D-09: OFF by
     /// default with `LGBM_CUDA_ON_DEVICE` unset), overridable by the GBDT device
-    /// driver via [`ScoreUpdater::set_boosting_on_cuda`] (Plan 20-04).
+    /// driver via [`ScoreUpdater::set_boosting_on_cuda`].
     boosting_on_cuda: bool,
 }
 
@@ -142,13 +142,13 @@ impl ScoreUpdater {
     }
 
     // =====================================================================
-    // Phase-20 (§11, ODL-16) — resident device score path + host-mirror toggle.
+    // Resident device score path + host-mirror toggle.
     //
     // ADDITIVE and GATED (D-09): with `LGBM_CUDA_ON_DEVICE` unset, `boosting_on_cuda`
     // is `false` and every `*_on` method delegates to the byte-unchanged host path
     // above. When the toggle is on, the constant ops route to the §11
     // `add_score_constant_on` / `multiply_score_constant_on` kernels and the per-leaf
-    // training-path AddScore delegates to the Phase-18
+    // training-path AddScore delegates to the
     // `add_prediction_to_score_on_device` tree-walk kernel (D-02 — NO new tree-walk
     // kernel), keeping the buffer resident and mirroring it back into `self.score`
     // (`CopyFromCUDADeviceToHost`) so non-resident consumers (`scores()` /
@@ -157,7 +157,7 @@ impl ScoreUpdater {
     // OUT-OF-SLICE (stay host): the DART/RF per-row-predict paths
     // [`Self::add_tree_predict_path`] / [`Self::add_tree_scaled_all`] are NOT part
     // of the continuous proving slice (they walk real feature values per row, not
-    // the partition scatter) and remain on the host path this phase.
+    // the partition scatter) and remain on the host path.
     // =====================================================================
 
     /// Whether the resident device score path is active (the `boosting_on_cuda_`
@@ -168,8 +168,8 @@ impl ScoreUpdater {
         self.boosting_on_cuda
     }
 
-    /// Driver seam: force the resident/host toggle. The GBDT device driver (Plan
-    /// 20-04) sets this from `on_device_eligible`; the env-gated default from
+    /// Driver seam: force the resident/host toggle. The GBDT device driver
+    /// sets this from `on_device_eligible`; the env-gated default from
     /// [`ScoreUpdater::new`] already reflects `LGBM_CUDA_ON_DEVICE`.
     #[inline]
     pub fn set_boosting_on_cuda(&mut self, on: bool) {
@@ -221,13 +221,13 @@ impl ScoreUpdater {
     }
 
     /// §11 training-path `AddScore` (resident, D-02): the per-leaf score scatter
-    /// delegates to the Phase-18 [`add_prediction_to_score_on_device`] tree-walk
+    /// delegates to the [`add_prediction_to_score_on_device`] tree-walk
     /// kernel — NO new per-row tree-walk kernel is introduced. The kernel returns
     /// the `num_data`-length per-row raw-margin delta; this adds it into class
     /// `cur_tree_id`'s slice and mirrors the resident buffer back to `self.score`.
     ///
     /// `predict_tree` / `rows` / `num_features` / `bit_type` are the walk inputs the
-    /// device driver (Plan 20-04) reconstructs from the grown `Tree` + `Dataset`
+    /// device driver reconstructs from the grown `Tree` + `Dataset`
     /// bins; on the identity-binned corpus this is bit-exact to the host
     /// partition scatter [`Self::add_tree_train_path`] (the L2 contract).
     ///
@@ -262,7 +262,7 @@ impl ScoreUpdater {
         Ok(())
     }
 
-    /// Phase-25 (25-03, ODP2-04, §11) resident `AddScore` for an ON-DEVICE-grown tree:
+    /// Resident `AddScore` for an ON-DEVICE-grown tree:
     /// add a PRE-COMPUTED per-row leaf-value `delta` (produced on device by the grow
     /// driver's resident partition scatter
     /// [`lgbm_compute::add_prediction_to_score_on_device_resident`] over the resident
@@ -273,7 +273,7 @@ impl ScoreUpdater {
     ///
     /// This is the SCATTER analog of [`Self::add_tree_train_path_on_device`] (which
     /// re-walks the tree over a reconstructed `[num_data × num_features]` bin matrix each
-    /// iter — the 5,420ms Phase-24 host-scoring long-pole): the grow already computed the
+    /// iteration, a significant host-scoring cost): the grow already computed the
     /// row→leaf partition ON DEVICE, so the score move only scatters exact f64 leaf
     /// values by integer row index. Bit-exact to the host partition scatter
     /// [`Self::add_tree_train_path`] on the cpu-f64 anchor (`delta[i]` IS that leaf

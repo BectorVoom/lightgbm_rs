@@ -1,15 +1,14 @@
-//! quick 260620-dpk — env-gated per-bucket wall-clock accumulators for the unified
-//! host-fusion per-leaf fixed cost. Inert unless `LGBM_FUSION_PROF=1`; in that case the
-//! four per-leaf buckets of [`build_fix_scan_impl`](crate::CpuBackend) and
-//! [`subtract_scan_impl`](crate::CpuBackend) accumulate into process-global atomics that
-//! the Task-1 bench harness prints via [`dump`].
+//! Env-gated per-bucket wall-clock accumulators for the unified host-fusion per-leaf
+//! fixed cost. Inert unless `LGBM_FUSION_PROF=1`; in that case the four per-leaf buckets
+//! of [`build_fix_scan_impl`](crate::CpuBackend) and [`subtract_scan_impl`](crate::CpuBackend)
+//! accumulate into process-global atomics that a bench harness prints via [`dump`].
 //!
 //! Measurement-only: every counter sits behind the [`enabled`] gate, so when the env var
 //! is off the instrumented sites add NOTHING — no value is read, written, gathered, or
-//! reordered. Parity is therefore unaffected (proven FORCED-ON in the Task-4 gate, which
-//! never sets `LGBM_FUSION_PROF`). Lives in `lgbm-compute` (not the treelearner
-//! `phase_prof`) because the fused impls are in this crate and `lgbm-compute` must NOT
-//! depend on `lgbm-treelearner` (that would be a dependency CYCLE).
+//! reordered. Parity is therefore unaffected when the gate is off. Lives in
+//! `lgbm-compute` (not the treelearner `phase_prof`) because the fused impls are in this
+//! crate and `lgbm-compute` must NOT depend on `lgbm-treelearner` (that would be a
+//! dependency CYCLE).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,22 +22,20 @@ pub static BFS_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 /// (3+4) FORK/JOIN + PARALLEL WORK: the `par_iter` region (fork/join floor + fold/fix/scan).
 pub static BFS_PAR_NS: AtomicU64 = AtomicU64::new(0);
 
-// --- quick 260620-njg: split the BFS_PAR work region into its three sub-stages so the
-//     dominant per-feature WORK sub-bucket is known before any "cheaper work" change.
+// --- The BFS_PAR work region is split into three sub-stages so the dominant
+//     per-feature WORK sub-bucket is known before any "cheaper work" change.
 //     Each is timed PER FEATURE inside the `par_iter` closure via the thread-safe
 //     `time()` (relaxed fetch_add), so concurrent rayon tasks accumulate into the shared
 //     atomic; inert when `LGBM_FUSION_PROF` is unset (closure runs identically → parity
-//     untouched, proven FORCED-ON in the parity gate). These three sum to ~BFS_PAR_NS
-//     minus the fork/join floor.
+//     untouched). These three sum to ~BFS_PAR_NS minus the fork/join floor.
 /// (3a) BUILD: the per-feature [`fold_one_feature`](crate::fold_one_feature) histogram fold
 /// (the once-gathered f32 ord read + per-bin f64 RMW). The f64-pregather micro-lever
-/// (QUICK-260620-njg) targets the `f64::from(ord_g[k])` widening inside this fold.
+/// targets the `f64::from(ord_g[k])` widening inside this fold.
 pub static BFS_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 /// (3b) FIX+COMPACT: `fix_histogram_inline` + `compact_histogram_inline` (no-ops in the
-/// common `most_freq_bin==0` / `offset==0` case — expected ~0). (QUICK-260620-njg)
+/// common `most_freq_bin==0` / `offset==0` case — expected ~0).
 pub static BFS_FIXCOMPACT_NS: AtomicU64 = AtomicU64::new(0);
 /// (3c) SCAN: the per-feature `find_best_split` split scan over the built histogram.
-/// (QUICK-260620-njg)
 pub static BFS_SCAN_NS: AtomicU64 = AtomicU64::new(0);
 
 // --- subtract_scan_impl (larger / subtract-derived child) buckets ---
@@ -47,7 +44,7 @@ pub static SUB_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 /// (3+4) FORK/JOIN + PARALLEL WORK: the `par_iter` subtract+scan region.
 pub static SUB_PAR_NS: AtomicU64 = AtomicU64::new(0);
 
-// --- spike-015: per-leaf GPU scan round-trip buckets (`find_best_splits_fused_inner`).
+// --- Per-leaf GPU scan round-trip buckets (`find_best_splits_fused_inner`).
 //     Independent gate `LGBM_SCAN_PROF=1` (separate from LGBM_FUSION_PROF) so the GPU
 //     scan decomposition can run without the CPU-fusion counters. Inert when unset. ---
 /// (1) MARSHAL: per-feature V5 validation + the 7 per-feature index arrays + leaf scalars.
@@ -76,7 +73,7 @@ pub fn enabled() -> bool {
     *E.get_or_init(|| std::env::var("LGBM_FUSION_PROF").map(|v| v == "1").unwrap_or(false))
 }
 
-/// Whether `LGBM_SCAN_PROF=1` is set (cached once) — the spike-015 GPU scan gate.
+/// Whether `LGBM_SCAN_PROF=1` is set (cached once) — the GPU scan gate.
 #[inline]
 pub fn scan_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
@@ -170,10 +167,10 @@ pub fn dump(label: &str) {
             bp as f64 / 1e4 / bfs_tot
         );
     }
-    // quick 260620-njg: the BUILD/FIX+COMPACT/SCAN sub-buckets are summed PER-THREAD
-    // across the rayon tasks, so their sum (`work_tot`) overcounts the single-threaded
-    // `par` wall by ~num_threads — the meaningful diagnostic is their share of the WORK
-    // (which sub-stage dominates the per-feature compute), NOT their fraction of `par`.
+    // The BUILD/FIX+COMPACT/SCAN sub-buckets are summed PER-THREAD across the rayon
+    // tasks, so their sum (`work_tot`) overcounts the single-threaded `par` wall by
+    // ~num_threads — the meaningful diagnostic is their share of the WORK (which
+    // sub-stage dominates the per-feature compute), NOT their fraction of `par`.
     let work_tot = (bbuild + bfix + bscan) as f64 / 1e6;
     eprintln!(
         "[fusion_prof:{label}] WORK (per-thread summed): build={:.3}ms fix+compact={:.3}ms scan={:.3}ms total={:.3}ms",

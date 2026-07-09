@@ -1,25 +1,21 @@
-//! `CopySubrow` row-subset gather + on-device bagging draw — **15-04**.
-//!
-//! Owning plan: **15-04**. Scope locked by **ODL-04**, **D-05** (block structure),
-//! **D-06** (arbitrary/GOSS indices), **D-07** (the gather kernel), **D-08** (cpu
-//! f64 anchor), **V5 / T-15-IDX** (out-of-range index rejection BEFORE launch).
+//! `CopySubrow` row-subset gather + on-device bagging draw.
 //!
 //! ## What lives here (design doc §3 `CopySubrowKernel_ColumnData`)
-//! - [`copy_subrow_kernel`] — the D-07 gather kernel: one unit per SELECTED row
+//! - [`copy_subrow_kernel`] — the gather kernel: one unit per SELECTED row
 //!   copies `in[used_indices[local]] → out[local]`, producing the compacted binned
 //!   subset for a bagging/subset selection. The kernel body is the real skeleton
 //!   (it is trivial and width-generic over `B: Int`).
-//! - [`copy_subrow_on`] — the host launcher that validates indices (V5) and drives
+//! - [`copy_subrow_on`] — the host launcher that validates indices and drives
 //!   the kernel per [`BinColumn`] width.
 //! - [`bagging_draw_on`] — the on-device bagging-draw wrapper that reproduces the
-//!   host `[in-bag asc] ++ [OOB desc]` draw (D-05).
+//!   host `[in-bag asc] ++ [OOB desc]` draw.
 //!
-//! ## Layout-difference warning (Pitfall 3)
+//! ## Layout-difference warning
 //! `CopySubrow` gathers the COLUMN-major store ([`super::column_data`]); it is NOT
 //! the row-major partition-local `data[idx * ncol + tx]` buffer of
 //! [`super::row_data`] (§13).
 //!
-//! ## RNG / security (V6, carried from [`super::random`])
+//! ## RNG / security
 //! The bagging draw reuses the deterministic, NON-cryptographic `Random` LCG; it
 //! exists ONLY to reproduce the C++ reference bit-for-bit and MUST NEVER be a
 //! source of secure randomness.
@@ -39,13 +35,13 @@ pub const COPY_SUBROW_BLOCK_SIZE: u32 = 1024;
 /// cycle; see the module prohibition).
 pub const BAGGING_RAND_BLOCK: i32 = 1024;
 
-/// The D-07 row-subset gather kernel (§3 `CopySubrowKernel_ColumnData`): one unit
+/// The row-subset gather kernel (§3 `CopySubrowKernel_ColumnData`): one unit
 /// per SELECTED row `local` copies `out_col[local] = in_col[used_indices[local]]`.
 /// Width-generic over `B: Int` (u8/u16/u32) — the bin is an index, byte-faithful
-/// across widths (the spike-029 native-width precedent, see [`super::partition`]).
+/// across widths (see [`super::partition`]).
 ///
 /// Tail units (`local >= num_used`) stay idle — the launch rounds the unit count up
-/// to a multiple of the cube dim (manual §4 Safe Indexing).
+/// to a multiple of the cube dim.
 #[cube(launch)]
 pub fn copy_subrow_kernel<B: Int>(
     in_col: &Array<B>,
@@ -59,16 +55,16 @@ pub fn copy_subrow_kernel<B: Int>(
     let local = ABSOLUTE_POS;
     if local < num_used as usize {
         // `used_indices[local]` is a non-negative row id (the host validates
-        // `0 <= idx < num_data` BEFORE launch, V5/T-15-IDX), so the `as usize`
+        // `0 <= idx < num_data` BEFORE launch), so the `as usize`
         // index cast is value-faithful.
         let src = used_indices[local] as usize;
         out_col[local] = in_col[src];
     }
 }
 
-/// Host launcher for [`copy_subrow_kernel`]: validate `used_indices` (V5 —
-/// `0 <= idx < num_data` for every entry, returning [`ComputeError`] BEFORE any
-/// launch, T-15-IDX) then gather `column` into the compacted subset at its native
+/// Host launcher for [`copy_subrow_kernel`]: validate `used_indices`
+/// (`0 <= idx < num_data` for every entry, returning [`ComputeError`] BEFORE any
+/// launch) then gather `column` into the compacted subset at its native
 /// [`BinColumn`] width.
 ///
 /// # Errors
@@ -81,14 +77,14 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
 ) -> Result<BinColumn, ComputeError> {
     use cubecl::prelude::CubeElement;
 
-    // --- CR-02: enforce the SAFETY invariant the kernel launch relies on. The kernel
+    // Enforce the SAFETY invariant the kernel launch relies on. The kernel
     // reads `in_col[used_indices[local]]` from a device buffer uploaded from `column`
     // (length `column.len()`), but the per-element index check below bounds indices by
     // `num_data` — an INDEPENDENT public parameter. If `num_data > column.len()`, an
     // index in `[column.len(), num_data)` would pass validation yet produce an
     // out-of-bounds device read. Validate the source-buffer relationship at the boundary,
     // BEFORE any launch, so the `SAFETY` comment's `num_data == n_in` is enforced rather
-    // than assumed. ---
+    // than assumed.
     if column.len() != num_data {
         return Err(ComputeError::LengthMismatch {
             expected: num_data,
@@ -96,11 +92,11 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
         });
     }
 
-    // --- V5 / T-15-IDX boundary validation: every used index must be in
+    // Boundary validation: every used index must be in
     // `[0, num_data)` BEFORE any unsafe launch (the `partition.rs:233-241`
     // per-index precedent). The C++ raw-pointer subset table has no bounds check;
     // the Rust port adds one so a malformed index can never reach an OOB device
-    // read. ---
+    // read.
     for (pos, &idx) in used_indices.iter().enumerate() {
         if idx < 0 {
             return Err(ComputeError::Runtime {
@@ -132,10 +128,10 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
 
     // Dispatch the kernel monomorph on the column's NATIVE width (u8/u16/u32) — the
     // `partition.rs` `launch_native!` idiom — so the subset uploads/reads at the same
-    // narrow width and the output `BinColumn` keeps that width (D-07, no widen).
+    // narrow width and the output `BinColumn` keeps that width (no widen).
     macro_rules! gather_native {
         ($w:ty, $variant:path, $slice:expr) => {{
-            // T-15-PART: guard the output byte sizing against `usize` overflow.
+            // Guard the output byte sizing against `usize` overflow.
             let elem = core::mem::size_of::<$w>();
             let out_bytes = num_used.checked_mul(elem).ok_or_else(|| ComputeError::Runtime {
                 detail: format!(
@@ -150,7 +146,7 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
             // all three outlive the launch. The kernel bounds-checks `local <
             // num_used` and each `used_indices[local]` was validated in `[0, num_data)`
             // above (and `num_data == n_in`), so every `in_col[used_indices[local]]`
-            // read is in range. All cubecl unsafe is confined here (CMP-01).
+            // read is in range. All cubecl unsafe is confined here.
             unsafe {
                 copy_subrow_kernel::launch::<$w, R>(
                     client,
@@ -176,23 +172,23 @@ pub fn copy_subrow_on<R: cubecl::Runtime>(
 }
 
 /// On-device bagging draw: reproduce the host `[in-bag asc] ++ [OOB desc]` index
-/// layout (D-05) bit-for-bit. One device RNG task per `BAGGING_RAND_BLOCK`-row block
+/// layout bit-for-bit. One device RNG task per `BAGGING_RAND_BLOCK`-row block
 /// (seeded `bagging_seed + block`) draws the per-row `NextFloat` stream via the
-/// Phase-14 [`draw_next_float_on`] launcher; the route is then computed host-side —
+/// [`draw_next_float_on`] launcher; the route is then computed host-side —
 /// `(draw as f64) < bagging_fraction` sends a row in-bag (left, ascending) else OOB
 /// (right) — and the OOB tail is reversed so the layout reads `[in-bag asc] ++
 /// [OOB desc]`. Returns the `bag_data_indices` layout.
 ///
-/// ## Seed-supply seam (Pitfall 5 — iteration-0 anchor only)
+/// ## Seed-supply seam (iteration-0 anchor only)
 /// `seeds[b] = bagging_seed + b` reproduces the host draw at iteration 0 (each block
 /// `Random` constructed once from `bagging_seed + block`). Multi-iteration training
 /// advances per-block RNG state across iterations; carrying that continuity needs the
-/// host to SUPPLY the per-block state — an explicit Phase-21 seam, NOT this phase.
+/// host to SUPPLY the per-block state, which is not implemented here.
 ///
-/// ## Anchor discipline (D-05 / D-08)
+/// ## Anchor discipline
 /// The draw stream is anchored to the inline HOST `bag_data_indices` reference, never
-/// GPU-vs-GPU (def-f8u-01). The f32 `NextFloat` is promoted to f64 BEFORE the `<
-/// bagging_fraction` compare (Pitfall 6) — matching the C++ `NextFloat() < fraction`.
+/// compared GPU-vs-GPU. The f32 `NextFloat` is promoted to f64 BEFORE the `<
+/// bagging_fraction` compare — matching the C++ `NextFloat() < fraction`.
 ///
 /// # Errors
 /// [`ComputeError`] on a runtime/launch failure (e.g. draw-output sizing overflow,
@@ -223,8 +219,8 @@ pub fn bagging_draw_on<R: cubecl::Runtime>(
     // stream is directly row-indexed. f32-exact via the shared `Random` recurrence.
     let draws = draw_next_float_on(client, &seeds, BAGGING_RAND_BLOCK as u32)?;
 
-    // Host-side route (Open Question 2 — simplest, fully anchored): promote the f32
-    // draw to f64 (Pitfall 6) and compare `< bagging_fraction`, filling in-bag left
+    // Host-side route: promote the f32
+    // draw to f64 and compare `< bagging_fraction`, filling in-bag left
     // (ascending) / OOB right, then reverse the OOB tail → `[in-bag asc] ++ [OOB desc]`
     // (mirrors `sample_strategy` + the `threading.h:152-155` one-buffer reverse).
     let nd_usize = nd as usize;

@@ -12,9 +12,9 @@ use thiserror::Error;
 
 /// Errors raised at the `lgbm-compute` `Backend` boundary.
 ///
-/// Mirrors the Phase-2 `DatasetError` discipline: every kernel input is
-/// validated to a typed error before any `unsafe` launch, so a malformed
-/// caller request can never reach undefined behaviour in a kernel.
+/// Every kernel input is validated to a typed error before any `unsafe`
+/// launch, so a malformed caller request can never reach undefined
+/// behaviour in a kernel.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ComputeError {
     /// A per-row bin index fell outside the valid `[0, num_bin)` range.
@@ -70,9 +70,8 @@ pub enum ComputeError {
     /// A non-finite (NaN or ±inf) value was produced on the opt-in on-device grow
     /// path — a seeded root grad/hess sum or an emitted leaf value.
     ///
-    /// OCX-04 (spike-072 method takeaway (d)): GBDT's C++-faithful no-split
-    /// pop-loop silently turns ONE NaN boosting iteration into a truncated model
-    /// (the observed 13-tree collapse). This tripwire makes the on-device arm FAIL
+    /// GBDT's C++-faithful no-split pop-loop can silently turn one NaN boosting
+    /// iteration into a truncated model. This tripwire makes the on-device arm FAIL
     /// LOUDLY at first onset instead — the guard lives on the compute/grow return
     /// path, NEVER in the boosting pop-loop (whose bit-faithful semantics stay
     /// unchanged). The `detail` names the offending quantity (leaf index / value or
@@ -121,8 +120,8 @@ mod tests {
 
     #[test]
     fn non_finite_names_quantity() {
-        // OCX-04: the on-device tripwire error must name the offending quantity so a
-        // NaN/±inf failure is diagnosable at the learner seam (spike-072 takeaway (d)).
+        // The on-device tripwire error must name the offending quantity so a
+        // NaN/±inf failure is diagnosable at the learner seam.
         let e = ComputeError::NonFinite {
             detail: "leaf 7 value is inf".to_string(),
         };

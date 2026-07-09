@@ -1,40 +1,31 @@
-//! Phase-29 29-05 (OCX-05, Task 1) — the ONE end-to-end proof gate on the EXACT
-//! spike-072 A/B corpus.
+//! End-to-end training regression gate on a fixed 500k×50 binary A/B corpus.
 //!
 //! # What this gate proves
 //!
-//! At master-before-Phase-29 the opt-in on-device arm (`LGBM_CUDA_ON_DEVICE=1`) trained a
-//! **13-tree model** on this exact corpus — boosting stopped when the f32 serial root-fold
-//! bias (spike-072 item 13) compounded to NaN grad/hess by iter 13, and GBDT's C++-faithful
-//! no-split pop-loop silently truncated the model. The Phase-28 "first not-slower cell"
-//! (0.931×) therefore compared a 13-tree model against a 100-tree host baseline
-//! (`28-AB-RESULTS.md`, invalidated per spike-072 Results 1-4).
+//! The opt-in on-device arm (`LGBM_CUDA_ON_DEVICE=1`) must train a full 100-tree model on
+//! this corpus with every leaf value finite and bounded. An f32 serial root-fold bias could
+//! previously compound to NaN grad/hess mid-training, and GBDT's C++-faithful no-split
+//! pop-loop would silently truncate the model to fewer trees. This gate is the committed,
+//! executed regression proof that the on-device arm trains 100/100 trees, matching the host
+//! arm.
 //!
-//! With 29-01..29-04 landed (exact f64 root fold on every GPU lane / config-bound
-//! admissibility gate / mfb-cell preservation / non-finite tripwire), the identical corpus
-//! and config must now train **100/100 trees** with every leaf value finite and bounded.
-//! This gate is the committed, executed regression proof of that.
-//!
-//! # Method (spike-072 lessons, do NOT weaken)
+//! # Method
 //!
 //! - The tree count is asserted on the **EMITTED MODEL TEXT** (`Tree=` headers), NEVER on a
-//!   per-tree-denominator counter. Spike-072's core method lesson: `launches/100`,
-//!   `syncs/100`, `rootbuild/100` all LIE when the train stops early — 880 syncs was 13 full
-//!   grows, not 100 stunted ones. This test contains NO assertion on launch/sync/rootbuild.
+//!   per-tree-denominator counter: launch/sync/rootbuild counters LIE when the train stops
+//!   early (a stunted, early-stopped train can report the same counter total as a full one).
+//!   This test contains NO assertion on launch/sync/rootbuild.
 //! - The subprocess route (not an in-process env flip) is REQUIRED: `LGBM_CUDA_ON_DEVICE`
 //!   is `OnceLock`-cached and read ONCE per process (`lgbm-compute/src/lib.rs`), so an
 //!   in-process test cannot flip it between the two arms. Each arm is a fresh
-//!   `bench_real` process with the env set — byte-identical to the spike's zero-code repro.
+//!   `bench_real` process with the env set.
 //! - The leaf bound is a GENEROUS structural bound (|v| <= 100.0). The healthy value is
 //!   pinned EMPIRICALLY by the host control arm run in this same gate: the host reference
-//!   arm's max |leaf| on this corpus is ~10.32 (and the on-device arm is bit-identical to it,
-//!   29-03). NOTE: spike-072 item 5 cited "~0.26" — that was a different, earlier-tree probe
-//!   measurement; the emitted 100-tree model's max |leaf| on this corpus is ~10.32 on BOTH
-//!   arms, so the bound is anchored to the observed host max, not the stale 0.26 figure. 100.0
-//!   sits ~10× above the healthy host max and ~13× below the spike-072 blow-up signature
-//!   (1.27e3 -> ±inf), so it detects degeneracy WITHOUT coupling to the f32 envelope — this is
-//!   a tree-COUNT + finiteness gate, not a value-parity gate (the u64-integer anchor in
-//!   `on_device_integer_anchor.rs` owns exact parity).
+//!   arm's max |leaf| on this corpus is ~10.32 (and the on-device arm is bit-identical to
+//!   it). 100.0 sits ~10× above the healthy host max, so it detects degeneracy WITHOUT
+//!   coupling to the f32 envelope — this is a tree-COUNT + finiteness gate, not a
+//!   value-parity gate (the u64-integer anchor in `on_device_integer_anchor.rs` owns exact
+//!   parity).
 //!
 //! # Cost + how to run
 //!
@@ -61,10 +52,9 @@ const NUM_SAMPLES: usize = 500_000;
 const NUM_FEATURES: usize = 50;
 const EXPECT_TREES: usize = 100;
 /// Structural degeneracy bound. Anchored to the host control arm's EMPIRICALLY measured max
-/// |leaf| (~10.32 on this 100-tree model; the on-device arm is bit-identical, 29-03) — NOT
-/// spike-072 item 5's stale "~0.26" (a different, earlier-tree probe). 100.0 sits ~10× above
-/// the healthy host max and ~13× below the spike-072 blow-up signature (1.27e3 -> ±inf), so it
-/// detects degeneracy without coupling to the f32 envelope.
+/// |leaf| (~10.32 on this 100-tree model; the on-device arm is bit-identical to it). 100.0
+/// sits ~10× above the healthy host max and well below the range where leaf values become
+/// non-finite, so it detects degeneracy without coupling to the f32 envelope.
 const LEAF_ABS_BOUND: f64 = 100.0;
 
 /// Repo root = `<repo>/crates/oracle-harness` -> up two.
@@ -76,7 +66,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Ensure the exact spike-072 corpus exists (cached in temp, keyed by shape). Returns `None`
+/// Ensure the fixed A/B corpus exists (cached in temp, keyed by shape). Returns `None`
 /// with a LOUD skip message if the `.venv` python or its deps are absent (never a false pass).
 fn ensure_corpus(repo_root: &Path) -> Option<PathBuf> {
     let cache = std::env::temp_dir().join(format!(
@@ -221,7 +211,7 @@ fn on_device_ab_corpus_trains_100_finite_bounded_trees() {
          host trees={trees_host} max|leaf|={max_host:.6} (bound={LEAF_ABS_BOUND})"
     );
 
-    // (1) The emitted on-device model has EXACTLY 100 trees — the spike-072 regression proof.
+    // (1) The emitted on-device model has EXACTLY 100 trees.
     assert_eq!(
         trees_on, EXPECT_TREES,
         "on-device arm emitted {trees_on} trees (want {EXPECT_TREES}); the spike-072 13-tree \

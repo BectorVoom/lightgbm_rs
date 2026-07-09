@@ -14,15 +14,14 @@
 //! - `binary_objective.hpp:167-169` — `ClassNeedTrain` returns `need_train_`,
 //!   which is false when the corpus contains only one class (`Init`:80-84).
 //! - `binary_objective.hpp:175-177` — `ConvertOutput`: `1/(1+exp(-sigmoid_*x))`
-//!   (reused from [`lgbm_model::ObjectiveKind::convert`], NOT re-ported here —
-//!   Open-Q1).
+//!   (reused from [`lgbm_model::ObjectiveKind::convert`], not re-ported here).
 //!
 //! The spine corpora are unweighted and use the balanced default
 //! (`label_weights_ = [1.0, 1.0]`, `scale_pos_weight = 1.0`, `is_unbalance =
 //! false`), so `label_weight == 1.0` for both classes. `is_unbalance` /
-//! `scale_pos_weight` weighting is recorded in the formula but exercised in a
-//! later wave (Phase 7 surface). Labels outside `{0,1}` are treated as `label > 0`
-//! (verbatim C++ — no array is indexed by the label, so no OOB risk, T-06-03-03).
+//! `scale_pos_weight` weighting is recorded in the formula but not yet exercised.
+//! Labels outside `{0,1}` are treated as `label > 0`
+//! (verbatim C++ — no array is indexed by the label, so no OOB risk).
 
 use lgbm_core::types::K_EPSILON;
 
@@ -85,10 +84,10 @@ impl Binary {
         let sigmoid = self.sigmoid;
         // Balanced default: label_weight = 1.0 for both classes.
         let label_weight = 1.0f64;
-        // spike-068: the per-row body is a pure function of (score[i], label[i]) written
+        // The per-row body is a pure function of (score[i], label[i]) written
         // to disjoint gradients[i]/hessians[i] — no reduction, no cross-row order — so
         // partitioning the row range is bit-exact. `apply_grad_hess` runs rayon above
-        // the grain floor (the measured 5.1× win: 100M single-core `exp()` → all cores)
+        // the grain floor (measured ~5.1× win: 100M single-core `exp()` → all cores)
         // and the serial loop below it. Per-row math is verbatim from the C++ mirror.
         apply_grad_hess(score, label, gradients, hessians, |s, l| {
             let is_pos = l > 0.0;
@@ -126,8 +125,8 @@ impl Binary {
 
     /// C++ `BinaryLogloss::ClassNeedTrain` (`need_train_`): false when the corpus
     /// contains only one class (all positive or all negative) — then a constant
-    /// (1-leaf) tree is pushed instead of training (Pitfall 6). Full degenerate
-    /// handling is exercised in 06-04 multiclass; the spine binary corpora carry
+    /// (1-leaf) tree is pushed instead of training. Full degenerate
+    /// handling is exercised elsewhere; the spine binary corpora carry
     /// both classes.
     pub fn class_need_train(&self, label: &[f32]) -> bool {
         let mut has_pos = false;

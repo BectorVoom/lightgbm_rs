@@ -7,29 +7,27 @@
 //! - `GetGradients(score, gradients, hessians)` — per-row grad/hess (the
 //!   GPU-relevant hot path, RESEARCH §"Objective Formulas").
 //! - `BoostFromScore` — the initial-score baseline (mean / median / etc.).
-//! - `RenewTreeOutput` — the leaf-output renewal hook (regression_l1 median, lands
-//!   in 06-03).
+//! - `RenewTreeOutput` — the leaf-output renewal hook (regression_l1 median).
 //!
 //! The **predict-side** transform (`ConvertOutput`, e.g. `softmax`) already lives
 //! in [`lgbm_model::ObjectiveKind::convert_output`] and is REUSED here (Open-Q1):
 //! this crate does NOT re-port it.
 //!
-//! Wave-0 scaffold (06-01): this plan creates the compiling skeleton + the
-//! [`error`] boundary only. The enum-dispatch objective factory (mirroring the
-//! C++ string-keyed `CreateObjectiveFunction`) and the per-objective math land in
-//! 06-02 (L2 spine) and 06-03+ (regression_l1 / binary / multiclass / custom).
+//! This crate began as a compiling skeleton plus the [`error`] boundary; the
+//! enum-dispatch objective factory (mirroring the C++ string-keyed
+//! `CreateObjectiveFunction`) and the per-objective math (regression_l1 / binary /
+//! multiclass / custom) were added subsequently.
 
-/// spike-068 grain guard: the minimum row count at which `get_gradients` switches
-/// from the serial per-row loop to the rayon-parallel one. Below this floor the
-/// rayon fork/join overhead outweighs the per-row `exp()` work (tiny corpora keep
-/// the serial loop); at/above it the embarrassingly-parallel independent-per-row
-/// grad/hess computation wins (measured 5.1× on 1M×30 binary). Bit-exactness is
-/// invariant across the branch: every output element is a pure function of its own
-/// row's inputs written to a disjoint slot, so partitioning the row range changes
-/// no float (threat T-sk7-02).
+/// The minimum row count at which `get_gradients` switches from the serial per-row
+/// loop to the rayon-parallel one. Below this floor the rayon fork/join overhead
+/// outweighs the per-row `exp()` work (tiny corpora keep the serial loop); at/above
+/// it the embarrassingly-parallel independent-per-row grad/hess computation wins
+/// (measured 5.1× on 1M×30 binary). Bit-exactness is invariant across the branch:
+/// every output element is a pure function of its own row's inputs written to a
+/// disjoint slot, so partitioning the row range changes no float (threat T-sk7-02).
 pub(crate) const GRAD_HESS_PAR_MIN_ROWS: usize = 50_000;
 
-/// spike-068 serial/parallel dispatch shared by the independent-per-row
+/// Serial/parallel dispatch shared by the independent-per-row
 /// `get_gradients` implementations (binary / regression / xentropy). `f(score[i],
 /// label[i]) -> (grad[i], hess[i])` is a pure per-row function written to disjoint
 /// slots, so the rayon partition is bit-exact vs the serial loop (threat T-sk7-02):

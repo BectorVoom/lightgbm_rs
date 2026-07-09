@@ -106,18 +106,18 @@ pub struct Config {
     /// `double min_gain_to_split`. config.h default: 0.0.
     pub min_gain_to_split: f64,
     /// `bool use_quantized_grad`. config.h default: false. Opt-in APPROXIMATE training
-    /// mode: gradients/hessians quantized to integers (phase-10, spike-008). The default
+    /// mode: gradients/hessians quantized to integers. The default
     /// exact path is unaffected when false.
     pub use_quantized_grad: bool,
     /// `int num_grad_quant_bins`. config.h default: 4. Quantization levels (more = closer
     /// to full precision). Used only if `use_quantized_grad`.
     pub num_grad_quant_bins: i32,
     /// `bool quant_train_renew_leaf`. config.h default: false. Renew leaf values with the
-    /// original (non-quantized) gradients. Used only if `use_quantized_grad`. (Deferred — Wave 6.)
+    /// original (non-quantized) gradients. Used only if `use_quantized_grad`. Not yet implemented.
     pub quant_train_renew_leaf: bool,
     /// `bool stochastic_rounding`. config.h default: true. Used only if `use_quantized_grad`.
     /// The Rust quantized path currently supports DETERMINISTIC rounding only (parity-tractable);
-    /// stochastic rounding is Wave 6.
+    /// stochastic rounding is not yet implemented.
     pub stochastic_rounding: bool,
     /// `double drop_rate`. config.h default: 0.1.
     pub drop_rate: f64,

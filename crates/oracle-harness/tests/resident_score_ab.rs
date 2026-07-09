@@ -1,24 +1,24 @@
-//! Phase-20 20-04 (ODL-16, D-01/D-06 layer 2) — the resident-score A/B.
+//! The resident-score A/B.
 //!
-//! Proves the SECOND D-06 parity layer: after a FULL multi-iteration GBDT train the
-//! resident `cuda_score_` (kept on device across the whole train via the
-//! `boosting_on_cuda_` toggle — the §16 Shrinkage → UpdateScore(§11) → optional
-//! RenewTreeOutput → Metric.Eval order) equals the pure-host `score_` accumulation.
+//! Proves that after a FULL multi-iteration GBDT train the resident `cuda_score_`
+//! (kept on device across the whole train via the `boosting_on_cuda_` toggle — the §16
+//! Shrinkage → UpdateScore(§11) → optional RenewTreeOutput → Metric.Eval order) equals
+//! the pure-host `score_` accumulation.
 //!
 //! Two arms driven on the SAME cpu backend inside ONE process (the
 //! `cuda_on_device_enabled()` env is a process-global `OnceLock`, so per-arm env
 //! toggling is impossible — the arms are selected via the `Gbdt::set_boosting_on_cuda`
-//! driver seam the 20-04 wiring exposes):
+//! driver seam):
 //!   - HOST arm  (`set_boosting_on_cuda(false)`): the byte-unchanged partition-scatter
 //!     score path — the ORACLE.
 //!   - RESIDENT arm (`set_boosting_on_cuda(true)`): the per-leaf `AddScore` routes
-//!     through the Phase-18 `add_prediction_to_score_on_device` tree-walk delegate
-//!     (D-02), keeping the score resident and mirroring it back to `score_`.
+//!     through the `add_prediction_to_score_on_device` tree-walk delegate, keeping the
+//!     score resident and mirroring it back to `score_`.
 //!
-//! Anchor discipline (D-05/D-07, def-f8u-01): the reference is ALWAYS the host/cpu-fold
-//! accumulation — NEVER a second GPU f32 path. On the cpu f64 anchor the two arms are
-//! BIT-EXACT (`compare_exact_f64_bits`); the optional `rocm` gpu cell holds the resident
-//! hip arm to the ~1e-6 f32 envelope AGAINST the same cpu-anchor host accumulation.
+//! Anchor discipline: the reference is ALWAYS the host/cpu-fold accumulation — NEVER a
+//! second GPU f32 path. On the cpu f64 anchor the two arms are BIT-EXACT
+//! (`compare_exact_f64_bits`); the optional `rocm` gpu cell holds the resident hip arm to
+//! the ~1e-6 f32 envelope AGAINST the same cpu-anchor host accumulation.
 //!
 //! Scope: the L2 continuous-feature proving slice (identity-binned, numeric splits, no
 //! missing values, no RenewTreeOutput refit) — the regime where the device tree-walk is
@@ -93,7 +93,7 @@ fn gain_config() -> GainConfig {
 }
 
 /// Train `ITERS` L2 continuous trees on `backend`/`client`, returning the post-train
-/// f64 `score_` buffer. `resident` selects the arm via the 20-04 `set_boosting_on_cuda`
+/// f64 `score_` buffer. `resident` selects the arm via the `set_boosting_on_cuda`
 /// driver seam: `true` keeps `cuda_score_` resident (device tree-walk delegate), `false`
 /// is the byte-unchanged host partition-scatter reference.
 fn train_scores<B: Backend>(
@@ -128,7 +128,7 @@ fn train_scores<B: Backend>(
     gbdt.scores().to_vec()
 }
 
-/// D-06 layer 2 — after a full multi-iteration train the RESIDENT `cuda_score_` equals
+/// After a full multi-iteration train the RESIDENT `cuda_score_` equals
 /// the pure-HOST `score_` BIT-FOR-BIT on the cpu f64 anchor.
 #[test]
 fn resident_score_matches_host_after_full_train_cpu_anchor() {
@@ -161,7 +161,7 @@ fn resident_score_matches_host_after_full_train_cpu_anchor() {
 /// Train `ITERS` L2 continuous trees on `backend`/`client` using the ENV-DERIVED default
 /// `boosting_on_cuda` (NO explicit `set_boosting_on_cuda`) — the path a normal caller takes.
 /// With `LGBM_CUDA_ON_DEVICE` unset the default is `false`, so this is the byte-unchanged host
-/// score path; the SC-4 test below proves it equals the explicit host arm bit-for-bit.
+/// score path; the test below proves it equals the explicit host arm bit-for-bit.
 fn train_scores_env_default<B: Backend>(
     backend: &B,
     client: &ComputeClient<B::Runtime>,
@@ -179,18 +179,18 @@ fn train_scores_env_default<B: Backend>(
         true,
         None,
     );
-    // NOTE: deliberately NO `set_boosting_on_cuda` — take the env-derived default (SC-4).
+    // NOTE: deliberately NO `set_boosting_on_cuda` — take the env-derived default.
     gbdt.train(&mut learner, &labels, num_features, ITERS)
         .expect("multi-iteration train (env-default arm)");
     gbdt.scores().to_vec()
 }
 
-/// SC-4 (28-05, ODF-06) — with `LGBM_CUDA_ON_DEVICE` UNSET, the env-DERIVED default GBDT train
+/// With `LGBM_CUDA_ON_DEVICE` UNSET, the env-DERIVED default GBDT train
 /// produces a score BIT-IDENTICAL to the explicit byte-unchanged host arm. This proves the
-/// 28-03/28-04 resident rewrite is CONFINED to the resident arm (reached only under the
+/// resident rewrite is CONFINED to the resident arm (reached only under the
 /// env-gated `boosting_on_cuda_` seam) and does NOT leak into the default path — "every backend
 /// byte unchanged with the env unset". When the A/B is run under `LGBM_CUDA_ON_DEVICE=1` the
-/// default flips resident ON by design (D-09), so the assertion is skipped there.
+/// default flips resident ON by design, so the assertion is skipped there.
 #[test]
 fn sc4_env_unset_default_train_is_byte_identical_to_host_arm() {
     if lgbm_compute::cuda_on_device_enabled() {
@@ -207,7 +207,7 @@ fn sc4_env_unset_default_train_is_byte_identical_to_host_arm() {
     let default_scores = train_scores_env_default(&backend, &client);
     let host = train_scores(&backend, &client, false);
 
-    // Sanity: a real multi-iter train moved the score (non-vacuous SC-4 proof).
+    // Sanity: a real multi-iter train moved the score (non-vacuous proof).
     assert!(
         host.iter().any(|&s| s.abs() > 1e-6),
         "the score must be non-zero after a real multi-iter train"
@@ -250,7 +250,7 @@ fn grow_features() -> Vec<lgbm_compute::GrowFeature> {
         .collect()
 }
 
-/// Phase-25 (25-03, ODP2-04) — the COMBINED on-device GROW → on-device SCORE path
+/// The COMBINED on-device GROW → on-device SCORE path
 /// (not just the score delegate in isolation) is BIT-EXACT to the host partition
 /// scatter on the cpu-f64 anchor.
 ///
@@ -260,7 +260,7 @@ fn grow_features() -> Vec<lgbm_compute::GrowFeature> {
 /// [`add_prediction_to_score_on_device_resident`] over the resident row→leaf layout
 /// the grow produced. The oracle is the byte-unchanged host partition scatter
 /// [`SerialTreeLearner::add_prediction_to_score`] over the SAME grown `(tree,
-/// layout)`. This proves the ODP2-04 score move is correctness-preserving before the
+/// layout)`. This proves the on-device score move is correctness-preserving before a
 /// real-CUDA A/B measures the speedup (single-process, no `LGBM_CUDA_ON_DEVICE`
 /// OnceLock fight — the driver runs regardless of the env).
 #[test]
@@ -313,7 +313,7 @@ fn combined_on_device_grow_and_score_matches_host_scatter_cpu_anchor() {
     });
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06, Task 1) — the per-row leaf map derived ON DEVICE
+/// The per-row leaf map derived ON DEVICE
 /// from the resident leaf-grouped partition layout equals the retired host `O(num_data)`
 /// inversion loop, BIT-FOR-BIT, on the cpu-f64 anchor. Uses a multi-leaf fixture with
 /// rows deliberately shuffled inside each leaf (so the derivation is index-driven, not
@@ -335,7 +335,7 @@ fn resident_leaf_map_device_matches_host_inversion() {
         .expect("device leaf-map derivation from the resident partition ranges");
 
     // ORACLE: the retired host inversion loop (add_prediction_to_score_on_device_resident
-    // 1248-1281, pre-28-04): `data_index_to_leaf[row] = leaf` for every leaf's rows.
+    // 1248-1281): `data_index_to_leaf[row] = leaf` for every leaf's rows.
     let mut host = vec![-1i32; num_data];
     for (leaf, (&b, &c)) in leaf_begin.iter().zip(leaf_count.iter()).enumerate() {
         for &row in &indices[b as usize..(b + c) as usize] {
@@ -354,7 +354,7 @@ fn resident_leaf_map_device_matches_host_inversion() {
     );
 }
 
-/// Phase-28 (28-07, ODF-06, WR-02) — a malformed partition layout whose permutation
+/// A malformed partition layout whose permutation
 /// contains a row id `>= num_data` yields a clean `ComputeError` (mirroring the retired
 /// host inversion's `r >= num_data` guard) instead of an out-of-bounds device write inside
 /// the `unsafe` scatter launch (UB). The bound is enforced at the host boundary
@@ -386,15 +386,15 @@ fn derive_leaf_map_rejects_out_of_range_row_id() {
     );
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06, Task 2) — the DEFERRED-readback resident score
+/// The DEFERRED-readback resident score
 /// mirror accumulated ACROSS trees (one final readback) is BIT-EXACT to the EAGER
 /// per-tree-readback accumulation, on the cpu-f64 anchor.
 ///
-/// EAGER (the pre-28-04 per-tree contract): for each grown tree, call
+/// EAGER (the per-tree contract): for each grown tree, call
 /// `add_prediction_to_score_on_device_resident` and sum the returned `num_data` f64 delta
 /// into a host accumulator — a full readback PER TREE.
 ///
-/// DEFERRED (the 28-04 residency): allocate ONE `ResidentScore` mirror, apply every tree's
+/// DEFERRED (the resident approach): allocate ONE `ResidentScore` mirror, apply every tree's
 /// `AddScore` on device (`add_tree_on_device`, NO intermediate readback), and read the
 /// resident buffer back ONCE at the end. The two must agree bit-for-bit: the mirror adds
 /// the same exact f64 leaf values into `score[row]` in the same tree order the eager host
@@ -438,7 +438,7 @@ fn resident_score_deferred_readback_matches_eager_cpu_anchor() {
         ),
     ];
 
-    // EAGER: full readback per tree, summed on host (the pre-28-04 path).
+    // EAGER: full readback per tree, summed on host (the prior contract).
     let mut eager = vec![0.0f64; num_data];
     for (layout, leaf_values) in &trees {
         let delta = add_prediction_to_score_on_device_resident(&client, layout, leaf_values)
@@ -471,7 +471,7 @@ fn resident_score_deferred_readback_matches_eager_cpu_anchor() {
     });
 }
 
-/// The env-unset default `Gbdt` reports the host path (D-09): with `LGBM_CUDA_ON_DEVICE`
+/// The env-unset default `Gbdt` reports the host path: with `LGBM_CUDA_ON_DEVICE`
 /// unset the internal score updater defaults `boosting_on_cuda = false`, so the GBDT
 /// score/eval path is byte-unchanged. (This cell forces neither arm; it reads the
 /// env-derived default.)
@@ -511,7 +511,7 @@ fn binary_labels() -> Vec<f32> {
 
 /// Train a fresh binary GBDT for `ITERS` iterations on `backend`/`client`, returning
 /// `(trees, scores, resident_active)`. `resident` selects the arm via the
-/// `set_boosting_on_cuda` seam: `true` is the Phase-31 (31-04) GBDT-owned resident score
+/// `set_boosting_on_cuda` seam: `true` is the GBDT-owned resident score
 /// + on-device grad/hess path, `false` the byte-unchanged host path.
 fn train_binary<B: Backend>(
     backend: &B,
@@ -546,7 +546,7 @@ fn train_binary<B: Backend>(
     )
 }
 
-/// Phase-31 (31-04, ODS-01/ODS-03) — the GBDT-owned, TRAIN-LIFETIME resident score +
+/// The GBDT-owned, TRAIN-LIFETIME resident score +
 /// on-device grad/hess path produces a model BIT-IDENTICAL (every leaf value, every
 /// split) to the host path across a 6-iteration binary train. This proves the resident
 /// score never drifts across a persistent multi-tree train (not just a single tree): the
@@ -554,7 +554,7 @@ fn train_binary<B: Backend>(
 /// place tree-by-tree, and read only via the on-device grad/hess launcher — yet stays
 /// bit-exact to the host `score_updater.scores()` accumulation on the cpu-f64 anchor.
 ///
-/// Pitfall-5 (WR-01 / D5 reset discipline) note: this envelope sidesteps the
+/// Reset-discipline note: this envelope sidesteps the
 /// length-mismatch/aliasing class entirely. Bagging/GOSS are the only mid-train
 /// row-count changers and are EXCLUDED from activation (they fall back to host, proven
 /// by `resident_score_falls_back_completely_for_bagging_and_multiclass`), so the resident
@@ -596,10 +596,10 @@ fn resident_score_persists_across_full_train_bit_exact() {
     });
 }
 
-/// Phase-31 (31-04, ODS-03) — bagging and multiclass fall back to the host path for the
+/// Bagging and multiclass fall back to the host path for the
 /// ENTIRE train (`resident_score_active() == Some(false)`), never a partial-resident
 /// state. Proves the num_class==1 / no-bagging / no-GOSS scope guard is complete, not
-/// partial (T-31-06: no silent host/device divergence).
+/// partial (no silent host/device divergence).
 #[test]
 fn resident_score_falls_back_completely_for_bagging_and_multiclass() {
     use lgbm_boosting::BoostObjective;
@@ -669,7 +669,7 @@ fn resident_score_falls_back_completely_for_bagging_and_multiclass() {
 
 /// Optional ROCm/HIP gpu cell (opt-in `--features rocm`): the resident hip arm held to
 /// the ~1e-6 f32 envelope AGAINST the cpu-anchor host accumulation — NEVER a second GPU
-/// path (D-07/def-f8u-01). The cpu f64 host arm is the anchor; the hip resident arm is
+/// path. The cpu f64 host arm is the anchor; the hip resident arm is
 /// the f32 candidate.
 #[cfg(feature = "rocm")]
 mod hip {
@@ -680,7 +680,7 @@ mod hip {
     /// The f32 leaf-accumulation envelope (mirrors `learner_parity::ROCM_LEAF_VALUE_TOL`).
     /// The ROCm/HIP arm is held to this ~1e-6-order envelope (the CLAUDE.md ROCm bar is
     /// ~1e-6; f32 leaf accumulation widens it to `1e-5`) AGAINST the cpu-f64 host anchor
-    /// — NEVER bit-exact to a second GPU f32 path (def-f8u-01).
+    /// — NEVER bit-exact to a second GPU f32 path.
     const ROCM_SCORE_TOL: f64 = 1e-5;
 
     #[test]
@@ -706,11 +706,11 @@ mod hip {
         }
     }
 
-    /// Phase-25 (25-03, ODP2-04) — the COMBINED on-device GROW → on-device SCORE path
+    /// The COMBINED on-device GROW → on-device SCORE path
     /// on hip: grow the L2 tree on the hip runtime, score it via the resident §11
     /// partition scatter, and hold that on-device arm to the ~1e-6-order f32 envelope
     /// (`ROCM_SCORE_TOL`, CLAUDE.md ROCm bar ~1e-6) AGAINST the cpu-f64 host partition
-    /// scatter — NEVER bit-exact to a second GPU f32 path (def-f8u-01). Mirrors the
+    /// scatter — NEVER bit-exact to a second GPU f32 path. Mirrors the
     /// cpu-anchor combined test, with the hip runtime as the on-device candidate.
     #[test]
     fn combined_on_device_grow_and_score_on_hip_within_envelope() {

@@ -1,4 +1,4 @@
-//! `subtract_histograms` cube kernel — the histogram-subtraction MATH (A3).
+//! `subtract_histograms` cube kernel — the histogram-subtraction MATH.
 //!
 //! VERBATIM transcription of `FeatureHistogram::Subtract`
 //! (`LightGBM/src/treelearner/feature_histogram.hpp:99-145`, commit 195c26fc,
@@ -13,9 +13,8 @@
 //! i.e. element-wise `derived[i] = parent[i] - child[i]` over the stride-2
 //! `[g0,h0,g1,h1,…]` f64 cells (both the gradient AND hessian cells). This is the
 //! histogram-subtraction trick's MATH; WHICH child is subtracted from the parent
-//! (the smaller sibling) is Phase-5 learner orchestration — RESEARCH open
-//! question A3 resolves the subtract OP itself as in-scope at the kernel layer
-//! (it is histogram-layer math).
+//! (the smaller sibling) is decided by the learner's orchestration logic, not by
+//! this kernel (it is histogram-layer math).
 //!
 //! ## Determinism / launch shape
 //! The op is element-wise (each output cell is independent), so it is launched
@@ -53,7 +52,7 @@ pub fn subtract_hist_kernel(parent: &Array<f64>, child: &Array<f64>, out: &mut A
 
 
 /// SIMD-vectorized twin of [`subtract_hist_kernel`] / `subtract_hist_kernel_f32`
-/// over `Array<Vector<F, N>>` (spike-041, VALIDATED on cubecl-hip + cubecl-cpu).
+/// over `Array<Vector<F, N>>`, validated on cubecl-hip + cubecl-cpu.
 ///
 /// IDENTICAL 1D grid-stride structure to the scalar kernels — the only difference is
 /// that each lane subtracts a whole `Vector<F, N>` (one SIMD load/sub/store per `N`
@@ -62,7 +61,7 @@ pub fn subtract_hist_kernel(parent: &Array<f64>, child: &Array<f64>, out: &mut A
 /// (`vector/ops.rs`), so `out[i] = parent[i] - child[i]` is **BIT-EXACT-by-construction**
 /// to the scalar kernel: every component is an independent `F` subtract, no float op
 /// is reordered, and there are no atomics, no reduction, and no cross-lane ordering
-/// (spike-041 confirmed `bit_exact=true` on every width × size × backend cell; see also
+/// (bit-exact confirmed on every width × size × backend cell; see also
 /// CONVENTIONS "SIMD vectorization with `Vector<P,N>`" 313–351). The `N: Size` width is
 /// supplied as a RUNTIME `usize` positional launch arg right after `CubeDim`, and array
 /// lengths are passed in vector units (`n / N`). The `while i < n_vec` bound guards every
@@ -95,7 +94,7 @@ pub fn subtract_hist_kernel_vec<F: Float, N: Size>(
 /// `1` — the sentinel meaning "use the scalar kernel". The iterator yields widths
 /// widest-first (hip f32 → `[4,2,1]`; cpu f64 → `[8,4,2,1]`); the production all-256-bin
 /// histogram shape (`2 * num_bin` divisible by the max width) takes the wide path, while
-/// mixed-cardinality / odd lengths fall back to scalar (spike-041 launch recipe).
+/// mixed-cardinality / odd lengths fall back to scalar.
 fn pick_vec_width<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     elem_size: usize,
@@ -153,7 +152,7 @@ pub fn subtract_histograms_f64_on<R: cubecl::Runtime>(
     let zeros = vec![0.0f64; n];
     let h_out = client.create_from_slice(f64::as_bytes(&zeros));
 
-    // Width-gated SIMD dispatch (spike-041): vectorize when, and only when, the chosen
+    // Width-gated SIMD dispatch: vectorize when, and only when, the chosen
     // `io_optimized` width divides `n` exactly (`vs > 1`); otherwise the proven scalar
     // kernel. Both read/write the SAME byte buffers — `n` f64 cells whether viewed as
     // scalar (`n` units) or as `n / vs` `Vector<f64, vs>` units — and `Vector::sub` is
@@ -215,7 +214,7 @@ pub fn subtract_histograms_cpu_native(
     Ok(parent.iter().zip(child).map(|(p, c)| p - c).collect())
 }
 
-/// Handle-in/Handle-out resident subtract (260608-p90 Task 2A) — the device-resident
+/// Handle-in/Handle-out resident subtract — the device-resident
 /// sibling of [`subtract_histograms_f64_on`]. Derives `out[i] = parent[i] - child[i]`
 /// over `len` stride-2 f64 cells entirely on device: it CONSUMES the `parent` and
 /// `child` device Handles, allocates a fresh `out` Handle of `len` f64 cells, launches
@@ -241,7 +240,7 @@ pub fn subtract_histograms_f64_from_handles_on<R: cubecl::Runtime>(
     let zeros = vec![0.0f64; len];
     let h_out = client.create_from_slice(f64::as_bytes(&zeros));
 
-    // Width-gated SIMD dispatch (spike-041) on the resident hot path: vectorize when the
+    // Width-gated SIMD dispatch on the resident hot path: vectorize when the
     // chosen `io_optimized` width divides `len` exactly, else the proven scalar kernel.
     // No read-back — the derived child's histogram stays on device either way.
     let vs = pick_vec_width(client, std::mem::size_of::<f64>(), len);
@@ -341,7 +340,7 @@ mod tests {
         }
     }
 
-    /// OCX-03 (spike-072 item 15b), disposition (a): a subtract-derived cell whose
+    /// A subtract-derived cell whose
     /// parent and child carry IDENTICAL mass must be EXACTLY `+0.0` — the property that
     /// makes a true-zero-mass subtract-derived histogram cell exactly 0. This is the
     /// leak-free contract of the subtract op itself: IEEE f64 `x − x = +0.0` for every
@@ -394,7 +393,7 @@ mod tests {
     /// The VECTORIZED branch itself must be bit-exact. 256000 = 500 feat × 256 bin × 2
     /// is divisible by every cpu f64 `io_optimized` width (8/4/2), so `pick_vec_width`
     /// selects the SIMD `subtract_hist_kernel_vec` path here — and its `to_bits()` output
-    /// must match a plain serial `parent[i] - child[i]` on every cell (spike-041's
+    /// must match a plain serial `parent[i] - child[i]` on every cell (the
     /// bit-exact-by-construction claim, asserted on the cpu client). The existing
     /// 12345-length cases above already cover the non-divisible scalar fallback.
     #[test]

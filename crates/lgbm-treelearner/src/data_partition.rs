@@ -3,11 +3,11 @@
 //! Faithful transcription of `DataPartition` (`data_partition.hpp`, commit
 //! 195c26fc, VERSION 4.6.0.99): the `indices_` permutation of all row ids grouped
 //! by leaf, plus the per-leaf `leaf_begin_` / `leaf_count_` ranges. The actual
-//! per-row left/right routing math lives in the Phase-4 `Backend::data_partition`
+//! per-row left/right routing math lives in the `Backend::data_partition`
 //! op (the `DenseBin::SplitInner` `MissingType::None` transcription); this module
-//! owns ONLY the leaf-range bookkeeping (`lib.rs:115-117`: "the Phase-5 learner
+//! owns ONLY the leaf-range bookkeeping (see `lib.rs:115-117`: the learner
 //! owns `leaf_begin_`/`leaf_count_` bookkeeping; this op returns only the
-//! partition"). No new partition numerics.
+//! partition. No new partition numerics.
 //!
 //! ## C++ correspondence
 //! - `indices_`     ↔ `std::vector<data_size_t> indices_` — all row ids, grouped
@@ -15,7 +15,7 @@
 //! - `leaf_begin_`  ↔ `std::vector<data_size_t> leaf_begin_` — start offset of
 //!   each leaf's slice in `indices_`.
 //! - `leaf_count_`  ↔ `std::vector<data_size_t> leaf_count_` — row count per leaf
-//!   (the GLOBAL count; no bagging this phase, so global == local, Pitfall 3).
+//!   (the GLOBAL count; no bagging currently, so global == local).
 //!
 //! `Init` puts ALL rows into leaf 0 in identity order (`data_partition.hpp` Init).
 //! `Split` calls the Backend op on the leaf's rows, then rewrites the leaf's slice
@@ -28,21 +28,20 @@ use lgbm_compute::BinColumn;
 // the Backend ops' client argument without ever depending on `cubecl` directly.
 use lgbm_compute::ComputeClientReexport as ComputeClient;
 
-/// Phase-27 (spike-063): minimum leaf-row count to engage the block-parallel
+/// Minimum leaf-row count to engage the block-parallel
 /// two-buffer partition in `split_fused_host`. Below this the serial two-buffer
 /// path runs (no fork/join) — the win lives in the first few LARGE splits, so a
 /// high default captures ~all of it with ~no small-leaf fork/join risk. Read ONCE
 /// via `OnceLock` (env `LGBM_PAR_PARTITION_MIN`, default 65536). Set to
-/// `18446744073709551615` (= `usize::MAX`) to FORCE the serial path — the bit-exact
-/// serial-vs-parallel dump-model A/B toggle (no parallel split ever engages).
+/// `18446744073709551615` (= `usize::MAX`) to FORCE the serial path — a bit-exact
+/// serial-vs-parallel toggle (no parallel split ever engages).
 ///
-/// Default = **65536** (raised from spike-063's 1M-only ~16384 suggestion). The 27-01
-/// A/B measured a small (~6% wall) REGRESSION at 50k×50 with MIN=16384: the 50k root
-/// leaf (>16384) forks/joins and the scheduling overhead leaks into the already-parallel
-/// histogram build (shared rayon pool). 65536 keeps ≤50k leaves serial — 50k×50 becomes
-/// neutral (no regression, CPP-04) — while still capturing the 1M×30 win (partition
-/// 2385→~640ms, ~3.7×; wall ~7866→~6250ms, ~20%): at 1M the first several splits
-/// (1M, ~500k, ~250k, ~125k) all clear 65536 and engage.
+/// Default = **65536**: a lower threshold lets a mid-size root leaf (e.g. 50k rows)
+/// fork/join and its scheduling overhead leaks into the already-parallel
+/// histogram build (shared rayon pool), causing a small wall-clock regression.
+/// 65536 keeps such leaves serial while still capturing the parallel win on large
+/// (e.g. ~1M-row) leaves, where the first several splits clear the threshold and
+/// engage the block-parallel path.
 fn par_partition_min() -> usize {
     use std::sync::OnceLock;
     static M: OnceLock<usize> = OnceLock::new();
@@ -70,12 +69,12 @@ pub struct DataPartition {
     leaf_begin: Vec<i32>,
     /// C++ `std::vector<data_size_t> leaf_count_` — per-leaf row count.
     leaf_count: Vec<i32>,
-    /// Phase-27 two-buffer scratch ↔ C++ `ParallelPartitionRunner::left_`
+    /// Two-buffer scratch ↔ C++ `ParallelPartitionRunner::left_`
     /// (`threading.h:91`): persistent left-side row-id scratch, sized `num_data`,
     /// allocated ONCE and reused across every `split_fused_host` call (no per-split
     /// `Vec` alloc). Pass-1 scatters left rows ascending into `[0..left_count)`.
     part_left: Vec<u32>,
-    /// Phase-27 two-buffer scratch ↔ C++ `ParallelPartitionRunner::right_`:
+    /// Two-buffer scratch ↔ C++ `ParallelPartitionRunner::right_`:
     /// persistent right-side row-id scratch, sized `num_data`, reused across splits.
     /// Pass-1 scatters right rows ascending into `[0..right_count)`.
     part_right: Vec<u32>,
@@ -108,13 +107,13 @@ impl DataPartition {
         }
     }
 
-    /// ODL-01 (Phase 14, D-03 Option A): reconstruct a `DataPartition` from the
+    /// Reconstruct a `DataPartition` from the
     /// lower-crate [`lgbm_dataset::LeafPartitionLayout`] payload `P` returned by
     /// `Backend::grow_tree_on_device`. A thin field-move — the payload mirrors the
     /// four fields `DataPartition` wraps (identical shapes), so this never depends
     /// on `lgbm-compute` (acyclic: treelearner already names both DataPartition and
-    /// lgbm_dataset). In Slice 0 the seam returns `Ok(None)`, so this is reachable
-    /// but not exercised at runtime yet — kept minimal until Slice 1 wires a kernel.
+    /// lgbm_dataset). The seam currently returns `Ok(None)`, so this is reachable
+    /// but not exercised at runtime yet — kept minimal until a kernel is wired up.
     pub fn from_payload(p: lgbm_dataset::LeafPartitionLayout) -> Self {
         let n = p.num_data.max(0) as usize;
         Self {
@@ -129,7 +128,7 @@ impl DataPartition {
     }
 
     /// C++ `DataPartition::leaf_count(leaf)` — the GLOBAL row count in `leaf`.
-    /// Drives the smaller-child selection (Pitfall 3).
+    /// Drives the smaller-child selection.
     pub fn leaf_count(&self, leaf: i32) -> i32 {
         self.leaf_count[leaf as usize]
     }
@@ -169,22 +168,16 @@ impl DataPartition {
     /// Propagates [`ComputeError`] from the Backend op (V5 boundary; e.g. a bin
     /// index `>= num_bin`).
     ///
-    /// PARALLELISM (Phase-27, spike-063 — SUPERSEDES the quick-260622-ia0 NULL): the
-    /// host partition is now a **two-buffer, all-passes block-parallel** reorder
-    /// (`split_fused_host` → `partition_parallel`), gated on `LGBM_PAR_PARTITION_MIN`.
+    /// PARALLELISM: the host partition is a **two-buffer, all-passes
+    /// block-parallel** reorder (`split_fused_host` → `partition_parallel`), gated
+    /// on `LGBM_PAR_PARTITION_MIN`.
     ///
-    /// The prior `quick-260622-ia0` "parallel partition = NULL" verdict measured a
-    /// DEFICIENT impl: all-leaf fork/join + a RETAINED third copyback pass + shared
-    /// histogram-pool contention (the partition phase went bimodal). spike-063 REFUTES
-    /// that verdict on this exact 16-core box — C++ scales its `SplitInner` ~3.5×
-    /// (1548→438ms) so the win is physically reclaimable, and BUILD & PARTITION are
-    /// SEQUENTIAL phases per split, so a properly-gated parallel partition does NOT
-    /// truly contend with the already-parallel build. The win decomposes as:
-    ///   two-buffer (drop the third copyback pass) ≈ 1.68× single-thread TRAFFIC
-    ///   × all-passes block-parallel ≈ 3× PARALLELISM,
-    /// gated on `LGBM_PAR_PARTITION_MIN` (default 65536) so small leaves stay serial.
-    /// Evidence: `.planning/spikes/063-proof-partition-parallel/README.md` and the
-    /// 27-01 plan SUMMARY (same-session interleaved serial-vs-parallel A/B).
+    /// BUILD and PARTITION are SEQUENTIAL phases per split, so a properly-gated
+    /// parallel partition does not truly contend with the already-parallel
+    /// histogram build. The win decomposes as: two-buffer (drop the third
+    /// copyback pass) reduces single-thread TRAFFIC, and all-passes
+    /// block-parallel adds PARALLELISM on top — gated on
+    /// `LGBM_PAR_PARTITION_MIN` (default 65536) so small leaves stay serial.
     #[allow(clippy::too_many_arguments)]
     pub fn split<B: Backend>(
         &mut self,
@@ -204,7 +197,7 @@ impl DataPartition {
         let count = self.leaf_count[leaf_u] as usize;
 
         let (left_count, right_count) = if backend.prefers_host_partition() {
-            // CpuBackend host anchor: spike-027 V1 fused u8-route path, IN PLACE on
+            // CpuBackend host anchor: fused u8-route path, IN PLACE on
             // `self.indices[begin..begin+count]`. ONE random gather + a ¼-width u8
             // route scratch + ONE u32 scatter — no leaf_rows clone, no u32-widened
             // leaf_feature_bins, no local→row remap. Byte-identical [left | right]
@@ -222,7 +215,7 @@ impl DataPartition {
             )?
         } else {
             // RocmBackend / any device backend: route the leaf's rows ON-DEVICE.
-            // quick-260625-j1l (spike-029): re-gather the leaf's bins at NATIVE width
+            // Re-gather the leaf's bins at NATIVE width
             // (`BinColumn::gather` preserves u8/u16/u32) and route via the additive
             // `data_partition_native`. The CpuBackend default widens + delegates (so the
             // non-fused cpu path stays byte-unchanged); RocmBackend overrides it to
@@ -263,14 +256,14 @@ impl DataPartition {
         Ok((left_count, right_count))
     }
 
-    /// Phase-27 TWO-BUFFER host split (C++ `ParallelPartitionRunner<INDEX_T, true>`,
+    /// TWO-BUFFER host split (C++ `ParallelPartitionRunner<INDEX_T, true>`,
     /// `threading.h:91`), run IN PLACE on the leaf's slice `self.indices[begin..+count]`.
     /// Returns `(left_count, right_count)`.
     ///
-    /// ## Two passes, not three (spike-063, ~1.68× single-thread traffic win)
-    /// The prior spike-027/032 path was THREE O(count) passes: (1) gather→route into a
+    /// ## Two passes, not three
+    /// A naive implementation needs THREE O(count) passes: (1) gather→route into a
     /// `route: Vec<u8>` scratch, (2) scatter row ids into a fresh `out: Vec<u32>`, (3)
-    /// `copy_from_slice(out)` back into `self.indices`. This two-buffer rewrite collapses
+    /// `copy_from_slice(out)` back into `self.indices`. This two-buffer design collapses
     /// that to TWO passes matching the C++ runner:
     /// - **pass 1** (`func`): gather each leaf row's bin ONCE, range-check, route via the
     ///   SAME `SplitInner` `MissingType::None` `go_right` decision as before (byte-for-byte
@@ -279,7 +272,7 @@ impl DataPartition {
     /// - **pass 2** (`copy_n`): copy the `part_left[..left_count]` run then the
     ///   `part_right[..right_count]` run into `self.indices[begin..begin+count]`.
     ///
-    /// The eliminated third pass (the fresh per-split `out: Vec<u32>` + its copyback) is
+    /// Eliminating the third pass (the fresh per-split `out: Vec<u32>` + its copyback) is
     /// the traffic win, BEFORE any parallelism. `part_left`/`part_right` are persistent
     /// members (sized `num_data`, reused across splits) — no per-split allocation.
     ///
@@ -434,7 +427,7 @@ impl DataPartition {
     ///   into per-block disjoint sub-slices in ascending block order (the prefix-sum
     ///   guarantees they tile each region exactly). Each block then `copy_from_slice`s
     ///   its scratch run into its sub-slice — FULLY SAFE disjoint writes (no unsafe;
-    ///   `split_at_mut` proves non-aliasing), satisfying T-27-01.
+    ///   `split_at_mut` proves non-aliasing).
     ///
     /// Stability: pass-1 appends ascending within each block; pass-2 lays block 0's
     /// left run, then block 1's, … then all right runs — so the result is
@@ -693,7 +686,7 @@ mod tests {
         assert_eq!(dp.indices_in_leaf(0), &[0, 2, 4, 6]);
     }
 
-    /// V0 serial reference (mirrors `v0_baseline` in the spike example): gather the
+    /// Serial reference: gather the
     /// leaf's bins, run `data_partition_cpu_native`, remap local→row, write back.
     /// Returns the rewritten leaf slice + `(left_count, right_count)`.
     #[allow(clippy::too_many_arguments)]
@@ -770,7 +763,7 @@ mod tests {
             "CpuBackend must select the fused host path"
         );
 
-        // Deterministic LCG (mirrors the spike example) for a scattered leaf + column.
+        // Deterministic LCG for a scattered leaf + column.
         let lcg = |seed: u64| {
             let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
             move || {
@@ -878,7 +871,7 @@ mod tests {
         }
     }
 
-    /// Task-2 gate: the BLOCK-PARALLEL arm (`par_min = 0`) must be BYTE-IDENTICAL to
+    /// The BLOCK-PARALLEL arm (`par_min = 0`) must be BYTE-IDENTICAL to
     /// the SERIAL arm (`par_min = usize::MAX`) and to the `data_partition_cpu_native`
     /// reference on a LARGE scattered multi-block leaf, for both the `most_freq_bin==0`
     /// branch and a U8 column. Byte-identity to the serial arm element-for-element IS
@@ -950,7 +943,7 @@ mod tests {
         }
     }
 
-    /// Task-2 DIRECT stability (defense-in-depth beyond sha/parity): on an
+    /// DIRECT stability (defense-in-depth beyond sha/parity): on an
     /// IDENTITY-ordered multi-block leaf, each side must be STRICTLY INCREASING —
     /// left rows in ascending original order, then right rows in ascending original
     /// order (here original order == row id) — and equal the serial arm element-for-element.
@@ -997,7 +990,7 @@ mod tests {
         assert_eq!(dp_ser.indices(), dp_par.indices(), "parallel != serial (identity leaf)");
     }
 
-    /// Task-2 error semantics on the PARALLEL path: two out-of-range bins are planted
+    /// Error semantics on the PARALLEL path: two out-of-range bins are planted
     /// in DIFFERENT blocks of a large leaf; the LOWEST leaf position must be reported
     /// as `BinIndexOutOfRange` and `self.indices` must be UNMUTATED (pass-1 writes only
     /// scratch, error returns before pass-2).

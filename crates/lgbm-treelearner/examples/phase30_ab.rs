@@ -1,29 +1,28 @@
-//! Phase 30 (OHP-02/03/04) — A/B the on-device partition + `GrowFeature` levers.
+//! On-device partition + `GrowFeature` levers A/B harness.
 //!
 //! This harness does TWO things in one process:
 //!
-//!  (A) BIT-EXACT GATE (OHP-03, Plan 30-02): proves the `GrowFeature` memoize
+//!  (A) BIT-EXACT GATE: proves the `GrowFeature` memoize
 //!      (`learner.rs`, the ~25–50MB per-tree `f.bins.clone()` hoisted to a once-per-train
 //!      `grow_features_cache`) is bit-exact — the tree-stream fingerprint over a multi-tree
 //!      train INCLUDING a `with_features` swap tail is IDENTICAL memo-ON vs memo-OFF.
 //!
-//!  (B) SAME-SESSION ONDEV_GROW LEDGER A/B (OHP-04, Plan 30-03): a 4-arm A/B at 500k×50
+//!  (B) SAME-SESSION ONDEV_GROW LEDGER A/B: a 4-arm A/B at 500k×50
 //!      driving the FULL learner path, toggling BOTH off-switches in ONE process, draining
 //!      the per-train `ONDEV_GROW` ledger, and printing the two target deltas:
 //!        - OHP-01 (fused partition): the ledger `partition` bucket — fused ON ≤ fused OFF.
 //!        - OHP-02 (GrowFeature memo): the learner GLUE = (learner wall − grow wall), which
 //!          holds the per-tree `GrowFeature` build — memo ON ≤ memo OFF.
-//!      Same-session is mandatory: box noise across separate processes invents fake deltas
-//!      (the 061–068/078/080 discipline). Local hip is a spoofed 8-CU APU ⇒ these numbers
-//!      are DIRECTIONAL only (both levers are host-side data-movement/alloc elisions, so the
-//!      spike-080 transfer rule says the DIRECTION transfers to real CUDA — magnitudes come
-//!      from the Kaggle A/B, NOT from here).
+//!      Same-session is mandatory: box noise across separate processes invents fake deltas.
+//!      Local hip is a spoofed 8-CU APU ⇒ these numbers are DIRECTIONAL only (both levers
+//!      are host-side data-movement/alloc elisions, so the direction is expected to transfer
+//!      to real CUDA — magnitudes come from the Kaggle A/B, NOT from here).
 //!
 //!  The 4 arms (both switches, one process):
-//!    arm 1  fused ON , memo ON   (both levers ON — the Phase-30 master default)
+//!    arm 1  fused ON , memo ON   (both levers ON — the default)
 //!    arm 2  fused OFF, memo ON   (isolates OHP-01: partition bucket must be ≥ arm 1)
 //!    arm 3  fused ON , memo OFF  (isolates OHP-02: learner glue must be ≥ arm 1)
-//!    arm 4  fused OFF, memo OFF  (both OFF — the pre-Phase-30 baseline)
+//!    arm 4  fused OFF, memo OFF  (both OFF — the pre-optimization baseline)
 //!
 //!  The fused-partition switch is read-once (`OnceLock`) in production, so this harness
 //!  flips it via the same-session override `grow_driver::set_fused_partition_override`
@@ -37,7 +36,7 @@
 //!   The perf DIRECTION (partition ↓, glue ↓) is printed + soft-flagged, NOT hard-gated:
 //!   the DoD verdict is the Kaggle real-CUDA A/B, and the local APU wall is directional.
 //!
-//! Run (local hip) — build with the crate's OWN `--features rocm` (Pitfall 4: the
+//! Run (local hip) — build with the crate's OWN `--features rocm` (the
 //! dep-scoped `<dep>/rocm` spelling leaves the example's own `cfg(feature="rocm")`
 //! false and silently compiles the GPU arm OUT — do NOT use it here):
 //!   LGBM_CUDA_ON_DEVICE=1 LGBM_PHASE_PROF=1 \
@@ -172,9 +171,9 @@ fn train_stream_fingerprint(num_data: usize, num_features: usize, memo: bool) ->
     for iter in 0..N_TREES {
         let (g, h) = grads(0x9e37_79b9 ^ iter as u64, num_data);
         let tree = learner.train(&g, &h, iter == 0).expect("on-device train");
-        // SEAM (Plan 30-03): drain the per-train ONDEV_GROW ledger. Asserting the arm
-        // actually took the on-device path guards against Pitfall 4 (GPU arm compiled
-        // out ⇒ empty ledger ⇒ a vacuous "identical" pass).
+        // SEAM: drain the per-train ONDEV_GROW ledger. Asserting the arm
+        // actually took the on-device path guards against a compiled-out GPU arm
+        // (empty ledger ⇒ a vacuous "identical" pass).
         let led = on_device_grow_phase_take();
         assert!(led.wall > 0, "grow ledger empty — on-device path NOT taken (iter {iter}); \
              did you build with the crate's OWN --features rocm?");
@@ -204,7 +203,7 @@ fn train_stream_fingerprint(num_data: usize, num_features: usize, memo: bool) ->
 /// GLUE = (learner wall − grow wall) that holds the per-tree `GrowFeature` build (OHP-02).
 /// Also EMITS a canonical `[phase_prof:...] ONDEV_GROW:` line to stderr (identical format
 /// to `phase_prof::dump`) so the Kaggle parser regex (`parse_growth_ledger.ONDEV_RE`) can
-/// be validated against a REAL locally-emitted line before the ~45-min kernel is burned.
+/// be validated against a REAL locally-emitted line.
 #[cfg(feature = "rocm")]
 struct ArmResult {
     fingerprint: u64,
@@ -216,7 +215,7 @@ struct ArmResult {
 
 /// Replicate `phase_prof::dump`'s ONDEV_GROW line VERBATIM (same prefix + field order +
 /// `{:.3}`/`{:.1}` precision) from a drained ledger, so `parse_growth_ledger.ONDEV_RE`
-/// matches a line this harness actually emits (Task-2 regex-validation gate).
+/// matches a line this harness actually emits (the regex-validation gate).
 #[cfg(feature = "rocm")]
 fn emit_ondev_grow_line(label: &str, led: &lgbm_compute::kernels::grow_driver::GrowPhaseNs) {
     let sum = led.setup
@@ -291,7 +290,7 @@ fn ledger_arm(fused: bool, memo: bool, arm: &str) -> ArmResult {
 
 /// OHP-04: the 4-arm same-session `ONDEV_GROW` ledger A/B at 500k×50. Prints the two
 /// target deltas (partition bucket for fused ON/OFF; learner glue for memo ON/OFF), a
-/// compact block for pasting into `30-AB-RESULTS.md`, and hard-asserts the tree-stream
+/// compact block for pasting into the results summary, and hard-asserts the tree-stream
 /// fingerprint is IDENTICAL across ALL 4 arms (the byte-neutral parity gate). The perf
 /// DIRECTION is soft-flagged (local APU wall is DIRECTIONAL — the DoD verdict is Kaggle).
 #[cfg(feature = "rocm")]

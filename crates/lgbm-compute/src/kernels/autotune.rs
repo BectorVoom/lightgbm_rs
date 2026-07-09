@@ -1,19 +1,18 @@
-//! Shared CubeCL-autotune plumbing for the GPU launch-config knobs (phase 13).
+//! Shared CubeCL-autotune plumbing for the GPU launch-config knobs.
 //!
 //! This is the one place the two launch-knob wirings depend on:
-//!   - 13-02 histogram-BUILD row-partition `P` (`histogram.rs`) and
-//!   - 13-03 split-SCAN `CubeDim` `W` (`split.rs`)
+//!   - histogram-BUILD row-partition `P` (`histogram.rs`) and
+//!   - split-SCAN `CubeDim` `W` (`split.rs`)
 //! both reuse the [`LaunchKey`] AutotuneKey, the [`size_band`] log2 bucketer, the
 //! [`autotune_enabled`] off-switch, and the [`cache_namespace_id`] device cache id.
 //!
-//! Honors the spike-037/038/039 corrections (READ
-//! `.claude/skills/spike-findings-lightgbm_rs/references/gpu-kernel-autotuning.md`):
+//! Two correctness rules apply here:
 //!   - serde is MANDATORY in the crate that defines the key — the `AutotuneKey` trait
 //!     alias requires `serde::{Serialize, DeserializeOwned}` under `std_io` (always on
 //!     linux), so the persistent disk cache (`target/autotune/<ver>/<device>/*.json.log`)
-//!     can round-trip the chosen variant across processes (spike-037).
+//!     can round-trip the chosen variant across processes.
 //!   - The AutotuneKey keys on the OCCUPANCY REGIME (`log2(rows)` size-band), NOT the
-//!     exact row count — exact-`rows` keying is a per-leaf tuning STORM (spike-039).
+//!     exact row count — exact-`rows` keying would cause a per-leaf tuning STORM.
 //!
 //! Gated `#[cfg(feature = "rocm")]` at the declaration site (see `kernels/mod.rs`); the
 //! default cpu build pulls none of this codegen (the f64 anchor is never autotuned).
@@ -23,9 +22,9 @@ use std::fmt::Display;
 /// The shared [`cubecl::tune::AutotuneKey`] both launch knobs reuse.
 ///
 /// One shape, two consumers:
-///   - the histogram-BUILD tunable (13-02) sets `bucket = size_band(rows)` so the chosen
+///   - the histogram-BUILD tunable sets `bucket = size_band(rows)` so the chosen
 ///     row-partition `P` tracks the occupancy regime, and
-///   - the split-SCAN tunable (13-03) sets `bucket = 0` (the feature-per-lane scan is
+///   - the split-SCAN tunable sets `bucket = 0` (the feature-per-lane scan is
 ///     bit-exact across `CubeDim` `W` and the winning `W` does not depend on row count).
 ///
 /// `serde::{Serialize, Deserialize}` are REQUIRED: the persistent disk cache (`std_io`,
@@ -52,7 +51,7 @@ impl Display for LaunchKey {
     }
 }
 
-/// The `log2(rows)` occupancy size-band (spike-039).
+/// The `log2(rows)` occupancy size-band.
 ///
 /// Returns `floor(log2(rows))`, i.e. the power-of-two decade `rows` falls in, so every
 /// node within the same decade shares a key and tunes ONCE per regime instead of once
@@ -74,7 +73,7 @@ pub fn size_band(rows: usize) -> u32 {
 ///
 /// Default-ON: returns `true` unless `LGBM_AUTOTUNE=0` is set, in which case the rocm
 /// launch paths fall back to the cold-start heuristic (`row_partition_count` /
-/// `LGBM_SCAN_CUBEDIM`). Read FRESH on every call (NOT `OnceLock`-cached) so the 13-04
+/// `LGBM_SCAN_CUBEDIM`). Read FRESH on every call (NOT `OnceLock`-cached) so the
 /// parity tests and the off-switch can toggle within a single process. Mirrors the
 /// existing `LGBM_SCAN_CUBEDIM` / `LGBM_ROWPART_*` escape hatches.
 ///
@@ -89,7 +88,7 @@ pub fn autotune_enabled() -> bool {
 /// The persistent-cache namespace id — the `id` first arg of `LocalTuner::execute`.
 ///
 /// Names the on-disk cache directory (`target/autotune/<ver>/<device>/*.json.log`) so the
-/// winner persists across processes (spike-037). Tied to the device ordinal bound by
+/// winner persists across processes. Tied to the device ordinal bound by
 /// [`crate::runtime::rocm_client`]'s `AmdDevice::new(0)`; returns the constant `"rocm:0"`
 /// to match that single local device (there is no clean public ordinal accessor in
 /// `runtime.rs`, and the client is hardcoded to ordinal 0).

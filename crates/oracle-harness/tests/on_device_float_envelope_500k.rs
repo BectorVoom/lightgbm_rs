@@ -1,17 +1,16 @@
-//! Phase-29 29-04 (OCX-04, Task 3) — the ≥500k-row NON-UNIFORM-hessian float-reduction
-//! ENVELOPE gate over the FULL resident chain.
+//! A ≥500k-row NON-UNIFORM-hessian float-reduction ENVELOPE gate over the FULL resident
+//! chain.
 //!
-//! # The blind spot this gate closes (spike-072 Results 5)
+//! # The blind spot this gate closes
 //!
-//! Every float-reduction gate before Phase 29 ran SMALL corpora with UNIFORM hessians — the
-//! exact regime where the spike-072 f32 root-fold bias was INVISIBLE. Iter-0 binary-logloss
-//! hessians are uniformly ≈0.25, which is exactly 32 ulps at accumulator magnitude ~124k, so
-//! every add is EXACT and the serial f32 fold shows no bias (spike-072 item 13, "Tree 0
-//! escapes"). The bias only appears once (a) the corpus is large enough for the accumulator
-//! to reach a magnitude where ~0.25 addends round, AND (b) the hessians are NON-UNIFORM
-//! (iter-1+ binary logloss). This gate runs at ≥500k rows with NON-UNIFORM (binary-logloss-
-//! like) hessians so the f32-accumulation class is OBSERVABLE — it must never be
-//! "optimized away" back to a small/uniform corpus.
+//! A small corpus with UNIFORM hessians cannot detect an f32 root-fold accumulation bias.
+//! Iter-0 binary-logloss hessians are uniformly ≈0.25, which is exactly 32 ulps at
+//! accumulator magnitude ~124k, so every add is EXACT and a serial f32 fold shows no bias.
+//! The bias only appears once (a) the corpus is large enough for the accumulator to reach a
+//! magnitude where ~0.25 addends round, AND (b) the hessians are NON-UNIFORM (iter-1+ binary
+//! logloss). This gate runs at ≥500k rows with NON-UNIFORM (binary-logloss-like) hessians so
+//! the f32-accumulation class is OBSERVABLE — it must never be "optimized away" back to a
+//! small/uniform corpus.
 //!
 //! # Two lanes (mirrors `on_device_sync_count.rs` / `on_device_integer_anchor.rs`)
 //!   - **rocm RESIDENT lane (`#[cfg(feature = "rocm")]`, hardware-only):** ONE resident grow
@@ -21,13 +20,13 @@
 //!   - **cpu ANCHOR companion (always runnable):** the SAME assertions on the cubecl-cpu f64
 //!     anchor arm — proves the harness itself and gives CI a lane for future refactors.
 //!
-//! # Assertions (device-vs-HOST-f64 ONLY — never GPU-f32-vs-GPU-f32, def-f8u-01)
+//! # Assertions (device-vs-HOST-f64 ONLY — never GPU-f32-vs-GPU-f32)
 //!   (a) the seeded root grad/hess sums are BIT-EXACT to an independent host f64 ascending
-//!       fold (the 29-01 root-fold contract at the driver level);
+//!       fold;
 //!   (b) for a SAMPLE of grown leaves, the emitted leaf value is within a DOCUMENTED envelope
 //!       of the host f64 truth recomputed over that leaf's ACTUAL rows (from the layout);
-//!   (c) every emitted leaf value is FINITE and |v| is sane (the spike-072 blow-up signature
-//!       is 1.27e3 → ±inf; healthy binary-logloss leaves are O(1)).
+//!   (c) every emitted leaf value is FINITE and |v| is sane (healthy binary-logloss leaves
+//!       are O(1)).
 
 use lgbm_compute::gain::calculate_splitted_leaf_output;
 use lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver;
@@ -111,8 +110,8 @@ fn envelope_corpus() -> (Vec<GrowFeature>, Vec<f32>, Vec<f32>) {
     (features, gradients, hessians)
 }
 
-/// Independent host f64 ASCENDING fold (the 29-01 reference; NOT `root_grad_hess_fold`, so
-/// the assertion is against a fold computed in the test, not the code under test).
+/// Independent host f64 ASCENDING fold (NOT `root_grad_hess_fold`, so the assertion is
+/// against a fold computed in the test, not the code under test).
 fn host_f64_fold(rows: impl Iterator<Item = u32>, grad: &[f32], hess: &[f32]) -> (f64, f64) {
     let mut sg = 0.0f64;
     let mut sh = 0.0f64;
@@ -136,7 +135,7 @@ fn assert_envelope(
     leaf_atol: f64,
     leaf_rtol: f64,
 ) {
-    // (a) ROOT SEED bit-exact to the independent host f64 ascending fold (29-01 contract).
+    // (a) ROOT SEED bit-exact to the independent host f64 ascending fold.
     let host_root = host_f64_fold(0..NUM_DATA as u32, grad, hess);
     assert_eq!(
         device_root.0.to_bits(),
@@ -153,7 +152,7 @@ fn assert_envelope(
         host_root.1
     );
 
-    // (c) every leaf value finite + sane (the spike-072 1.27e3 → ±inf blow-up signature).
+    // (c) every leaf value finite + sane.
     for (leaf, &v) in tree.leaf_value.iter().enumerate() {
         assert!(v.is_finite(), "leaf {leaf} value is non-finite ({v}) — spike-072 blow-up");
         assert!(v.abs() < 1e3, "leaf {leaf} value {v} implausibly large (blow-up signature)");
@@ -188,7 +187,7 @@ fn assert_envelope(
     }
 }
 
-/// Task 3 (cpu ANCHOR companion) — the same properties at 500k on the cubecl-cpu f64 anchor
+/// cpu ANCHOR companion — the same properties at 500k on the cubecl-cpu f64 anchor
 /// arm. Proves the harness; leaf values are within a TIGHT f64-reorder envelope (the emitted
 /// leaf sums are bin-grouped folds of the histogram while the host truth is a row-order fold —
 /// f64 non-associativity ≲ n·u·Σ|h| ≈ 7e-6 abs on the sum at n=5e5, so a leaf-value envelope
@@ -210,13 +209,13 @@ fn float_envelope_500k_cpu_anchor() {
     assert_envelope(&tree, &layout, device_root, &gradients, &hessians, 1e-7, 1e-9);
 }
 
-/// Task 3 (rocm RESIDENT lane) — ONE ≥500k non-uniform-hessian resident grow on real hip
-/// hardware. Root seed BIT-EXACT to the host f64 fold (29-01 on-device fold); sampled leaf
+/// rocm RESIDENT lane — ONE ≥500k non-uniform-hessian resident grow on real hip
+/// hardware. Root seed BIT-EXACT to the host f64 fold; sampled leaf
 /// values within the u64-dequant envelope: the resident build quantizes grad/hess at
 /// S = 2^30, so each cell carries ≤ 2^-31 abs error and a leaf sum over n rows ≤ n·2^-31 ≈
 /// 2.3e-4 at n=5e5; propagated through -sg/sh (sh = O(n·0.1) ≈ 6e4) that is a leaf-value
-/// atol ≈ 1e-3 / rtol ≈ 1e-3 — loose but DERIVED, and (c) finiteness is the real spike-072
-/// guard. Compares device-vs-host-f64 ONLY (def-f8u-01: never GPU-f32-vs-GPU-f32).
+/// atol ≈ 1e-3 / rtol ≈ 1e-3 — loose but DERIVED, and (c) finiteness is the real
+/// guard. Compares device-vs-host-f64 ONLY (never GPU-f32-vs-GPU-f32).
 #[cfg(feature = "rocm")]
 #[test]
 fn float_envelope_500k_rocm_resident() {
@@ -228,7 +227,7 @@ fn float_envelope_500k_rocm_resident() {
     let hip = rocm_client();
     let (features, gradients, hessians) = envelope_corpus();
 
-    // The 29-01 on-device f64 root fold (the resident driver's own seed path).
+    // The on-device f64 root fold (the resident driver's own seed path).
     let device_root = backend.root_grad_hess_sum(&hip, &gradients, &hessians);
 
     let (tree, layout) =

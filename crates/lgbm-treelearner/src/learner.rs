@@ -1,21 +1,21 @@
-//! `SerialTreeLearner` — the leaf-wise (best-first) growth loop (the D-04 spine).
+//! `SerialTreeLearner` — the leaf-wise (best-first) growth loop.
 //!
 //! Faithful 1:1 port of `SerialTreeLearner::Train` + `BeforeTrain` +
 //! `BeforeFindBestSplit` + `FindBestSplits` + `SplitInner`
 //! (`LightGBM/src/treelearner/serial_tree_learner.cpp`, commit 195c26fc,
 //! VERSION 4.6.0.99) for the pinned spine config: `force_row_wise=true`,
 //! `feature_fraction=1.0` (no subsampling → every feature used), numeric splits,
-//! `missing_type == None` (NA_AS_MISSING deferred, RESEARCH A5). It grows ONE
-//! tree from FIXED g/h — there is no boosting loop (Phase 6) and no objective.
+//! `missing_type == None` (NA_AS_MISSING deferred). It grows ONE
+//! tree from FIXED g/h — there is no boosting loop and no objective.
 //!
-//! ## What it drives (Phase-4 Backend ops — no new numerics)
+//! ## What it drives
 //! - `construct_histograms` (smaller leaf) → host-side `Vec<f64>` histogram.
 //! - `subtract_histograms` (larger leaf = parent − smaller) when `use_subtract`.
 //! - `fix_histogram` (learner-side, RAW leaf sums — Pitfall 2) before each scan.
-//! - `find_best_split` (per feature; gain math IN-kernel — D-01a, Anti-Pattern:
-//!   never re-derive per-bin gains here).
-//! - `data_partition` (row→leaf reorder, TRL-07) via [`DataPartition::split`].
-//! - `Tree::split` (grow the node + two child leaves, D-07).
+//! - `find_best_split` (per feature; gain math IN-kernel; never re-derive
+//!   per-bin gains here).
+//! - `data_partition` (row→leaf reorder) via [`DataPartition::split`].
+//! - `Tree::split` (grow the node + two child leaves).
 //!
 //! ## Keystone fidelity points
 //! - Smaller-child SELECTION drives the subtraction trick off
@@ -23,12 +23,12 @@
 //!   ⇒ smaller = left (the parent buffer is `Move`d to the larger child).
 //! - Cross-feature argmax is a FLAT `Vec<SplitInfo>` + first-max scan using
 //!   [`split_gt`] (gain, then smaller feature) — NEVER an ordered/priority-queue
-//!   container (RESEARCH Standard Stack: a heap would change tie-break order).
+//!   container (a heap would change tie-break order).
 //! - `min_gain_to_split` is added back ONLY for the tree-model `split_gain` field
 //!   (`serial_tree_learner.cpp:804`), NOT for selection (the kernel already
 //!   returns gain net of `min_gain_shift`).
 //!
-//! ## Dropped branches (Phase-7+ / project-dropped)
+//! ## Dropped branches
 //! Every `use_quantized_grad` / monotone / cegb / linear / categorical branch is
 //! ignored — only the no-constraint, non-linear, numeric default path is ported.
 
@@ -51,27 +51,26 @@ use crate::leaf_splits::LeafSplits;
 use crate::monotone_constraints::MonotoneConstraints;
 use crate::split_info::{split_gt, SplitInfo};
 
-/// The histogram-build strategy (`force_row_wise` / `force_col_wise`, TRL-09).
+/// The histogram-build strategy (`force_row_wise` / `force_col_wise`).
 ///
 /// In C++ this selects between row-major and column-major histogram accumulation
 /// in `GetShareStates` (`serial_tree_learner.cpp:81-112`). The two differ ONLY in
 /// the ORDER bins are accumulated, NOT the result (Pitfall 5): on the
-/// single-thread deterministic anchor the Phase-4 `construct_histograms`
+/// single-thread deterministic anchor the `construct_histograms`
 /// whole-kernel op produces the SAME f64 cells for either strategy, so this is a
-/// config FLAG over the shared Backend path (RESEARCH A1 / Open Q2 — verified
-/// empirically by the `learner_parity_row_vs_col` golden, which asserts both
-/// strategies grow a tree bit-identical to each other and to C++).
+/// config FLAG over the shared Backend path — verified empirically by the
+/// `learner_parity_row_vs_col` golden, which asserts both strategies grow a
+/// tree bit-identical to each other and to C++.
 ///
 /// If a future backend's column-major accumulation ever diverged from the
-/// row-major cells at the `construct_histograms` layer, that would be a Phase-4
-/// boundary re-open (threat T-05-04-02) — the learner does not silently ship a
-/// divergent tree; the row==col equality gate would fail loudly.
+/// row-major cells at the `construct_histograms` layer, the learner does not
+/// silently ship a divergent tree; the row==col equality gate would fail loudly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BuildStrategy {
-    /// `force_row_wise=true` — the Plan-03 spine default.
+    /// `force_row_wise=true` — the spine default.
     #[default]
     RowWise,
-    /// `force_col_wise=true` — observationally identical on the anchor (A1).
+    /// `force_col_wise=true` — observationally identical on the anchor.
     ColWise,
 }
 
@@ -82,13 +81,13 @@ const K_MIN_SCORE: f64 = f64::NEG_INFINITY;
 /// One feature column's spine input: the binned column over ALL rows plus the
 /// bin-layout descriptors the Backend ops + `Tree::split` need.
 ///
-/// This is the spine's faithful slice of the Phase-2 `Dataset` / `FeatureGroup` /
-/// `BinMapper` surface — the learner does NOT re-bin (RESEARCH Don't-Hand-Roll);
-/// the caller (or the capture harness) supplies these directly.
+/// This is the spine's faithful slice of the `Dataset` / `FeatureGroup` /
+/// `BinMapper` surface — the learner does NOT re-bin; the caller (or the
+/// capture harness) supplies these directly.
 #[derive(Debug, Clone)]
 pub struct FeatureColumn {
     /// Per-GLOBAL-ROW bin index, length `num_data`, stored in the NARROWEST
-    /// unsigned type for `num_bin` (spike 004 — [`BinColumn`]). The hot histogram
+    /// unsigned type for `num_bin` (see [`BinColumn`]). The hot histogram
     /// fold reads the narrow type directly per-width; cold readers
     /// (partition/bagging/validation/scatter/GPU upload) go through the widening
     /// [`BinColumn::bin`] / [`BinColumn::iter_u32`] / [`BinColumn::to_u32_vec`]
@@ -99,7 +98,7 @@ pub struct FeatureColumn {
     pub num_bin: u32,
     /// The threshold-offset arithmetic descriptor (`meta_->offset`). This MUST be
     /// derived from [`crate::offset_for_most_freq_bin`] — the single authoritative
-    /// rule (`most_freq_bin == 0 -> 1`, else `0`) that supersedes D-01 per D-09. Do
+    /// rule (`most_freq_bin == 0 -> 1`, else `0`). Do
     /// NOT inline the rule here; the helper is the sole source. It drives the
     /// FORWARD/REVERSE compacted-scan range (`num_bin - offset` cells) and the
     /// threshold recording (`t + offset` / `t - 1 + offset`).
@@ -128,7 +127,7 @@ pub struct FeatureColumn {
     pub real_feature_index: i32,
     /// C++ `BinMapper::bin_type()` — the per-feature dispatch flag
     /// (`serial_tree_learner.cpp:779`). [`BinType::Numerical`] routes the
-    /// byte-untouched continuous split spine (D-06 HARD INVARIANT);
+    /// byte-untouched continuous split spine (HARD INVARIANT);
     /// [`BinType::Categorical`] routes the additive
     /// [`find_best_threshold_categorical`](crate::find_best_threshold_categorical)
     /// branch. Defaults to `Numerical` so every spine call site is unchanged.
@@ -210,21 +209,21 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     max_depth: i32,
     /// The spine's per-feature columns (set via [`with_features`](Self::with_features)).
     /// `Arc` so the per-tree `self.features.clone()` in `train_inner` is an O(1) refcount
-    /// bump, not a num_features×num_data deep copy (spike-062/064; the columns are
+    /// bump, not a num_features×num_data deep copy — the columns are
     /// immutable across trees — the bagging path swaps a fresh subset Arc in and out).
     features: Arc<Vec<FeatureColumn>>,
-    /// `force_row_wise` / `force_col_wise` (TRL-09). Default `RowWise` (spine).
+    /// `force_row_wise` / `force_col_wise`. Default `RowWise` (spine).
     strategy: BuildStrategy,
-    /// Feature-subsampling config (TRL-08): `(feature_fraction,
+    /// Feature-subsampling config: `(feature_fraction,
     /// feature_fraction_bynode, feature_fraction_seed)`. `None` ⇒ the spine path
     /// (`feature_fraction == feature_fraction_bynode == 1.0`, no subsampling, the
-    /// `ColSampler` is never built so the Plan-03 behavior is bit-identical).
+    /// `ColSampler` is never built so behavior is bit-identical).
     col_sampling: Option<(f64, f64, i32)>,
-    /// TEST-ONLY audit hook (T-05-07-01). When `Some`, every `use_subtract` larger
+    /// TEST-ONLY audit hook. When `Some`, every `use_subtract` larger
     /// child in the live growth path records `(derived, direct)`: the histogram the
     /// wired `subtract_histograms(parent, smaller)` produced vs an independent
     /// direct build of the same leaf's rows. A parity test drains this to assert the
-    /// subtracted larger child equals the direct build cell-for-cell (TRL-02), in
+    /// subtracted larger child equals the direct build cell-for-cell, in
     /// the ACTUAL growth path (not just in isolation). `None` in production (no-op,
     /// zero overhead beyond the `Option` check).
     subtract_audit: Option<std::cell::RefCell<Vec<(Vec<f64>, Vec<f64>)>>>,
@@ -236,23 +235,23 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// Sized to `num_leaves` and reset alongside `best_split_per_leaf` each split.
     /// A `RefCell` so the `&self` scan can record into it.
     best_cat_threshold: std::cell::RefCell<Vec<Option<Vec<u32>>>>,
-    /// W10 advanced learner constraints (ADV-01..05). `Default` (all-empty/off) ⇒
-    /// every gate is INACTIVE and the spine split path is byte-untouched (D-06).
+    /// Advanced learner constraints. `Default` (all-empty/off) ⇒
+    /// every gate is INACTIVE and the spine split path is byte-untouched.
     constraints: LearnerConstraints,
-    /// Per-tree monotone state (ADV-01), set up at the top of each `train_inner`
+    /// Per-tree monotone state, set up at the top of each `train_inner`
     /// when `constraints.monotone_constraints` is active; `None` on the spine.
     /// A `RefCell` so the `&self` scan can READ the per-leaf clamp while the
     /// `&mut self` growth loop UPDATES it after each split.
     monotone: std::cell::RefCell<Option<MonotoneConstraints>>,
-    /// Per-tree CEGB state (ADV-05); `None` on the spine. A `RefCell` so the scan
+    /// Per-tree CEGB state; `None` on the spine. A `RefCell` so the scan
     /// can read the penalty state while the growth loop updates it after a split.
     cegb: std::cell::RefCell<Option<CegbModel>>,
-    /// ADV-02 interaction constraints: per-leaf branch-feature list (the REAL
+    /// Interaction constraints: per-leaf branch-feature list (the REAL
     /// feature indices on the root-to-leaf path, C++ `Tree::branch_features_`).
     /// Empty entries on the spine (interaction inactive). A `RefCell` so the scan
     /// can read each node's allowed set while the growth loop appends on split.
     branch_features: std::cell::RefCell<Vec<Vec<i32>>>,
-    /// ADV-04 extra-trees per-feature RNG (`meta_->rand = Random(extra_seed + i)`,
+    /// Extra-trees per-feature RNG (`meta_->rand = Random(extra_seed + i)`,
     /// feature_histogram.hpp:1450), indexed by feature POSITION. `None` on the
     /// spine. Built per tree; each per-feature scan draws ONE `next_int` (the
     /// `BeforeNumerical` rand_threshold), so the RNG state must persist across
@@ -273,23 +272,23 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// Indexed `[leaf][feature_position]`; reset per tree. `RefCell` so the `&self`
     /// scan records it.
     feature_splittable: std::cell::RefCell<Vec<Vec<bool>>>,
-    /// R1 (perf): when `false`, `scan_leaf_histogram` SKIPS the snapshot-only
+    /// Performance: when `false`, `scan_leaf_histogram` SKIPS the snapshot-only
     /// `per_bin_gains` host re-scan (the per-feature per-bin gain arrays that feed
-    /// the D-06 `SplitSnapshot`). The grown tree is bit-identical either way — the
+    /// the `SplitSnapshot`). The grown tree is bit-identical either way — the
     /// live split decision comes from `backend.find_best_split`, never from
     /// `per_bin_gains` (a pure read). Set `true` by `train_with_snapshots` /
     /// `train_with_col_sampler_trace` (the golden-replay paths) and `false` by
     /// `train` / `train_returning_partition` (the production boosting path), so the
     /// boosting loop pays nothing for snapshots it discards.
     capture_snapshots: bool,
-    /// 260608-p90: whether THIS train is device-resident-eligible (a pure numeric
+    /// Whether THIS train is device-resident-eligible (a pure numeric
     /// spine on a resident-capable backend). Computed ONCE at the top of
     /// `train_inner` via [`crate::resident_pool::resident_eligible`] and read in
     /// `find_best_splits` to route the per-leaf build→fix→compact→subtract→scan chain
     /// through the device-handle slot mirror (keeping histograms resident). `false`
     /// (the default, and ALWAYS on CpuBackend) takes the byte-unchanged host path.
     resident_eligible: bool,
-    /// 260608-t3t: when `true`, directly-built leaves (root + smaller children) on the
+    /// When `true`, directly-built leaves (root + smaller children) on the
     /// small/medium fused-eligible band route through the FUSED build+fix+compact+scan
     /// kernel (`Backend::build_fix_scan_resident`) — ONE launch instead of construct +
     /// fix + scan = 3. The subtract-derived larger children KEEP subtract+scan; large
@@ -297,35 +296,35 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// `train_inner` via [`crate::resident_pool::fused_directly_built_eligible`]; `false`
     /// (default, ALWAYS on CpuBackend) takes the existing resident/host routing.
     fused_eligible: bool,
-    /// ODL-01 (Phase 14, D-05): whether THIS learner is eligible to grow whole
+    /// Whether THIS learner is eligible to grow whole
     /// trees on-device. The base gate is computed at [`new`](Self::new) as
-    /// `backend.on_device_growth_supported()` alone (L-2, 23-01: that method already
+    /// `backend.on_device_growth_supported()` alone (that method already
     /// returns the resolved tri-state `lgbm_compute::cuda_on_device_enabled()`, so the
-    /// learner no longer parses `LGBM_CUDA_ON_DEVICE` a second time), then
+    /// learner does not parse `LGBM_CUDA_ON_DEVICE` a second time), then
     /// [`refresh_on_device_eligibility`](Self::refresh_on_device_eligibility)
-    /// re-applies the D-06 categorical+quantized host-fallback gate
+    /// re-applies the categorical+quantized host-fallback gate
     /// ([`on_device_eligible_gate`]) from [`with_features`](Self::with_features) /
     /// [`with_quantized_grad`](Self::with_quantized_grad) (setup-time, once) — read at
     /// the TOP of `train_inner` to route the decide-once on-device fork. Unlike
     /// [`resident_eligible`](Self::resident_eligible) (recomputed per train), this
     /// is NOT recomputed in `train_inner` — on-device eligibility has no per-train,
     /// size-dependent input the way resident does, so a per-train env re-read buys
-    /// nothing and adds a syscall per tree (D-05 INTENTIONAL divergence — do NOT
+    /// nothing and adds a syscall per tree (an intentional divergence — do NOT
     /// "normalize" this back into `train_inner`). ANDing the backend discriminator
     /// means CpuBackend (false) — and GpuBackend<R> (false in Slice 0) — can NEVER
     /// be eligible regardless of the env, so the host path is byte-unchanged.
     on_device_eligible: bool,
-    /// Phase-25 (25-03, ODP2-04, §11): one-shot signal that THIS learner just grew a
+    /// One-shot signal that THIS learner just grew a
     /// tree ON-DEVICE, so its per-leaf `AddScore` must be applied via the resident
     /// partition scatter `add_prediction_to_score_on_device` over the returned resident
     /// partition / `cuda_score_` — NOT the host `add_prediction_to_score` scatter and
     /// NOT the rows-reconstruction device tree-walk. Set inside the `on_device_eligible`
     /// grow block (so it is DEAD with `LGBM_CUDA_ON_DEVICE` unset — the host score path
-    /// stays byte-identical, SC-4) and drained by the `boosting_on_cuda_` resident-score
+    /// stays byte-identical) and drained by the `boosting_on_cuda_` resident-score
     /// seam via [`take_resident_score_pending`](Self::take_resident_score_pending). A
     /// `Cell` so the `&self` boosting caller can take it.
     resident_score_pending: std::cell::Cell<bool>,
-    /// D-06 (Phase 22): whether `config.use_quantized_grad` is on. Set via
+    /// Whether `config.use_quantized_grad` is on. Set via
     /// [`with_quantized_grad`](Self::with_quantized_grad) (default `false` — the spine
     /// path). The CUDA reference `asm("trap;")`s on the categorical + quantized combo
     /// (it has NO on-device categorical+quantized path), so when this is `true` AND any
@@ -334,51 +333,51 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// [`refresh_on_device_eligibility`](Self::refresh_on_device_eligibility); the
     /// numeric+quantized and categorical-without-quantized combos are UNCHANGED.
     use_quantized_grad: bool,
-    /// D-06: one-shot guard so the categorical+quantized host-fallback notice is
+    /// One-shot guard so the categorical+quantized host-fallback notice is
     /// logged EXACTLY once (the eligibility recompute may run from more than one
     /// builder). With `LGBM_CUDA_ON_DEVICE` unset the base gate is `false`, so the
-    /// notice never fires and the default lane emits nothing (SC #4).
+    /// notice never fires and the default lane emits nothing.
     cat_quant_fallback_logged: bool,
-    /// quick-260621-p9v (spike-014b lever): whether the per-train resident-bin device
+    /// Whether the per-train resident-bin device
     /// upload has already run THIS train. The binned columns are immutable for the whole
     /// train and `RocmBackend` is one instance per `train()` (its `resident_bins` cache
     /// survives across trees — `reset_resident_pool` never clears it), so the upload only
-    /// needs to happen on the FIRST tree, not every tree (the per-tree re-upload was ~31%
-    /// of train wall-clock at 1M×500). Default `false`; set `true` after the upload in
-    /// `train_inner`; reset to `false` in [`with_features`](Self::with_features) (a new
+    /// needs to happen on the FIRST tree, not every tree. Default `false`; set `true`
+    /// after the upload in `train_inner`; reset to `false` in
+    /// [`with_features`](Self::with_features) (a new
     /// feature set makes the cached device bins stale ⇒ must re-upload).
     resident_bins_uploaded: bool,
-    /// spike-066 (D5): whether the V5 bin-range validation scan (the relocated
-    /// T-04-01 mitigation) has already validated the CURRENT `self.features`. The
+    /// Whether the bin-range validation scan has already validated the CURRENT
+    /// `self.features`. The
     /// feature columns are IMMUTABLE after load (the `Dataset`-is-immutable
     /// contract), so the per-column `first_ge(num_bin)` full-column scan + the
     /// `na_as_missing()` branch only need to run ONCE per feature set — not once per
-    /// tree (the per-tree re-scan was ~672ms/train, ~14% of wall on 1M×30). Default
+    /// tree. Default
     /// `false`; set `true` in `train_inner` after the scan completes without error;
     /// RESET to `false` at EVERY point `self.features` is (re)assigned (`with_features`
     /// + the bagging swap-in/swap-back in `train_on_subset*`) so each distinct feature
     /// set (full corpus AND every bagging/subsample subset) is validated exactly once.
     /// A plain `bool` suffices — `train_inner` holds `&mut self` and reads/sets this
     /// separately from the local `features` Arc clone (no borrow conflict, no interior
-    /// mutability). Memoizing MUST NOT skip any distinct feature set (threat T-sk7-01).
+    /// mutability). Memoizing MUST NOT skip any distinct feature set.
     bins_validated: bool,
-    /// OHP-02 (Phase 30, spike-080 residual lever): the on-device
+    /// The on-device
     /// `Vec<GrowFeature>` is a PURE function of the immutable `self.features` +
     /// immutable `self.cfg` — gradients/hessians and per-tree scalars flow as
     /// separate args to `grow_tree_on_device_with_cfg`, so nothing per-tree crosses
     /// into `GrowFeature`. The `bins: f.bins.clone()` at :857 is an
     /// O(num_features × num_data) ~25–50MB host memcpy that was rebuilt EVERY tree
-    /// (`train_inner` runs per tree — the D2/D5 per-tree-setup trap's 3rd instance,
-    /// cf spike-064/066). Memoize the whole `Vec<GrowFeature>` once per train; reset
-    /// to `None` at EVERY `self.features =` assignment site (the D5 rule — co-located
+    /// (`train_inner` runs per tree). Memoize the whole `Vec<GrowFeature>` once per
+    /// train; reset
+    /// to `None` at EVERY `self.features =` assignment site (co-located
     /// with `bins_validated = false` at :702/:708/:754/:759/:3925), NEVER gated on
     /// `is_first_tree` (bagging swaps the feature set mid-run, so a first-tree gate
     /// would serve a stale subset cache). Built + read only inside the
     /// `on_device_eligible` block ⇒ DEAD (stays `None`) with `LGBM_CUDA_ON_DEVICE`
-    /// unset (SC-4, default lane byte-unchanged). Off-switchable for the A/B via
+    /// unset (default lane byte-unchanged). Off-switchable for the A/B via
     /// `LGBM_ONDEVICE_GROWFEAT_MEMO=0` (forces the pre-change per-tree rebuild).
     grow_features_cache: Option<Vec<lgbm_compute::GrowFeature>>,
-    /// R3 (perf, 260614-p0n): reused per-feature `num_bin` descriptor for
+    /// Reused per-feature `num_bin` descriptor for
     /// [`build_leaf_histogram_into`](Self::build_leaf_histogram_into). The feature
     /// set is FIXED per train (set once via [`with_features`](Self::with_features)),
     /// so the `Vec<u32>` of per-feature bin counts is identical on every leaf build —
@@ -392,7 +391,7 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// parameter lifetime and cannot be stored behind `&self` without infecting the
     /// struct with a lifetime param (an architectural change the plan defers).
     build_num_bins: std::cell::RefCell<Vec<u32>>,
-    /// Spike 012 (perf): the leaf→histogram buffer pool, REUSED across every tree in
+    /// The leaf→histogram buffer pool, REUSED across every tree in
     /// this train instead of reallocated per tree at the top of `train_inner`. The
     /// feature set + `num_leaves` are fixed per train, so `cache_size`/`hist_len` are
     /// identical on every tree; the pool is `take()`n at the top of `train_inner`,
@@ -400,46 +399,46 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// fully overwritten before any read: directly-built leaves zero+fill the whole
     /// slot in `build_leaf_histogram_into`, subtract-derived leaves `copy_from_slice`
     /// the whole slot), used, then stored back. This eliminates the per-tree
-    /// `num_leaves`-slot allocation + zeroing + first-touch page faults that the
-    /// per-tree flat arena (spike 010) still paid — its 8–22%/tree isolated ceiling.
+    /// `num_leaves`-slot allocation + zeroing + first-touch page faults that a
+    /// per-tree flat arena still paid.
     /// Lazily built on the first tree (survives `with_features`); rebuilt only if the
     /// geometry ever changes. Bit-exact (same slot semantics as within-tree reuse).
     hist_pool: Option<HistogramPool>,
 }
 
-/// W10 advanced learner constraints (ADV-01..05) — the inactive `Default` is the
+/// Advanced learner constraints — the inactive `Default` is the
 /// spine path (every gate off, the numeric + categorical split paths
-/// byte-untouched, D-06).
+/// byte-untouched).
 #[derive(Debug, Clone, Default)]
 pub struct LearnerConstraints {
-    /// ADV-01: per-feature monotone type (indexed by REAL feature index;
+    /// Per-feature monotone type (indexed by REAL feature index;
     /// `+1`/`-1`/`0`). Empty ⇒ no monotone constraint.
     pub monotone_constraints: Vec<i32>,
-    /// ADV-01: `monotone_penalty` (`config.monotone_penalty`).
+    /// `monotone_penalty` (`config.monotone_penalty`).
     pub monotone_penalty: f64,
-    /// ADV-02: interaction-constraint groups. Each inner Vec is a set of REAL
+    /// Interaction-constraint groups. Each inner Vec is a set of REAL
     /// feature indices allowed to co-occur on a root-to-leaf path. Empty ⇒ no
     /// interaction constraint.
     pub interaction_constraints: Vec<Vec<i32>>,
-    /// ADV-04: extra-trees randomized threshold selection.
+    /// Extra-trees randomized threshold selection.
     pub extra_trees: bool,
-    /// ADV-04: `extra_seed` (per-feature RNG seed offset).
+    /// `extra_seed` (per-feature RNG seed offset).
     pub extra_seed: i32,
-    /// ADV-05: `cegb_tradeoff`.
+    /// `cegb_tradeoff`.
     pub cegb_tradeoff: f64,
-    /// ADV-05: `cegb_penalty_split`.
+    /// `cegb_penalty_split`.
     pub cegb_penalty_split: f64,
-    /// ADV-05: per-feature coupled penalty.
+    /// Per-feature coupled penalty.
     pub cegb_penalty_feature_coupled: Vec<f64>,
-    /// ADV-05: per-feature lazy penalty.
+    /// Per-feature lazy penalty.
     pub cegb_penalty_feature_lazy: Vec<f64>,
-    /// ADV-03: a pre-parsed forced-split tree (from `forced_splits_filename`
+    /// A pre-parsed forced-split tree (from `forced_splits_filename`
     /// JSON). `None` ⇒ no forced split (the spine path).
     pub forced_splits: Option<crate::forced_splits::ForcedSplitNode>,
 }
 
 
-/// The per-split snapshot the spine emits for the D-06 golden: for each candidate
+/// The per-split snapshot the spine emits for the golden: for each candidate
 /// feature at one split decision, the full per-bin gain arrays + the chosen
 /// winner. (Returned by [`SerialTreeLearner::train_with_snapshots`].)
 #[derive(Debug, Clone)]
@@ -453,13 +452,13 @@ pub struct SplitSnapshot {
     pub winner_feature: i32,
 }
 
-/// One feature's per-bin gain scan at a split decision (D-06).
+/// One feature's per-bin gain scan at a split decision.
 #[derive(Debug, Clone)]
 pub struct FeatureSplitRecord {
     /// ORIGINAL feature index.
     pub feature: i32,
     /// REVERSE-then-FORWARD per-candidate gains packed into ONE allocation
-    /// (260609-bfx snapshot-path alloc reduction: 2 retained Vecs/record → 1).
+    /// (2 retained Vecs/record → 1).
     /// `rev_len` is the REVERSE prefix length; the remaining cells are FORWARD.
     /// NaN marks a gated candidate. Empty for categorical features. Read via
     /// [`cand_rev`](Self::cand_rev) / [`cand_fwd`](Self::cand_fwd).
@@ -483,7 +482,7 @@ impl FeatureSplitRecord {
     }
 }
 
-/// The `ColSampler` selection trace for one tree (TRL-08 RNG call-sequence
+/// The `ColSampler` selection trace for one tree (RNG call-sequence
 /// golden). Records the per-tree `ResetByTree` selection and every per-node
 /// `GetByNode` selection IN DRAW ORDER (smaller-leaf then larger-leaf per split),
 /// so the parity golden can assert the exact selected feature indices.
@@ -499,13 +498,13 @@ pub struct ColSamplerTrace {
     pub bynode_selected: Vec<Vec<i32>>,
 }
 
-/// D-06 host-fallback gate (Phase 22): the CUDA reference `asm("trap;")`s on the
+/// Host-fallback gate: the CUDA reference `asm("trap;")`s on the
 /// categorical + `use_quantized_grad` combo — it has NO on-device categorical+quantized
 /// path. Mirror that non-support HONESTLY by ANDing `!(has_categorical_feature &&
 /// use_quantized_grad)` into `on_device_eligible`, so the combo routes to the host
 /// (no silent wrong answer). This lives in the learner (not `lgbm-compute`) because
 /// `on_device_growth_supported()` takes no config args and cannot see
-/// `use_quantized_grad` / per-feature `bin_type` (RESEARCH A4).
+/// `use_quantized_grad` / per-feature `bin_type`.
 ///
 /// Every OTHER combo is unchanged: numeric-only + quantized stays eligible, and
 /// categorical-without-quantized stays eligible (when the device is otherwise on).
@@ -518,21 +517,21 @@ pub(crate) fn on_device_eligible_gate(
     base_eligible && !(has_categorical_feature && use_quantized_grad)
 }
 
-/// OHP-02 (Phase 30): whether the on-device `Vec<GrowFeature>` memo is enabled.
+/// Whether the on-device `Vec<GrowFeature>` memo is enabled.
 /// Default ON (`LGBM_ONDEVICE_GROWFEAT_MEMO` unset or != "0"). Setting it to `"0"`
 /// forces the pre-change per-tree rebuild — the memo-OFF baseline arm for the
-/// same-session `ONDEV_GROW` A/B (mirrors `LGBM_ONDEVICE_BIN_HOIST=0`, spike-079).
+/// same-session A/B (mirrors `LGBM_ONDEVICE_BIN_HOIST=0`).
 #[must_use]
 fn ondevice_growfeat_memo_enabled() -> bool {
     std::env::var("LGBM_ONDEVICE_GROWFEAT_MEMO").as_deref() != Ok("0")
 }
 
-/// OHP-02 (Phase 30): build the on-device `Vec<GrowFeature>` from the immutable
+/// Build the on-device `Vec<GrowFeature>` from the immutable
 /// feature columns + the learner's `GainConfig`. Extracted as a FREE fn (not a
 /// method) so the memoize site can populate `self.grow_features_cache` without the
 /// `get_or_insert_with` closure borrowing `self.features`/`self.cfg` while it
-/// mutably borrows `self.grow_features_cache` (the RESEARCH §Code Examples #2
-/// borrow-checker fallback). All 18 fields derive from the immutable `f` /
+/// mutably borrows `self.grow_features_cache` (a borrow-checker fallback).
+/// All 18 fields derive from the immutable `f` /
 /// `cfg` — grad/hess/per-tree scalars are passed SEPARATELY to
 /// `grow_tree_on_device_with_cfg`, so this value is invariant across trees for a
 /// fixed feature set. The `f.bins.clone()` (the ~25–50MB memcpy) is therefore paid
@@ -556,8 +555,8 @@ fn build_grow_features(
             bin_upper_bound: f.bin_upper_bound.clone(),
             real_feature_index: f.real_feature_index,
             bin_type: f.bin_type,
-            // Phase-22 additive categorical metadata (inert on the numeric path;
-            // consumed by the 22-04 categorical grow branch). Empty
+            // Additive categorical metadata (inert on the numeric path;
+            // consumed by the categorical grow branch). Empty
             // `bin_to_category` + config scalars from the learner's `cfg`.
             bin_to_category: f.bin_to_category.clone(),
             cat_smooth: cfg.cat_smooth,
@@ -601,45 +600,45 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // Default OFF: the common `train` path discards snapshots, so by default
             // we never pay the per_bin_gains re-scan. The snapshot wrappers opt in.
             capture_snapshots: false,
-            // Default OFF: recomputed per train in `train_inner` (260608-p90).
+            // Default OFF: recomputed per train in `train_inner`.
             resident_eligible: false,
-            // Default OFF: recomputed per train in `train_inner` (260608-t3t).
+            // Default OFF: recomputed per train in `train_inner`.
             fused_eligible: false,
-            // ODL-01 (D-05): cache the on-device eligibility ONCE here (NOT in
+            // Cache the on-device eligibility ONCE here (NOT in
             // train_inner). The AND-gate makes CpuBackend (discriminator false) —
             // and GpuBackend<R> (false in Slice 0) — ineligible regardless of the
             // env, so with `LGBM_CUDA_ON_DEVICE` unset every backend is false and
             // the host path is byte-unchanged.
-            // D-06 base gate: features are empty here and `use_quantized_grad` defaults
+            // Base gate: features are empty here and `use_quantized_grad` defaults
             // false, so the categorical+quantized negation is a no-op at construction —
             // it is (re)applied in `refresh_on_device_eligibility`, called from
             // `with_features` / `with_quantized_grad` once the inputs are known.
             on_device_eligible: backend.on_device_growth_supported(),
-            // Phase-25 (25-03): no on-device grow has happened yet; set only inside the
+            // No on-device grow has happened yet; set only inside the
             // on_device_eligible grow block (dead with LGBM_CUDA_ON_DEVICE unset).
             resident_score_pending: std::cell::Cell::new(false),
-            // D-06 (Phase 22): default OFF (spine path); set via `with_quantized_grad`.
+            // Default OFF (spine path); set via `with_quantized_grad`.
             use_quantized_grad: false,
             cat_quant_fallback_logged: false,
-            // quick-260621-p9v: no upload yet; first tree of the train uploads once.
+            // No upload yet; first tree of the train uploads once.
             resident_bins_uploaded: false,
-            // spike-066 (D5): no feature set validated yet; the first train() over a
-            // given feature set runs the V5 bin-range scan once, then trees 2+ skip it.
+            // No feature set validated yet; the first train() over a
+            // given feature set runs the bin-range scan once, then trees 2+ skip it.
             bins_validated: false,
-            // OHP-02 (Phase 30): no on-device grow-feature build yet; the first
+            // No on-device grow-feature build yet; the first
             // on_device_eligible tree builds it once, trees 2+ reuse it, and every
-            // `self.features =` site resets it to None (the D5 rule). Dead (stays
-            // None) with `LGBM_CUDA_ON_DEVICE` unset (SC-4).
+            // `self.features =` site resets it to None. Dead (stays
+            // None) with `LGBM_CUDA_ON_DEVICE` unset.
             grow_features_cache: None,
-            // R3 (260614-p0n): filled lazily on the first leaf-histogram build.
+            // Filled lazily on the first leaf-histogram build.
             build_num_bins: std::cell::RefCell::new(Vec::new()),
-            // Spike 012: built lazily on the first tree, reused across all trees.
+            // Built lazily on the first tree, reused across all trees.
             hist_pool: None,
         }
     }
 
     /// Read-only view of the learner's [`ComputeClient`] (the same `&'b` client the
-    /// learner was constructed with). Phase-20 (20-04, ODL-16) seam: `GBDT`'s resident
+    /// learner was constructed with). `GBDT`'s resident
     /// score loop needs the `&ComputeClient<B::Runtime>` the score-updater's `*_on`
     /// device delegates require, and the learner is the only holder of a client
     /// generic over `B::Runtime` in the boosting call graph. Additive, read-only — no
@@ -651,7 +650,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     }
 
     /// Read-only view of the learner's per-feature columns (set via
-    /// [`with_features`](Self::with_features)). Phase-20 (20-04, ODL-16) seam: the
+    /// [`with_features`](Self::with_features)). The
     /// GBDT resident score loop reconstructs a `PredictTree` from the grown tree's
     /// inner-bin arrays + these columns' bin metadata (min/max/default/most-freq-bin/
     /// offset). The learner is the authoritative holder of the columns the tree was
@@ -663,7 +662,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         &self.features[..]
     }
 
-    /// Phase-25 (25-03, ODP2-04, §11) seam: take-and-clear the one-shot signal that the
+    /// Take-and-clear the one-shot signal that the
     /// most recently grown tree came from the ON-DEVICE grow path. When `true`, the
     /// `boosting_on_cuda_` resident-score seam must apply the tree's per-leaf `AddScore`
     /// via the resident partition scatter
@@ -671,7 +670,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// resident partition (the row→leaf layout the grow already produced) into
     /// `cuda_score_`, instead of the host `add_prediction_to_score` scatter or the
     /// rows-reconstruction device tree-walk. `false` (the default, and always with
-    /// `LGBM_CUDA_ON_DEVICE` unset) leaves the host score path byte-unchanged (SC-4).
+    /// `LGBM_CUDA_ON_DEVICE` unset) leaves the host score path byte-unchanged.
     #[inline]
     pub fn take_resident_score_pending(&self) -> bool {
         self.resident_score_pending.replace(false)
@@ -681,7 +680,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     ///
     /// `features` are the spine's per-feature columns (all used, `feature_fraction
     /// = 1.0`); `is_first_tree` is carried for API parity. The histogram BUFFER
-    /// pool is reused across trees (spike 012, `hist_pool`), but the per-tree
+    /// pool is reused across trees (`hist_pool`), but the per-tree
     /// `reset_map` makes each tree's slot assignment independent — the C++
     /// `is_first_tree` cache-reuse semantics are not relied on.
     ///
@@ -697,14 +696,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         is_first_tree: bool,
     ) -> Result<Tree, TreeLearnerError> {
         // Production path: snapshots are NOT requested, so skip the per_bin_gains
-        // re-scan (R1). Calls `train_inner` directly — NOT via `train_with_snapshots`
+        // re-scan. Calls `train_inner` directly — NOT via `train_with_snapshots`
         // — so `capture` stays false.
         let (tree, _snaps, _trace, _part) =
             self.train_inner(gradients, hessians, is_first_tree, false)?;
         Ok(tree)
     }
 
-    /// Like [`train`](Self::train) but also returns the per-split D-06 snapshots
+    /// Like [`train`](Self::train) but also returns the per-split snapshots
     /// (full per-bin gain arrays per candidate feature at every split) for the
     /// golden replay.
     #[allow(clippy::type_complexity)]
@@ -714,7 +713,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>), TreeLearnerError> {
-        // Golden-replay path: capture the full D-06 snapshots (per_bin_gains ON).
+        // Golden-replay path: capture the full snapshots (per_bin_gains ON).
         let (tree, snaps, _trace, _part) =
             self.train_inner(gradients, hessians, is_first_tree, true)?;
         Ok((tree, snaps))
@@ -731,7 +730,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// (binning is identical for any row subset of an identity-binned corpus), so the
     /// boosting layer scores BOTH in-bag and out-of-bag rows via the predict-side
     /// [`Tree::predict`] over the original real feature values (bit-exact to the
-    /// train-path scatter on this identity-binned corpus — the L2 contract). This
+    /// train-path scatter on this identity-binned corpus). This
     /// mirrors the C++ result: in-bag rows scored via the data-partition scatter, OOB
     /// rows via the tree predict-side add, both adding the SAME f64 leaf value once.
     ///
@@ -769,19 +768,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // Swap in the subset features for the growth, restore afterward (the learner
         // is reused across iterations with the full-corpus features).
         let saved = std::mem::replace(&mut self.features, Arc::new(subset_features));
-        // spike-066 (D5): swapping in a NEW (subset) feature set invalidates the
-        // memo — the V5 bin-range scan must validate these subset columns once.
+        // Swapping in a NEW (subset) feature set invalidates the
+        // memo — the bin-range scan must validate these subset columns once.
         self.bins_validated = false;
-        // OHP-02 (D5): the subset feature set makes the memoized on-device
+        // The subset feature set makes the memoized on-device
         // `Vec<GrowFeature>` stale — re-arm so it rebuilds over the subset columns.
         self.grow_features_cache = None;
         let result = self.train(&sub_grad, &sub_hess, is_first_tree);
         self.features = saved;
-        // spike-066 (D5): restoring the full-corpus feature set changes `self.features`
+        // Restoring the full-corpus feature set changes `self.features`
         // identity again — re-arm so `bins_validated == true` never refers to a stale
         // (subset) feature set (the invariant: true ⇒ CURRENT `self.features` validated).
         self.bins_validated = false;
-        // OHP-02 (D5): restoring the full-corpus feature set re-arms the on-device memo.
+        // Restoring the full-corpus feature set re-arms the on-device memo.
         self.grow_features_cache = None;
         result
     }
@@ -791,7 +790,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// **subset-row space** (each leaf's `indices_in_leaf` are indices into `in_bag`,
     /// i.e. `0..in_bag.len()`, NOT full-corpus rows).
     ///
-    /// The GBDT bagging path (06-06, WR-03) needs this to mirror the C++
+    /// The GBDT bagging path needs this to mirror the C++
     /// `RenewTreeOutput` on the subset path (`serial_tree_learner.cpp:920-958`): the
     /// `index_mapper` is the subset `data_partition_->GetIndexOnLeaf`, and the caller
     /// maps each subset row `sr` through `bag_mapper[sr] = in_bag[sr]` to the
@@ -827,17 +826,17 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let sub_hess: Vec<f32> = in_bag.iter().map(|&r| hessians[r as usize]).collect();
 
         let saved = std::mem::replace(&mut self.features, Arc::new(subset_features));
-        // spike-066 (D5): swapping in a NEW (subset) feature set invalidates the memo.
+        // Swapping in a NEW (subset) feature set invalidates the memo.
         self.bins_validated = false;
-        // OHP-02 (D5): the subset feature set makes the memoized on-device
+        // The subset feature set makes the memoized on-device
         // `Vec<GrowFeature>` stale — re-arm so it rebuilds over the subset columns.
         self.grow_features_cache = None;
         let result = self.train_returning_partition(&sub_grad, &sub_hess, is_first_tree);
         self.features = saved;
-        // spike-066 (D5): restoring the full-corpus feature set re-arms the memo (the
+        // Restoring the full-corpus feature set re-arms the memo (the
         // invariant: bins_validated == true ⇒ CURRENT self.features validated).
         self.bins_validated = false;
-        // OHP-02 (D5): restoring the full-corpus feature set re-arms the on-device memo.
+        // Restoring the full-corpus feature set re-arms the on-device memo.
         self.grow_features_cache = None;
         result
     }
@@ -845,7 +844,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// Like [`train`](Self::train) but ALSO returns the final [`DataPartition`]
     /// the tree was grown over (the row→leaf mapping after the last split).
     ///
-    /// The GBDT loop (06-02) needs this for the bit-exact training-path score
+    /// The GBDT loop needs this for the bit-exact training-path score
     /// scatter [`add_prediction_to_score`](Self::add_prediction_to_score): the
     /// C++ `data_partition_` is a learner member, but this port builds the
     /// partition locally inside `train_inner` and does not retain it on `self`, so
@@ -867,7 +866,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
     /// Like [`train_with_snapshots`](Self::train_with_snapshots) but also returns
     /// the [`ColSamplerTrace`] — the per-tree + per-node feature-subsampling
-    /// selections in DRAW ORDER (TRL-08 RNG call-sequence golden). On the spine
+    /// selections in DRAW ORDER (RNG call-sequence golden). On the spine
     /// (`feature_fraction == feature_fraction_bynode == 1.0`) the trace records
     /// every feature as selected and no per-node draws (the sampler is inactive).
     #[allow(clippy::type_complexity)]
@@ -877,7 +876,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace), TreeLearnerError> {
-        // Golden-replay path (TRL-08 RNG + D-06 snapshots): capture ON.
+        // Golden-replay path (RNG + snapshots): capture ON.
         let (tree, snaps, trace, _part) =
             self.train_inner(gradients, hessians, is_first_tree, true)?;
         Ok((tree, snaps, trace))
@@ -894,29 +893,28 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         _is_first_tree: bool,
         capture_snapshots: bool,
     ) -> Result<(Tree, Vec<SplitSnapshot>, ColSamplerTrace, DataPartition), TreeLearnerError> {
-        // ODL-01 (Phase 14, D-02/D-05): the decide-once on-device routing fork. With
+        // The decide-once on-device routing fork. With
         // `LGBM_CUDA_ON_DEVICE` unset, `on_device_eligible` is false on every Slice-0
         // backend (the AND-gate's discriminator is false on CpuBackend AND GpuBackend<R>),
         // so this block is DEAD and the host path below is byte-identical to master.
         // When the seam DOES grow a tree (Slice 1+), `Some((tree, payload))` synthesizes
         // the train_inner 4-tuple directly (empty snapshots + default ColSamplerTrace —
-        // production never captures here) and returns early. CRITICAL (D-02): production
+        // production never captures here) and returns early. CRITICAL: production
         // uses `Ok(None) ⇒ fall through` ONLY — there is NO `unwrap_or_else(host_grow)`
-        // host-fallback here; that stand-in belongs to Plan 03's oracle test, never the
+        // host-fallback here; that stand-in belongs to the oracle test, never the
         // learner. On `Ok(None)` execution falls through UNCHANGED into the resident/host
         // path below.
         if self.on_device_eligible {
-            // SPIKE-079 (the spike-078 ledger's #1 lever — the per-grow bin re-upload was
-            // 67–78% of the real-CUDA on-device gap): upload the IMMUTABLE resident bins
-            // ONCE per train on the on-device path too — the exact quick-260621-p9v guard
+            // Upload the IMMUTABLE resident bins
+            // ONCE per train on the on-device path too — the same guard
             // the batched host path runs at its `wants_resident_bins` site. The columns
             // are byte-identical to the per-grow `GrowFeature` clones the driver would
-            // upload, `with_features` re-arms the flag on any feature-set change (the D5
-            // rule: reset at every `self.features=` site, never `is_first_tree`), and the
+            // upload, `with_features` re-arms the flag on any feature-set change (reset
+            // at every `self.features=` site, never `is_first_tree`), and the
             // PIN authorizes the driver to skip its per-grow re-upload
             // (`Backend::resident_bins_pinned`; any fresh upload dissolves the pin).
             // Inside the `on_device_eligible` block ⇒ DEAD with `LGBM_CUDA_ON_DEVICE`
-            // unset (SC-4, default lane byte-unchanged).
+            // unset (default lane byte-unchanged).
             if self.backend.wants_resident_bins() && !self.resident_bins_uploaded {
                 let _g = crate::phase_prof::guard(&crate::phase_prof::UPLOAD_NS);
                 let upload_bins: Vec<&BinColumn> =
@@ -926,18 +924,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             }
             self.backend.pin_resident_bins();
             // Build the ADDITIVE `Vec<GrowFeature>` field-by-field from the spine's
-            // `FeatureColumn`s (ODL-18, D-01/Option A). `GrowFeature` is the
+            // `FeatureColumn`s. `GrowFeature` is the
             // lgbm-compute-local mirror over BinColumn + lgbm-dataset BinType/
             // MissingType — never a treelearner type crossing the seam (no crate
             // cycle). This build is inside the `on_device_eligible` block, so with
             // `LGBM_CUDA_ON_DEVICE` unset it is DEAD (never allocated) and the host
             // path below is byte-identical to master.
             //
-            // OHP-02 (Phase 30, spike-080 residual lever): the `Vec<GrowFeature>` is a
+            // The `Vec<GrowFeature>` is a
             // pure function of the immutable `self.features` + `self.cfg`, so its
             // `f.bins.clone()` (~25–50MB host memcpy) is MEMOIZED once per train in
             // `self.grow_features_cache` instead of rebuilt every tree. The cache is
-            // reset to None at every `self.features =` site (the D5 rule — NOT
+            // reset to None at every `self.features =` site (NOT
             // `is_first_tree`), so a bagging/`with_features` swap re-arms it. The
             // memo-OFF arm (`LGBM_ONDEVICE_GROWFEAT_MEMO=0`) rebuilds per tree without
             // touching the cache — the byte-identical pre-change baseline for the A/B.
@@ -953,15 +951,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     grow_features_owned = build_grow_features(&self.features, &self.cfg);
                     &grow_features_owned
                 };
-            // OCX-02 (29-02): bind the learner's REAL `GainConfig` across the seam via the
+            // Bind the learner's REAL `GainConfig` across the seam via the
             // config-bound `grow_tree_on_device_with_cfg` (NOT the parameterless
             // `grow_tree_on_device`, which pins the permissive proving-slice config). This
             // makes C++ admissibility (min_data_in_leaf / min_sum_hessian_in_leaf) — and every
             // other gain field (lambdas, min_gain_to_split, categorical scalars) — bind on the
-            // on-device arm, closing the spike-072 item-15 near-empty-prefix defect. `self.cfg`
+            // on-device arm. `self.cfg`
             // IS the `GainConfig` the host per-leaf scans use, so both arms of every anchor gate
             // bind the SAME config (bit-exactness vs the cpu-f64 anchor preserved). Still inside
-            // the dead `on_device_eligible` block ⇒ byte-unchanged with the env unset (SC-4).
+            // the dead `on_device_eligible` block ⇒ byte-unchanged with the env unset.
             if let Some((tree, payload)) = self.backend.grow_tree_on_device_with_cfg(
                 gradients,
                 hessians,
@@ -970,36 +968,36 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 self.max_depth,
                 self.cfg,
             )? {
-                // Phase-25 (25-03, ODP2-04, §10/§11): the grow already produced the
+                // The grow already produced the
                 // resident row→leaf partition (`payload`), so the tree's per-leaf
                 // `AddScore` is applied ON-DEVICE via the resident partition scatter
                 // `add_prediction_to_score_on_device` over that partition / the resident
                 // `cuda_score_` buffer — NOT the host `add_prediction_to_score` scatter,
-                // and NOT the rows-reconstruction device tree-walk (the 5,420ms Phase-24
-                // host-scoring long-pole). Signal the `boosting_on_cuda_` resident-score
+                // and NOT the rows-reconstruction device tree-walk (the host-scoring
+                // long-pole). Signal the `boosting_on_cuda_` resident-score
                 // seam here; it drains this via `take_resident_score_pending` and scores
                 // over the `part` returned below with the post-shrinkage leaf values.
                 // Setting the flag INSIDE this `on_device_eligible` block keeps it dead
                 // with `LGBM_CUDA_ON_DEVICE` unset, so the host score path is
-                // byte-identical to master (SC-4).
+                // byte-identical to master.
                 self.resident_score_pending.set(true);
                 let part = DataPartition::from_payload(payload);
                 return Ok((tree, Vec::new(), ColSamplerTrace::default(), part));
             }
         }
 
-        // R1: record whether this growth must emit D-06 snapshots. Read deep in
+        // Record whether this growth must emit snapshots. Read deep in
         // `scan_leaf_histogram` to gate the snapshot-only `per_bin_gains` re-scan.
         self.capture_snapshots = capture_snapshots;
         let num_data = gradients.len() as i32;
         let features = self.features.clone();
 
-        // 260608-p90: decide device-resident eligibility ONCE per train (CONSERVATIVE /
+        // Decide device-resident eligibility ONCE per train (CONSERVATIVE /
         // fail-safe — see `resident_pool::resident_eligible`). ANDs in the backend's
         // `resident_pool_supported` so CpuBackend (false) NEVER takes the resident
         // branch; ANY non-spine feature/config falls back to the byte-unchanged host
         // path. Read in `find_best_splits` to route the per-leaf chain.
-        // 260608-s2b Lever B: pass `num_data` so `resident_eligible` can size-gate the
+        // Pass `num_data` so `resident_eligible` can size-gate the
         // resident path (below RESIDENT_MIN_NUM_DATA → host path; the launch-bound tiny
         // workload regresses on the resident chain). `LGBM_RESIDENT_FORCE` overrides the
         // size gate for benching both paths. Correctness checks still fail-safe first.
@@ -1012,7 +1010,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             &self.cfg,
         );
 
-        // 260608-t3t: the FUSED directly-built-leaf gate (small/medium band). Same
+        // The FUSED directly-built-leaf gate (small/medium band). Same
         // fail-safe correctness spine as `resident_eligible`, but targets the launch-
         // bound small/medium band where the 3-launch resident chain loses to host. When
         // on, directly-built leaves (root + smaller children) use ONE fused launch
@@ -1039,20 +1037,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             self.resident_eligible = true;
         }
 
-        // force_row_wise / force_col_wise (TRL-09, A1 / Open Q2): the two strategies
+        // force_row_wise / force_col_wise: the two strategies
         // differ ONLY in the histogram-build ORDER, not the result. On the
-        // single-thread deterministic anchor the Phase-4 `construct_histograms`
+        // single-thread deterministic anchor the `construct_histograms`
         // whole-kernel op produces the SAME f64 cells for either, so `self.strategy`
         // does NOT route a distinct compute path here — both `RowWise` and `ColWise`
         // drive the identical `backend.construct_histograms` call below and therefore
         // grow a bit-identical tree (asserted by `learner_parity_row_vs_col`). If a
         // backend's column-major accumulation ever diverged at that layer, the
-        // row==col equality gate would fail loudly (threat T-05-04-02) — we never
+        // row==col equality gate would fail loudly — we never
         // silently ship a divergent tree. `_strategy` is read here to make the
         // (verified) no-op explicit rather than dead.
         let _strategy: BuildStrategy = self.strategy;
 
-        // ---- V5 boundary validation (T-05-03-01/02/03) ----
+        // ---- boundary validation ----
         if hessians.len() != gradients.len() {
             return Err(TreeLearnerError::LengthMismatch {
                 expected: gradients.len(),
@@ -1075,16 +1073,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 });
             }
         }
-        // V5 / threat T-04-01 — the SINGLE bin-range gate, RELOCATED from the
-        // per-element kernel fold (spike-003b). MEMOIZED via `bins_validated`
-        // (spike-066 / D5): the feature columns are IMMUTABLE after load, so this
+        // The SINGLE bin-range gate, RELOCATED from the
+        // per-element kernel fold. MEMOIZED via `bins_validated`:
+        // the feature columns are IMMUTABLE after load, so this
         // full O(num_data) per-column scan runs ONCE per (re)assigned feature set —
-        // NOT once per tree (the per-tree re-scan was ~672ms/train, ~14% of wall).
-        // `bins_validated` is reset to `false` at EVERY `self.features =` assignment
+        // NOT once per tree. `bins_validated` is reset to `false` at EVERY
+        // `self.features =` assignment
         // (`with_features` + the bagging swap-in/swap-back in `train_on_subset*`), so
-        // the T-04-01 mitigation STILL runs for EVERY distinct feature set (the full
+        // the mitigation STILL runs for EVERY distinct feature set (the full
         // corpus AND every bagging/subsample subset swapped into `self.features`) —
-        // it is memoized, NOT skipped (threat T-sk7-01). The scan rejects any
+        // it is memoized, NOT skipped. The scan rejects any
         // `bin >= num_bin` with `BinIndexOutOfRange` BEFORE any leaf histogram is
         // built. After this gate, the fused CPU `Backend::build_leaf_histograms_raw`
         // (lgbm-compute/src/lib.rs) folds BRANCHLESS trusting `bin < num_bin`
@@ -1102,7 +1100,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // VALUE FITS the narrow type, but the `bin < num_bin` VALUE check must
                 // STILL run (a u8 column can hold a value >= a num_bin that is < 256).
                 // `first_ge` is a MONOMORPHIC per-width slice scan (no boxed iterator /
-                // dynamic dispatch on the hot per-row path — spike 004 small-row fix);
+                // dynamic dispatch on the hot per-row path);
                 // it returns the first offending bin VALUE so the rejection still
                 // carries the exact index. Iteration order (and thus the
                 // first-offending-feature reported) is identical to the pre-memo loop.
@@ -1113,7 +1111,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     });
                 }
                 if f.na_as_missing() {
-                    // NA_AS_MISSING forward branch deferred (RESEARCH A5) — surface the
+                    // NA_AS_MISSING forward branch deferred — surface the
                     // compute layer's typed error rather than silently mis-routing.
                     return Err(TreeLearnerError::Compute(ComputeError::Runtime {
                         detail: "train: na_as_missing feature (num_bin>2 && missing_type==NaN) \
@@ -1131,7 +1129,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ---- BeforeTrain (serial_tree_learner.cpp:205-208, 288-...) ----
         // ColSampler.ResetByTree (col_sampler.hpp:74-89) happens HERE, once per
         // tree (BeforeTrain). The spine path (`col_sampling == None`) builds no
-        // sampler and gates nothing — Plan-03 behavior is bit-identical.
+        // sampler and gates nothing — behavior is bit-identical.
         let mut trace = ColSamplerTrace::default();
         let num_features = features.len();
         // valid_feature_indices_ = 0..num_features on the spine (every feature is
@@ -1156,7 +1154,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             trace.bytree_selected = valid_feature_indices.clone();
         }
 
-        // spike-049: time the per-tree partition alloc (a component of in_learner_other).
+        // Time the per-tree partition alloc (a component of in_learner_other).
         let mut data_partition = crate::phase_prof::time(
             &crate::phase_prof::PARTITION_NEW_NS,
             || DataPartition::new(num_data, self.num_leaves),
@@ -1167,10 +1165,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // total slot length is `Σ 2*num_bin`. The whole concatenated buffer is the
         // subtraction-trick unit: `larger = parent − smaller` is a single
         // element-wise subtract over it (each feature's compacted region subtracts
-        // independently; the zeroed compaction tails subtract to zero — D-05/A3).
+        // independently; the zeroed compaction tails subtract to zero).
         let (slot_off, slot_len) = feature_slot_layout(&features);
 
-        // nn7 (L1): one-time per-train upload of the binned feature columns to the
+        // One-time per-train upload of the binned feature columns to the
         // backend's device-resident cache, BEFORE the per-leaf growth loop. For the
         // CpuBackend this is the no-op default (zero behavior change); the RocmBackend
         // uploads every column ONCE and gathers leaf rows on device per leaf — the
@@ -1178,21 +1176,21 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // are immutable for the whole train, so upload once here (not per tree); the
         // backend instance persists across trees (booster.rs constructs it per
         // train() call, outside the GBDT iter loop).
-        // SPIKE 004: only widen the narrow columns to u32 when the backend actually
+        // Only widen the narrow columns to u32 when the backend actually
         // consumes them (`wants_resident_bins()` — true on Rocm, false on the
         // CpuBackend no-op default). This avoids a per-tree `num_features`-Vec u32
         // allocation on the CPU path (the bins are stored narrow now; widening for a
         // no-op upload was a measured small-row regression). The Rocm path is
         // byte-unchanged — it still receives the same u32 resident buffer.
-        // quick-260621-p9v (spike-014b lever): upload the resident bins ONCE per train,
+        // Upload the resident bins ONCE per train,
         // not every tree. The binned columns are immutable for the whole train and the
         // backend's `resident_bins` cache persists across trees (`reset_resident_pool`
         // never clears it), so the first tree's upload is reused byte-for-byte by every
         // later tree. `with_features` re-arms the guard when the feature set changes.
         if self.backend.wants_resident_bins() && !self.resident_bins_uploaded {
-            // Spike-014b: time the resident-bin upload (now fires on the first tree only).
+            // Time the resident-bin upload (fires on the first tree only).
             let _g = crate::phase_prof::guard(&crate::phase_prof::UPLOAD_NS);
-            // quick-260621-qix: pass native BinColumn refs (NO u32 widen) — the backend
+            // Pass native BinColumn refs (NO u32 widen) — the backend
             // uploads at the narrowest uniform width (u8/u16/u32), dropping the per-train
             // 2GB `to_u32_vec` host alloc at the wide shape.
             let upload_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
@@ -1200,7 +1198,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             self.resident_bins_uploaded = true;
         }
 
-        // Spike 012: REUSE the pool across trees. Take the cached pool if its
+        // REUSE the pool across trees. Take the cached pool if its
         // geometry matches this train's (it always does — features + num_leaves are
         // fixed per train), else build fresh (first tree, or a geometry change).
         // `reset_map` clears only the index maps; the buffers carry the previous
@@ -1213,11 +1211,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             _ => HistogramPool::new(self.num_leaves, slot_len),
         };
         pool.reset_map();
-        // 260608-p90: when eligible, reset the device-handle slot mirror alongside the
+        // When eligible, reset the device-handle slot mirror alongside the
         // host pool's reset_map, sized to the host pool's cache_size (== num_leaves).
         // No-op on CpuBackend (the default trait impl) and when ineligible.
         if self.resident_eligible {
-            // spike-049: time the per-tree GPU resident-pool reset (in_learner_other,
+            // Time the per-tree GPU resident-pool reset (in_learner_other,
             // GPU-only; no-op on CpuBackend so this guard never fires there).
             let _g = crate::phase_prof::guard(&crate::phase_prof::RESIDENT_RESET_NS);
             self.backend
@@ -1227,7 +1225,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // Root leaf sums via the ordered f64 fold over ALL rows.
         let root_indices: Vec<u32> = (0..num_data as u32).collect();
         let mut smaller_leaf_splits = LeafSplits::new();
-        // spike-049: time the per-tree root f64 fold over ALL rows (in_learner_other).
+        // Time the per-tree root f64 fold over ALL rows (in_learner_other).
         crate::phase_prof::time(&crate::phase_prof::ROOT_FOLD_NS, || {
             smaller_leaf_splits.init(gradients, hessians, &root_indices, &self.cfg)
         });
@@ -1251,7 +1249,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         );
         let mut tree = root_tree(root_output, num_data);
 
-        // spike-049: time the per-tree scratch/constraint setup block (suspected
+        // Time the per-tree scratch/constraint setup block (suspected
         // dominant `residual` of in_learner_other — esp. CegbModel::new at num_data
         // scale every tree even when CEGB is inactive). Guard drops after branch_features.
         let _scratch_g = crate::phase_prof::guard(&crate::phase_prof::SCRATCH_NS);
@@ -1270,9 +1268,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         *self.feature_splittable.borrow_mut() =
             vec![vec![true; num_features]; self.num_leaves as usize];
 
-        // ---- W10 advanced-constraint per-tree setup (ADV-01..05) ----
+        // ---- Advanced-constraint per-tree setup ----
         // Each is INACTIVE by default → `None`/empty → the scan + growth loop take
-        // the spine path byte-untouched (D-06).
+        // the spine path byte-untouched.
         *self.monotone.borrow_mut() = MonotoneConstraints::new(
             &self.constraints.monotone_constraints,
             self.num_leaves,
@@ -1294,21 +1292,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         );
         // Interaction: per-leaf branch-feature list (empty when inactive).
         *self.branch_features.borrow_mut() = vec![Vec::new(); self.num_leaves as usize];
-        drop(_scratch_g); // spike-049: end of the scratch/constraint setup block.
+        drop(_scratch_g); // End of the scratch/constraint setup block.
 
         // Extra-trees: one `Random(extra_seed + inner_feature_index)` per feature,
         // persisted across leaf scans within this tree (C++
         // `ref_feature_meta[i].rand = Random(config->extra_seed + i)`,
         // feature_histogram.hpp:1450, where `i` is the DATASET INNER feature index).
         //
-        // DEF-07-11-03: the seed offset is the INNER feature index, NOT the real /
+        // The seed offset is the INNER feature index, NOT the real /
         // sidecar feature order. LightGBM's `Dataset` assigns inner indices via
         // feature bundling (`GetFeatureGroups` / `dataset.cpp:387-406`), which for
         // these dense single-bin-group corpora REVERSES the column order — confirmed
-        // by a source-built lib_lightgbm 4.6 trace (`CPP_MAP inner=0 real=1`,
-        // `inner=1 real=0`). Seeding by the real order drew each feature's rand from
-        // the WRONG LCG stream, swapping which feature's randomized threshold won the
-        // root and flipping the tree structure (seed6 4-vs-3 leaves; seed9 3-vs-4).
+        // by a source-built lib_lightgbm 4.6 trace. Seeding by the real order drew
+        // each feature's rand from the WRONG LCG stream, swapping which feature's
+        // randomized threshold won the root and flipping the tree structure.
         // The harness feeds features in real order, so the inner index = the reversed
         // position. `extra_rng[fpos]` (consumed by `fpos` in the real-order scan)
         // therefore draws from `Random(extra_seed + (nf-1-fpos))`, aligning the
@@ -1331,7 +1328,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut left_leaf: i32 = 0;
         let mut right_leaf: i32 = -1;
 
-        // ---- ADV-03 ForceSplits (serial_tree_learner.cpp:620-734) ----
+        // ---- ForceSplits (serial_tree_learner.cpp:620-734) ----
         // Apply the forced-split tree top-down BEFORE the leaf-wise loop. Each
         // forced split consumes one of the `num_leaves - 1` split budget. `None`
         // ⇒ no forced split (spine). The growth loop below then continues from the
@@ -1382,7 +1379,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // FindBestSplits: build smaller histogram (and larger via subtract),
                 // then per-feature find_best_split + cross-feature argmax. The
                 // per-node ColSampler draws (smaller-then-larger) happen INSIDE
-                // find_best_splits in the exact C++ order (T-05-04-01).
+                // find_best_splits in the exact C++ order.
                 let snap = crate::phase_prof::time(&crate::phase_prof::HISTSPLIT_NS, || {
                     self.find_best_splits(
                         &features,
@@ -1427,7 +1424,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     )
                 })?;
 
-            // ---- W10 post-split constraint updates (ADV-01/02/05) ----
+            // ---- post-split constraint updates ----
             self.update_constraints_after_split(
                 &tree,
                 &data_partition,
@@ -1458,20 +1455,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             right_leaf = new_right;
         }
 
-        // Spike 012: hand the pool back for the next tree to reuse (the per-tree
+        // Hand the pool back for the next tree to reuse (the per-tree
         // alloc+zero+page-fault is paid once per train, not once per tree).
         self.hist_pool = Some(pool);
         Ok((tree, snapshots, trace, data_partition))
     }
 
-    /// W10 post-split constraint bookkeeping (ADV-01/02/05). A no-op on the spine
-    /// (every constraint inactive, D-06):
-    /// - ADV-02: append the winning feature to BOTH children's branch-feature
+    /// Post-split constraint bookkeeping. A no-op on the spine
+    /// (every constraint inactive):
+    /// - Append the winning feature to BOTH children's branch-feature
     ///   lists (C++ `Tree::branch_features_`, tree.cpp:580-583) — used by the
     ///   per-node interaction-allowed set.
-    /// - ADV-01: propagate the monotone `[min,max]` clamp to the parent + new
+    /// - Propagate the monotone `[min,max]` clamp to the parent + new
     ///   child (`BasicLeafConstraints::Update`).
-    /// - ADV-05: mark the feature used (coupled) / mark the leaf rows seen (lazy)
+    /// - Mark the feature used (coupled) / mark the leaf rows seen (lazy)
     ///   + the coupled OTHER-leaf gain recompute (`UpdateLeafBestSplits`).
     #[allow(clippy::too_many_arguments)]
     fn update_constraints_after_split(
@@ -1485,7 +1482,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         best: &SplitInfo,
         best_split_per_leaf: &mut [SplitInfo],
     ) {
-        // ADV-02: branch features (only when interaction is active — else the
+        // Branch features (only when interaction is active — else the
         // lists stay empty and the gate is never consulted).
         if !self.constraints.interaction_constraints.is_empty() {
             let mut bf = self.branch_features.borrow_mut();
@@ -1500,7 +1497,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             }
         }
 
-        // ADV-01: monotone clamp propagation. The winning feature's monotone type
+        // Monotone clamp propagation. The winning feature's monotone type
         // drives the mid-output min/max split (numeric splits only).
         {
             let mut mono = self.monotone.borrow_mut();
@@ -1514,7 +1511,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             }
         }
 
-        // ADV-05: CEGB post-split marking + coupled recompute. When
+        // CEGB post-split marking + coupled recompute. When
         // `best_split_per_leaf` is empty (the forced-splits pre-grow path passes an
         // empty slice — there is no live per-leaf best yet) the coupled recompute
         // is a no-op but the feature-used / row-seen marking still applies.
@@ -1537,7 +1534,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
     }
 
-    /// ADV-03 `ForceSplits` (serial_tree_learner.cpp:620-734): grow the forced
+    /// `ForceSplits` (serial_tree_learner.cpp:620-734): grow the forced
     /// split structure top-down via BFS. For each forced node, build the leaf's
     /// histogram for the forced feature, compute the split at the forced threshold
     /// (`gather_info_for_threshold`), and `split_inner` it; enqueue the children.
@@ -1565,7 +1562,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // and EVERY child leaf is seeded DIRECTLY from its parent split's `SplitInfo`
         // by `split_inner` — NOT re-folded.
         //
-        // DEF-07-11-02 fix: the prior code re-folded each forced leaf via
+        // Fix: the prior code re-folded each forced leaf via
         // `LeafSplits::init(rows)` at EVERY BFS level. C++ `ForceSplits`
         // (serial_tree_learner.cpp:638-734) never re-folds: each BFS iteration's
         // `GatherInfoForThreshold` consumes `left_leaf_splits->sum_gradients()/
@@ -1574,8 +1571,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // sum_hessian` (= `best_sum_left_hessian - kEpsilon`, feature_histogram.hpp:
         // 1042), carrying the parent REVERSE-scan kEpsilon + FixHistogram fold-order
         // provenance. A fresh re-fold loses that provenance and drifts the deeper-leaf
-        // output denominator 1-2 ULPs (the SAME class as the 05-09 mfb>0 node-2 fix;
-        // see leaf_splits.rs:124-138). `forced_single` is unaffected (its only forced
+        // output denominator 1-2 ULPs (see leaf_splits.rs:124-138). `forced_single` is
+        // unaffected (its only forced
         // leaf is the root, whose whole-row fold == C++ `Init()` bit-exact).
         //
         // We track each leaf id's seeded `LeafSplits` in a side map: leaf 0 is the
@@ -1670,7 +1667,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 &mut [],
             );
             // Record each child's kEpsilon-bearing seeded LeafSplits (just written by
-            // `split_inner` into smaller/larger by PARTITION count, the 07-13 source).
+            // `split_inner` into smaller/larger by PARTITION count).
             // Map child leaf id → its seeded splits so the next BFS level CONSUMES
             // these sums (NOT a re-fold). Mirror split_inner's `part_left < part_right`
             // smaller/larger assignment exactly.
@@ -1831,8 +1828,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ColSampler.GetByNode draw ORDER (serial_tree_learner.cpp:479,487): the
         // SMALLER leaf is drawn FIRST (always), the LARGER leaf SECOND (only when a
         // larger child exists, i.e. not the root). Each call advances the shared
-        // PRNG once. The raw per-node selection is recorded in the trace (the
-        // TRL-08 golden asserts these), then combined with the per-tree
+        // PRNG once. The raw per-node selection is recorded in the trace (a
+        // golden asserts these), then combined with the per-tree
         // is_feature_used_bytree flag to form the effective scan mask. On the spine
         // (`col_sampler == None`) no draw happens and every feature is used.
         let has_larger = use_subtract && larger_leaf >= 0;
@@ -1879,7 +1876,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // (serial_tree_learner.cpp:851). The previous `smaller_leaf == left_leaf`
         // branch SWAPPED the slots whenever the smaller child was the right leaf
         // (incl. the equal-count tie), feeding `smaller_leaf` the larger sibling's
-        // sums (CR-03 root cause: leaf 1 got leaf 0's −24 sum → wrong child splits /
+        // sums (root cause: leaf 1 got leaf 0's −24 sum → wrong child splits /
         // `leaf_value` like −17.99).
         let (smaller_splits, larger_splits) = if right_leaf < 0 {
             (smaller_leaf_splits, smaller_leaf_splits)
@@ -1891,29 +1888,29 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // pool slot (construct → FixHistogram raw sums → compact, per feature),
         // then scan it (serial_tree_learner.cpp:530-543). ----
         //
-        // 260608-p90: when resident-eligible, build the SMALLER (directly-built / root)
+        // When resident-eligible, build the SMALLER (directly-built / root)
         // leaf's histogram DEVICE-RESIDENT (build→fix→compact stays on device) into the
-        // mirror's `smaller_slot`, and scan it from that Handle. T2: NO host build on the
+        // mirror's `smaller_slot`, and scan it from that Handle. NO host build on the
         // eligible path — subtract is now resident (reads the device Handle), so the host
-        // pool buffer is never needed (the T1 transitional double-build is removed). The
+        // pool buffer is never needed. The
         // host pool slot is left as-is (zeroed/stale); it is not read on the eligible spine
         // path (the spine pulls SplitInfos from the resident scan; categorical/monotone/
         // extra-trees inline branches are unreachable when eligible; capture_snapshots is
         // off). `None` (ineligible / CpuBackend) is the byte-unchanged host path.
-        // 260608-t3t: on the FUSED directly-built path, the build is FUSED into the scan
+        // On the FUSED directly-built path, the build is FUSED into the scan
         // (one `build_fix_scan_resident` launch in `scan_leaf_histogram`), so we SKIP the
         // standalone `build_resident_leaf_into` here. The fused scan stores the
         // fixed+compacted Handle into `smaller_slot`, so the subtract-derived larger
         // child still finds its parent. `smaller_fused` signals the fused scan path.
         let smaller_fused = self.fused_eligible;
-        // quick 260620-a48: the UNIFIED host build+fix+scan path is the CpuBackend
+        // The UNIFIED host build+fix+scan path is the CpuBackend
         // directly-built (smaller/root) leaf analog of `smaller_fused`. It is eligible
         // ONLY when neither GPU-fused nor resident (i.e. CpuBackend), and gated by
         // `unified_bfs_threshold()` keyed on the feature count (the same scan-work proxy
-        // as `par_scan_threshold` — narrow leaves were catastrophic in 8v4/9cp). When
+        // as `par_scan_threshold` — narrow leaves regressed badly). When
         // set, the standalone `build_leaf_histogram_into` below is SKIPPED; the build is
         // FUSED into `scan_leaf_histogram`'s one rayon region.
-        // quick-260627-o6i: AND in the explicit host-unified capability — a GPU backend
+        // AND in the explicit host-unified capability — a GPU backend
         // WITHOUT a resident pool (CudaBackend/WgpuBackend) is `!resident_eligible` yet
         // does NOT implement the host `build_fix_scan`, so gating on `!resident_eligible`
         // alone routed it into the erroring default. Only CpuBackend returns true here.
@@ -1956,16 +1953,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             );
             None
         };
-        // ---- FUSED-path exception to the Phase-12 scan deferral (subtract-empty-slot fix). ----
+        // ---- FUSED-path exception to the scan deferral (subtract-empty-slot fix). ----
         // On the FUSED directly-built path the smaller child's "scan" is ALSO its histogram
         // BUILD+store: `scan_leaf_histogram`'s `build_fix_scan_resident` launch is the ONLY
-        // thing that puts the smaller Handle into `smaller_slot`. The Phase-12 co-pack deferral
+        // thing that puts the smaller Handle into `smaller_slot`. The co-pack deferral
         // (below) moves the smaller scan PAST `subtract_resident` — fine for the resident
         // scan-only path (its histogram is already built+resident), but on the fused path it
         // leaves `smaller_slot` EMPTY when the larger child's `subtract_resident` derives
         // `parent − smaller` → "subtract_resident: smaller slot is empty". Co-pack NEVER fires
         // on the fused path anyway (its gate requires `!smaller_fused`), so deferring buys the
-        // fused path nothing. Restore the pre-Phase-12 (260608-t3t) order: run the smaller fused
+        // fused path nothing. Restore the earlier order: run the smaller fused
         // build+scan NOW, before the larger subtract, and reuse the records at the deferred site.
         let smaller_records_early: Option<Vec<FeatureSplitRecord>> = if smaller_fused {
             Some(self.scan_leaf_histogram(
@@ -1993,19 +1990,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
         // OR build directly when no parent was retained. ----
         //
-        // Phase 12 (spike-024): the larger child's BUILD/SUBTRACT (computing
+        // The larger child's BUILD/SUBTRACT (computing
         // `larger_resident_slot` / `larger_unified` / `larger_subtract_inputs`) runs
         // FIRST — BEFORE either sibling's scan — so the smaller-child resident scan can
         // be DEFERRED past `subtract_resident` and CO-PACKED with the larger child into
         // ONE `scan_resident_siblings` launch. The build/subtract ORDER is UNCHANGED
-        // (CONTEXT: "No build/subtract reordering needed"); only the smaller SCAN moves.
+        // ("No build/subtract reordering needed"); only the smaller SCAN moves.
         let mut larger_records: Vec<FeatureSplitRecord> = Vec::new();
         // Captured from the larger build/subtract so the co-pack decision (below) and
         // the deferred scans can use them; `None`/default when there is no larger child.
         let mut larger_resident_slot: Option<usize> = None;
         let mut larger_unified = false;
         let mut larger_subtract_inputs: Option<(Vec<f64>, Vec<f64>)> = None;
-        // WR-03: set TRUE only on the resident `subtract_resident` success arm — i.e.
+        // Set TRUE only on the resident `subtract_resident` success arm — i.e.
         // the larger child was derived `parent − smaller` on device. The co-pack
         // kernel was validated ONLY against the subtract-derived larger Handle layout,
         // so the co-pack gate keys on THIS flag rather than overloading
@@ -2016,21 +2013,21 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let larger_slot_id = larger_slot;
         if larger_leaf >= 0 {
             let larger_slot = larger_slot.expect("non-root larger child must hold a pool slot");
-            // quick 260620-b97: the UNIFIED host subtract→scan path for the
-            // subtract-derived larger child (the use_subtract analog of a48's
-            // `smaller_unified`). Eligible ONLY when CpuBackend (not resident/GPU), a
+            // The UNIFIED host subtract→scan path for the
+            // subtract-derived larger child (the use_subtract analog of the
+            // smaller-unified path). Eligible ONLY when CpuBackend (not resident/GPU), a
             // parent histogram was retained (so the larger child IS derived by subtract,
             // not directly built), the subtract-audit diagnostic is OFF (the audit-active
-            // path MUST take the byte-unchanged two-step so T-05-07-01 stays valid), and
-            // the leaf is wide enough. quick 260620-b97 A/B: the larger child's crossover
-            // (~130 feat) is materially HIGHER than a48's smaller threshold (100), so it
+            // path MUST take the byte-unchanged two-step so the audit stays valid), and
+            // the leaf is wide enough. The larger child's crossover
+            // (~130 feat) is materially HIGHER than the smaller-unified threshold (100), so it
             // keys on a SEPARATE `unified_subscan_threshold()` (default 130, env
-            // `LGBM_UNIFIED_SUBSCAN_THRESHOLD`) — leaving a48's smaller-unified default at
+            // `LGBM_UNIFIED_SUBSCAN_THRESHOLD`) — leaving the smaller-unified default at
             // 100 untouched. When set, the seam materializes parent/smaller scratch and the
             // fused subtract→scan runs inside `scan_leaf_histogram`. The larger child has NO
-            // parallel build to contend with (only the cheap serial subtract), so 9cp's
-            // contention is structurally absent.
-            // quick-260627-o6i: AND in the host-unified capability (CpuBackend-only),
+            // parallel build to contend with (only the cheap serial subtract), so lock
+            // contention on the shared histogram buffer is structurally absent.
+            // AND in the host-unified capability (CpuBackend-only),
             // same reason as `smaller_unified` — keep the erroring `subtract_scan`
             // default off a non-resident GPU backend (CudaBackend/WgpuBackend).
             larger_unified = self.backend.host_unified_fused_supported()
@@ -2038,7 +2035,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 && parent_slot.is_some()
                 && self.subtract_audit.is_none()
                 && features.len() >= lgbm_compute::unified_subscan_threshold();
-            // 260608-p90 T2: when resident-eligible AND a parent was retained, derive the
+            // When resident-eligible AND a parent was retained, derive the
             // larger child RESIDENT — `parent_slot` Handle − `smaller_slot` Handle →
             // `larger_slot` Handle, on device, NO read-back. The device mirror is keyed by
             // SLOT id and `pool.move_` preserves slot ids (larger_slot == parent_slot;
@@ -2060,7 +2057,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         larger_slot,
                         pool.hist_len(),
                     )?;
-                    // WR-03: the larger child is now the on-device subtract-derived
+                    // The larger child is now the on-device subtract-derived
                     // Handle the co-pack kernel was validated against.
                     larger_is_resident_subtract = true;
                 } else {
@@ -2092,7 +2089,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // reproduce bit-for-bit.
                 debug_assert_eq!(larger_slot, parent_slot, "the larger child reuses the moved parent slot");
                 if larger_unified {
-                    // quick 260620-b97: UNIFIED host subtract→scan. The fused
+                    // UNIFIED host subtract→scan. The fused
                     // subtract+scan runs INSIDE `scan_leaf_histogram` (so it reuses
                     // Pass-1's exact spine-gating to build `scan_active`, identical to the
                     // two-step path). Here we only materialize the owned parent/smaller
@@ -2106,7 +2103,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         pool.buffer(smaller_slot).to_vec(),
                     ));
                 } else {
-                    // 260609-bfx follow-up: pass the pool slots directly — `subtract_histograms`
+                    // Pass the pool slots directly — `subtract_histograms`
                     // only READS parent/child and returns a fresh owned buffer, so the two
                     // per-split `.to_vec()` scratch clones were redundant. `parent_slot ==
                     // larger_slot`, but `derived` is fully materialized (owns its data) before
@@ -2118,7 +2115,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         pool.buffer(parent_slot),
                         pool.buffer(smaller_slot),
                     )?;
-                    // TEST audit hook (T-05-07-01): record (derived, direct) so a parity
+                    // TEST audit hook: record (derived, direct) so a parity
                     // test can assert the subtracted larger child == a direct build of its
                     // own rows, cell-for-cell, in the LIVE growth path. Host-path only (the
                     // resident eligible path is inert here — audit is a non-spine diagnostic).
@@ -2157,7 +2154,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             };
         }
 
-        // ---- Phase 12 (spike-024) CO-PACK eligibility (computed AFTER the larger
+        // ---- CO-PACK eligibility (computed AFTER the larger
         // build/subtract so BOTH sibling Handles are simultaneously resident). ----
         // Co-pack fires ONLY when ALL hold:
         //   - `resident_eligible` (the resident scan-only path; CpuBackend never here);
@@ -2168,7 +2165,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         //     (`larger_resident_slot == Some(larger_slot)`, NOT unified);
         //   - BOTH siblings are SCANNABLE (`sum_h > 0`, `num_data > 0`) — otherwise that
         //     sibling early-outs to `none()` in `scan_leaf_histogram`;
-        //     WR-02: this scannability gate is the SINGLE SOURCE OF TRUTH for the
+        //     this scannability gate is the SINGLE SOURCE OF TRUTH for the
         //     kernel's per-sibling `sum_hessian > 0` reject (split.rs
         //     `find_best_splits_siblings`). Because a non-scannable leaf degrades to
         //     `none()` here BEFORE co-pack is even considered, the kernel reject is
@@ -2194,7 +2191,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             && smaller_resident_only
             && smaller_scannable
             && larger_leaf >= 0
-            // WR-03: gate explicitly on "the larger child was derived by resident
+            // Gate explicitly on "the larger child was derived by resident
             // subtract" (the only layout the co-pack kernel was validated against)
             // rather than the `larger_resident_slot == larger_slot_id` proxy, which
             // is ALSO true for the (post-root unreachable) direct-build resident arm.
@@ -2232,7 +2229,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         let (smaller_precomputed, larger_precomputed) = if let Some(feats) = copack_feats {
             // ---- CO-PACKED scan: ONE 2-slot launch over BOTH resident Handles + ONE
-            // readback (the 024 sync-floor win: ≈59→≈30 syncs/tree). Bump
+            // readback (a sync-floor win: ≈59→≈30 syncs/tree). Bump
             // `SCAN_RESIDENT_CNT` ONCE for the pair (one readback). The two returned
             // vecs are distributed into the smaller/larger scans below via the
             // `precomputed_batched_splits` param, which feeds the SHARED post-scan
@@ -2286,7 +2283,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 smaller_resident_slot,
                 smaller_fused,
                 smaller_unified,
-                // quick 260620-b97: the directly-built smaller child is never subtract-unified.
+                // The directly-built smaller child is never subtract-unified.
                 None,
                 smaller_precomputed,
                 gradients,
@@ -2296,7 +2293,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         if larger_leaf >= 0 {
             let larger_slot = larger_slot_id.expect("non-root larger child must hold a pool slot");
-            // 260608-t3t: the larger child is subtract-derived (parent − smaller),
+            // The larger child is subtract-derived (parent − smaller),
             // NEVER fused-built — it reads its histogram via the resident subtract
             // Handle (or host buffer), so `fused_build = false`.
             larger_records = self.scan_leaf_histogram(
@@ -2312,8 +2309,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 parent_splittable.as_deref(),
                 larger_resident_slot,
                 false,
-                // quick 260620-a48: the larger child is never BUILD-unified (no per-feature
-                // fold). quick 260620-b97: it CAN be SUBTRACT-unified — `larger_unified`
+                // The larger child is never BUILD-unified (no per-feature
+                // fold), but it CAN be SUBTRACT-unified — `larger_unified`
                 // routes the scan through `subtract_scan` (fused subtract→scan) using the
                 // scratch in `larger_subtract_inputs`; the build-unified flag stays false.
                 false,
@@ -2326,7 +2323,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let _ = use_subtract; // recorded for clarity; the parent_slot Option drives it
 
         // The snapshot records the SMALLER leaf's per-feature scan (the directly-
-        // built one — the D-06 localizer); the winner is the smaller leaf's best.
+        // built one); the winner is the smaller leaf's best.
         let winner_feature = best_split_feature[smaller_leaf as usize];
         let mut per_feature = smaller_records;
         per_feature.extend(larger_records);
@@ -2370,11 +2367,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return;
         }
         let leaf_rows = data_partition.indices_in_leaf(leaf);
-        // BATCHED per-leaf histogram build (260608-lad): the backend builds ALL
+        // BATCHED per-leaf histogram build: the backend builds ALL
         // features' RAW histograms in one call (CPU: the per-feature gather+construct
         // loop, bit-exact; GPU: one batched kernel launch + device-resident bins).
         let feature_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
-        // R3 (260614-p0n): the per-feature `num_bin` descriptor is identical on every
+        // The per-feature `num_bin` descriptor is identical on every
         // leaf build (the feature set is fixed per train). Fill the learner-held
         // scratch lazily on the first build (it survives `with_features`) or whenever
         // the feature count changes; re-borrow it thereafter. The CONTENT and ORDER
@@ -2418,7 +2415,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
                 // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
                 crate::fix_histogram::fix_histogram(hist, f.most_freq_bin, sum_g, sum_h);
-                // COMPACTED layout (D-09): shift real-bin `c+offset` into cell `c`,
+                // COMPACTED layout: shift real-bin `c+offset` into cell `c`,
                 // zero the dropped tail. No-op for offset==0.
                 compact_histogram(hist, f.offset);
             }
@@ -2426,7 +2423,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         }
     }
 
-    /// 260608-p90: build ONE directly-built leaf's histogram DEVICE-RESIDENT (the
+    /// Build ONE directly-built leaf's histogram DEVICE-RESIDENT (the
     /// resident analog of [`build_leaf_histogram_into`](Self::build_leaf_histogram_into)).
     /// Assembles the per-feature `(slot_off, num_bin, offset, most_freq_bin)` fix_feats
     /// (the SAME params the host `fix_histogram` + `compact_histogram` use) and the
@@ -2467,8 +2464,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // fix_feats: per-feature (slot_off, num_bin, offset, most_freq_bin) — the SAME
         // values the host fix_histogram (most_freq_bin) + compact_histogram (offset)
         // consume, so the on-device fix+compact reproduces the host buffer bit-for-bit
-        // (the f32-atomic RAW build is the only ~1e-6 contributor; oib proved fix+compact
-        // bit-exact).
+        // (the f32-atomic RAW build is the only ~1e-6 contributor; a parity check
+        // confirmed fix+compact is bit-exact).
         let fix_feats: Vec<(usize, u32, i32, u32)> = features
             .iter()
             .enumerate()
@@ -2491,9 +2488,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         Ok(())
     }
 
-    /// Phase 12 (spike-024): assemble the SPINE `BatchedSplitFeature` list for one
+    /// Assemble the SPINE `BatchedSplitFeature` list for one
     /// leaf — the EXACT Pass-1 gate-only pre-pass that `scan_leaf_histogram` runs
-    /// internally (col-sampler mask → parent-splittability gate → ADV-02 interaction
+    /// internally (col-sampler mask → parent-splittability gate → interaction
     /// gate → not-categorical / not-monotone / not-extra-trees), in the IDENTICAL
     /// order with the IDENTICAL predicates. Returns the spine features in ascending
     /// fpos. Used by the co-pack path in `find_best_splits` to (a) verify both siblings
@@ -2571,7 +2568,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// in the pool slot `buf`, built directly OR derived via subtraction), running
     /// `find_best_split` per feature and recording the cross-feature argmax into
     /// `best_split_per_leaf[leaf]` (C++ `FindBestSplitsFromHistograms` per-feature
-    /// `ComputeBestSplitForFeature`). Returns the per-feature D-06 records.
+    /// `ComputeBestSplitForFeature`). Returns the per-feature records.
     #[allow(clippy::too_many_arguments)]
     fn scan_leaf_histogram(
         &self,
@@ -2579,7 +2576,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         slot_off: &[usize],
         leaf: i32,
         leaf_splits: &LeafSplits,
-        // quick 260620-a48: `&mut` so the UNIFIED host build+fix+scan path
+        // `&mut` so the UNIFIED host build+fix+scan path
         // (`unified_build == true`) can BUILD this leaf's complete histogram into the
         // pool slot in-region (instead of a separate `build_leaf_histogram_into` call at
         // the seam). The non-unified paths re-borrow it immutably and are byte-unchanged.
@@ -2589,7 +2586,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         used_features: Option<&[i8]>,
         data_partition: &DataPartition,
         parent_splittable: Option<&[bool]>,
-        // 260608-p90: when `Some(slot)` (resident-eligible), the SPINE batched scan
+        // When `Some(slot)` (resident-eligible), the SPINE batched scan
         // reads the device-resident Handle in mirror slot `slot` (via
         // `backend.scan_resident_leaf`) instead of the host `buf` (via
         // `find_best_splits_batched`). Every other gate / argmax / record / bookkeeping
@@ -2598,7 +2595,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ZERO categorical/monotone/extra-trees features, so those inline branches are
         // unreachable and `buf` is not read on the spine path.
         resident_slot: Option<usize>,
-        // 260608-t3t: when `true` (the fused directly-built path), the SPINE batched
+        // When `true` (the fused directly-built path), the SPINE batched
         // scan is replaced by ONE `backend.build_fix_scan_resident` launch that BUILDS
         // (sequential f64), fixes, compacts, AND scans the leaf in a single launch —
         // storing the fixed+compacted Handle into `resident_slot` (so the subtract-
@@ -2607,7 +2604,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // FULL-corpus `gradients`/`hessians` (the launcher gathers leaf rows on device).
         // `false` keeps the existing scan-only path (host buf or resident-Handle scan).
         fused_build: bool,
-        // quick 260620-a48: when `true` (CpuBackend directly-built smaller leaf, above
+        // When `true` (CpuBackend directly-built smaller leaf, above
         // `unified_bfs_threshold`), the SPINE scan is preceded by ONE rayon region that
         // BUILDS (per-feature private fold), fixes, compacts EVERY feature into `buf`
         // (complete for the subtract-derived larger child) AND scans the spine subset —
@@ -2615,7 +2612,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `build_leaf_histogram_into` at the seam is SKIPPED for this leaf. `false` keeps
         // the existing host-buf scan (the buffer is pre-built by the seam).
         unified_build: bool,
-        // quick 260620-b97: `Some((parent, smaller))` (CpuBackend subtract-derived larger
+        // `Some((parent, smaller))` (CpuBackend subtract-derived larger
         // child, above `unified_bfs_threshold`) routes the SPINE scan through ONE rayon
         // `subtract_scan` region that SUBTRACTS (parent − smaller per feature, NO fix)
         // into `buf` (complete for downstream) AND scans the spine subset — the
@@ -2625,7 +2622,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `unified_build` and `subtract_inputs.is_some()` are mutually exclusive (a leaf is
         // either directly built or subtract-derived, never both).
         subtract_inputs: Option<(Vec<f64>, Vec<f64>)>,
-        // Phase 12 (spike-024): when `Some(splits)`, the per-spine-feature SplitInfos
+        // When `Some(splits)`, the per-spine-feature SplitInfos
         // were ALREADY computed by a CO-PACKED `scan_resident_siblings` call in
         // `find_best_splits` (this leaf is one of the two co-packed siblings), so the
         // entire histogram-source dispatch below is SKIPPED and `splits` is used
@@ -2663,7 +2660,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return Ok(records);
         }
 
-        // ---- ADV-02 interaction-allowed feature set for THIS node (D-06: empty
+        // ---- Interaction-allowed feature set for THIS node (empty
         // when interaction is inactive, then every feature is allowed). Mirrors
         // `ColSampler::GetByNode`'s interaction branch (col_sampler.hpp:91-125)
         // for the `fraction_bynode >= 1.0` (no col-subsample) case. ----
@@ -2674,15 +2671,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 Some(self.interaction_allowed_features(leaf))
             };
 
-        // ADV-05 CEGB: this leaf's GLOBAL rows (needed for the lazy on-demand cost
+        // CEGB: this leaf's GLOBAL rows (needed for the lazy on-demand cost
         // + the post-split row marking). Computed once per scan when CEGB active.
         let cegb_active = self.cegb.borrow().is_some();
 
-        // ---- PASS 1 (260608-lsx): gate-only pre-pass collecting the SPINE features
+        // ---- PASS 1: gate-only pre-pass collecting the SPINE features
         // into ONE batched find_best_splits_batched call. A "spine" feature is one
         // that reaches the byte-untouched continuous `find_best_split` branch below:
         // it passes the col-sampler mask, the LOAD-BEARING parent-splittability gate,
-        // and the ADV-02 interaction gate, AND is NOT categorical, NOT monotone, NOT
+        // and the interaction gate, AND is NOT categorical, NOT monotone, NOT
         // extra-trees-randomized. Those gates are applied here in the IDENTICAL order
         // and with the IDENTICAL predicates as the main loop (which still re-applies
         // them — this pre-pass only DECIDES batch membership; it must not change which
@@ -2712,7 +2709,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             if f.bin_type == BinType::Categorical {
                 continue;
             }
-            // monotone-active feature ⇒ ADV-01 inline branch (NOT batched).
+            // monotone-active feature ⇒ inline branch (NOT batched).
             let monotone_type = if monotone_active {
                 self.monotone
                     .borrow()
@@ -2725,7 +2722,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             if monotone_type != 0 {
                 continue;
             }
-            // extra-trees ⇒ ADV-04 randomized-threshold inline branch (NOT batched).
+            // extra-trees ⇒ randomized-threshold inline branch (NOT batched).
             if self.constraints.extra_trees {
                 continue;
             }
@@ -2743,26 +2740,26 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             });
         }
 
-        // ---- ONE batched call per leaf for all spine features (260608-lsx). On
+        // ---- ONE batched call per leaf for all spine features. On
         // CpuBackend this is the default per-feature-order loop ⇒ each result is
         // byte-identical to the inline `find_best_split` it replaces; on RocmBackend
         // it is the batched GPU override. Empty `batched_feats` ⇒ empty Vec, no
-        // launch (T-lsx-03). ----
+        // launch. ----
         //
-        // 260608-p90: when resident-eligible (`resident_slot == Some(slot)`), read the
+        // When resident-eligible (`resident_slot == Some(slot)`), read the
         // device-resident Handle in mirror slot `slot` instead of the host `buf` — the
         // Handle-consuming fused scan (`scan_resident_leaf`) is byte-identical to the
         // host-buf fused scan (same `split_scan_body`, same decode), so the per-feature
         // SplitInfos are the SAME and the grown tree is unchanged. `slot_len ==
         // buf.len()` (the pool slot length).
-        // 260608-t3t: the FUSED directly-built path — ONE launch builds (sequential
+        // The FUSED directly-built path — ONE launch builds (sequential
         // f64), fixes, compacts, AND scans the leaf, storing the fixed+compacted Handle
         // into `slot` (so the subtract-derived larger child finds its parent). The
         // returned SplitInfos are BIT-EXACT to build_resident_leaf_into +
-        // scan_resident_leaf (the fused==host oracle, T1) — same `split_scan_body`, same
+        // scan_resident_leaf — same `split_scan_body`, same
         // decode, same fix/compact f64 fold order — so the grown tree is unchanged; only
         // the launch count drops (3 → 1 on directly-built leaves).
-        // quick 260620-a48: the UNIFIED host build+fix+scan branch. Builds (per-feature
+        // The UNIFIED host build+fix+scan branch. Builds (per-feature
         // private fold), fixes, compacts EVERY feature into `buf` (COMPLETE for the
         // subtract-derived larger child) AND scans the spine subset (`scan_active`),
         // inside ONE rayon region — the host f64 analog of the GPU `fused_build`. The
@@ -2772,7 +2769,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // downstream `spine_batch_index[fpos]` lookup is byte-identical to the two-step
         // path. Only on CpuBackend + directly-built smaller leaf + above threshold.
         let batched_splits = if let Some(splits) = precomputed_batched_splits {
-            // Phase 12 (spike-024): this leaf was scanned by a CO-PACKED
+            // This leaf was scanned by a CO-PACKED
             // `scan_resident_siblings` launch in `find_best_splits` (one launch + one
             // readback for BOTH siblings). The caller computed `batched_feats` for the
             // SHARED spine layout and verified this leaf's spine membership matches the
@@ -2784,7 +2781,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 subtract_inputs.is_none() && !unified_build && !fused_build,
                 "co-packed precomputed splits are mutually exclusive with the unified/fused/subtract paths"
             );
-            // WR-01: the contract that the co-packed `splits` align slot-for-slot
+            // The contract that the co-packed `splits` align slot-for-slot
             // with THIS leaf's independently-re-derived `batched_feats` is
             // load-bearing for numerical fidelity (CLAUDE.md non-negotiable #1) —
             // a length skew (e.g. if a future gate is added to Pass-1 but not to
@@ -2802,7 +2799,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             }
             splits
         } else if let Some((parent_hist, smaller_hist)) = subtract_inputs.as_ref() {
-            // quick 260620-b97: UNIFIED host subtract→scan for the larger child. ONE rayon
+            // UNIFIED host subtract→scan for the larger child. ONE rayon
             // region SUBTRACTS (parent − smaller per feature, NO fix — non-negotiable #3)
             // into `buf` (complete for downstream non-spine branches) AND scans the spine
             // subset (`scan_active`). `all_feats` is the full fpos-ordered param list;
@@ -2963,15 +2960,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // feature can fail `min_data_in_leaf` at the parent (not splittable) yet
             // look splittable on this child (whose larger cnt_factor no longer
             // rounds to 0). Without the gate Rust selects a split C++ never
-            // considers (GOSS tree-10 node1: Rust f1 gain 4.36 vs C++ picking f0
-            // 1.14 because the root's f1 was not splittable). `None` (smaller child
+            // considers. `None` (smaller child
             // / root) ⇒ no gate, every feature scanned.
             if let Some(ps) = parent_splittable {
                 if !ps.get(fpos).copied().unwrap_or(true) {
                     continue;
                 }
             }
-            // ADV-02 interaction gate: skip a feature not allowed to co-occur with
+            // Interaction gate: skip a feature not allowed to co-occur with
             // this node's branch features (additive — no-op when inactive).
             if interaction_allowed
                 .as_ref()
@@ -2984,7 +2980,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
             // ---- bin_type dispatch (serial_tree_learner.cpp:779) ----
             // Categorical features route to the ADDITIVE many-vs-many/one-hot
-            // categorical finder (D-06: the numeric path below is byte-untouched).
+            // categorical finder (the numeric path below is byte-untouched).
             // The categorical winner's bitset is stashed in `best_cat_threshold`
             // indexed by leaf so `split_inner` can grow a categorical node.
             if f.bin_type == BinType::Categorical {
@@ -3005,7 +3001,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 );
                 let split = cat.split;
                 this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
-                // Categorical features have no per-bin numeric gain arrays; the D-06
+                // Categorical features have no per-bin numeric gain arrays; the
                 // numeric snapshot uses empty rev/fwd for them (the categorical
                 // diagnostics live in the dedicated categorical golden, not here).
                 records.push(FeatureSplitRecord {
@@ -3035,7 +3031,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             let na_as_missing = f.na_as_missing();
             let run_forward = f.run_forward();
 
-            // ADV-04 extra-trees: draw this feature's random threshold for this
+            // Extra-trees: draw this feature's random threshold for this
             // scan (BeforeNumerical, feature_histogram.hpp:202-206) — drawn for
             // EVERY scanned feature so the RNG sequence matches C++ even when the
             // candidate is later rejected. `None` ⇒ spine (best-threshold).
@@ -3057,7 +3053,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             };
 
             // ---- the split for this feature ----
-            // Gate selection (D-06): monotone-active feature → the constraint-aware
+            // Gate selection: monotone-active feature → the constraint-aware
             // finder; extra-trees → the randomized-threshold finder; otherwise the
             // BYTE-UNTOUCHED spine `find_best_split`.
             let monotone_type = self
@@ -3068,7 +3064,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 .unwrap_or(0);
 
             let mut split = if monotone_type != 0 {
-                // ADV-01: constraint-aware re-scan with this leaf's [min,max] clamp.
+                // Constraint-aware re-scan with this leaf's [min,max] clamp.
                 let constraint = self
                     .monotone
                     .borrow()
@@ -3090,12 +3086,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     &constraint,
                 )
             } else if let Some(rt) = rand_threshold {
-                // ADV-04: only the candidate at `rt` is admissible.
+                // Only the candidate at `rt` is admissible.
                 self.find_best_split_rand(
                     hist, f, skip_default_bin, run_forward, sum_g, sum_h, num_data_in_leaf, rt,
                 )
             } else {
-                // SPINE (260608-lsx): the bit-exact continuous finder is now run via
+                // SPINE: the bit-exact continuous finder is now run via
                 // the ONE batched find_best_splits_batched call above; pull THIS
                 // feature's SplitInfo from the batched results by the Pass-1 mapping.
                 // On CpuBackend the batched default impl is the per-feature
@@ -3115,9 +3111,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // BEFORE any CEGB / monotone gain post-processing, exactly as C++ sets
             // the flag inside the scan, not after ComputeBestSplitForFeature.
             this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
-            // ---- ADV-05 CEGB: SUBTRACT the per-split cost penalty from the gain
+            // ---- CEGB: SUBTRACT the per-split cost penalty from the gain
             // (ComputeBestSplitForFeature, serial_tree_learner.cpp:988-992) BEFORE
-            // the argmax. No-op when CEGB inactive (D-06). ----
+            // the argmax. No-op when CEGB inactive. ----
             if cegb_active && split.gain > K_MIN_SCORE {
                 let leaf_rows = data_partition.indices_in_leaf(leaf);
                 let delta = self
@@ -3129,12 +3125,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 split.gain -= delta;
             }
 
-            // ---- ADV-01 monotone penalty (serial_tree_learner.cpp:993-997):
+            // ---- Monotone penalty (serial_tree_learner.cpp:993-997):
             // multiply a monotone split's gain by the depth-dependent penalty. ----
             if monotone_type != 0 && split.gain > K_MIN_SCORE {
                 // Leaf depth == the count of branch features on its root path
                 // (C++ `tree_->leaf_depth(leaf)`); the branch_features list is
-                // maintained for ADV-02 and reused here.
+                // maintained for the interaction gate and reused here.
                 let depth = self
                     .branch_features
                     .borrow()
@@ -3150,9 +3146,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 split.gain *= penalty;
             }
 
-            // Per-bin gain arrays for the D-06 snapshot (host re-scan of the SAME
+            // Per-bin gain arrays for the snapshot (host re-scan of the SAME
             // fixed histogram via the gain primitive — localizes a divergence).
-            // R1: snapshot-ONLY work — skip it entirely on the production path
+            // Snapshot-ONLY work — skip it entirely on the production path
             // (`capture_snapshots == false`). The live split (`split` above) and the
             // splittability flag are already decided; the grown tree is identical.
             let (gains, rev_len) = if self.capture_snapshots {
@@ -3183,7 +3179,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // categorical bitset that was stashed for this leaf by an earlier (losing)
         // categorical candidate — `split_inner` must see `None` for a numeric
         // winner. (Purely a side-structure cleanup; the numeric scan above is
-        // byte-untouched, D-06.)
+        // byte-untouched.)
         let winner_is_cat = leaf_best_feature >= 0
             && features
                 .iter()
@@ -3209,7 +3205,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         Ok(records)
     }
 
-    /// ADV-02: the set of REAL feature indices allowed at `leaf` given its branch
+    /// The set of REAL feature indices allowed at `leaf` given its branch
     /// features and the interaction-constraint groups (`ColSampler::GetByNode`
     /// interaction branch, col_sampler.hpp:91-125, `fraction_bynode>=1.0` case).
     /// A feature is allowed iff it is a branch feature OR it belongs to a group
@@ -3233,7 +3229,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         allowed
     }
 
-    /// ADV-04 extra-trees: the randomized-threshold finder — the `USE_RAND`
+    /// Extra-trees: the randomized-threshold finder — the `USE_RAND`
     /// instantiation of `FindBestThresholdSequentially` (feature_histogram.hpp:
     /// 894-898 / 1268-1271): only the candidate whose recorded threshold equals
     /// `rand_threshold` is admissible (`t-1+offset` reverse / `t+offset` forward).
@@ -3312,7 +3308,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     // C++ computes the child OUTPUTS from the RAW hessians
                     // (best_sum_left_hessian, sum_hessian - best_sum_left_hessian) and
                     // ONLY THEN stores `<raw> - kEpsilon` (feature_histogram.hpp:1042-
-                    // 1062). DEF-07-11-03: computing from the `-kEpsilon` value drifts
+                    // 1062). Computing from the `-kEpsilon` value drifts
                     // the leaf output ~1 ULP. Use the C++ right operand order too.
                     let right_g_out = sum_g - sum_left_gradient;
                     let right_h_raw = sum_hessian - sum_left_hessian;
@@ -3369,7 +3365,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 let g = get_split_gains(use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient, sum_right_hessian, l1, l2);
                 if g > min_gain_shift && g > best_gain {
                     best_gain = g;
-                    // RAW-hessian output operands (see REVERSE branch, DEF-07-11-03).
+                    // RAW-hessian output operands (see REVERSE branch above).
                     let right_g_out = sum_g - sum_left_gradient;
                     let right_h_raw = sum_hessian - sum_left_hessian;
                     best = SplitInfo {
@@ -3392,7 +3388,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         best
     }
 
-    /// ADV-03 `GatherInfoForThresholdNumerical` (feature_histogram.hpp:486-588):
+    /// `GatherInfoForThresholdNumerical` (feature_histogram.hpp:486-588):
     /// compute the split at a SPECIFIC `threshold` bin (the forced threshold). The
     /// right side accumulates bins `> threshold`; left = total - right. Returns the
     /// [`SplitInfo`] (or `none()` when the forced gain is not better than no-split,
@@ -3465,7 +3461,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             return SplitInfo::none();
         }
         let mk_output = |g: f64, h: f64| calculate_splitted_leaf_output(use_l1, g, h, l1, l2);
-        // DEF-07-11-02: C++ `GatherInfoForThresholdNumericalInner`
+        // C++ `GatherInfoForThresholdNumericalInner`
         // (feature_histogram.hpp:579-590) computes the child OUTPUTS from the RAW
         // child hessians (`sum_left_hessian` and `sum_hessian - sum_left_hessian`),
         // and ONLY THEN stores `{left,right}_sum_hessian = <raw> - kEpsilon`. The
@@ -3498,8 +3494,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     }
 
     /// Host re-scan of the per-bin gain arrays (REVERSE + FORWARD) on a FIXED
-    /// histogram, for the D-06 snapshot. Reuses `gain::get_split_gains` so the
-    /// learner emitter and kernel emitter agree (D-02a). NaN marks a gated bin.
+    /// histogram, for the snapshot. Reuses `gain::get_split_gains` so the
+    /// learner emitter and kernel emitter agree. NaN marks a gated bin.
     fn per_bin_gains(
         &self,
         hist: &[f64],
@@ -3519,8 +3515,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let default_bin = f.default_bin as i32;
         let qnan = f64::NAN;
 
-        // BeforeNumerical min_gain_shift (host, same as find_best_split). Phase-7
-        // D-05 faithful-fix: `gain_shift` uses the 2*kEpsilon-BUMPED `sum_hessian`
+        // BeforeNumerical min_gain_shift (host, same as find_best_split).
+        // `gain_shift` uses the 2*kEpsilon-BUMPED `sum_hessian`
         // (C++ passes the bumped value into `BeforeNumerical`, feature_histogram.hpp
         // :174,400-401) — mirrors the `find_best_split_cpu` fix so this diagnostic
         // re-scan stays bit-identical to the live kernel path.
@@ -3534,8 +3530,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let get_grad = |t: i32| hist[(t as usize) << 1];
         let get_hess = |t: i32| hist[((t as usize) << 1) + 1];
 
-        // REVERSE (:854-936) then FORWARD packed into ONE allocation (260609-bfx
-        // snapshot-path alloc reduction: 2 retained Vecs/record → 1). Pre-sized to
+        // REVERSE (:854-936) then FORWARD packed into ONE allocation
+        // (alloc reduction: 2 retained Vecs/record → 1). Pre-sized to
         // `2*num_bin` (the combined push upper bound) so the per-feature per-leaf
         // snapshot scan never reallocates mid-grow. Parity-neutral — capacity only,
         // identical pushed sequence; `rev_len` (captured after the REVERSE block)
@@ -3699,9 +3695,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             );
         }
 
-        // Partition this leaf's rows (TRL-07) via the Backend op.
+        // Partition this leaf's rows via the Backend op.
         //
-        // SINGLE-FEATURE-GROUP min_bin convention (D-09, the CR-01 fix): the C++
+        // SINGLE-FEATURE-GROUP min_bin convention: the C++
         // single-feature `FeatureGroup::Split` (`feature_group.h`, `num_feature_
         // == 1`) dispatches to `DenseBin::Split(max_bin, …)` which HARD-CODES
         // `min_bin = 1` and `USE_MIN_BIN = false` (`dense_bin.hpp:423-433`). For a
@@ -3711,7 +3707,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // predict-time `fval <= bin_upper_bound[threshold]` routing. Passing the
         // raw `min_bin == 0` instead (as before) left `th = threshold - 1`, routing
         // `bin == threshold` RIGHT while predict routed it LEFT — the `[4,8]` vs
-        // `[6,6]` CR-01 divergence. We mirror the C++ overload by passing
+        // `[6,6]` divergence. We mirror the C++ overload by passing
         // `min_bin + offset` (== 1 for the offset==1 single-feature spine, == the
         // raw min_bin for offset==0). max_bin / most_freq_bin are unchanged; the
         // partition `--th` body stays verbatim.
@@ -3775,7 +3771,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `kEpsilon` provenance from the parent's REVERSE scan. The prior re-fold
         // produced a fresh `sum_hessian` (e.g. exactly `4.0` for the mfb>0 node-2)
         // that lost that provenance and shifted the grandchild leaf-output
-        // denominator by 2 ULPs (the 05-09 mfb>0 node-2 leaf-0 residual). The seed
+        // denominator by 2 ULPs. The seed
         // provenance was confirmed against a real `lib_lightgbm` 4.6 FP execution
         // trace: node-2's scan `sum_hessian` is the parent stored
         // `left_sum_hessian` (`0x4010000000000001` = `4.000000000000001`), bumped by
@@ -3811,9 +3807,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // attaching node{2,3}'s sums (sum_g=1.0) to node{0,1}'s histogram and
         // flipping the next split's gain (bogus 1.0417 vs C++ 0.0333) → tree-0
         // topology [1,8,2,1] vs golden [2,4,2,4]. Constant-hessian families round
-        // identically so this never tripped them. (DEF-07-02/03 root cause; proven
-        // by the source-built lib_lightgbm 4.6 FP trace,
-        // .planning/debug/split-gain-knife-edge-07-02.md.)
+        // identically so this never tripped them. Root cause proven
+        // by a source-built lib_lightgbm 4.6 FP trace.
         if part_left < part_right {
             // smaller = left
             smaller_leaf_splits.init_from_split(
@@ -3855,7 +3850,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// `output->cat_threshold`). The inner bitset is `ConstructBitset` over those
     /// bins; the real bitset is `ConstructBitset` over their CATEGORY VALUES
     /// (`bin_to_category[bin]`, the C++ `RealThreshold`). The numeric split spine
-    /// is untouched (this is a sibling method, D-06).
+    /// is untouched (this is a sibling method).
     #[allow(clippy::too_many_arguments)]
     fn split_inner_categorical(
         &self,
@@ -3994,24 +3989,24 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// Attach the spine's per-feature columns (consumed/cloned in `train`).
     pub fn with_features(mut self, features: Vec<FeatureColumn>) -> Self {
         self.features = Arc::new(features);
-        // quick-260621-p9v: a new feature set makes the device-resident bin cache stale,
+        // A new feature set makes the device-resident bin cache stale,
         // so force the next train to re-upload (the once-per-train guard re-arms).
         self.resident_bins_uploaded = false;
-        // spike-066 (D5): a new feature set must be re-validated by the V5 bin-range
+        // A new feature set must be re-validated by the bin-range
         // scan — re-arm the memo so the next train() runs it once over these columns.
         self.bins_validated = false;
-        // OHP-02 (D5): a new feature set makes the memoized on-device
+        // A new feature set makes the memoized on-device
         // `Vec<GrowFeature>` stale — re-arm so the next on-device train rebuilds it
         // (co-located with the `resident_bins_uploaded`/`bins_validated` resets).
         self.grow_features_cache = None;
-        // D-06: the feature set determines `has_categorical_feature`, so re-apply the
+        // The feature set determines `has_categorical_feature`, so re-apply the
         // categorical+quantized host-fallback gate now that the columns are known.
         self.refresh_on_device_eligibility();
         self
     }
 
-    /// D-06 (Phase 22): declare whether `config.use_quantized_grad` is on. Default
-    /// `false` (the spine path — NOT calling this is byte-identical to the pre-D-06
+    /// Declare whether `config.use_quantized_grad` is on. Default
+    /// `false` (the spine path — NOT calling this is byte-identical to the default
     /// behavior). When `true` AND any attached feature is [`BinType::Categorical`], the
     /// on-device eligibility gate demotes to the host (mirroring the reference
     /// `asm("trap;")` non-support), logging one line. Every other combo is unchanged.
@@ -4022,20 +4017,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self
     }
 
-    /// D-06: recompute [`on_device_eligible`](Self::on_device_eligible) from the base
+    /// Recompute [`on_device_eligible`](Self::on_device_eligible) from the base
     /// backend/env gate ANDed with the categorical+quantized host-fallback
     /// ([`on_device_eligible_gate`]). Called from [`with_features`](Self::with_features)
     /// and [`with_quantized_grad`](Self::with_quantized_grad) (each runs once at setup,
-    /// before any `train`), preserving the "compute once, NOT per-train" property (D-05).
+    /// before any `train`), preserving the "compute once, NOT per-train" property.
     /// With `LGBM_CUDA_ON_DEVICE` unset the base gate is `false`, so the result is
-    /// `false` and NOTHING is logged (SC #4 byte-unchanged default lane).
+    /// `false` and NOTHING is logged (byte-unchanged default lane).
     fn refresh_on_device_eligibility(&mut self) {
         let base = self.backend.on_device_growth_supported();
         let has_categorical_feature =
             self.features.iter().any(|f| f.bin_type == BinType::Categorical);
         let eligible =
             on_device_eligible_gate(base, has_categorical_feature, self.use_quantized_grad);
-        // D-06 host-fallback notice: log EXACTLY once, only when the combo actually
+        // Host-fallback notice: log EXACTLY once, only when the combo actually
         // demotes an otherwise-eligible device (base true). Guarded so re-running the
         // recompute from a second builder does not double-log.
         if base && !eligible && !self.cat_quant_fallback_logged {
@@ -4048,25 +4043,25 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self.on_device_eligible = eligible;
     }
 
-    /// Set the W10 advanced learner constraints (ADV-01..05). The `Default`
+    /// Set the advanced learner constraints. The `Default`
     /// (all-empty/off) is the spine path — every gate INACTIVE and the numeric +
-    /// categorical split paths byte-untouched (D-06).
+    /// categorical split paths byte-untouched.
     #[must_use]
     pub fn with_constraints(mut self, constraints: LearnerConstraints) -> Self {
         self.constraints = constraints;
         self
     }
 
-    /// Select the histogram-build strategy (`force_row_wise` / `force_col_wise`,
-    /// TRL-09). Default [`BuildStrategy::RowWise`]. On the single-thread anchor both
+    /// Select the histogram-build strategy (`force_row_wise` / `force_col_wise`).
+    /// Default [`BuildStrategy::RowWise`]. On the single-thread anchor both
     /// strategies route through the SAME `construct_histograms` op and produce
-    /// bit-identical trees (A1) — this flag exists to drive + assert that equality.
+    /// bit-identical trees — this flag exists to drive + assert that equality.
     pub fn with_strategy(mut self, strategy: BuildStrategy) -> Self {
         self.strategy = strategy;
         self
     }
 
-    /// Enable per-tree / per-node feature subsampling (TRL-08) with
+    /// Enable per-tree / per-node feature subsampling with
     /// `(feature_fraction, feature_fraction_bynode, feature_fraction_seed)`. A
     /// `feature_fraction == feature_fraction_bynode == 1.0` is equivalent to NOT
     /// calling this (the spine path — no RNG advance, all features used).
@@ -4080,7 +4075,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self
     }
 
-    /// Enable the GROWTH-PATH subtraction audit (T-05-07-01, TEST hook). After a
+    /// Enable the GROWTH-PATH subtraction audit (TEST hook). After a
     /// `train*` call, [`take_subtract_audit`](Self::take_subtract_audit) returns one
     /// `(derived, direct)` pair per `use_subtract` larger child grown: the histogram
     /// the wired `subtract_histograms(parent, smaller)` produced vs an independent
@@ -4109,12 +4104,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// The training-path score scatter: for every leaf of the just-grown `tree`,
     /// add that leaf's f64 output to each of its rows' scores, reading the rows
     /// directly from `data_partition` (the same partition the tree was grown over).
-    /// Accumulation is in f64 (the score buffer is a f64 accumulator, RESEARCH
+    /// Accumulation is in f64 (the score buffer is a f64 accumulator, see
     /// score_updater.hpp:123). A single-leaf tree (`num_leaves <= 1`) contributes
     /// nothing and early-returns, mirroring the C++ guard.
     ///
     /// `out_score` is the class-major score slice for the current tree's class; the
-    /// boosting layer (06-02) calls this rather than re-walking the tree per row.
+    /// boosting layer calls this rather than re-walking the tree per row.
     ///
     /// NOTE on partitioning: the learner builds its `DataPartition` locally inside
     /// `train_inner` (it is not retained on `self`), so the boosting caller passes
@@ -4142,11 +4137,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     ///
     /// The leaf-output renewal hook the GBDT loop calls after growth and BEFORE
     /// shrinkage. For objectives whose `IsRenewTreeOutput() == false` (the spine
-    /// L2 objective, 06-02) this is a NO-OP. For `regression_l1` (06-03) the real
+    /// L2 objective) this is a NO-OP. For `regression_l1` the real
     /// body replaces each leaf's output with the weighted median of that leaf's
-    /// residuals — that math lands with the objective in 06-03.
+    /// residuals — that math lands with the objective.
     ///
-    /// This Wave-0 seam takes an optional per-leaf renewal closure so the loop
+    /// This seam takes an optional per-leaf renewal closure so the loop
     /// contract is stable now without coupling the learner to `lgbm-objective`
     /// (which would invert the crate dependency direction). When `renew` is `None`
     /// the tree is unchanged (the `IsRenewTreeOutput()==false` path); when `Some`,
@@ -4189,7 +4184,7 @@ fn feature_slot_layout(features: &[FeatureColumn]) -> (Vec<usize>, usize) {
 }
 
 /// Shift a stride-2 `[g0,h0,g1,h1,…]` histogram into the C++ COMPACTED layout for
-/// `offset > 0` (D-09): cell `c` ends holding the pair from REAL bin `c + offset`,
+/// `offset > 0`: cell `c` ends holding the pair from REAL bin `c + offset`,
 /// dropping the first `offset` bins (the most-freq / bin-0 slot that is never
 /// directly folded). The now-unused tail cells are zeroed so the buffer keeps its
 /// original `2 * num_bin` length — mirroring the C++ `data_` buffer whose tail is
@@ -4228,7 +4223,7 @@ fn compact_histogram(hist: &mut [f64], offset: i32) {
     }
 }
 
-/// ADV-03 `BinMapper::BinThreshold` analog: map a forced REAL threshold to the
+/// `BinMapper::BinThreshold` analog: map a forced REAL threshold to the
 /// bin a split should be placed AT. A split at bin `b` routes `value <=
 /// bin_upper_bound[b]` LEFT, so the forced threshold `thr` maps to the LARGEST bin
 /// `b` whose `bin_upper_bound[b] < thr` (i.e. all bins up to `b` go left). Falls
@@ -4262,7 +4257,7 @@ fn bin_threshold(f: &FeatureColumn, thr: f64) -> u32 {
 
 /// Convert a `ColSampler::get_by_node` mask (indexed by REAL feature index) into
 /// the ascending list of SELECTED real feature indices, restricted to the feature
-/// columns the learner actually holds. Used for the TRL-08 per-node golden trace.
+/// columns the learner actually holds. Used for the per-node golden trace.
 fn mask_to_indices(mask: &[i8], features: &[FeatureColumn]) -> Vec<i32> {
     let mut out: Vec<i32> = features
         .iter()
@@ -4294,10 +4289,10 @@ fn arg_max(best_split_per_leaf: &[SplitInfo], best_feature: &[i32]) -> i32 {
 
 #[cfg(test)]
 mod spike013 {
-    //! Spike 013 — is the per-tree `feature_splittable = vec![vec![true; nf]; nl]`
+    //! Microbenchmark: is the per-tree `feature_splittable = vec![vec![true; nf]; nl]`
     //! bool matrix (`learner.rs:~891`) worth flattening / reusing? It is the same
-    //! `vec![template; n]` clone-memcpy pattern as the histogram pool (spike 010),
-    //! but ~1.5KB instead of multi-MB. This isolates its per-tree construction cost
+    //! `vec![template; n]` clone-memcpy pattern as the histogram pool, but ~1.5KB
+    //! instead of multi-MB. This isolates its per-tree construction cost
     //! as a fraction of per-tree train time. Run:
     //!   cargo test -p lgbm-treelearner --release --lib spike013_feature_splittable -- --ignored --nocapture
     use std::time::Instant;
@@ -4412,7 +4407,7 @@ mod tests {
         (f, gradients, hessians)
     }
 
-    /// D-06 (Phase 22): the categorical + `use_quantized_grad` combo must route to the
+    /// The categorical + `use_quantized_grad` combo must route to the
     /// host — the CUDA reference `asm("trap;")`s on it (no on-device path). The gate
     /// [`on_device_eligible_gate`] ANDs `!(has_categorical_feature && use_quantized_grad)`
     /// into eligibility; every OTHER combo is unchanged. The three-case truth table is
@@ -4458,7 +4453,7 @@ mod tests {
 
     #[test]
     fn per_bin_gains_packs_reverse_then_forward_one_alloc() {
-        // 260609-bfx: the D-06 snapshot per-bin gains are packed REVERSE-then-FORWARD
+        // The snapshot per-bin gains are packed REVERSE-then-FORWARD
         // into ONE allocation (was two separate Vecs per record); `rev_len` splits the
         // buffer. Verify the producer fills both halves with the expected candidate
         // counts so the `cand_rev()` / `cand_fwd()` accessors slice them correctly.
@@ -4512,10 +4507,10 @@ mod tests {
 
     #[test]
     fn train_rejects_out_of_range_bin_with_typed_error() {
-        // V5 / threat T-04-01 RELOCATION (spike-003b): the per-element bin-range
+        // The per-element bin-range
         // check moved OUT of the now-branchless `build_leaf_histograms_raw` fold
         // into the once-per-train upstream gate in `train_inner` (learner.rs:700-714).
-        // This test proves the V5 guarantee SURVIVES at its new location — an
+        // This test proves the guarantee SURVIVES at its new location — an
         // out-of-range bin is rejected with the typed `BinIndexOutOfRange` BEFORE
         // any leaf builds, carrying the exact offending index + num_bin.
         let backend = CpuBackend;
@@ -4581,7 +4576,7 @@ mod tests {
 
     #[test]
     fn monotone_constraint_inactive_matches_spine() {
-        // D-06: an all-zero monotone vector is the spine path byte-for-byte.
+        // An all-zero monotone vector is the spine path byte-for-byte.
         let backend = CpuBackend;
         let client = cpu_client();
         let (f, g, h) = two_feature_corpus();
@@ -4713,7 +4708,7 @@ mod tests {
 
     #[test]
     fn forced_split_inactive_matches_spine() {
-        // D-06: no forced split == the spine tree byte-for-byte.
+        // No forced split == the spine tree byte-for-byte.
         let backend = CpuBackend;
         let client = cpu_client();
         let (f, g, h) = two_feature_corpus();

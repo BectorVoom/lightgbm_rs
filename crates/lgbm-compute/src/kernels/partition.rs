@@ -2,18 +2,18 @@
 //!
 //! Mirrors `DataPartition::Split` (`data_partition.hpp:101-120`), whose per-row
 //! left/right decision is `DenseBin::SplitInner`
-//! (`LightGBM/src/io/dense_bin.hpp:314-394`, commit 195c26fc). This plan
-//! transcribes the `MissingType::None` instantiation
+//! (`LightGBM/src/io/dense_bin.hpp:314-394`, commit 195c26fc). This transcribes
+//! the `MissingType::None` instantiation
 //! `SplitInner<MISS_IS_ZERO=false, MISS_IS_NA=false, MFB_IS_ZERO=false,
 //! MFB_IS_NA=false, USE_MIN_BIN=true>` — the default numeric routing (no missing
-//! handling). Missing/NA routing is Phase-7+ scope.
+//! handling). Missing/NA routing is not yet implemented.
 //!
-//! RESEARCH Open Q3 is RESOLVED to ONE shape: the op returns a STABLE reordered
-//! index array — left rows in original relative order followed by right rows in
-//! original relative order — plus a `split_point` (= the left-row count; left
-//! indices occupy `[0, split_point)`, right `[split_point, len)`). The Phase-5
-//! learner owns `leaf_begin_`/`leaf_count_` bookkeeping, so this op returns only
-//! the partition, not the leaf-tree state.
+//! The op returns a STABLE reordered index array — left rows in original
+//! relative order followed by right rows in original relative order — plus a
+//! `split_point` (= the left-row count; left indices occupy `[0, split_point)`,
+//! right `[split_point, len)`). The tree learner owns `leaf_begin_`/
+//! `leaf_count_` bookkeeping, so this op returns only the partition, not the
+//! leaf-tree state.
 //!
 //! ## Design
 //! The kernel computes a per-row routing flag (`route[i] == 1` ⇒ right/`gt`,
@@ -47,12 +47,12 @@ use crate::BinColumn;
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn data_partition_kernel<B: Int>(
-    // quick-260625-j1l (spike-029): the bin column is now NATIVE-WIDTH (u8/u16/u32),
-    // read via `u32::cast_from` to a u32 INDEX — value-identical to the prior `u32`
-    // monomorph (`u32::cast_from(x: u32)` is the identity cast), so the `<u32>` launch
-    // is byte-for-byte the previous kernel. The narrow widths upload 4× fewer bytes
-    // and read 4× less device memory. Exactly the qix histogram `<B: Int>` precedent
-    // (histogram.rs:1069, `u32::cast_from(resident_bins[...])`).
+    // The bin column is NATIVE-WIDTH (u8/u16/u32), read via `u32::cast_from` to a
+    // u32 INDEX — value-identical to the prior `u32` monomorph (`u32::cast_from(x:
+    // u32)` is the identity cast), so the `<u32>` launch is byte-for-byte the
+    // previous kernel. The narrow widths upload 4× fewer bytes and read 4× less
+    // device memory (same pattern as the histogram `<B: Int>` path,
+    // histogram.rs:1069).
     bins: &Array<B>,
     route: &mut Array<u32>,
     min_bin: i32,
@@ -66,7 +66,7 @@ pub fn data_partition_kernel<B: Int>(
     // stay single-owner sequential for bit-exactness. Each unit writes its OWN
     // `route[i]` (disjoint, no atomics). Previously this scanned all rows on a
     // single lane (`UNIT_POS == 0`); the parallel form is bit-identical (the host
-    // gather below is unchanged) and lets the GPU use all its lanes (260609-eu9).
+    // gather below is unchanged) and lets the GPU use all its lanes.
     let i = ABSOLUTE_POS;
     // Tail units (i >= len) stay idle: the launch rounds the unit count up to a
     // multiple of the cube dim (manual §4 Safe Indexing).
@@ -83,9 +83,9 @@ pub fn data_partition_kernel<B: Int>(
         // threshold` (then lte) — dense_bin.hpp:336-339. Equivalent to
         // `most_freq_bin > threshold`.
         let default_to_right = most_freq_bin > threshold; // 1=gt, 0=lte
-        // quick-260625-j1l: widen the native-width bin to a u32 INDEX, then to i32 for
-        // the signed compares — value-identical to the prior `bins[i] as i32` on the
-        // `<u32>` monomorph (`u32::cast_from(x: u32)` is the identity).
+        // Widen the native-width bin to a u32 INDEX, then to i32 for the signed
+        // compares — value-identical to the prior `bins[i] as i32` on the `<u32>`
+        // monomorph (`u32::cast_from(x: u32)` is the identity).
         let bin = u32::cast_from(bins[i]) as i32;
         // USE_MIN_BIN, no-missing: out-of-[minb,maxb] -> default direction.
         let is_default = bin < min_bin || bin > max_bin;
@@ -97,7 +97,7 @@ pub fn data_partition_kernel<B: Int>(
 }
 
 
-/// **Native** host `data_partition` — the production cpu-anchor path (R2).
+/// **Native** host `data_partition` — the production cpu-anchor path.
 ///
 /// Bit-IDENTICAL to the `data_partition_kernel` cubecl path (one-unit-per-row
 /// routing + host gather): the SAME integer `SplitInner` routing decision and the
@@ -107,9 +107,8 @@ pub fn data_partition_kernel<B: Int>(
 /// route ([`data_partition_native_on`]).
 ///
 /// # Errors
-/// V5 boundary validation: [`ComputeError::Runtime`] if `num_bin == 0` or
-/// `threshold >= num_bin`; [`ComputeError::BinIndexOutOfRange`] if any
-/// `bins[i] >= num_bin`.
+/// [`ComputeError::Runtime`] if `num_bin == 0` or `threshold >= num_bin`;
+/// [`ComputeError::BinIndexOutOfRange`] if any `bins[i] >= num_bin`.
 #[allow(clippy::too_many_arguments)]
 pub fn data_partition_cpu_native(
     bins: &[u32],
@@ -119,7 +118,7 @@ pub fn data_partition_cpu_native(
     threshold: u32,
     most_freq_bin: u32,
 ) -> Result<(Vec<u32>, usize), ComputeError> {
-    // --- V5 boundary validation (identical to data_partition_on) ---
+    // --- Boundary validation (identical to data_partition_on) ---
     if num_bin == 0 {
         return Err(ComputeError::Runtime {
             detail: "data_partition: num_bin must be > 0".to_string(),
@@ -204,8 +203,8 @@ fn gather_route(route: &[u32], n: usize) -> (Vec<u32>, usize) {
     (reordered, split_point)
 }
 
-/// **Native-width** host `data_partition` on ANY runtime — the spike-029 narrow
-/// upload. Identical routing + stable gather to `data_partition_on`, but uploads
+/// **Native-width** host `data_partition` on ANY runtime — a narrow upload path.
+/// Identical routing + stable gather to `data_partition_on`, but uploads
 /// the leaf's bins at their NATIVE [`BinColumn`] width (u8/u16/u32) instead of a
 /// u32-widened buffer: a U8 column uploads `count × 1` bytes (4× fewer) and launches
 /// the `::<u8>` kernel monomorph; U16 → `::<u16>`; U32 → `::<u32>`.
@@ -216,7 +215,7 @@ fn gather_route(route: &[u32], n: usize) -> (Vec<u32>, usize) {
 /// by construction (partition is f64-free).
 ///
 /// # Errors
-/// Same V5 as `data_partition_on`: [`ComputeError::Runtime`] if `num_bin == 0` or
+/// Same as `data_partition_on`: [`ComputeError::Runtime`] if `num_bin == 0` or
 /// `threshold >= num_bin`; [`ComputeError::BinIndexOutOfRange`] for any
 /// `bins.bin(i) >= num_bin`.
 #[allow(clippy::too_many_arguments)]
@@ -231,8 +230,8 @@ pub fn data_partition_native_on<R: cubecl::Runtime>(
 ) -> Result<(Vec<u32>, usize), ComputeError> {
     use cubecl::prelude::CubeElement;
 
-    // --- V5 boundary validation (T-04-01 / T-j1l-01), reading each bin via the
-    // `BinColumn` widening accessor BEFORE the unsafe create_from_slice + launch. ---
+    // --- Boundary validation, reading each bin via the `BinColumn` widening
+    // accessor BEFORE the unsafe create_from_slice + launch. ---
     if num_bin == 0 {
         return Err(ComputeError::Runtime {
             detail: "data_partition: num_bin must be > 0".to_string(),
@@ -268,7 +267,7 @@ pub fn data_partition_native_on<R: cubecl::Runtime>(
     // SAFETY: `h_bins`/`h_route` each allocated for exactly `n` elements and outlive
     // the launch; the kernel bounds-checks `i < n` and writes only indices `0..n`. The
     // narrow upload is `n` elements of the native width (value-faithful — the bin is an
-    // index, byte-identical across widths). All cubecl unsafe is confined here (CMP-01).
+    // index, byte-identical across widths). All cubecl unsafe is confined here.
     macro_rules! launch_native {
         ($w:ty, $slice:expr) => {{
             let h_bins = client.create_from_slice(<$w>::as_bytes($slice));
@@ -300,9 +299,9 @@ pub fn data_partition_native_on<R: cubecl::Runtime>(
 }
 
 // =========================================================================
-// 28-02 (ODF-02/ODF-05/ODF-06, R2): device-resident child ranges — the §9
-// AggregateBlockOffset "write cuda_leaf_data_start/_end/_num_data on device"
-// stage, WITHOUT the split-point readback (grow_driver.rs:1582 = R2).
+// Device-resident child ranges — the §9 AggregateBlockOffset "write
+// cuda_leaf_data_start/_end/_num_data on device" stage, without the
+// split-point readback (grow_driver.rs:1582).
 // =========================================================================
 
 /// A leaf's two child row-ranges, as they live (device-resident) in a
@@ -313,7 +312,7 @@ pub fn data_partition_native_on<R: cubecl::Runtime>(
 /// span). `left_count == left_end - left_start` is the split point; `right_count`
 /// the remainder. Mirrors the reference `cuda_leaf_data_start_` /
 /// `cuda_leaf_data_end_` / `cuda_leaf_num_data_` triple (§9), read back ONLY by the
-/// test golden — the 28-03 loop consumes them on device by handle.
+/// test golden — the driver's grow loop consumes them on device by handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChildRanges {
     /// Left child's first row offset (== the parent's `p_begin`).
@@ -338,8 +337,8 @@ pub const LEAF_SPLIT_STRIDE: usize = 6;
 /// `_end_` / `_num_data_` analog), allocated once and indexed by leaf id. A single
 /// `i32` device buffer of `LEAF_SPLIT_STRIDE * num_leaves` cells;
 /// [`partition_child_ranges_device`] writes leaf `L`'s six fields into
-/// `[6L, 6L+6)` ON DEVICE so the split point never crosses back to the host (R2).
-/// The 28-03 grow loop reads the ranges by handle; only the test golden reads them
+/// `[6L, 6L+6)` ON DEVICE so the split point never crosses back to the host.
+/// The grow loop reads the ranges by handle; only the test golden reads them
 /// back ([`Self::read_leaf`]).
 pub struct DeviceLeafSplits<R: cubecl::Runtime> {
     /// `LEAF_SPLIT_STRIDE * num_leaves` i32 cells; leaf `L` owns `[6L, 6L+6)`.
@@ -377,14 +376,14 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         self.num_leaves
     }
 
-    /// A borrow of the device child-range i32 buffer handle (28-03 reads it on device).
+    /// A borrow of the device child-range i32 buffer handle (read on device by the grow loop).
     #[must_use]
     pub fn ranges_handle(&self) -> &Handle {
         &self.ranges
     }
 
-    /// Read leaf `leaf_id`'s child ranges back to the host (TEST/DEBUG ONLY — the
-    /// 28-03 loop keeps them resident). Panics if `leaf_id >= num_leaves`.
+    /// Read leaf `leaf_id`'s child ranges back to the host (TEST/DEBUG ONLY —
+    /// production code keeps them resident). Panics if `leaf_id >= num_leaves`.
     #[must_use]
     pub fn read_leaf(&self, client: &ComputeClient<R>, leaf_id: usize) -> ChildRanges {
         use cubecl::prelude::CubeElement;
@@ -407,7 +406,7 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
 /// ON DEVICE from the device-resident split point + the parent's `[p_begin,
 /// p_begin+p_count)` span. Single-owner (`ABSOLUTE_POS == 0`), integer-only — the §9
 /// AggregateBlockOffset "write cuda_leaf_data_start/_end/_num_data" stage. No value
-/// crosses back to the host: the split point stays resident (R2 retired).
+/// crosses back to the host: the split point stays resident.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn write_child_ranges_kernel(
@@ -428,11 +427,10 @@ fn write_child_ranges_kernel(
     }
 }
 
-/// 28-02 (R2, ODF-02/ODF-05/ODF-06): partition a leaf's rows via the §9
-/// `mark → prefix-sum → scatter` and write the child left/right start/end/count into
-/// the resident [`DeviceLeafSplits`] slot `leaf_id` ON DEVICE — the split point never
-/// crosses back to the host as a scalar the driver consumes (retires R2, the
-/// `grow_driver.rs:1582` `bump_sync`).
+/// Partition a leaf's rows via the §9 `mark → prefix-sum → scatter` and write the
+/// child left/right start/end/count into the resident [`DeviceLeafSplits`] slot
+/// `leaf_id` ON DEVICE — the split point never crosses back to the host as a scalar
+/// the driver consumes.
 ///
 /// The routing + stable scatter reuse the proven §9 device fold
 /// ([`partition_on_device`], bit-exact across the full missing-type × default-direction
@@ -440,7 +438,7 @@ fn write_child_ranges_kernel(
 /// byte-identical to [`partition_on_device`] / the cpu f64 anchor
 /// ([`partition_on_device`]'s `partition_leaf_stable` reference). The child ranges are
 /// then written into the device struct by [`write_child_ranges_kernel`] (static
-/// single-owner geometry — never a dynamic cube count, spike-059).
+/// single-owner geometry — never a dynamic cube count).
 ///
 /// `p_begin` / `p_count` are the parent leaf's resident-span offset + length; the two
 /// children become the adjacent sub-ranges `[p_begin, p_begin+split_point)` and
@@ -448,13 +446,13 @@ fn write_child_ranges_kernel(
 /// permutation (`reordered`) the caller scatters into the resident buffer; the split
 /// point is NOT returned (it lives, resident, in `leaf_splits[leaf_id]`).
 ///
-/// # No-HIP scope (Plan-02 discipline, matches 26-03 / 28-01)
+/// # Scope
 /// The routing scatter still materializes `reordered` on the host inside
-/// [`partition_on_device`] — the FULLY device-side to-left-total + resident scatter
-/// (so even `reordered` never crosses back) is the real-hardware refinement Plan 05
-/// wires over the once-per-grow resident bin buffer; it cannot be authored/verified on
-/// the local spoofed 8-CU APU. What ships HERE is the R2 seam: the child ranges are
-/// device-resident and the split point is no longer a host scalar the grow loop reads.
+/// [`partition_on_device`] — a fully device-side to-left-total + resident scatter
+/// (so even `reordered` never crosses back) would require real hardware to author and
+/// verify and is not implemented here. What ships here is the resident child-range
+/// seam: the child ranges are device-resident and the split point is no longer a host
+/// scalar the grow loop reads.
 ///
 /// # Errors
 /// [`ComputeError`] from [`partition_on_device`] (bad `num_bin`/threshold, an
@@ -503,11 +501,11 @@ pub fn partition_child_ranges_device<R: cubecl::Runtime>(
     )?;
 
     // §9 AggregateBlockOffset: write the child ranges into the resident device slot —
-    // the split point stays on device (R2). Static single-owner geometry (spike-059:
-    // never a dynamic cube count).
+    // the split point stays on device. Static single-owner geometry (never a dynamic
+    // cube count).
     // SAFETY: `ranges` is sized `LEAF_SPLIT_STRIDE * num_leaves`; `leaf_id <
     // num_leaves` (checked above), so the six writes `[6*leaf_id, 6*leaf_id+6)` stay
-    // in-bounds. Single owner (`ABSOLUTE_POS == 0`). cubecl unsafe confined here (CMP-01).
+    // in-bounds. Single owner (`ABSOLUTE_POS == 0`). cubecl unsafe confined here.
     let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
     unsafe {
         write_child_ranges_kernel::launch::<R>(
@@ -556,9 +554,9 @@ mod tests {
         assert!(matches!(err, ComputeError::BinIndexOutOfRange { .. }));
     }
 
-    // quick-260625-j1l (spike-029): the native-width path must route BYTE-IDENTICALLY
-    // to the u32-widened host reference `data_partition_cpu_native` — value-identical
-    // routing across the u8/u16/u32 monomorphs (`u32::cast_from`).
+    // The native-width path must route BYTE-IDENTICALLY to the u32-widened host
+    // reference `data_partition_cpu_native` — value-identical routing across the
+    // u8/u16/u32 monomorphs (`u32::cast_from`).
 
     #[test]
     fn partition_native_u8_matches_widened() {

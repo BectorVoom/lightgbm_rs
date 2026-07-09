@@ -33,17 +33,13 @@
 pub struct HistogramPool {
     /// C++ `int cache_size_` — number of physical slots (== `num_leaves` here).
     cache_size: usize,
-    /// All slot buffers in ONE flat arena (spike 010): slot `s` occupies
+    /// All slot buffers live in ONE flat arena: slot `s` occupies
     /// `[s*hist_len, (s+1)*hist_len)`, each a stride-2 `[g,h]` f64 histogram for
-    /// one feature column's bins. Replaces the old `Vec<Vec<f64>>` (per-tree this
-    /// is constructed at `learner.rs:816`): the jagged form did `cache_size`
-    /// separate allocations AND clone-memcpy'd a zeroed template `cache_size−1`
-    /// times (`vec![vec![..]; n]`) — measured 8–22% of per-tree time on
-    /// medium/large. One flat `vec![0.0; cache_size*hist_len]` is a single
-    /// allocation with no clones (calloc zero-pages), 15–20× cheaper to build, and
-    /// gives the subtraction trick contiguous parent/child slots. The public
-    /// slot API (`buffer`/`buffer_mut`) is unchanged ⇒ bit-exact, learner
-    /// untouched. See `.planning/spikes/010-histogram-pool-arena/`.
+    /// one feature column's bins. A single flat `vec![0.0; cache_size*hist_len]`
+    /// allocation avoids the per-tree cost of many small allocations plus a
+    /// zeroed-template clone-copy that a jagged `Vec<Vec<f64>>` would require,
+    /// and it keeps the subtraction trick's parent/child slots contiguous. The
+    /// public slot API (`buffer`/`buffer_mut`) is unaffected.
     buffers: Vec<f64>,
     /// C++ `std::vector<int> mapper_` — `mapper_[leaf]` = slot id, or `-1`.
     mapper: Vec<i32>,
@@ -213,7 +209,7 @@ impl HistogramPool {
 
 #[cfg(test)]
 mod spike010 {
-    //! Spike 010 — what is the per-tree CEILING for replacing the pool's
+    //! What is the per-tree CEILING for replacing the pool's
     //! `Vec<Vec<f64>>` buffers? `HistogramPool::new` runs once per tree
     //! (`learner.rs:816`): `num_leaves` slot allocations, each `slot_len` f64,
     //! zeroed then overwritten. This isolates that cost three ways at the bench

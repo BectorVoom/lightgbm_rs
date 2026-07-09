@@ -1,29 +1,24 @@
 //! On-device tree-growth driver seam — the ADDITIVE feature/bin metadata the
-//! per-leaf grow loop consumes, expressed in ONLY lgbm-compute-reachable types
-//! (Option A, D-01, ODL-18/ODL-19).
+//! per-leaf grow loop consumes, expressed in ONLY lgbm-compute-reachable types.
 //!
 //! ## Why this struct lives HERE (not in lgbm-treelearner)
 //! The learner's per-feature spine column carries the same bin layout, but it lives
 //! in `lgbm-treelearner`, which depends on `lgbm-compute`. Naming that learner type
 //! from `lgbm-compute` (so [`crate::Backend::grow_tree_on_device`] could take it)
-//! would form the crate cycle `treelearner → compute → treelearner` this replan
-//! exists to avoid. Instead [`GrowFeature`] is a faithful, lgbm-compute-local MIRROR
-//! of exactly the fields the Phase-16/17/18 kernels read — built from types that are
-//! ALREADY reachable below `lgbm-compute`:
+//! would form the crate cycle `treelearner → compute → treelearner`. Instead
+//! [`GrowFeature`] is a faithful, lgbm-compute-local MIRROR of exactly the fields
+//! the device kernels read — built from types that are ALREADY reachable below
+//! `lgbm-compute`:
 //! - [`BinColumn`] — lgbm-compute-local (defined in `lib.rs`).
 //! - [`BinType`] / [`MissingType`] — `lgbm-dataset` (a dependency of `lgbm-compute`).
 //! - primitive slices (`u32`/`i32`/`f64`).
 //!
 //! The learner builds a `Vec<GrowFeature>` from its `Vec` of spine columns
 //! field-by-field at the on-device fork and passes `&grow_features` across the seam.
-//! The
-//! driver derives the split kernel's [`crate::kernels::best_split::FeatureMeta`]
-//! from `GrowFeature` internally in 20-03b; this plan lands ONLY the metadata
-//! carrier (the driver body still returns `Ok(None)`).
 //!
-//! Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE` (D-09); ungated like
-//! the other Phase-14..19 kernel modules (NOT `#[cfg(feature = "gpu")]`) so the
-//! default cpu f64 anchor exercises the plumbing (D-08).
+//! Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE`; ungated like the other
+//! on-device kernel modules (NOT `#[cfg(feature = "gpu")]`) so the default cpu f64
+//! anchor exercises the plumbing.
 
 use lgbm_dataset::{BinType, LeafPartitionLayout, MissingType};
 
@@ -47,7 +42,7 @@ use lgbm_core::types::K_EPSILON;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-/// Compute-owned ON-DEVICE launch counter (L-1, SC-2). The on-device grow driver bumps
+/// Compute-owned ON-DEVICE launch counter. The on-device grow driver bumps
 /// this once per REAL device dispatch so an on-device train can report an HONEST,
 /// NON-ZERO `device_launches` figure through the `phase_prof` COUNTS line — even though
 /// `phase_prof` lives in `lgbm-treelearner` (ABOVE `lgbm-compute` in the crate DAG) and
@@ -55,30 +50,29 @@ use std::sync::OnceLock;
 /// [`on_device_launch_count_take`] (the learner depends on compute, so it may reference
 /// this symbol).
 ///
-/// **Real-dispatch contract (24-05, supersedes the WR-01 per-leaf-collapse fiction):** on
-/// the RESIDENT fast arm this counts REAL device dispatches — exactly one bump per
-/// launcher actually issued: the per-train `upload_resident_bins`, each
-/// `build_fix_scan_resident` / `build_resident_leaf`, each `subtract_resident`, each
+/// **Real-dispatch contract:** on the RESIDENT fast arm this counts REAL device dispatches
+/// — exactly one bump per launcher actually issued: the per-train `upload_resident_bins`,
+/// each `build_fix_scan_resident` / `build_resident_leaf`, each `subtract_resident`, each
 /// `scan_resident_leaf` / `scan_resident_siblings`, and each on-device
 /// `data_partition_native`. A CO-PACKED sibling scan (`scan_resident_siblings`) scans BOTH
 /// children in ONE launch and therefore counts as exactly ONE dispatch; the HOST partition
 /// route issues NO device dispatch (0 bumps). This makes `device_launches=` an honest
-/// per-dispatch total the 24-06 A/B can trust, and it lets the launch-count test detect the
-/// spike-055 per-FEATURE non-collapse regression — a per-feature layout would scale the
-/// build+scan terms with `num_features` and blow past the analytic real-dispatch bound.
+/// per-dispatch total, and it lets the launch-count test detect a per-FEATURE non-collapse
+/// regression — a per-feature layout would scale the build+scan terms with `num_features`
+/// and blow past the analytic real-dispatch bound.
 ///
 /// The NON-resident ANCHOR arm keeps its coarser per-leaf-phase bumps (`build_leaf_hist` /
-/// subtract / `scan_leaf`, once per leaf regardless of feature count, left AS-IS by 24-05):
-/// it is the parity anchor, not the perf A/B path, and its count stays
-/// `num_features`-independent by the same launch-collapse property the test asserts.
+/// subtract / `scan_leaf`, once per leaf regardless of feature count): it is the parity
+/// anchor, not the perf A/B path, and its count stays `num_features`-independent by the
+/// same launch-collapse property the test asserts.
 pub static ON_DEVICE_LAUNCH_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Read-once `LGBM_PHASE_PROF=="1"` gate (mirrors `phase_prof::enabled()`), so the
 /// launch counter is INERT and zero-overhead in the default merge gate — the bump
 /// never touches tree structure or values, keeping the on-device path parity-neutral
-/// and byte-unchanged (SC-4).
+/// and byte-unchanged.
 ///
-/// IN-01: this is a deliberate verbatim TWIN of `lgbm_treelearner::phase_prof::enabled()`
+/// This is a deliberate verbatim TWIN of `lgbm_treelearner::phase_prof::enabled()`
 /// — the two crates cannot share a helper without a crate cycle (`phase_prof` lives
 /// ABOVE `lgbm-compute` in the DAG). If the env interpretation ever changes here (e.g.
 /// accepting `"true"`), update the canonical twin `phase_prof::enabled()` in lockstep,
@@ -88,7 +82,7 @@ fn launch_prof_enabled() -> bool {
     *E.get_or_init(|| std::env::var("LGBM_PHASE_PROF").map(|v| v == "1").unwrap_or(false))
 }
 
-/// Bump the on-device launch counter by ONE real device dispatch (24-05): on the resident
+/// Bump the on-device launch counter by ONE real device dispatch: on the resident
 /// arm one `upload_resident_bins` / `build_fix_scan_resident` / `build_resident_leaf` /
 /// `subtract_resident` / `scan_resident_leaf` / `scan_resident_siblings` /
 /// `data_partition_native` call actually issued (a co-packed sibling scan is ONE dispatch);
@@ -108,7 +102,7 @@ pub fn on_device_launch_count_take() -> u64 {
     ON_DEVICE_LAUNCH_CNT.swap(0, Ordering::Relaxed)
 }
 
-/// 26-01 (ODP3-07) — the BLOCKING-READBACK sync counter, DISTINCT from
+/// The BLOCKING-READBACK sync counter, DISTINCT from
 /// [`ON_DEVICE_LAUNCH_CNT`]. Where the launch counter counts every real device DISPATCH
 /// (upload / build / subtract / scan / partition), this counts ONLY the real blocking
 /// device→host READBACKS (syncs) — the point where the host waits for a device result:
@@ -116,13 +110,12 @@ pub fn on_device_launch_count_take() -> u64 {
 /// `tree.split_on_device` `right_leaf_index` readback. Builds / subtracts / uploads issue
 /// NO readback (they stay resident) and do NOT bump this.
 ///
-/// This is the class the Phase-26 M1–M3 control-plane collapse targets: Plans 02/03 push
-/// the argmax + row-permutation on device to REMOVE these host syncs, and this counter is
-/// what proves the drop (Plan 05 asserts the aggregate). It counts REAL syncs — a co-packed
-/// sibling scan reads BOTH children back in ONE readback and bumps EXACTLY ONCE — so it can
-/// never fall into the Phase-24 per-leaf counter trap. Drained by
-/// [`on_device_sync_count_take`] (folded into the `phase_prof` COUNTS line without a crate
-/// cycle). Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral, SC-4-safe).
+/// Moving the argmax and row-permutation work onto the device removes these host syncs,
+/// and this counter is what proves the drop. It counts REAL syncs — a co-packed sibling
+/// scan reads BOTH children back in ONE readback and bumps EXACTLY ONCE — so it can never
+/// fall into a per-leaf counter trap. Drained by [`on_device_sync_count_take`] (folded
+/// into the `phase_prof` COUNTS line without a crate cycle). Inert unless
+/// `LGBM_PHASE_PROF=="1"` (parity-neutral).
 pub static ON_DEVICE_SYNC_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Bump the blocking-readback sync counter by ONE real device→host sync (see
@@ -144,32 +137,30 @@ pub fn on_device_sync_count_take() -> u64 {
     ON_DEVICE_SYNC_CNT.swap(0, Ordering::Relaxed)
 }
 
-/// spike-056 fix (25-01, ODP2-05) — ROOT + directly-built-child PARALLEL-u64 build
-/// tripwire. Bumped ONCE at each of the two build sites this plan CONVERTED off the f64
-/// single-owner fused build (`build_fix_scan_resident_f64_on`, spike-052's 5.4×-worse
-/// kernel) onto the parallel u64 fixed-point resident build (`build_resident_leaf` →
-/// `build_fix_compact_resident_f64_on` → `resident_raw_build_into(fixed_point=true)` →
-/// `construct_leaf_hist_resident_lds_kernel_u64`): the ROOT ([`grow_tree_on_device_resident`]'s
-/// slot-0 build) and each directly-built (co-pack-OFF) smaller child.
+/// ROOT + directly-built-child PARALLEL-u64 build tripwire. Bumped ONCE at each of the
+/// two build sites that use the parallel u64 fixed-point resident build
+/// (`build_resident_leaf` → `build_fix_compact_resident_f64_on` →
+/// `resident_raw_build_into(fixed_point=true)` → `construct_leaf_hist_resident_lds_kernel_u64`)
+/// instead of the slower f64 single-owner fused build (`build_fix_scan_resident_f64_on`):
+/// the ROOT ([`grow_tree_on_device_resident`]'s slot-0 build) and each directly-built
+/// (co-pack-OFF) smaller child.
 ///
-/// SCOPE (PROVABILITY, ODP2-05): this counter is DISTINCT from the subtract-path smaller
-/// child (the co-pack-ON `build_resident_leaf` at the sibling co-pack site) which was
-/// ALREADY parallel-u64 BEFORE this fix. A nonzero "any u64 resident build" figure would be
-/// necessary-but-not-sufficient to prove the CONVERTED sites ran u64; scoping the bump to the
-/// root + directly-built arm makes NONZERO here sufficient proof that the Phase-24 f64
-/// single-owner sites were actually swapped. Read/reset by the launch-count test AND folded
-/// into the `phase_prof` COUNTS line. Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral).
+/// This counter is DISTINCT from the subtract-path smaller child (the co-pack-ON
+/// `build_resident_leaf` at the sibling co-pack site), which was already parallel-u64.
+/// Scoping the bump to the root + directly-built arm makes a NONZERO count here sufficient
+/// proof that those two sites are actually running the parallel-u64 build rather than the
+/// f64 single-owner kernel. Read/reset by the launch-count test AND folded into the
+/// `phase_prof` COUNTS line. Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral).
 pub static ON_DEVICE_ROOTBUILD_U64_CNT: AtomicU64 = AtomicU64::new(0);
 
-/// spike-056 NEGATIVE guard (25-01, ODP2-05) — bumped iff the on-device driver dispatches
-/// the f64 single-owner fused build (`Backend::build_fix_scan_resident` →
-/// `build_fix_scan_resident_f64_on`), which is now reachable ONLY via the
-/// `LGBM_ONDEVICE_F64_FUSED=1` A/B escape hatch ([`on_device_f64_fused_build`]). It MUST
-/// stay 0 on the DEFAULT (swapped) path; the launch-count test asserts `== 0` so the
-/// spike-052 slow kernel can never SILENTLY return to the default on-device build — the
-/// exact failure mode (manual code-tracing) that let Phase-24's wrong kernel survive. Only
-/// the DRIVER bumps this, so it can never be polluted by the host-learner fused path that
-/// legitimately keeps using `build_fix_scan_resident`. Inert unless `LGBM_PHASE_PROF=="1"`.
+/// NEGATIVE guard — bumped iff the on-device driver dispatches the f64 single-owner fused
+/// build (`Backend::build_fix_scan_resident` → `build_fix_scan_resident_f64_on`), which is
+/// reachable ONLY via the `LGBM_ONDEVICE_F64_FUSED=1` A/B escape hatch
+/// ([`on_device_f64_fused_build`]). It MUST stay 0 on the DEFAULT (parallel-u64) path; the
+/// launch-count test asserts `== 0` so the slower f64 kernel can never silently become the
+/// default on-device build again. Only the DRIVER bumps this, so it can never be polluted
+/// by the host-learner fused path that legitimately keeps using `build_fix_scan_resident`.
+/// Inert unless `LGBM_PHASE_PROF=="1"`.
 pub static ON_DEVICE_F64_FUSED_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Bump the converted-site parallel-u64 build tripwire (see [`ON_DEVICE_ROOTBUILD_U64_CNT`]).
@@ -201,25 +192,25 @@ pub fn on_device_f64_fused_count_take() -> u64 {
     ON_DEVICE_F64_FUSED_CNT.swap(0, Ordering::Relaxed)
 }
 
-// ---- SPIKE-077: the on-device growth-loop PHASE LEDGER (env-gated, parity-neutral). ----
+// ---- The on-device growth-loop PHASE LEDGER (env-gated, parity-neutral). ----
 //
-// Post-spike-076 the on-device-vs-host-cuda residual is ~95% UNATTRIBUTED inside
+// The on-device-vs-host-cuda residual is largely UNATTRIBUTED inside
 // [`grow_tree_on_device_resident`] — `phase_prof`'s growth-phase guards all read 0 on this
 // path (`in_learner_other=100%` BY DESIGN), so the loop is a black box. These counters give
 // the loop its own wall-clock ledger: every ns of the grow wall lands in exactly ONE bucket,
 // and `phase_prof::dump` prints the breakdown + the `host_other` complement (wall − Σ).
 //
-// TIMING SEMANTICS (the spike-015 "scan=96%" aliasing trap): build / subtract / tree-split /
-// frontier-reduce are ASYNC submissions — in free-run mode their bucket holds host SUBMISSION
-// time only, and their device time drains inside the next BLOCKING bucket (scan / pick /
-// device-route partition). The free-run ledger is therefore a TRUE wall decomposition but not
-// a device-time attribution. `LGBM_GROW_DRAIN=1` (diagnostic, with LGBM_PHASE_PROF=1) blocks
-// the queue empty inside each async phase's own timer (`grow_drain`, the LGBM_SCAN_DRAIN
-// precedent) so device time lands in its own bucket — at the cost of changing the schedule
-// (drain numbers rank phases; free-run numbers price the wall).
+// TIMING SEMANTICS: build / subtract / tree-split / frontier-reduce are ASYNC submissions —
+// in free-run mode their bucket holds host SUBMISSION time only, and their device time
+// drains inside the next BLOCKING bucket (scan / pick / device-route partition). The
+// free-run ledger is therefore a TRUE wall decomposition but not a device-time attribution.
+// `LGBM_GROW_DRAIN=1` (diagnostic, with LGBM_PHASE_PROF=1) blocks the queue empty inside
+// each async phase's own timer (`grow_drain`) so device time lands in its own bucket — at
+// the cost of changing the schedule (drain numbers rank phases; free-run numbers price the
+// wall).
 //
-// Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral, SC-4-safe — same contract as every
-// counter above).
+// Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral — same contract as every counter
+// above).
 pub static GROW_WALL_NS: AtomicU64 = AtomicU64::new(0);
 pub static GROW_SETUP_NS: AtomicU64 = AtomicU64::new(0);
 pub static GROW_UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -233,7 +224,7 @@ pub static GROW_TREESPLIT_NS: AtomicU64 = AtomicU64::new(0);
 pub static GROW_REDUCE_NS: AtomicU64 = AtomicU64::new(0);
 pub static GROW_TAIL_NS: AtomicU64 = AtomicU64::new(0);
 
-/// SPIKE-077: one drained snapshot of the growth-loop phase ledger (all fields ns).
+/// One drained snapshot of the growth-loop phase ledger (all fields ns).
 /// `host_other` is NOT stored — the consumer computes `wall − Σ(components)` at dump time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GrowPhaseNs {
@@ -251,7 +242,7 @@ pub struct GrowPhaseNs {
     pub tail: u64,
 }
 
-/// SPIKE-077: swap the whole growth-loop phase ledger to zero and return the prior values.
+/// Swap the whole growth-loop phase ledger to zero and return the prior values.
 /// Called by `phase_prof::dump` (no crate cycle — the learner depends on compute).
 pub fn on_device_grow_phase_take() -> GrowPhaseNs {
     GrowPhaseNs {
@@ -270,8 +261,7 @@ pub fn on_device_grow_phase_take() -> GrowPhaseNs {
     }
 }
 
-/// SPIKE-077: time `f` into `c` (ns). Zero-overhead passthrough when the gate is off
-/// (the spike-071 `time_block` idiom, generalized to a named bucket).
+/// Time `f` into `c` (ns). Zero-overhead passthrough when the gate is off.
 #[inline]
 fn time_phase<T>(c: &'static AtomicU64, f: impl FnOnce() -> T) -> T {
     if launch_prof_enabled() {
@@ -284,7 +274,7 @@ fn time_phase<T>(c: &'static AtomicU64, f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// SPIKE-077: RAII phase timer for spans with `?` early-exits (accumulates on drop, so a
+/// RAII phase timer for spans with `?` early-exits (accumulates on drop, so a
 /// propagated error still books the partial span). Inert when the gate is off.
 struct PhaseGuard {
     c: &'static AtomicU64,
@@ -304,17 +294,17 @@ impl Drop for PhaseGuard {
     }
 }
 
-/// SPIKE-077: read-once `LGBM_GROW_DRAIN=="1"` — the de-alias diagnostic mode (see the
+/// Read-once `LGBM_GROW_DRAIN=="1"` — the de-alias diagnostic mode (see the
 /// ledger header comment). Meaningful only together with `LGBM_PHASE_PROF=1`.
 fn grow_drain_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("LGBM_GROW_DRAIN").map(|v| v == "1").unwrap_or(false))
 }
 
-/// SPIKE-077: in drain mode, block until the device queue is EMPTY so the just-submitted
-/// async work's device time is booked into the CURRENT phase timer instead of aliasing into
-/// the next blocking readback (the spike-015 artifact). No-op unless BOTH gates are on —
-/// never active in the default build/tests (parity-neutral; it only waits, never mutates).
+/// In drain mode, block until the device queue is EMPTY so the just-submitted async work's
+/// device time is booked into the CURRENT phase timer instead of aliasing into the next
+/// blocking readback. No-op unless BOTH gates are on — never active in the default
+/// build/tests (parity-neutral; it only waits, never mutates).
 #[inline]
 fn grow_drain<R: cubecl::Runtime>(client: &cubecl::prelude::ComputeClient<R>) {
     if launch_prof_enabled() && grow_drain_enabled() {
@@ -322,17 +312,17 @@ fn grow_drain<R: cubecl::Runtime>(client: &cubecl::prelude::ComputeClient<R>) {
     }
 }
 
-/// SPIKE-079: read-once `LGBM_ONDEVICE_BIN_HOIST != "0"` — default ON (the spike-035
-/// `prefers_host_partition` gate pattern), `=0` restores the per-grow re-upload for A/B.
+/// Read-once `LGBM_ONDEVICE_BIN_HOIST != "0"` — default ON; `=0` restores the per-grow
+/// re-upload for A/B comparison.
 ///
 /// The hoist skips the driver's per-grow `upload_resident_bins` ONLY when the backend
 /// reports a PINNED, geometry-matching resident-bin cache
 /// ([`crate::Backend::resident_bins_pinned`]) — the pin is set exclusively by the
-/// learner's once-per-train guarded upload (`resident_bins_uploaded`, quick-260621-p9v)
-/// and dissolved by any fresh upload, so un-pinned direct-driver callers are
-/// byte-unchanged. Spike-078 measured the per-grow re-upload at 67–78% of the WHOLE
-/// remaining on-device-vs-host-cuda gap on real CUDA (the immutable bins re-crossed
-/// PCIe every tree; the host arm uploads once for ~36–72ms/train).
+/// learner's once-per-train guarded upload (`resident_bins_uploaded`) and dissolved by
+/// any fresh upload, so un-pinned direct-driver callers are byte-unchanged. Re-uploading
+/// the immutable bin columns every grow re-crosses PCIe on every tree, so skipping the
+/// re-upload once it is already resident and pinned removes a substantial, otherwise
+/// avoidable, on-device cost.
 fn ondevice_bin_hoist_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
@@ -340,16 +330,16 @@ fn ondevice_bin_hoist_enabled() -> bool {
     })
 }
 
-/// OHP-01: read-once `LGBM_ONDEVICE_FUSED_PARTITION != "0"` — default ON (mirroring
+/// Read-once `LGBM_ONDEVICE_FUSED_PARTITION != "0"` — default ON (mirroring
 /// [`ondevice_bin_hoist_enabled`]). When ON, the host arm of [`partition_resident_range`]
 /// routes through [`partition_leaf_stable_fused`] (one fused pass, no `bins_sub` alloc);
-/// `=0` restores the pre-change `bins_sub` gather + [`partition_leaf_stable`] path so the
-/// Kaggle A/B can measure the partition variant as a box-noise-free delta. Byte-equal
-/// either way (both fold through the same `RouteFlags`/`route_left_host` machinery).
+/// `=0` restores the pre-change `bins_sub` gather + [`partition_leaf_stable`] path for A/B
+/// comparison of the partition variant. Byte-equal either way (both fold through the same
+/// `RouteFlags`/`route_left_host` machinery).
 fn ondevice_fused_partition_enabled() -> bool {
-    // OHP-04 (Phase 30): same-session A/B override. The env gate below is read-once
-    // (`OnceLock`), so it CANNOT be toggled between arms in one process — arm 2/4 of the
-    // local same-session ledger (`phase30_ab`) would silently keep arm 1's frozen value.
+    // Same-session A/B override. The env gate below is read-once (`OnceLock`), so it
+    // CANNOT be toggled between arms in one process — a same-session A/B harness that
+    // flips arms within one process would silently keep the first arm's frozen value.
     // This atomic lets the harness flip the partition variant per arm WITHOUT a `getenv`
     // on the per-split hot path (a `Relaxed` load is timing-neutral for the `partition`
     // bucket it measures). 0 = defer to the env; 1 = force ON; 2 = force OFF. Default 0 ⇒
@@ -365,17 +355,17 @@ fn ondevice_fused_partition_enabled() -> bool {
     })
 }
 
-/// OHP-04 (Phase 30) same-session A/B override for [`ondevice_fused_partition_enabled`].
+/// Same-session A/B override for [`ondevice_fused_partition_enabled`].
 /// 0 = unset (defer to `LGBM_ONDEVICE_FUSED_PARTITION`), 1 = force ON, 2 = force OFF.
 static FUSED_PARTITION_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
-/// OHP-04 (Phase 30) harness/test hook: force the fused-partition host arm ON
-/// (`Some(true)`), OFF (`Some(false)`), or defer to the `LGBM_ONDEVICE_FUSED_PARTITION`
-/// env gate (`None`). Exists solely so the local same-session ledger A/B (`phase30_ab`)
-/// can toggle the partition variant between arms in ONE process — the env gate is
-/// read-once (`OnceLock`) and cannot be re-read mid-process. Timing-neutral (an
-/// `AtomicU8` `Relaxed` store; the per-split read is a `Relaxed` load, not a `getenv`).
-/// The default (never called) leaves production on the pure env path.
+/// Harness/test hook: force the fused-partition host arm ON (`Some(true)`), OFF
+/// (`Some(false)`), or defer to the `LGBM_ONDEVICE_FUSED_PARTITION` env gate (`None`).
+/// Exists solely so a same-session A/B harness can toggle the partition variant between
+/// arms in ONE process — the env gate is read-once (`OnceLock`) and cannot be re-read
+/// mid-process. Timing-neutral (an `AtomicU8` `Relaxed` store; the per-split read is a
+/// `Relaxed` load, not a `getenv`). The default (never called) leaves production on the
+/// pure env path.
 pub fn set_fused_partition_override(v: Option<bool>) {
     let code = match v {
         None => 0,
@@ -385,15 +375,15 @@ pub fn set_fused_partition_override(v: Option<bool>) {
     FUSED_PARTITION_OVERRIDE.store(code, Ordering::Relaxed);
 }
 
-/// spike-056 A/B escape hatch (25-01, ODP2-01) — read-once `LGBM_ONDEVICE_F64_FUSED=="1"`.
+/// A/B escape hatch — read-once `LGBM_ONDEVICE_F64_FUSED=="1"`.
 ///
 /// DEFAULT (unset/`!= "1"`): the on-device ROOT + directly-built resident histogram BUILD
-/// runs on the PARALLEL u64 fixed-point kernel — the spike-056 fix that kills the f64
-/// single-owner `CubeDim::new_1d(1)` row-fold spike-052 measured at 5.4× worse on real
-/// consumer NVIDIA. `LGBM_ONDEVICE_F64_FUSED=1` restores the OLD f64 single-owner fused
-/// build+scan at those two sites so the 25-02/25-04 real-CUDA A/B can quantify the u64-vs-f64
-/// win side-by-side (spike-056 "the first Phase-25 execution step"). It is NEVER the default —
-/// the plan's hard constraint is "do NOT default the on-device path to the f64 fused kernel."
+/// runs on the PARALLEL u64 fixed-point kernel, which replaced the f64 single-owner
+/// `CubeDim::new_1d(1)` row-fold kernel measured to be substantially slower on real
+/// consumer NVIDIA hardware. `LGBM_ONDEVICE_F64_FUSED=1` restores the OLD f64 single-owner
+/// fused build+scan at those two sites so a real-CUDA A/B can quantify the u64-vs-f64
+/// difference side-by-side. It is NEVER the default — the hard constraint is "do NOT
+/// default the on-device path to the f64 fused kernel."
 fn on_device_f64_fused_build() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
@@ -402,18 +392,16 @@ fn on_device_f64_fused_build() -> bool {
 }
 
 /// One feature column's ADDITIVE grow-loop input — the faithful lgbm-compute-local
-/// mirror of the fields the learner's spine feature column exposes to the
-/// Phase-16/17/18 device kernels, using ONLY lgbm-compute-reachable types so the
-/// seam never names a treelearner type (no crate cycle, D-01/Option A).
+/// mirror of the fields the learner's spine feature column exposes to the device
+/// kernels, using ONLY lgbm-compute-reachable types so the seam never names a
+/// treelearner type (no crate cycle).
 ///
-/// Field-for-field parity with the learner's spine column. Phase 22 adds the
-/// categorical metadata (`bin_to_category` + the five categorical config scalars)
-/// the §6.3 bitset construction and §8.1 evaluator consume for the categorical
-/// grow branch (wired in 22-04); this milestone lands them as inert carriers so
-/// the transcription (22-03) and wiring (22-04) build on a settled struct. Every
-/// field is a plain value / `lgbm-dataset` enum / narrow [`BinColumn`] / native
-/// primitive (`Vec<i32>`/`f64`/`i32`) — nothing here reaches up into
-/// `lgbm-treelearner` (no crate cycle, D-01/Option A, RESEARCH A3).
+/// Field-for-field parity with the learner's spine column, including the categorical
+/// metadata (`bin_to_category` + the five categorical config scalars) the §6.3 bitset
+/// construction and §8.1 evaluator consume for the categorical grow branch. Every field
+/// is a plain value / `lgbm-dataset` enum / narrow [`BinColumn`] / native primitive
+/// (`Vec<i32>`/`f64`/`i32`) — nothing here reaches up into `lgbm-treelearner` (no crate
+/// cycle).
 #[derive(Debug, Clone)]
 pub struct GrowFeature {
     /// Per-GLOBAL-ROW bin index, length `num_data`, in the narrowest unsigned type
@@ -444,13 +432,13 @@ pub struct GrowFeature {
     pub bin_type: BinType,
     /// C++ `BinMapper::bin_2_categorical_` — bin index → ORIGINAL category value
     /// (`BinToValue(bin)`, bin.h:138-143). Populated ONLY for categorical features;
-    /// the categorical grow branch (22-04) converts each winning REAL BIN to its
+    /// the categorical grow branch converts each winning REAL BIN to its
     /// category value to build the model-text (`cat_threshold`) bitset via
     /// SetRealThreshold. Empty (`Vec::new()`) for numeric features — inert on the
-    /// numeric grow path. Native `Vec<i32>` (no crate cycle, A3).
+    /// numeric grow path. Native `Vec<i32>` (no crate cycle).
     pub bin_to_category: Vec<i32>,
     /// `double cat_smooth` (config default 10.0) — categorical CTR smoothing +
-    /// the many-vs-many filter. Inert on the numeric path (§8.1, 22-03/22-04).
+    /// the many-vs-many filter. Inert on the numeric path (§8.1).
     pub cat_smooth: f64,
     /// `double cat_l2` (config default 10.0) — extra l2 ADDED to lambda_l2 in the
     /// per-category gain (NOT the `gain_shift` baseline). Inert on the numeric path.
@@ -468,32 +456,30 @@ pub struct GrowFeature {
 }
 
 // =========================================================================
-// data->leaf map buffer-strategy A/B harness (Pitfall 3, ODL-19).
+// data->leaf map buffer-strategy A/B harness.
 //
 // The per-split `UpdateDataIndexToLeafIndex` rewrite reads the row->leaf map for
-// the split leaf's rows and writes the two child leaf ids. When the 20-03b driver
-// grows num_leaves>2 it applies this rewrite REPEATEDLY over one running map. The
-// open aliasing question (RESEARCH Pitfall 3 / phase18-wr01 HistArena::swap): does
-// the driver read+write ONE map buffer in place (ALIAS), or read a source buffer
-// and write a distinct destination then swap (DOUBLE-BUFFER)? A wrong alias choice
-// silently corrupts the partition at num_leaves>2. This helper exposes BOTH so the
-// oracle A/B can anchor each to the cpu f64 partition and LOCK the safe strategy
-// (double-buffer unless alias is proven bit-identical) BEFORE 20-03b writes the
-// driver body. Each step drives the REAL Phase-18 device kernel
-// (`update_data_index_to_leaf_on`); the strategies differ ONLY in how the running
-// map buffer is carried across steps.
+// the split leaf's rows and writes the two child leaf ids. When the driver grows
+// num_leaves>2 it applies this rewrite REPEATEDLY over one running map. The open
+// aliasing question: does the driver read+write ONE map buffer in place (ALIAS), or
+// read a source buffer and write a distinct destination then swap (DOUBLE-BUFFER)? A
+// wrong alias choice silently corrupts the partition at num_leaves>2. This helper
+// exposes BOTH so an A/B harness can anchor each to the cpu f64 partition and lock in
+// the safe strategy (double-buffer unless alias is proven bit-identical). Each step
+// drives the REAL device kernel (`update_data_index_to_leaf_on`); the strategies
+// differ ONLY in how the running map buffer is carried across steps.
 //
-// WR-04 (Phase-21 review): this is a DECISION-RECORD A/B harness, NOT live driver
-// plumbing. The shipped driver (`grow_tree_on_device_driver_with_cfg`) carries NO
-// running leaf-map buffer and calls NEITHER strategy — it partitions each leaf into
-// a fresh `Vec<u32>` via `partition_leaf_stable`. `build_leaf_map_on` /
-// `LeafMapBufferStrategy` / `LeafMapStep` remain `pub` ONLY because the A/B oracle
-// lives in a separate crate (`oracle-harness`) and must reach them; they are not
-// consumed by any production path. Read the "LOCK" language above as "recorded the
-// A/B conclusion", not "the driver applies this strategy".
+// This is a DECISION-RECORD A/B harness, NOT live driver plumbing. The shipped
+// driver (`grow_tree_on_device_driver_with_cfg`) carries NO running leaf-map buffer
+// and calls NEITHER strategy — it partitions each leaf into a fresh `Vec<u32>` via
+// `partition_leaf_stable`. `build_leaf_map_on` / `LeafMapBufferStrategy` /
+// `LeafMapStep` remain `pub` ONLY because the A/B oracle lives in a separate crate
+// (`oracle-harness`) and must reach them; they are not consumed by any production
+// path. Read the "LOCK" language above as "recorded the A/B conclusion", not "the
+// driver applies this strategy".
 // =========================================================================
 
-/// The data->leaf map buffer strategy for the per-split rewrite (Pitfall 3).
+/// The data->leaf map buffer strategy for the per-split rewrite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeafMapBufferStrategy {
     /// (A) In-place alias — one running map buffer read AND written each step.
@@ -520,8 +506,8 @@ pub struct LeafMapStep<'a> {
 }
 
 /// Apply `steps` in order to build the final `num_data`-length row->leaf map,
-/// starting from `init_leaf` for every row, using the chosen buffer `strategy`
-/// (Pitfall 3). Each step drives the real Phase-18
+/// starting from `init_leaf` for every row, using the chosen buffer `strategy`.
+/// Each step drives the real
 /// [`update_data_index_to_leaf_on`] device kernel (which writes the two child leaf
 /// ids for the leaf's rows into a fresh `-1` map); the running map is then carried
 /// forward either in place ([`LeafMapBufferStrategy::Alias`]) or via a swapped
@@ -541,7 +527,7 @@ pub fn build_leaf_map_on<R: cubecl::Runtime>(
 ) -> Result<Vec<i32>, ComputeError> {
     let mut running = vec![init_leaf; num_data];
     for step in steps {
-        // Real Phase-18 device kernel: a fresh -1 map with ONLY this leaf's rows set
+        // Real device kernel: a fresh -1 map with ONLY this leaf's rows set
         // to their child leaf id (rest stay -1). This is the read-side result the
         // buffer strategy then folds into the running map.
         let per_split = update_data_index_to_leaf_on(
@@ -578,26 +564,25 @@ pub fn build_leaf_map_on<R: cubecl::Runtime>(
 }
 
 // =========================================================================
-// 20-03b: the per-leaf best-first on-device grow DRIVER (D-01, ODL-18/ODL-19).
+// The per-leaf best-first on-device grow DRIVER.
 //
-// This is the load-bearing STRUCTURE-bit-exact gate D-01 pulled forward from
-// Phase 21: it grows an ENTIRE continuous-feature + L2 tree by SEQUENCING the
-// already-golden Phase-16 (histogram build + subtract), Phase-4/17 (best-split
-// finder), and Phase-18 (`DeviceCudaTree` mutation) kernels into the C++
-// `SerialTreeLearner` §6/§16 best-first order — WITHOUT reusing lgbm-treelearner's
-// `LeafSplits` / `HistogramPool` / `DataPartition` (those cannot be named from
-// lgbm-compute: the crate wall this replan exists to keep). It reproduces the host
-// order with its OWN lightweight [`DriverLeaf`] bookkeeping.
+// This is the load-bearing STRUCTURE-bit-exact gate: it grows an ENTIRE
+// continuous-feature + L2 tree by SEQUENCING the already-golden histogram
+// build + subtract, best-split finder, and `DeviceCudaTree` mutation kernels into
+// the C++ `SerialTreeLearner` §6/§16 best-first order — WITHOUT reusing
+// lgbm-treelearner's `LeafSplits` / `HistogramPool` / `DataPartition` (those cannot
+// be named from lgbm-compute: the crate wall this module exists to keep). It
+// reproduces the host order with its OWN lightweight [`DriverLeaf`] bookkeeping.
 //
-// ## Faithfulness scope (proving slice — Pitfall 4)
+// ## Faithfulness scope (proving slice)
 // Continuous features + L2 only: NO categorical, NO L1/smoothing/max_delta_step,
 // NO RenewTreeOutput refit, NO col-sampler / monotone / interaction / extra-trees /
 // CEGB / forced-splits. The proving corpus is `MissingType::None` (single reverse
 // scan). The L1/quantile/categorical follow-up reuses this exact ordering contract
 // but adds the missing-value forward preamble + the categorical split kernel.
 //
-// ## ODL-19 (no f64 per-row grow/build hot loop)
-// The only per-ROW device work is the Phase-16 histogram BUILD
+// ## No f64 per-row grow/build hot loop
+// The only per-ROW device work is the histogram BUILD
 // ([`construct_histograms_f64_on`]) and the row PARTITION
 // ([`partition_leaf_stable`]) — both operate on integer bins / f32 grad-hess and
 // keep the u64/f32 build contract inside the kernel. The f64 that appears here is
@@ -606,7 +591,7 @@ pub fn build_leaf_map_on<R: cubecl::Runtime>(
 // gain/leaf-value math — NONE of it is a per-row loop.
 // =========================================================================
 
-/// The fixed L2 proving-slice gain config — **TEST / PROVING-SLICE ONLY** (OCX-02, 29-02).
+/// The fixed L2 proving-slice gain config — **TEST / PROVING-SLICE ONLY**.
 ///
 /// Continuous + L2 with a PERMISSIVE `min_data_in_leaf = 1` / `min_sum_hessian_in_leaf = 0.0`
 /// (admissibility effectively OFF). This is the config the parameterless
@@ -617,9 +602,9 @@ pub fn build_leaf_map_on<R: cubecl::Runtime>(
 /// # No production caller
 /// The PRODUCTION on-device path (`SerialTreeLearner` → [`crate::Backend::grow_tree_on_device_with_cfg`]
 /// → [`grow_tree_on_device_driver_with_cfg`]) binds the learner's REAL `GainConfig` instead —
-/// NEVER this permissive config. Pinning it in production disabled C++ admissibility and let a
-/// near-empty prefix win with an `inf`-magnitude gain (spike-072 item-15). Do NOT re-adopt this
-/// on any production grow path; it exists solely to keep the anchor fixtures' two arms identical.
+/// NEVER this permissive config. Pinning it in production disables C++ admissibility and can let a
+/// near-empty prefix win with an `inf`-magnitude gain. Do NOT re-adopt this on any production
+/// grow path; it exists solely to keep the anchor fixtures' two arms identical.
 #[must_use]
 pub fn proving_slice_config() -> GainConfig {
     GainConfig {
@@ -655,18 +640,18 @@ struct DriverLeaf {
     best_fpos: i32,
     /// When the winning split is CATEGORICAL, the winning category bins
     /// (`output->cat_threshold`, each `+ offset`) the driver body stages into the
-    /// pre-allocated `DeviceSplitInfo` cat slab (W-3/SC #1). Empty for a numeric win.
+    /// pre-allocated `DeviceSplitInfo` cat slab. Empty for a numeric win.
     best_cat: Vec<u32>,
     /// The leaf's depth (root = 0), for the `max_depth` gate.
     depth: i32,
 }
 
-/// The SINGLE `+2*kEpsilon` categorical `sum_hessian` bump (W-4), mirroring the host
+/// The SINGLE `+2*kEpsilon` categorical `sum_hessian` bump, mirroring the host
 /// call site `learner.rs:2760`. The `best_split.rs` dispatch seam PASSES THROUGH the
-/// bumped value and the §8.1 evaluator does NOT bump internally (22-03 caller
-/// contract, Pitfall 2), so the bump happens EXACTLY ONCE — here in the driver.
-/// A double-bump or missed-bump is a last-ULP silent divergence (DEF-07-11-01 class),
-/// so this is pinned bit-exact by `categorical_driver_bumps_sum_hessian_once`.
+/// bumped value and the §8.1 evaluator does NOT bump internally, so the bump happens
+/// EXACTLY ONCE — here in the driver. A double-bump or missed-bump is a last-ULP
+/// silent divergence, so this is pinned bit-exact by
+/// `categorical_driver_bumps_sum_hessian_once`.
 #[inline]
 fn bump_sum_hessian_cat(sum_h: f64) -> f64 {
     sum_h + 2.0 * f64::from(K_EPSILON)
@@ -751,7 +736,7 @@ fn compact_histogram(hist: &mut [f64], offset: i32) {
 
 /// Build one leaf's per-feature CONCATENATED fixed+compacted histogram by
 /// DIRECTLY constructing each feature's raw histogram over the leaf's rows
-/// (Phase-16 [`construct_histograms_f64_on`]), then FixHistogram + compacting each
+/// ([`construct_histograms_f64_on`]), then FixHistogram + compacting each
 /// feature region in place. `slot_off[fpos]` is the feature's start cell.
 fn build_leaf_hist<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -771,12 +756,12 @@ fn build_leaf_hist<R: cubecl::Runtime>(
     // Gather the leaf's ordered grad/hess ONCE (shared across features).
     let g: Vec<f32> = rows.iter().map(|&r| gradients[r as usize]).collect();
     let h: Vec<f32> = rows.iter().map(|&r| hessians[r as usize]).collect();
-    // L-1/WR-01: one leaf-level build launch (bumped ONCE per leaf, NOT per feature,
+    // One leaf-level build launch (bumped ONCE per leaf, NOT per feature,
     // to match the host per-leaf `BUILD_RESIDENT_CNT` unit `phase_prof::dump` sums with).
     bump_launch();
     for (fpos, f) in features.iter().enumerate() {
         let binned: Vec<u32> = rows.iter().map(|&r| f.bins.bin(r as usize)).collect();
-        // Phase-16 device build: RAW f64 histogram (2*num_bin cells).
+        // Device build: RAW f64 histogram (2*num_bin cells).
         let mut region = construct_histograms_f64_on(client, &binned, &g, &h, f.num_bin)?;
         // FixHistogram (RAW leaf sums) then compact — O(num_bin) f64, bit-exact to
         // the host reference fold (mfb==0 ⇒ fix is a no-op; offset==1 ⇒ drop bin 0).
@@ -789,17 +774,17 @@ fn build_leaf_hist<R: cubecl::Runtime>(
 }
 
 /// Scan one leaf's concatenated compacted histogram: per-feature best-split eval +
-/// the cross-feature `split_gt` argmax. NUMERIC features route into the Phase-4/17
+/// the cross-feature `split_gt` argmax. NUMERIC features route into the
 /// [`find_best_split_f64_on`] finder; CATEGORICAL features route into the §8.1
-/// [`find_best_threshold_categorical`] evaluator (Phase-22). Returns the winning
+/// [`find_best_threshold_categorical`] evaluator. Returns the winning
 /// `(SplitInfo, feature-position, cat_bins)` — `cat_bins` are the winning category
 /// bins when the winner is categorical (empty otherwise); `(-inf, -1, [])` when
 /// nothing is admissible.
 ///
-/// **kEpsilon single-bump site (W-4):** for a categorical feature the driver applies
+/// **kEpsilon single-bump site:** for a categorical feature the driver applies
 /// the ONE `+2*kEpsilon` `sum_h` bump HERE (via [`bump_sum_hessian_cat`]) before the
 /// evaluator sees it, mirroring host `learner.rs:2760`. The numeric finder bumps
-/// internally, so numeric passes RAW `sum_h` (unchanged, SC #4).
+/// internally, so numeric passes RAW `sum_h` (unchanged).
 fn scan_leaf<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     features: &[GrowFeature],
@@ -818,10 +803,10 @@ fn scan_leaf<R: cubecl::Runtime>(
     if !(sum_h > 0.0) || num_data_in_leaf <= 0 {
         return Ok((best, best_fpos, best_cat));
     }
-    // L-1/WR-01: one leaf-level scan launch (bumped ONCE per leaf that is actually
+    // One leaf-level scan launch (bumped ONCE per leaf that is actually
     // scanned, NOT per feature, to match the host per-leaf `SCAN_RESIDENT_CNT` unit).
     bump_launch();
-    // 26-01/ODP3-07: the per-feature finders below each read a SplitInfo back to the host —
+    // The per-feature finders below each read a SplitInfo back to the host —
     // ONE blocking scan readback per SCANNED leaf (not per feature: the count must stay
     // num_features-independent, the counter-trap guard).
     bump_sync();
@@ -838,7 +823,7 @@ fn scan_leaf<R: cubecl::Runtime>(
         let cells = 2 * f.num_bin as usize;
         let region = &hist[slot_off[fpos]..slot_off[fpos] + cells];
         let (si, cat_bins) = if f.bin_type == BinType::Categorical {
-            // Phase-22 categorical branch (§8.1). W-4: bump sum_h ONCE here before the
+            // Categorical branch (§8.1). Bump sum_h ONCE here before the
             // evaluator; best_split passes through, the evaluator does not bump.
             let cat_cfg = categorical_feature_config(cfg, f);
             let sum_h_bumped = bump_sum_hessian_cat(sum_h);
@@ -881,34 +866,33 @@ fn scan_leaf<R: cubecl::Runtime>(
     Ok((best, best_fpos, best_cat))
 }
 
-/// Grow an ENTIRE continuous-feature + L2 tree ON-DEVICE by sequencing the
-/// Phase-16/17/18 kernels in the `SerialTreeLearner` best-first order, using the
-/// driver's OWN [`DriverLeaf`] bookkeeping (D-01/ODL-18). Returns the grown
-/// [`lgbm_model::Tree`] and the final row→leaf [`LeafPartitionLayout`].
+/// Grow an ENTIRE continuous-feature + L2 tree ON-DEVICE by sequencing the device
+/// kernels in the `SerialTreeLearner` best-first order, using the driver's OWN
+/// [`DriverLeaf`] bookkeeping. Returns the grown [`lgbm_model::Tree`] and the final
+/// row→leaf [`LeafPartitionLayout`].
 ///
 /// Thin delegator to [`grow_tree_on_device_driver_with_cfg`] pinned to the fixed
 /// [`proving_slice_config`] the parameterless [`crate::Backend::grow_tree_on_device`]
 /// trait seam grows under (that seam carries no `GainConfig`, so the STRUCTURE/anchor
 /// gates build both arms with the IDENTICAL proving config).
 ///
-/// # NOT the production entry (OCX-02, 29-02)
+/// # NOT the production entry
 /// PRODUCTION on-device grows go through [`crate::Backend::grow_tree_on_device_with_cfg`]
 /// → [`grow_tree_on_device_driver_with_cfg`], which binds the learner's REAL `GainConfig`.
 /// This parameterless delegator pins the PERMISSIVE proving config and is retained ONLY for
-/// the anchor fixtures — never call it from a production path (that reopens the spike-072
-/// item-15 admissibility hole). Tests that need a constrained gain config call `_with_cfg`.
+/// the anchor fixtures — never call it from a production path (that would disable
+/// admissibility checking). Tests that need a constrained gain config call `_with_cfg`.
 ///
 /// Runs on ANY `R` (the STRUCTURE gate drives it on the cubecl-cpu runtime, anchored
-/// to the cpu f64 fold — never GPU-vs-GPU, def-f8u-01). `max_depth <= 0` ⇒ no depth
-/// cap.
+/// to the cpu f64 fold — never GPU-vs-GPU). `max_depth <= 0` ⇒ no depth cap.
 ///
-/// Takes `backend: &B` (`B: Backend<Runtime = R>`) — Option C, 24-01: the driver
-/// reaches the backend so it can branch on `backend.resident_pool_supported()` and,
-/// in 24-02..24-04, dispatch the resident/batched launchers `GpuBackend<R>` already
-/// implements (`upload_resident_bins` / `build_fix_scan_resident` / `subtract_resident`
-/// / `find_best_splits_batched` / `data_partition_native`). Per D-01/Option A the
-/// driver still names NO `lgbm-treelearner` type (`B` is satisfied by
-/// `CpuBackend`/`GpuBackend<R>`, both in `lgbm-compute`), so no crate cycle.
+/// Takes `backend: &B` (`B: Backend<Runtime = R>`) — the driver reaches the backend
+/// so it can branch on `backend.resident_pool_supported()` and dispatch the
+/// resident/batched launchers `GpuBackend<R>` already implements
+/// (`upload_resident_bins` / `build_fix_scan_resident` / `subtract_resident` /
+/// `find_best_splits_batched` / `data_partition_native`). The driver still names NO
+/// `lgbm-treelearner` type (`B` is satisfied by `CpuBackend`/`GpuBackend<R>`, both in
+/// `lgbm-compute`), so no crate cycle.
 ///
 /// # Errors
 /// [`ComputeError`] from any sequenced kernel (bad num_bin / histogram length,
@@ -984,7 +968,7 @@ where
         });
     }
 
-    // ---- Capability branch (Option C, 24-RESEARCH / 24-02). ----
+    // ---- Capability branch. ----
     // A resident-pool-capable backend (`GpuBackend<R>` with a device-resident
     // histogram pool) takes the FAST batched+resident build/subtract/scan path for the
     // NUMERIC proving slice — dispatching `backend`'s `upload_resident_bins` (ONCE per
@@ -992,10 +976,9 @@ where
     // pool slot), `subtract_resident` (larger child = parent − smaller, on device), and
     // `scan_resident_leaf` (each leaf's splits read from the resident slot). A
     // non-resident backend (`CpuBackend`, the f64 anchor) always folds through the
-    // single-owner anchor kernels below — byte-for-byte unchanged (SC-4). CATEGORICAL
-    // features demote to the anchor fold this milestone (24-RESEARCH: `on_device_eligible`
-    // routes categorical+quantized to the host path anyway); the resident arm is the
-    // numeric proving slice only.
+    // single-owner anchor kernels below — byte-for-byte unchanged. CATEGORICAL
+    // features demote to the anchor fold (`on_device_eligible` routes categorical+quantized
+    // to the host path anyway); the resident arm is the numeric proving slice only.
     if backend.resident_pool_supported()
         && !features.iter().any(|f| f.bin_type == BinType::Categorical)
     {
@@ -1022,8 +1005,8 @@ where
         root_sum_g += f64::from(gradients[r as usize]);
         root_sum_h += f64::from(hessians[r as usize]);
     }
-    // OCX-04 tripwire (spike-072 takeaway (d)): loud typed failure on a NaN root seed on the
-    // anchor/non-resident arm too — never a silently-truncated model via GBDT's pop-loop.
+    // Loud typed failure on a NaN root seed on the anchor/non-resident arm too — never
+    // a silently-truncated model via GBDT's pop-loop.
     check_root_seed_finite(root_sum_g, root_sum_h)?;
     let root_hist = build_leaf_hist(
         client, features, gradients, hessians, &root_rows, root_sum_g, root_sum_h, &slot_off,
@@ -1044,15 +1027,15 @@ where
         depth: 0,
     }];
 
-    // ---- The device flat tree (Phase-18), pre-allocated once (D-15). ----
+    // ---- The device flat tree, pre-allocated once. ----
     // `num_leaves >= 1` is guaranteed by the guard above, so no `.max(1)` needed.
     let mut tree = DeviceCudaTree::<R>::new(client, num_leaves as usize, num_data as i32)?;
 
-    // ---- The pre-allocated categorical split-info slab (W-3 / SC #1), allocated
-    // ONCE (ODL-02, no per-split device alloc) and ONLY when the feature set has a
-    // categorical feature — so a pure-numeric grow allocates nothing new and stays
-    // byte-for-byte unchanged (SC #4). The runtime slab width is the D-03 max
-    // `max_cat_threshold` across the categorical features (default MAX_CAT_PER_SPLIT). ----
+    // ---- The pre-allocated categorical split-info slab, allocated ONCE (no
+    // per-split device alloc) and ONLY when the feature set has a categorical feature
+    // — so a pure-numeric grow allocates nothing new and stays byte-for-byte
+    // unchanged. The runtime slab width is the max `max_cat_threshold` across the
+    // categorical features (default MAX_CAT_PER_SPLIT). ----
     let has_categorical = features.iter().any(|f| f.bin_type == BinType::Categorical);
     let mut split_info: Option<DeviceSplitInfo<R>> = if has_categorical {
         let cat_width = features
@@ -1102,7 +1085,7 @@ where
         let parent_depth = leaves[best_leaf as usize].depth;
         let parent_hist = leaves[best_leaf as usize].hist.clone();
 
-        // ---- Partition the parent leaf's rows (Phase-18 route), BEFORE the tree
+        // ---- Partition the parent leaf's rows, BEFORE the tree
         // mutation reads the child ids. ----
         let parent_rows = leaves[best_leaf as usize].rows.clone();
         let bins_sub = BinColumn::new(
@@ -1123,15 +1106,15 @@ where
         // and the new right-leaf id.
         let (left_rows, right_rows, left_count, right_count, new_right) =
             if f.bin_type == BinType::Categorical {
-                // ===== Categorical grow branch (Phase-22 §6.3 + §9 + §10). =====
+                // ===== Categorical grow branch (§6.3 + §9 + §10). =====
                 // (1) Stage the winning thresholds into the pre-allocated DeviceSplitInfo
-                //     cat slab (W-3 / SC #1) — allocate-once, NO per-split device alloc.
+                //     cat slab — allocate-once, NO per-split device alloc.
                 let win_bins: Vec<u32> = leaves[best_leaf as usize].best_cat.clone();
                 let win_real: Vec<i32> = win_bins
                     .iter()
                     .map(|&b| f.bin_to_category.get(b as usize).copied().unwrap_or(b as i32))
                     .collect();
-                // IN-02: provably unreachable (this branch is entered only when
+                // Provably unreachable (this branch is entered only when
                 // `f.bin_type == Categorical`, which implies `has_categorical`, which
                 // implies `split_info == Some`), but surface a typed `ComputeError`
                 // rather than a raw panic to keep the grow loop's error boundary uniform.
@@ -1143,10 +1126,10 @@ where
                 dsi.set_cat_thresholds(best_leaf as usize, &win_bins, &win_real)?;
                 // (2) Materialize the real + inner bitsets FROM the slab-staged thresholds
                 //     (§6.3) — the host Vec<u32> bitsets are DERIVED from the slab, not a
-                //     parallel per-split allocation (SC #1). IN-01: the REAL bitset is built
+                //     parallel per-split allocation. The REAL bitset is built
                 //     by CONSUMING the `cat_threshold_real` slab (the `win_real` mapping
                 //     already staged above), not by re-mapping bin→category a second time;
-                //     the inner routing bitset carries the CR-01 `bin - min_bin + offset`
+                //     the inner routing bitset carries the `bin - min_bin + offset`
                 //     transform via `construct_inner_bitset`.
                 let slab_bins: Vec<i32> = dsi
                     .cat_threshold(best_leaf as usize)
@@ -1163,8 +1146,8 @@ where
                     construct_inner_bitset(&slab_bins, f.min_bin as i32, f.offset);
                 // (3) Partition parent rows by categorical membership (§9). The INNER-bin
                 //     bitset is the routing key `route_to_left_categorical` expects
-                //     (`bin - min_bin + offset`, offset from most_freq_bin) — Open Q1 /
-                //     Pattern 3, isolation-tested in `categorical_partition_counts_match_host_stable`.
+                //     (`bin - min_bin + offset`, offset from most_freq_bin) — isolation-tested
+                //     in `categorical_partition_counts_match_host_stable`.
                 let (reordered, split_point) = partition_categorical_on_device(
                     client,
                     &bins_sub,
@@ -1204,7 +1187,7 @@ where
                     right_value: best.right_output,
                     num_cat_threshold: win_bins.len() as i32,
                 };
-                // 26-01/ODP3-07: the categorical split also reads `right_leaf_index` back —
+                // The categorical split also reads `right_leaf_index` back —
                 // ONE blocking readback per split (num_features-independent).
                 bump_sync();
                 let result = tree.split_categorical_on_device(
@@ -1218,8 +1201,8 @@ where
                 )?;
                 (left_rows, right_rows, left_count, right_count, result.right_leaf_index)
             } else {
-                // ===== Numeric grow branch (unchanged — SC #4 byte-for-byte). =====
-                // Single-feature-group min_bin convention (CR-01): min_bin + offset.
+                // ===== Numeric grow branch (unchanged — byte-for-byte). =====
+                // Single-feature-group min_bin convention: min_bin + offset.
                 let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
                 let (reordered, split_point) = partition_leaf_stable(
                     &bins_sub,
@@ -1237,7 +1220,7 @@ where
                 let right_rows: Vec<u32> = reordered[split_point..].to_vec();
                 let left_count = left_rows.len() as i32;
                 let right_count = right_rows.len() as i32;
-                // IN-01: an out-of-range `best.threshold` would silently record the raw
+                // An out-of-range `best.threshold` would silently record the raw
                 // bin index cast to f64 as the tree's REAL threshold — a plausible-looking
                 // wrong value that would corrupt prediction routing and mask an off-by-one
                 // in the offset/compaction threshold space. Surface a typed error instead.
@@ -1274,7 +1257,7 @@ where
                     right_value: best.right_output,
                     num_cat_threshold: 0,
                 };
-                // 26-01/ODP3-07: split_on_device reads `right_leaf_index` back to the host —
+                // split_on_device reads `right_leaf_index` back to the host —
                 // ONE blocking readback per split (num_features-independent).
                 bump_sync();
                 let result = tree.split_on_device(
@@ -1302,15 +1285,15 @@ where
             l.best_fpos = -1;
             l.best_cat = Vec::new();
         }
-        // Append the new right child (leaf id == new_right). WR-03: the kernel's
+        // Append the new right child (leaf id == new_right). The kernel's
         // `right_leaf_index` (== the tree's internal `num_leaves`) and the driver's
-        // `leaves.len()` are kept in lockstep only by construction. In release the old
-        // `debug_assert_eq!` was compiled out, so a kernel/driver desync would either
-        // panic on the later `leaves[new_right]` index or — worse — silently write the
-        // derived histogram into the wrong leaf slot, corrupting the partition with no
-        // typed error. Fail loudly with a typed `ComputeError` in ALL build profiles,
-        // BEFORE the `push` and any `leaves[new_right]` access, matching the driver's
-        // other invariant boundaries (IN-01/IN-02 at the split sites above).
+        // `leaves.len()` are kept in lockstep only by construction. A plain
+        // `debug_assert_eq!` would compile out in release, so a kernel/driver desync
+        // would either panic on the later `leaves[new_right]` index or — worse —
+        // silently write the derived histogram into the wrong leaf slot, corrupting
+        // the partition with no typed error. Fail loudly with a typed `ComputeError`
+        // in ALL build profiles, BEFORE the `push` and any `leaves[new_right]` access,
+        // matching the driver's other invariant boundaries.
         if new_right as usize != leaves.len() {
             return Err(ComputeError::Runtime {
                 detail: format!(
@@ -1334,7 +1317,7 @@ where
         });
 
         // ---- Build the children histograms: SMALLER directly, LARGER by
-        // subtraction from the PARENT (Phase-16 subtract, parent-built-before-child).
+        // subtraction from the PARENT (subtract, parent-built-before-child).
         // Smaller = the fewer-row child (num_left < num_right ⇒ left, else right). ----
         let smaller_is_left = left_count < right_count;
         let (smaller_leaf, larger_leaf) = if smaller_is_left {
@@ -1349,21 +1332,21 @@ where
         let smaller_hist = build_leaf_hist(
             client, features, gradients, hessians, &s_rows, s_g, s_h, &slot_off, hist_len,
         )?;
-        // LARGER = parent − smaller (Phase-16 subtract kernel), over the whole
+        // LARGER = parent − smaller (subtract kernel), over the whole
         // concatenated compacted buffer (zeroed tails subtract to zero).
-        bump_launch(); // L-1: one real on-device subtraction-trick dispatch.
+        bump_launch(); // One real on-device subtraction-trick dispatch.
         let larger_hist = subtract_histograms_f64_on(client, &parent_hist, &smaller_hist)?;
         leaves[smaller_leaf as usize].hist = smaller_hist;
         leaves[larger_leaf as usize].hist = larger_hist;
 
         // ---- BeforeFindBestSplit gates + scan each child (compute its best). ----
-        // WR-04: mirror C++ `BeforeFindBestSplit`'s PER-LEAF `num_data <
+        // Mirror C++ `BeforeFindBestSplit`'s PER-LEAF `num_data <
         // min_data_in_leaf * 2` gate — evaluate each child INDEPENDENTLY (a child
         // with fewer than `2*min_data` rows cannot yield a split with both sides
         // >= min_data, so it is skipped) rather than applying one combined
         // predicate to both children. `saturating_mul` guards the `* 2` against a
         // pathological `min_data > i32::MAX/2` overflow. Tree structure is unchanged
-        // vs the old combined gate: the small child's splits are already rejected by
+        // either way: the small child's splits are already rejected by
         // `scan_leaf`'s per-side `min_data_in_leaf` guards.
         let min_data_x2 = min_data.saturating_mul(2);
         for &child in &[new_left, new_right] {
@@ -1387,7 +1370,7 @@ where
         }
     }
 
-    // ---- Reconstruct the host tree (Phase-18 to_host_tree) + the row→leaf layout. ----
+    // ---- Reconstruct the host tree (to_host_tree) + the row→leaf layout. ----
     let host_tree = tree.to_host_tree(client);
     let final_leaves = host_tree.num_leaves as usize;
     let mut indices = Vec::with_capacity(num_data);
@@ -1404,29 +1387,27 @@ where
         leaf_begin,
         leaf_count,
     };
-    // OCX-04 tripwire: refuse to emit a tree with any non-finite leaf value (read-only).
+    // Refuse to emit a tree with any non-finite leaf value (read-only).
     check_tree_leaves_finite(&host_tree)?;
     Ok((host_tree, layout))
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06, §11 `cuda_score_` analog) — a DEVICE-RESIDENT f64
-/// per-row score mirror accumulated ACROSS trees with NO per-tree readback.
+/// A DEVICE-RESIDENT f64 per-row score mirror (the §11 `cuda_score_` analog) accumulated
+/// ACROSS trees with NO per-tree readback.
 ///
-/// This is the concrete `cuda_score_` residency the ledger's third component (spike-069
-/// score path, ~815ms/30% of the real-CUDA gap at 500k×50) needs: the score buffer stays
-/// on device for the whole train; each grown tree's per-leaf `AddScore` is applied by
-/// [`Self::add_tree_on_device`] (device leaf-map derivation via
+/// This keeps the score buffer resident on device for the whole train instead of reading
+/// the full `num_data` f64 delta back to host every tree: each grown tree's per-leaf
+/// `AddScore` is applied by [`Self::add_tree_on_device`] (device leaf-map derivation via
 /// [`crate::kernels::predict::derive_leaf_map_device_handle`] + resident scatter via
 /// [`crate::kernels::predict::add_leaf_values_to_resident_score`], BOTH device→device, no
 /// crossback), and the host reads the score back ONLY on demand via
-/// [`Self::read_resident_score`] (§16 `Metric::Eval` / final), NOT the full `num_data` f64
-/// delta every tree.
+/// [`Self::read_resident_score`] (§16 `Metric::Eval` / final).
 ///
-/// Anchor discipline (D-05/D-07, def-f8u-01): the accumulation is an integer-indexed
-/// scatter of the SAME exact post-shrinkage f64 leaf values into `score[row]`, in tree
-/// order — no float reduction, no ordering dependence — so the final resident score is
-/// BIT-EXACT to the eager per-tree-readback host accumulation on the cpu-f64 anchor, and
-/// within the ~1e-6 f32 envelope on hip (NEVER bit-exact to a second GPU f32 path).
+/// Anchor discipline: the accumulation is an integer-indexed scatter of the SAME exact
+/// post-shrinkage f64 leaf values into `score[row]`, in tree order — no float reduction,
+/// no ordering dependence — so the final resident score is BIT-EXACT to the eager
+/// per-tree-readback host accumulation on the cpu-f64 anchor, and within the ~1e-6 f32
+/// envelope on hip (NEVER bit-exact to a second GPU f32 path).
 ///
 /// Static geometry only — never a dynamic (device-derived) launch count.
 pub struct ResidentScore<R: cubecl::Runtime> {
@@ -1453,7 +1434,7 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         }
     }
 
-    /// Phase-31 (31-04, ODS-01) — allocate a resident f64 score buffer initialized
+    /// Allocate a resident f64 score buffer initialized
     /// FROM the current host `scores` snapshot (uploaded ONCE at train start, after
     /// `BoostFromAverage` has injected any per-class init constant). This is the
     /// GBDT-owned train-lifetime constructor: the buffer is created once and then
@@ -1537,7 +1518,7 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
 
     /// On-demand crossback (§16 `Metric::Eval` / final result) — read the resident score
     /// buffer back to host ONCE. The host calls this only when it genuinely needs the
-    /// score, NOT every tree — the whole point of the residency (ODF-03).
+    /// score, NOT every tree — the whole point of the residency.
     #[must_use]
     pub fn read_resident_score(&self, client: &cubecl::prelude::ComputeClient<R>) -> Vec<f64> {
         use cubecl::prelude::CubeElement;
@@ -1545,7 +1526,7 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
     }
 }
 
-/// Phase-31 (31-04, ODS-02x) — read a resident `[num_data]` f32 device buffer back to
+/// Read a resident `[num_data]` f32 device buffer back to
 /// a host `Vec<f32>`. The on-device grad/hess branch (`gbdt.rs:679`) computes grad/hess
 /// on device (`get_gradients_resident_on`, device-in/device-out Handles) from the
 /// resident score, then reads them back here to feed the (host) tree learner — the SAME
@@ -1562,24 +1543,24 @@ pub fn read_handle_f32<R: cubecl::Runtime>(
     f32::from_bytes(&client.read_one_unchecked(handle.clone())).to_vec()
 }
 
-/// Phase-25 (25-03, ODP2-04, §11 `AddPredictionToScore`) — apply an ON-DEVICE-grown
-/// tree's leaf-value contribution to the per-row score by scattering each leaf's f64
-/// output over the RESIDENT row→leaf partition the grow already produced
-/// ([`LeafPartitionLayout`]), entirely on device.
+/// Apply an ON-DEVICE-grown tree's leaf-value contribution to the per-row score
+/// (the §11 `AddPredictionToScore` analog) by scattering each leaf's f64 output over the
+/// RESIDENT row→leaf partition the grow already produced ([`LeafPartitionLayout`]),
+/// entirely on device.
 ///
 /// This is the resident partition-SCATTER analog of the C++ training-path
 /// `SerialTreeLearner::AddPredictionToScore` (`serial_tree_learner.h:100-118`): the
 /// grow driver hands back the row→leaf layout, so the on-device score move needs NO
 /// host re-gather of the `[num_data × num_features]` bin matrix and NO per-row tree
-/// walk (the 5,420ms Phase-24 host-scoring long-pole, 24-AB-RESULTS) — only the
-/// winning leaf id per row (already computed on device by the grow) and the
-/// (post-shrinkage) leaf values. Delegates to the golden Phase-18
+/// walk (previously the dominant host-scoring cost) — only the winning leaf id per row
+/// (already computed on device by the grow) and the (post-shrinkage) leaf values.
+/// Delegates to the golden
 /// [`crate::kernels::predict::add_prediction_bagging_on_device`] partition-scatter
 /// kernel in identity mode (every row walked exactly once), returning the
 /// `num_data`-length per-row raw-margin delta — the host mirror is the ONLY thing
 /// that crosses back (`cuda_score_` and the partition/leaf-value stay resident).
 ///
-/// Anchor discipline (D-05/D-07, def-f8u-01): bit-exact to the host partition scatter
+/// Anchor discipline: bit-exact to the host partition scatter
 /// [`add_prediction_to_score`](../../../lgbm_treelearner) on the cpu-f64 anchor by
 /// construction — an integer-indexed scatter of the SAME exact f64 leaf values, no
 /// float reduction, no ordering dependence; the ROCm/HIP arm holds to the ~1e-6 f32
@@ -1589,16 +1570,16 @@ pub fn read_handle_f32<R: cubecl::Runtime>(
 /// `boosting_on_cuda_` resident-score seam calls this AFTER shrinkage, matching the
 /// §16 Shrinkage → UpdateScore order.
 ///
-/// # Phase-28 (28-04) rework
-/// This is now the SINGLE-TREE eager-readback convenience over the resident
+/// # Relationship to [`ResidentScore`]
+/// This is the SINGLE-TREE eager-readback convenience over the resident
 /// [`ResidentScore`] mirror: it allocates a fresh zeroed resident buffer, applies the one
-/// tree ON DEVICE (device leaf-map derivation + resident scatter — the host `O(num_data)`
-/// inversion loop is gone), and crosses the buffer back once to return the per-tree
+/// tree ON DEVICE (device leaf-map derivation + resident scatter — no host `O(num_data)`
+/// inversion loop), and crosses the buffer back once to return the per-tree
 /// `num_data`-length delta (the fresh buffer started at 0, so the read IS this tree's
 /// delta). The ACROSS-trees residency (accumulate many trees, defer the readback to
 /// on-demand) is [`ResidentScore`] — the resident mirror the deferred-readback score path
-/// (28-05/28-06) drives; this wrapper preserves the byte-compatible `Vec<f64>` contract
-/// for the existing per-tree caller.
+/// drives; this wrapper preserves the byte-compatible `Vec<f64>` contract for the
+/// existing per-tree caller.
 ///
 /// # Errors
 /// [`ComputeError::LengthMismatch`] if a leaf group (`leaf_begin + leaf_count`) overruns
@@ -1615,30 +1596,28 @@ pub fn add_prediction_to_score_on_device_resident<R: cubecl::Runtime>(
 }
 
 // =========================================================================
-// 24-02: the RESIDENT/BATCHED numeric grow path (Pattern 1 / §7.1, ODP-01/ODP-02).
+// The RESIDENT/BATCHED numeric grow path (§7.1).
 //
 // The fast capability arm of `grow_tree_on_device_driver_with_cfg`. Instead of the
 // anchor fold's per-feature single-thread `construct_histograms_f64_on` (`CubeDim(1)`)
-// with a host re-gather + blocking readback each leaf (the spike-055 anti-pattern),
-// this arm uploads the binned columns to the device ONCE per grow
-// (`upload_resident_bins`) and keeps every leaf's histogram DEVICE-RESIDENT in a
-// pool slot: `build_resident_leaf` builds the root and each SMALLER child (build →
-// dequant → fix → compact into a slot, using the shipped u64 fixed-point
-// deterministic accumulation), and `subtract_resident` derives the LARGER child
-// (parent − smaller, on device, no readback). Splits are read from the resident slot
-// via `scan_resident_leaf` — the histogram never returns to host. The driver keeps
-// its OWN best-first `DriverLeaf` bookkeeping and maps each leaf to a resident pool
-// slot with a simple counter (SMALLER child gets a fresh slot; LARGER reuses the
-// parent's slot, which holds the subtraction's parent Handle).
+// with a host re-gather + blocking readback each leaf, this arm uploads the binned
+// columns to the device ONCE per grow (`upload_resident_bins`) and keeps every leaf's
+// histogram DEVICE-RESIDENT in a pool slot: `build_resident_leaf` builds the root and
+// each SMALLER child (build → dequant → fix → compact into a slot, using the shipped
+// u64 fixed-point deterministic accumulation), and `subtract_resident` derives the
+// LARGER child (parent − smaller, on device, no readback). Splits are read from the
+// resident slot via `scan_resident_leaf` — the histogram never returns to host. The
+// driver keeps its OWN best-first `DriverLeaf` bookkeeping and maps each leaf to a
+// resident pool slot with a simple counter (SMALLER child gets a fresh slot; LARGER
+// reuses the parent's slot, which holds the subtraction's parent Handle).
 //
-// ## Scope (this milestone)
+// ## Scope
 // NUMERIC features + the reverse/forward split scan only (categorical demotes to the
 // anchor fold in the caller). The row PARTITION still routes on the HOST
-// (`partition_leaf_stable`, unchanged from the numeric anchor branch); the on-device
-// partition is a later plan (24-03/24-04). No new kernels — this wires the shipped
-// `GpuBackend` resident primitives into the driver.
+// (`partition_leaf_stable`, unchanged from the numeric anchor branch). No new kernels
+// — this wires the shipped `GpuBackend` resident primitives into the driver.
 //
-// ## Ordering (Pitfall 7 / phase18-wr01)
+// ## Ordering
 // build-SMALLER → subtract-LARGER, ALWAYS — never subtract before the smaller build
 // (`subtract_resident` reads the smaller slot). The larger child reuses the parent
 // slot, so `subtract_resident(parent_slot, smaller_slot, larger_slot=parent_slot)`
@@ -1649,7 +1628,7 @@ pub fn add_prediction_to_score_on_device_resident<R: cubecl::Runtime>(
 /// device pool SLOT id instead of a host `hist: Vec<f64>` (the histogram is
 /// device-resident). No `best_cat` (numeric proving slice only).
 struct ResidentDriverLeaf {
-    /// 26-03 (M1/M6, ODP3-04): this leaf's rows as a RESIDENT device index RANGE — the
+    /// This leaf's rows as a RESIDENT device index RANGE — the
     /// `[row_begin, row_begin + row_count)` sub-range of the single resident permutation buffer
     /// (`perm`, the `cuda_data_indices_` mirror). The row ids never leave that buffer: a split
     /// partitions the parent's sub-range IN PLACE and the two children become adjacent
@@ -1674,10 +1653,10 @@ struct ResidentDriverLeaf {
 
 /// Read-once `LGBM_SIBLING_COPACK != "0"` gate — the driver-local TWIN of
 /// `lgbm_treelearner::resident_pool::sibling_copack_override` (which lives ABOVE
-/// `lgbm-compute` and cannot be imported here without a crate cycle, IN-01). Default-ON
+/// `lgbm-compute` and cannot be imported here without a crate cycle). Default-ON
 /// (co-pack engages whenever the correctness gate holds); `LGBM_SIBLING_COPACK=0`
-/// FORCE-OFFs it (the byte-identical two-separate-scans A/B off-path, i.e. Task-1's
-/// fused-smaller + separate-larger scan). Parsed EVERY call (NOT `OnceLock`-cached) so a
+/// FORCE-OFFs it (the byte-identical two-separate-scans off-path: a fused-smaller +
+/// separate-larger scan). Parsed EVERY call (NOT `OnceLock`-cached) so a
 /// single test process can grow with the env set and unset and observe BOTH launch
 /// layouts — the two trees are identical (co-pack is bit-exact by construction), only
 /// WHICH launch scans each sibling changes.
@@ -1686,7 +1665,7 @@ fn sibling_copack_enabled() -> bool {
 }
 
 /// The driver's cross-feature `split_gt` argmax over an ORDER-PRESERVING per-feature
-/// scan result (T-lsx-01 tie-break bit-exact). One [`SplitInfo`] per feature in fpos
+/// scan result (tie-break bit-exact). One [`SplitInfo`] per feature in fpos
 /// order; the per-feature `na_as_missing` skip mirrors [`scan_leaf`]'s `continue` (the
 /// finder rejects NA — never fires on the `MissingType::None` proving slice). Shared by
 /// the fused ([`crate::Backend::build_fix_scan_resident`]), single-slot
@@ -1716,11 +1695,11 @@ fn argmax_over_splits(
     (best, best_fpos)
 }
 
-/// 26-02 (M3/ODP3-02, §8.2 `SyncBestSplitForLeafKernel` analog): the cross-feature best-split
-/// REDUCE that returns ONLY the winning `(SplitInfo, feature-position)` — the ~8-int
+/// The cross-feature best-split REDUCE (the §8.2 `SyncBestSplitForLeafKernel` analog)
+/// that returns ONLY the winning `(SplitInfo, feature-position)` — the ~8-int
 /// CUDASplitInfo-equivalent the on-device argmax reads back per leaf, INSTEAD of the full
 /// `Vec<SplitInfo>` per feature. Byte-for-byte the same fold as [`argmax_over_splits`] (strict
-/// `>` gain, lowest real-feature-index tie-break — Pitfall 5 / T-lsx-01 — and the
+/// `>` gain, lowest real-feature-index tie-break, and the
 /// `na_as_missing` skip) so the winner is BIT-IDENTICAL to the host argmax; it takes
 /// `real_feats[fpos]` (each feature's real index, the tie-break key) directly so it can live on
 /// the [`crate::Backend`] seam in `lib.rs` without importing [`GrowFeature`]. Shared by the
@@ -1751,8 +1730,8 @@ pub(crate) fn argmax_over_resident_splits(
     (best, best_fpos)
 }
 
-/// 26-02 (M7/ODP3-03, §8.3 `FindBestFromAllSplitsKernel` analog): the cross-LEAF best-leaf
-/// REDUCE — argmax over each leaf's best split via the SAME `split_gt` first-max rule the host
+/// The cross-LEAF best-leaf REDUCE (the §8.3 `FindBestFromAllSplitsKernel` analog) —
+/// argmax over each leaf's best split via the SAME `split_gt` first-max rule the host
 /// loop uses (strict `>` gain, lowest real-feature-index tie-break; a no-split leaf carries
 /// `real == -1` ⇒ `i32::MAX`). Returns the winning leaf index (`0` when nothing has positive
 /// gain — the caller's `best_fpos < 0 || !(gain > 0)` guard then breaks, exactly as the host
@@ -1771,11 +1750,11 @@ pub(crate) fn best_leaf_argmax(leaf_best: &[SplitInfo], leaf_real_feat: &[i32]) 
     best_leaf
 }
 
-/// 26-02 (M7/ODP3-03, §6.1 `CUDAInitValuesKernel` analog): the whole-dataset ROOT grad/hess
-/// sum as an ORDERED f64 fold (ascending row order is load-bearing — the bit-exact anchor;
+/// The whole-dataset ROOT grad/hess sum (the §6.1 `CUDAInitValuesKernel` analog) as an
+/// ORDERED f64 fold (ascending row order is load-bearing — the bit-exact anchor;
 /// `LeafSplits::init`). The [`crate::Backend::root_grad_hess_sum`] default + the GpuBackend impl
 /// both delegate here so the root init is bit-exact vs the integer path and (on the GpuBackend
-/// arm) held ~1e-6 vs the host-CUDA fold — NEVER a GPU-f32-vs-GPU-f32 pairing (def-f8u-01).
+/// arm) held ~1e-6 vs the host-CUDA fold — NEVER a GPU-f32-vs-GPU-f32 pairing.
 pub(crate) fn root_grad_hess_fold(gradients: &[f32], hessians: &[f32]) -> (f64, f64) {
     let mut sum_g = 0.0f64;
     let mut sum_h = 0.0f64;
@@ -1786,16 +1765,15 @@ pub(crate) fn root_grad_hess_fold(gradients: &[f32], hessians: &[f32]) -> (f64, 
     (sum_g, sum_h)
 }
 
-/// OCX-04 (spike-072 method takeaway (d)) — the NON-FINITE TRIPWIRE on the seeded root
-/// grad/hess sums. A NaN root sum is the iter-13 signature the spike bisected: an f32
-/// root-fold bias (or any upstream corruption) accumulates to NaN, `!(sum_h > 0)` makes
-/// the root unscannable, and GBDT's C++-faithful no-split POP-LOOP then silently truncates
-/// the model (the observed 13-tree collapse). Erroring HERE — the instant the corruption is
-/// observable at the grow return path — surfaces the failure LOUDLY as a typed
-/// [`ComputeError::NonFinite`] that the learner seam propagates (`?`), five phases before it
-/// would have shown up as a stunted A/B. This guard lives on the on-device grow/score side
-/// ONLY; the boosting pop-loop's bit-faithful semantics are NOT changed (29-CONTEXT locked
-/// rule). O(1), read-only — no per-row cost, no effect on healthy grows.
+/// The NON-FINITE TRIPWIRE on the seeded root grad/hess sums. A NaN root sum can arise
+/// from an f32 root-fold bias (or any upstream corruption) accumulating to NaN;
+/// `!(sum_h > 0)` then makes the root unscannable, and GBDT's C++-faithful no-split
+/// POP-LOOP silently truncates the model instead of failing. Erroring HERE — the instant
+/// the corruption is observable at the grow return path — surfaces the failure LOUDLY as a
+/// typed [`ComputeError::NonFinite`] that the learner seam propagates (`?`), instead of
+/// producing a silently truncated model. This guard lives on the on-device grow/score
+/// side ONLY; the boosting pop-loop's bit-faithful semantics are NOT changed. O(1),
+/// read-only — no per-row cost, no effect on healthy grows.
 fn check_root_seed_finite(sum_g: f64, sum_h: f64) -> Result<(), ComputeError> {
     if !sum_g.is_finite() || !sum_h.is_finite() {
         return Err(ComputeError::NonFinite {
@@ -1809,15 +1787,14 @@ fn check_root_seed_finite(sum_g: f64, sum_h: f64) -> Result<(), ComputeError> {
     Ok(())
 }
 
-/// OCX-04 — the NON-FINITE TRIPWIRE on the EMITTED tree's leaf values. An `is_finite()`
-/// sweep over `tree.leaf_value` (O(num_leaves), read-only): a NaN/±inf leaf value (the
-/// spike-072 tree-4 `1.27e3` → tree-12 `±inf` progression) becomes a typed
-/// [`ComputeError::NonFinite`] naming the leaf, instead of a truncated `Ok(tree)` flowing
-/// into scoring and compounding to NaN gradients. Belt-and-suspenders with
-/// [`check_root_seed_finite`]: the root check catches the seed at onset, this catches any
-/// non-finite that reaches an emitted leaf value on either driver arm. Healthy trees pass
-/// untouched (the check never mutates the tree), so with `LGBM_CUDA_ON_DEVICE` unset the
-/// whole on-device arm is dead and every backend byte is unchanged (SC-4).
+/// The NON-FINITE TRIPWIRE on the EMITTED tree's leaf values. An `is_finite()`
+/// sweep over `tree.leaf_value` (O(num_leaves), read-only): a NaN/±inf leaf value
+/// becomes a typed [`ComputeError::NonFinite`] naming the leaf, instead of a truncated
+/// `Ok(tree)` flowing into scoring and compounding to NaN gradients. Belt-and-suspenders
+/// with [`check_root_seed_finite`]: the root check catches the seed at onset, this catches
+/// any non-finite that reaches an emitted leaf value on either driver arm. Healthy trees
+/// pass untouched (the check never mutates the tree), so with `LGBM_CUDA_ON_DEVICE` unset
+/// the whole on-device arm is dead and every backend byte is unchanged.
 fn check_tree_leaves_finite(tree: &lgbm_model::Tree) -> Result<(), ComputeError> {
     for (leaf, &v) in tree.leaf_value.iter().enumerate() {
         if !v.is_finite() {
@@ -1834,8 +1811,8 @@ fn check_tree_leaves_finite(tree: &lgbm_model::Tree) -> Result<(), ComputeError>
 
 /// Scan one leaf's DEVICE-RESIDENT histogram (slot `slot`) for every feature's best
 /// split in ONE batched launch ([`crate::Backend::scan_resident_leaf`]), then apply the
-/// driver's cross-feature `split_gt` argmax over the ORDER-PRESERVING return (T-lsx-01
-/// tie-break bit-exact) via [`argmax_over_splits`]. Mirrors [`scan_leaf`]'s numeric
+/// driver's cross-feature `split_gt` argmax over the ORDER-PRESERVING return
+/// (tie-break bit-exact) via [`argmax_over_splits`]. Mirrors [`scan_leaf`]'s numeric
 /// path: the same `!(sum_h > 0.0) || num_data <= 0` short-circuit and RAW `sum_h` passed
 /// to the finder (it bumps `kEpsilon` internally). Returns `(SplitInfo, feature-position)`
 /// — `(-inf, -1)` when nothing is admissible.
@@ -1860,15 +1837,15 @@ where
     if !(sum_h > 0.0) || num_data_in_leaf <= 0 {
         return Ok((SplitInfo::none(), -1));
     }
-    // L-1/24-05: one REAL dispatch (a single-slot `scan_resident_leaf` launch — the
+    // One REAL dispatch (a single-slot `scan_resident_leaf` launch — the
     // larger child's separate scan on the co-pack-OFF path).
     bump_launch();
-    // 26-01/ODP3-07: the batched scan reads ONE blocking readback per single-slot scan
-    // (num_features-independent). 26-02/ODP3-02/M3: the cross-feature argmax now runs ON DEVICE
+    // The batched scan reads ONE blocking readback per single-slot scan
+    // (num_features-independent). The cross-feature argmax runs ON DEVICE
     // (`scan_resident_leaf_argmax`, §8.2) so only the winning ~8-int split crosses back — the
     // per-feature `Vec<SplitInfo>` payload collapses to a single winner; still ONE sync per scan.
     bump_sync();
-    // SPIKE-077: the single-slot scan is a BLOCKING readback — in free-run mode this bucket
+    // The single-slot scan is a BLOCKING readback — in free-run mode this bucket
     // also absorbs the queued build/subtract device time draining at its sync (see the
     // ledger header; LGBM_GROW_DRAIN=1 de-aliases).
     time_phase(&GROW_SCAN_NS, || {
@@ -1878,7 +1855,7 @@ where
     })
 }
 
-/// 26-03 (M1/M6, ODP3-04, §9): partition the parent leaf's RESIDENT index sub-range IN PLACE.
+/// Partition the parent leaf's RESIDENT index sub-range IN PLACE (§9).
 ///
 /// `perm_range` is a mutable sub-slice of the SINGLE resident permutation buffer that mirrors
 /// the reference `cuda_data_indices_` — it holds the parent leaf's GLOBAL row ids. This reorders
@@ -1887,24 +1864,23 @@ where
 /// leaves then become the adjacent sub-ranges `[0, split_point)` and `[split_point, len)` of the
 /// SAME buffer. No per-leaf `Vec<u32>` is allocated and the buffer is never grown — only permuted.
 ///
-/// Reuses the SHIPPED partition primitives (no new kernel — plan prohibition): the DEFAULT host
-/// route folds through [`partition_leaf_stable`] (the spike-027 fused stable partition, which
+/// Reuses the SHIPPED partition primitives (no new kernel): the DEFAULT host
+/// route folds through [`partition_leaf_stable`] (the fused stable partition, which
 /// already returns reordered GLOBAL row ids); the on-device route folds through
-/// [`crate::Backend::data_partition_native`] (spike-029 narrow-width route kernel) and scatters
+/// [`crate::Backend::data_partition_native`] (a narrow-width route kernel) and scatters
 /// the global ids back into `perm_range` in place. Either way the per-leaf `rows.clone()` and the
 /// host `parent_rows` map-back Vec are RETIRED — the resident buffer is updated in place. The
 /// routing bin values are read from the resident index range (`perm_range`), not a separately
 /// cloned `parent_rows`.
 ///
-/// # No-HIP scope (Plan-01/02 discipline)
+/// # No-HIP scope
 /// The FULLY device-side gather-through-resident-index scatter (reading the split feature's bins
 /// from the once-per-grow resident bin buffer via the index range, eliminating even the host bin
-/// read + the on-device route's local→global map) is a fused resident scatter kernel — a NEW
-/// kernel the plan prohibits AND which cannot be authored/verified on the local spoofed 8-CU APU.
-/// It is the real-hardware refinement (Plan 05 / Kaggle), exactly as Plan 02 deferred the
-/// reduce-before-copy readback. What ships here is the resident-buffer + in-place-partition
-/// ARCHITECTURE: one permutation buffer for the whole grow, leaf ranges (not per-leaf Vecs), and
-/// the retired `rows.clone()` / `parent_rows` map-back.
+/// read + the on-device route's local→global map) would be a fused resident scatter kernel — a
+/// NEW kernel, and one that cannot be authored/verified on the local spoofed 8-CU APU. It is a
+/// real-hardware refinement deferred to a discrete-GPU test environment. What ships here is the
+/// resident-buffer + in-place-partition ARCHITECTURE: one permutation buffer for the whole grow,
+/// leaf ranges (not per-leaf Vecs), and the retired `rows.clone()` / `parent_rows` map-back.
 ///
 /// # Errors
 /// [`ComputeError`] from the underlying partition primitive (bad `num_bin`/threshold, an
@@ -1928,12 +1904,12 @@ where
     R: cubecl::Runtime,
 {
     let (reordered, split_point) = if backend.prefers_host_partition() {
-        // HOST route (spike-027/035 fused): returns the reordered GLOBAL row ids directly.
-        // OHP-01: read the split feature's bins INLINE through the resident index range
+        // HOST route (fused): returns the reordered GLOBAL row ids directly.
+        // Read the split feature's bins INLINE through the resident index range
         // (`partition_leaf_stable_fused`) — no per-split `bins_sub` gather / `BinColumn::new`
         // narrow, and the range check is folded into the single route pass. The env off-switch
         // (`LGBM_ONDEVICE_FUSED_PARTITION=0`) restores the pre-change gather + `partition_leaf_stable`
-        // path for the box-noise-free A/B; both are byte-equal (same RouteFlags/route_left_host).
+        // path for A/B comparison; both are byte-equal (same RouteFlags/route_left_host).
         if ondevice_fused_partition_enabled() {
             partition_leaf_stable_fused(
                 &f.bins,
@@ -1970,26 +1946,26 @@ where
         // Gather the split feature's bins for the parent's resident row range (read THROUGH the
         // resident index buffer — NOT a cloned `parent_rows` Vec). The gather feeds the shipped
         // route kernel; the fully device-side gather-through-index scatter is deferred (see above).
-        // The host arm no longer builds this (OHP-01); it is confined to the DEVICE arm, whose
-        // fused gather-through-index kernel is a separate real-hardware track (RESEARCH Open Q1).
+        // The host arm no longer builds this; it is confined to the DEVICE arm, whose
+        // fused gather-through-index kernel is a separate real-hardware track.
         let bins_sub = BinColumn::new(
             perm_range.iter().map(|&r| f.bins.bin(r as usize)).collect(),
             f.num_bin,
         );
-        // 28-02/28-03 (ODF-02/ODF-05, R2) ON-DEVICE route: `data_partition_resident_no_readback`
+        // ON-DEVICE route: `data_partition_resident_no_readback`
         // runs the §9 mark→prefix-sum→scatter and writes the child left/right ranges INTO the
         // resident `DeviceLeafSplits` slot ON DEVICE — the split point no longer crosses back as
         // the host scalar the grow loop consumed. It returns the stable-ordered GLOBAL row
         // permutation DIRECTLY, so the local→global `parent_rows` map-back
-        // (`locals.map(|i| perm_range[i])`) is RETIRED (ODF-05 grep gate: no permutation map-back
+        // (`locals.map(|i| perm_range[i])`) is RETIRED (no permutation map-back
         // on the resident grow path).
-        // L-1/24-05: one REAL on-device partition dispatch. Counted ONLY on this arm.
+        // One REAL on-device partition dispatch. Counted ONLY on this arm.
         bump_launch();
         // The child ranges are resident; the host reads only the split-point SCALAR from the
         // device struct for its `ResidentDriverLeaf` row bookkeeping (the fully device-side
-        // child-row consumption — so even this scalar never crosses back — is the Plan-05
-        // hardware refinement, per the 28-02 no-HIP scope note). This single scalar read replaces
-        // the old R2 split-point + route readback (count unchanged on this arm).
+        // child-row consumption — so even this scalar never crosses back — is a real-hardware
+        // refinement, per the no-HIP scope note above). This single scalar read replaces
+        // the prior split-point + route readback (count unchanged on this arm).
         bump_sync();
         let rows = backend.data_partition_resident_no_readback(
             client,
@@ -2028,8 +2004,8 @@ fn real_feat_of(features: &[GrowFeature], fpos: i32) -> i32 {
     }
 }
 
-/// 28-03 (ODF-01/ODF-05, §8.2): fold ONE leaf's winning split into the DEVICE-RESIDENT frontier
-/// slot `leaf` via [`crate::Backend::frontier_reduce_leaf_device`] — the device-side replacement
+/// Fold ONE leaf's winning split into the DEVICE-RESIDENT frontier slot `leaf` (§8.2) via
+/// [`crate::Backend::frontier_reduce_leaf_device`] — the device-side replacement
 /// for the retired host cross-leaf argmax over a `leaf_bests: Vec<SplitInfo>` collection.
 ///
 /// The `winner` is already the cross-FEATURE reduce output of this leaf's resident scan-argmax
@@ -2040,7 +2016,7 @@ fn real_feat_of(features: &[GrowFeature], fpos: i32) -> i32 {
 /// ON DEVICE (device→device, no readback). `real_feat` is the winner's real feature index (`-1`
 /// for a no-split leaf), the §8.3 tie-break key. An un-set / self-invalidated slot admits the
 /// first valid record, so re-seeding a re-used leaf id after the §8.3 self-invalidation is
-/// correct (28-01 semantics).
+/// correct.
 ///
 /// # Errors
 /// Propagates [`crate::Backend::frontier_reduce_leaf_device`] (device-resident frontier
@@ -2070,15 +2046,15 @@ where
         threshold: winner.threshold,
         default_left: winner.default_left,
         num_cat_threshold: 0,
-        // 31-03 (D-081-1, ODS-02): carry the winner's 4 child grad/hess sums into the resident
+        // Carry the winner's 4 child grad/hess sums into the resident
         // frontier so the §8.3 pick export can hand the driver the next build's seed sums FRESH
-        // (Plan 01 wired these fields through SplitSoa/§8.2; without folding them here they would
-        // stay at the 0.0 default and the re-sourced seed would be wrong → NaN-collapse).
+        // — without folding them here they would stay at the 0.0 default and the re-sourced
+        // seed would be wrong → NaN-collapse.
         left_sum_gradients: winner.left_sum_gradient,
         left_sum_hessians: winner.left_sum_hessian,
         right_sum_gradients: winner.right_sum_gradient,
         right_sum_hessians: winner.right_sum_hessian,
-        // 31-08 (ODS-02): carry the winner's child leaf OUTPUTS into the resident frontier too
+        // Carry the winner's child leaf OUTPUTS into the resident frontier too
         // so the §8.3 pick export hands the driver the tree-record `left_output`/`right_output`
         // FRESH (retiring the host `leaves[best_leaf].best.left_output/.right_output` read). The
         // ROOT seed + the NOT-scannable `SplitInfo::none()` path both flow through here; the
@@ -2091,11 +2067,11 @@ where
         is_valid: false,
         ..SplitScalars::default()
     };
-    // SPIKE-077: the winner upload + §8.2 reduce dispatch are async (no readback) — the
+    // The winner upload + §8.2 reduce dispatch are async (no readback) — the
     // REDUCE bucket holds submission time in free-run mode; drain mode books device time here.
     time_phase(&GROW_REDUCE_NS, || {
         let in_slab = crate::kernels::best_split::SplitSoa::from_records(client, &[rec, pad]);
-        // L-1: one device §8.2 reduce dispatch (device→device, NO readback — no bump_sync).
+        // One device §8.2 reduce dispatch (device→device, NO readback — no bump_sync).
         bump_launch();
         let r = backend.frontier_reduce_leaf_device(client, frontier, &in_slab, 1, true, leaf);
         if r.is_ok() {
@@ -2108,9 +2084,9 @@ where
 /// Grow an ENTIRE continuous-feature + L2 tree on a RESIDENT-capable backend by keeping
 /// every leaf's histogram DEVICE-RESIDENT (build/subtract/scan in pool slots), sequenced
 /// in the `SerialTreeLearner` best-first order with the driver's OWN
-/// [`ResidentDriverLeaf`] bookkeeping (24-02, Pattern 1). Bins are uploaded ONCE per grow
+/// [`ResidentDriverLeaf`] bookkeeping. Bins are uploaded ONCE per grow
 /// (`upload_resident_bins`); the row partition still routes on the HOST
-/// (`partition_leaf_stable`, on-device partition is 24-03/24-04). Called from
+/// (`partition_leaf_stable`). Called from
 /// [`grow_tree_on_device_driver_with_cfg`]'s resident capability arm for the NUMERIC
 /// proving slice; the caller guards `features.is_empty()` / `num_leaves < 1` /
 /// hessian-length and demotes categorical to the anchor fold.
@@ -2137,10 +2113,10 @@ where
     let num_data = gradients.len();
     let min_data = cfg.min_data_in_leaf;
 
-    // SPIKE-077: whole-grow wall guard (RAII — a `?` early exit still books the partial
+    // Whole-grow wall guard (RAII — a `?` early exit still books the partial
     // span, keeping wall ≥ Σ(component buckets) invariant for the dump's host_other).
     let _grow_wall = PhaseGuard::new(&GROW_WALL_NS);
-    // SPIKE-077 SETUP: host-side per-grow input shaping (slot offsets, feats/fix_feats
+    // SETUP: host-side per-grow input shaping (slot offsets, feats/fix_feats
     // vectors) + the resident-pool mirror reset. Explicitly dropped before the uploads.
     let setup_guard = PhaseGuard::new(&GROW_SETUP_NS);
 
@@ -2163,7 +2139,7 @@ where
     // - `feats`: the fpos-ORDERED `BatchedSplitFeature` layout that carries BOTH the
     //   FixHistogram+compaction descriptor (num_bin/offset/most_freq_bin) the fused
     //   `build_fix_scan_resident` applies AND the scan dispatch flags. Order-preserving
-    //   returns keep the cross-feature argmax tie-break bit-exact (T-lsx-01); the
+    //   returns keep the cross-feature argmax tie-break bit-exact; the
     //   dispatch flags match `scan_leaf`'s per-feature computation.
     let feature_bins: Vec<&BinColumn> = features.iter().map(|f| &f.bins).collect();
     let num_bins: Vec<u32> = features.iter().map(|f| f.num_bin).collect();
@@ -2192,90 +2168,85 @@ where
     // in the argmax), so all features are scan-active ⇒ the returned Vec is one SplitInfo
     // per feature in fpos order, aligning 1:1 with `feats`/`features` for the argmax.
     let scan_active: Vec<bool> = vec![true; features.len()];
-    // 26-02 (M3/ODP3-02): the fpos-ordered real-feature-index vector — the tie-break KEY the
+    // The fpos-ordered real-feature-index vector — the tie-break KEY the
     // on-device cross-feature argmax (`scan_resident_leaf_argmax` / `scan_resident_siblings_argmax`,
-    // §8.2) folds by, so the winner is bit-identical to the host `argmax_over_splits` (T-lsx-01).
+    // §8.2) folds by, so the winner is bit-identical to the host `argmax_over_splits`.
     let real_feats: Vec<i32> = features.iter().map(|f| f.real_feature_index).collect();
 
     // ---- ONCE per grow: size the device pool mirror (num_leaves slots) + upload the
-    // binned columns to the device (no per-leaf host re-gather — ODP-01/ODP-02). ----
+    // binned columns to the device (no per-leaf host re-gather). ----
     backend.reset_resident_pool(num_leaves as usize, slot_len);
-    drop(setup_guard); // SPIKE-077: end of SETUP.
-    // SPIKE-079 (the spike-078 #1 lever): SKIP the per-grow re-upload of the IMMUTABLE
-    // binned columns when the learner's once-per-train guarded upload is already resident
-    // AND pinned with matching geometry — spike-078 priced this re-upload at 67–78% of the
-    // whole remaining on-device gap on real CUDA. Un-pinned callers (anything that never
+    drop(setup_guard); // End of SETUP.
+    // SKIP the per-grow re-upload of the IMMUTABLE binned columns when the learner's
+    // once-per-train guarded upload is already resident AND pinned with matching
+    // geometry — this re-upload was previously a substantial fraction of the
+    // remaining on-device gap on real CUDA. Un-pinned callers (anything that never
     // ran the learner's guard) take the original upload branch, byte-unchanged.
     if !(ondevice_bin_hoist_enabled() && backend.resident_bins_pinned(features.len(), num_data)) {
-        // L-1/24-05: one REAL per-train device dispatch (the once-per-grow bin upload).
+        // One REAL per-train device dispatch (the once-per-grow bin upload).
         // `reset_resident_pool` sizes a host-side handle mirror (no device launch) and is NOT
         // counted; `upload_resident_bins` moves the binned columns host→device, so it is.
         bump_launch();
-        // SPIKE-077 UPLOAD: the once-per-grow host→device bin upload.
+        // UPLOAD: the once-per-grow host→device bin upload.
         time_phase(&GROW_UPLOAD_NS, || {
             backend.upload_resident_bins(client, &feature_bins);
             grow_drain(client);
         });
     }
 
-    // ---- 26-01 (ODP3-01/M2): ONCE per grow — upload this tree's grad/hess to the device
+    // ---- ONCE per grow: upload this tree's grad/hess to the device
     // (mirror of the once-per-grow `upload_resident_bins`). grad/hess are constant across the
     // whole tree grow, so the resident build gathers each leaf's grad/hess ON DEVICE from
     // these buffers via the leaf-row index (no per-build host `ord_g`/`ord_h` gather +
-    // re-upload — spike-057 M2 / histogram.rs host gather+upload site). This is a single
-    // linear statement (grow runs once per tree, with no loop over it), so it needs no
-    // once-guard flag. Counted as one REAL host→device dispatch (like the bin upload).
-    // (IN-01 25-REVIEW: dropped the vacuous always-true `resident_gradients_uploaded` guard,
-    // which implied control flow that did not exist.) ----
+    // re-upload). This is a single linear statement (grow runs once per tree, with no loop
+    // over it), so it needs no once-guard flag. Counted as one REAL host→device dispatch
+    // (like the bin upload). ----
     bump_launch();
     time_phase(&GROW_UPLOAD_NS, || {
         backend.upload_resident_grad_hess(client, gradients, hessians);
         grow_drain(client);
     });
 
-    // ---- Root init (§6.1, M7/ODP3-03): whole-dataset root grad/hess sum. Routed through
+    // ---- Root init (§6.1): whole-dataset root grad/hess sum. Routed through
     // `backend.root_grad_hess_sum` (the §6.1 `CUDAInitValuesKernel` analog) so the GpuBackend arm
     // runs it on-device (ordered f64 reduction — bit-exact vs the integer path, ~1e-6 vs
-    // host-CUDA, NEVER GPU-f32-vs-GPU-f32 / def-f8u-01), retiring the host f64 root fold on that
+    // host-CUDA, NEVER GPU-f32-vs-GPU-f32), retiring the host f64 root fold on that
     // arm. `root_rows == 0..num_data` in order, so this is the identical ascending fold. ----
-    // 26-03 (M1/M6, ODP3-04): the SINGLE resident permutation buffer for the WHOLE grow — the
+    // The SINGLE resident permutation buffer for the WHOLE grow — the
     // `cuda_data_indices_` mirror. Identity at the root (`0..num_data` in order, so the root build
     // + root grad/hess fold below are the identical ascending order). Every split partitions a
     // leaf's sub-range of THIS buffer in place (`partition_resident_range`); the buffer is never
     // reallocated and no per-leaf `rows: Vec<u32>` is ever cloned.
     let mut perm: Vec<u32> =
         time_phase(&GROW_SETUP_NS, || (0..num_data as u32).collect());
-    // SPIKE-077 ROOTFOLD: post-076 this is the bit-exact HOST anchor fold (spike-075's fix);
-    // its own bucket keeps the 075 root-fold cost visible if a device fold ever returns.
+    // ROOTFOLD: this is the bit-exact HOST anchor fold; its own bucket keeps the
+    // root-fold cost visible if a device fold is ever introduced here.
     let (root_sum_g, root_sum_h) =
         time_phase(&GROW_ROOTFOLD_NS, || backend.root_grad_hess_sum(client, gradients, hessians));
-    // OCX-04 tripwire (spike-072 takeaway (d)): a NaN root seed is the iter-13 corruption
-    // signature — fail loudly HERE rather than grow a 1-leaf tree GBDT's pop-loop truncates.
+    // Fail loudly HERE on a non-finite root seed rather than grow a 1-leaf tree GBDT's
+    // pop-loop would silently truncate.
     check_root_seed_finite(root_sum_g, root_sum_h)?;
-    // Build the ROOT histogram device-resident into slot 0 AND scan it in ONE FUSED
-    // launch (build → fix → compact → scan — 260608-t3t / ODP-03), replacing the 24-02
-    // `build_resident_leaf` + separate `scan_resident_leaf` pair. RAW (un-bumped) sums
-    // feed the FIX (Pitfall 2); the launcher derives the 2*kEpsilon-bumped scan operand
-    // internally. All features are scan-active on the numeric proving slice, so the
-    // returned Vec is one SplitInfo per feature in fpos order. The fixed+compacted f64
-    // Handle is stored into slot 0 so a later split can still subtract from it if the
-    // root becomes a parent. L-1/24-05: one REAL dispatch (the fused root build+scan). The
-    // root has no sibling, so it is ALWAYS fused (co-pack only applies to the split loop's
-    // two children).
-    // spike-056 SWAP (25-01, ODP2-01): the DEFAULT on-device root build now runs the
-    // PARALLEL u64 fixed-point resident build (`build_resident_leaf`) + a separate resident
-    // SCAN, replacing the f64 single-owner `build_fix_scan_resident` fused kernel spike-052
-    // measured at 5.4× worse on real NVIDIA. `build_resident_leaf` stores the fixed+compacted
-    // f64 Handle into slot 0 (identical to what the fused path stored), so a later split can
-    // still subtract from the root. The f64 fused build is reachable ONLY via the
-    // `LGBM_ONDEVICE_F64_FUSED=1` A/B escape hatch (25-02/25-04 side-by-side), NEVER default.
+    // The ROOT histogram is built device-resident into slot 0 and then scanned. The
+    // fixed+compacted f64 Handle is stored into slot 0 so a later split can still
+    // subtract from it if the root becomes a parent. The root has no sibling, so its
+    // build+scan is never co-packed (co-pack only applies to the split loop's two
+    // children).
+    //
+    // DEFAULT: the on-device root build runs the PARALLEL u64 fixed-point resident
+    // build (`build_resident_leaf`) followed by a separate resident SCAN — this
+    // replaced an f64 single-owner `build_fix_scan_resident` fused kernel that measured
+    // substantially slower on real NVIDIA hardware. `build_resident_leaf` stores the
+    // fixed+compacted f64 Handle into slot 0 (identical to what the fused path stored),
+    // so a later split can still subtract from the root. The f64 fused build is
+    // reachable ONLY via the `LGBM_ONDEVICE_F64_FUSED=1` A/B escape hatch, NEVER
+    // default.
     let (root_best, root_fpos) = if on_device_f64_fused_build() {
         // ESCAPE HATCH ONLY (A/B): the old f64 single-owner fused build+scan.
         bump_launch();
         bump_f64_fused();
-        // 26-01/ODP3-07: the fused build+scan reads its SplitInfos back — ONE blocking readback.
+        // The fused build+scan reads its SplitInfos back — ONE blocking readback.
         bump_sync();
-        // SPIKE-077: the f64 fused build+scan is ONE launch — booked to BUILD (escape hatch
+        // The f64 fused build+scan is ONE launch — booked to BUILD (escape hatch
         // only, never the default arm; a nonzero f64_fused counter flags the attribution).
         let root_splits = time_phase(&GROW_BUILD_NS, || {
             backend.build_fix_scan_resident(
@@ -2297,8 +2268,8 @@ where
         argmax_over_splits(&root_splits, &feats, features)
     } else {
         // DEFAULT: parallel-u64 resident BUILD into slot 0, then resident SCAN.
-        bump_launch(); // L-1: one parallel-u64 resident build dispatch.
-        bump_rootbuild_u64(); // ODP2-05: CONVERTED root site ran u64 (positive proof).
+        bump_launch(); // One parallel-u64 resident build dispatch.
+        bump_rootbuild_u64(); // CONVERTED root site ran u64 (positive proof).
         time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
             backend.build_resident_leaf(
                 client,
@@ -2318,7 +2289,7 @@ where
             Ok(())
         })?;
         // `scan_resident_and_argmax` bumps its own scan dispatch + applies the
-        // `!(sum_h>0)||num_data<=0` short-circuit (never fires at the root here). 26-02/M3: the
+        // `!(sum_h>0)||num_data<=0` short-circuit (never fires at the root here). The
         // cross-feature argmax runs on-device via `scan_resident_leaf_argmax` (§8.2).
         scan_resident_and_argmax(
             backend,
@@ -2348,8 +2319,8 @@ where
     // and the LARGER child the parent's slot, so `num_leaves` slots suffice.
     let mut next_slot = 1usize;
 
-    // ---- The device flat tree (Phase-18), pre-allocated once. ----
-    // SPIKE-077: once-per-grow device-struct allocations are SETUP.
+    // ---- The device flat tree, pre-allocated once. ----
+    // Once-per-grow device-struct allocations are SETUP.
     let mut tree = time_phase(&GROW_SETUP_NS, || {
         DeviceCudaTree::<R>::new(client, num_leaves as usize, num_data as i32)
     })?;
@@ -2363,19 +2334,19 @@ where
     );
     tree.add_bias(client, root_output);
 
-    // ---- 28-03 (ODF-01/ODF-05, §8.2/§8.3): the DEVICE-RESIDENT best-first FRONTIER. The
+    // ---- The DEVICE-RESIDENT best-first FRONTIER (§8.2/§8.3). The
     // cross-leaf `best_leaf` pick now runs ON DEVICE — the host `best_leaf_reduce` argmax over a
     // materialized `leaf_bests: Vec<SplitInfo>` collection is RETIRED. Each leaf's winning split
     // is folded into the resident frontier SoA (`reduce_winner_into_frontier` → §8.2, device→device
     // no readback); `frontier_pick_best_leaf_device` (§8.3) picks `best_leaf` into a device slot,
     // self-invalidates the chosen + freshly-created slots, and exports only the ~8-int winner
-    // (the per-iteration host-visible crossing, batched-drained — ODF-04, Task 2). The §8.3
-    // tie-break mirrors the cpu-f64 merge-gate anchor `split_gt` EXACTLY (28-07 WR-01): on an
+    // (the per-iteration host-visible crossing). The §8.3
+    // tie-break mirrors the cpu-f64 merge-gate anchor `split_gt` EXACTLY: on an
     // exact gain tie the LOWER real feature index wins (`-1 ⇒ i32::MAX`), then the lower leaf
     // index — the resident frontier stores the winner's REAL feature index in `feat`
     // (`reduce_winner_into_frontier` folds `real_feat_of(...)` into it), so the device pick and
     // the anchor agree on ties, keeping the resident tree bit-exact to the anchor even when the
-    // corpus DOES tie (ODF-06, the hard merge gate). ----
+    // corpus DOES tie (the hard merge gate). ----
     let frontier =
         time_phase(&GROW_SETUP_NS, || crate::DeviceFrontier::<R>::new(client, num_leaves as usize));
     // Seed the ROOT's winning split into frontier slot 0 so the first device pick sees it.
@@ -2392,7 +2363,7 @@ where
     let mut prev_smaller: i32 = 0;
     let mut prev_larger: i32 = -1;
 
-    // ---- 28-02/28-03 (ODF-02, R2): the DEVICE-RESIDENT child-range struct. Each split's
+    // ---- The DEVICE-RESIDENT child-range struct. Each split's
     // partition (on the on-device arm) writes its child left/right start/end/count into
     // `leaf_splits_dev[leaf_id]` ON DEVICE — the split point stays resident, not a host scalar
     // the grow loop consumes. Allocated once (num_leaves slots), like the frontier. ----
@@ -2400,7 +2371,7 @@ where
         crate::kernels::partition::DeviceLeafSplits::<R>::new(client, num_leaves as usize)
     })?;
 
-    // ---- 31-03 (D-081-1, ODS-02): a real_feature_index -> feature-position (`fpos`) reverse
+    // ---- A real_feature_index -> feature-position (`fpos`) reverse
     // lookup, built ONCE per grow from the immutable `features` slice. The §8.3 pick export
     // carries the winning leaf's REAL feature index (the resident frontier `feat` stores real,
     // via `reduce_winner_into_frontier`); the driver needs the feature POSITION to index
@@ -2414,34 +2385,34 @@ where
         .collect();
 
     // ---- The best-first leaf-wise loop (serial_tree_learner.cpp:218-236): a FIXED
-    // `num_leaves - 1` device schedule (ODF-05), broken early by the device stop signal
+    // `num_leaves - 1` device schedule, broken early by the device stop signal
     // (`best_leaf == -1`) — no host argmax drives which leaf grows next. ----
     for _split in 0..(num_leaves - 1) {
-        // 28-03 (§8.3): pick `best_leaf` ON DEVICE from the resident frontier — the ONLY
+        // (§8.3): pick `best_leaf` ON DEVICE from the resident frontier — the ONLY
         // host-visible crossing this iteration is the ~8-int export (cell [6] = best_leaf, `-1`
         // = the stop signal). `prev_smaller`/`prev_larger` are the previous split's children
         // (the §8.3 self-invalidation targets); their export cells [0..6] are unused here (the
         // driver evaluates children directly, not the CUDA-pipelined smaller/larger prep).
-        // 26-01/ODP3-07: this single export readback is bumped ONCE (batched async drain,
-        // ODF-04); it REPLACES the free host argmax with the device pick, and Task 2 retires the
-        // R3 split readback so the per-grow blocking-sync total does not rise.
+        // This single export readback is bumped ONCE (batched async drain);
+        // it REPLACES the free host argmax with the device pick, and retires a prior
+        // split readback so the per-grow blocking-sync total does not rise.
         let cur_num_leaves = leaves.len();
-        // 28-03 (ODF-04, M4/M5): the per-iteration host crossing is ONE deferred/async drain of
-        // the §8.3 8-int export (the achievable equivalent of the reference's two-stream overlap
-        // — cubecl 0.10 cannot express true per-op multi-stream overlap; see
-        // docs/on-device-streams-M4-M5.md). The device-handle chain build→subtract→scan→§8.2
-        // reduce→§8.3 pick hands off by device handle within the iteration; only this export
-        // reads back, drained through the batched single-drain path the backend advertises.
+        // The per-iteration host crossing is ONE deferred/async drain of
+        // the §8.3 8-int export (the achievable equivalent of overlapping asynchronous work
+        // — cubecl 0.10 cannot express true per-op multi-stream overlap). The device-handle
+        // chain build→subtract→scan→§8.2 reduce→§8.3 pick hands off by device handle within
+        // the iteration; only this export reads back, drained through the batched
+        // single-drain path the backend advertises.
         debug_assert!(
             backend.supports_async_device_copy(),
             "the §8.3 per-iteration best-leaf export relies on cubecl async batched device→host \
              copy (client.read(Vec<Handle>)) for a single-drain crossing (ODF-04, M4/M5)"
         );
-        // L-1: the §8.3 device pick (argmax + self-invalidation + export) is one logical device
+        // The §8.3 device pick (argmax + self-invalidation + export) is one logical device
         // dispatch; its 8-int export is the ONE per-iteration blocking readback (batched drain).
         bump_launch();
         bump_sync();
-        // SPIKE-077 PICK: the §8.3 device pick + its 8-int blocking export — the once-per-
+        // PICK: the §8.3 device pick + its 8-int blocking export — the once-per-
         // iteration sync; in free-run mode it also absorbs queued reduce/treesplit device time.
         let export = time_phase(&GROW_PICK_NS, || {
             backend.frontier_pick_best_leaf_device(
@@ -2456,18 +2427,18 @@ where
         if best_leaf < 0 {
             break;
         }
-        // 31-03 (D-081-1) + 31-08 (ODS-02, the checkpoint-approved full fix): the device frontier
-        // chose WHICH leaf AND now hands back the picked leaf's COMPLETE node record in the SAME
-        // per-iteration export (`export.winner`). Source EVERY tree-record field FRESH from that
-        // export — threshold, default_left, the REAL feature index (→ `fpos` via the reverse
-        // lookup), the 4 child grad/hess sums (kEpsilon-carrying build seeds, Pitfall 2), AND the
-        // node-recording `gain` (NET) + child leaf OUTPUTS (31-08 extended the frontier SoA +
-        // export to carry `gain`/`left_output`/`right_output` device→device). The host cache
-        // `leaves[best_leaf].best`/`.best_fpos` is NO LONGER read here (D-31-B resolved: the full
-        // export means the SCANNED-case cache writes are dead — see the per-split arms below). The
-        // export values are bit-identical to what the old scan-readback cache carried (the reduce
-        // launchers carry the SAME winning feature's raw scan cells the host decode read; net gain
-        // is `(raw - min_gain_shift) * penalty` bit-for-bit), so the tree grown is bit-identical.
+        // The device frontier chose WHICH leaf AND now hands back the picked leaf's
+        // COMPLETE node record in the SAME per-iteration export (`export.winner`). Source
+        // EVERY tree-record field FRESH from that export — threshold, default_left, the
+        // REAL feature index (→ `fpos` via the reverse lookup), the 4 child grad/hess sums
+        // (kEpsilon-carrying build seeds, Pitfall 2), AND the node-recording `gain` (NET) +
+        // child leaf OUTPUTS (the frontier SoA + export carry `gain`/`left_output`/
+        // `right_output` device→device). The host cache `leaves[best_leaf].best`/`.best_fpos`
+        // is NO LONGER read here — the full export means the SCANNED-case cache writes are
+        // dead (see the per-split arms below). The export values are bit-identical to what
+        // the old scan-readback cache carried (the reduce launchers carry the SAME winning
+        // feature's raw scan cells the host decode read; net gain is `(raw - min_gain_shift)
+        // * penalty` bit-for-bit), so the tree grown is bit-identical.
         // `left_count`/`right_count` are recomputed from the partition `split_point` below (they
         // were never read off the cache), so 0 here is inert.
         let w = export.winner; // [feat(real), thr, dleft, lsum_g, lsum_h, rsum_g, rsum_h, gain, lout, rout]
@@ -2501,17 +2472,17 @@ where
         let parent_depth = leaves[best_leaf as usize].depth;
         let parent_slot = leaves[best_leaf as usize].slot;
 
-        // ---- Partition the parent leaf's rows (24-04 Pattern 3, §9). This is the LAST
+        // ---- Partition the parent leaf's rows (§9). This is the LAST
         // per-leaf compute phase; keep the row permutation RESIDENT by routing on-device
-        // via `backend.data_partition_native` (the shipped spike-029 narrow-width
+        // via `backend.data_partition_native` (a narrow-width
         // mark→prefix-sum→scatter) UNLESS the backend prefers the host route. The arm is
-        // chosen by `backend.prefers_host_partition()` (spike-035 default-ON for
+        // chosen by `backend.prefers_host_partition()` (default-ON for
         // `RocmBackend` because on the shared-DDR5 APU the device round-trip is pure
-        // overhead; that calculus may INVERT on real discrete CUDA over PCIe — Assumption
-        // A2, unmeasured). `LGBM_ROCM_HOST_PARTITION=0` forces `prefers_host_partition()`
-        // false → the on-device arm, the A/B device selector the 24-06 Kaggle run decides
-        // between. Both arms produce the SAME stable (left-then-right, original relative
-        // order) partition the cpu f64 anchor produces (Task 2 gate). ----
+        // overhead; that calculus may INVERT on real discrete CUDA over PCIe — this is an
+        // unmeasured assumption). `LGBM_ROCM_HOST_PARTITION=0` forces `prefers_host_partition()`
+        // false → the on-device arm, an A/B device selector. Both arms produce the SAME
+        // stable (left-then-right, original relative order) partition the cpu f64 anchor
+        // produces. ----
         let missing_type_u8 = match f.missing_type {
             MissingType::None => 0u8,
             MissingType::Zero => 1,
@@ -2520,10 +2491,10 @@ where
         let missing_type_code = i32::from(missing_type_u8);
         let new_left = best_leaf;
 
-        // Single-feature-group min_bin convention (CR-01): min_bin + offset.
+        // Single-feature-group min_bin convention: min_bin + offset.
         let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
 
-        // 26-03 (M1/M6, ODP3-04, §9): partition the parent leaf's RESIDENT index sub-range IN
+        // (§9): partition the parent leaf's RESIDENT index sub-range IN
         // PLACE. The parent's global row ids live in `perm[p_begin..p_begin+p_count]`; the
         // partition reorders them into stable left-then-right order (left rows first in original
         // relative order, then right) and the two children become the adjacent sub-ranges
@@ -2535,7 +2506,7 @@ where
         // by `backend.prefers_host_partition()` inside `partition_resident_range`.
         let p_begin = leaves[best_leaf as usize].row_begin;
         let p_count = leaves[best_leaf as usize].row_count;
-        // SPIKE-077 PARTITION: the whole per-split row-routing op (host bin gather + the
+        // PARTITION: the whole per-split row-routing op (host bin gather + the
         // host-fused OR device route + the in-place perm scatter-back).
         let split_point = time_phase(&GROW_PARTITION_NS, || {
             partition_resident_range(
@@ -2554,7 +2525,7 @@ where
         })?;
         let left_count = split_point as i32;
         let right_count = (p_count - split_point) as i32;
-        // IN-01: an out-of-range `best.threshold` would silently record a wrong REAL
+        // An out-of-range `best.threshold` would silently record a wrong REAL
         // threshold — surface a typed error instead (mirrors the anchor branch).
         let real_threshold =
             *f.bin_upper_bound.get(best.threshold as usize).ok_or_else(|| {
@@ -2589,13 +2560,13 @@ where
             right_value: best.right_output,
             num_cat_threshold: 0,
         };
-        // 28-02/28-03 (ODF-02, R3): the NO-READBACK scheduled device tree split — the right
+        // The NO-READBACK scheduled device tree split — the right
         // child leaf id is SUPPLIED by the fixed grow schedule (`leaves.len()`), NOT read back
-        // from the kernel (retires the R3 `right_leaf_index` `bump_sync`). `split_tree_scheduled`
-        // asserts the WR-03 desync invariant (`right == tree.num_leaves`) host-side as a
-        // pre-condition WITHOUT a readback (28-02), so the driver consumes no returned value.
+        // from the kernel (retires a `right_leaf_index` `bump_sync`). `split_tree_scheduled`
+        // asserts the desync invariant (`right == tree.num_leaves`) host-side as a
+        // pre-condition WITHOUT a readback, so the driver consumes no returned value.
         let new_right = leaves.len() as i32;
-        // SPIKE-077 TREESPLIT: the no-readback scheduled device tree mutation (async).
+        // TREESPLIT: the no-readback scheduled device tree mutation (async).
         time_phase(&GROW_TREESPLIT_NS, || -> Result<(), ComputeError> {
             backend.split_tree_scheduled(
                 client,
@@ -2627,8 +2598,8 @@ where
         let right_slot = if smaller_is_left { larger_slot } else { smaller_slot };
 
         // Seed the two child leaves from the SplitInfo (NOT a re-fold): the
-        // kEpsilon-carrying sums are load-bearing for the next split (Pitfall 2). 26-03 (M1/M6):
-        // the children are the adjacent RESIDENT sub-ranges of the parent's just-partitioned span
+        // kEpsilon-carrying sums are load-bearing for the next split (Pitfall 2).
+        // The children are the adjacent RESIDENT sub-ranges of the parent's just-partitioned span
         // (left = `[p_begin, p_begin+split_point)`, right = `[p_begin+split_point, p_begin+p_count)`)
         // — no `rows` Vec is materialized; the resident permutation buffer already holds them.
         {
@@ -2654,13 +2625,13 @@ where
         });
 
         // ---- Build the children histograms device-resident and scan both. ORDER (always,
-        // both arms): build-SMALLER → subtract-LARGER (Pitfall 7 / phase18-wr01 —
+        // both arms): build-SMALLER → subtract-LARGER (Pitfall 7 —
         // `subtract_resident` reads the smaller slot; NEVER defer the smaller BUILD past
         // the subtract). `larger_slot == parent_slot`, so the subtraction overwrites the
         // now-consumed parent Handle with the derived larger child. ----
-        // 26-03 (M1/M6): read the smaller child's rows as a BORROWED slice of the resident
+        // Read the smaller child's rows as a BORROWED slice of the resident
         // permutation buffer (no `rows.clone()`) — the build gathers grad/hess+bins THROUGH this
-        // resident index range (Plan-01 on-device grad/hess gather via `leaf_rows[k]`).
+        // resident index range (on-device grad/hess gather via `leaf_rows[k]`).
         let (s_begin, s_count, s_g, s_h) = {
             let s = &leaves[smaller_leaf as usize];
             (s.row_begin, s.row_count, s.sum_g, s.sum_h)
@@ -2671,7 +2642,7 @@ where
             let l = &leaves[larger_leaf as usize];
             (l.sum_g, l.sum_h, l.row_count as i32)
         };
-        // BeforeFindBestSplit per-leaf gates (WR-04): a too-small / depth-capped /
+        // BeforeFindBestSplit per-leaf gates: a too-small / depth-capped /
         // sum_h<=0 child is not scannable and records `none` (mirrors C++
         // `BeforeFindBestSplit` + the finder's `!(sum_h>0)||num_data<=0` short-circuit).
         let min_data_x2 = min_data.saturating_mul(2);
@@ -2686,13 +2657,13 @@ where
             && l_h > 0.0
             && l_n > 0;
 
-        // CO-PACK (spike-024, ODP-03): default-ON (`LGBM_SIBLING_COPACK != "0"`) when BOTH
+        // CO-PACK: default-ON (`LGBM_SIBLING_COPACK != "0"`) when BOTH
         // siblings are simultaneously resident AND scannable — the smaller slot survives
         // `subtract_resident`, the larger is its derived output, so ONE
         // `scan_resident_siblings` launch (+ ONE readback) scans both. Bit-exact by
         // construction: each feature's sequential scan is identical to the two single-slot
         // scans; only WHICH launch runs it changes ⇒ tree STRUCTURE is unchanged.
-        // WR-01 (25-REVIEW): the f64-fused A/B hatch must actually revert the CHILD builds,
+        // The f64-fused A/B hatch must actually revert the CHILD builds,
         // not just the root. Co-pack (default-ON) otherwise runs the u64 `build_resident_leaf`
         // whenever both siblings are scannable, so `LGBM_ONDEVICE_F64_FUSED=1` alone would
         // leave every smaller child on u64 and contaminate the u64-vs-f64 delta. Gating
@@ -2703,24 +2674,24 @@ where
             && !on_device_f64_fused_build()
             && smaller_scannable
             && larger_scannable;
-        // 31-08 (ODS-02): each arm folds BOTH children's winners DIRECTLY into the resident
+        // Each arm folds BOTH children's winners DIRECTLY into the resident
         // frontier (`frontier.records()` slots `smaller_leaf`/`larger_leaf`). The §8.3 pick
         // self-invalidated the parent (`best_leaf`, reused by the left child) + the freshly-created
         // slot; the reduce launchers RE-SEED those slots. The host `leaves[...].best`/`.best_fpos`
         // cache is NO LONGER written for the scanned case (its only reader, the consumption site
-        // above, now reads the device export) — D-31-B resolved (option b: the export fully sources
-        // the tree record). Only the RESET writes (`l.best = SplitInfo::none()` at leaf creation)
+        // above, now reads the device export) — the export fully sources the tree record. Only
+        // the RESET writes (`l.best = SplitInfo::none()` at leaf creation)
         // remain. The anchor-fold branch (`grow_tree_on_device_driver_with_cfg`, a different
         // function) keeps its own `.best`/`.best_fpos` usage — untouched.
         if use_copack {
-            // CO-PACK arm (default-ON, spike-024): build the SMALLER child resident-ONLY (scan
+            // CO-PACK arm (default-ON): build the SMALLER child resident-ONLY (scan
             // DEFERRED to the co-pack), subtract to derive the LARGER child, then CO-SCAN both and
             // fold EACH sibling's winner DIRECTLY into its frontier slot in ONE launch —
-            // device→device, NO readback (31-08 retires the co-pack per-split scan `bump_sync`,
+            // device→device, NO readback (retires the co-pack per-split scan `bump_sync`,
             // Pitfall 4's MOST commonly hit arm). The precondition guarantees both siblings are
             // scannable, so there is no not-scannable branch. Bit-exact to two
             // `argmax_over_resident_splits` folds + `reduce_winner_into_frontier` on the anchor.
-            bump_launch(); // L-1: one resident build dispatch (scan deferred to co-pack).
+            bump_launch(); // One resident build dispatch (scan deferred to co-pack).
             time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
                 backend.build_resident_leaf(
                     client, smaller_slot, &feature_bins, &num_bins, &slot_off, slot_len,
@@ -2733,13 +2704,13 @@ where
                 smaller_slot, larger_slot,
                 "resident subtract slot aliasing (smaller must own a fresh slot)"
             );
-            bump_launch(); // L-1: one on-device subtraction-trick dispatch.
+            bump_launch(); // One on-device subtraction-trick dispatch.
             time_phase(&GROW_SUBTRACT_NS, || -> Result<(), ComputeError> {
                 backend.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
                 grow_drain(client);
                 Ok(())
             })?;
-            bump_launch(); // L-1: one CO-PACKED 2-slot scan + device fold (NO readback — 31-08).
+            bump_launch(); // One CO-PACKED 2-slot scan + device fold (NO readback).
             time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
                 backend.scan_resident_siblings_into_frontier(
                     client, smaller_slot, larger_slot, slot_len, &feats, &real_feats, cfg,
@@ -2752,7 +2723,7 @@ where
         } else if on_device_f64_fused_build() {
             // f64-fused ESCAPE HATCH (A/B, LGBM_ONDEVICE_F64_FUSED=1): build+fix+compact+scan the
             // smaller child and fold its winner DIRECTLY into the frontier (device→device, NO
-            // readback — 31-08). The BUILD runs UNCONDITIONALLY (required for the subtraction trick
+            // readback). The BUILD runs UNCONDITIONALLY (required for the subtraction trick
             // even when the smaller child is unscannable); when NOT scannable, an all-false scan
             // mask makes every window decode `is_splittable=0` so the frontier slot gets the
             // no-split sentinel (histogram still built for the subtract). Subtract to derive the
@@ -2762,7 +2733,7 @@ where
             } else {
                 vec![false; scan_active.len()]
             };
-            bump_launch(); // L-1: one fused build+fix+compact+scan dispatch (device→device fold).
+            bump_launch(); // One fused build+fix+compact+scan dispatch (device→device fold).
             bump_f64_fused();
             time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
                 backend.build_fix_scan_resident_into_frontier(
@@ -2777,14 +2748,14 @@ where
                 smaller_slot, larger_slot,
                 "resident subtract slot aliasing (smaller must own a fresh slot)"
             );
-            bump_launch(); // L-1: one on-device subtraction-trick dispatch.
+            bump_launch(); // One on-device subtraction-trick dispatch.
             time_phase(&GROW_SUBTRACT_NS, || -> Result<(), ComputeError> {
                 backend.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
                 grow_drain(client);
                 Ok(())
             })?;
             if larger_scannable {
-                bump_launch(); // L-1: one single-slot scan dispatch (device→device fold).
+                bump_launch(); // One single-slot scan dispatch (device→device fold).
                 time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
                     backend.scan_resident_leaf_into_frontier(
                         client, larger_slot, slot_len, &feats, &real_feats, cfg, l_g, l_h, l_n,
@@ -2799,15 +2770,15 @@ where
                 )?;
             }
         } else {
-            // DEFAULT (spike-056, ODP2-01): parallel-u64 resident BUILD of the smaller child,
+            // DEFAULT: parallel-u64 resident BUILD of the smaller child,
             // subtract to derive the larger child, then fold EACH scannable child's winner DIRECTLY
-            // into the frontier (device→device, NO host argmax readback — 31-08 retires the
+            // into the frontier (device→device, NO host argmax readback — retires the
             // per-split scan `bump_sync` the two `scan_resident_and_argmax` calls issued). A
             // NOT-scannable child seeds the no-split sentinel via `reduce_winner_into_frontier`.
             // The BUILD runs UNCONDITIONALLY (required for the subtraction trick even when the
             // smaller child is unscannable — only its scan is skipped).
-            bump_launch(); // L-1: one parallel-u64 resident build dispatch.
-            bump_rootbuild_u64(); // ODP2-05: CONVERTED directly-built site ran u64.
+            bump_launch(); // One parallel-u64 resident build dispatch.
+            bump_rootbuild_u64(); // CONVERTED directly-built site ran u64.
             time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
                 backend.build_resident_leaf(
                     client, smaller_slot, &feature_bins, &num_bins, &slot_off, slot_len,
@@ -2820,14 +2791,14 @@ where
                 smaller_slot, larger_slot,
                 "resident subtract slot aliasing (smaller must own a fresh slot)"
             );
-            bump_launch(); // L-1: one on-device subtraction-trick dispatch.
+            bump_launch(); // One on-device subtraction-trick dispatch.
             time_phase(&GROW_SUBTRACT_NS, || -> Result<(), ComputeError> {
                 backend.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
                 grow_drain(client);
                 Ok(())
             })?;
             if smaller_scannable {
-                bump_launch(); // L-1: one single-slot scan dispatch (device→device fold).
+                bump_launch(); // One single-slot scan dispatch (device→device fold).
                 time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
                     backend.scan_resident_leaf_into_frontier(
                         client, smaller_slot, slot_len, &feats, &real_feats, cfg, s_g, s_h, s_n,
@@ -2842,7 +2813,7 @@ where
                 )?;
             }
             if larger_scannable {
-                bump_launch(); // L-1: one single-slot scan dispatch (device→device fold).
+                bump_launch(); // One single-slot scan dispatch (device→device fold).
                 time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
                     backend.scan_resident_leaf_into_frontier(
                         client, larger_slot, slot_len, &feats, &real_feats, cfg, l_g, l_h, l_n,
@@ -2862,8 +2833,8 @@ where
         prev_larger = larger_leaf;
     }
 
-    // ---- Reconstruct the host tree (Phase-18 to_host_tree) + the row→leaf layout. ----
-    // SPIKE-077 TAIL: `to_host_tree` is a per-grow device READBACK and the layout rebuild is
+    // ---- Reconstruct the host tree (to_host_tree) + the row→leaf layout. ----
+    // TAIL: `to_host_tree` is a per-grow device READBACK and the layout rebuild is
     // O(num_data) host work — previously entirely invisible to phase_prof (a residual suspect).
     let _tail_guard = PhaseGuard::new(&GROW_TAIL_NS);
     let host_tree = tree.to_host_tree(client);
@@ -2871,9 +2842,8 @@ where
     let mut indices = Vec::with_capacity(num_data);
     let mut leaf_begin = Vec::with_capacity(final_leaves);
     let mut leaf_count = Vec::with_capacity(final_leaves);
-    // 26-03 (M1/M6): each leaf's rows are the resident sub-range `perm[row_begin..+row_count]`
-    // (no per-leaf `rows` Vec). Grouping them by leaf-index rebuilds the row→leaf layout exactly
-    // as the pre-26-03 per-leaf `rows` concatenation did.
+    // Each leaf's rows are the resident sub-range `perm[row_begin..+row_count]`
+    // (no per-leaf `rows` Vec). Grouping them by leaf-index rebuilds the row→leaf layout.
     for leaf in leaves.iter().take(final_leaves) {
         leaf_begin.push(indices.len() as i32);
         leaf_count.push(leaf.row_count as i32);
@@ -2885,8 +2855,8 @@ where
         leaf_begin,
         leaf_count,
     };
-    // OCX-04 tripwire: refuse to emit a resident-grown tree with any non-finite leaf value
-    // (the spike-072 tree-4→tree-12 leaf blow-up) — loud typed error over silent truncation.
+    // Refuse to emit a resident-grown tree with any non-finite leaf value —
+    // loud typed error over silent truncation.
     check_tree_leaves_finite(&host_tree)?;
     Ok((host_tree, layout))
 }
@@ -2899,7 +2869,7 @@ mod tests {
     use crate::runtime::cpu_client;
     use crate::CpuBackend;
 
-    /// OCX-04 unit lane (spike-072 takeaway (d)): [`check_root_seed_finite`] is the loud
+    /// Unit lane: [`check_root_seed_finite`] is the loud
     /// tripwire on the seeded root sums — NaN/±inf → typed [`ComputeError::NonFinite`]
     /// naming the sums; a healthy seed is `Ok(())`. Pinned here where the private helper is
     /// reachable (the integration NaN-injection grow lives in
@@ -2923,8 +2893,8 @@ mod tests {
         }
     }
 
-    /// OCX-04 unit lane: [`check_tree_leaves_finite`] is the loud tripwire on the EMITTED
-    /// tree's leaf values (the spike-072 tree-4→tree-12 leaf blow-up). A NaN/±inf leaf value
+    /// Unit lane: [`check_tree_leaves_finite`] is the loud tripwire on the EMITTED
+    /// tree's leaf values. A NaN/±inf leaf value
     /// → typed [`ComputeError::NonFinite`] naming the leaf index; an all-finite tree passes
     /// untouched (the check never mutates the tree).
     #[test]
@@ -2948,13 +2918,13 @@ mod tests {
         }
     }
 
-    /// 26-04 (M4/M5, ODP3-05): the sanctioned deferred-sync single drain
+    /// The sanctioned deferred-sync single drain
     /// [`crate::Backend::read_batched`] returns BYTE-IDENTICAL bytes to reading each handle
     /// separately — it is a pure call-ordering change (one `read_sync` over all handles vs
     /// N), never a numerics change. Pinned on the CpuBackend arm so the deferred-sync-batching
-    /// semantics are verified WITHOUT HIP (the Plan 01–03 cpu-pinning discipline). Also asserts
+    /// semantics are verified WITHOUT HIP. Also asserts
     /// the documented cubecl-0.10 capability boundary the driver relies on: async batched copy
-    /// available, true multi-stream overlap NOT (see `docs/on-device-streams-M4-M5.md`).
+    /// available, true multi-stream overlap NOT.
     #[test]
     fn read_batched_single_drain_matches_per_handle_reads() {
         use crate::Backend;
@@ -2987,7 +2957,7 @@ mod tests {
             "decoded f32 payload survives the single drain unchanged"
         );
 
-        // The documented cubecl-0.10 M4/M5 boundary, encoded in code.
+        // The documented cubecl-0.10 async-copy capability boundary, encoded in code.
         assert!(
             CpuBackend.supports_async_device_copy(),
             "async batched device→host copy is expressible in cubecl 0.10 (client.read(Vec<Handle>))"
@@ -3024,11 +2994,11 @@ mod tests {
         }
     }
 
-    /// 26-02 (Task 1, M3/ODP3-02): the on-device cross-feature argmax reduce
+    /// The on-device cross-feature argmax reduce
     /// ([`argmax_over_resident_splits`], which the GpuBackend `scan_resident_leaf_argmax` delegates
     /// to) returns a winner BIT-IDENTICAL to the host [`argmax_over_splits`] over the SAME resident
-    /// scan — including the strict-`>` gain rule, the lowest-real-feature-index tie-break (Pitfall 5
-    /// / T-lsx-01), and the `na_as_missing` skip. This proves the payload-collapsed device argmax
+    /// scan — including the strict-`>` gain rule, the lowest-real-feature-index tie-break (Pitfall 5),
+    /// and the `na_as_missing` skip. This proves the payload-collapsed device argmax
     /// preserves the exact winner the host selected.
     #[test]
     fn on_device_argmax_reduce_matches_host_argmax_bit_for_bit() {
@@ -3123,13 +3093,13 @@ mod tests {
         );
     }
 
-    /// 26-02 (Task 2, M7/ODP3-03): the cross-leaf best-leaf reduce ([`best_leaf_argmax`], which the
+    /// The cross-leaf best-leaf reduce ([`best_leaf_argmax`], which the
     /// GpuBackend `best_leaf_reduce` delegates to) picks the SAME leaf the host best-first loop
     /// picked — strict-`>` gain, lowest-real-feature-index tie-break, seeded at leaf 0, a no-split
     /// leaf (`real == -1` ⇒ `i32::MAX`) never beating a real split.
     #[test]
     fn on_device_best_leaf_reduce_matches_host_loop() {
-        // Reference host loop (the exact pre-26-02 body).
+        // Reference host loop (the exact prior body).
         let host_pick = |bests: &[SplitInfo], reals: &[i32]| -> i32 {
             let mut best_leaf = 0i32;
             for i in 1..bests.len() {
@@ -3158,9 +3128,9 @@ mod tests {
         }
     }
 
-    /// 26-02 (Task 2, M7/ODP3-03, §6.1): the root grad/hess reduce ([`root_grad_hess_fold`], which
+    /// The root grad/hess reduce (§6.1, [`root_grad_hess_fold`], which
     /// the GpuBackend `root_grad_hess_sum` delegates to) equals the ordered f64 fold the resident
-    /// driver used before 26-02 — BIT-IDENTICAL (ascending row order is load-bearing).
+    /// driver used previously — BIT-IDENTICAL (ascending row order is load-bearing).
     #[test]
     fn root_grad_hess_reduce_matches_ordered_fold() {
         let gradients: Vec<f32> = (0..257).map(|r| (r as f32 - 128.0) * 0.1).collect();
@@ -3176,7 +3146,7 @@ mod tests {
         assert_eq!(rh.to_bits(), sh.to_bits(), "root sum_hessian must be bit-identical to the ordered f64 fold");
     }
 
-    /// W-4 double-bump / missed-bump guard (DEF-07-11-01 class). The driver applies
+    /// Double-bump / missed-bump guard. The driver applies
     /// the SINGLE `+2*kEpsilon` `sum_h` bump before the §8.1 evaluator (mirroring host
     /// `learner.rs:2760`); `best_split.rs` passes through and the evaluator does not
     /// bump. This pins the value the driver hands the evaluator to `raw + 2*kEpsilon`
@@ -3195,7 +3165,7 @@ mod tests {
                 "{name}: driver-supplied sum_h must equal raw + 2*kEpsilon bit-exact (W-4)"
             );
         }
-        // Double-bump / missed-bump guard (DEF-07-11-01 class). At the fixture magnitudes
+        // Double-bump / missed-bump guard. At the fixture magnitudes
         // (40/60) `2*kEpsilon` (2e-15) sits below the f64 ULP (~7e-15), so it is absorbed —
         // faithful to the host, but not a discriminating guard there. Exercise the guard at
         // a magnitude where `2*kEpsilon` IS representable: a single bump must differ from
@@ -3208,7 +3178,7 @@ mod tests {
         assert_ne!(once, twice, "double-bump guard: one bump must differ from two");
     }
 
-    /// Phase-25 (25-03, ODP2-04): the on-device resident §11 `AddPredictionToScore`
+    /// The on-device resident §11 `AddPredictionToScore`
     /// partition scatter ([`add_prediction_to_score_on_device_resident`]) equals the host
     /// leaf-value scatter BIT-FOR-BIT on the cpu-f64 anchor. Builds a hand-rolled
     /// row→leaf [`LeafPartitionLayout`] (rows deliberately out of natural order inside
@@ -3257,10 +3227,10 @@ mod tests {
         }
     }
 
-    /// Open Q1 routing-convention isolation (Pattern 3 / Pitfall 4). The on-device
+    /// Routing-convention isolation (Pitfall 4). The on-device
     /// categorical partition counts MUST equal the host `partition_categorical_stable`
     /// reference for both fixtures' winning bitsets, isolating the real-value-vs-inner-bin
-    /// routing convention as a standalone signal BEFORE the full structure gate (22-05).
+    /// routing convention as a standalone signal BEFORE the full structure gate.
     /// The driver feeds the INNER-bin bitset (the `construct_bitset` over the winning
     /// bins) with `min_bin=0` and `most_freq_bin` supplied — both device and host derive
     /// `offset = (most_freq_bin==0)?1:0` INTERNALLY (== `offset_for_most_freq_bin`), so
@@ -3304,16 +3274,16 @@ mod tests {
         }
     }
 
-    /// WR-03 / CR-01 full-chain regression: a `most_freq_bin == 0 ⇒ offset 1`
+    /// Full-chain regression: a `most_freq_bin == 0 ⇒ offset 1`
     /// categorical feature driven through the WHOLE evaluator → `set_real_threshold`
     /// → `partition_categorical_on_device` chain, pinned to the CATEGORY-MEMBERSHIP
     /// golden (a row routes LEFT iff its raw bin is a winning category; one-hot with
     /// `most_freq_bin == 0` defaults non-members RIGHT). This is independent of the
-    /// router's internal `bin - min_bin + offset` key arithmetic and therefore fails
-    /// under the pre-CR-01 inner bitset (which set bits at the raw winning bin, so
-    /// the router — looking up `bin + 1` for offset 1 — missed every member and sent
-    /// the whole winning category to the WRONG child). No committed fixture covered
-    /// `offset == 1`, which is exactly how CR-01 hid.
+    /// router's internal `bin - min_bin + offset` key arithmetic and therefore catches
+    /// a bug class where an inner bitset that set bits at the raw winning bin (instead
+    /// of the offset-adjusted bin) would miss every member when the router looks up
+    /// `bin + 1` for offset 1, sending the whole winning category to the WRONG child.
+    /// No committed fixture covered `offset == 1`, which is exactly how that bug hid.
     #[test]
     fn categorical_offset1_full_chain_routes_by_membership() {
         use crate::gain::GainConfig;
@@ -3355,7 +3325,7 @@ mod tests {
         let winning_bins: Vec<i32> = r.cat_threshold.iter().map(|&b| b as i32).collect();
         assert_eq!(winning_bins, vec![3], "unique one-hot winner is raw bin 3");
 
-        // Build the inner routing bitset via the (CR-01-fixed) set_real_threshold.
+        // Build the inner routing bitset via set_real_threshold.
         let bin_to_category = [-1, 0, 1, 2]; // bins 0..=3 -> category values.
         let (_real, inner_bitset) =
             set_real_threshold(&winning_bins, &bin_to_category, min_bin, offset);
@@ -3400,13 +3370,13 @@ mod tests {
         assert_eq!(order.len() - split_point, 10, "non-winners route right");
     }
 
-    /// 26-03 (Task 1, M1/M6, ODP3-04): the resident-index in-place partition
+    /// The resident-index in-place partition
     /// ([`partition_resident_range`]) reorders a RESIDENT permutation sub-range into the SAME
     /// stable (left-then-right, original relative order) partition [`partition_leaf_stable`]
     /// produces over the same rows — the row permutation stays a single buffer, partitioned in
     /// place, with NO per-leaf `Vec<u32>` clone and NO local→global `parent_rows` map-back Vec.
     /// This is the cpu-runnable pin of the device-scatter semantics (the resident/rocm runtime
-    /// path is compile-verified + real-hardware deferred, per the Plan-01/02 no-HIP discipline).
+    /// path is compile-verified + real-hardware deferred, per the no-HIP discipline).
     #[test]
     fn resident_range_partition_matches_host_and_tiles_parent() {
         let client = cpu_client();

@@ -1,42 +1,40 @@
-//! Phase-29 29-04 (OCX-04) — the on-device NON-FINITE TRIPWIRE + ZERO-BIN CANARY gates.
+//! On-device NON-FINITE TRIPWIRE + ZERO-BIN CANARY gates.
 //!
-//! # Why this file exists (spike-072 Results 5, method takeaway (d))
+//! # Why this file exists
 //!
-//! Two coverage holes let the spike-072 f32-root-fold corruption ship on the opt-in
-//! on-device path (`LGBM_CUDA_ON_DEVICE=1`):
+//! Two coverage holes could let a numeric corruption ship silently on the opt-in on-device
+//! path (`LGBM_CUDA_ON_DEVICE=1`):
 //!
 //! 1. **No loud failure on NaN.** GBDT's C++-faithful no-split POP-LOOP turns ONE NaN
-//!    boosting iteration into a SILENTLY-truncated model (the observed 13-tree collapse):
-//!    a NaN root grad/hess sum makes the root unscannable, the loop emits a 1-leaf tree,
-//!    GBDT stops, and the DEF-07-13-01 pop-loop repeats the stop — nothing failed loudly.
-//!    An explicit NaN guard would have surfaced the defect five phases earlier.
+//!    boosting iteration into a SILENTLY-truncated model: a NaN root grad/hess sum makes
+//!    the root unscannable, the loop emits a 1-leaf tree, GBDT stops, and the pop-loop
+//!    repeats the stop — nothing failed loudly. An explicit NaN guard surfaces the defect
+//!    immediately instead of shipping a truncated model.
 //!
 //! 2. **No gate watched the forced-empty zero/most-frequent bin.** On a no-exact-zeros
 //!    corpus, `find_bin_with_zero_as_one_bin` carves a dedicated bin for value 0.0 (which
 //!    NO row ever hits ⇒ 0 rows globally), and the `sparse_rate < 0.7` override forces
-//!    `most_freq_bin = default_bin` onto that empty bin (spike-072 items 9–11). Because the
-//!    on-device FixHistogram reconstructs the mfb cell, ANY seed-vs-build disagreement lands
-//!    THERE FIRST — it is a PERFECT seed-vs-build-disagreement detector. 29-03 (OCX-03)
-//!    root-caused + fixed the residue that polluted it; this canary ARMS that cell as a
-//!    committed gate so any FUTURE disagreement fails a named test.
+//!    `most_freq_bin = default_bin` onto that empty bin. Because the on-device FixHistogram
+//!    reconstructs the mfb cell, ANY seed-vs-build disagreement lands THERE FIRST — it is a
+//!    PERFECT seed-vs-build-disagreement detector. This canary ARMS that cell as a committed
+//!    gate so any FUTURE disagreement fails a named test.
 //!
-//! # What this file lands (Tasks 1 + 2)
+//! # What this file lands
 //!
-//! - **Task 1 — the non-finite tripwire** (driver-side, `grow_driver.rs`): a NaN root seed
+//! - **The non-finite tripwire** (driver-side, `grow_driver.rs`): a NaN root seed
 //!   or a non-finite emitted leaf value now returns a typed `ComputeError::NonFinite`, which
 //!   the learner seam propagates (`?`) as a training failure instead of a truncated
 //!   `Ok(tree)`. Tested here on the cpu ANCHOR lane (the driver's f64 arm). The tripwire
 //!   lives ONLY on the on-device grow return path — GBDT's pop-loop (in `lgbm-boosting`) is
-//!   NOT touched (29-CONTEXT locked rule; its bit-faithful semantics are the merge gate).
+//!   NOT touched (its bit-faithful semantics are the merge gate).
 //!
-//! - **Task 2 — the zero-bin canary**: on a forced-empty-mfb corpus (precondition ASSERTED:
+//! - **The zero-bin canary**: on a forced-empty-mfb corpus (precondition ASSERTED:
 //!   the mfb bin has 0 global rows — the canary self-validates its trap is armed), the mfb
 //!   cell stays EXACTLY 0 across every resident-histogram slot class the on-device grow
 //!   produces — root build, subtract-derived larger child, and both co-pack sibling slots —
 //!   plus down a subtract SPINE (num_leaves ≥ 8 spirit). A failure here means seed-vs-build
-//!   disagreement re-entered the resident chain (see `29-REDUCTION-AUDIT.md` /
-//!   `29-SUBTRACT-RESIDUE.md`). NON-UNIFORM (binary-logloss-like) hessians make the canary
-//!   sensitive to the exact f32-bias class that hid at uniform 0.25 (spike-072 item 13).
+//!   disagreement re-entered the resident chain. NON-UNIFORM (binary-logloss-like) hessians
+//!   make the canary sensitive to the exact f32-bias class that can hide at uniform values.
 //!
 //! # Two lanes (mirrors `on_device_integer_anchor.rs` / `on_device_subtract_residue.rs`)
 //!   - **cpu ANCHOR lane (always runnable):** the driver's f64 fold arm + the generic-over-R
@@ -44,8 +42,8 @@
 //!     Canary tolerance is EXACTLY 0.0 (the f64 fold never touches a globally-empty bin, and
 //!     `x − x = +0.0` for identical zero cells — the ordered-f64/integer-exact anchor chain).
 //!   - **rocm RESIDENT lane (`#[cfg(feature = "rocm")]`, hardware-only):** the SAME chain on
-//!     the hip client, PLUS `fix_compact_f64_on` (the resident u64 FixHistogram 29-03 fixed),
-//!     at the 29-03 disposition bound (exactly 0 for a forced-empty cell at all scales).
+//!     the hip client, PLUS `fix_compact_f64_on` (the resident u64 FixHistogram), at the
+//!     disposition bound (exactly 0 for a forced-empty cell at all scales).
 
 use lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver;
 use lgbm_compute::kernels::histogram::construct_histograms_f64_on;
@@ -105,15 +103,15 @@ fn dominant_corpus(num_features: usize, num_bin: u32, num_data: usize) -> (Vec<G
     (features, gradients, hessians)
 }
 
-/// Task 1 — NaN-injection: growing on the on-device arm with a NaN gradient FAILS LOUDLY
+/// NaN-injection: growing on the on-device arm with a NaN gradient FAILS LOUDLY
 /// with a typed `ComputeError::NonFinite` naming the non-finite quantity — no `Ok(tree)`
-/// escapes. This is the spike-072 iter-13 signature (a NaN grad/hess seed) that GBDT's
-/// pop-loop would otherwise turn into a silently-truncated model.
+/// escapes, guarding against a NaN grad/hess seed that GBDT's pop-loop would otherwise
+/// turn into a silently-truncated model.
 #[test]
 fn nan_gradient_grow_fails_loudly() {
     let client = cpu_client();
     let (features, mut gradients, hessians) = dominant_corpus(3, 64, 512);
-    // Inject a single NaN gradient — the root f64 fold sums to NaN (the iter-13 fingerprint).
+    // Inject a single NaN gradient — the root f64 fold sums to NaN.
     gradients[123] = f32::NAN;
 
     let result =
@@ -135,7 +133,7 @@ fn nan_gradient_grow_fails_loudly() {
     }
 }
 
-/// Task 1 — healthy path: a normal grow is UNAFFECTED by the read-only tripwire. It returns
+/// Healthy path: a normal grow is UNAFFECTED by the read-only tripwire. It returns
 /// `Ok`, grows a real multi-leaf tree, and every emitted leaf value is finite (the tripwire
 /// never mutates the tree, so the output is byte-identical to the pre-tripwire driver).
 #[test]
@@ -155,7 +153,7 @@ fn healthy_grow_returns_finite_tree() {
 }
 
 // ===========================================================================
-// Task 2 — the ZERO-BIN CANARY (both lanes)
+// The ZERO-BIN CANARY (both lanes)
 //
 // The mfb/default cell of a forced-empty bin must stay ~0 across every resident-histogram
 // slot class. This exercises the SHARED f64 build + subtract kernels (generic over the
@@ -163,7 +161,7 @@ fn healthy_grow_returns_finite_tree() {
 // `fix_compact_f64_on` FixHistogram (the exact site 29-03 fixed).
 // ===========================================================================
 
-/// The forced-empty most-frequent bin (spike-072 item 10): a dedicated bin index that NO row
+/// The forced-empty most-frequent bin: a dedicated bin index that NO row
 /// ever maps to (`find_bin_with_zero_as_one_bin` + the `sparse_rate < 0.7` mfb override).
 const CANARY_MFB: usize = 3;
 const CANARY_NUM_BIN: u32 = 8;
@@ -228,14 +226,13 @@ macro_rules! run_zero_bin_canary {
     assert!(sg.abs() <= tol && sh.abs() <= tol, "co-pack SMALLER mfb cell must be ~0, got (g={sg}, h={sh})");
 
     // ---- SUBTRACT-DERIVED larger child (slot class 2: larger = root − smaller). The other
-    // co-pack sibling slot. This is the class the spike-072 ~0.36 phantom rode. ----
+    // co-pack sibling slot. ----
     let larger = subtract_histograms_f64_on(client, &root, &smaller).expect("subtract-derived larger child");
     let (dg, dh) = mfb_cell(&larger);
     assert!(dg.abs() <= tol && dh.abs() <= tol, "SUBTRACT-DERIVED larger-child mfb cell must be ~0, got (g={dg}, h={dh})");
 
     // ---- SUBTRACT SPINE (num_leaves ≥ 8 spirit): derive down a chain of larger children,
-    // asserting the mfb cell never accumulates residue along the spine (spike-072 leaf-16 was
-    // a subtract-derived larger child on the right-spine slot-0 chain). ----
+    // asserting the mfb cell never accumulates residue along the spine. ----
     let mut parent = larger;
     for level in 0..6 {
         // Split the parent's live bins again; build the smaller side and subtract.
@@ -251,9 +248,9 @@ macro_rules! run_zero_bin_canary {
     }
 
     // ---- ARMED-TRAP self-validation: prove the canary CAN detect pollution. Inject a
-    // δ = 0.37 phantom into the ROOT mfb cell (the spike-072-class residue) and subtract a
-    // clean zero-mfb child — the derived cell must carry δ through, so the |·| ≤ tol
-    // assertion above WOULD fire on a real regression. ----
+    // δ = 0.37 phantom into the ROOT mfb cell and subtract a clean zero-mfb child — the
+    // derived cell must carry δ through, so the |·| ≤ tol assertion above WOULD fire on
+    // a real regression. ----
     let mut polluted = root.clone();
     let delta = 0.37f64;
     polluted[2 * CANARY_MFB] += delta; // phantom g
@@ -268,19 +265,18 @@ macro_rules! run_zero_bin_canary {
     }};
 }
 
-/// Task 2 (cpu anchor lane) — the zero-bin canary at EXACTLY-0.0 tolerance on the cubecl-cpu
-/// client (the ordered-f64 / integer-exact anchor chain). See the module header for the
-/// seed-vs-build-disagreement semantics (spike-072 items 9–11; 29-SUBTRACT-RESIDUE.md).
+/// The zero-bin canary at EXACTLY-0.0 tolerance on the cubecl-cpu client (the ordered-f64 /
+/// integer-exact anchor chain). See the module header for the seed-vs-build-disagreement
+/// semantics.
 #[test]
 fn zero_bin_canary_cpu_anchor_exact_zero() {
     let client = cpu_client();
     run_zero_bin_canary!(&client, 0.0);
 }
 
-/// Task 2 (rocm resident lane) — the SAME canary on the hip client, PLUS the resident u64
-/// `fix_compact_f64_on` FixHistogram (the exact site 29-03 fixed). Tolerance = the 29-03
-/// disposition bound: EXACTLY 0 for a forced-empty cell at all scales (the built cell is
-/// preserved, not reconstructed from the row-order seed).
+/// The SAME canary on the hip client, PLUS the resident u64 `fix_compact_f64_on`
+/// FixHistogram. Tolerance: EXACTLY 0 for a forced-empty cell at all scales (the built
+/// cell is preserved, not reconstructed from the row-order seed).
 #[cfg(feature = "rocm")]
 #[test]
 fn zero_bin_canary_rocm_resident() {
@@ -288,13 +284,13 @@ fn zero_bin_canary_rocm_resident() {
     use lgbm_compute::runtime::rocm_client;
 
     let client = rocm_client();
-    // 29-03 disposition bound: exactly 0 for a forced-empty cell at all scales.
+    // Disposition bound: exactly 0 for a forced-empty cell at all scales.
     run_zero_bin_canary!(&client, 0.0f64);
 
     // ---- The RESIDENT u64 FixHistogram slot (build+fix): a raw histogram with the mfb cell
     // built as exactly 0 and a leaf seed that DISAGREES with the built total by δ must still
-    // leave the mfb cell EXACTLY 0 (29-03: preserve the built cell, do NOT reconstruct from
-    // the seed). This is the resident-path guard the cpu lane cannot exercise. ----
+    // leave the mfb cell EXACTLY 0 (preserve the built cell, do NOT reconstruct from the
+    // seed). This is the resident-path guard the cpu lane cannot exercise. ----
     let num_bin = CANARY_NUM_BIN;
     let mfb = CANARY_MFB as u32;
     let raw: Vec<f32> = {
@@ -318,7 +314,7 @@ fn zero_bin_canary_rocm_resident() {
     let (fg, fh) = mfb_cell(&fixed);
     assert_eq!((fg, fh), (0.0, 0.0), "resident FixHistogram: self-consistent seed must leave mfb exactly 0");
 
-    // Offset seed (δ=0.37) → STILL exactly 0 (the 29-03 fix: the built cell is preserved).
+    // Offset seed (δ=0.37) → STILL exactly 0 (the built cell is preserved, not the seed).
     let fixed_off = fix_compact_f64_on(&client, &raw, &feats, built_g + 0.37, built_h + 0.37)
         .expect("fix (offset seed)");
     let (og, oh) = mfb_cell(&fixed_off);

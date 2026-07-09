@@ -1,38 +1,37 @@
-//! On-device data partition — `mark → prefix-sum → scatter` (§9, ODL-13).
+//! On-device data partition — `mark → prefix-sum → scatter` (§9).
 //!
-//! The NEW §9-faithful device data-partition path, PARALLEL to the shipped
-//! host-gather [`crate::kernels::partition`] (D-01, never rebuilt/extended). It
+//! The §9-faithful device data-partition path, PARALLEL to the shipped
+//! host-gather [`crate::kernels::partition`] (never rebuilt/extended). It
 //! reproduces the reference `GenDataToLeftBitVector → PrepareOffset →
 //! AggregateBlockOffset → SplitInner → CopyDataIndices` pipeline as a
 //! `mark → prefix-sum → scatter` row permutation — NEVER sorting (§17). Row order
 //! fixes per-leaf f32 accumulation order, so the post-scatter permutation must
-//! match the reference bit-for-bit (D-04 CONFIRMED: the reference block-tiled
-//! scatter is order-equivalent to a plain single-owner stable partition).
+//! match the reference bit-for-bit (the reference block-tiled scatter is
+//! order-equivalent to a plain single-owner stable partition).
 //!
-//! ## What lives here (18-02, ODL-13)
+//! ## What lives here
 //! - [`route_to_left`] — the shared `pub(crate) #[cube]` numeric route decision
-//!   (the full comptime flag fan-out, D-02), using branchless `select` stores
-//!   only (SP-2, cubecl-cpu MLIR constraint). SINGLE SOURCE both the mark kernel
-//!   here and the 18-04 predict tree-walk call (Pitfall 4).
+//!   (the full comptime flag fan-out), using branchless `select` stores
+//!   only (cubecl-cpu MLIR constraint). SINGLE SOURCE both the mark kernel
+//!   here and the predict tree-walk call (Pitfall 4).
 //! - [`find_in_bitset`] + [`route_to_left_categorical`] — the shared categorical
-//!   membership route (D-03), also `pub(crate)` for 18-04 reuse.
+//!   membership route, also `pub(crate)` for reuse by the predict path.
 //! - [`gen_data_to_left_kernel`] / [`gen_data_to_left_categorical_kernel`] — the
 //!   per-row native-width (u8/u16/u32) mark kernels.
 //! - [`split_inner_scatter_kernel`] — the `SplitInner`/`CopyDataIndices` scatter,
 //!   deriving the exclusive left rank from the inclusive scan `[tid-1]`
-//!   (Pitfall 2), preserving the `global_thread_index < num_data_in_leaf` guard
-//!   (T-18-01).
+//!   (Pitfall 2), preserving the `global_thread_index < num_data_in_leaf` guard.
 //! - [`update_data_index_to_leaf_kernel`] — `UpdateDataIndexToLeafIndex`
 //!   (row→leaf map, consuming `right_leaf_index`, the §1/§10 ordering invariant).
 //! - [`partition_leaf_stable`] / [`partition_categorical_stable`] — the cpu f64
-//!   stable-partition ANCHOR (D-04 CONFIRMED, never GPU-vs-GPU, D-12).
+//!   stable-partition anchor, never GPU-vs-GPU.
 //! - [`partition_on_device`] / [`partition_categorical_on_device`] — the full
 //!   device `mark → prefix-sum → scatter` fold on any runtime.
 //! - [`SplitPacket`] / [`split_tree_structure_packet`] — the 16-int
-//!   `SplitTreeStructure` child-stats packet (D-08).
+//!   `SplitTreeStructure` child-stats packet.
 //!
-//! Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE` (D-13); anchored to
-//! the cubecl-cpu f64 fold (D-12), never GPU-vs-GPU.
+//! Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE`; anchored to
+//! the cubecl-cpu f64 fold, never GPU-vs-GPU.
 
 use cubecl::prelude::*;
 
@@ -42,15 +41,15 @@ use crate::kernels::split_info::SplitScalars;
 use crate::BinColumn;
 
 // =========================================================================
-// Shared route decision (D-02 numeric / D-03 categorical) — the SINGLE SOURCE
-// both the partition mark kernel and the 18-04 predict tree-walk call.
+// Shared route decision (numeric / categorical) — the SINGLE SOURCE
+// both the partition mark kernel and the predict tree-walk call.
 // =========================================================================
 
 /// The shared numeric route decision — returns `1` if the row routes LEFT
 /// (`lte`), `0` if RIGHT (`gt`). Transcribes the VERBATIM `SplitInner` full flag
 /// fan-out (`dense_bin.hpp:314-394` + the `Split()` dispatcher :405-421, mirrored
 /// by `xtask/cpp/kernel_capture.cpp::SplitRouteFanout`) with the seven comptime
-/// flags (D-02). Uses **branchless `select` stores only** (SP-2): the comptime
+/// flags. Uses **branchless `select` stores only**: the comptime
 /// bools are folded to `i32` consts (`mz`/`mna`/`ftm`/`mdt`) at the top, and every
 /// per-row branch is a `select`, so there is no nested-if mutation chain
 /// (cubecl-cpu MLIR constraint).
@@ -130,8 +129,8 @@ pub(crate) fn route_to_left(
 
 /// Shared bitset membership test (`Common::FindInBitset`, `common.h:836-843`;
 /// mirrored by `kernel_capture.cpp::FindInBitsetHost`). Returns `1` if bit `pos`
-/// is set, `0` otherwise. Preserves the `pos/32 >= n → 0` bound check (T-18-03,
-/// bitset OOB); `pub(crate)` for the 18-04 predict cat branch. Branchless: the
+/// is set, `0` otherwise. Preserves the `pos/32 >= n → 0` bound check (bitset
+/// OOB); `pub(crate)` for the predict cat branch. Branchless: the
 /// out-of-range word index is clamped to `0` (the bitset is non-empty, `n >= 1`)
 /// and the result forced to `0` via `select` — no divergent control flow.
 #[cube]
@@ -145,7 +144,7 @@ pub(crate) fn find_in_bitset(bits: &Array<u32>, n: u32, pos: u32) -> u32 {
 /// The shared categorical route decision — returns `1` if the row routes LEFT
 /// (member), `0` if RIGHT (non-member). Transcribes the VERBATIM
 /// `SplitCategoricalInner<USE_MIN_BIN=true>` (`dense_bin.hpp:450-483`, mirrored by
-/// `kernel_capture.cpp::SplitCategoricalRoute`, D-03): membership via
+/// `kernel_capture.cpp::SplitCategoricalRoute`): membership via
 /// `FindInBitset(bitset, bin − min_bin + offset)` with `offset = (mfb == 0) ? 1 :
 /// 0`, and the out-of-[min,max] rows folding to the default direction
 /// (`most_freq_bin > 0 && member(most_freq_bin)` ⇒ lte). Branchless `select`.
@@ -183,7 +182,7 @@ pub(crate) fn route_to_left_categorical(
 /// mark. One unit PER ROW (`ABSOLUTE_POS`); reads the native-width bin
 /// (u8/u16/u32 via the `<B: Int>` monomorph, `u32::cast_from`) and writes
 /// `to_left[i] ∈ {0,1}` via the shared [`route_to_left`] decision. Bounds-guarded
-/// (`i < bins.len()`, T-18-01).
+/// (`i < bins.len()`).
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gen_data_to_left_kernel<B: Int>(
@@ -252,10 +251,10 @@ pub(crate) fn gen_data_to_left_categorical_kernel<B: Int>(
 /// strictly before `i` (the inclusive-scan `[tid-1]` derivation, Pitfall 2). Left
 /// rows land at `out[rank]`; right rows at `out[to_left_total + (i − rank)]`
 /// (`i − rank` = the exclusive count of right rows before `i`). The
-/// `global_thread_index < n` guard is preserved (T-18-01); each unit writes ONE
+/// `global_thread_index < n` guard is preserved; each unit writes ONE
 /// disjoint destination (no atomics). The result is a plain stable partition
 /// (left rows in original order, then right rows in original order), byte-equal to
-/// the cpu f64 anchor (D-04 CONFIRMED).
+/// the cpu f64 anchor.
 #[cube(launch)]
 fn split_inner_scatter_kernel(
     data_indices: &Array<u32>,
@@ -300,7 +299,7 @@ fn update_data_index_to_leaf_kernel(
 }
 
 // =========================================================================
-// cpu f64 stable-partition ANCHOR (D-04 CONFIRMED — plain stable partition).
+// cpu f64 stable-partition ANCHOR (plain stable partition).
 // =========================================================================
 
 /// The comptime flag fan-out derived from the runtime split params, EXACTLY as
@@ -344,7 +343,7 @@ impl RouteFlags {
 
 /// Plain-Rust mirror of [`route_to_left`] — the host anchor's per-row decision.
 /// Bit-identical integer routing (returns `true` for LEFT/lte). Kept as a separate
-/// transcription so the cpu f64 anchor never launches a kernel (D-12).
+/// transcription so the cpu f64 anchor never launches a kernel.
 #[allow(clippy::too_many_arguments)]
 fn route_left_host(
     bin: i32,
@@ -436,7 +435,7 @@ fn route_left_categorical_host(
     route == 0
 }
 
-/// Validate the split params at the host boundary (SP-4 / T-18-02) before any
+/// Validate the split params at the host boundary before any
 /// `launch`. Rejects `num_bin == 0`, `threshold >= num_bin`, any `bin >= num_bin`,
 /// and a `data_indices`/`bins` length mismatch.
 fn validate_partition(
@@ -470,7 +469,7 @@ fn validate_partition(
     Ok(())
 }
 
-/// The cpu f64 stable-partition ANCHOR (D-04 CONFIRMED) — numeric route. Over the
+/// The cpu f64 stable-partition ANCHOR — numeric route. Over the
 /// leaf's `data_indices` slice, left-keepers appear first in original relative
 /// order, then right-keepers in original relative order; `split_point` =
 /// `count(route_left)`. `bins[i]` is the bin of the row `data_indices[i]`.
@@ -516,8 +515,8 @@ pub fn partition_leaf_stable(
     Ok((left, split_point))
 }
 
-/// OHP-01 — the fused-gather sibling of [`partition_leaf_stable`] (spike-027/032
-/// one-gather pattern, confined to `lgbm-compute`). Reads `bins.bin(data_indices[i])`
+/// The fused-gather sibling of [`partition_leaf_stable`] (a one-gather pattern,
+/// confined to `lgbm-compute`). Reads `bins.bin(data_indices[i])`
 /// INLINE through the resident index range — NO pre-materialized `bins_sub` gather /
 /// `BinColumn::new` re-narrow — folding the per-row `bin >= num_bin` range check into
 /// the SINGLE route pass. `bins` is the FULL feature column (indexed by GLOBAL row);
@@ -533,7 +532,7 @@ pub fn partition_leaf_stable(
 ///
 /// The `validate_partition` `data_indices.len() == bins.len()` check is DROPPED here
 /// (invalid — `bins` is the full column, `data_indices` a leaf sub-range); the per-row
-/// `bin >= num_bin` guard folded into pass 1 preserves the T-18-02 boundary validation
+/// `bin >= num_bin` guard folded into pass 1 preserves the boundary validation
 /// and reports the lowest offending sub-range index, leaving the output unmutated.
 ///
 /// # Errors
@@ -594,7 +593,7 @@ pub fn partition_leaf_stable_fused(
     Ok((left, split_point))
 }
 
-/// The cpu f64 stable-partition ANCHOR — categorical membership route (D-03).
+/// The cpu f64 stable-partition ANCHOR — categorical membership route.
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] if `num_bin == 0`; [`ComputeError::LengthMismatch`]
@@ -658,7 +657,7 @@ fn scan_block_size(n: usize) -> u32 {
 }
 
 /// Run the `mark → prefix-sum → scatter` device permutation over a marked
-/// `to_left[]`, reusing the 18-01 u32 exclusive (`AggregateBlockOffset`) + u16
+/// `to_left[]`, reusing the u32 exclusive (`AggregateBlockOffset`) + u16
 /// inclusive (`PrepareOffset`) scans and the [`split_inner_scatter_kernel`]. The
 /// caller supplies `to_left` (from a numeric/categorical mark). Returns
 /// `(reordered, split_point)` — the stable permutation of `data_indices`.
@@ -679,7 +678,7 @@ fn scatter_marked<R: cubecl::Runtime>(
 
     // PrepareOffset (u16 INCLUSIVE): incl[i] = # left rows in [0, i]. Bit-exact
     // cross-check of the [tid-1] inclusive↔exclusive relation (Pitfall 2). Guarded
-    // to n <= 65535 for the u16 cell width. IN-02: this scan feeds ONLY the
+    // to n <= 65535 for the u16 cell width. This scan feeds ONLY the
     // debug_assert below, so the whole block is compiled out of release builds — it
     // must never launch three extra kernels per partition in a release run.
     #[cfg(debug_assertions)]
@@ -704,7 +703,7 @@ fn scatter_marked<R: cubecl::Runtime>(
     // SAFETY: every input handle is sized exactly `n` u32 cells and outlives the
     // launch; the kernel bounds-guards `i < n` and each unit writes ONE disjoint
     // `out[dest]` with `dest ∈ [0, n)` (a permutation index). cubecl unsafe
-    // confined here (CMP-01 / T-18-01).
+    // confined here.
     unsafe {
         split_inner_scatter_kernel::launch::<R>(
             client,
@@ -726,8 +725,8 @@ fn scatter_marked<R: cubecl::Runtime>(
 
 /// The full device numeric `mark → prefix-sum → scatter` fold (any runtime). Runs
 /// [`gen_data_to_left_kernel`] (native-width dispatch) then [`scatter_marked`].
-/// Returns a `(reordered, split_point)` BYTE-EQUAL to [`partition_leaf_stable`]
-/// (D-04). Anchored to the cpu f64 fold, never GPU-vs-GPU (D-12).
+/// Returns a `(reordered, split_point)` BYTE-EQUAL to [`partition_leaf_stable`].
+/// Anchored to the cpu f64 fold, never GPU-vs-GPU.
 ///
 /// # Errors
 /// As [`partition_leaf_stable`].
@@ -862,7 +861,7 @@ fn mark_categorical<R: cubecl::Runtime>(
             let h_bins = client.create_from_slice(<$w>::as_bytes($slice));
             // SAFETY: `h_bins` sized `n` native cells, `h_to_left` `n` u32, `h_bitset`
             // `bitset.len()`; all outlive the launch; kernel guards `i < n` and
-            // `find_in_bitset` guards the word index (T-18-03).
+            // `find_in_bitset` guards the word index.
             unsafe {
                 gen_data_to_left_categorical_kernel::launch::<$w, R>(
                     client,
@@ -950,7 +949,7 @@ pub fn update_data_index_to_leaf_on<R: cubecl::Runtime>(
 }
 
 // =========================================================================
-// 16-int SplitTreeStructure child-stats packet (D-08).
+// 16-int SplitTreeStructure child-stats packet.
 // =========================================================================
 
 /// The 16-int `cuda_split_info_buffer` (`SplitTreeStructureKernel:799-825`) — 8
@@ -966,7 +965,7 @@ pub struct SplitPacket {
     pub sums: [f64; 4],
 }
 
-/// Pack the 16-int `SplitTreeStructure` child-stats packet (D-08). The per-side
+/// Pack the 16-int `SplitTreeStructure` child-stats packet. The per-side
 /// sums are read from [`SplitScalars`] (the `CUDASplitInfo` record); `smaller`/
 /// `larger` follow the `left_num < right_num` branch (`cuda_data_partition.cu:823`).
 #[must_use]
@@ -1020,7 +1019,7 @@ mod tests {
         assert_eq!(order, vec![0, 2, 4, 6, 1, 3, 5, 7]);
     }
 
-    // The device fold must be BYTE-EQUAL to the anchor (D-04), never GPU-vs-GPU.
+    // The device fold must be BYTE-EQUAL to the anchor, never GPU-vs-GPU.
     #[test]
     fn device_matches_anchor_basic() {
         let client = cpu_client();
@@ -1085,7 +1084,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // OHP-01: partition_leaf_stable_fused must be BYTE-IDENTICAL to
+    // partition_leaf_stable_fused must be BYTE-IDENTICAL to
     // partition_leaf_stable(&gathered_bins, ...) on every fan-out corpus + edge.
     // ---------------------------------------------------------------------
 

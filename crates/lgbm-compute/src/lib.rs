@@ -1,11 +1,10 @@
-//! `lgbm-compute` — the single CubeCL isolation seam (CMP-01).
+//! `lgbm-compute` — the single CubeCL isolation seam.
 //!
 //! This crate exists to confine all `cubecl` type names and API churn to one
 //! place so the alpha-stage CubeCL surface can evolve without leaking into
-//! `lgbm-core` or any other crate. Phase 4 fills the Phase-1 kernel-free
-//! skeleton with the compute foundation: a typed [`ComputeError`] boundary, a
-//! cpu/rocm runtime selection + startup capability gate ([`runtime`]), and the
-//! first `#[cube]` histogram kernel ([`kernels`]).
+//! `lgbm-core` or any other crate. It provides the compute foundation: a typed
+//! [`ComputeError`] boundary, a cpu/rocm runtime selection + startup capability
+//! gate ([`runtime`]), and the first `#[cube]` histogram kernel ([`kernels`]).
 //!
 //! Downstream crates should depend only on the [`Backend`] abstraction (and the
 //! re-exported [`ComputeError`]), never on `cubecl` directly — that is the whole
@@ -23,10 +22,10 @@ pub use device_objective::{device_objective_supported, DeviceObjectiveKind};
 pub use error::ComputeError;
 pub use gain::{GainConfig, SplitInfo};
 pub use kernels::grow_driver::GrowFeature;
-// Phase-25 (25-03, ODP2-04, §11): the on-device resident `AddPredictionToScore`
-// partition scatter applied after an on-device grow (the score half of the on-device
-// perf fix). Re-exported at the crate root so the `boosting_on_cuda_` resident-score
-// seam reaches it without spelling the full `kernels::grow_driver` path.
+// The on-device resident `AddPredictionToScore` partition scatter applied after an
+// on-device grow (the score half of the on-device perf fix). Re-exported at the crate
+// root so the `boosting_on_cuda_` resident-score seam reaches it without spelling the
+// full `kernels::grow_driver` path.
 pub use kernels::grow_driver::add_prediction_to_score_on_device_resident;
 pub use kernels::grow_driver::read_handle_f32;
 pub use kernels::grow_driver::ResidentScore;
@@ -36,7 +35,7 @@ pub use kernels::split::BatchedSplitFeature;
 /// Re-export of the cubecl device buffer [`Handle`](cubecl::server::Handle) so
 /// downstream crates (e.g. `lgbm-boosting`) can name the resident device buffers
 /// (the resident score / grad / hess Handles the on-device grad/hess path returns)
-/// WITHOUT depending on `cubecl` directly — preserving the CMP-01 containment
+/// WITHOUT depending on `cubecl` directly — preserving the containment
 /// boundary. `Handle` is a cheaply-clonable, ref-counted handle to a device
 /// allocation; it names no runtime.
 pub use cubecl::server::Handle;
@@ -46,13 +45,13 @@ use cubecl::prelude::ComputeClient;
 /// Re-export of the cubecl [`ComputeClient`](cubecl::prelude::ComputeClient) so
 /// downstream crates (e.g. `lgbm-treelearner`) can name the
 /// `&ComputeClient<B::Runtime>` argument the [`Backend`] ops require WITHOUT
-/// depending on `cubecl` directly — preserving the CMP-01 containment boundary
+/// depending on `cubecl` directly — preserving the containment boundary
 /// (the compute crate is the single CubeCL seam; everyone above it sees only
 /// `lgbm_compute::ComputeClient`).
 pub use cubecl::prelude::ComputeClient as ComputeClientReexport;
 
 /// A feature column's per-row bin indices, stored in the NARROWEST unsigned type
-/// for its `num_bin` (spike 004 — columnar narrow bins). Faithful to C++
+/// for its `num_bin` (columnar narrow bins). Faithful to C++
 /// `DenseBin<uint8_t>` / `<uint16_t>` / `<uint32_t>`, which picks the narrowest
 /// bin type per feature so the hot histogram gather+fold is cache-dense.
 ///
@@ -89,7 +88,7 @@ impl BinColumn {
     /// check, `lgbm-treelearner` learner.rs) runs upstream of any tree growth, so
     /// width selection only needs the cast to be loss-free: a `debug_assert!`
     /// guards that each bin FITS the chosen narrow type (the truncation /
-    /// memory-safety concern, T-ruz-01), which always holds because the type is
+    /// memory-safety concern), which always holds because the type is
     /// sized to `num_bin`'s capacity. We do NOT assert `bin < num_bin` here — that
     /// is the gate's job, and a deliberately-edge value equal to `num_bin` is a
     /// valid input to construct (it is rejected later by the gate, not by `new`).
@@ -189,7 +188,7 @@ impl BinColumn {
     /// the once-per-train bin-range gate uses (the `bin < num_bin` VALUE check) — it
     /// dispatches on the width ONCE then runs a tight slice loop per arm, avoiding
     /// the boxed [`iter_u32`](BinColumn::iter_u32) dynamic dispatch on the hot
-    /// per-row path (spike 004 small-row regression fix).
+    /// per-row path (a measured small-row regression fix).
     #[inline]
     #[must_use]
     pub fn first_ge(&self, bound: u32) -> Option<u32> {
@@ -210,25 +209,25 @@ impl BinColumn {
 /// Fold ONE feature's narrow bin column into the pre-zeroed histogram `h`
 /// (`len == 2 * num_bin`): ascending `leaf_rows`, grad at `bin<<1` / hess at `+1`,
 /// f32-read → f64-accumulate. The [`BinColumn`] width `match` is OUTSIDE the row
-/// loop (monomorphic arms — spike 004), and the fold ORDER is byte-identical to
+/// loop (monomorphic arms), and the fold ORDER is byte-identical to
 /// `construct_histograms_cpu_native`, so this is the single bit-exact fold body used
 /// by BOTH the serial and the parallel build paths.
 ///
-/// Precondition (caller-established once per train, T-04-01 relocation): every
+/// Precondition (caller-established once per train): every
 /// `bins[row] < num_bin`. Debug-asserted; release trusts the upstream gate.
 #[inline]
 fn fold_one_feature(bins: &BinColumn, leaf_rows: &[u32], ord_g: &[f32], ord_h: &[f32], h: &mut [f64]) {
     macro_rules! fold {
         ($v:expr) => {
-            // spike-064: get_unchecked elides the 4 per-row bounds checks (bit-exact —
-            // same order/values; validated ~1.20× isolated / ~5.5% end-to-end wall). The
-            // precondition `bins[row] < num_bin` is established once per train (T-04-01)
-            // and debug-asserted below; `k < leaf_rows.len()` and `row < num_data` hold by
-            // construction, so every index here is provably in bounds.
+            // get_unchecked elides the 4 per-row bounds checks (bit-exact — same
+            // order/values). The precondition `bins[row] < num_bin` is established once
+            // per train and debug-asserted below; `k < leaf_rows.len()` and
+            // `row < num_data` hold by construction, so every index here is provably in
+            // bounds.
             unsafe {
                 for (k, &row) in leaf_rows.iter().enumerate() {
                     let bin = *$v.get_unchecked(row as usize) as usize;
-                    debug_assert!(bin * 2 + 1 < h.len(), "bin out of range — caller must establish bin < num_bin once per train (T-04-01)");
+                    debug_assert!(bin * 2 + 1 < h.len(), "bin out of range — caller must establish bin < num_bin once per train");
                     *h.get_unchecked_mut(bin * 2) += f64::from(*ord_g.get_unchecked(k));
                     *h.get_unchecked_mut(bin * 2 + 1) += f64::from(*ord_h.get_unchecked(k));
                 }
@@ -242,14 +241,9 @@ fn fold_one_feature(bins: &BinColumn, leaf_rows: &[u32], ord_g: &[f32], ord_h: &
     }
 }
 
-// quick 260620-njg: a f64-pregather fold variant (read once-widened f64 ords instead of
-// recomputing f64::from(f32) per feature) was prototyped here and A/B'd via the throwaway
-// bench (bench_split_scan.rs njg_pregather_ab) — NULL (cold microbench win did not survive
-// to the warm end-to-end train-wall), so nothing shipped to the hot path. See FINDINGS.
-
 /// Build the concatenated stride-2 per-feature histogram buffer (feature `f` occupies
-/// `[slot_off[f], slot_off[f] + 2*num_bins[f])`). `parallel` (spike 005 / R4) selects
-/// rayon-over-features — each feature folds its OWN histogram Vec from the shared
+/// `[slot_off[f], slot_off[f] + 2*num_bins[f])`). `parallel` selects rayon-over-features
+/// — each feature folds its OWN histogram Vec from the shared
 /// read-only `ord_g`/`ord_h`, then a sequential copy assembles `out` — versus the
 /// serial reused-scratch path for small leaves (rayon dispatch overhead crushes tiny
 /// per-feature folds). Both paths call [`fold_one_feature`] with the SAME fold order
@@ -269,15 +263,13 @@ fn build_histograms_into(
     let mut out = vec![0.0f64; slot_len];
     if parallel {
         use rayon::prelude::*;
-        // NOTE (spike 011, INVALIDATED): this per-feature `Vec<f64>` intermediate
-        // looks like a flattenable `Vec<Vec<f64>>` wart, but it is LOAD-BEARING.
-        // Each rayon task folds into its OWN cache-hot private buffer, then a
-        // single sequential `copy_from_slice` assembles `out`. Replacing it with
-        // a scatter (16 threads folding scattered writes directly into disjoint
-        // sub-slices of one shared `out`) regressed the threshold-sized leaves
-        // 13–21% on a 16-core box (cache-coherence/false-sharing traffic > the
-        // alloc+copy it removed) and was null on huge leaves. Keep the private
-        // accumulators. See `.planning/spikes/011-parallel-build-scatter/`.
+        // NOTE: this per-feature `Vec<f64>` intermediate looks like a flattenable
+        // `Vec<Vec<f64>>` wart, but it is LOAD-BEARING. Each rayon task folds into its
+        // OWN cache-hot private buffer, then a single sequential `copy_from_slice`
+        // assembles `out`. A scatter variant (threads folding directly into disjoint
+        // sub-slices of one shared `out`) measured worse due to cache-coherence /
+        // false-sharing traffic exceeding the alloc+copy it would remove. Keep the
+        // private accumulators.
         let hists: Vec<Vec<f64>> = (0..feature_bins.len())
             .into_par_iter()
             .map(|fpos| {
@@ -305,8 +297,8 @@ fn build_histograms_into(
 }
 
 /// The leaf-row count at/above which a per-leaf build parallelizes over features
-/// (spike 005: parallel wins ≈≥12k rows; 16384 keeps small+medium serial with zero
-/// regression while parallelizing the genuinely large leaves — large train −26%).
+/// (parallel wins at large leaf sizes; the default keeps small+medium leaves serial
+/// with zero regression while parallelizing the genuinely large ones).
 /// Override via `LGBM_PAR_THRESHOLD`.
 fn par_build_threshold() -> usize {
     std::env::var("LGBM_PAR_THRESHOLD")
@@ -323,27 +315,20 @@ fn par_build_threshold() -> usize {
 /// `find_best_split` reads a DISJOINT `buf` region and is row-count-independent.
 /// So this gate is keyed on `feats.len()` (the simplest defensible scan-work
 /// proxy; bin counts are near-uniform across a leaf's spine features, so feature
-/// count alone separates the narrow/wide regimes — confirmed by the quick
-/// 260620-9cp A/B). Below the threshold the serial loop runs verbatim (the same
-/// per-feature dispatch overhead that regressed the unconditional BUILD path —
-/// Spike 005 — would regress narrow leaves here). Override via
+/// count alone separates the narrow/wide regimes). Below the threshold the serial
+/// loop runs verbatim (the same per-feature dispatch overhead that regressed the
+/// unconditional BUILD path would regress narrow leaves here). Override via
 /// `LGBM_PAR_SCAN_THRESHOLD`.
 ///
-/// DEFAULT (quick 260620-9cp): HONEST NULL — the parallel scan is kept available
-/// (env-reachable, bit-exact-proven FORCED-ON) but is NOT the effective default,
-/// so the threshold is set effectively-unreachable (`usize::MAX`). The A/B measured
-/// on cubecl-cpu (warm, 3-run medians):
-///   - narrow (10 feat): SCAN serial 31.7ms vs parallel 104.4ms (3.3× WORSE),
-///     train-wall 156ms vs 287ms — fork/join overhead at 10 features dominates.
-///   - wide (120 feat):  SCAN serial 353ms vs parallel 309ms (−13%, sign-stable),
-///     BUT train-wall 1066ms vs 1184ms (+11%, sign-stable WORSE) — the per-leaf
-///     scan fork/join CONTENDS with the already-rayon-parallel BUILD path
-///     (BUILD_NS rose 438→520ms), so the isolated SCAN_NS win does NOT translate
-///     to a warm train-wall win; it regresses overall.
-/// Adoption criterion (wide train-wall gain AND no narrow regression) is NOT met,
-/// so per the project's audit-before-wire value the serial loop stays the effective
-/// default. Set `LGBM_PAR_SCAN_THRESHOLD=0` (or any small value) to force the
-/// parallel path on for the bit-exact parity proof / future re-measurement.
+/// DEFAULT: HONEST NULL — the parallel scan is kept available (env-reachable,
+/// bit-exact-proven FORCED-ON) but is NOT the effective default, so the threshold
+/// is set effectively-unreachable (`usize::MAX`). Measurement showed the per-leaf
+/// scan fork/join CONTENDS with the already-rayon-parallel BUILD path, so an
+/// isolated scan-time win does NOT translate to a warm train-wall win; it
+/// regresses overall. The adoption criterion (wide train-wall gain AND no narrow
+/// regression) is not met, so the serial loop stays the effective default. Set
+/// `LGBM_PAR_SCAN_THRESHOLD=0` (or any small value) to force the parallel path on
+/// for the bit-exact parity proof / future re-measurement.
 fn par_scan_threshold() -> usize {
     std::env::var("LGBM_PAR_SCAN_THRESHOLD")
         .ok()
@@ -351,30 +336,30 @@ fn par_scan_threshold() -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Floor for a core-scaled unified-fusion threshold (quick 260620-c5v): never let a
-/// many-core machine drive the gate so low it parallelizes a trivially-narrow leaf (the
-/// 8v4/9cp "narrow is catastrophic" lesson). 32 = the lowest feature count Task-1's sweep
-/// ever saw a sign-stable win at (2-core, feat=30).
+/// Floor for a core-scaled unified-fusion threshold: never let a many-core machine
+/// drive the gate so low it parallelizes a trivially-narrow leaf (narrow leaves regress
+/// badly under fork/join overhead). 32 = the lowest feature count measurement found a
+/// sign-stable win at.
 const THRESHOLD_FLOOR: usize = 32;
 
-/// Ceiling for a core-scaled unified-fusion threshold (quick 260620-c5v): never let a
-/// 1–2 core machine drive the gate so high it effectively disables the fusion forever.
-/// 256 sits just above the highest crossover Task-1 measured (16-core subscan ~200–250).
+/// Ceiling for a core-scaled unified-fusion threshold: never let a 1–2 core machine
+/// drive the gate so high it effectively disables the fusion forever. 256 sits just
+/// above the highest measured crossover.
 const THRESHOLD_CEILING: usize = 256;
 
 /// Slope of the additive-log core-scaling, in feature-counts per doubling of cores.
-/// Fitted to the clean Task-1 BFS crossover deltas (≈30 at 2 cores → ≈80 at 16 cores over
+/// Fitted to the measured BFS crossover deltas (≈30 at 2 cores → ≈80 at 16 cores over
 /// log2-span 3 ⇒ ≈17 per log2 step). Applied to BOTH anchors so the relative shape is
 /// shared; the per-anchor offset (100 vs 130) shifts the whole curve.
 const THRESHOLD_LOG2_SLOPE: f64 = 17.0;
 
-/// The rayon global-pool size, queried EXACTLY ONCE (quick 260620-c5v). The unified
+/// The rayon global-pool size, queried EXACTLY ONCE. The unified
 /// threshold fns are called per-leaf on a hot path, so we cache rather than re-query.
 ///
 /// Input source = [`rayon::current_num_threads`] (NOT
 /// [`std::thread::available_parallelism`]): `current_num_threads` returns the actual
 /// global rayon pool size the fork/join actually runs on, and it HONORS
-/// `RAYON_NUM_THREADS`. The Task-1 measurement sweep drove the pool with
+/// `RAYON_NUM_THREADS`. The threshold measurement sweep drove the pool with
 /// `RAYON_NUM_THREADS`, so reading the same value here makes the measured curve and the
 /// production default agree. `available_parallelism` reports the hardware count and would
 /// DIVERGE from the pool whenever `RAYON_NUM_THREADS` is set — silently breaking that
@@ -385,14 +370,14 @@ fn rayon_cores() -> usize {
     *CORES.get_or_init(|| rayon::current_num_threads().max(1))
 }
 
-/// Core-count-derived default for a unified-fusion gate threshold (quick 260620-c5v).
+/// Core-count-derived default for a unified-fusion gate threshold.
 ///
 /// `anchor_at_16` is the hand-measured optimum at THIS machine's 16 logical cores (the
-/// shipped constants: 100 for BFS, 130 for subscan). Task-1 (`RAYON_NUM_THREADS` sweep,
-/// warm 3-run medians) found the win-crossover feature count RISES roughly logarithmically
-/// with core count for BOTH fusions (MATERIAL, >20% swing 2→16 cores): more cores ⇒ each
-/// rayon fork/join's sync overhead grows ⇒ the single-fork/join fusion needs more
-/// per-feature work to beat the two-step's double fork/join. So we shape the default as
+/// shipped constants: 100 for BFS, 130 for subscan). Measurement (a `RAYON_NUM_THREADS`
+/// sweep, warm multi-run medians) found the win-crossover feature count RISES roughly
+/// logarithmically with core count for BOTH fusions: more cores ⇒ each rayon fork/join's
+/// sync overhead grows ⇒ the single-fork/join fusion needs more per-feature work to beat
+/// the two-step's double fork/join. So we shape the default as
 ///
 /// ```text
 /// threshold = clamp( anchor_at_16 − SLOPE · log2(16 / cores),  FLOOR, CEILING )
@@ -405,8 +390,7 @@ fn rayon_cores() -> usize {
 /// pathological value. PROXY CAVEAT: the off-16-core shape was measured by capping the
 /// rayon pool on a 16-core box, which isolates parallelism but NOT a real low-core
 /// machine's smaller cache / lower bandwidth — so off-16 it is a heuristic, and the
-/// `LGBM_UNIFIED_*` env overrides remain the escape hatch. See the 260620-c5v
-/// SUMMARY/FINDINGS for the full crossover table.
+/// `LGBM_UNIFIED_*` env overrides remain the escape hatch.
 fn core_scaled_threshold(anchor_at_16: usize, cores: usize) -> usize {
     let cores = cores.max(1) as f64;
     // log2(16/cores): +ve below 16 cores (lower threshold), 0 at 16, −ve above (higher).
@@ -419,46 +403,33 @@ fn core_scaled_threshold(anchor_at_16: usize, cores: usize) -> usize {
 
 /// The feature-count at/above which the directly-built (smaller/root) leaf's
 /// per-feature `{build histogram → fix_histogram → compact → scan}` runs inside ONE
-/// rayon region (the host f64 analog of the GPU `build_fix_scan_resident` fusion,
-/// quick 260620-a48) instead of the two-step `build_leaf_histogram_into` +
+/// rayon region (the host f64 analog of the GPU `build_fix_scan_resident` fusion)
+/// instead of the two-step `build_leaf_histogram_into` +
 /// `find_best_splits_batched`.
 ///
 /// Keyed on `feats.len()` — the SAME scan-work proxy as [`par_scan_threshold`] —
-/// because the contention this lever removes (quick 260620-9cp: a parallel scan
-/// `par_iter` fighting the already-parallel build `par_iter`) scales with the
-/// feature count, and narrow leaves were catastrophic in BOTH 8v4 and 9cp. Below the
-/// threshold the leaf takes the byte-unchanged serial two-step path. Override via
-/// `LGBM_UNIFIED_BFS_THRESHOLD`.
+/// because the contention this lever removes (a parallel scan `par_iter` fighting
+/// the already-parallel build `par_iter`) scales with the feature count, and narrow
+/// leaves were catastrophic in measurement. Below the threshold the leaf takes the
+/// byte-unchanged serial two-step path. Override via `LGBM_UNIFIED_BFS_THRESHOLD`.
 ///
-/// DEFAULT (quick 260620-a48): CONDITIONAL WIN at `feats.len() >= 100`. The unified
-/// region removes the quick-260620-9cp cross-region contention (a parallel scan
-/// `par_iter` fighting the already-parallel build `par_iter`) by fusing
-/// build+fix+compact+scan for each spine feature into ONE rayon fork/join, keeping
-/// each feature's histogram cache-hot in its building thread through fix and scan.
-/// The A/B measured on cubecl-cpu (warm, 3-run medians, train-wall = decisive metric):
-///   - WIDE (120 feat, 20k rows): fused build+scan 779.7ms→569.7ms (−27%), warm
-///     train-wall A 810ms vs B 755ms (−6.8%, sign-stable, no run overlap across all 3
-///     runs at 100 AND 120 feat). The phase counters confirm the mechanism: the
-///     two-step path forks/joins TWICE (build then scan), the unified path ONCE.
-///   - NARROW (10 feat, 20k rows): fused build+scan 95.9ms→124.9ms (+30%), warm
-///     train-wall A 169ms vs B 246ms (+45%, sign-stable WORSE) — the single rayon
-///     fork/join overhead at 10 features dominates (the 8v4/9cp narrow-is-catastrophic
-///     lesson). So narrow MUST stay serial two-step.
-///   - SWEEP crossover: B regresses or is within-spread up to ~90 feat (feat=80 +0.6%,
-///     feat=90 overlapping/sign-flips); B becomes sign-stable-below-A only at ≥100 feat
-///     (feat=100 −5%, feat=120 −6%, neither overlapping A's spread).
-/// Tuned default = 100: narrow/medium (≤90 feat) keep the byte-unchanged serial
-/// two-step path (zero regression); genuinely wide leaves (≥100 feat) take the unified
-/// region for the sign-stable −6% train-wall gain. Both adoption gates met (wide
-/// sign-stable gain AND no narrow regression at the tuned threshold). Set
-/// `LGBM_UNIFIED_BFS_THRESHOLD=0` to force the unified path on for the bit-exact parity
-/// proof; set a large value (or `usize::MAX`) to force the serial two-step path.
-/// See the 260620-a48 SUMMARY for the full A/B.
+/// DEFAULT: CONDITIONAL WIN at `feats.len() >= 100`. The unified region removes the
+/// cross-region contention (a parallel scan `par_iter` fighting the already-parallel
+/// build `par_iter`) by fusing build+fix+compact+scan for each spine feature into ONE
+/// rayon fork/join, keeping each feature's histogram cache-hot in its building thread
+/// through fix and scan. Measurement showed a sign-stable train-wall win on wide leaves
+/// (≥100 features) and a sign-stable regression on narrow leaves (single rayon
+/// fork/join overhead dominates), so narrow MUST stay serial two-step. Tuned default =
+/// 100: narrow/medium (≤90 feat) keep the byte-unchanged serial two-step path (zero
+/// regression); genuinely wide leaves (≥100 feat) take the unified region for the
+/// train-wall gain. Set `LGBM_UNIFIED_BFS_THRESHOLD=0` to force the unified path on
+/// for the bit-exact parity proof; set a large value (or `usize::MAX`) to force the
+/// serial two-step path.
 ///
-/// DEFAULT IS NOW CORE-DERIVED (quick 260620-c5v): the constant `100` was measured only at
-/// THIS box's 16 cores. The default is `core_scaled_threshold(100, rayon_cores())`, which
-/// reproduces `100` exactly at 16 cores (zero local regression) and scales the crossover
-/// down on fewer-core / up on more-core machines per the Task-1 measured curve. The
+/// DEFAULT IS NOW CORE-DERIVED: the constant `100` was measured only at THIS box's 16
+/// cores. The default is `core_scaled_threshold(100, rayon_cores())`, which reproduces
+/// `100` exactly at 16 cores (zero local regression) and scales the crossover down on
+/// fewer-core / up on more-core machines per the measured curve. The
 /// `LGBM_UNIFIED_BFS_THRESHOLD` env var still takes ULTIMATE precedence.
 pub fn unified_bfs_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_BFS_THRESHOLD")
@@ -470,38 +441,30 @@ pub fn unified_bfs_threshold() -> usize {
 /// The feature-count at/above which the subtract-derived (larger / use_subtract) child's
 /// per-feature `{subtract → scan}` runs inside ONE rayon region (the host f64 analog of
 /// [`unified_bfs_threshold`] but for the larger child, fused subtract+scan with NO build
-/// and NO fix — quick 260620-b97) instead of the two-step whole-buffer
+/// and NO fix) instead of the two-step whole-buffer
 /// [`subtract_histograms`](Backend::subtract_histograms) + a separate
 /// [`find_best_splits_batched`](Backend::find_best_splits_batched) scan. Override via
 /// `LGBM_UNIFIED_SUBSCAN_THRESHOLD`.
 ///
 /// Keyed on `feats.len()` (the same scan-work proxy as [`unified_bfs_threshold`]). The
 /// larger child has NO parallel build to contend with (only a cheap serial subtract), so
-/// quick 260620-9cp's build/scan contention is STRUCTURALLY ABSENT — yet the A/B
-/// crossover is MATERIALLY higher than a48's smaller-child threshold (100), so a SEPARATE
-/// env is justified (the larger child's single rayon fork/join over the subtract+scan only
-/// amortizes above ~130 features; below that it is overlapping/within-spread).
+/// the build/scan contention the smaller-child fusion removes is STRUCTURALLY ABSENT here
+/// — yet the measured crossover is MATERIALLY higher than the smaller-child threshold
+/// (100), so a SEPARATE env is justified (the larger child's single rayon fork/join over
+/// the subtract+scan only amortizes above ~130 features; below that it is
+/// overlapping/within-spread).
 ///
-/// DEFAULT (quick 260620-b97): WIN at `feats.len() >= 130`. The A/B measured on cubecl-cpu
-/// (warm, train-wall = decisive metric, A = larger-child two-step at a48 HEAD, B = larger
-/// child also subtract-unified):
-///   - 200 feat: A ~953ms vs B ~888ms (−6.8%, sign-stable, NO run overlap).
-///   - 150 feat: A ~771ms vs B ~745ms (−3.4%, sign-stable, NO run overlap).
-///   - 130 feat: A ~718ms vs B ~698ms (−2.8%, sign-stable, NO run overlap).
-///   - 120 feat: A ~672ms vs B ~663ms (−1.3%, distributions OVERLAP — not sign-stable).
-///   - 10  feat (narrow): below threshold in BOTH ⇒ identical two-step code, no regression.
-/// Tuned default = 130: the 120-feat zone (overlapping, not sign-stable) keeps the
-/// byte-unchanged two-step path; genuinely wide leaves (≥130 feat) take the fused
-/// subtract→scan for the sign-stable train-wall gain. Both adoption gates met (wide
-/// sign-stable gain AND no narrow regression). Set `LGBM_UNIFIED_SUBSCAN_THRESHOLD=0` to
-/// force the fused path on for the bit-exact parity proof; `usize::MAX` to force two-step.
-/// See the 260620-b97 SUMMARY for the full A/B.
+/// DEFAULT: WIN at `feats.len() >= 130`. Tuned default = 130: the near-threshold zone
+/// (overlapping, not sign-stable) keeps the byte-unchanged two-step path; genuinely wide
+/// leaves (≥130 feat) take the fused subtract→scan for the sign-stable train-wall gain.
+/// Set `LGBM_UNIFIED_SUBSCAN_THRESHOLD=0` to force the fused path on for the bit-exact
+/// parity proof; `usize::MAX` to force two-step.
 ///
-/// DEFAULT IS NOW CORE-DERIVED (quick 260620-c5v): the constant `130` was measured only at
-/// THIS box's 16 cores. The default is `core_scaled_threshold(130, rayon_cores())`, which
-/// reproduces `130` exactly at 16 cores (zero local regression) and scales the crossover
-/// per the Task-1 measured curve (same additive-log shape as the BFS gate, offset to this
-/// larger child's higher anchor). The `LGBM_UNIFIED_SUBSCAN_THRESHOLD` env var still takes
+/// DEFAULT IS NOW CORE-DERIVED: the constant `130` was measured only at THIS box's 16
+/// cores. The default is `core_scaled_threshold(130, rayon_cores())`, which reproduces
+/// `130` exactly at 16 cores (zero local regression) and scales the crossover per the
+/// measured curve (same additive-log shape as the BFS gate, offset to this larger
+/// child's higher anchor). The `LGBM_UNIFIED_SUBSCAN_THRESHOLD` env var still takes
 /// ULTIMATE precedence.
 pub fn unified_subscan_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_SUBSCAN_THRESHOLD")
@@ -510,44 +473,44 @@ pub fn unified_subscan_threshold() -> usize {
         .unwrap_or_else(|| core_scaled_threshold(130, rayon_cores()))
 }
 
-/// The compute backend seam (CMP-01).
+/// The compute backend seam.
 ///
 /// Binds a concrete CubeCL [`Runtime`](cubecl::Runtime) (CPU or ROCm/HIP) that
-/// kernels are dispatched to. The coarse whole-kernel ops (D-01) live on this
-/// trait: [`construct_histograms`](Backend::construct_histograms) is finalized
-/// in 04-02 (this plan); `find_best_split` / `data_partition` follow in 04-03.
+/// kernels are dispatched to. The coarse whole-kernel ops live on this
+/// trait: [`construct_histograms`](Backend::construct_histograms),
+/// `find_best_split`, and `data_partition`.
 ///
 /// This trait is the ONLY place where CubeCL runtime types should appear; that
 /// is the whole point of the seam.
 
-/// 26-02 (M3/ODP3-02): a resident leaf's WINNING split paired with its winning
-/// feature-POSITION (fpos) — the ~8-int CUDASplitInfo-equivalent the on-device
-/// cross-feature argmax ([`Backend::scan_resident_leaf_argmax`]) returns per leaf INSTEAD of
-/// the full per-feature `Vec<SplitInfo>`. `fpos == -1` ⇒ no admissible split.
+/// A resident leaf's WINNING split paired with its winning feature-POSITION (fpos) — the
+/// ~8-int CUDASplitInfo-equivalent the on-device cross-feature argmax
+/// ([`Backend::scan_resident_leaf_argmax`]) returns per leaf INSTEAD of the full
+/// per-feature `Vec<SplitInfo>`. `fpos == -1` ⇒ no admissible split.
 pub type ResidentSplitWinner = (SplitInfo, i32);
 
-/// 28-01 (ODF-01/ODF-05): the DEVICE-RESIDENT best-first frontier state — the precondition
-/// for the no-blocking control loop (28-03) to retire the R1 readback (spike-071). It owns:
+/// The DEVICE-RESIDENT best-first frontier state — the precondition for the
+/// no-blocking control loop to retire the host readback. It owns:
 ///
 /// - a resident per-leaf best-split SoA ([`SplitSoa`](kernels::best_split::SplitSoa)) sized
 ///   `num_leaves` — the §8.2 winners live here on device, addressed by leaf id;
 /// - a device `best_leaf` i32 slot — the §8.3 cross-leaf argmax winner, written on device;
 /// - a device `stop` i32 flag — the per-iteration stop signal (the ONLY host read the
-///   no-blocking loop needs; 28-03 wires it).
+///   no-blocking loop needs).
 ///
 /// The frontier reduce ([`frontier_reduce_leaf`](DeviceFrontier::frontier_reduce_leaf)) and
 /// best-leaf pick ([`frontier_pick_best_leaf`](DeviceFrontier::frontier_pick_best_leaf))
 /// write into these device buffers and hand off BY HANDLE — no device→host readback happens
 /// inside the reduction (the ONLY transfer is §8.3's single 8-int export). On the cubecl-cpu
-/// f64 anchor the reductions are BIT-EXACT to the host folds (ODF-06). This plan does NOT
-/// drive the grow loop — it builds the resident state the loop (28-03) consumes.
+/// f64 anchor the reductions are BIT-EXACT to the host folds. This does NOT drive the grow
+/// loop — it builds the resident state the control loop consumes.
 #[derive(Debug)]
 pub struct DeviceFrontier<R: cubecl::Runtime> {
     /// The resident per-leaf best-split records (sized `num_leaves`); `valid` starts 0.
     records: kernels::best_split::SplitSoa,
     /// The device best-leaf i32 slot (1 element), written by the §8.3 argmax on device.
     best_leaf: cubecl::server::Handle,
-    /// The device per-iteration stop i32 flag (1 element); read by the 28-03 loop only.
+    /// The device per-iteration stop i32 flag (1 element); read by the control loop only.
     stop: cubecl::server::Handle,
     /// The frontier width = the resident SoA length.
     num_leaves: usize,
@@ -581,7 +544,7 @@ impl<R: cubecl::Runtime> DeviceFrontier<R> {
         self.num_leaves
     }
 
-    /// A borrow of the resident per-leaf best-split SoA (28-03 reads it by handle).
+    /// A borrow of the resident per-leaf best-split SoA (the control loop reads it by handle).
     #[must_use]
     pub fn records(&self) -> &kernels::best_split::SplitSoa {
         &self.records
@@ -646,7 +609,7 @@ impl<R: cubecl::Runtime> DeviceFrontier<R> {
         )
     }
 
-    /// Read back the device `best_leaf` slot (TEST/DEBUG; the 28-03 loop keeps it resident).
+    /// Read back the device `best_leaf` slot (TEST/DEBUG; the control loop keeps it resident).
     /// The slot is an exact-integer `f64` (`-1.0` = none) decoded to `i32`.
     #[must_use]
     pub fn read_best_leaf(&self, client: &ComputeClient<R>) -> i32 {
@@ -659,10 +622,10 @@ pub trait Backend {
     /// The concrete CubeCL runtime this backend dispatches kernels to.
     type Runtime: cubecl::Runtime;
 
-    /// Construct a single feature column's gradient/hessian histogram (D-01
+    /// Construct a single feature column's gradient/hessian histogram (a
     /// whole-kernel op, faithful to `dense_bin.hpp:99-141`).
     ///
-    /// Inputs (sourced from the Phase-2 binned store — do NOT re-bin):
+    /// Inputs (sourced from the binned store — do NOT re-bin):
     /// - `client`  — the compute client for [`Self::Runtime`].
     /// - `binned`  — the per-row bin indices for this feature column, i.e. the
     ///   `u32`-widened `Bin::data(idx)` for `idx in 0..num_data()`.
@@ -674,14 +637,14 @@ pub trait Backend {
     /// Output: the stride-2 interleaved `[g0,h0,g1,h1,…]` histogram of length
     /// `2 * num_bin`, indexed `ti = bin << 1` (`out[ti] += grad`,
     /// `out[ti + 1] += hess`). Gradients/hessians are read as `f32` but
-    /// accumulated into `f64` cells (`hist_t = double`, RESEARCH Pitfall 3) on
-    /// the single-owner ordered fold proven bit-exact in 04-01.
+    /// accumulated into `f64` cells (`hist_t = double`) on the single-owner
+    /// ordered fold proven bit-exact.
     ///
     /// # Errors
     /// Returns [`ComputeError::LengthMismatch`] if `ordered_gradients`/
     /// `ordered_hessians`/`binned` lengths differ, or
     /// [`ComputeError::BinIndexOutOfRange`] if any `binned[i] >= num_bin` (V5
-    /// boundary validation, threat T-04-01) — never a panic / UB.
+    /// boundary validation) — never a panic / UB.
     fn construct_histograms(
         &self,
         client: &ComputeClient<Self::Runtime>,
@@ -691,8 +654,8 @@ pub trait Backend {
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError>;
 
-    /// Find the best split threshold for a feature column (D-01 whole-kernel op,
-    /// gain math in-kernel per D-01a), faithful to
+    /// Find the best split threshold for a feature column (a whole-kernel op,
+    /// gain math in-kernel), faithful to
     /// `feature_histogram.hpp:165-1057` (the default CPU template
     /// `<USE_RAND=false, USE_MC=false, USE_MAX_OUTPUT=false,
     /// USE_SMOOTHING=false>`; `USE_L1` keyed on `cfg.lambda_l1 > 0`).
@@ -703,7 +666,7 @@ pub trait Backend {
     ///   `2 * num_bin`.
     /// - `cfg` — the [`GainConfig`] (the seven gain-relevant `Config` fields).
     /// - `num_bin` — the feature's bin count.
-    /// - `offset` / `default_bin` / `most_freq_bin` — the Phase-2
+    /// - `offset` / `default_bin` / `most_freq_bin` — the
     ///   `FeatureGroup`/`Bin` bin-layout descriptors driving the
     ///   `SKIP_DEFAULT_BIN` continue and the threshold offset arithmetic.
     /// - `skip_default_bin` / `na_as_missing` — the AUTHORITATIVE C++ dispatch
@@ -711,9 +674,9 @@ pub trait Backend {
     ///   feature's `missing_type` + `num_bin > 2`
     ///   (`skip == (num_bin > 2 && missing_type == Zero)`,
     ///   `na_as_missing == (num_bin > 2 && missing_type == NaN)`, both false for
-    ///   `missing_type == None`). These REPLACE the Phase-4
-    ///   `cfg_skip_default_bin(default_bin, num_bin)` heuristic (RESEARCH
-    ///   Pitfall 1).
+    ///   `missing_type == None`). These REPLACE a prior
+    ///   `cfg_skip_default_bin(default_bin, num_bin)` heuristic that did not
+    ///   match the C++ dispatch table.
     /// - `run_forward` — the AUTHORITATIVE C++ FORWARD-branch dispatch flag
     ///   (`feature_histogram.hpp:420-429`): the FORWARD scan runs ONLY when
     ///   `num_bin > 2 && missing_type == Zero` (the sole dispatch invoking both the
@@ -724,8 +687,8 @@ pub trait Backend {
     ///   case is a typed error), but threaded explicitly as a verbatim transcription
     ///   of the C++ dispatch truth table, NOT a bin-layout heuristic.
     ///   `na_as_missing == true` is currently a typed
-    ///   [`ComputeError::Runtime`] (the NA_AS_MISSING forward branch is deferred,
-    ///   RESEARCH A5 — never a silent wrong answer).
+    ///   [`ComputeError::Runtime`] (the NA_AS_MISSING forward branch is deferred
+    ///   — never a silent wrong answer).
     /// - `sum_gradient` / `sum_hessian` / `num_data` — the leaf totals.
     ///
     /// Returns a [`SplitInfo`]; `gain == f64::NEG_INFINITY` (C++ `kMinScore`)
@@ -735,7 +698,7 @@ pub trait Backend {
     /// [`ComputeError::LengthMismatch`] if `hist.len() != 2 * num_bin`, or
     /// [`ComputeError::Runtime`] for `num_bin == 0`, non-positive `sum_hessian`,
     /// `na_as_missing == true` (deferred branch), or unsupported non-default gain
-    /// params (V5, T-04-01).
+    /// params (V5).
     #[allow(clippy::too_many_arguments)]
     fn find_best_split(
         &self,
@@ -762,7 +725,7 @@ pub trait Backend {
     /// left rows in their original relative order followed by the right rows in
     /// their original relative order — and `split_point` = the left-row count
     /// (left indices occupy `[0, split_point)`, right `[split_point, len)`). The
-    /// Phase-5 learner owns `leaf_begin_`/`leaf_count_` bookkeeping; this op
+    /// learner owns `leaf_begin_`/`leaf_count_` bookkeeping; this op
     /// returns only the partition.
     ///
     /// # Errors
@@ -781,8 +744,8 @@ pub trait Backend {
     ) -> Result<(Vec<u32>, usize), ComputeError>;
 
     /// **Native-width** sibling of [`data_partition`](Backend::data_partition)
-    /// (quick-260625-j1l / spike-029, ADDITIVE — the `data_partition(&[u32])`
-    /// signature and every caller are byte-unchanged).
+    /// (ADDITIVE — the `data_partition(&[u32])` signature and every caller are
+    /// byte-unchanged).
     ///
     /// Takes the leaf's bins as a narrow [`BinColumn`] (u8/u16/u32) instead of a
     /// u32-widened slice. The DEFAULT body simply WIDENS and delegates to
@@ -819,19 +782,19 @@ pub trait Backend {
         )
     }
 
-    /// 28-02 (ODF-02/ODF-05/ODF-06, R2): partition a leaf's resident row sub-range via
-    /// the §9 `mark → prefix-sum → scatter` and write the child left/right start/end/count
-    /// into the resident [`DeviceLeafSplits`](kernels::partition::DeviceLeafSplits) slot
-    /// `leaf_id` ON DEVICE — the split point is NOT returned to the host (retires R2, the
-    /// `grow_driver.rs:1582` split-point `bump_sync`). The child ranges live, resident, in
-    /// the device struct (the 28-03 loop reads them by handle); the returned value is the
-    /// stable-ordered GLOBAL row permutation the caller scatters into the resident buffer.
+    /// Partition a leaf's resident row sub-range via the §9 `mark → prefix-sum →
+    /// scatter` and write the child left/right start/end/count into the resident
+    /// [`DeviceLeafSplits`](kernels::partition::DeviceLeafSplits) slot `leaf_id` ON
+    /// DEVICE — the split point is NOT returned to the host, avoiding a host
+    /// round-trip for it. The child ranges live, resident, in the device struct (the
+    /// control loop reads them by handle); the returned value is the stable-ordered
+    /// GLOBAL row permutation the caller scatters into the resident buffer.
     ///
     /// Default: a typed error (the device-resident partition is a GpuBackend capability;
     /// the CpuBackend anchor uses the host fold
     /// [`data_partition_native`](Backend::data_partition_native) +
     /// `partition_leaf_stable`). GpuBackend runs the §9 device path. Bit-exact to the cpu
-    /// f64 anchor (ODF-06) — the returned permutation is byte-identical to
+    /// f64 anchor — the returned permutation is byte-identical to
     /// [`data_partition_native`](Backend::data_partition_native) and the child ranges
     /// equal the host split point.
     ///
@@ -869,8 +832,8 @@ pub trait Backend {
     /// Derive the larger child's histogram via the subtraction trick
     /// (`parent - child`), the kernel-layer MATH of `FeatureHistogram::Subtract`
     /// (`feature_histogram.hpp:99`). WHICH child is subtracted (the smaller
-    /// sibling) is Phase-5 orchestration (RESEARCH A3: the subtract OP is
-    /// in-scope at the kernel layer).
+    /// sibling) is learner orchestration (the subtract OP itself is in-scope at
+    /// the kernel layer).
     ///
     /// `parent` / `child` are the stride-2 `[g0,h0,g1,h1,…]` f64 histograms of
     /// equal length `2 * num_bin`.
@@ -887,7 +850,7 @@ pub trait Backend {
     /// Build the RAW (pre-FixHistogram, pre-compact) per-feature histograms for ONE
     /// leaf's rows, concatenated into a single `slot_len`-cell f64 buffer (feature
     /// `fpos` occupies `[slot_off[fpos], slot_off[fpos] + 2*num_bins[fpos])`). This
-    /// is the batched per-leaf abstraction seam (260608-lad): the learner calls it
+    /// is the batched per-leaf abstraction seam: the learner calls it
     /// ONCE per leaf instead of looping `construct_histograms` per feature.
     ///
     /// The DEFAULT implementation here is exactly the per-feature host gather + per-
@@ -901,7 +864,7 @@ pub trait Backend {
     /// compaction stay in the caller (they read per-leaf sums + the compaction
     /// offset), applied to each feature's region of the returned RAW buffer.
     ///
-    /// # Bin-range precondition (V5 / threat T-04-01, RELOCATED — spike-003b)
+    /// # Bin-range precondition (V5)
     /// The hot fold below is **branchless**: it reads `bins[row]` and folds it into
     /// `scratch[bin*2 (+1)]` with NO per-element `bin < num_bin` check. This is a
     /// CALLER-GUARANTEED PRECONDITION: every `feature_bins[fpos][row] <
@@ -913,10 +876,10 @@ pub trait Backend {
     /// columns are fixed for the whole train, so the amortized cost is O(rows) ONCE
     /// per train instead of O(leaf_rows) per build per iteration. This mirrors C++
     /// `dense_bin.hpp` (`ConstructHistogramInner`), which folds `data_[i]` directly
-    /// with no per-element validation, trusting the binning invariant. Spike-003b
-    /// proved ANY per-element check (early-return OR branchless clamp+OOB-flag)
-    /// serializes the fold and regresses the 200k-row build ~3-8%; the branchless
-    /// form wins both scales (-17% small / -4.5% large).
+    /// with no per-element validation, trusting the binning invariant. Measurement
+    /// showed ANY per-element check (early-return OR branchless clamp+OOB-flag)
+    /// serializes the fold and regresses the build meaningfully; the branchless
+    /// form wins at all scales tested.
     ///
     /// # Errors
     /// The fused fold no longer returns `BinIndexOutOfRange` per element — there is
@@ -938,11 +901,11 @@ pub trait Backend {
         gradients: &[f32],
         hessians: &[f32],
     ) -> Result<Vec<f64>, ComputeError> {
-        // SPIKE 003: gather the ordered gradients/hessians ONCE per leaf — they are
-        // identical across every feature (only the bin column differs), so the prior
-        // per-feature re-gather repeated this work `num_features` times. Mirrors C++
-        // `ordered_gradients_`/`ordered_hessians_` reuse. Values + order unchanged ⇒
-        // bit-exact.
+        // Gather the ordered gradients/hessians ONCE per leaf — they are
+        // identical across every feature (only the bin column differs), so a
+        // per-feature re-gather would repeat this work `num_features` times. Mirrors
+        // C++ `ordered_gradients_`/`ordered_hessians_` reuse. Values + order
+        // unchanged ⇒ bit-exact.
         let r = leaf_rows.len();
         let mut ord_g: Vec<f32> = Vec::with_capacity(r);
         let mut ord_h: Vec<f32> = Vec::with_capacity(r);
@@ -950,29 +913,29 @@ pub trait Backend {
             ord_g.push(gradients[row as usize]);
             ord_h.push(hessians[row as usize]);
         }
-        // SPIKE 003b: FUSE the per-feature bin gather into the fold. Read `bins[row]`
+        // The per-feature bin gather is FUSED into the fold. Read `bins[row]`
         // inline and fold directly into a REUSED per-feature hot scratch (sized to the
         // widest feature, <= 2*max_num_bin) — NOT `ord_bins` materialization, NOT a
         // per-feature alloc, and NOT a fold into the big multi-feature `out` buffer
-        // (p0n proved folding into `out` cache-scatters and regresses large ~9%). The
+        // (folding into `out` directly cache-scatters and regresses large leaves). The
         // fold is BRANCHLESS: no per-element bin check (see the precondition doc above),
         // only a `debug_assert!`. The f64 fold ORDER is byte-identical to
         // `construct_histograms_cpu_native` — ascending `leaf_rows`, grad at `bin<<1`,
         // hess at `+1`, f32-read -> f64-accumulate — so the bit-exact gate holds.
         //
-        // SPIKE 004: the bin column is NARROW ([`BinColumn`], u8/u16/u32). Dispatch
+        // The bin column is NARROW ([`BinColumn`], u8/u16/u32). Dispatch
         // on the width ONCE per feature (OUTSIDE the row loop) so each arm is a
         // MONOMORPHIC tight loop reading the narrow element directly — the
         // cache-density win lives here (no per-element width branch / accessor in the
         // hot loop). The fold ORDER and the `bin as usize * 2` index arithmetic are
         // IDENTICAL across arms and identical to the prior u32 path ⇒ bit-exact.
-        // SPIKE 005 (R4): build each feature's histogram in parallel across rayon WHEN the
+        // Build each feature's histogram in parallel across rayon WHEN the
         // leaf is big enough to amortize task dispatch (>= par_build_threshold), else the
         // serial reused-scratch path. Both call the SAME `fold_one_feature` body with the
         // SAME ascending order into disjoint `out` regions ⇒ byte-identical result; the
         // per-feature independence makes it thread-count-deterministic (bit-exact gate
         // holds). The threshold protects small/medium leaves — unconditional parallel
-        // regressed 2k-row train ~5× on rayon dispatch overhead.
+        // regressed small trains significantly on rayon dispatch overhead.
         let parallel = r >= par_build_threshold();
         let out = build_histograms_into(
             feature_bins, num_bins, slot_off, slot_len, leaf_rows, &ord_g, &ord_h, parallel,
@@ -981,7 +944,7 @@ pub trait Backend {
     }
 
     /// Find the best split for EVERY spine feature of ONE leaf in a single batched
-    /// op (260608-lad Part 2): the fused per-leaf SPLIT SCAN over the concatenated
+    /// op: the fused per-leaf SPLIT SCAN over the concatenated
     /// stride-2 f64 histogram `buf` (the same layout
     /// [`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw) produces —
     /// feature `f` occupies `[f.slot_off, f.slot_off + 2*f.num_bin)`). The learner
@@ -994,7 +957,7 @@ pub trait Backend {
     /// Returns one [`SplitInfo`] per input feature, **in the SAME order as `feats`**
     /// — order-preservation keeps the caller's cross-feature argmax (gain, then
     /// smaller feature) tie-break identical, which is what keeps the CPU-grown tree
-    /// bit-exact (threat T-lsx-01).
+    /// bit-exact.
     ///
     /// The DEFAULT impl (used by [`CpuBackend`] unchanged) loops
     /// [`find_best_split`](Backend::find_best_split) over `feats` in order, so each
@@ -1003,13 +966,12 @@ pub trait Backend {
     /// features' splits in one launch per leaf.
     ///
     /// An empty `feats` (every feature gated out / categorical-only leaf) returns an
-    /// empty Vec with no launch (threat T-lsx-03).
+    /// empty Vec with no launch.
     ///
     /// # Errors
     /// Propagates [`find_best_split`](Backend::find_best_split) errors; returns
     /// [`ComputeError::LengthMismatch`] if any feature's
-    /// `[slot_off, slot_off + 2*num_bin)` region exceeds `buf` (V5, threat T-lsx-02
-    /// — no panic / UB).
+    /// `[slot_off, slot_off + 2*num_bin)` region exceeds `buf` (V5 — no panic / UB).
     fn find_best_splits_batched(
         &self,
         client: &ComputeClient<Self::Runtime>,
@@ -1060,8 +1022,8 @@ pub trait Backend {
         Ok(out)
     }
 
-    /// One-time per-train upload of the binned feature columns to the device
-    /// (260608-nn7 L1). The learner calls this ONCE per `train_inner` (before the
+    /// One-time per-train upload of the binned feature columns to the device.
+    /// The learner calls this ONCE per `train_inner` (before the
     /// per-leaf growth loop) with every feature's GLOBAL-row bin column; a GPU
     /// backend uploads them ONCE and caches the device `Handle` (interior
     /// mutability), so per-leaf histogram builds gather rows ON DEVICE from the
@@ -1081,12 +1043,13 @@ pub trait Backend {
     ) {
     }
 
-    /// SPIKE-079 (the spike-078 ledger's #1 lever — 67–78% of the real-CUDA on-device
-    /// gap): mark the CURRENT resident-bin cache as OWNED by a once-per-train guard
-    /// (the learner's `resident_bins_uploaded` flag, quick-260621-p9v), i.e. the caller
-    /// guarantees the uploaded columns are the immutable feature set for every grow
-    /// until the next upload. The on-device grow driver may then SKIP its per-grow
-    /// re-upload ([`resident_bins_pinned`](Backend::resident_bins_pinned)).
+    /// Mark the CURRENT resident-bin cache as OWNED by a once-per-train guard (the
+    /// learner's `resident_bins_uploaded` flag), i.e. the caller guarantees the
+    /// uploaded columns are the immutable feature set for every grow until the next
+    /// upload. The on-device grow driver may then SKIP its per-grow re-upload
+    /// ([`resident_bins_pinned`](Backend::resident_bins_pinned)) — measurement found
+    /// this per-grow re-upload was the largest single contributor to the real-CUDA
+    /// on-device performance gap.
     ///
     /// DEFAULT: no-op (CpuBackend never takes the resident grow arm). Any subsequent
     /// [`upload_resident_bins`](Backend::upload_resident_bins) CLEARS the pin (a fresh
@@ -1095,7 +1058,7 @@ pub trait Backend {
     /// same-shape corpora.
     fn pin_resident_bins(&self) {}
 
-    /// SPIKE-079: whether the resident-bin cache is PINNED by a once-per-train owner
+    /// Whether the resident-bin cache is PINNED by a once-per-train owner
     /// AND matches this grow's geometry (`num_features`, `num_data`). Only the
     /// combination (pin + geometry) authorizes the on-device driver to skip its
     /// per-grow `upload_resident_bins`. DEFAULT: `false` (never skip).
@@ -1104,7 +1067,7 @@ pub trait Backend {
     }
 
     /// One-time per-GROW upload of the current tree's gradients + hessians to the
-    /// device (26-01, ODP3-01/M2) — the grad/hess analog of
+    /// device — the grad/hess analog of
     /// [`upload_resident_bins`](Backend::upload_resident_bins). The on-device resident
     /// grow calls this ONCE per tree (grad/hess are constant across a grow but change
     /// every boosting iteration), then the resident histogram build gathers each leaf's
@@ -1125,7 +1088,7 @@ pub trait Backend {
     }
 
     /// Whether [`upload_resident_bins`](Backend::upload_resident_bins) actually
-    /// consumes its `&[&[u32]]` argument (spike 004). With narrow [`BinColumn`]
+    /// consumes its `&[&[u32]]` argument. With narrow [`BinColumn`]
     /// storage, the learner must WIDEN each column to `u32` to call
     /// `upload_resident_bins`; that widening allocates `num_features` u32 Vecs ONCE
     /// per `train_inner`. On [`CpuBackend`] the upload is a no-op, so the learner
@@ -1138,7 +1101,7 @@ pub trait Backend {
 
     /// Whether the caller's `DataPartition::split` numeric branch should route a
     /// leaf's rows on the HOST, directly off the narrow [`BinColumn`] (the
-    /// spike-027 fused u8-route path), instead of widening to `&[u32]` and calling
+    /// fused u8-route path), instead of widening to `&[u32]` and calling
     /// [`data_partition`](Backend::data_partition).
     ///
     /// `true` ⇒ the caller's `DataPartition::split` numeric branch should route a
@@ -1162,20 +1125,20 @@ pub trait Backend {
     /// This is a SEPARATE capability from [`resident_pool_supported`](Backend::resident_pool_supported):
     /// a GPU backend WITHOUT a resident pool (e.g. CudaBackend/WgpuBackend) is neither
     /// resident NOR host-unified, so `!resident_pool_supported()` alone is NOT a
-    /// sufficient gate for the unified host path (quick-260627-o6i — it routed such a
+    /// sufficient gate for the unified host path (that gate previously routed such a
     /// backend into the erroring `build_fix_scan` default).
     fn host_unified_fused_supported(&self) -> bool {
         false
     }
 
     // ===================================================================
-    // 26-04 (M4/M5, ODP3-05): async device→host copy + multi-stream capability seam.
+    // Async device→host copy + multi-stream capability seam.
     //
     // These encode — IN CODE — the cubecl-0.10 boundary established in
     // `docs/on-device-streams-M4-M5.md` (verified against the installed
-    // cubecl-runtime-0.10.0, NOT from memory), so the M4/M5 finding is a documented
+    // cubecl-runtime-0.10.0, NOT from memory), so the finding is a documented
     // limit + achievable equivalent rather than a silent no-op. Additive defaults; no
-    // backend behavior changes (CpuBackend inherits the defaults untouched → SC-4 holds).
+    // backend behavior changes (CpuBackend inherits the defaults untouched).
     // ===================================================================
 
     /// Whether this backend can issue an ASYNC batched device→host copy.
@@ -1189,7 +1152,7 @@ pub trait Backend {
     /// re-pays the drain N times (the [[gpu-lazy-dispatch-deferred-sync-win]] finding).
     ///
     /// The on-device resident driver already sits at this single-drain floor: the co-packed
-    /// sibling scan drains BOTH children's outputs in one readback (spike-024), and every
+    /// sibling scan drains BOTH children's outputs in one readback, and every
     /// other per-split readback consolidates one handle.
     fn supports_async_device_copy(&self) -> bool {
         true
@@ -1213,7 +1176,7 @@ pub trait Backend {
     }
 
     /// The sanctioned SINGLE deferred drain for a genuine multi-handle device→host readback
-    /// (M4/M5 deferred-sync batching, ODP3-05). Delegates to cubecl's batched
+    /// (deferred-sync batching). Delegates to cubecl's batched
     /// `ComputeClient::read(Vec<Handle>)` (`client.rs:131`), which issues ONE `read_sync`
     /// over all handles — collapsing N per-handle read-sync fixed costs to 1
     /// ([[gpu-lazy-dispatch-deferred-sync-win]]). Any future site that must read several
@@ -1236,7 +1199,7 @@ pub trait Backend {
     }
 
     // ===================================================================
-    // 260608-p90: DEVICE-RESIDENT histogram-pool seam.
+    // DEVICE-RESIDENT histogram-pool seam.
     //
     // A device-Handle slot mirror that follows the host `HistogramPool` slot
     // bookkeeping, so a pure-numeric-spine tree keeps its per-leaf histograms
@@ -1248,7 +1211,7 @@ pub trait Backend {
     // OVERRIDES all of them.
     // ===================================================================
 
-    /// Whether this backend supports the device-resident histogram pool (260608-p90).
+    /// Whether this backend supports the device-resident histogram pool.
     /// `false` (the default, CpuBackend) means the learner's `resident_eligible` gate
     /// ANDs this in and ALWAYS takes the byte-unchanged host path. RocmBackend returns
     /// `true`.
@@ -1256,17 +1219,17 @@ pub trait Backend {
         false
     }
 
-    /// Clear/resize the device-handle slot mirror for a new tree (260608-p90), called
+    /// Clear/resize the device-handle slot mirror for a new tree, called
     /// alongside the host `HistogramPool::reset_map`. Default: no-op (CpuBackend never
     /// takes the resident branch).
     fn reset_resident_pool(&self, _num_slots: usize, _slot_len: usize) {}
 
     /// Build ONE leaf's per-feature histogram DEVICE-RESIDENT (build → f32→f64 widen →
-    /// fix → compact) and store the resulting f64 `Handle` into mirror slot `slot`
-    /// (260608-p90). Mirrors `build_leaf_histogram_into` but keeps the histogram on
+    /// fix → compact) and store the resulting f64 `Handle` into mirror slot `slot`.
+    /// Mirrors `build_leaf_histogram_into` but keeps the histogram on
     /// device. `fix_feats[fpos]` is `(slot_off, num_bin, offset, most_freq_bin)` for
     /// feature `fpos`; `sum_gradient` / `sum_hessian` are the leaf RAW (un-bumped)
-    /// totals (Pitfall 2). Default: typed error (never called on cpu — the gate is off).
+    /// totals. Default: typed error (never called on cpu — the gate is off).
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the resident
@@ -1293,16 +1256,16 @@ pub trait Backend {
         })
     }
 
-    /// Move the resident Handle from `src_slot` to `dst_slot` in the device mirror
-    /// (260608-p90), mirroring the host `HistogramPool::move_` slot reassignment so the
+    /// Move the resident Handle from `src_slot` to `dst_slot` in the device mirror,
+    /// mirroring the host `HistogramPool::move_` slot reassignment so the
     /// device mirror's slot→Handle map tracks the host pool's slot→leaf map. Default:
     /// no-op.
     fn move_resident(&self, _src_slot: usize, _dst_slot: usize) {}
 
     /// Derive the larger child's resident histogram by the subtraction trick on device
     /// (`parent_slot` Handle − `smaller_slot` Handle → `larger_slot` Handle, no
-    /// read-back; 260608-p90 Task 2). The derived larger child is NOT re-FixHistogram'd
-    /// (matches host/C++, non-negotiable #3). Default: typed error.
+    /// read-back). The derived larger child is NOT re-FixHistogram'd (matches
+    /// host/C++). Default: typed error.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the resident
@@ -1322,7 +1285,7 @@ pub trait Backend {
     }
 
     /// Scan slot `slot`'s resident histogram Handle for every spine feature's best
-    /// split in ONE fused launch (260608-p90), reading back only the `n*12` SplitInfo
+    /// split in ONE fused launch, reading back only the `n*12` SplitInfo
     /// cells (the histogram Handle never leaves the device). Returns one [`SplitInfo`]
     /// per `feats` entry, in input order (the cross-feature-argmax tie-break invariant).
     /// Default: typed error.
@@ -1348,10 +1311,10 @@ pub trait Backend {
         })
     }
 
-    /// CO-PACKED 2-slot resident scan (spike-024, Phase 12) — the co-packed analog of
+    /// CO-PACKED 2-slot resident scan — the co-packed analog of
     /// [`scan_resident_leaf`]. Scans BOTH siblings of a split in ONE 2-slot launch over
     /// their simultaneously-resident Handles (`smaller_slot` + `larger_slot`) with ONE
-    /// `read_one_unchecked` readback (the 024 sync-floor win: ≈59→≈30 syncs/tree),
+    /// `read_one_unchecked` readback (roughly halving device syncs per tree),
     /// returning `(smaller_splits, larger_splits)`. Bit-exact by construction — each
     /// feature's sequential scan is the SAME as the two single-slot scans; only WHICH
     /// launch it runs in changes. `feats` (the SHARED per-feature spine layout) and
@@ -1379,12 +1342,12 @@ pub trait Backend {
         })
     }
 
-    /// 26-02 (M3/ODP3-02, §8.2 `SyncBestSplitForLeafKernel` analog): scan one resident leaf AND
+    /// §8.2 `SyncBestSplitForLeafKernel` analog: scan one resident leaf AND
     /// reduce the per-feature best splits to the SINGLE winning split ON DEVICE, returning only
     /// the winner `(SplitInfo, feature-position)` — the ~8-int CUDASplitInfo-equivalent — INSTEAD
     /// of the full `Vec<SplitInfo>` [`scan_resident_leaf`](Backend::scan_resident_leaf) reads
     /// back per feature. The cross-feature reduction folds features in fpos order with the strict
-    /// `>` gain, lowest-real-feature-index tie-break (Pitfall 5 / T-lsx-01) so the winner is
+    /// `>` gain, lowest-real-feature-index tie-break so the winner is
     /// BIT-IDENTICAL to the host `argmax_over_splits`; `real_feats[fpos]` supplies each feature's
     /// real index (the tie-break key) and `feats[fpos].na_as_missing` skips a feature exactly as
     /// the host argmax `continue` does. Applies the `!(sum_h > 0) || num_data <= 0` short-circuit
@@ -1414,7 +1377,7 @@ pub trait Backend {
         })
     }
 
-    /// 26-02 (M3/ODP3-02): the CO-PACKED 2-slot analog of
+    /// The CO-PACKED 2-slot analog of
     /// [`scan_resident_leaf_argmax`](Backend::scan_resident_leaf_argmax) — co-scan BOTH siblings
     /// in ONE launch and reduce EACH side's per-feature splits to its winner ON DEVICE, returning
     /// `((smaller_winner, smaller_fpos), (larger_winner, larger_fpos))`. Both reductions fold in
@@ -1446,7 +1409,7 @@ pub trait Backend {
         })
     }
 
-    /// 26-02 (M7/ODP3-03, §8.3 `FindBestFromAllSplitsKernel` analog): reduce the per-leaf best
+    /// §8.3 `FindBestFromAllSplitsKernel` analog: reduce the per-leaf best
     /// splits to the winning LEAF index — the cross-leaf argmax that replaces the host best-leaf
     /// loop on the GpuBackend arm. `leaf_best[i]` is leaf `i`'s best split; `leaf_real_feat[i]`
     /// its winning feature's real index (`-1` = no split ⇒ `i32::MAX` in the tie-break). Uses the
@@ -1458,11 +1421,11 @@ pub trait Backend {
         kernels::grow_driver::best_leaf_argmax(leaf_best, leaf_real_feat)
     }
 
-    /// 26-02 (M7/ODP3-03, §6.1 `CUDAInitValuesKernel` analog): the whole-dataset root grad/hess
+    /// §6.1 `CUDAInitValuesKernel` analog: the whole-dataset root grad/hess
     /// sum — replaces the host f64 root fold on the GpuBackend arm. Default: the ordered f64 fold
     /// (ascending row order, the bit-exact anchor — the CpuBackend keeps this). GpuBackend runs
     /// the §6.1 reduction anchored bit-exact vs the integer path and ~1e-6 vs the host-CUDA fold
-    /// (NEVER GPU-f32-vs-GPU-f32, def-f8u-01). Returns `(sum_gradient, sum_hessian)`.
+    /// (NEVER GPU-f32-vs-GPU-f32). Returns `(sum_gradient, sum_hessian)`.
     fn root_grad_hess_sum(
         &self,
         _client: &ComputeClient<Self::Runtime>,
@@ -1472,13 +1435,13 @@ pub trait Backend {
         kernels::grow_driver::root_grad_hess_fold(gradients, hessians)
     }
 
-    /// 28-01 (ODF-01, §8.2): device-resident cross-feature reduce for ONE leaf — reduce the
+    /// §8.2 device-resident cross-feature reduce for ONE leaf — reduce the
     /// per-task `in_slab` records into resident frontier slot `out_leaf` ON DEVICE (no
     /// readback). Default: a typed error (the device-resident frontier is a GpuBackend
     /// capability; the CpuBackend anchor uses the host fold
     /// [`sync_best_split_for_leaf_on`](kernels::best_split::sync_best_split_for_leaf_on)).
     /// GpuBackend runs the §8.2 device kernel. Bit-exact to the host fold on the cpu f64
-    /// anchor (ODF-06).
+    /// anchor.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] on the default (device-resident frontier unsupported);
@@ -1499,12 +1462,12 @@ pub trait Backend {
         })
     }
 
-    /// 28-01 (ODF-01, §8.3): device-resident cross-leaf best-leaf pick + self-invalidation +
+    /// §8.3 device-resident cross-leaf best-leaf pick + self-invalidation +
     /// 8-int export — the winner lives in the device `best_leaf` slot; the ONLY device→host
-    /// transfer is the single 8-int export (SC#2). Default: a typed error (GpuBackend
+    /// transfer is the single 8-int export. Default: a typed error (GpuBackend
     /// capability); the CpuBackend anchor uses the host fold
     /// [`find_best_from_all_splits_on`](kernels::best_split::find_best_from_all_splits_on).
-    /// Bit-identical to the host pick on the cpu f64 anchor (ODF-06).
+    /// Bit-identical to the host pick on the cpu f64 anchor.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] on the default; propagates the device reduce error on
@@ -1524,17 +1487,17 @@ pub trait Backend {
         })
     }
 
-    /// 28-02 (ODF-02/ODF-05/ODF-06, R3): the NO-READBACK device tree split — mutate the
-    /// device tree in place via the §10 SplitKernel with the right child leaf id SUPPLIED
-    /// BY THE CALLER from the fixed grow schedule, NOT read back from the kernel (retires
-    /// R3, the `grow_driver.rs:1931` `right_leaf_index` `bump_sync`). The WR-03 desync
-    /// invariant (`right_leaf_index == tree.num_leaves`) is asserted host-side without a
+    /// The NO-READBACK device tree split — mutate the device tree in place via the §10
+    /// SplitKernel with the right child leaf id SUPPLIED BY THE CALLER from the fixed
+    /// grow schedule, NOT read back from the kernel (avoiding a host round-trip for the
+    /// `grow_driver.rs:1931` `right_leaf_index`). The desync invariant
+    /// (`right_leaf_index == tree.num_leaves`) is asserted host-side without a
     /// readback.
     ///
     /// Default: a typed error (the device tree split is a GpuBackend capability; the
     /// CpuBackend anchor mutates the host `lgbm_model::Tree` directly). GpuBackend calls
     /// [`DeviceCudaTree::split_on_device_scheduled`](kernels::tree::DeviceCudaTree::split_on_device_scheduled).
-    /// Byte-identical tree structure to the host mutation on the cpu f64 anchor (ODF-06).
+    /// Byte-identical tree structure to the host mutation on the cpu f64 anchor.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] on the default; on GpuBackend propagates the device tree
@@ -1558,7 +1521,7 @@ pub trait Backend {
         })
     }
 
-    /// 260608-t3t: FUSED directly-built-leaf path — build + fix + compact + scan a
+    /// FUSED directly-built-leaf path — build + fix + compact + scan a
     /// leaf's per-feature histogram in ONE launch. Builds the leaf's histogram
     /// DEVICE-RESIDENT (sequential f64 fold ⇒ bit-exact), fixes+compacts it, and
     /// scans it for every SCAN-ACTIVE feature's best split — STORING the
@@ -1569,7 +1532,7 @@ pub trait Backend {
     /// for the subtraction trick — and `scan_active[fpos]` selects which features are
     /// scanned (the spine subset that passed the learner's gates). Collapses
     /// `build_resident_leaf` + `scan_resident_leaf` (3 launches) into 1. The leaf RAW
-    /// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2), the
+    /// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX, the
     /// launcher derives the 2*kEpsilon-bumped scan operand internally. Default: typed
     /// error (never called on cpu — the fused gate is off there).
     ///
@@ -1600,12 +1563,12 @@ pub trait Backend {
         })
     }
 
-    /// 31-08 (ODS-02): the ZERO-READBACK analog of
+    /// The ZERO-READBACK analog of
     /// [`scan_resident_leaf_argmax`](Backend::scan_resident_leaf_argmax) — scan ONE resident
     /// leaf and fold its cross-feature winner (gain + threshold + default_left + 4 child sums +
     /// left/right output) DIRECTLY into the resident frontier slot `out_leaf` on device, with NO
-    /// host argmax readback. Retires the per-split scan `bump_sync`
-    /// [`scan_resident_and_argmax`](kernels::grow_driver) issued; the winner reaches the driver
+    /// host argmax readback. Avoids the per-split scan host round-trip that
+    /// [`scan_resident_and_argmax`](kernels::grow_driver) issues; the winner reaches the driver
     /// only via the §8.3 pick export (`frontier_pick_best_leaf_device`), which now carries the
     /// picked leaf's full node record. Default: typed error (GpuBackend capability). Bit-exact to
     /// `scan_resident_leaf_argmax` + `reduce_winner_into_frontier` on the cpu f64 anchor.
@@ -1635,11 +1598,11 @@ pub trait Backend {
         })
     }
 
-    /// 31-08 (ODS-02): the ZERO-READBACK, CO-PACKED analog of
+    /// The ZERO-READBACK, CO-PACKED analog of
     /// [`scan_resident_siblings_argmax`](Backend::scan_resident_siblings_argmax) — co-scan BOTH
     /// siblings in ONE launch and fold EACH side's winner DIRECTLY into its frontier slot
-    /// (`out_leaf_smaller` / `out_leaf_larger`) on device, NO host argmax readback. Retires the
-    /// co-pack arm's per-split scan `bump_sync`. Default: typed error. Bit-exact to two
+    /// (`out_leaf_smaller` / `out_leaf_larger`) on device, NO host argmax readback. Avoids the
+    /// co-pack arm's per-split scan host round-trip. Default: typed error. Bit-exact to two
     /// `argmax_over_resident_splits` folds + `reduce_winner_into_frontier` on the cpu f64 anchor.
     ///
     /// # Errors
@@ -1668,7 +1631,7 @@ pub trait Backend {
         })
     }
 
-    /// 31-08 (ODS-02): the ZERO-READBACK analog of
+    /// The ZERO-READBACK analog of
     /// [`build_fix_scan_resident`](Backend::build_fix_scan_resident) (the f64-fused escape hatch)
     /// — build+fix+compact+scan a directly-built leaf in ONE launch, STORE the fixed+compacted
     /// f64 histogram Handle into mirror slot `slot` (so `subtract_resident` still finds it), AND
@@ -1708,15 +1671,15 @@ pub trait Backend {
         })
     }
 
-    /// quick 260620-a48: UNIFIED host per-feature `{build → fix → compact → scan}` for
+    /// UNIFIED host per-feature `{build → fix → compact → scan}` for
     /// the directly-built (smaller/root) leaf, run inside ONE rayon region — the host f64
     /// analog of [`build_fix_scan_resident`](Backend::build_fix_scan_resident).
     ///
     /// Each feature folds its OWN private histogram (cache-hot in the building thread),
     /// runs `fix_histogram` (RAW sums + `most_freq_bin` reconstruct) + `compact`
     /// (`offset` shift) IN PLACE on it, and — IF `scan_active[fpos]` — scans it, all
-    /// WITHOUT a cross-region fork/join hand-off (the contention quick 260620-9cp found:
-    /// a parallel scan `par_iter` fighting the parallel build `par_iter`). After the
+    /// WITHOUT a cross-region fork/join hand-off (avoiding the contention a parallel
+    /// scan `par_iter` would cause fighting the parallel build `par_iter`). After the
     /// region a SERIAL ordered loop copies each private histogram into its disjoint
     /// `buf[slot_off..]` region (the COMPLETE leaf histogram for the subtract-derived
     /// larger child) and assembles the per-feature `Option<SplitInfo>` results in
@@ -1735,14 +1698,14 @@ pub trait Backend {
     /// one thread changes NEITHER per-feature op order NOR the (serial, feature-order)
     /// argmax ⇒ byte-identical to the two-step path (proven FORCED-ON via
     /// `LGBM_UNIFIED_BFS_THRESHOLD=0`). `sum_gradient`/`sum_hessian` are the RAW
-    /// (un-bumped) leaf totals (Pitfall 2 — the `fix` operand).
+    /// (un-bumped) leaf totals (the `fix` operand).
     ///
     /// Default: typed error — only [`CpuBackend`] overrides this (the unified path is the
     /// CPU-only host analog; RocmBackend keeps `build_fix_scan_resident`). The learner's
     /// `smaller_unified` gate ANDs in [`host_unified_fused_supported`](Backend::host_unified_fused_supported)
     /// (CpuBackend-only) so this is never reached on a GPU backend — including one without
     /// a resident pool (CudaBackend/WgpuBackend), for which `!resident_pool_supported()`
-    /// alone was insufficient (quick-260627-o6i).
+    /// alone was insufficient.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; on CpuBackend,
@@ -1771,7 +1734,7 @@ pub trait Backend {
         })
     }
 
-    /// quick 260620-b97: UNIFIED host per-feature `{subtract → scan}` for the
+    /// UNIFIED host per-feature `{subtract → scan}` for the
     /// subtract-derived (larger / use_subtract) child, run inside ONE rayon region — the
     /// host f64 analog of [`build_fix_scan`](Backend::build_fix_scan) but for the larger
     /// child, with NO build and NO fix (non-negotiable #3: C++ runs no FixHistogram on the
@@ -1796,7 +1759,7 @@ pub trait Backend {
     /// learner's `larger_unified` gate ANDs in [`host_unified_fused_supported`](Backend::host_unified_fused_supported)
     /// (CpuBackend-only) so this is never reached on a GPU backend — including one without
     /// a resident pool (CudaBackend/WgpuBackend), for which `!resident_eligible` alone was
-    /// insufficient (quick-260627-o6i).
+    /// insufficient.
     ///
     /// # Errors
     /// [`ComputeError::Runtime`] (unsupported) on the default; on CpuBackend,
@@ -1824,76 +1787,76 @@ pub trait Backend {
     }
 
     // ===================================================================
-    // ODL-01: CUDA on-device tree-learner seam (Phase 14 Slice 0).
+    // CUDA on-device tree-learner seam.
     //
     // The additive `Backend` seam + discriminator that lets a backend grow an
     // ENTIRE tree on-device and return the `(Tree, LeafPartitionLayout)` payload,
-    // bypassing the per-leaf host build/scan loop. In Slice 0 BOTH methods are a
-    // provable NO-OP on every backend: the discriminator defaults `false` and the
+    // bypassing the per-leaf host build/scan loop. Both methods are a
+    // provable NO-OP on every backend by default: the discriminator defaults `false` and the
     // seam defaults `Ok(None)` ("I did not grow it"), so the default CPU/ROCm tree
-    // path is byte-unchanged. Activation (a real kernel + a `true` discriminator)
-    // is Slice 1; the learner fork that consumes the seam is Plan 02.
+    // path is byte-unchanged. Activation requires a real kernel plus a `true`
+    // discriminator, and a learner fork that consumes the seam.
     // ===================================================================
 
-    /// Whether this backend can grow an entire tree ON-DEVICE (ODL-01/ODL-19).
+    /// Whether this backend can grow an entire tree ON-DEVICE.
     ///
     /// The trait DEFAULT is `false` (a hypothetical future backend opts out until it
-    /// wires the driver). [`CpuBackend`] and `GpuBackend<R>` OVERRIDE this in 20-03a
-    /// to return [`cuda_on_device_enabled`] — GATED, not a bare `true` (Pitfall 2,
-    /// D-09): with `LGBM_CUDA_ON_DEVICE` unset every backend reports `false`, so the
+    /// wires the driver). [`CpuBackend`] and `GpuBackend<R>` OVERRIDE this
+    /// to return [`cuda_on_device_enabled`] — GATED, not a bare `true`: with
+    /// `LGBM_CUDA_ON_DEVICE` unset every backend reports `false`, so the
     /// learner's on-device eligibility gate ANDs this in and ALWAYS takes the
     /// byte-unchanged host/per-leaf path (the hard merge gate stays byte-identical).
-    /// Extending the gated flip to `CpuBackend` is deliberate: the 20-03b STRUCTURE
-    /// gate must grow the on-device tree on the cubecl-cpu runtime so it runs in the
+    /// Extending the gated flip to `CpuBackend` is deliberate: the structural gate
+    /// must grow the on-device tree on the cubecl-cpu runtime so it runs in the
     /// DEFAULT merge gate (the cpu-f64 anchor lane), not behind rocm hardware — the
-    /// env gate keeps the env-unset merge gate byte-unchanged either way. This plan
+    /// env gate keeps the env-unset merge gate byte-unchanged either way. Today
     /// the driver body still returns `Ok(None)`, so even with the env SET the fork
     /// safely falls through to the byte-identical host path (output still correct).
     fn on_device_growth_supported(&self) -> bool {
         false
     }
 
-    /// Grow an ENTIRE tree on-device and return its model + raw leaf-row layout (ODL-01).
+    /// Grow an ENTIRE tree on-device and return its model + raw leaf-row layout.
     ///
     /// Returns `Ok(None)` = "I did not grow the tree on-device" — the caller falls
     /// back to the standard host/per-leaf path. This is deliberately NOT a typed
-    /// `Err(NotSupported)`: D-03 keeps the default route error-noise-free, so an
+    /// `Err(NotSupported)`: it keeps the default route error-noise-free, so an
     /// unsupported backend is a quiet `None`, not an error the learner must filter.
     ///
     /// The args are what the learner holds at the `train_inner` fork point:
     /// `gradients`, `hessians`, the ADDITIVE `features` metadata slice
     /// ([`GrowFeature`] — the per-feature bin layout the grow loop reads, expressed
-    /// in ONLY lgbm-compute-reachable types so no crate cycle is introduced,
-    /// D-01/Option A), `num_leaves`, and `max_depth`. The per-leaf orchestration
-    /// BODY that consumes `features` lands in 20-03b; this plan keeps `Ok(None)`.
+    /// in ONLY lgbm-compute-reachable types so no crate cycle is introduced),
+    /// `num_leaves`, and `max_depth`. The per-leaf orchestration BODY that
+    /// consumes `features` returns `Ok(None)` for now.
     ///
     /// The return type names ONLY lgbm-compute-reachable crates
     /// (`lgbm_model::Tree` + `lgbm_dataset::LeafPartitionLayout`). It MUST NOT name
     /// the treelearner crate's `DataPartition` — that would require importing
     /// lgbm-treelearner here, which is the crate-cycle warning sign (treelearner →
     /// compute → treelearner). The learner reconstructs its `DataPartition` from the lower-crate
-    /// `LeafPartitionLayout` payload in Plan 02.
+    /// `LeafPartitionLayout` payload.
     ///
-    /// # cubecl-0.10 kernel checklist (Slice 1, when a real kernel lands here)
+    /// # cubecl-0.10 kernel checklist (for when a real kernel lands here)
     /// - NO global barrier across cubes — synchronize within a cube only.
     /// - `Atomic<i64>` is broken on this cubecl — use u64 fixed-point atomics.
     /// - `wrapping_add` is NOT a kernel intrinsic — avoid it in `#[cube]` code.
     /// - a plane-sum reduction spans at most ONE plane width — no cross-plane sum.
     /// - `launch_unchecked` is `unsafe` — uphold the launch-arg invariants by hand.
     ///
-    /// # Phase-14 foundation modules this Slice-1 kernel will compose (14-06)
+    /// # Foundation modules a future on-device grow kernel will compose
     /// The shared device primitives, split-info structs, and on-device RNG the
-    /// future on-device grow loop assembles already exist and are golden-validated
-    /// (14-06, ODL-01): [`kernels::primitives`] (block + global prefix-sum,
+    /// future on-device grow loop assembles already exist and are golden-validated:
+    /// [`kernels::primitives`] (block + global prefix-sum,
     /// shuffle reductions, index-only bitonic argsort, percentile),
     /// [`kernels::split_info`] (the device-side split/leaf-split structs), and
-    /// [`kernels::random`] (the on-device LCG mirror). The on-device growth
-    /// consumer (Phase 21) reuses these — this seam stays a strict no-op until
-    /// then; the discriminator above is FROZEN `false` (D-09).
+    /// [`kernels::random`] (the on-device LCG mirror). A future on-device growth
+    /// consumer reuses these — this seam stays a strict no-op until
+    /// then; the discriminator above is FROZEN `false`.
     ///
     /// # Errors
-    /// Returns [`ComputeError`] only once Slice 1 wires a real kernel that can fail
-    /// (device OOM, launch error). In Slice 0 it is infallible (`Ok(None)`).
+    /// Returns [`ComputeError`] only once a real kernel is wired that can fail
+    /// (device OOM, launch error). Until then it is infallible (`Ok(None)`).
     fn grow_tree_on_device(
         &self,
         _gradients: &[f32],
@@ -1905,11 +1868,11 @@ pub trait Backend {
         Ok(None)
     }
 
-    /// OCX-02 (Phase-29, 29-02): the CONFIG-BOUND on-device grow seam — grow the whole
+    /// The CONFIG-BOUND on-device grow seam — grow the whole
     /// tree under the caller's REAL [`crate::gain::GainConfig`] instead of the permissive
     /// proving-slice config the parameterless [`Self::grow_tree_on_device`] pins.
     ///
-    /// This is the ADDITIVE fix for spike-072 item-15: the pre-fix production seam
+    /// This is the ADDITIVE fix for a prior gap where the production seam
     /// (`SerialTreeLearner` → `grow_tree_on_device` → `grow_tree_on_device_driver` →
     /// [`kernels::grow_driver::proving_slice_config`]) grew every on-device tree with
     /// `min_data_in_leaf = 1` / `min_sum_hessian_in_leaf = 0.0`, so C++'s admissibility gate
@@ -1945,27 +1908,27 @@ pub trait Backend {
     }
 }
 
-/// The default cpu-runtime backend (the D-04 deterministic anchor, CMP-02).
+/// The default cpu-runtime backend (the deterministic anchor).
 ///
 /// Binds [`runtime::ActiveRuntime`] (cubecl-cpu under the default `cpu` feature)
 /// and dispatches [`construct_histograms`](Backend::construct_histograms) to the
 /// single-owner ordered f64 fold in [`kernels::histogram`].
-/// THE production seam gate for the on-device histogram/tree path (D-07, ODL-10).
+/// THE production seam gate for the on-device histogram/tree path.
 ///
-/// `LGBM_CUDA_ON_DEVICE` is a TRI-STATE toggle (D-01), read ONCE (OnceLock-cached,
+/// `LGBM_CUDA_ON_DEVICE` is a TRI-STATE toggle, read ONCE (OnceLock-cached,
 /// mirroring [`split_2lane_enabled`]):
 /// - `"1"` ⇒ force ON,
 /// - `"0"` ⇒ force OFF (the explicit off-switch fallback),
 /// - unset / empty / any other value ⇒ follow the device default
-///   ([`on_device_default`], which is `false` this phase — D-09 pre-verdict).
+///   ([`on_device_default`], currently `false`).
 ///
 /// While the resolver is `false` the on-device histogram entry
-/// (`construct_histogram_for_leaf` (removed)) and the Phase-18/21 tree-growth
+/// (`construct_histogram_for_leaf` (removed)) and the tree-growth
 /// driver that will call it stay UNREACHABLE, so the CPU / ROCm / host-CUDA paths are
 /// byte-unchanged. This is the call-site gate the future growth loop checks, exactly as
 /// it ANDs in [`Backend::on_device_growth_supported`] — which INDEPENDENTLY stays `false`
-/// this phase (Phase 16 demonstrates the build→fix→subtract histogram path in isolation;
-/// the growth loop that consumes it is Phase 18/21). The entry fn is additive and pure:
+/// for now (the build→fix→subtract histogram path exists in isolation; the growth loop
+/// that consumes it is separate). The entry fn is additive and pure:
 /// it never mutates global state and is invoked only behind this gate (in production) or
 /// directly by the anchor tests.
 #[must_use]
@@ -1973,12 +1936,12 @@ pub fn cuda_on_device_enabled() -> bool {
     cuda_on_device_override().unwrap_or_else(on_device_default)
 }
 
-/// Pure tri-state MAPPING for `LGBM_CUDA_ON_DEVICE` (D-01, V5 exact-match closed enum).
+/// Pure tri-state MAPPING for `LGBM_CUDA_ON_DEVICE` (V5 exact-match closed enum).
 ///
 /// This is the testable core of [`cuda_on_device_override`]: it does NOT touch the
 /// process env or the OnceLock cache, so unit tests can exercise every branch without
-/// fighting the read-once semantics (Pitfall P-1). Exact-string match only — no eval,
-/// no path/format interpretation of the value (ASVS V5, T-23-01):
+/// fighting the read-once semantics. Exact-string match only — no eval,
+/// no path/format interpretation of the value (ASVS V5):
 /// - `Some("1")` ⇒ `Some(true)` (force on),
 /// - `Some("0")` ⇒ `Some(false)` (force off),
 /// - `None` / `Some("")` / any other string ⇒ `None` (follow the device default).
@@ -1992,9 +1955,9 @@ pub fn cuda_on_device_override_from(s: Option<&str>) -> Option<bool> {
     }
 }
 
-/// The OnceLock-cached tri-state override read from `LGBM_CUDA_ON_DEVICE` (D-01).
+/// The OnceLock-cached tri-state override read from `LGBM_CUDA_ON_DEVICE`.
 ///
-/// Read ONCE per process (P-1) via [`cuda_on_device_override_from`]. Returns
+/// Read ONCE per process via [`cuda_on_device_override_from`]. Returns
 /// `Some(true)`/`Some(false)` when the operator forces the toggle, `None` when the
 /// env is unset/empty/malformed (defer to [`on_device_default`]). NOT
 /// `#[cfg(feature="cpu")]`-gated (unlike [`split_2lane_enabled`]) because cuda/rocm
@@ -2005,49 +1968,21 @@ fn cuda_on_device_override() -> Option<bool> {
     *E.get_or_init(|| cuda_on_device_override_from(std::env::var("LGBM_CUDA_ON_DEVICE").ok().as_deref()))
 }
 
-/// The compile-time device default for on-device growth when the env is unset (D-09).
+/// The compile-time device default for on-device growth when the env is unset.
 ///
 /// STAYS `false` — on-device growth is OPT-IN via `LGBM_CUDA_ON_DEVICE="1"`, so
-/// cpu / rocm / cuda builds are ALL byte-unchanged vs today (SC-4).
+/// cpu / rocm / cuda builds are ALL byte-unchanged vs today.
 ///
-/// VERDICT (Phase 25, 25-05 — evidence-gated per ODP2-07): the real-CUDA Kaggle A/B
-/// (`25-AB-RESULTS.md`) FAILED BOTH bars, so the flip is WITHHELD:
-///   - D-04 not-slower (≤1.05×): **FAIL** — the 25-01 u64-build swap cut the Phase-24
-///     gap from 3.6–5.3× down to **1.23–1.32×** (a real, large gain, confirmed live by
-///     `on_device_rootbuild_u64 > 0` AND `on_device_f64_fused == 0` counters), but no
-///     shape/route meets ≤1.05× on real discrete NVIDIA CUDA. Root cause of the residual:
-///     per-iteration device-sync overhead across ~9244 per-leaf launches — NOT launch-bound
-///     (launches already at ~92/tree vs 85.7/tree host parity); the on-device row-partition
-///     route (`LGBM_ROCM_HOST_PARTITION=0`) is a net negative (+30 launches/tree, slower).
-///   - ~1e-6 real-CUDA parity (D-11 re-anchored): **FAIL** — the harness f32-vs-f32
-///     `max_abs=1.0` on both routes (flagged as a def-f8u-01 two-GPU-f32-paths artifact; the
-///     sanctioned 25-02 integer/f64 on-device anchor passed locally, but the real-CUDA ~1e-6
-///     bar as measured fails and must be re-resolved against the f64 anchor before any flip).
-/// Evidence + root-cause analysis:
-/// `.planning/phases/25-on-device-cuda-perf-v2-root-cause-the-residual-real-cuda-slo/25-AB-RESULTS.md`.
+/// On-device growth stays off by default because repeated real-CUDA measurement found
+/// it slower than the host path: even after removing host-side control-plane overhead,
+/// a per-leaf device-sync/readback floor (thousands of blocking readbacks per grow)
+/// remains the dominant residual cost on real discrete NVIDIA hardware, and real-CUDA
+/// numerical parity against the f64 anchor has not yet been re-resolved either. Until a
+/// genuinely device-resident best-first grow loop removes that per-leaf sync floor (and
+/// parity is re-verified), the default stays off; `LGBM_CUDA_ON_DEVICE="1"` remains the
+/// opt-in switch and `="0"` the explicit off-switch.
 ///
-/// VERDICT (Phase 26, 26-06 — evidence-gated per ODP3-08): re-ran the Kaggle real-CUDA
-/// A/B against the full resident control plane (Plans 01–05: grad/hess once-per-tree,
-/// on-device split argmax + cross-leaf pick + root sum, resident row permutation +
-/// device partition, cubecl-0.10 async-copy boundary). It **FAILED BOTH bars again** —
-/// so the flip STAYS WITHHELD (the fourth consecutive gate, 24/25/26):
-///   - D-04 not-slower (≤1.05×): **FAIL** — essentially flat vs Phase-25: host route
-///     1.245×/1.233×, device route 1.182×/1.204× on real discrete NVIDIA CUDA. The
-///     resident control plane collapsed the host-side control cost the spike-057/058
-///     analysis fingered, but did NOT remove the real-CUDA per-leaf device sync/readback
-///     floor (6044 blocking readbacks/grow, ODP3-07 counter), which is the true residual.
-///   - ~1e-6 real-CUDA parity: **FAIL** — harness f32-vs-f32 `max_abs=1.0` both routes
-///     (def-f8u-01 artifact; the sanctioned integer/u64 + cpu-f64 anchor passed locally).
-/// Evidence + root-cause analysis:
-/// `.planning/phases/26-on-device-cuda-perf-v3-resident-control-plane/26-AB-RESULTS.md`.
-/// The default-on flip is therefore WITHHELD (mirrors the Phase-24 24-06 and Phase-25
-/// 25-05 deferrals); `LGBM_CUDA_ON_DEVICE="1"` remains the opt-in switch and `="0"` the
-/// off-switch. Carry-forward: attack the per-leaf device sync/readback floor directly
-/// (a genuinely device-resident best-first grow loop that does not block-read per leaf),
-/// not further host-control-plane residency; and re-resolve real-CUDA ~1e-6 parity
-/// against the f64 anchor before re-attempting the flip.
-///
-/// Pitfall P-3 caveat for any future flip: `cfg!(feature = "cuda")` is evaluated in
+/// Caveat for any future flip: `cfg!(feature = "cuda")` is evaluated in
 /// THIS crate's feature set — a mono-feature (`cuda`-only) build resolves it `true`,
 /// a dual-feature (`cpu`+`cuda`) build resolves it `true` as well, so a future flip to
 /// `cfg!(feature = "cuda")` must keep the `LGBM_CUDA_ON_DEVICE="0"` off-switch as the
@@ -2057,7 +1992,7 @@ fn on_device_default() -> bool {
     false
 }
 
-/// quick-260620-8v4 opt-in gate for the additive 2-lane native split scan. Read
+/// Opt-in gate for the additive 2-lane native split scan. Read
 /// ONCE from `LGBM_SPLIT_2LANE` (`"1"` => on). OFF by default: the serial
 /// [`kernels::split::find_best_split_cpu_native`] is the bit-exact source of truth
 /// and the production path; the 2-lane variant is selected only for the explicit
@@ -2077,27 +2012,27 @@ pub struct CpuBackend;
 impl Backend for CpuBackend {
     type Runtime = runtime::ActiveRuntime;
 
-    // ODL-19 (Phase 20, 20-03a): GATED on-device-growth discriminator. Returns
+    // GATED on-device-growth discriminator. Returns
     // [`cuda_on_device_enabled`] — `false` when `LGBM_CUDA_ON_DEVICE` is unset, so
     // the learner's eligibility AND-gate is dead and the byte-unchanged host/per-leaf
     // cpu-f64 anchor path runs (the hard merge gate). The gated flip lands on
-    // CpuBackend (not only GpuBackend) so the 20-03b STRUCTURE gate grows the
+    // CpuBackend (not only GpuBackend) so the structural gate grows the
     // on-device tree on the cubecl-cpu runtime, INSIDE the default merge gate. The
-    // `grow_tree_on_device` body still returns `Ok(None)` this plan (trait default),
+    // `grow_tree_on_device` body still returns `Ok(None)` for now (trait default),
     // so even with the env SET the fork falls through to the byte-identical host path.
     fn on_device_growth_supported(&self) -> bool {
         cuda_on_device_enabled()
     }
 
-    // ODL-18 (20-03b): the ACTIVATED on-device grow seam. When the discriminator is
+    // The ACTIVATED on-device grow seam. When the discriminator is
     // live ([`cuda_on_device_enabled`]) grow the ENTIRE continuous-feature + L2 tree
     // on the cubecl-cpu runtime via the per-leaf best-first driver
     // ([`kernels::grow_driver::grow_tree_on_device_driver`]) and return
     // `Ok(Some((Tree, LeafPartitionLayout)))`. With the env unset the discriminator is
     // `false`, so the learner's eligibility AND-gate never reaches here and the seam is
-    // a byte-unchanged `Ok(None)` (the merge-gate contract, D-09). The on-device tree is
+    // a byte-unchanged `Ok(None)` (the merge-gate contract). The on-device tree is
     // anchored STRUCTURE-bit-exact to the cpu f64 fold (the SAME cubecl-cpu runtime) —
-    // never a second GPU f32 path (def-f8u-01).
+    // never a second GPU f32 path.
     fn grow_tree_on_device(
         &self,
         gradients: &[f32],
@@ -2116,12 +2051,13 @@ impl Backend for CpuBackend {
         Ok(Some((tree, layout)))
     }
 
-    // OCX-02 (29-02): the CONFIG-BOUND on-device grow seam — delegate to the driver's
+    // The CONFIG-BOUND on-device grow seam — delegate to the driver's
     // `_with_cfg` entry so the caller's REAL `GainConfig` (min_data_in_leaf /
     // min_sum_hessian_in_leaf / lambdas / min_gain_to_split / categorical scalars) binds on
-    // every scan, closing the spike-072 item-15 admissibility hole. Env-gated + `Ok(None)`
-    // exactly like the parameterless seam above, so SC-4 (byte-unchanged with the env unset)
-    // holds. The cpu-lane driver takes the f64 ANCHOR arm (`resident_pool_supported() == false`).
+    // every scan, closing a prior admissibility hole where those bounds were not enforced.
+    // Env-gated + `Ok(None)` exactly like the parameterless seam above, so behavior stays
+    // byte-unchanged with the env unset. The cpu-lane driver takes the f64 ANCHOR arm
+    // (`resident_pool_supported() == false`).
     fn grow_tree_on_device_with_cfg(
         &self,
         gradients: &[f32],
@@ -2149,7 +2085,7 @@ impl Backend for CpuBackend {
         ordered_hessians: &[f32],
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError> {
-        // R2: native f64 fold — bit-identical to the single-unit `construct_hist_
+        // Native f64 fold — bit-identical to the single-unit `construct_hist_
         // kernel` but without the ~20–50µs cubecl-cpu launch per call (the dominant
         // train-time cost). The cubecl path stays in `construct_histograms_cpu` for
         // the kernel-parity / ROCm-mirror tests. `_client` is unused on the native
@@ -2179,11 +2115,11 @@ impl Backend for CpuBackend {
         sum_hessian: f64,
         num_data: i32,
     ) -> Result<SplitInfo, ComputeError> {
-        // R2: native f64 scan — bit-identical to the single-unit find_best_split_
+        // Native f64 scan — bit-identical to the single-unit find_best_split_
         // kernel, without the per-(feature,leaf) cubecl launch. The cubecl path
         // stays in find_best_split_cpu for kernel-parity / ROCm-mirror tests.
         //
-        // quick-260620-8v4: an OPT-IN additive 2-lane variant runs the REVERSE and
+        // An OPT-IN additive 2-lane variant runs the REVERSE and
         // FORWARD passes on two rayon lanes (bit-identical winner — see
         // `find_best_split_cpu_native_2lane`). Gated behind `LGBM_SPLIT_2LANE=1` so
         // the DEFAULT path is the unchanged serial source of truth; the 2-lane path
@@ -2233,7 +2169,7 @@ impl Backend for CpuBackend {
         threshold: u32,
         most_freq_bin: u32,
     ) -> Result<(Vec<u32>, usize), ComputeError> {
-        // R2: native u32 routing + stable gather — bit-identical to the kernel path.
+        // Native u32 routing + stable gather — bit-identical to the kernel path.
         kernels::partition::data_partition_cpu_native(
             bins,
             num_bin,
@@ -2245,7 +2181,7 @@ impl Backend for CpuBackend {
     }
 
     // CpuBackend is the bit-exact host anchor: route a leaf's rows on the HOST via
-    // the spike-027 fused u8-route path (DataPartition::split) instead of widening
+    // the fused u8-route path (DataPartition::split) instead of widening
     // each leaf's bins to `&[u32]` and calling `data_partition`. Byte-identical
     // [left | right] order. RocmBackend inherits the default false (on-device).
     fn prefers_host_partition(&self) -> bool {
@@ -2266,35 +2202,30 @@ impl Backend for CpuBackend {
         parent: &[f64],
         child: &[f64],
     ) -> Result<Vec<f64>, ComputeError> {
-        // R2: native element-wise parent − child — bit-identical to the kernel path.
+        // Native element-wise parent − child — bit-identical to the kernel path.
         kernels::subtract::subtract_histograms_cpu_native(parent, child)
     }
 
-    // CPU batched split: 260608-mc5 Task-3 DECISION = keep the NATIVE per-feature
-    // path (the `Backend::find_best_splits_batched` trait default, which calls
-    // `self.find_best_split` == `find_best_split_cpu_native` per feature). The merge
-    // initially routed CpuBackend through `find_best_splits_batched_fused_f64_on`
-    // (the same fused cubecl kernel the GPU uses), but a measured bench_train run on
-    // this HEAD showed a MATERIAL CPU regression — the cubecl-cpu per-leaf launch
-    // dispatch dominates even when batched into ONE launch per leaf:
-    //   fused cubecl-cpu  vs  native (same HEAD, R2-equivalent):
-    //     small  223.92ms vs  42.86ms  (~5.2x slower)
-    //     medium 618.49ms vs 256.17ms  (~2.4x slower)
-    //     large    1.76s  vs 828.95ms  (~2.1x slower)
-    // (same root cause R2/260608-jyl found: the cubecl-cpu launch fixed cost, not
-    // the arithmetic). CLAUDE.md non-negotiable #2 forbids shipping a silent CPU
-    // slowdown, so the CpuBackend override is intentionally NOT defined here — the
-    // native trait default applies. The GPU `RocmBackend` KEEPS the fused override
+    // CPU batched split: keep the NATIVE per-feature path (the
+    // `Backend::find_best_splits_batched` trait default, which calls
+    // `self.find_best_split` == `find_best_split_cpu_native` per feature) rather than
+    // routing CpuBackend through `find_best_splits_batched_fused_f64_on` (the same
+    // fused cubecl kernel the GPU uses). Measurement found the fused cubecl-cpu path
+    // materially slower — the cubecl-cpu per-leaf launch dispatch dominates even when
+    // batched into ONE launch per leaf, regardless of leaf size (the launch fixed
+    // cost, not the arithmetic, is the bottleneck). Shipping a silent CPU slowdown is
+    // not acceptable, so the CpuBackend override is intentionally NOT defined here —
+    // the native trait default applies. The GPU `RocmBackend` KEEPS the fused override
     // (one launch per leaf on gfx1100, f64 bit-exact), and the shared
-    // `split_scan_body` helper (THE MERGE: one source of the split math) stays for
-    // BOTH paths regardless. See the 260608-mc5 SUMMARY for the full measurement.
+    // `split_scan_body` helper (one source of the split math) stays for
+    // BOTH paths regardless.
     //
     // The fused launcher `find_best_splits_batched_fused_f64_on` is generic over R,
     // so it remains available for the cubecl-cpu runtime via the oracle three-way
     // bit-exact gate (`kernel_parity_fused_equals_per_feature_and_native`) — the
     // merge is PROVEN bit-exact on cpu even though it is not the production path.
 
-    // quick-260620-9cp (R4 split-scan lever): override the per-leaf SPLIT SCAN to
+    // Override the per-leaf SPLIT SCAN to
     // parallelize the per-feature loop with ONE rayon fork/join per leaf, amortized
     // across all features — replacing the trait-default serial `for f in feats`.
     //
@@ -2319,7 +2250,7 @@ impl Backend for CpuBackend {
     // bins, NOT leaf rows — a rows-based gate would be WRONG). Below threshold the
     // serial path runs verbatim, protecting narrow leaves from the per-feature
     // dispatch overhead (the same overhead that regressed the unconditional BUILD
-    // path, Spike 005). Empty feats ⇒ empty Vec, no work (threat T-lsx-03).
+    // path). Empty feats ⇒ empty Vec, no work.
     //
     // Scope: CpuBackend ONLY. RocmBackend keeps its fused-launch override (lib.rs).
     fn find_best_splits_batched(
@@ -2439,7 +2370,7 @@ impl Backend for CpuBackend {
         Ok(out)
     }
 
-    // quick 260620-a48: UNIFIED host build+fix+scan — delegate to the inherent impl
+    // UNIFIED host build+fix+scan — delegate to the inherent impl
     // (the host f64 analog of the GPU build_fix_scan_resident). CpuBackend ONLY;
     // RocmBackend keeps the trait-default typed error (its fusion is the resident path).
     #[allow(clippy::too_many_arguments)]
@@ -2474,7 +2405,7 @@ impl Backend for CpuBackend {
         )
     }
 
-    // quick 260620-b97: UNIFIED host subtract+scan — delegate to the inherent impl
+    // UNIFIED host subtract+scan — delegate to the inherent impl
     // (the host f64 analog for the use_subtract larger child). CpuBackend ONLY;
     // RocmBackend keeps the trait-default typed error (its larger child is the
     // resident `subtract_resident` path).
@@ -2507,16 +2438,15 @@ impl Backend for CpuBackend {
     }
 }
 
-/// quick 260620-a48: the host f64 analog of the GPU `build_fix_scan_resident` fusion.
+/// The host f64 analog of the GPU `build_fix_scan_resident` fusion.
 ///
-/// quick 260620-dpk (LEVER DECISION): the obvious "reuse `ord_g`/`ord_h`/`ranges`/`out`
-/// scratch across leaves" lever (lever A) was profiled and RULED OUT — the per-leaf
-/// allocation bucket is ≤0.6 % of this path's fixed cost (≤0.3 % of `subtract_scan_impl`);
-/// the cost is ~99 % the rayon `par_iter` region (fork/join floor + the actual
-/// fold/fix/scan work), which is irreducible at the gate-decision granularity. So the
-/// per-leaf allocations are LEFT AS-IS (cheap, served warm from a hot arena every leaf);
-/// adding learner-threaded or thread-local scratch reuse would trade a stale-state
-/// tampering surface (T-dpk-01/03) for a sub-1 % gain. See 260620-dpk-FINDINGS.md.
+/// The obvious "reuse `ord_g`/`ord_h`/`ranges`/`out` scratch across leaves" lever was
+/// profiled and RULED OUT — the per-leaf allocation bucket is a small fraction of this
+/// path's fixed cost; the cost is overwhelmingly the rayon `par_iter` region (fork/join
+/// floor + the actual fold/fix/scan work), which is irreducible at the gate-decision
+/// granularity. So the per-leaf allocations are LEFT AS-IS (cheap, served warm from a
+/// hot arena every leaf); adding learner-threaded or thread-local scratch reuse would
+/// trade a stale-state tampering surface for a marginal gain.
 #[cfg(feature = "cpu")]
 impl CpuBackend {
     #[allow(clippy::too_many_arguments)]
@@ -2541,9 +2471,9 @@ impl CpuBackend {
         debug_assert_eq!(scan_active.len(), all_feats.len());
 
         // 1) Gather the ordered gradients/hessians ONCE per leaf (identical across every
-        //    feature — only the bin column differs; mirrors `build_leaf_histograms_raw`
-        //    SPIKE 003). Values + order unchanged ⇒ bit-exact fold inputs.
-        //    quick 260620-dpk: ALLOC + GATHER buckets timed under the inert fusion_prof gate.
+        //    feature — only the bin column differs; mirrors `build_leaf_histograms_raw`).
+        //    Values + order unchanged ⇒ bit-exact fold inputs.
+        //    ALLOC + GATHER buckets timed under the inert fusion_prof gate.
         let r = leaf_rows.len();
         let (mut ord_g, mut ord_h) = fusion_prof::time(&fusion_prof::BFS_ALLOC_NS, || {
             (Vec::<f32>::with_capacity(r), Vec::<f32>::with_capacity(r))
@@ -2554,16 +2484,15 @@ impl CpuBackend {
                 ord_h.push(hessians[row as usize]);
             }
         });
-        // quick 260620-njg: the f64-pregather micro-lever was A/B'd here and is NULL —
-        // sign-stable +7-14% on the COLD isolated fold microbench did NOT survive to the
-        // warm end-to-end bench_train train-wall (full 3-run overlap, B +0.2-0.5% = noise),
-        // exactly the cold-overstates-warm rule. Not shipped (the f32 gather + per-feature
-        // widen stays). See 260620-njg-FINDINGS.md / bench_split_scan.rs njg_pregather_ab().
+        // The f64-pregather micro-lever was A/B'd here and is NULL — a cold-isolated-
+        // microbench win did not survive to the warm end-to-end train-wall (the
+        // cold-overstates-warm rule). Not shipped (the f32 gather + per-feature widen
+        // stays).
 
         // 2) Hoisted ascending-order validation ⇒ deterministic lowest-index error
         //    (matches the two-step / serial path's first-failure behavior). Records each
         //    feature's validated `[start, end)` so the parallel map is infallible.
-        // quick 260620-dpk: the `ranges` Vec alloc is part of the lever-A-reducible bucket.
+        // The `ranges` Vec alloc is part of the small allocation bucket discussed above.
         let mut ranges: Vec<(usize, usize)> =
             fusion_prof::time(&fusion_prof::BFS_ALLOC_NS, || Vec::with_capacity(all_feats.len()));
         for f in all_feats {
@@ -2592,7 +2521,7 @@ impl CpuBackend {
         //    into its OWN private buffer (cache-hot, no cross-region hand-off). Returns
         //    `(private_hist, Option<SplitInfo>)`; `par_iter` preserves input order so the
         //    serial assembly below stays feature-index-ordered (bit-exact argmax).
-        // quick 260620-dpk: the par region (fork/join floor + the actual fold/fix/scan
+        // The par region (fork/join floor + the actual fold/fix/scan
         // work) is the candidate-IRREDUCIBLE bucket — timed as one unit under the gate.
         let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> =
             fusion_prof::time(&fusion_prof::BFS_PAR_NS, || {
@@ -2603,25 +2532,25 @@ impl CpuBackend {
             .map(|((f, &active), bins)| {
                 let cells = 2 * f.num_bin as usize;
                 // (a) BUILD: own private histogram, ascending leaf_rows, grad at bin<<1.
-                // quick 260620-njg: BUILD timed per-feature (the fold body — the f64-pregather
-                // micro-lever's target). time() is thread-safe (relaxed fetch_add) so summing
-                // across rayon tasks is correct; inert when the gate is off (parity untouched).
+                // BUILD timed per-feature (the fold body). time() is thread-safe (relaxed
+                // fetch_add) so summing across rayon tasks is correct; inert when the gate
+                // is off (parity untouched).
                 let mut hist = vec![0.0f64; cells];
                 fusion_prof::time(&fusion_prof::BFS_BUILD_NS, || {
                     fold_one_feature(bins, leaf_rows, &ord_g, &ord_h, &mut hist);
                 });
-                // (b) FIX: most_freq_bin reconstruct on RAW leaf sums (Pitfall 2). No-op
+                // (b) FIX: most_freq_bin reconstruct on RAW leaf sums. No-op
                 //     for most_freq_bin==0 (the C++ `if (most_freq_bin > 0)` guard).
-                // (c) COMPACT: shift real-bin `c+offset` into `c`, zero the tail (D-09).
+                // (c) COMPACT: shift real-bin `c+offset` into `c`, zero the tail.
                 //     No-op for offset==0.
-                // quick 260620-njg: FIX+COMPACT timed as one sub-bucket (expected ~0 — the
+                // FIX+COMPACT timed as one sub-bucket (expected ~0 — the
                 // no-op guards dominate in the common case).
                 fusion_prof::time(&fusion_prof::BFS_FIXCOMPACT_NS, || {
                     fix_histogram_inline(&mut hist, f.most_freq_bin, sum_gradient, sum_hessian);
                     compact_histogram_inline(&mut hist, f.offset);
                 });
                 // (d) SCAN (only if spine-active): own SplitInfo from the disjoint hist.
-                // quick 260620-njg: SCAN timed per-feature (find_best_split).
+                // SCAN timed per-feature (find_best_split).
                 let split = if active {
                     Some(fusion_prof::time(&fusion_prof::BFS_SCAN_NS, || {
                         self.find_best_split(
@@ -2662,7 +2591,7 @@ impl CpuBackend {
         Ok(splits)
     }
 
-    /// quick 260620-b97: UNIFIED host subtract+scan for the subtract-derived LARGER
+    /// UNIFIED host subtract+scan for the subtract-derived LARGER
     /// child — the host f64 analog of [`build_fix_scan_impl`] but for the use_subtract
     /// child, fusing per-feature `{subtract → scan}` into ONE rayon region. There is NO
     /// build step (the larger child's histogram is `parent − smaller`, already
@@ -2708,7 +2637,7 @@ impl CpuBackend {
         //    (matches the two-step `subtract_histograms`' whole-buffer length check).
         //    Each feature's `[start, end)` is validated against parent/smaller/larger so
         //    the parallel map is infallible on the validated slices.
-        // quick 260620-dpk: `ranges` alloc is the lever-A-reducible bucket for this child.
+        // The `ranges` alloc is part of the small allocation bucket for this child.
         let mut ranges: Vec<(usize, usize)> =
             fusion_prof::time(&fusion_prof::SUB_ALLOC_NS, || Vec::with_capacity(all_feats.len()));
         for f in all_feats {
@@ -2749,7 +2678,7 @@ impl CpuBackend {
         //    private buffer (cache-hot, no cross-region hand-off). Returns
         //    `(private_region, Option<SplitInfo>)`; `par_iter` preserves input order so
         //    the serial assembly below stays feature-index-ordered (bit-exact argmax).
-        // quick 260620-dpk: par region (fork/join floor + subtract+scan work) timed as one.
+        // The par region (fork/join floor + subtract+scan work) timed as one.
         let results: Vec<Result<(Vec<f64>, Option<SplitInfo>), ComputeError>> =
             fusion_prof::time(&fusion_prof::SUB_PAR_NS, || {
         all_feats
@@ -2863,10 +2792,10 @@ fn compact_histogram_inline(hist: &mut [f64], offset: i32) {
     }
 }
 
-/// Element width of the device-resident bin buffer (quick-260621-qix). The buffer is
+/// Element width of the device-resident bin buffer. The buffer is
 /// uploaded at the NARROWEST uniform width covering every feature's `BinColumn` variant
 /// (widest variant present), so the resident-reading kernels dispatch the matching
-/// `<B: Int>` monomorphization. Mirrors the host `BinColumn` u8/u16/u32 axis (spike-004).
+/// `<B: Int>` monomorphization. Mirrors the host `BinColumn` u8/u16/u32 axis.
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentBinWidth {
@@ -2896,7 +2825,7 @@ pub fn resident_bin_width(cols: &[&BinColumn]) -> ResidentBinWidth {
     w
 }
 
-/// The device-resident binned dataset cached inside [`RocmBackend`] (260608-nn7 L1):
+/// The device-resident binned dataset cached inside [`RocmBackend`]:
 /// the ONE concatenated feature-column bin buffer's device `Handle` (feature-major,
 /// length `num_features * num_data`) + the dims to index it (`f * num_data + row`) +
 /// the native element `width`. `Handle` is cheaply clonable (ref-counted).
@@ -2908,12 +2837,12 @@ struct ResidentBins {
     handle: cubecl::server::Handle,
     num_features: usize,
     num_data: usize,
-    /// Element width of `handle` (quick-260621-qix): the resident-reading kernels are
+    /// Element width of `handle`: the resident-reading kernels are
     /// generic `<B: Int>` and dispatched on this.
     width: ResidentBinWidth,
 }
 
-/// 26-01 (ODP3-01/M2): the device-resident gradients+hessians for the CURRENT tree,
+/// The device-resident gradients+hessians for the CURRENT tree,
 /// uploaded ONCE per grow by
 /// [`upload_resident_grad_hess`](Backend::upload_resident_grad_hess) — the grad/hess
 /// analog of [`ResidentBins`]. Unlike the binned columns (constant for the whole
@@ -2934,18 +2863,18 @@ struct ResidentGradHess {
 }
 
 
-/// The generic GPU backend (quick-260627-qxl) — dispatches every hot-path op to the
+/// The generic GPU backend — dispatches every hot-path op to the
 /// runtime-generic f64/f32 CubeCL kernels, carrying the on-device resident histogram
 /// pool. Parameterized by the CubeCL [`Runtime`](cubecl::Runtime) `R` so ONE
 /// implementation serves ROCm/HIP (`RocmBackend`), CUDA (`CudaBackend`), and WGPU
 /// (`WgpuBackend`) — see the type aliases below. The ROCm GPU parity gate validates
 /// this shared code on hardware; CUDA/WGPU inherit correctness by construction (same
-/// code, different `R`). Previously this was the hand-written `RocmBackend` plus a
-/// 4-method `gpu_core_backend!` macro for a pool-less CudaBackend/WgpuBackend; qxl
-/// hoisted the FULL resident surface into this one generic so cuda/wgpu reach speed
-/// parity.
+/// code, different `R`). Previously this was a hand-written `RocmBackend` plus a
+/// separate pool-less `gpu_core_backend!` macro for CudaBackend/WgpuBackend; the
+/// FULL resident surface was later hoisted into this one generic so cuda/wgpu reach
+/// speed parity.
 ///
-/// 260608-nn7 (L1): the backend carries interior-mutable device state — a
+/// The backend carries interior-mutable device state — a
 /// `RefCell<Option<ResidentBins>>` cache of the binned feature columns uploaded ONCE
 /// per train. The learner holds `&B` (shared ref) and the trait methods take
 /// `&self`, so the cache MUST be behind interior mutability (RefCell), NOT a
@@ -2960,20 +2889,20 @@ pub struct GpuBackend<R: cubecl::Runtime> {
     /// override. `None` until the first upload (defensive fallback to the per-leaf
     /// host-gather path).
     resident_bins: std::cell::RefCell<Option<ResidentBins>>,
-    /// SPIKE-079: whether `resident_bins` is PINNED by a once-per-train owner (the
+    /// Whether `resident_bins` is PINNED by a once-per-train owner (the
     /// learner's `resident_bins_uploaded` guard). Cleared by every fresh
     /// `upload_resident_bins`; set only via `pin_resident_bins`. Authorizes (together
     /// with a geometry match) the on-device driver's per-grow upload skip.
     resident_bins_pin: std::cell::Cell<bool>,
-    /// 260608-p90: the device-handle slot mirror, indexed by host `HistogramPool`
+    /// The device-handle slot mirror, indexed by host `HistogramPool`
     /// slot id. `resident_pool[slot]` holds the fixed+compacted f64 histogram `Handle`
     /// for whichever leaf currently owns that slot, or `None` when the slot is empty.
     /// The learner issues build/subtract/move/scan ops here at the SAME call sites
     /// (with the SAME slot ids) it drives the host pool, so this mirror tracks the
-    /// host pool's slot→leaf map exactly (T-p90-02). Like `resident_bins`, the
-    /// single-threaded train loop makes the RefCell borrow safe (the nn7 rationale).
+    /// host pool's slot→leaf map exactly. Like `resident_bins`, the
+    /// single-threaded train loop makes the RefCell borrow safe.
     resident_pool: std::cell::RefCell<Vec<Option<cubecl::server::Handle>>>,
-    /// 26-01 (ODP3-01/M2): the device-resident grad/hess for the current tree grow,
+    /// The device-resident grad/hess for the current tree grow,
     /// uploaded ONCE per grow by
     /// [`upload_resident_grad_hess`](Backend::upload_resident_grad_hess). `None` until
     /// the first upload (the on-device resident build then falls back to the host
@@ -2982,7 +2911,7 @@ pub struct GpuBackend<R: cubecl::Runtime> {
     /// grad/hess can never leak into the next grow. Interior-mutable for the same
     /// single-threaded-train reason as `resident_bins`/`resident_pool`.
     resident_grad_hess: std::cell::RefCell<Option<ResidentGradHess>>,
-    /// 260608-p90: test-only toggle to FORCE the host path on RocmBackend (so the
+    /// Test-only toggle to FORCE the host path on RocmBackend (so the
     /// resident==host tree-equivalence test can grow the SAME f32-atomic-built tree
     /// through the host read-back/subtract/scan chain). `true` (the default) reports
     /// `resident_pool_supported() == true`; `false` forces the host path. Set only by
@@ -3021,7 +2950,7 @@ impl<R: cubecl::Runtime> Default for GpuBackend<R> {
 
 #[cfg(feature = "gpu")]
 impl<R: cubecl::Runtime> GpuBackend<R> {
-    /// TEST-ONLY constructor (260608-p90): build a backend that REPORTS
+    /// TEST-ONLY constructor: build a backend that REPORTS
     /// `resident_pool_supported() == enabled`. The resident==host tree-equivalence
     /// test grows the SAME corpus twice on a `RocmBackend` — once with `with_resident(true)`
     /// (the resident chain) and once with `with_resident(false)` (forcing the host
@@ -3047,8 +2976,7 @@ impl<R: cubecl::Runtime> GpuBackend<R> {
 pub type RocmBackend = GpuBackend<runtime::RocmRuntime>;
 
 /// The CUDA GPU backend (opt-in `cuda` feature) — `GpuBackend` bound to the cubecl-cuda
-/// runtime (NVIDIA). Reaches ROCm-parity speed via the SAME resident histogram pool
-/// (quick-260627-qxl).
+/// runtime (NVIDIA). Reaches ROCm-parity speed via the SAME resident histogram pool.
 #[cfg(feature = "cuda")]
 pub type CudaBackend = GpuBackend<runtime::CudaRuntime>;
 
@@ -3063,35 +2991,35 @@ pub type WgpuBackend = GpuBackend<runtime::WgpuRuntime>;
 impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
     type Runtime = R;
 
-    // spike-035 SHIPPED (quick-260626-a6t): route the rocm partition on the HOST via the shipped
-    // spike-027 fused path instead of the per-split device round-trip — ~1.18-1.23x launch-bound,
-    // wash at wide, parity within ~1e-6 (def-f8u-01; not a bit-exact swap). The device round-trip
+    // Route the rocm partition on the HOST via the shipped
+    // fused path instead of the per-split device round-trip — faster at narrow widths,
+    // wash at wide, parity within ~1e-6 (not a bit-exact swap). The device round-trip
     // is pure overhead on shared DDR5 (the build reads host indices_ either way). Default ON;
     // LGBM_ROCM_HOST_PARTITION=0 forces the old device round-trip for benching/rollback.
     fn prefers_host_partition(&self) -> bool {
         !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
     }
 
-    // ODL-19 (Phase 20, 20-03a): GATED on-device-growth discriminator, mirroring
+    // GATED on-device-growth discriminator, mirroring
     // CpuBackend. Returns [`cuda_on_device_enabled`] — `false` when
     // `LGBM_CUDA_ON_DEVICE` is unset, so the ROCm/CUDA/WGPU host path is
-    // byte-unchanged (Pitfall 2, D-09). One generic GpuBackend<R> impl is shared by
+    // byte-unchanged. One generic GpuBackend<R> impl is shared by
     // ROCm/CUDA/WGPU; the env gate (not a per-runtime `true`) is what keeps the flip
-    // safe until 20-03b wires the driver body (which still returns `Ok(None)` here).
+    // safe until the driver body is wired in (which still returns `Ok(None)` here).
     fn on_device_growth_supported(&self) -> bool {
         cuda_on_device_enabled()
     }
 
-    // ODL-01 (Phase 14 Slice 0) / ODL-18 (Phase 20, 20-03b): the ACTIVATED on-device
+    // The ACTIVATED on-device
     // grow seam on the GPU backend. When the discriminator is live
     // ([`cuda_on_device_enabled`]) grow the ENTIRE continuous-feature + L2 tree on the
     // GPU runtime `R` via the shared per-leaf best-first driver
     // ([`kernels::grow_driver::grow_tree_on_device_driver`]) and return `Ok(Some(..))`.
     // One generic `GpuBackend<R>` impl is shared by ROCm/CUDA/WGPU; the driver runs the
     // SAME runtime-generic f64 kernels the histogram/split/partition paths use. With the
-    // env unset the discriminator is `false`, so the seam is a byte-unchanged `Ok(None)`
-    // (D-09). The grown GPU tree is anchored STRUCTURE-bit-exact to the cpu f64 fold —
-    // never a second GPU f32 path (def-f8u-01).
+    // env unset the discriminator is `false`, so the seam is a byte-unchanged `Ok(None)`.
+    // The grown GPU tree is anchored STRUCTURE-bit-exact to the cpu f64 fold —
+    // never a second GPU f32 path.
     fn grow_tree_on_device(
         &self,
         gradients: &[f32],
@@ -3110,11 +3038,12 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         Ok(Some((tree, layout)))
     }
 
-    // OCX-02 (29-02): the CONFIG-BOUND on-device grow seam on the GPU backend — one generic
+    // The CONFIG-BOUND on-device grow seam on the GPU backend — one generic
     // `GpuBackend<R>` impl shared by ROCm/CUDA/WGPU. Delegates to the driver's `_with_cfg`
     // entry so the learner's REAL `GainConfig` binds through the resident build/subtract/scan
-    // path (the spike-072 item-15 fix reaches the hip arm identically). Env-gated + `Ok(None)`
-    // like the parameterless seam, so SC-4 holds with `LGBM_CUDA_ON_DEVICE` unset.
+    // path (the same admissibility-gate fix reaches the hip arm identically). Env-gated +
+    // `Ok(None)` like the parameterless seam, so behavior stays byte-unchanged with
+    // `LGBM_CUDA_ON_DEVICE` unset.
     fn grow_tree_on_device_with_cfg(
         &self,
         gradients: &[f32],
@@ -3142,7 +3071,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         ordered_hessians: &[f32],
         num_bin: u32,
     ) -> Result<Vec<f64>, ComputeError> {
-        // quick-260705-h17: the old non-resident f32 GPU build kernels (global-atomic /
+        // The old non-resident f32 GPU build kernels (global-atomic /
         // LDS-privatized / plane-aggregated) were deleted. This required trait method now
         // drives the runtime-generic f64 on-device build (`construct_histograms_f64_on`,
         // the kernel the v2.0 on-device grow-driver's non-resident fallback also uses) —
@@ -3203,7 +3132,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         threshold: u32,
         most_freq_bin: u32,
     ) -> Result<(Vec<u32>, usize), ComputeError> {
-        // quick-260705-h17: the old u32 GPU partition launcher (`data_partition_on`) was
+        // The old u32 GPU partition launcher (`data_partition_on`) was
         // deleted. This required trait method now folds on the host (`data_partition_cpu_native`,
         // value-identical to the device route). The v2.0 on-device path uses the native-width
         // `data_partition_native` override, which is unaffected.
@@ -3217,7 +3146,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// GPU override (quick-260625-j1l / spike-029): upload the leaf's bins at NATIVE
+    /// GPU override: upload the leaf's bins at NATIVE
     /// width (u8/u16/u32) instead of u32-widening — 4× fewer host→device bytes + a
     /// narrow-reading route kernel on the common all-u8 (`max_bin≤255`) case. Bit-EXACT
     /// to the default widening path (`data_partition`): the u8/u16/u32 route kernels read
@@ -3245,11 +3174,11 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// 28-02 (R2) GPU override: run the §9 `mark → prefix-sum → scatter` and write the
+    /// GPU override: run the §9 `mark → prefix-sum → scatter` and write the
     /// child ranges into the resident [`DeviceLeafSplits`](kernels::partition::DeviceLeafSplits)
     /// slot ON DEVICE via [`partition_child_ranges_device`](kernels::partition::partition_child_ranges_device)
-    /// — the split point never crosses back (R2 retired). Bit-exact to the cpu f64 anchor
-    /// (ODF-06); static single-owner geometry (never `CubeCount::Dynamic`).
+    /// — the split point never crosses back to the host. Bit-exact to the cpu f64 anchor;
+    /// static single-owner geometry (never `CubeCount::Dynamic`).
     #[allow(clippy::too_many_arguments)]
     fn data_partition_resident_no_readback(
         &self,
@@ -3294,22 +3223,22 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         parent: &[f64],
         child: &[f64],
     ) -> Result<Vec<f64>, ComputeError> {
-        // quick-260705-h17: the old buffer-based f32/f64 GPU subtract launchers were
+        // The old buffer-based f32/f64 GPU subtract launchers were
         // deleted. This required trait method now folds on the host
         // (`subtract_histograms_cpu_native`). The v2.0 on-device path uses the resident
         // handle-based `subtract_resident` override, which is unaffected.
         kernels::subtract::subtract_histograms_cpu_native(parent, child)
     }
 
-    /// The GPU path's resident u32 upload DOES consume the widened columns (spike
-    /// 004): the learner widens each [`BinColumn`] to u32 once and calls
+    /// The GPU path's resident u32 upload DOES consume the widened columns:
+    /// the learner widens each [`BinColumn`] to u32 once and calls
     /// [`upload_resident_bins`](Backend::upload_resident_bins) so the resident buffer
     /// is byte-identical to HEAD.
     fn wants_resident_bins(&self) -> bool {
         true
     }
 
-    /// GPU override (260608-nn7 L1): upload the binned feature columns to the device
+    /// GPU override: upload the binned feature columns to the device
     /// ONCE per train and cache the device `Handle` in `self.resident_bins` (interior
     /// mutability). The columns are concatenated feature-major into ONE buffer
     /// (`f * num_data + row`) so a single resident `Handle` covers every feature.
@@ -3321,7 +3250,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         client: &ComputeClient<Self::Runtime>,
         feature_bins: &[&BinColumn],
     ) {
-        // SPIKE-079: a fresh upload dissolves any prior once-per-train pin — the new
+        // A fresh upload dissolves any prior once-per-train pin — the new
         // owner must re-pin (`pin_resident_bins`), so an un-pinned per-grow uploader
         // (a direct driver caller) can never inherit a stale skip authorization.
         self.resident_bins_pin.set(false);
@@ -3331,7 +3260,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             return;
         }
         let num_data = feature_bins[0].len();
-        // quick-260621-qix: upload at the NARROWEST uniform width covering every column,
+        // Upload at the NARROWEST uniform width covering every column,
         // not always u32 — cuts the host concat + host→device transfer ~4× on all-u8
         // data (bins ≤256) and drops the learner's `to_u32_vec` widen. Narrower columns
         // upcast into the uniform buffer; the value is a bin INDEX, byte-faithful across
@@ -3383,13 +3312,13 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         });
     }
 
-    /// SPIKE-079: mark the just-uploaded resident bins as owned by a once-per-train
+    /// Mark the just-uploaded resident bins as owned by a once-per-train
     /// guard (see the trait doc). Set ONLY by the learner after its guarded upload.
     fn pin_resident_bins(&self) {
         self.resident_bins_pin.set(true);
     }
 
-    /// SPIKE-079: skip authorization for the on-device driver's per-grow upload —
+    /// Skip authorization for the on-device driver's per-grow upload —
     /// requires BOTH the pin (a live once-per-train owner) AND a geometry match.
     fn resident_bins_pinned(&self, num_features: usize, num_data: usize) -> bool {
         self.resident_bins_pin.get()
@@ -3400,7 +3329,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
                 .is_some_and(|c| c.num_features == num_features && c.num_data == num_data)
     }
 
-    /// GPU override (26-01, ODP3-01/M2): upload the current tree's grad/hess to the
+    /// GPU override: upload the current tree's grad/hess to the
     /// device ONCE per grow and cache the two device `Handle`s in `self.resident_grad_hess`
     /// (interior mutability). The on-device resident build
     /// ([`build_resident_leaf`](Backend::build_resident_leaf)) then gathers each leaf's
@@ -3428,7 +3357,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         });
     }
 
-    // quick-260705-h17: the old non-resident GPU `build_leaf_histograms_raw` and
+    // The old non-resident GPU `build_leaf_histograms_raw` and
     // `find_best_splits_batched` overrides (which drove the deleted f32 batched/resident
     // build launcher and the batched-fused split launcher on the OLD per-leaf GPU route)
     // are REMOVED. `GpuBackend<R>` now inherits the `Backend` trait defaults for both
@@ -3436,7 +3365,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
     // `find_best_split`). The v2.0 on-device grow-driver does NOT use these — it uses the
     // resident build/scan overrides below — so its path is unaffected.
 
-    // ---- 260608-p90: device-resident histogram-pool overrides ----
+    // ---- device-resident histogram-pool overrides ----
 
     fn resident_pool_supported(&self) -> bool {
         self.resident_enabled
@@ -3449,7 +3378,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         let mut mirror = self.resident_pool.borrow_mut();
         mirror.clear();
         mirror.resize_with(num_slots, || None);
-        // 26-01 (ODP3-01/M2): drop the prior tree's resident grad/hess so a stale grow's
+        // Drop the prior tree's resident grad/hess so a stale grow's
         // buffers can never leak into the next tree (grad/hess are per-grow, not per-train).
         // The driver re-uploads via `upload_resident_grad_hess` before the root build.
         *self.resident_grad_hess.borrow_mut() = None;
@@ -3461,7 +3390,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
     /// to a typed error if the resident bin cache is empty (defensive — the learner
     /// always uploads before the growth loop when eligible).
     ///
-    /// phase-11 (spike-018/019): the RAW histogram BUILD now accumulates grad/hess as
+    /// The RAW histogram BUILD accumulates grad/hess as
     /// u64 TWO'S-COMPLEMENT FIXED-POINT (scale S = 2^30) via integer LDS atomics, NOT
     /// f32 atomics. On RDNA the f32 `atomicAdd` lowers to a CAS retry loop that saturates
     /// under contention; the integer `ds_add_u64` is a native single-instruction op,
@@ -3501,7 +3430,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
                     .to_string(),
             });
         };
-        // 26-01 (ODP3-01/M2): when the once-per-grow resident grad/hess are cached, gather
+        // When the once-per-grow resident grad/hess are cached, gather
         // grad/hess ON DEVICE from them via the leaf-row index — no host `ord_g`/`ord_h`
         // gather + per-build upload. `None` (grad/hess never uploaded) keeps the byte-identical
         // host-gather build (defensive; the on-device driver always uploads before the root).
@@ -3610,7 +3539,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// CO-PACKED 2-slot resident scan (spike-024, Phase 12) — borrows BOTH the
+    /// CO-PACKED 2-slot resident scan — borrows BOTH the
     /// smaller and larger sibling Handles (simultaneously resident at the co-pack
     /// point: the smaller slot survives `subtract_resident`, the larger is its
     /// derived output) and runs ONE co-packed 2-slot launch + ONE readback, returning
@@ -3655,13 +3584,13 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// 26-02 (M3/ODP3-02, §8.2): scan the resident leaf then REDUCE the per-feature splits to the
+    /// §8.2: scan the resident leaf then REDUCE the per-feature splits to the
     /// single winner ON DEVICE, reading back only the ~8-int winning split (payload collapses
     /// from `num_features` SplitInfo cells). The cross-feature reduce
     /// ([`kernels::grow_driver::argmax_over_resident_splits`]) folds in fpos order with the strict
     /// `>` lowest-real-feature-index tie-break, so the winner is bit-identical to the host
-    /// `argmax_over_splits` (T-lsx-01). Bit-exact vs the integer path, ~1e-6 vs host-CUDA — never
-    /// GPU-f32-vs-GPU-f32 (def-f8u-01). The `!(sum_h>0)||num_data<=0` short-circuit mirrors the
+    /// `argmax_over_splits`. Bit-exact vs the integer path, ~1e-6 vs host-CUDA — never
+    /// GPU-f32-vs-GPU-f32. The `!(sum_h>0)||num_data<=0` short-circuit mirrors the
     /// driver scan gate.
     #[allow(clippy::too_many_arguments)]
     fn scan_resident_leaf_argmax(
@@ -3686,7 +3615,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         Ok(kernels::grow_driver::argmax_over_resident_splits(&splits, feats, real_feats))
     }
 
-    /// 26-02 (M3/ODP3-02): co-packed 2-slot scan + per-side on-device reduce → each sibling's
+    /// Co-packed 2-slot scan + per-side on-device reduce → each sibling's
     /// winner. Bit-identical to two `argmax_over_splits` folds; each side reads back only its
     /// winning ~8-int split.
     #[allow(clippy::too_many_arguments)]
@@ -3718,34 +3647,33 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         ))
     }
 
-    /// 26-02 (M7/ODP3-03, §8.3 `FindBestFromAllSplitsKernel`): the cross-leaf best-leaf pick runs
+    /// §8.3 `FindBestFromAllSplitsKernel`: the cross-leaf best-leaf pick runs
     /// on the GpuBackend arm here (replacing the host loop in `grow_tree_on_device_resident`),
     /// via the deterministic `split_gt` first-max reduce
     /// ([`kernels::grow_driver::best_leaf_argmax`]) — bit-identical to the host loop's pick, so
     /// the on-device tree structure is unchanged. (The fully-resident device reduction over
     /// per-leaf records is the real-hardware refinement; the pick VALUE is fixed by the ordered
-    /// `split_gt` fold and never a GPU-f32-vs-GPU-f32 comparison, def-f8u-01.)
+    /// `split_gt` fold and never a GPU-f32-vs-GPU-f32 comparison.)
     fn best_leaf_reduce(&self, leaf_best: &[SplitInfo], leaf_real_feat: &[i32]) -> i32 {
         kernels::grow_driver::best_leaf_argmax(leaf_best, leaf_real_feat)
     }
 
-    /// 26-02 (M7/ODP3-03, §6.1 `CUDAInitValuesKernel`): the root grad/hess sum on the GpuBackend
-    /// arm. Spike-075 measured the prior on-device single-lane f64 fold kernel at 12.9ms/tree on
-    /// real CUDA (Tesla P100) at 500k rows ⇒ ~1.29s/100-tree train, ~12% of the spike-073
-    /// on-device A/B gap ("Bug 2"), and proved via a register-accumulator A/B (bit-exact both
-    /// variants, wash) that the cost is the un-hideable per-iteration memory latency of one GPU
-    /// lane walking `num_data` elements with zero occupancy to overlap it — not the f64 width and
-    /// not the accumulator shape. There is no in-kernel fix; the fix is routing. The caller
+    /// §6.1 `CUDAInitValuesKernel`: the root grad/hess sum on the GpuBackend
+    /// arm. Measurement found the prior on-device single-lane f64 fold kernel materially
+    /// slower on real CUDA hardware than folding on the host, and proved via a
+    /// register-accumulator A/B (bit-exact both variants, wash) that the cost is the
+    /// un-hideable per-iteration memory latency of one GPU lane walking `num_data`
+    /// elements with zero occupancy to overlap it — not the f64 width and not the
+    /// accumulator shape. There is no in-kernel fix; the fix is routing. The caller
     /// (`grow_driver.rs:1949`) already holds the host `gradients: &[f32]` / `hessians: &[f32]`
     /// slices, and [`kernels::grow_driver::root_grad_hess_fold`] — the exact ascending f64 fold
-    /// the device kernel was built to match bit-exact — costs 0.32-0.75ms over the same data
-    /// (~20-130× cheaper). This override now calls it directly, identical to the `Backend` trait's
-    /// default impl (which `CpuBackend` inherits, ~line 1435) — parity-neutral BY CONSTRUCTION
+    /// the device kernel was built to match bit-exact — is dramatically cheaper over the same
+    /// data. This override now calls it directly, identical to the `Backend` trait's
+    /// default impl (which `CpuBackend` inherits) — parity-neutral BY CONSTRUCTION
     /// since `root_grad_hess_fold` is the literal anchor the device kernel proves bit-exact
     /// against. `root_grad_hess_sum_device`/`root_grad_hess_sum_device_slices` (best_split.rs)
-    /// remain defined and covered by their own bit-exact anchor tests and the
-    /// `spike075_rootfold_cost` harness — they are simply no longer called from this production
-    /// seam.
+    /// remain defined and covered by their own bit-exact anchor tests and a dedicated cost
+    /// harness — they are simply no longer called from this production seam.
     fn root_grad_hess_sum(
         &self,
         _client: &ComputeClient<Self::Runtime>,
@@ -3755,9 +3683,9 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         kernels::grow_driver::root_grad_hess_fold(gradients, hessians)
     }
 
-    /// 28-01 (ODF-01, §8.2): run the device-resident cross-feature reduce ON DEVICE via
+    /// §8.2: run the device-resident cross-feature reduce ON DEVICE via
     /// [`DeviceFrontier::frontier_reduce_leaf`] — the winner is written into the resident
-    /// frontier slot, no readback. Bit-exact to the host fold on the cpu f64 anchor (ODF-06).
+    /// frontier slot, no readback. Bit-exact to the host fold on the cpu f64 anchor.
     fn frontier_reduce_leaf_device(
         &self,
         client: &ComputeClient<Self::Runtime>,
@@ -3770,10 +3698,10 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         frontier.frontier_reduce_leaf(client, in_slab, num_tasks, is_smaller, out_leaf)
     }
 
-    /// 28-01 (ODF-01, §8.3): run the device-resident cross-leaf argmax + self-invalidation +
+    /// §8.3: run the device-resident cross-leaf argmax + self-invalidation +
     /// 8-int export ON DEVICE via [`DeviceFrontier::frontier_pick_best_leaf`] — the ONLY
     /// device→host transfer is the single 8-int export. Bit-identical to the host pick on the
-    /// cpu f64 anchor (ODF-06).
+    /// cpu f64 anchor.
     fn frontier_pick_best_leaf_device(
         &self,
         client: &ComputeClient<Self::Runtime>,
@@ -3790,11 +3718,11 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// 28-02 (R3) GPU override: mutate the device tree in place via
+    /// GPU override: mutate the device tree in place via
     /// [`DeviceCudaTree::split_on_device_scheduled`](kernels::tree::DeviceCudaTree::split_on_device_scheduled)
     /// with the right leaf id supplied from the fixed schedule — no `right_leaf_index`
-    /// readback (R3 retired). Byte-identical tree structure to `split_on_device` /the host
-    /// mutation on the cpu f64 anchor (ODF-06); static geometry.
+    /// readback. Byte-identical tree structure to `split_on_device` / the host
+    /// mutation on the cpu f64 anchor; static geometry.
     #[allow(clippy::too_many_arguments)]
     fn split_tree_scheduled(
         &self,
@@ -3818,7 +3746,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// 260608-t3t: FUSED build+fix+compact+scan for a directly-built leaf. Reads the
+    /// FUSED build+fix+compact+scan for a directly-built leaf. Reads the
     /// resident bin cache, runs the SINGLE fused-kernel launch (build → fix →
     /// compact → scan), STORES the returned fixed+compacted f64 Handle into mirror
     /// slot `slot` (so `subtract_resident` finds it as the parent), and returns the
@@ -3875,7 +3803,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         Ok(splits)
     }
 
-    /// 31-08 (ODS-02): scan the resident leaf and fold its winner DIRECTLY into the frontier
+    /// Scan the resident leaf and fold its winner DIRECTLY into the frontier
     /// slot via [`kernels::split::find_best_splits_fused_reduce_into_leaf_on`] — no host argmax
     /// readback (the winner lives device-resident, handed to the driver only through the §8.3
     /// pick export). Borrows the SAME resident-pool slot Handle `scan_resident_leaf` reads.
@@ -3915,7 +3843,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// 31-08 (ODS-02): co-scan BOTH siblings and fold each side's winner DIRECTLY into its
+    /// Co-scan BOTH siblings and fold each side's winner DIRECTLY into its
     /// frontier slot via [`kernels::split::find_best_splits_fused_siblings_reduce_into_leaves_on`]
     /// — no host argmax readback. Borrows the SAME two resident-pool slot Handles
     /// `scan_resident_siblings` reads (both siblings simultaneously resident at the co-pack point).
@@ -3968,7 +3896,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// 31-08 (ODS-02): the f64-fused escape hatch's zero-readback variant — build+fix+compact+scan
+    /// The f64-fused escape hatch's zero-readback variant — build+fix+compact+scan
     /// in ONE launch via [`kernels::histogram::build_fix_scan_resident_reduce_f64_on`], STORE the
     /// fixed+compacted f64 Handle into mirror slot `slot` (for `subtract_resident`), and fold the
     /// scan winner DIRECTLY into frontier slot `out_leaf` — no per-feature-array readback.
@@ -4037,7 +3965,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
 mod par_build_tests {
     use super::{build_histograms_into, BinColumn};
 
-    /// Spike 005 / R4 bit-exact guard: the rayon-parallel per-feature build MUST
+    /// Bit-exact guard: the rayon-parallel per-feature build MUST
     /// produce a byte-identical (f64::to_bits) `out` to the serial path — the
     /// per-feature folds are independent + same-order, so thread scheduling can never
     /// change the result. Guards the multi-threaded anchor's determinism.
@@ -4079,7 +4007,7 @@ mod par_build_tests {
         }
     }
 
-    /// Spike 011 microbench — isolates the parallel build's `Vec<Vec<f64>>`+copy
+    /// Microbench (`spike011_microbench`) — isolates the parallel build's `Vec<Vec<f64>>`+copy
     /// strategy (BEFORE) against the disjoint-slot scatter (AFTER, the live
     /// `build_histograms_into` parallel branch) on ONE representative large leaf,
     /// many launches, same process. Ignored by default; run with:
@@ -4267,7 +4195,7 @@ mod build_fix_scan_tests {
                 run_forward: false,
             })
             .collect();
-        // RAW leaf sums over the leaf rows (the fix operand, Pitfall 2).
+        // RAW leaf sums over the leaf rows (the fix operand).
         let mut sum_g = 0.0f64;
         let mut sum_h = 0.0f64;
         for &row in &leaf_rows {
@@ -4416,10 +4344,10 @@ mod build_fix_scan_tests {
         assert!(res[3].is_none(), "feature 3 ineligible -> None");
     }
 
-    // ---- quick 260620-b97: subtract_scan (larger child: subtract → scan, NO fix) ----
+    // ---- subtract_scan (larger child: subtract → scan, NO fix) ----
 
     /// Build a parent histogram and a smaller-child histogram (both already
-    /// fixed+compacted, as they are in the pool) for the b97 fixture features, so the
+    /// fixed+compacted, as they are in the pool) for the fixture features, so the
     /// larger child = parent − smaller is exercised. The two histograms use disjoint
     /// row sets, but the test only needs them to be ARBITRARY valid f64 buffers — the
     /// subtract is a pure cell-wise op and the scan reads the derived buffer.
@@ -4659,7 +4587,7 @@ mod core_scaled_threshold_tests {
         THRESHOLD_CEILING, THRESHOLD_FLOOR,
     };
 
-    /// HARD no-regression invariant (quick 260620-c5v): at THIS machine's 16 cores the
+    /// HARD no-regression invariant: at THIS machine's 16 cores the
     /// derived default MUST reproduce the measured/shipped optima (BFS 100, SUBSCAN 130)
     /// exactly — the anchor is the one point the proxy sweep can trust absolutely.
     #[test]
@@ -4668,7 +4596,7 @@ mod core_scaled_threshold_tests {
         assert_eq!(core_scaled_threshold(130, 16), 130);
     }
 
-    /// The crossover RISES with core count (Task-1 measured, MATERIAL): fewer cores ⇒
+    /// The crossover RISES with core count (measured, MATERIAL): fewer cores ⇒
     /// fusion amortizes at fewer features ⇒ lower threshold; more cores ⇒ higher.
     /// Values are the additive-log shape `anchor − 17·log2(16/cores)`, clamped.
     #[test]
@@ -4701,7 +4629,7 @@ mod core_scaled_threshold_tests {
     /// Clamps protect the extremes: a 128-core box never gets a pathologically high
     /// threshold (fusion would never engage), and a 1-core box never gets an absurdly
     /// tiny one (parallelizing a trivial leaf). Floor 32 / ceiling 256, justified from
-    /// the Task-1 curve (measured crossovers stayed within [~20, ~250]).
+    /// the measured curve (crossovers stayed within [~20, ~250]).
     #[test]
     fn clamped_to_floor_and_ceiling_at_extremes() {
         for anchor in [100usize, 130] {
@@ -4744,9 +4672,9 @@ mod core_scaled_threshold_tests {
     }
 }
 
-/// Plan 16-04 Task 3 (D-07/D-08): the on-device seam is OFF by default and the
-/// tree-growth discriminator stays `false` — Phase 16 demonstrates the histogram
-/// build→fix→subtract path in isolation; the growth driver is Phase 18/21.
+/// The on-device seam is OFF by default and the
+/// tree-growth discriminator stays `false` — the histogram
+/// build→fix→subtract path exists in isolation; the growth driver is separate.
 #[cfg(all(test, feature = "cpu"))]
 mod on_device_seam_tests {
     use super::{cuda_on_device_enabled, Backend, CpuBackend};
@@ -4759,7 +4687,7 @@ mod on_device_seam_tests {
         assert!(!cuda_on_device_enabled(), "LGBM_CUDA_ON_DEVICE must be OFF by default");
     }
 
-    /// The tree-growth discriminator stays `false` this phase (no growth driver wired);
+    /// The tree-growth discriminator stays `false` for now (no growth driver wired);
     /// the learner's on-device eligibility gate ANDs this in and always takes the
     /// byte-unchanged host/per-leaf path.
     #[test]

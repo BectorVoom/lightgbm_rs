@@ -1,20 +1,14 @@
-//! Spike 088 — coalesced-reorder NET cost. Direct follow-up named by spike-087
-//! ("Follow-up named: spike-088 (reorder-cost / net-win)"): 087 found real-CUDA (P100)
-//! build-coalescing HEADROOM of 1.60-1.86x (vs the spoofed APU's ~1.4x) but that number is
-//! a CEILING, gated on the unmeasured cost of actually reordering rows into coalesced order
-//! before the build. This spike measures that reorder pass on Kaggle P100 and nets it against
-//! the coalescing saving:
+//! Coalesced-reorder NET cost. Measures whether reordering rows into coalesced order before a
+//! histogram build is worth its own cost, netted against the coalescing saving it enables:
 //!
 //!   net_ms  = REAL_ORDER_ms (current production: uncoalesced gather + atomic build)
 //!           - (REORDER_ms + COAL_OVER_REORDERED_ms)  (candidate: reorder pass + coalesced build)
 //!
 //! net_ms > 0  ⇒ the reorder-before-build pipeline is FASTER than production as-is ⇒
 //!               a genuine, launch-bound-adjacent GPU lever worth building for real
-//!               (/gsd-plan-phase, bit-exact by construction: the histogram is order-independent
-//!               for the u64 fixed-point build, so any row permutation is exact — cf. spike-038's
-//!               accumulate-fresh-out rule).
-//! net_ms <= 0 ⇒ the reorder overhead eats the coalescing saving ⇒ no lever, confirms 030/031's
-//!               "read-once-unamortizable" verdict transfers to discrete CUDA too.
+//!               (bit-exact by construction: the histogram is order-independent for the u64
+//!               fixed-point build, so any row permutation is exact).
+//! net_ms <= 0 ⇒ the reorder overhead eats the coalescing saving ⇒ no lever.
 //!
 //! REORDER kernel: one cube per feature (matches build's launch shape), each thread gathers
 //! `resident_bins[col + leaf_rows[k]]` (the SAME random-access pattern REAL_ORDER's build pays
@@ -22,10 +16,10 @@
 //! coalesced; only the READ is uncoalesced (same as build's own bin gather, minus the atomic
 //! histogram accumulation). This isolates "sort/scatter" cost from "coalesced build" cost.
 //!
-//! COAL_OVER_REORDERED: byte-for-byte spike-087's `build_coalbin`, but launched over the
-//! `scratch` buffer at row count `r_real` (the leaf's actual row count) instead of `num_data`
-//! — apples-to-apples with REAL_ORDER (same row count), so the two candidate-pipeline stages
-//! sum to a directly comparable total.
+//! COAL_OVER_REORDERED: the coalesced-build kernel, launched over the `scratch` buffer at row
+//! count `r_real` (the leaf's actual row count) instead of `num_data` — apples-to-apples with
+//! REAL_ORDER (same row count), so the two candidate-pipeline stages sum to a directly
+//! comparable total.
 //!
 //! Run:
 //!   local APU:  cargo run --release -p lgbm-compute --features rocm --example spike088_reorder_net
@@ -46,7 +40,7 @@ const HIST_LDS_U64: usize = 512; // 2 u64/bin, NUM_BIN <= 256
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 const SCALE: f32 = 1_073_741_824.0; // 2^30 (== production SCALE_F32)
 
-// ─── FULL: byte-faithful copy of construct_leaf_hist_resident_lds_kernel_u64 (verbatim 087) ───
+// ─── FULL: byte-faithful copy of construct_leaf_hist_resident_lds_kernel_u64 ───
 #[cfg(any(feature = "rocm", feature = "cuda"))]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
@@ -121,7 +115,7 @@ fn reorder_bins(
     }
 }
 
-// ─── COAL_OVER_REORDERED: spike-087's build_coalbin, but over the reordered `scratch` buffer
+// ─── COAL_OVER_REORDERED: the coalesced-build kernel, but over the reordered `scratch` buffer
 //     at row count `r` (the leaf's row count), col stride = r (not num_data). Sequential read
 //     `scratch[out_col + k]` — the coalesced ceiling, realized on the ACTUAL leaf row count so
 //     it's directly summable with REORDER's time for the net comparison. ───
@@ -203,9 +197,9 @@ fn run<R: cubecl::Runtime>(client: cubecl::prelude::ComputeClient<R>) {
                 bins.push((h % num_bin as u64) as u8);
             }
         }
-        // Same as spike-087: the production monotone subset — a 50%-selectivity leaf one
-        // level below root (stride-2, sorted). This is the row order production actually
-        // pays for; the reorder pass would materialize this INTO fully coalesced (0,1,2,...).
+        // The production monotone subset — a 50%-selectivity leaf one level below root
+        // (stride-2, sorted). This is the row order production actually pays for; the
+        // reorder pass would materialize this INTO fully coalesced (0,1,2,...).
         let leaf_rows_real: Vec<u32> = (0..num_data as u32).step_by(2).collect();
         let r_real = leaf_rows_real.len();
         let ord_g: Vec<f32> = (0..r_real).map(|i| (i as f32 * 0.013).sin() * 0.5).collect();
@@ -217,7 +211,7 @@ fn run<R: cubecl::Runtime>(client: cubecl::prelude::ComputeClient<R>) {
         let d_h = client.create_from_slice(f32::as_bytes(&ord_h));
         let d_slot = client.create_from_slice(u32::as_bytes(&slot_off));
 
-        // REAL_ORDER: current production baseline (verbatim 087's REAL_ORDER measurement).
+        // REAL_ORDER: current production baseline.
         let mut real_samples = Vec::with_capacity(REPS);
         for _ in 0..REPS {
             let out = client.create_from_slice(u64::as_bytes(&vec![0u64; slot_len]));

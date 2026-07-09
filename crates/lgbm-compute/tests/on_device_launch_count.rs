@@ -1,5 +1,5 @@
-//! 24-05 (L-1 / SC-2) — the on-device launch counter reports an HONEST REAL-DISPATCH
-//! total, and the test can DETECT launch non-collapse (the spike-055 per-FEATURE
+//! The on-device launch counter reports an HONEST REAL-DISPATCH
+//! total, and the test can DETECT launch non-collapse (a per-FEATURE
 //! regression). Folded through [`on_device_launch_count_take`], the counter is bumped
 //! ONCE per real device dispatch on the resident arm (upload / build_fix_scan /
 //! build_resident / subtract / scan / data_partition_native; a co-packed sibling scan is
@@ -21,8 +21,8 @@
 //! Scope: INSTRUMENTATION, not parity — the on-device grow's numerical faithfulness is
 //! covered by the `learner_parity` STRUCTURE gate (pinned to the cpu f64 anchor).
 //!
-//! ## 26-03 note (M1/M6 resident row permutation — launch closed form UNCHANGED)
-//! Plan 03 made the row permutation resident (a device index RANGE into a single `perm` buffer)
+//! ## Resident row permutation note (launch closed form UNCHANGED)
+//! The row permutation is resident (a device index RANGE into a single `perm` buffer)
 //! and partitions it IN PLACE per split. On the DEFAULT tested lane the partition still routes on
 //! the HOST (`prefers_host_partition()`), which issues NO device dispatch, and the build / subtract
 //! / scan dispatch layout is untouched — so the real-dispatch closed form
@@ -116,16 +116,15 @@ fn anchor_launch_count(num_features: usize) -> u64 {
     on_device_launch_count_take()
 }
 
-/// L-1 / SC-2 (cpu lane): the launch count is NON-ZERO and INDEPENDENT of `num_features`.
+/// cpu lane: the launch count is NON-ZERO and INDEPENDENT of `num_features`.
 ///
 /// Growing the SAME dominant-feature corpus with 3 vs 12 feature columns must report the
 /// EXACT same launch count — the per-leaf/real-dispatch counter never scales with the
-/// number of features. A per-FEATURE regression (the spike-055 / WR-01 failure mode) would
-/// multiply the build+scan launches by `num_features`, breaking this equality. The old
-/// ~100×-loose `< 8570` bound could not detect that; this can.
+/// number of features. A per-FEATURE regression (the WR-01 failure mode) would
+/// multiply the build+scan launches by `num_features`, breaking this equality.
 #[test]
 fn on_device_launch_count_is_num_features_independent() {
-    // P-1: enable the read-once phase-prof gate BEFORE the FIRST counter read (the
+    // Enable the read-once phase-prof gate BEFORE the FIRST counter read (the
     // `bump_launch`/`take` OnceLock reads env exactly once per process). This single test
     // owns the process, so setting it first is race-free.
     // SAFETY: set at the very top before any grow reads the OnceLock-cached gate; no
@@ -162,13 +161,13 @@ fn on_device_launch_count_is_num_features_independent() {
          {per_leaf_collapse_bound} (= 2 + 4*(num_leaves-1), num_leaves={NUM_LEAVES})"
     );
 
-    // spike-056 NEGATIVE guard (25-01, ODP2-05), CI-reachable on the cpu anchor lane: the
-    // f64 single-owner fused build (`build_fix_scan_resident_f64_on`, spike-052's 5.4×-worse
-    // kernel) is NEVER dispatched on the default on-device path. The cpu anchor arm does not
-    // enter the resident driver at all, so this is trivially 0 here; the rocm resident lane
-    // below exercises the real SWAPPED path where the guard is load-bearing (it asserts == 0
-    // there too, on the arm that USED to dispatch the f64 fused build). Drain the positive
-    // counter as well so no process-global state leaks into the resident lane's per-grow reads.
+    // NEGATIVE guard, CI-reachable on the cpu anchor lane: the f64 single-owner fused build
+    // (`build_fix_scan_resident_f64_on`, a much slower kernel) is NEVER dispatched on the
+    // default on-device path. The cpu anchor arm does not enter the resident driver at all,
+    // so this is trivially 0 here; the rocm resident lane below exercises the real SWAPPED
+    // path where the guard is load-bearing (it asserts == 0 there too, on the arm that USED
+    // to dispatch the f64 fused build). Drain the positive counter as well so no
+    // process-global state leaks into the resident lane's per-grow reads.
     let _ = on_device_rootbuild_u64_count_take();
     let f64_fused = on_device_f64_fused_count_take();
     assert_eq!(
@@ -191,19 +190,16 @@ fn on_device_launch_count_is_num_features_independent() {
 /// resident launchers. The env gate is already set by the caller.
 ///
 /// Analytic real-dispatch closed form (host partition route, DEFAULT co-pack ON, every split
-/// has two scannable children so the tree reaches `num_leaves` leaves). AFTER the spike-056
-/// swap (25-01), the on-device root + directly-built build runs the PARALLEL u64 fixed-point
-/// kernel via `build_resident_leaf` (BUILD only) + a SEPARATE resident scan, replacing the
-/// f64 single-owner `build_fix_scan_resident` FUSED build+scan:
+/// has two scannable children so the tree reaches `num_leaves` leaves). The on-device root +
+/// directly-built build runs the PARALLEL u64 fixed-point kernel via `build_resident_leaf`
+/// (BUILD only) + a SEPARATE resident scan (not a fused f64 single-owner build+scan):
 ///   upload (1) + root [ build (1) + scan (1) = 2 ]
 ///     + per split [ build_resident (1) + subtract (1) + `scan_resident_siblings` (1) = 3 ]
 ///   = `3 + 3*(num_leaves - 1)`.
-/// The host partition route issues NO device dispatch (0). The ROOT term rose 1 → 2 vs the
-/// pre-swap form (the fused root build+scan became a separate build + scan). This closed form
-/// assumes DEFAULT co-pack (ON) — the test removes `LGBM_SIBLING_COPACK` below to pin it. Note
-/// the swap makes the per-split count co-pack-DEPENDENT (co-pack-OFF is now
-/// build_resident + subtract + smaller scan + larger scan = 4, up from the old fused 3), so
-/// the closed form is stated for the default co-pack-ON path the test exercises.
+/// The host partition route issues NO device dispatch (0). This closed form assumes DEFAULT
+/// co-pack (ON) — the test removes `LGBM_SIBLING_COPACK` below to pin it. The per-split count
+/// is co-pack-DEPENDENT (co-pack-OFF is build_resident + subtract + smaller scan + larger
+/// scan = 4), so the closed form is stated for the default co-pack-ON path the test exercises.
 #[cfg(feature = "rocm")]
 fn resident_analytic_lane() {
     use lgbm_compute::runtime::rocm_client;
@@ -250,20 +246,19 @@ fn resident_analytic_lane() {
     let (launches_3, rootbuild_3, f64_fused_3, leaves_3, leaf_count_3) = grow_resident(3);
     let (launches_12, _rootbuild_12, f64_fused_12, leaves_12, _) = grow_resident(12);
 
-    // spike-056 POSITIVE proof (ODP2-05): the CONVERTED root + directly-built build sites
-    // actually ran the PARALLEL u64 fixed-point kernel — a nonzero root-build sub-counter
-    // (>= 1 for the root; the co-pack splits build via the already-u64 subtract path and do
-    // NOT bump this scoped counter). Proves the swap AUTOMATICALLY, not by code-tracing —
-    // exactly what Phase-24's wrong kernel evaded.
+    // POSITIVE proof: the root + directly-built build sites actually ran the PARALLEL u64
+    // fixed-point kernel — a nonzero root-build sub-counter (>= 1 for the root; the co-pack
+    // splits build via the already-u64 subtract path and do NOT bump this scoped counter).
+    // Proves the kernel choice AUTOMATICALLY, not by code-tracing.
     assert!(
         rootbuild_3 > 0,
         "on-device root/directly-built build must dispatch the parallel u64 kernel (rootbuild \
          sub-counter > 0), got {rootbuild_3} — the converted sites did not run u64"
     );
 
-    // spike-056 NEGATIVE guard (ODP2-05): the f64 single-owner fused build must NEVER be
-    // dispatched on the default (swapped) on-device path — this is the arm that USED to run
-    // `build_fix_scan_resident_f64_on` (spike-052's 5.4×-worse kernel). `== 0` at BOTH feature
+    // NEGATIVE guard: the f64 single-owner fused build must NEVER be dispatched on the
+    // default on-device path — this is the arm that could otherwise silently run
+    // `build_fix_scan_resident_f64_on` (a much slower kernel). `== 0` at BOTH feature
     // counts so the slow kernel can never silently return on-device.
     assert_eq!(
         f64_fused_3, 0,
@@ -300,13 +295,12 @@ fn resident_analytic_lane() {
          would break this"
     );
 
-    // EXACT analytic real-dispatch closed form (host partition route, DEFAULT co-pack ON),
-    // AFTER the spike-056 u64 swap AND the 26-01 (ODP3-01/M2) once-per-grow grad/hess upload:
+    // EXACT analytic real-dispatch closed form (host partition route, DEFAULT co-pack ON):
     // bin upload (1) + grad/hess upload (1) + root [build (1) + scan (1)] + per split
     // [build_resident (1) + subtract (1) + siblings_scan (1)] = 4 + 3*(num_leaves-1). The
-    // leading constant rose 3 → 4 vs the pre-26-01 form: the on-device grad/hess gather hoists
-    // the per-build host grad/hess upload to ONE once-per-grow device dispatch (num_features-
-    // AND num_leaves-independent), counted like the bin upload.
+    // on-device grad/hess gather hoists the per-build host grad/hess upload to ONE
+    // once-per-grow device dispatch (num_features- AND num_leaves-independent), counted
+    // like the bin upload.
     let analytic = 4 + 3 * (NUM_LEAVES as u64 - 1);
     assert_eq!(
         launches_3, analytic,

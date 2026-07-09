@@ -1,19 +1,13 @@
-//! Spike 087 — build+scan COMPUTE deep-dive: the Kaggle-ready real-CUDA build-coalescing
-//! probe. This is spike-030's `build_roofline_ab` made RUNTIME-GENERIC and CUDA-buildable,
-//! so the same kernels run on the local spoofed-APU (`--features rocm`) AND on real discrete
-//! NVIDIA via Kaggle (`--features cuda`). Spike-030 established on the APU that the post-u64
-//! wide build is UNCOALESCED-BIN-GATHER-bound (86–93%), and that the production stable-
-//! partition MONOTONE row order already banks ~70% of the coalesced ceiling (REAL_ORDER
-//! ~1.4× off COAL) — so on the APU the build is "effectively tuned" and 030 explicitly
-//! deferred the real verdict: *"reopens only on discrete gfx110x — re-run the probe there."*
+//! Build+scan COMPUTE deep-dive: a Kaggle-ready real-CUDA build-coalescing probe,
+//! runtime-generic and CUDA-buildable so the same kernels run on the local spoofed-APU
+//! (`--features rocm`) AND on real discrete NVIDIA via Kaggle (`--features cuda`).
 //!
 //! THE OPEN QUESTION this probe answers on real CUDA: does discrete NVIDIA (128-B coalesced
 //! transactions + a real L1/L2 hierarchy, unlike the shared-DDR5 APU) leave MORE coalescing
-//! headroom than the APU's ~1.4× (⇒ a reorder-to-coalesced lever with real headroom), or
-//! does its cache absorb the uncoalesced gather (⇒ no lever, and the ~2× architectural floor
-//! from spike-054 dominates)? The headline metric is REAL_ORDER vs COAL throughput.
+//! headroom than the APU's, or does its cache absorb the uncoalesced gather? The headline
+//! metric is REAL_ORDER vs COAL throughput.
 //!
-//! METHOD — "remove the suspect" (verbatim spike-030): each kernel deletes ONE suspected
+//! METHOD — "remove the suspect": each kernel deletes ONE suspected
 //! cost; whichever deletion moves the clock IS the bottleneck.
 //!   FULL      the production build replica (random gather, atomic, grad/hess read)
 //!   NOATOMIC  reads+quantize kept, per-row LDS fetch_add removed        → the ATOMIC cost
@@ -140,10 +134,9 @@ fn build_coalbin(
     }
 }
 
-// (The NOATOMIC / CONST_GH / SEQ_BIN "remove-the-suspect" kernels that complete the
-// mechanism breakdown are in the spike-030 source, sources/030-wide-build-roofline-
-// reattribution/. This Kaggle probe keeps the headline coalescing pair FULL + COAL_BIN plus
-// the REAL_ORDER production-order run — the quantity whose real-CUDA value 030 deferred.)
+// This probe keeps the headline coalescing pair FULL + COAL_BIN plus the REAL_ORDER
+// production-order run; the NOATOMIC / CONST_GH / SEQ_BIN "remove-the-suspect" kernels that
+// complete the mechanism breakdown are not included here.
 
 /// The whole probe, generic over the CubeCL runtime — one code path serves the hip (APU) and
 /// cuda (real NVIDIA) backends; only the client the caller passes differs. Prints, per wide
@@ -196,9 +189,9 @@ fn run<R: cubecl::Runtime>(client: cubecl::prelude::ComputeClient<R>) {
 
         // Time a build-kernel launch batch; return the median device-ms/launch over REPS.
         // Args mirror the kernel signature (bins, rows, ord_g, ord_h, slot_off, scalar,
-        // feat_len, out). Launch form is verbatim spike-030 (cubecl 0.10):
-        // `ArrayArg::from_raw_parts(handle.clone(), len)`, scalars passed directly, `::<R>` for
-        // the generic-fn context (matches histogram.rs:1167).
+        // feat_len, out). Launch form: `ArrayArg::from_raw_parts(handle.clone(), len)`,
+        // scalars passed directly, `::<R>` for the generic-fn context (matches
+        // histogram.rs:1167).
         macro_rules! bench_build {
             ($k:ident, $bins:expr, $rows:expr, $nrows:expr) => {{
                 let mut samples = Vec::with_capacity(REPS);

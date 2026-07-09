@@ -1,27 +1,26 @@
-//! Phase 31 (31-05, ODS-01/ODS-02x/ODS-04) — the GBDT-level GRAD_NS/SCORE_NS same-session
-//! ledger + bit-exactness gate for Plan 04's on-device grad/hess + resident-score path.
+//! The GBDT-level GRAD_NS/SCORE_NS same-session ledger + bit-exactness gate for the
+//! on-device grad/hess + resident-score path.
 //!
 //! This is the crate-boundary counterpart to `phase31_ab.rs` (an `lgbm-treelearner` EXAMPLE,
-//! which covers ODS-02/ODS-03 at the Backend+SerialTreeLearner level). `lgbm-treelearner` does
-//! NOT depend on `lgbm-boosting` (the dependency runs the other way), so it CANNOT construct a
-//! `Gbdt` or exercise Plan 04's grad/hess branch — and therefore cannot populate the
-//! `GRAD_NS`/`SCORE_NS` statics, which only a GBDT-level train drives. `oracle-harness` is the
-//! ONLY crate depending on all three of `lgbm-compute`/`lgbm-treelearner`/`lgbm-boosting`, so
-//! the GBDT-level GRAD_NS/SCORE_NS measurement lives HERE (correcting 31-VALIDATION.md's
-//! placeholder that a single `lgbm-treelearner` example would report both — it structurally
-//! cannot).
+//! which covers the same comparison at the Backend+SerialTreeLearner level). `lgbm-treelearner`
+//! does NOT depend on `lgbm-boosting` (the dependency runs the other way), so it CANNOT
+//! construct a `Gbdt` or exercise the resident grad/hess branch — and therefore cannot
+//! populate the `GRAD_NS`/`SCORE_NS` statics, which only a GBDT-level train drives.
+//! `oracle-harness` is the ONLY crate depending on all three of
+//! `lgbm-compute`/`lgbm-treelearner`/`lgbm-boosting`, so the GBDT-level GRAD_NS/SCORE_NS
+//! measurement lives HERE.
 //!
-//! What it proves (31-RESEARCH.md Assumption A4 / Common Pitfall #2 — measure via
-//! GRAD_NS/SCORE_NS, NOT the ONDEV_GROW ledger which wraps only the grow call):
+//! What it proves (measure via GRAD_NS/SCORE_NS, NOT the ONDEV_GROW ledger which wraps only
+//! the grow call):
 //!   - CORRECTNESS GATE (asserted): training a `num_class==1`, no-bagging, no-GOSS `binary`
-//!     GBDT with `boosting_on_cuda()=true` (Plan 04's resident grad/hess + resident-score path
+//!     GBDT with `boosting_on_cuda()=true` (the resident grad/hess + resident-score path
 //!     ACTIVE) produces a model + score BIT-IDENTICAL, leaf-for-leaf, to the same config with
 //!     `boosting_on_cuda()=false` (byte-unchanged host path) — on the cpu-f64 anchor.
 //!   - MEASUREMENT ARTIFACT (printed, NOT asserted for magnitude/direction): both runs' drained
-//!     `GRAD_NS`/`SCORE_NS` (ns) are dumped side-by-side in the SAME process (the spike-078/080
-//!     same-session discipline — box noise across separate processes invents fake deltas). ODS-04
-//!     explicitly FORBIDS assuming a specific drop without measuring, so this test asserts only
-//!     the bit-exactness; the ns delta is left for a human/Kaggle reader to interpret.
+//!     `GRAD_NS`/`SCORE_NS` (ns) are dumped side-by-side in the SAME process (measuring both
+//!     arms in one process avoids inventing fake deltas from cross-process noise). No specific
+//!     magnitude or direction is asserted — this test asserts only the bit-exactness; the ns
+//!     delta is left for a human reader to interpret.
 //!
 //! The `GRAD_NS`/`SCORE_NS` statics are gated by `LGBM_PHASE_PROF=1` (read-once at process
 //! start), so under a plain `cargo test` they stay 0 and the ledger line prints zeros — the
@@ -106,7 +105,7 @@ fn gain_config() -> GainConfig {
 /// One arm: train a fresh `binary` num_class==1 GBDT for `ITERS` iterations with the given
 /// `boosting_on_cuda` toggle, draining `GRAD_NS`/`SCORE_NS` immediately AROUND this train (clear
 /// before, read after) so the returned ns belong to THIS arm only. `resident=true` activates
-/// Plan 04's GBDT-owned resident score + on-device grad/hess path; `false` is the byte-unchanged
+/// the GBDT-owned resident score + on-device grad/hess path; `false` is the byte-unchanged
 /// host path. Returns `(trees, scores, resident_active, grad_ns, score_ns)`.
 fn train_arm<B: Backend>(
     backend: &B,
@@ -127,7 +126,7 @@ fn train_arm<B: Backend>(
     let mut gbdt = Gbdt::with_objective(
         BoostObjective::Binary(Binary::new(1.0).unwrap()),
         0.3,
-        1, // num_class == 1 (the Plan-04 envelope)
+        1, // num_class == 1
         num_data,
         true,
         None,
@@ -148,18 +147,17 @@ fn train_arm<B: Backend>(
     )
 }
 
-/// ODS-01/ODS-02x/ODS-04 — SAME-SESSION GBDT-level ledger: Plan 04's resident grad/hess +
+/// SAME-SESSION GBDT-level ledger: the resident grad/hess +
 /// resident-score path is BIT-EXACT to the host path (the asserted correctness gate), and its
 /// `GRAD_NS`/`SCORE_NS` are reported side-by-side from ONE process run (the printed measurement
-/// artifact — no magnitude/direction is asserted, per ODS-04's "do not assume a transfer number
-/// without measuring").
+/// artifact — no magnitude/direction is asserted; do not assume a transfer number without
+/// measuring).
 #[test]
 fn resident_grad_hess_score_same_session_ledger_bit_exact() {
     let backend = CpuBackend;
     let client = cpu_client();
 
-    // SAME process, back-to-back (the spike-078/080 same-session discipline): resident arm
-    // (Plan 04 active) then the byte-unchanged host arm.
+    // SAME process, back-to-back: resident arm active, then the byte-unchanged host arm.
     let (dev_trees, dev_scores, dev_active, dev_grad, dev_score) =
         train_arm(&backend, &client, true);
     let (host_trees, host_scores, host_active, host_grad, host_score) =
@@ -167,7 +165,7 @@ fn resident_grad_hess_score_same_session_ledger_bit_exact() {
 
     let phase_prof_on = std::env::var("LGBM_PHASE_PROF").map(|v| v == "1").unwrap_or(false);
 
-    // MEASUREMENT ARTIFACT (for pasting into 31-AB-RESULTS.md, Plan 06) — printed, not asserted.
+    // MEASUREMENT ARTIFACT — printed, not asserted.
     println!(
         "[phase31_grad_score_ab] resident_on: grad_ns={dev_grad} score_ns={dev_score} | \
          host: grad_ns={host_grad} score_ns={host_score} | phase_prof={phase_prof_on} \
@@ -176,7 +174,7 @@ fn resident_grad_hess_score_same_session_ledger_bit_exact() {
     );
 
     // Activation sanity: the binary num_class==1 envelope MUST activate the resident path on the
-    // `true` arm and MUST stay host on the `false` arm (Plan 04's frozen activation decision).
+    // `true` arm and MUST stay host on the `false` arm.
     assert_eq!(
         dev_active,
         Some(true),
@@ -194,7 +192,7 @@ fn resident_grad_hess_score_same_session_ledger_bit_exact() {
         "a real multi-iter binary train must move the score (non-vacuous ledger)"
     );
 
-    // THE CORRECTNESS GATE (ODS-03): bit-identical model + score vs the host path.
+    // THE CORRECTNESS GATE: bit-identical model + score vs the host path.
     assert_eq!(
         dev_trees, host_trees,
         "resident on-device grad/hess + score model diverged from the host path (leaf-for-leaf) \
@@ -209,7 +207,7 @@ fn resident_grad_hess_score_same_session_ledger_bit_exact() {
 
     // When the phase-prof gate IS on, the ledger must be non-vacuous (the drain actually saw the
     // grad/hess + score timers fire) — otherwise the printed measurement is meaningless. This is
-    // a gate on the LEDGER's honesty, NOT on any delta magnitude (ODS-04).
+    // a gate on the LEDGER's honesty, NOT on any delta magnitude.
     if phase_prof_on {
         assert!(
             dev_grad > 0 && dev_score > 0 && host_grad > 0 && host_score > 0,

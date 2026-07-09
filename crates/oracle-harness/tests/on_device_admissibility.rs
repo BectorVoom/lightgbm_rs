@@ -1,26 +1,16 @@
-//! Phase-29 29-02 (OCX-02) — the on-device scan admissibility RED→GREEN gate.
+//! The on-device scan admissibility gate.
 //!
 //! # What this proves
 //!
-//! Spike-072 **item 15** (the residual, second-class defect under the f64 root fold):
-//! once the f32 root-sum bias (29-01/OCX-01) is cured, corruption onset moves to ~tree
-//! 27, where the on-device resident scan accepts an INADMISSIBLE near-empty split:
-//!
-//! ```text
-//!   thr = 0 / 1  WIN  with  gain = inf
-//!   scan_h = -1.000000e-15  (exactly 0 - kEpsilon)  actual_n = 0  out = ±inf
-//!   scan_n = 6  (a cnt_factor row ESTIMATE off a ~0.36 subtract-residue in the low bins)
-//! ```
-//!
 //! C++'s `min_data_in_leaf` / `min_sum_hessian_in_leaf` admissibility gate
-//! (`feature_histogram.hpp` FindBestThresholdSequentially) rejects these candidates
-//! before they can win; the PRODUCTION on-device seam did not — because the seam
+//! (`feature_histogram.hpp` FindBestThresholdSequentially) rejects near-empty splits
+//! before they can win. If the on-device seam is pinned to a PERMISSIVE config
+//! (`min_data_in_leaf = 1`, `min_sum_hessian_in_leaf = 0.0`), a ~1-row `cnt_factor`
+//! estimate can pass `>= 1` and a kEpsilon-magnitude prefix can pass `>= 0.0`, minting a
+//! near-zero-hessian denominator and an `inf`-gain winner. The production on-device seam
 //! (`SerialTreeLearner` → `Backend::grow_tree_on_device` → `grow_tree_on_device_driver`)
-//! pinned the PERMISSIVE `proving_slice_config()` (`min_data_in_leaf = 1`,
-//! `min_sum_hessian_in_leaf = 0.0`), so a ~1-row `cnt_factor` estimate passes `>= 1` and a
-//! kEpsilon-magnitude prefix passes `>= 0.0`, minting a near-zero-hessian denominator and an
-//! `inf`-gain winner. The FIX (Task 2) plumbs the learner's REAL `GainConfig` across the
-//! seam so LightGBM's default admissibility (20 / 1e-3) binds on every on-device grow.
+//! must thread the learner's REAL `GainConfig` across the seam so LightGBM's default
+//! admissibility (20 / 1e-3) binds on every on-device grow.
 //!
 //! # Lanes
 //!
@@ -28,23 +18,15 @@
 //!   production on-device driver on a corpus engineered so the max-gain split isolates a
 //!   `< min_data_in_leaf`-row micro-cluster. Admissibility is recomputed FROM THE DATA (the
 //!   grow's own row→leaf partition + the raw hessians), NEVER from `SplitInfo.left_count`
-//!   (a `cnt_factor` estimate — spike-072 method rule). At master the pinned permissive
-//!   config admits the inadmissible split; under the real config every leaf is admissible.
+//!   (a `cnt_factor` row-count estimate). Under the real config every leaf must be
+//!   admissible.
 //! - **Lane B** (unit, cpu anchor): drive the shared scan (`Backend::find_best_split`,
 //!   `split_scan_body`) on a crafted histogram carrying a true-near-zero low-bin prefix
-//!   (the ~0.36-scale residue) plus real mass in the high bins. Under the permissive config
-//!   the near-empty prefix WINS with a sub-`min_sum_hessian` left child; under the real
-//!   config the admissibility gate rejects it. Every returned `SplitInfo` is asserted to
-//!   have a FINITE gain (`inf` impossible by construction) and admissible children (gated on
-//!   the scanned HESSIAN SUMS, not the count estimate).
-//!
-//! # RED→GREEN discipline
-//!
-//! These two lanes are committed `#[ignore = "RED until 29-02 Task 2"]` in the Task-1 (RED)
-//! commit — the project runs a hard bit-exact merge gate, so a genuinely-failing test cannot
-//! live on master; the RED failure is captured by `cargo test -- --ignored` and recorded in
-//! 29-02-SUMMARY.md. Task 2 (the fix commit) un-ignores them and repoints them at the
-//! config-bound production path, turning them GREEN.
+//!   plus real mass in the high bins. Under a permissive config the near-empty prefix can
+//!   WIN with a sub-`min_sum_hessian` left child; under the real config the admissibility
+//!   gate rejects it. Every returned `SplitInfo` is asserted to have a FINITE gain (`inf`
+//!   impossible by construction) and admissible children (gated on the scanned HESSIAN
+//!   SUMS, not the count estimate).
 
 use lgbm_compute::gain::GainConfig;
 use lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver_with_cfg;
@@ -69,9 +51,9 @@ fn realistic_cfg() -> GainConfig {
     }
 }
 
-/// The PERMISSIVE proving-slice config the pre-fix seam pinned (`min_data_in_leaf = 1`,
-/// `min_sum_hessian_in_leaf = 0.0`) — admissibility effectively OFF. Lane B feeds this to
-/// the scan to reproduce the spike-072 fingerprint (a near-empty prefix passing the gate).
+/// A PERMISSIVE proving-slice config (`min_data_in_leaf = 1`, `min_sum_hessian_in_leaf =
+/// 0.0`) — admissibility effectively OFF. Lane B feeds this to the scan to reproduce a
+/// near-empty prefix passing the gate.
 fn permissive_cfg() -> GainConfig {
     GainConfig {
         min_data_in_leaf: 1,
@@ -176,10 +158,10 @@ fn driver_leaf_rows(layout: &lgbm_dataset::LeafPartitionLayout) -> Vec<Vec<u32>>
 /// production seam ([`Backend::grow_tree_on_device_with_cfg`]) delegates to, threading the
 /// caller's REAL `GainConfig`.
 ///
-/// GREEN (Task 2): calls [`grow_tree_on_device_driver_with_cfg`] with the realistic config, so
-/// `min_data_in_leaf` / `min_sum_hessian_in_leaf` bind on every scan (spike-072 item-15 fix).
-/// (The pre-fix RED lane called the parameterless [`grow_tree_on_device_driver`], which pins
-/// the permissive proving config — retained for the anchor gates but NEVER on a production path.)
+/// Calls [`grow_tree_on_device_driver_with_cfg`] with the realistic config, so
+/// `min_data_in_leaf` / `min_sum_hessian_in_leaf` bind on every scan. The parameterless
+/// [`grow_tree_on_device_driver`] pins the permissive proving config instead — retained for
+/// the anchor gates but NEVER used on a production path.
 fn grow_via_production_seam(
     backend: &CpuBackend,
     gradients: &[f32],
@@ -197,8 +179,8 @@ fn grow_via_production_seam(
 }
 
 /// Lane A — the on-device-grown tree honors `min_data_in_leaf` / `min_sum_hessian_in_leaf`
-/// recomputed FROM THE DATA. RED at master (the pinned permissive config isolates the 10-row
-/// micro-cluster into its own leaf); GREEN once the real config binds through the seam.
+/// recomputed FROM THE DATA. Fails with a pinned permissive config (which would isolate the
+/// 10-row micro-cluster into its own leaf); passes once the real config binds through the seam.
 #[test]
 fn on_device_seam_honors_min_data_in_leaf() {
     let backend = CpuBackend;
@@ -244,8 +226,8 @@ fn on_device_seam_honors_min_data_in_leaf() {
 // a non-finite gain.
 // ===========================================================================
 
-/// A crafted single-feature histogram (concatenated `[g,h]` cells) reproducing the
-/// spike-072 low-bin residue: bin 0 carries a tiny (`~0.36`-scale gradient, `1e-4` hessian)
+/// A crafted single-feature histogram (concatenated `[g,h]` cells) reproducing a
+/// near-empty low-bin residue: bin 0 carries a tiny (`~0.36`-scale gradient, `1e-4` hessian)
 /// near-empty prefix; bins 1..=3 carry real mass. `sum_hessian` / `num_data` are chosen so
 /// `cnt_factor = num_data / sum_hessian ≈ 60000` ⇒ bin 0's row ESTIMATE `round(h0·cnt_factor)`
 /// is 6 (passes `min_data_in_leaf = 1`, fails `= 20`) while its hessian `1e-4` fails
@@ -279,7 +261,7 @@ fn scan(cfg: &GainConfig, hist: &[f64], sum_g: f64, sum_h: f64, num_data: i32, n
 }
 
 /// Assert admissibility on an emitted `SplitInfo` under `cfg` — gated on the scanned HESSIAN
-/// SUMS (ground truth), never on the cnt_factor count estimate (spike-072 method rule).
+/// SUMS (ground truth), never on the cnt_factor count estimate.
 fn assert_split_admissible(si: &lgbm_compute::gain::SplitInfo, cfg: &GainConfig, ctx: &str) {
     // Property (impossible by construction): finite gain or the no-split sentinel — never inf/NaN.
     assert!(
@@ -306,8 +288,8 @@ fn assert_split_admissible(si: &lgbm_compute::gain::SplitInfo, cfg: &GainConfig,
 }
 
 /// Lane B — under the REAL config the shared scan rejects the near-empty prefix and returns
-/// only an admissible, finite-gain winner. RED at master used the permissive config (the thr=0
-/// near-empty prefix won with a sub-`min_sum_hessian` left child); GREEN binds the real config.
+/// only an admissible, finite-gain winner. Under a permissive config the thr=0 near-empty
+/// prefix would win with a sub-`min_sum_hessian` left child; the real config rejects it.
 #[test]
 fn resident_scan_rejects_near_empty_prefix() {
     let cfg = realistic_cfg();
@@ -327,7 +309,7 @@ fn resident_scan_rejects_near_empty_prefix() {
     }
 }
 
-/// Lane B property sweep (OCX-02, T-29-02-01): across several crafted histograms × BOTH the
+/// Lane B property sweep: across several crafted histograms × BOTH the
 /// permissive and the real config, the scan NEVER returns a non-finite gain (gain=inf is
 /// impossible by construction — the kEpsilon-seeded denominators keep every emitted gain
 /// finite), and under the REAL config every emitted winner is admissible. The permissive arm
@@ -337,7 +319,7 @@ fn resident_scan_rejects_near_empty_prefix() {
 fn resident_scan_never_emits_non_finite_gain() {
     // A family of crafted histograms: (hist, sum_g, sum_h, num_data, num_bin).
     let cases: Vec<(Vec<f64>, f64, f64, i32, u32)> = vec![
-        // The near-empty low-bin prefix (spike-072 residue).
+        // The near-empty low-bin prefix residue.
         {
             let (h, g, s, n) = crafted_near_empty_histogram();
             (h, g, s, n, 4)
@@ -379,13 +361,13 @@ fn resident_scan_never_emits_non_finite_gain() {
 }
 
 // ===========================================================================
-// Task 3 — the `--features rocm` HARDWARE lane: prove admissibility binds on the
-// real hip resident scheduler (the arm spike-072 exercised), plus a non-uniform-
-// hessian SMOKE (the small-corpus/uniform-hessian blind spot the fingerprint hid in).
+// The `--features rocm` HARDWARE lane: prove admissibility binds on the real hip
+// resident scheduler, plus a non-uniform-hessian SMOKE (a small-corpus/uniform-hessian
+// blind spot that a real-data corpus can hide).
 //
-// Runtime budget (29-CONTEXT): both lanes use SMALL/moderate corpora and grow a
-// single tree — well under the 1–2.5 min/train hip budget. The 100-iter 500k×50
-// end-to-end proof belongs to 29-05, NOT here.
+// Runtime budget: both lanes use SMALL/moderate corpora and grow a single tree — well
+// under the hip training budget. A full end-to-end proof over a much larger corpus is
+// out of scope here.
 // ===========================================================================
 #[cfg(feature = "rocm")]
 mod rocm {
@@ -415,7 +397,7 @@ mod rocm {
         )
         .unwrap_or_else(|e| panic!("{ctx}: hip resident grow failed: {e:?}"));
 
-        // Every leaf value finite (the spike-072 corruption drove leaves to ±inf/NaN).
+        // Every leaf value must be finite (an inadmissible split can drive leaves to ±inf/NaN).
         for (leaf, &v) in tree.leaf_value.iter().enumerate() {
             assert!(
                 v.is_finite(),
@@ -452,8 +434,8 @@ mod rocm {
     }
 
     /// A moderate (~50k-row) deterministic corpus with NON-UNIFORM binary-logloss-like hessians
-    /// (`h = p·(1-p)`, `p = sigmoid(varied score)`, in `(0, 0.25]`) across 8 features — the exact
-    /// class the small-corpus/uniform-hessian gates were blind to (spike-072 / 29-CONTEXT OCX-04).
+    /// (`h = p·(1-p)`, `p = sigmoid(varied score)`, in `(0, 0.25]`) across 8 features — a class
+    /// of corpus that small, uniform-hessian test corpora do not exercise.
     fn non_uniform_corpus() -> (Vec<lgbm_compute::GrowFeature>, Vec<f32>, Vec<f32>) {
         use lgbm_dataset::BinType;
         use lgbm_treelearner::offset_for_most_freq_bin;
@@ -519,9 +501,9 @@ mod rocm {
     }
 
     /// Non-uniform-hessian SMOKE on hip hardware: grow a full tree; assert every leaf value is
-    /// finite and no leaf carries a near-zero actual child hessian (the spike-072 fingerprint of
-    /// an admitted near-empty split). This is the hardware-real, non-uniform-hessian coverage the
-    /// pre-fix gates lacked — kept to a single moderate grow (well under the hip runtime budget).
+    /// finite and no leaf carries a near-zero actual child hessian (the fingerprint of an
+    /// admitted near-empty split). Hardware-real, non-uniform-hessian coverage — kept to a
+    /// single moderate grow (well under the hip runtime budget).
     #[test]
     fn on_device_non_uniform_hessian_smoke_on_hip() {
         let (gf, gradients, hessians) = non_uniform_corpus();

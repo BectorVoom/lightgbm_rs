@@ -1,4 +1,4 @@
-//! Phase-28 28-07 (ODF-06, WR-01) — the resident device cross-leaf best-leaf pick
+//! The resident device cross-leaf best-leaf pick (ODF-06, WR-01)
 //! (§8.3, `find_best_from_all_splits_device` → `find_best_leaf_kernel`) breaks an EXACT
 //! gain tie by the SAME key as the cpu-f64 anchor `SerialTreeLearner::split_gt`: gain
 //! descending, then the LOWER real feature index (`-1` ⇒ `i32::MAX`), then the lower leaf
@@ -13,8 +13,8 @@
 //! FAILS against the pre-fix kernel and passes after.
 //!
 //! Runs on the cubecl-cpu f64 anchor (the merge gate) — `find_best_leaf_kernel` is an
-//! ungated `#[cube]` kernel, so this parity gate needs NO GPU hardware (28-REVIEW
-//! verification caveat: the resident sequencing is otherwise only compile-covered).
+//! ungated `#[cube]` kernel, so this parity gate needs NO GPU hardware (the resident
+//! sequencing is otherwise only compile-covered).
 
 use lgbm_compute::kernels::best_split::{
     find_best_from_all_splits_device, find_best_from_all_splits_on, SplitSoa,

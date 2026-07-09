@@ -5,16 +5,16 @@
 ## Tech Debt
 
 **On-device (fully GPU-resident) CUDA tree learner — architecturally stuck, opt-in only:**
-- Issue: `on_device_default()` hardcoded to `false` after 5 consecutive real-CUDA A/B failures (Phases 23-31, spikes 055-088). Root cause moved through several iterations — per-tree bin re-upload (fixed, largest single win, 67-78% of gap), host control-plane cost (fixed), and finally landed on a per-leaf device sync/readback floor (6044-9044 blocking readbacks/grow) that is architectural, not a bug.
+- Issue: `on_device_default()` hardcoded to `false` — real-CUDA A/B testing found it consistently slower. Root cause moved through several iterations — per-tree bin re-upload (fixed, largest single win, 67-78% of gap), host control-plane cost (fixed), and finally landed on a per-leaf device sync/readback floor (6044-9044 blocking readbacks/grow) that is architectural, not a bug.
 - Files: `crates/lgbm-compute/src/lib.rs:1990-2058` (`on_device_default`, extensive inline history of every failed attempt), `crates/lgbm-compute/src/kernels/grow_driver.rs` (3500 lines, host-driven best-first grow loop), `crates/lgbm-treelearner/src/resident_pool.rs`.
 - Impact: The on-device path is fully implemented, bit-exact/parity-tested, but 1.12-2.2x SLOWER than the host-orchestrated CUDA path in every measured shape. It is reachable only via `LGBM_CUDA_ON_DEVICE="1"` env opt-in; production default routes through the host-driven loop.
-- Fix approach: Per spike-088/081 findings, would require a genuinely device-resident best-first grow loop that never blocks on a per-leaf readback — a larger rewrite than incremental patches; currently shelved.
+- Fix approach: Would require a genuinely device-resident best-first grow loop that never blocks on a per-leaf readback — a larger rewrite than incremental patches; currently shelved.
 
 **`grow_driver.rs` and `learner.rs` are oversized control-flow hubs:**
 - Issue: `crates/lgbm-compute/src/kernels/grow_driver.rs` (3500 lines) and `crates/lgbm-treelearner/src/learner.rs` (5100 lines, the largest file in the workspace) mix kernel dispatch, host bookkeeping, environment-variable-gated A/B branches, and profiling instrumentation in single files.
 - Files: `crates/lgbm-treelearner/src/learner.rs`, `crates/lgbm-compute/src/kernels/grow_driver.rs`, `crates/lgbm-compute/src/kernels/best_split.rs` (4185 lines), `crates/lgbm-compute/src/kernels/split.rs` (4090 lines), `crates/lgbm-compute/src/lib.rs` (4773 lines).
 - Impact: High-risk surface for regressions; any change touching the grow loop must be cross-checked against many env-flag-gated paths (`LGBM_SPLIT_2LANE`, `LGBM_CUDA_ON_DEVICE`, `LGBM_SCAN_CUBEDIM`, `LGBM_BENCH_SWEEP`, etc.) that all live inline.
-- Fix approach: No active plan; acceptable given the parity-test coverage, but any future refactor should preserve every A/B env-gate's semantics (each is load-bearing for a completed spike).
+- Fix approach: No active plan; acceptable given the parity-test coverage, but any future refactor should preserve every A/B env-gate's semantics.
 
 **`HistArena::swap` slot-aliasing fragility (WR-01):**
 - Issue: A previously identified latent slot-aliasing bug in histogram-arena swap logic; test coverage for the multi-leaf on-device grow loop specifically targets this class of bug (tie-break pick using stale/aliased buffers).
@@ -22,11 +22,11 @@
 - Impact: Requires careful review of any change to histogram-pool reuse (`HistogramPool`, `resident_pool.rs`) or shared/global-memory hessian buffers on the CUDA kernel side; regressions here are silent numerical corruption, not crashes.
 - Fix approach: Guarded today by dedicated parity tests (`objective_parity_rank.rs`, `on_device_tie_break_parity.rs`); no structural fix beyond the current test net.
 
-**Categorical-feature GPU kernel seam is a stub (Phase 22 deferred):**
+**Categorical-feature GPU kernel seam is a stub:**
 - Issue: Metadata plumbing and `_GlobalMemory` kernel variants for categorical features are allocated/reserved but unused.
 - Files: `crates/lgbm-compute/src/kernels/column_data.rs:28`, `crates/lgbm-compute/src/kernels/best_split.rs:1126,1194`.
 - Impact: Categorical-split GPU support is incomplete; falls back to whatever the continuous-only kernel path does.
-- Fix approach: Tracked inline as "Phase 22 / v2 QGD-02" seam, not currently scheduled.
+- Fix approach: Tracked inline as a "v2 QGD-02" seam, not currently scheduled.
 
 **Widespread `#[allow(clippy::too_many_arguments)]`:**
 - Issue: ~25+ kernel/dispatch functions across `lgbm-compute` (data_partition.rs, predict.rs, objective_rank.rs, metric_pointwise.rs) and `lgbm-boosting/gbdt.rs` silence the too-many-arguments lint rather than group parameters into structs.
@@ -59,7 +59,7 @@
 **Single-threaded `DataPartition::split` remains the dominant CPU-vs-C++ gap:**
 - Problem: At scale, tall-narrow shapes (e.g. 500k rows × 50 features) run ~1.7-2.2x slower than C++ LightGBM; the root cause traced to `DataPartition::split` not being parallelized the way C++'s reference implementation is, despite several rayon/cubecl-cpu parallelization spikes.
 - Files: `crates/lgbm-treelearner/src/data_partition.rs`.
-- Cause: Per project memory, direct parallelization attempts (spike-026, cubecl-cpu scan+scatter) hit a shared-DRAM-bandwidth wall rather than a contention wall; wins only appear in cache-resident regimes (~100k balanced), and regress on skewed/large inputs. The "fused-gather partition" win (narrower route-scratch + fused bin-gather) is shipped and reduces but does not eliminate the gap.
+- Cause: Direct parallelization attempts (cubecl-cpu scan+scatter) hit a shared-DRAM-bandwidth wall rather than a contention wall; wins only appear in cache-resident regimes (~100k balanced), and regress on skewed/large inputs. The "fused-gather partition" win (narrower route-scratch + fused bin-gather) is shipped and reduces but does not eliminate the gap.
 - Improvement path: No further-open lever per current memory (`partition-parallel-null.md`); this is treated as a closed/accepted gap, not an active TODO.
 
 **GPU (ROCm/CUDA host-orchestrated) path loses to 16-core CPU on the local (spoofed 8-CU APU) hardware in most shapes.**
@@ -87,7 +87,7 @@
 **Histogram pool sized by `num_leaves × total_bins`:**
 - Current capacity: Memory-bound by the fixed-size histogram pool used with the subtraction trick (mirrors C++ design).
 - Limit: Very high `max_bin` combined with very high `num_leaves` grows pool memory linearly in both; not independently re-verified in this pass but inherited directly from the ported C++ design (see ARCHITECTURE.md "Histogram pool memory" constraint) — same limit class as upstream LightGBM.
-- Scaling path: No Rust-specific scaling work identified beyond the flattened-arena + cross-tree-reuse optimization already shipped (spikes 010/012, ~7% win, bit-exact).
+- Scaling path: No Rust-specific scaling work identified beyond the flattened-arena + cross-tree-reuse optimization already shipped (~7% win, bit-exact).
 
 ## Dependencies at Risk
 
@@ -111,7 +111,7 @@
 - Priority: Low (feature is opt-in and known-slow; not user-facing by default), but High if the flip to default-on is ever attempted without restoring a repeatable real-GPU gate.
 
 **On-device kernel goldens are host re-transcriptions, not captured from a compiled `lib_lightgbm`:**
-- What's not tested: Phase 17/18 partition/tree/predict goldens for on-device kernels prove internal transcription self-consistency, not fidelity to the actual C++ reference binary.
+- What's not tested: The partition/tree/predict goldens for on-device kernels prove internal transcription self-consistency, not fidelity to the actual C++ reference binary.
 - Files: `crates/oracle-harness/tests/` (on-device partition/tree/predict parity suites — see `on-device-kernel-goldens-are-retranscriptions` in project memory for full context).
 - Risk: A latent divergence between the hand-transcribed golden and true C++ behavior would not be caught by these specific tests; the CPU f64-fold anchor tests (bit-exact vs real `lib_lightgbm` 4.6) are the ones with genuine external-reference fidelity.
 - Priority: Medium — mitigated by the CPU anchor being the hard merge gate; on-device correctness is anchored transitively (device vs CPU-f64, not device vs real C++) per the `def-f8u-01` "never compare two nondeterministic GPU f32 paths to each other at 1e-6" lesson.

@@ -1,24 +1,23 @@
-//! Phase-29 29-03 (OCX-03) — the subtract-residue exact-zero gate.
+//! The subtract-residue exact-zero gate (OCX-03).
 //!
-//! # Why this file exists (spike-072 item 15b)
+//! # Why this file exists
 //!
 //! On the opt-in on-device path, a subtract-derived leaf's low bins whose TRUE mass is
-//! zero carried a ~0.36 phantom hessian, feeding the (29-02-fixed) admissibility hole a
-//! fake near-empty prefix that won with `gain=inf`. 29-03's forensics
-//! (`29-SUBTRACT-RESIDUE.md`) named the mechanism to the line: the on-device dense
-//! resident build accumulates EVERY bin (mfb included), but the transcribed C++
-//! `Dataset::FixHistogram` step then OVERWRITES the forced-empty most-frequent-bin cell
-//! with `external_seed − Σ_bin-grouped hist`. Because the external leaf seed is a
-//! ROW-ORDER fold (or a scan prefix) while the histogram is a BIN-GROUPED fold, f64
-//! non-associativity makes them disagree, and the difference is swept into the
+//! zero carried a ~0.36 phantom hessian, feeding an admissibility hole a fake near-empty
+//! prefix that won with `gain=inf`. Forensics named the mechanism to the line: the
+//! on-device dense resident build accumulates EVERY bin (mfb included), but the
+//! transcribed C++ `Dataset::FixHistogram` step then OVERWRITES the forced-empty
+//! most-frequent-bin cell with `external_seed − Σ_bin-grouped hist`. Because the external
+//! leaf seed is a ROW-ORDER fold (or a scan prefix) while the histogram is a BIN-GROUPED
+//! fold, f64 non-associativity makes them disagree, and the difference is swept into the
 //! globally-empty mfb cell — the phantom.
 //!
-//! The fix (disposition (a), 29-03): preserve the dense-BUILT mfb cell instead of
-//! reconstructing it from the external seed. For a globally-empty bin the built value is
-//! exactly 0 at ALL scales (n·u·Σ|h| can exceed the 1e-3 admissibility floor at n≳1e7,
-//! so a bound+gate-defusal disposition (b) was ruled INVALID per the 29-CONTEXT locked
-//! rule). This is a provable no-op in the anchor regime (integer grad/hess ⇒ row-order ==
-//! bin-grouped ⇒ external_seed == Σ hist), so every anchor gate stays green.
+//! The fix: preserve the dense-BUILT mfb cell instead of reconstructing it from the
+//! external seed. For a globally-empty bin the built value is exactly 0 at ALL scales
+//! (n·u·Σ|h| can exceed the 1e-3 admissibility floor at n≳1e7, so a bound+gate-defusal
+//! disposition was ruled INVALID). This is a provable no-op in the anchor regime (integer
+//! grad/hess ⇒ row-order == bin-grouped ⇒ external_seed == Σ hist), so every anchor gate
+//! stays green.
 //!
 //! # Scope / lanes
 //!
@@ -37,7 +36,7 @@ use lgbm_compute::runtime::rocm_client;
 
 /// The FixHistogram reconstruction must leave a globally-empty most-frequent-bin cell
 /// EXACTLY `+0.0`, even when the leaf's external seed disagrees with the histogram's own
-/// bin-grouped total by a residue far larger than the ~0.36 spike-072 phantom.
+/// bin-grouped total by a residue far larger than the ~0.36 phantom.
 ///
 /// Construction: one feature, `num_bin = 8`, `offset = 0` (no compaction shift),
 /// `most_freq_bin = 3` seeded as the forced-empty bin (built mass exactly 0). All other

@@ -1,9 +1,9 @@
-//! Phase-10 Wave 3a: end-to-end check that the quantized build pipeline
-//! (discretize → integer histogram → de-quant) feeds the REAL split-gain machinery and
-//! recovers the exact path's split decision within the quantization envelope (spike-008).
+//! End-to-end check that the quantized build pipeline (discretize → integer histogram →
+//! de-quant) feeds the REAL split-gain machinery and recovers the exact path's split
+//! decision within the quantization envelope.
 //!
-//! This is the numeric pipeline proof; production GBDT-loop/backend wiring is Wave 3b, and
-//! parity to C++ `use_quantized_grad` goldens is Wave 4.
+//! This is the numeric pipeline proof; production GBDT-loop/backend wiring and parity to
+//! C++ `use_quantized_grad` goldens are separate follow-on work.
 
 use lgbm_compute::gain::get_split_gains;
 use lgbm_treelearner::gradient_discretizer::{construct_int_histogram, GradientDiscretizer};

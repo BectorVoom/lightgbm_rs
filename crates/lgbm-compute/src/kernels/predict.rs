@@ -1,4 +1,4 @@
-//! On-device prediction — tree-walk `AddPredictionToScore` (§10, ODL-15).
+//! On-device prediction — tree-walk `AddPredictionToScore` (§10).
 //!
 //! The Rust port of the AMD-fork `AddPredictionToScoreKernel` tree-walk
 //! (`LightGBM-release-4.6.0.99/src/io/cuda/cuda_tree.cu:317-396`): a per-row walk
@@ -8,29 +8,29 @@
 //! (missing/`default_left` → threshold) or categorically (bitset membership), and
 //! adding `leaf_value[~node]` into a `double*` score accumulator on reaching a leaf.
 //!
-//! ## What lives here (18-04, ODL-15)
+//! ## What lives here
 //! - [`add_prediction_to_score_kernel`] — the `#[cube(launch)]` tree-walk over one
 //!   row per unit (`ABSOLUTE_POS`), `USE_INDICES` comptime (used-index subset vs
 //!   identity). The **categorical membership branch reuses the shared
-//!   [`crate::kernels::data_partition::find_in_bitset`] helper** (one transcription,
-//!   Pitfall 4). The numeric branch transcribes the reference predict route
+//!   [`crate::kernels::data_partition::find_in_bitset`] helper** (one transcription).
+//!   The numeric branch transcribes the reference predict route
 //!   (`cuda_tree.cu:376-391`) — a DISTINCT, simpler decision than the dense_bin
 //!   `SplitInner` fan-out (`route_to_left`): it works on the ALREADY-remapped bin
 //!   with a runtime `missing_type`/`default_left` read per node, so the comptime
 //!   `route_to_left` flag fan-out is neither applicable nor callable inside a
-//!   runtime multi-node walk (see the 18-04 SUMMARY deviation note).
+//!   runtime multi-node walk.
 //! - [`add_prediction_bagging_kernel`] — the §9 `AddPredictionToScoreKernel<USE_BAGGING>`
-//!   per-row leaf-map gather-add (D-06): `score[data_index] += leaf_value[leaf_map[data_index]]`.
+//!   per-row leaf-map gather-add: `score[data_index] += leaf_value[leaf_map[data_index]]`.
 //! - [`add_prediction_to_score_on_device`] / [`add_prediction_bagging_on_device`] —
-//!   the host drivers (input validation at the SP-4 boundary before the confined
-//!   `unsafe` launch, T-18-06).
+//!   the host drivers (input validation at the host boundary before the confined
+//!   `unsafe` launch).
 //!
-//! Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE` (D-13); the score
+//! Additive and OFF by default behind `LGBM_CUDA_ON_DEVICE`; the score
 //! accumulator + scalar leaf-value math are the ONLY f64 — bin reads are
-//! native-width integer (`u32::cast_from`), no f64 per-row hot loop (D-14/SP-5).
+//! native-width integer (`u32::cast_from`), no f64 per-row hot loop.
 //! The objective inverse-link (`ConvertOutput`) stays HOST-side at the readback
-//! boundary this phase (Phase-19 moves it on-device). Anchored to the cubecl-cpu
-//! f64 fold, never GPU-vs-GPU (D-12 / def-f8u-01).
+//! boundary (not yet moved on-device). Anchored to the cubecl-cpu
+//! f64 fold, never GPU-vs-GPU.
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -56,11 +56,11 @@ const K_DEFAULT_LEFT_MASK: i32 = 2;
 /// (`cuda_tree.cu:376-391`: `(missing_type==1 && bin==default_bin) ||
 /// (missing_type==2 && bin==max_bin) ? default_left : bin <= threshold`). On a leaf
 /// (`node < 0`) adds `leaf_value[~node]` into `score[data_index]` — the f64
-/// accumulator is the ONLY f64 in the loop (D-14/SP-5).
+/// accumulator is the ONLY f64 in the loop.
 ///
 /// `bins` is the row-major `[num_rows × num_features]` binned matrix at native
 /// width `B`; `feat_*` are the per-(inner)feature meta arrays (indexed by
-/// `split_feature_inner[node]`). Bounds-guarded (`i < num_rows`, T-18-06).
+/// `split_feature_inner[node]`). Bounds-guarded (`i < num_rows`).
 #[cube(launch)]
 #[allow(clippy::too_many_arguments, unused_assignments)]
 pub(crate) fn add_prediction_to_score_kernel<B: Int>(
@@ -114,7 +114,7 @@ pub(crate) fn add_prediction_to_score_kernel<B: Int>(
             let mut go_left = false;
             if is_cat {
                 // Categorical membership (cuda_tree.cu:367-374) via the SHARED
-                // find_in_bitset helper (Pitfall 4). The cat's bitset occupies pool
+                // find_in_bitset helper. The cat's bitset occupies pool
                 // words [start, end); index it with a GLOBAL position so the shared
                 // 0-based helper reads the correct pool word (word = start + bin/32).
                 let cat_idx = threshold_in_bin[nd] as i32;
@@ -141,7 +141,7 @@ pub(crate) fn add_prediction_to_score_kernel<B: Int>(
     }
 }
 
-/// `AddPredictionToScoreKernel<USE_BAGGING>` (§9, D-06) — the per-row leaf-map
+/// `AddPredictionToScoreKernel<USE_BAGGING>` (§9) — the per-row leaf-map
 /// gather-add. Each unit adds its row's leaf output into the f64 score via the
 /// `data_index → leaf` map: `score[data_index] += leaf_value[leaf_map[data_index]]`.
 /// `USE_BAGGING` (== `use_indices`) walks a used-index subset; else identity.
@@ -162,7 +162,7 @@ pub(crate) fn add_prediction_bagging_kernel(
     }
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06, §9 `UpdateDataIndexToLeafIndexKernel` analog) —
+/// The §9 `UpdateDataIndexToLeafIndexKernel` analog —
 /// derive the per-row `data_index_to_leaf[row] = leaf` map ON DEVICE from the resident
 /// leaf-grouped partition layout, retiring the host `O(num_data)` inversion loop that
 /// `add_prediction_to_score_on_device_resident` used to run.
@@ -195,7 +195,7 @@ pub(crate) fn derive_leaf_map_kernel(
         let leaf_id = i32::cast_from(l);
         for k in 0..c {
             let row = indices[b + k];
-            // 28-07 WR-02 defense-in-depth: bound the scattered row-id VALUE so an out-of-range
+            // Defense-in-depth: bound the scattered row-id VALUE so an out-of-range
             // permutation entry cannot write past `data_index_to_leaf` (the host boundary in
             // `upload_leaf_map_inputs` rejects it before the launch; this guard makes the scatter
             // itself total — an out-of-range row simply does not write).
@@ -206,7 +206,7 @@ pub(crate) fn derive_leaf_map_kernel(
     }
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06) — the §9 leaf-value SCATTER into an EXISTING
+/// The §9 leaf-value SCATTER into an EXISTING
 /// device-RESIDENT f64 score accumulator (accumulate in place, NO zero-init, NO
 /// readback). One lane per row: `score[i] += leaf_value[data_index_to_leaf[i]]` guarded
 /// by the `-1` sentinel (an uncovered row contributes nothing). This is the identity
@@ -230,15 +230,15 @@ pub(crate) fn scatter_leaf_values_resident_kernel(
 }
 
 // =========================================================================
-// Host drivers (SP-4 validation → confined unsafe launch).
+// Host drivers (validation → confined unsafe launch).
 // =========================================================================
 
 /// The tree + per-feature meta arrays the [`add_prediction_to_score_on_device`]
-/// walk consumes. Field names mirror 18-03's flat `DeviceCudaTree` layout
+/// walk consumes. Field names mirror the flat `DeviceCudaTree` layout
 /// (`split_feature_inner`/`threshold_in_bin`/`decision_type`/`left_child`/
-/// `right_child`/`leaf_value` + the `cat_boundaries_inner` bitset slab) to minimise
-/// Phase-21 rework, though this phase builds the arrays standalone from the parity
-/// fixture rather than consuming a live `DeviceCudaTree` (plan-check W2).
+/// `right_child`/`leaf_value` + the `cat_boundaries_inner` bitset slab); the
+/// arrays here are built standalone from the parity fixture rather than
+/// consuming a live `DeviceCudaTree`.
 #[derive(Clone, Debug)]
 pub struct PredictTree<'a> {
     /// Per-(inner)feature meta, each indexed by `split_feature_inner[node]`.
@@ -268,9 +268,9 @@ const WALK_BLOCK: u32 = 256;
 /// is the row-major `[num_data × num_features]` raw column store (indexed by the walk's
 /// `data_index`); `num_rows` is the number of units to launch (`== num_data` for the
 /// identity walk, `== used_indices.len()` for a subset); `bit_type ∈ {8,16,32}`
-/// selects the native column width (D-05). `used_indices == None` walks all rows
+/// selects the native column width. `used_indices == None` walks all rows
 /// (identity); otherwise the used-index subset. The objective inverse-link stays
-/// HOST-side at readback (Phase-19 boundary) — this emits raw margin only.
+/// HOST-side at readback — this emits raw margin only.
 ///
 /// # Errors
 /// [`ComputeError::LengthMismatch`] on a `rows`/meta/tree length inconsistency,
@@ -328,7 +328,7 @@ pub fn add_prediction_to_score_on_device<R: cubecl::Runtime>(
     let n_bitset = bitset_owned.len();
     let n_catb = catb_owned.len();
 
-    // The f64 score accumulator (D-15: sized to num_data once), initialised to 0.
+    // The f64 score accumulator, sized to num_data once, initialised to 0.
     let init = vec![0.0f64; num_data];
     let h_score = client.create_from_slice(f64::as_bytes(&init));
 
@@ -351,10 +351,10 @@ pub fn add_prediction_to_score_on_device<R: cubecl::Runtime>(
             // num_features cells, meta = nf, tree = nn, leaf = nl, score = num_data);
             // all outlive the launch; the kernel bounds-guards `i < num_rows`.
             // `validate_walk` has already range-checked every tree index the walk
-            // dereferences (WR-02): split_feature_inner ∈ [0, nf), each child either a
+            // dereferences: split_feature_inner ∈ [0, nf), each child either a
             // leaf `~child < nl` or an internal node `< nn`, categorical cat_idx within
             // cat_boundaries_inner, and cat_boundaries_inner monotone with its last word
-            // bound ≤ bitset_inner.len() (the `n` passed to find_in_bitset, T-18-03/06).
+            // bound ≤ bitset_inner.len() (the `n` passed to find_in_bitset).
             unsafe {
                 add_prediction_to_score_kernel::launch::<$w, R>(
                     client,
@@ -399,13 +399,13 @@ pub fn add_prediction_to_score_on_device<R: cubecl::Runtime>(
     Ok(f64::from_bytes(&bytes).to_vec())
 }
 
-/// Drive the §9 [`add_prediction_bagging_kernel`] leaf-map gather-add (D-06) on
+/// Drive the §9 [`add_prediction_bagging_kernel`] leaf-map gather-add on
 /// runtime `R`, returning the `num_data`-length f64 score. `data_index_to_leaf` maps
 /// each data index to its resident leaf; `leaf_value` the per-leaf output.
 /// `used_indices == None` adds every row (identity); else the used-index subset.
 ///
 /// # Preconditions (debug-checked)
-/// **IN-02:** `used_indices` must be unique — the kernel does `score[data_index] += ...`,
+/// `used_indices` must be unique — the kernel does `score[data_index] += ...`,
 /// so a duplicated index double-counts (and races on a real GPU backend). Reference
 /// bagging indices are unique; a `debug_assert` guards it with no release-mode cost.
 ///
@@ -425,7 +425,7 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
             actual: data_index_to_leaf.len(),
         });
     }
-    // WR-04: validate a leaf-map entry only where the kernel actually reads it. A
+    // Validate a leaf-map entry only where the kernel actually reads it. A
     // single closure keeps the error text identical for both paths.
     let check_leaf = |di: usize, leaf: i32| -> Result<(), ComputeError> {
         if leaf < 0 || leaf as usize >= leaf_value.len() {
@@ -441,7 +441,7 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
     };
     let (use_indices, idx_owned, num_rows): (bool, Vec<u32>, usize) = match used_indices {
         Some(idx) => {
-            // WR-04: subset (USE_BAGGING) mode reads only data_index_to_leaf[idx[i]],
+            // Subset (USE_BAGGING) mode reads only data_index_to_leaf[idx[i]],
             // so validate ONLY the walked entries. Un-sampled rows legitimately carry
             // the `-1` sentinel that `update_data_index_to_leaf_on` writes
             // (data_partition.rs:841) and must NOT be rejected — the kernel never reads
@@ -454,7 +454,7 @@ pub fn add_prediction_bagging_on_device<R: cubecl::Runtime>(
                 }
                 check_leaf(di as usize, data_index_to_leaf[di as usize])?;
             }
-            // IN-02: `score[data_index] += ...` requires unique used indices — a
+            // `score[data_index] += ...` requires unique used indices — a
             // duplicate double-counts (and races on a real GPU backend). Debug-only.
             debug_assert!(
                 {
@@ -527,7 +527,7 @@ fn upload_leaf_map_inputs<R: cubecl::Runtime>(
             actual: leaf_count.len(),
         });
     }
-    // O(num_positions) row-id VALUE bound (28-07 WR-02): mirror the retired host inversion's
+    // O(num_positions) row-id VALUE bound: mirror the retired host inversion's
     // `if r >= num_data { return Err(..) }` guard. The per-leaf `[begin, begin + count) <=
     // indices.len()` check below bounds the READ positions in `indices`; this bounds the row-id
     // VALUES that index the `num_data`-sized `data_index_to_leaf` buffer. Without it a malformed
@@ -586,7 +586,7 @@ fn upload_leaf_map_inputs<R: cubecl::Runtime>(
     ))
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06) — derive `data_index_to_leaf` ON DEVICE from the
+/// Derive `data_index_to_leaf` ON DEVICE from the
 /// leaf-grouped resident partition (`indices` grouped by leaf via `leaf_begin` /
 /// `leaf_count`) and read the map back to host. This is the device replacement for the
 /// host `O(num_data)` inversion loop; it launches [`derive_leaf_map_kernel`] over
@@ -610,7 +610,7 @@ pub fn derive_leaf_map_device<R: cubecl::Runtime>(
     Ok(i32::from_bytes(&bytes).to_vec())
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06) — the RESIDENT variant of [`derive_leaf_map_device`]:
+/// The RESIDENT variant of [`derive_leaf_map_device`]:
 /// derive `data_index_to_leaf` on device and return the device [`Handle`] WITHOUT
 /// crossing it back to host, so the resident score scatter can consume it in place. The
 /// caller owns the returned handle (drop = free).
@@ -635,8 +635,8 @@ pub fn derive_leaf_map_device_handle<R: cubecl::Runtime>(
     // `l < num_leaves`, and `upload_leaf_map_inputs` has range-checked each leaf's
     // `[begin, begin + count) <= num_positions` so the READ `indices[b + k]` is in bounds.
     // The WRITTEN index `data_index_to_leaf[indices[b + k]]` is in bounds because
-    // `upload_leaf_map_inputs` rejects any `indices[i] >= num_data` (the per-VALUE bound, 28-07
-    // WR-02) BEFORE this launch — NOT because `num_data == layout.num_data` (a COUNT equality,
+    // `upload_leaf_map_inputs` rejects any `indices[i] >= num_data` (the per-VALUE bound)
+    // BEFORE this launch — NOT because `num_data == layout.num_data` (a COUNT equality,
     // which bounds no individual value); the kernel's `row < num_data` guard is defense-in-depth.
     // The leaf sub-ranges are non-overlapping, so no two lanes write the same slot.
     unsafe {
@@ -655,7 +655,7 @@ pub fn derive_leaf_map_device_handle<R: cubecl::Runtime>(
     Ok(h_map)
 }
 
-/// Phase-28 (28-04, ODF-03/ODF-06, §11 `AddPredictionToScore`) — scatter the
+/// The §11 `AddPredictionToScore` — scatter the
 /// (post-shrinkage) `leaf_values` into an EXISTING device-RESIDENT f64 score buffer
 /// `score` (accumulate in place, NO zero-init, NO readback) via
 /// [`scatter_leaf_values_resident_kernel`], reading the resident device leaf map
@@ -697,19 +697,19 @@ pub fn add_leaf_values_to_resident_score<R: cubecl::Runtime>(
     Ok(())
 }
 
-/// Validate the tree-walk inputs at the host boundary (SP-4 / T-18-06) before the
+/// Validate the tree-walk inputs at the host boundary before the
 /// confined `unsafe` launch. Rejects a `rows`/`num_features` mismatch, an unequal
 /// per-feature meta length, an unequal per-node tree length, and a `num_data` too
 /// small for the walked data indices.
 ///
 /// # Preconditions (debug-checked)
-/// - **IN-03 (identity path):** with `used_indices == None` the walk is the
+/// - **Identity path:** with `used_indices == None` the walk is the
 ///   `USE_INDICES=false` semantics, which require `num_rows == num_data` — every data
 ///   row is walked exactly once. A `num_rows < num_data` identity call silently scores
 ///   only the `[0, num_rows)` prefix and leaves the tail at 0; a `debug_assert`
-///   rejects it. (Release builds keep the historical lenient behavior — this changes
+///   rejects it. (Release builds keep the lenient behavior — this changes
 ///   no hot-path numeric output.)
-/// - **IN-02 (uniqueness):** `used_indices` must be unique. `add_prediction_*_kernel`
+/// - **Uniqueness:** `used_indices` must be unique. `add_prediction_*_kernel`
 ///   does `score[data_index] += ...`, so a duplicated index double-counts (and races
 ///   on a real GPU backend). Reference bagging indices are unique; a `debug_assert`
 ///   guards the precondition without a release-mode cost.
@@ -735,7 +735,7 @@ fn validate_walk(
             detail: format!("add_prediction_to_score: num_rows {num_rows} > num_data {num_data}"),
         });
     }
-    // IN-03: the identity (`USE_INDICES=false`) path requires num_rows == num_data. A
+    // The identity (`USE_INDICES=false`) path requires num_rows == num_data. A
     // shorter num_rows silently scores only a prefix. Debug-only guard (no release
     // behavior change).
     debug_assert!(
@@ -780,10 +780,10 @@ fn validate_walk(
             detail: "add_prediction_to_score: tree must have at least one internal node".to_string(),
         });
     }
-    // WR-02: validate the tree indices the walk actually dereferences. The launch
+    // Validate the tree indices the walk actually dereferences. The launch
     // SAFETY comment claims the walk "only reads valid node/feature/leaf indices" —
     // enforce that here so a malformed fixture tree surfaces a typed ComputeError at
-    // the host boundary (SP-4) instead of an in-kernel out-of-bounds.
+    // the host boundary instead of an in-kernel out-of-bounds.
     let nl = tree.leaf_value.len();
     for n in 0..nn {
         // split_feature_inner[node] indexes the per-feature meta arrays (len nf).
@@ -864,7 +864,7 @@ fn validate_walk(
                 });
             }
         }
-        // IN-02: `score[data_index] += ...` requires unique used indices — a duplicate
+        // `score[data_index] += ...` requires unique used indices — a duplicate
         // double-counts (and races on a real GPU backend). Debug-only check (no
         // release-mode cost on the hot path).
         debug_assert!(
@@ -912,7 +912,7 @@ mod tests {
 
     /// Numeric tree-walk matches the predict.txt golden raw margins for the SAME bin
     /// values presented at 8-, 16-, and 32-bit column width (a bin is a width-
-    /// invariant index) — the D-05 8/16/32 dispatch coverage.
+    /// invariant index) — exercising the 8/16/32 dispatch coverage.
     #[test]
     fn numeric_walk_matches_golden_all_widths() {
         let client = cpu_client();
@@ -951,7 +951,7 @@ mod tests {
 
     /// Categorical membership walk matches the predict.txt golden for the one-hot
     /// (8-bit, mfb0→offset1) and many-vs-many (16-bit, members {2,3,5}) models —
-    /// the shared find_in_bitset reuse (Pitfall 4).
+    /// the shared find_in_bitset reuse.
     #[test]
     fn categorical_walk_matches_golden() {
         let client = cpu_client();
@@ -1073,7 +1073,7 @@ mod tests {
         }
     }
 
-    /// Host-boundary validation rejects a rows/num_features mismatch (SP-4).
+    /// Host-boundary validation rejects a rows/num_features mismatch.
     #[test]
     fn rejects_bad_rows_length() {
         let client = cpu_client();

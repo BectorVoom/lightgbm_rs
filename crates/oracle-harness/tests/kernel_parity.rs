@@ -1,13 +1,13 @@
-//! Compute-kernel histogram parity replay (ORA-04 cpu hard gate, D-04).
+//! Compute-kernel histogram parity replay (cpu hard gate).
 //!
 //! For every committed histogram golden case (`tests/fixtures/kernels/histogram.txt`,
 //! emitted by `cargo run -p xtask -- kernel-capture`), this test drives the
 //! cubecl-cpu `Backend::construct_histograms` over the golden's per-row bins +
 //! f32 ordered grad/hess and asserts the resulting f64 histogram cells are
 //! BIT-EXACT versus the C++-transcription golden via `compare_exact_f64_bits`.
-//! This is the first full vertical slice of the compute backend: a real consumer
-//! (the Phase-5 learner, simulated here) builds a histogram from the Phase-2
-//! binned store and gets C++-bit-identical f64 cells on the deterministic anchor.
+//! This exercises a real consumer of the binned store: the tree learner builds
+//! a histogram from binned data and must get C++-bit-identical f64 cells on
+//! the deterministic anchor.
 //!
 //! Idioms follow `oracle-harness/tests/rng_parity.rs` /
 //! `lgbm-dataset/tests/bin_storage_layout.rs`: `CARGO_MANIFEST_DIR` fixture path
@@ -206,7 +206,7 @@ fn kernel_parity_histogram_bit_exact_on_cpu() {
             .construct_histograms(&client, &c.bins, &c.grad, &c.hess, c.num_bin)
             .unwrap_or_else(|e| panic!("case `{}`: construct_histograms failed: {e:?}", c.name));
 
-        // D-04 hard cpu gate: BIT-EXACT vs the C++-transcription golden.
+        // Hard cpu gate: BIT-EXACT vs the C++-transcription golden.
         if let Err(mismatch) = compare_exact_f64_bits(&got, &c.hist) {
             panic!(
                 "KERNEL PARITY DIVERGENCE in case `{}` (num_bin={}): {mismatch}",
@@ -222,7 +222,7 @@ fn kernel_parity_histogram_bit_exact_on_cpu() {
         }
     }
 
-    // D-02a coverage assertion: at least one dense AND one sparse layout replayed.
+    // Coverage assertion: at least one dense AND one sparse layout replayed.
     assert!(
         dense_or_sparse_seen.0,
         "golden must contain at least one dense-layout case"
@@ -234,7 +234,7 @@ fn kernel_parity_histogram_bit_exact_on_cpu() {
 }
 
 // ===========================================================================
-// 04-03 SPLIT parity (ORA-04 cpu hard gate, gain-scan layer).
+// SPLIT parity (cpu hard gate, gain-scan layer).
 //
 // Two assertions per case:
 //  1. PER-CANDIDATE gains: replicate the C++ scan gate-by-gate using the public
@@ -503,7 +503,7 @@ fn lgbm_compute_k_epsilon() -> f64 {
 /// SINGLE source of truth for the L1 `Sign(s) = (s>0)-(s<0)` semantics. Rust's
 /// `f64::signum` must NOT be used here: it returns `+1.0` at `0.0` and `-1.0` at
 /// `-0.0`, never `0.0`, diverging from C++ `Common::Sign` for any zero-gradient
-/// L1 case (CR-01/CR-02).
+/// L1 case.
 fn leaf_gain(use_l1: bool, g: f64, h: f64, l1: f64, l2: f64) -> f64 {
     get_leaf_gain(use_l1, g, h, l1, l2)
 }
@@ -529,8 +529,8 @@ fn kernel_parity_split_bit_exact_on_cpu() {
     let mut saw_skip_default_bin_false_divergence = false;
 
     for c in &cases {
-        // The deferred NA_AS_MISSING forward branch (RESEARCH A5) must be false on
-        // every committed case — this layer only threads the flag and validates it
+        // The deferred NA_AS_MISSING forward branch must be false on every
+        // committed case — this layer only threads the flag and validates it
         // off; a captured `na_as_missing=1` case would (correctly) be a typed error
         // in the kernel, so the golden must never carry one until that branch lands.
         assert!(
@@ -540,9 +540,9 @@ fn kernel_parity_split_bit_exact_on_cpu() {
             c.name
         );
 
-        // Divergence-case coverage (Plan 05-01, RESEARCH Pitfall 1): a case where
-        // the OLD heuristic `default_bin < num_bin` would have set SKIP_DEFAULT_BIN
-        // but the authoritative flag is false (missing_type == None). Assert the
+        // Divergence-case coverage: a case where the OLD heuristic
+        // `default_bin < num_bin` would have set SKIP_DEFAULT_BIN but the
+        // authoritative flag is false (missing_type == None). Assert the
         // case is genuinely a divergence: skip is false WHILE default_bin < num_bin.
         if c.name == "skip_default_bin_false" {
             assert!(
@@ -651,8 +651,8 @@ fn kernel_parity_split_bit_exact_on_cpu() {
     // Coverage: BOTH threshold-recording branches must be exercised by a winner.
     assert!(saw_reverse_winner, "split golden must have a REVERSE-branch winner (default_left=1)");
     assert!(saw_forward_winner, "split golden must have a FORWARD-branch winner (default_left=0)");
-    // Coverage: the skip_default_bin==false divergence case (Plan 05-01) must be
-    // present and replay bit-exact (RESEARCH Pitfall 1).
+    // Coverage: the skip_default_bin==false divergence case must be
+    // present and replay bit-exact.
     assert!(
         saw_skip_default_bin_false_divergence,
         "split golden must contain the `skip_default_bin_false` divergence case \
@@ -661,8 +661,8 @@ fn kernel_parity_split_bit_exact_on_cpu() {
 }
 
 // ===========================================================================
-// 260608-lsx FUSED SPLIT parity. Prove the DEFAULT `find_best_splits_batched`
-// (the lad Part 2 batched seam) is BIT-EXACT to the per-feature `find_best_split`
+// FUSED SPLIT parity. Prove the DEFAULT `find_best_splits_batched`
+// (the batched seam) is BIT-EXACT to the per-feature `find_best_split`
 // loop on CPU — the contract that keeps the CpuBackend f64 anchor unchanged.
 //
 // We lay the committed split golden's feature cases into ONE concatenated leaf
@@ -818,7 +818,7 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
 
     // Also exercise a genuine MULTI-feature batch (shared totals) to prove order
     // preservation across the whole Vec: the i-th batched result must equal the
-    // i-th per-feature call with the SAME shared totals (T-lsx-01).
+    // i-th per-feature call with the SAME shared totals.
     let (sg, sh, nd) = (8.0f64, 8.0f64, 8i32);
     let multi = backend
         .find_best_splits_batched(&client, &buf, &feats, &cfg, sg, sh, nd)
@@ -860,14 +860,14 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
 }
 
 // ===========================================================================
-// 260608-mc5 THREE-WAY MERGE GATE. Prove the FUSED per-leaf split kernel is
+// THREE-WAY MERGE GATE. Prove the FUSED per-leaf split kernel is
 // BIT-EXACT to BOTH the cubecl per-feature loop AND the native production scan:
 //   fused find_best_splits_batched_fused_f64_on
 //     == per-feature find_best_split_f64_on
 //     == find_best_split_cpu_native
-// for EVERY feature in input order (order preservation, T-lsx-01). This is the
-// gate that the merge (one shared split_scan_body math + one fused launch) did NOT
-// drift any of the three transcriptions. No tolerance — compare_exact_f64_bits.
+// for EVERY feature in input order (order preservation). This proves the
+// shared split_scan_body math and fused launch did NOT drift any of the
+// three transcriptions. No tolerance — compare_exact_f64_bits.
 // ===========================================================================
 #[test]
 fn kernel_parity_fused_equals_per_feature_and_native() {
@@ -987,23 +987,22 @@ fn kernel_parity_fused_equals_per_feature_and_native() {
 }
 
 // ===========================================================================
-// Phase-12 SIBLING CO-PACK parity (cubecl-cpu W=1 byte-identity half, SC-1).
+// SIBLING CO-PACK parity (cubecl-cpu W=1 byte-identity half).
 //
-// Productionizes the spike-024 byte-for-byte gate WITHOUT rocm: the co-packed
-// 2-slot sibling scan (`find_best_splits_fused_siblings_from_handles_on`, Plan 01)
+// The co-packed 2-slot sibling scan (`find_best_splits_fused_siblings_from_handles_on`)
 // must return SplitInfos byte-IDENTICAL to two separate single-slot scans
 // (`find_best_splits_batched_fused_f64_on`), per sibling, every `SplitInfo` field.
 //
-// This is bit-exact BY CONSTRUCTION (12-CONTEXT, "Parity"): each feature's
-// REVERSE+FORWARD sequential scan is the SAME `split_scan_body` over the SAME
-// disjoint per-feature region — co-packing only changes WHICH launch a feature's
-// scan runs in, never its math. On the cubecl-cpu runtime the kernel runs at W=1
-// (CONVENTIONS: "W=1 stays byte-identical"), so this proves the byte-identical
-// claim on the ALWAYS-available CPU runtime — no GPU needed for the bit-exact gate.
+// This is bit-exact BY CONSTRUCTION: each feature's REVERSE+FORWARD sequential
+// scan is the SAME `split_scan_body` over the SAME disjoint per-feature region —
+// co-packing only changes WHICH launch a feature's scan runs in, never its math.
+// On the cubecl-cpu runtime the kernel runs at W=1, which stays byte-identical,
+// so this proves the byte-identical claim on the ALWAYS-available CPU runtime —
+// no GPU needed for the bit-exact gate.
 //
 // The two siblings carry DIFFERENT leaf totals (smaller-built vs larger-subtract-
-// derived asymmetry, spike-024's two seeds) over the SAME feature layout (the
-// shared per-feature param arrays the 2-slot kernel consumes).
+// derived asymmetry) over the SAME feature layout (the shared per-feature param
+// arrays the 2-slot kernel consumes).
 // ===========================================================================
 #[test]
 fn kernel_parity_sibling_copack_equals_two_scans_on_cpu() {
@@ -1131,8 +1130,8 @@ fn copack_cfg() -> GainConfig {
 
 /// The TWO concatenated stride-2 f64 histograms over the `copack_feats` layout
 /// (24 cells = 8 + 6 + 10). `buf_a` is the "smaller-built" sibling; `buf_b` the
-/// "larger-subtract-derived" sibling — DIFFERENT cell values (spike-024's two
-/// seeds) so the per-sibling scans produce distinct winners. Exactly-representable
+/// "larger-subtract-derived" sibling — DIFFERENT cell values so the per-sibling
+/// scans produce distinct winners. Exactly-representable
 /// f64 (widen losslessly to/from f32 on the GPU). Reused by both co-pack cells.
 fn copack_two_histograms() -> (Vec<f64>, Vec<f64>) {
     let buf_a: Vec<f64> = vec![
@@ -1155,7 +1154,7 @@ fn copack_two_histograms() -> (Vec<f64>, Vec<f64>) {
 }
 
 // ===========================================================================
-// 04-03 PARTITION parity. Drive Backend::data_partition over the golden bins +
+// PARTITION parity. Drive Backend::data_partition over the golden bins +
 // routing and assert the reordered index array + split_point match exactly.
 // ===========================================================================
 #[test]
@@ -1188,12 +1187,12 @@ fn kernel_parity_partition_exact_on_cpu() {
         let max_bin = parse_i64(&t, "max_bin") as u32;
         let threshold = parse_i64(&t, "threshold") as u32;
         let most_freq_bin = parse_i64(&t, "most_freq_bin") as u32;
-        // Phase-18 (18-01): the fixture now also carries the D-02 flag fan-out cases
-        // (`missing_type != None`), which are routed by the NEW device
-        // `GenDataToLeftBitVector` path (18-02) — NOT this None-only host-gather
-        // `data_partition`. Skip them HERE (consuming their 3 payload lines to keep
-        // the stream aligned); they are covered by `partition_parity.rs`. The
-        // `missing_type` field is absent on Phase-4 goldens → defaults to 0 (None).
+        // The fixture also carries flag fan-out cases (`missing_type != None`),
+        // which are routed by the device `GenDataToLeftBitVector` path — NOT
+        // this None-only host-gather `data_partition`. Skip them HERE (consuming
+        // their 3 payload lines to keep the stream aligned); they are covered by
+        // `partition_parity.rs`. The `missing_type` field is absent on older
+        // goldens → defaults to 0 (None).
         let missing_type = field(&t, "missing_type")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
@@ -1228,10 +1227,10 @@ fn kernel_parity_partition_exact_on_cpu() {
             "PARTITION `{name}`: split_point mismatch"
         );
 
-        // quick-260625-j1l (spike-029): route the SAME golden case through the
-        // NATIVE-WIDTH `data_partition_native` path with the bins carried as a narrow
-        // `BinColumn` (auto-selected by num_bin: U8 for ≤256, U16 for ≤65536). This is
-        // the narrow path that spike-029 wires; it MUST stay bit-exact to the golden.
+        // Route the SAME golden case through the NATIVE-WIDTH `data_partition_native`
+        // path with the bins carried as a narrow `BinColumn` (auto-selected by
+        // num_bin: U8 for ≤256, U16 for ≤65536). This narrow path MUST stay
+        // bit-exact to the golden.
         let col = BinColumn::new(bins.clone(), num_bin);
         let (nat_order, nat_split) = backend
             .data_partition_native(&client, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin)
@@ -1247,7 +1246,7 @@ fn kernel_parity_partition_exact_on_cpu() {
     }
     assert!(n_cases > 0, "partition fixture present but parsed zero cases");
 
-    // quick-260625-j1l: an explicit U16-band self-check so the U16 monomorph is
+    // An explicit U16-band self-check so the U16 monomorph is
     // exercised even if every golden `num_bin` is ≤256 (⇒ U8). Build the EXPECTED
     // (order, split_point) via the u32-widened `data_partition` reference, then assert
     // `data_partition_native` over the U16 `BinColumn` is byte-identical to it.
@@ -1269,7 +1268,7 @@ fn kernel_parity_partition_exact_on_cpu() {
 }
 
 // ===========================================================================
-// 04-03 SUBTRACT parity. Drive Backend::subtract_histograms and assert the
+// SUBTRACT parity. Drive Backend::subtract_histograms and assert the
 // derived cells bit-exact vs the golden.
 // ===========================================================================
 #[test]
@@ -1323,11 +1322,11 @@ fn kernel_parity_subtract_bit_exact_on_cpu() {
 }
 
 // ===========================================================================
-// 04-04 HIP (ROCm) parity layer — the SEPARATE ~1e-6 gate (D-03a, ORA-04 rocm).
+// HIP (ROCm) parity layer — the SEPARATE ~1e-6 gate.
 //
 // ENTIRELY `#[cfg(feature = "rocm")]`: this layer compiles/runs ONLY under
 // `cargo test -p oracle-harness --features rocm` and NEVER affects the default
-// CPU build (which keeps the bit-exact layers above as the HARD gate, SC#1).
+// CPU build (which keeps the bit-exact layers above as the HARD gate).
 //
 // For each committed golden it:
 //   1. drives the f32-accumulate kernel on the HIP runtime  -> `hip_f32: Vec<f32>`
@@ -1354,10 +1353,10 @@ mod hip {
         cpu_anchor_f64.iter().map(|&x| x as f32).collect()
     }
 
-    /// The PRIMARY hip gate at `ORACLE_TOL = 1e-6` (compare_within). Per D-03a
-    /// (best-effort ROCm), a residual f32-vs-f64 accumulation divergence that
+    /// The PRIMARY hip gate at `ORACLE_TOL = 1e-6` (compare_within). As a
+    /// best-effort ROCm gate, a residual f32-vs-f64 accumulation divergence that
     /// exceeds `ORACLE_TOL` but stays within f32's natural precision is NOT a
-    /// phase blocker — it is SURFACED to stderr (the per-case `index`/`abs_diff`
+    /// blocker — it is SURFACED to stderr (the per-case `index`/`abs_diff`
     /// for the `04-ROCM-GAPS.md` ledger; no silent pass) and the test continues.
     ///
     /// A separate, generous **f32 relative sanity bound** (`HIP_SANITY_REL`) DOES
@@ -1413,7 +1412,7 @@ mod hip {
     /// VERBATIM copy of the learner's private `compact_histogram`
     /// (`lgbm-treelearner/src/learner.rs:2838-2864`) — replicated here (rather than
     /// exposing the private fn) so the host reference path stays byte-for-byte the
-    /// production op while keeping `learner.rs` UNCHANGED (T-oib-02). Pairs with the
+    /// production op while keeping `learner.rs` UNCHANGED. Pairs with the
     /// real exported `lgbm_treelearner::fix_histogram`.
     fn host_compact_histogram(hist: &mut [f64], offset: i32) {
         if offset <= 0 {
@@ -1438,7 +1437,7 @@ mod hip {
         }
     }
 
-    /// 260608-oib Task 1 — the BIT-EXACT oracle: the on-GPU `fix_compact_kernel`
+    /// The BIT-EXACT oracle: the on-GPU `fix_compact_kernel`
     /// (via `fix_compact_f64_on`) must produce, for a leaf's concatenated RAW f64
     /// histogram, the SAME buffer that applying the host `fix_histogram` then
     /// `compact_histogram` PER FEATURE produces — BIT-IDENTICAL via
@@ -1449,7 +1448,7 @@ mod hip {
     ///
     /// Covers a MIXED-feature leaf concatenating:
     ///  - Test A: mfb > 0, offset == 0  — fix RECONSTRUCTS the mfb cell, compact no-op.
-    ///  - Test B: mfb == 0, offset == 1 — fix NO-OP, compact DROPS bin 0 (DEF-07-02).
+    ///  - Test B: mfb == 0, offset == 1 — fix NO-OP, compact DROPS bin 0.
     ///  - Test C: mfb >= num_bin        — fix no-op (defensive), offset 0 ⇒ compact no-op.
     ///  - Test D: offset >= num_bin     — compact ZEROS the whole feature region.
     /// Plus an extra mfb > 0 feature so the mixed concatenation exercises >1 fix.
@@ -1460,7 +1459,7 @@ mod hip {
 
         let hip = rocm_client();
 
-        // RAW leaf totals (un-bumped) — Pitfall 2. Chosen so the reconstructs land
+        // RAW leaf totals (un-bumped). Chosen so the reconstructs land
         // on exactly-representable f64 values for an unambiguous bit-exact assert.
         let sum_g = 100.0f64;
         let sum_h = 250.0f64;
@@ -1513,7 +1512,7 @@ mod hip {
         ];
 
         // Concatenate the RAW regions as f32 (the construct kernel's output type;
-        // 260608-s2b Lever A — the folded kernel reads f32 RAW and widens inline).
+        // the folded kernel reads f32 RAW and widens inline).
         // Every region value here is exactly f32-representable, so f32 carries the
         // RAW losslessly and the host reference (widened f32→f64) is the exact same
         // f64 the folded kernel produces from its inline `f64::cast_from`.
@@ -1548,29 +1547,28 @@ mod hip {
         }
     }
 
-    /// Phase 11 Plan 02 — the DEVICE-RESIDENT build→fix→compact chain
-    /// (`build_fix_compact_resident_readback_f64_on`), now driving the **u64
-    /// two's-complement fixed-point (S=2^30) resident LDS build** that Plan 11-01
-    /// shipped, RE-PINNED to a fresh **CPU f64 anchor** — NOT a second GPU launcher.
+    /// The DEVICE-RESIDENT build→fix→compact chain
+    /// (`build_fix_compact_resident_readback_f64_on`), driving the **u64
+    /// two's-complement fixed-point (S=2^30) resident LDS build**, pinned to a
+    /// fresh **CPU f64 anchor** — NOT a second GPU launcher.
     ///
-    /// ## Why this test was re-anchored (def-f8u-01)
-    /// Before Plan 11-01 this test compared the GPU `build_fix_compact_resident_*`
-    /// output against a "host reference" that was ITSELF a GPU launcher
-    /// (`build_leaf_histograms_resident_f32_on`). After Plan 11-01 BOTH arms became
-    /// u64-on-GPU ⇒ a GPU-vs-GPU comparison with NO deterministic anchor — a direct
-    /// def-f8u-01 violation ("never pin two nondeterministic GPU paths to each
-    /// other"). This version builds the reference from the bit-exact CPU f64 fold
-    /// `construct_histograms_cpu` (per feature, over the leaf's gathered
+    /// ## Why this test is anchored to the CPU
+    /// Comparing the GPU `build_fix_compact_resident_*` output against a "host
+    /// reference" that is itself a GPU launcher (e.g.
+    /// `build_leaf_histograms_resident_f32_on`) would be a GPU-vs-GPU comparison
+    /// with NO deterministic anchor — never pin two nondeterministic GPU paths to
+    /// each other. This test instead builds the reference from the bit-exact CPU
+    /// f64 fold `construct_histograms_cpu` (per feature, over the leaf's gathered
     /// `(bin, grad, hess)`), then applies the SAME host `fix_histogram` +
     /// `host_compact_histogram` the test already runs — so the GPU u64 path is pinned
     /// to the CPU f64 anchor, never to another GPU launcher.
     ///
     /// ## Tightened fixed-point gate
-    /// The resident LDS sub-hist now accumulates in u64 fixed-point, so the residual
+    /// The resident LDS sub-hist accumulates in u64 fixed-point, so the residual
     /// vs the f64 anchor is bounded, deterministic QUANTIZE-ROUNDING error (≤ ~1/2^30
-    /// per cell), NOT f32 catastrophic-cancellation error. Spike-018a/018b measured
+    /// per cell), NOT f32 catastrophic-cancellation error. Measured
     /// `rel_vs_anchor ≈ 5.9e-9` on real hardware (and exact `0.0` in the cancelling
-    /// integer regime) — ~3600× tighter than the old f32-LDS path. We therefore pin
+    /// integer regime) — far tighter than the old f32-LDS path. We therefore pin
     /// this test to a TIGHTENED `FIXEDPOINT_REL_GATE` well below the generous f32
     /// envelope (`HIP_SANITY_REL = 1e-3`), so a real fixed-point regression cannot
     /// slip. We do NOT reuse `assert_within` here — that helper's `HIP_SANITY_REL`
@@ -1613,11 +1611,11 @@ mod hip {
         let gradients: Vec<f32> = (0..num_data).map(|i| 0.25 + i as f32 * 0.5).collect();
         let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
 
-        // Leaf RAW totals over the leaf rows (un-bumped) — Pitfall 2.
+        // Leaf RAW totals over the leaf rows (un-bumped).
         let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
         let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
 
-        // ---- CPU f64 ANCHOR (def-f8u-01: the reference is the bit-exact CPU fold,
+        // ---- CPU f64 ANCHOR (the reference is the bit-exact CPU fold,
         //      NOT a second GPU launcher). Per feature: gather the leaf rows'
         //      (bin, grad, hess), fold with `construct_histograms_cpu` (the bit-exact
         //      CPU f64 path), then apply the SAME host fix + compact the GPU chain
@@ -1650,7 +1648,7 @@ mod hip {
             build_fix_compact_resident_readback_f64_on(
                 &hip,
                 upload_resident_columns(&hip, &feature_bins),
-                lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
+                lgbm_compute::ResidentBinWidth::U32, // u32 helper buffer
                 feature_bins.len(),
                 num_data,
                 &slot_off,
@@ -1671,10 +1669,10 @@ mod hip {
 
         // ---- TIGHTENED fixed-point gate, pinned to the CPU f64 anchor.
         // The u64 fixed-point residual is bounded quantize-rounding error, not f32
-        // cancellation. Spike-018a/018b measured ~5.9e-9 on hardware (exact in the
+        // cancellation. Measured ~5.9e-9 on hardware (exact in the
         // cancelling regime). We pin to a gate well below the f32 envelope
         // (`HIP_SANITY_REL = 1e-3`) so a real fixed-point regression cannot slip,
-        // with margin above the spike-measured max. rel = |gpu - anchor| / max(|anchor|, 1.0).
+        // with margin above the measured max. rel = |gpu - anchor| / max(|anchor|, 1.0).
         const FIXEDPOINT_REL_GATE: f64 = 1e-7;
         let mut max_rel = 0.0f64;
         for (i, (&g, &a)) in gpu.iter().zip(anchor.iter()).enumerate() {
@@ -1713,14 +1711,14 @@ mod hip {
         }
     }
 
-    /// quick-260622-t4u — WR-05 (Phase 11, 11-VERIFICATION.md): the P>1 sibling of
+    /// The P>1 sibling of
     /// `kernel_parity_resident_build_fix_compact_equals_host_on_hip`. The P=1 test above
     /// uses a 10-row leaf, so `row_partition_count` returns 1 and the **multi-cube
     /// row-partitioned additive merge** (each of P cubes builds a partial u64
     /// sub-histogram, all atomic-merge into the same global slot) is NEVER anchor-checked.
-    /// This test self-forces P>1 via a >=256k-row leaf (design_decision approach B — NO
-    /// env mutation, so the OnceLock-cached target is irrelevant) and pins the u64
-    /// fixed-point read-back to the bit-exact CPU f64 anchor. Closes the WR-05 coverage gap.
+    /// This test self-forces P>1 via a >=256k-row leaf (no env mutation, so the
+    /// OnceLock-cached target is irrelevant) and pins the u64
+    /// fixed-point read-back to the bit-exact CPU f64 anchor, closing that coverage gap.
     ///
     /// The P>1 multi-cube merge is integer-additive (order-independent) so we expect
     /// near-bit-exact parity (`max_rel ~= 0`), gated at the SAME tightened
@@ -1768,8 +1766,8 @@ mod hip {
         let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 3) as f32).collect();
 
         // ---- P>1 GUARD: assert the multi-cube row-partitioned merge is genuinely
-        // exercised. Without this, the test could pass while silently testing P=1 (the
-        // exact WR-05 trap). Uses the now-`pub` rocm-gated heuristic.
+        // exercised. Without this, the test could pass while silently testing P=1.
+        // Uses the now-`pub` rocm-gated heuristic.
         let p = row_partition_count(feature_bins.len(), leaf_rows.len());
         assert!(
             p > 1,
@@ -1786,11 +1784,11 @@ mod hip {
             leaf_rows.len()
         );
 
-        // Leaf RAW totals over the leaf rows (un-bumped) — Pitfall 2.
+        // Leaf RAW totals over the leaf rows (un-bumped).
         let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
         let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
 
-        // ---- CPU f64 ANCHOR (def-f8u-01: the reference is the bit-exact CPU fold, NOT a
+        // ---- CPU f64 ANCHOR (the reference is the bit-exact CPU fold, NOT a
         //      second GPU launcher). Per feature: gather the leaf rows' (bin, grad, hess),
         //      fold with `construct_histograms_cpu`, then apply the SAME host fix + compact
         //      the GPU chain runs on device.
@@ -1821,7 +1819,7 @@ mod hip {
             build_fix_compact_resident_readback_f64_on(
                 &hip,
                 upload_resident_columns(&hip, &feature_bins),
-                lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
+                lgbm_compute::ResidentBinWidth::U32, // u32 helper buffer
                 feature_bins.len(),
                 num_data,
                 &slot_off,
@@ -1879,7 +1877,7 @@ mod hip {
         }
     }
 
-    /// 260608-p90 Task 1E — the Handle-consuming fused split scan
+    /// The Handle-consuming fused split scan
     /// (`find_best_splits_batched_fused_f64_from_handle_on`) must be BIT-IDENTICAL to
     /// the host-buf fused scan (`find_best_splits_batched_fused_f64_on`): for the SAME
     /// concatenated f64 histogram `buf`, uploading it to a device Handle and scanning
@@ -1991,18 +1989,18 @@ mod hip {
         }
     }
 
-    /// 260608-t3t — the FUSED build+fix+compact+scan kernel
+    /// The FUSED build+fix+compact+scan kernel
     /// (`build_fix_scan_resident_f64_on`) must be BIT-EXACT to the host pipeline for a
     /// directly-built leaf: (1) its RESIDENT fixed+compacted f64 histogram region ==
     /// the host SEQUENTIAL f64 build (ascending leaf-row order) → `fix_histogram` (RAW
-    /// un-bumped sum_hessian, Pitfall 2) → host compact, via `compare_exact_f64_bits`;
+    /// un-bumped sum_hessian) → host compact, via `compare_exact_f64_bits`;
     /// and (2) its per-feature 12-cell SplitInfo == the host `find_best_split` (the
     /// production `find_best_split_cpu_native`) over that SAME fixed+compacted region,
     /// EXACTLY (every field). NO within-tol — the fused kernel folds in the SAME
     /// ascending f64 order as the host sequential build, so the bits are identical.
     ///
     /// Covers: mfb > 0 reconstruct (f0 fix active), mfb == 0 / offset == 1 compaction
-    /// (f1, DEF-07-02 path — unchanged), offset == 0 no-op (f0/f2/f3), a REVERSE-winner
+    /// (f1, compaction path unchanged), offset == 0 no-op (f0/f2/f3), a REVERSE-winner
     /// + a FORWARD-winner feature, and a no-split feature (is_splittable == 0).
     #[test]
     fn kernel_parity_build_fix_scan_equals_host_on_hip() {
@@ -2022,7 +2020,7 @@ mod hip {
         let num_data = 12usize;
         // num_bin 4, mfb 2 (fix), offset 0, REVERSE scan only (run_forward=false).
         let f0: Vec<u32> = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
-        // num_bin 3, mfb 0, offset 1 (DEF-07-02 compaction), FORWARD allowed.
+        // num_bin 3, mfb 0, offset 1 (compaction), FORWARD allowed.
         let f1: Vec<u32> = vec![0, 0, 1, 1, 2, 2, 0, 1, 2, 0, 1, 2];
         // num_bin 5, mfb 1 (fix), offset 0, FORWARD allowed.
         let f2: Vec<u32> = vec![4, 3, 2, 1, 0, 1, 2, 3, 4, 0, 2, 3];
@@ -2052,7 +2050,7 @@ mod hip {
         let gradients: Vec<f32> = (0..num_data).map(|i| 0.5 + i as f32 * 0.25).collect();
         let hessians: Vec<f32> = (0..num_data).map(|i| 1.0 + (i % 4) as f32 * 0.5).collect();
 
-        // Leaf RAW totals over the leaf rows (un-bumped) — Pitfall 2.
+        // Leaf RAW totals over the leaf rows (un-bumped).
         let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
         let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
         let num_data_in_leaf = leaf_rows.len() as i32;
@@ -2130,7 +2128,7 @@ mod hip {
         let (hist_handle, len, fused_splits) = build_fix_scan_resident_f64_on(
             &hip,
             upload_resident_columns(&hip, &feature_bins),
-            lgbm_compute::ResidentBinWidth::U32, // quick-260621-qix: u32 helper buffer
+            lgbm_compute::ResidentBinWidth::U32, // u32 helper buffer
             feature_bins.len(),
             num_data,
             &slot_off,
@@ -2201,26 +2199,26 @@ mod hip {
         assert!(saw_no_split, "test must exercise a no-split feature");
     }
 
-    /// Phase-12 SIBLING CO-PACK parity on REAL hip (SC-1). Two halves:
+    /// SIBLING CO-PACK parity on REAL hip. Two halves:
     ///
     /// (a) BYTE-IDENTICAL: the co-packed 2-slot sibling scan
-    ///     (`find_best_splits_fused_siblings_from_handles_on`, Plan 01) returns
+    ///     (`find_best_splits_fused_siblings_from_handles_on`) returns
     ///     `(co_a, co_b)` byte-IDENTICAL (`assert_eq!`, every `SplitInfo` field) to two
     ///     SEPARATE single-slot scans (`find_best_splits_batched_fused_f64_on`) of the
-    ///     same two histograms with each sibling's totals. This is the productionized
-    ///     spike-024 gate (B's two halves == A's two results, every cell). It is an
-    ///     EXACTNESS check, valid because BOTH paths run the SAME f64 kernel on the SAME
-    ///     input bits — co-packing only changes WHICH launch a feature scans in.
+    ///     same two histograms with each sibling's totals (B's two halves == A's two
+    ///     results, every cell). It is an EXACTNESS check, valid because BOTH paths run
+    ///     the SAME f64 kernel on the SAME input bits — co-packing only changes WHICH
+    ///     launch a feature scans in.
     ///
-    /// (b) ~1e-6 ANCHOR (def-f8u-01): each co-pack `SplitInfo` is within the hip ~1e-6
+    /// (b) ~1e-6 ANCHOR: each co-pack `SplitInfo` is within the hip ~1e-6
     ///     envelope (`assert_within` / `HIP_SANITY_REL`) of a CPU f64 anchor scan
     ///     (`find_best_split_cpu_native` per feature, per sibling). The reference is the
-    ///     CPU f64 anchor — NEVER a second GPU path (def-f8u-01: never compare two
-    ///     nondeterministic GPU f32 paths to each other). This guards a silent per-sibling
-    ///     mis-decode (wrong half / wrong min_gain_shift) that a GPU-vs-GPU check would miss.
+    ///     CPU f64 anchor — NEVER a second GPU path (never compare two nondeterministic
+    ///     GPU f32 paths to each other). This guards a silent per-sibling mis-decode
+    ///     (wrong half / wrong min_gain_shift) that a GPU-vs-GPU check would miss.
     ///
     /// The two siblings carry DIFFERENT leaf totals over the SAME feature layout (the
-    /// smaller-built vs larger-subtract-derived asymmetry, spike-024's two seeds).
+    /// smaller-built vs larger-subtract-derived asymmetry).
     #[test]
     fn kernel_parity_sibling_copack_equals_two_scans_on_hip() {
         use lgbm_compute::kernels::split::{
@@ -2266,7 +2264,7 @@ mod hip {
         assert_eq!(co_a.len(), feats.len(), "co-pack A length");
         assert_eq!(co_b.len(), feats.len(), "co-pack B length");
         // EXACT per-feature equality: same f64 kernel over the same input bits, only the
-        // launch differs (the productionized spike-024 byte-for-byte gate).
+        // launch differs.
         for (i, (co, si)) in co_a.iter().zip(single_a.iter()).enumerate() {
             assert_eq!(
                 co, si,
@@ -2282,7 +2280,7 @@ mod hip {
             );
         }
 
-        // ---- (b) ~1e-6 ANCHOR (def-f8u-01): each co-pack SplitInfo within the hip ~1e-6
+        // ---- (b) ~1e-6 ANCHOR: each co-pack SplitInfo within the hip ~1e-6
         //         envelope of a CPU f64 anchor (find_best_split_cpu_native) — NEVER a GPU path. ----
         // Decode each SplitInfo's continuous fields to f32 and compare to the f64 anchor
         // collected to f32, via the established `assert_within` (ORACLE_TOL surfaced +
@@ -2360,11 +2358,11 @@ mod hip {
         pin("B", &co_b, b_totals);
     }
 
-    /// RAII guard for an env var that FORCES a launch-config variant (the 13-04
+    /// RAII guard for an env var that FORCES a launch-config variant (an
     /// all-variants parity sweep — `LGBM_AUTOTUNE_FORCE_P` for the build `P`,
     /// `LGBM_SCAN_CUBEDIM` for the scan `W`). On `set` it records the prior value and
     /// writes the new one; on `drop` it restores the prior value (removing the var if
-    /// it was previously unset). Panic-safe (T-13-04-01): a failing assertion inside
+    /// it was previously unset). Panic-safe: a failing assertion inside
     /// one P/W iteration restores the env on unwind, so the forced variant can never
     /// leak into a sibling test.
     struct EnvVarGuard {
@@ -2393,7 +2391,7 @@ mod hip {
         }
     }
 
-    /// WR-02: import the production candidate sets directly so the "every autotune
+    /// Import the production candidate sets directly so the "every autotune
     /// candidate is anchor-pinned" gate tracks the source of truth — a maintainer adding a
     /// `P`/`W` in `histogram::BUILD_PSET` / `split::SCAN_WSET` now extends this sweep
     /// automatically instead of silently leaving the new variant ungated (the old
@@ -2404,16 +2402,16 @@ mod hip {
     use lgbm_compute::kernels::histogram::BUILD_PSET as BUILD_PSET_MIRROR;
     use lgbm_compute::kernels::split::SCAN_WSET as SCAN_WSET_MIRROR;
 
-    /// 13-04 PARITY GATE (build): autotune may pick ANY `P` in `BUILD_PSET` at runtime,
-    /// so EVERY variant must be anchor-correct, not just the current default (def-f8u-01:
-    /// never GPU-vs-GPU). This pins the u64 fixed-point resident build at EACH forced
+    /// PARITY GATE (build): autotune may pick ANY `P` in `BUILD_PSET` at runtime,
+    /// so EVERY variant must be anchor-correct, not just the current default (never
+    /// GPU-vs-GPU). This pins the u64 fixed-point resident build at EACH forced
     /// `P` (`LGBM_AUTOTUNE_FORCE_P=P`, which short-circuits the tuner) to the SAME CPU f64
-    /// anchor as the WR-05 P>1 test — `construct_histograms_cpu` (the bit-exact CPU fold)
-    /// + the exported host `fix_histogram` + compact, built ONCE. The u64 fixed-point
-    /// merge is integer-additive (order-independent across the P cubes) ⇒ bit-identical
-    /// across `P`, gated at the tightened `FIXEDPOINT_REL_GATE = 1e-7`.
+    /// anchor as the multi-cube P>1 resident-build parity test — `construct_histograms_cpu`
+    /// (the bit-exact CPU fold) + the exported host `fix_histogram` + compact, built ONCE.
+    /// The u64 fixed-point merge is integer-additive (order-independent across the P
+    /// cubes) ⇒ bit-identical across `P`, gated at the tightened `FIXEDPOINT_REL_GATE = 1e-7`.
     ///
-    /// SCOPE (IN-02): this gate FORCES each variant (`LGBM_AUTOTUNE_FORCE_P`, the direct
+    /// SCOPE: this gate FORCES each variant (`LGBM_AUTOTUNE_FORCE_P`, the direct
     /// launch) — it pins every per-`P` KERNEL to the anchor, but it does NOT drive
     /// `LocalTuner::execute` + `FreshOutGenerator` (the live default selection path). That
     /// tuner path's numerics are covered by `build_tuner_grad_conservation_fresh_vs_clone`
@@ -2439,8 +2437,9 @@ mod hip {
         let hip = rocm_client();
         let cpu = cpu_client();
 
-        // Clone the WR-05 P>1 fixture: 3 spine features over a >=256k-row leaf so the
-        // row-partitioned multi-cube merge is genuinely exercised at each forced P>1.
+        // Use the same P>1 fixture as the resident-build parity test: 3 spine features
+        // over a >=256k-row leaf so the row-partitioned multi-cube merge is genuinely
+        // exercised at each forced P>1.
         let num_data = 300_000usize;
         let num_bins: Vec<u32> = vec![4, 3, 5];
         let mfbs: Vec<u32> = vec![2, 0, 1];
@@ -2465,7 +2464,7 @@ mod hip {
         let sum_g: f64 = leaf_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
         let sum_h: f64 = leaf_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
 
-        // ---- CPU f64 ANCHOR built ONCE (def-f8u-01): per feature gather the leaf rows'
+        // ---- CPU f64 ANCHOR built ONCE: per feature gather the leaf rows'
         //      (bin, grad, hess), fold with `construct_histograms_cpu`, apply the SAME
         //      host fix + compact the GPU chain runs on device. NOT a second GPU launch.
         let mut anchor: Vec<f64> = vec![0.0; slot_len];
@@ -2535,16 +2534,16 @@ mod hip {
     }
 
 
-    /// 13-04 PARITY GATE (scan): autotune may pick ANY `W` in `SCAN_WSET` at runtime, so
+    /// PARITY GATE (scan): autotune may pick ANY `W` in `SCAN_WSET` at runtime, so
     /// EVERY scan width must be bit-exact. The feature-per-lane fused scan keeps each
-    /// feature's prefix scan SEQUENTIAL (one feature per lane, spike-021/022), so widening
+    /// feature's prefix scan SEQUENTIAL (one feature per lane), so widening
     /// `CubeDim W` reorders NOTHING within a feature ⇒ the per-feature `SplitInfo` is
     /// bit-IDENTICAL across `W`. This computes the `W=1` reference (the byte-exact oracle
     /// anchor) once, then for each `W` in `SCAN_WSET` forces `LGBM_SCAN_CUBEDIM=W`
     /// (`LGBM_AUTOTUNE=0` so the deterministic explicit-env fallback path runs) and asserts
     /// every feature's `SplitInfo` is byte-identical to the `W=1` result.
     ///
-    /// SCOPE (IN-02): like the build gate, this FORCES each `W` via the explicit-env
+    /// SCOPE: like the build gate, this FORCES each `W` via the explicit-env
     /// fallback (`LGBM_AUTOTUNE=0` + `LGBM_SCAN_CUBEDIM`) — it pins every per-`W` KERNEL to
     /// the `W=1` oracle, but it does NOT drive `LocalTuner::execute` (the live default
     /// selection path). The default-on tuner path is covered by
@@ -2646,12 +2645,12 @@ mod hip {
     }
 
     // =======================================================================
-    // 18-04 (ODL-15) PREDICT tree-walk hip parity. Drive the numeric + categorical
+    // PREDICT tree-walk hip parity. Drive the numeric + categorical
     // AddPredictionToScore tree-walk on cubecl-hip and assert within ~1e-6 of the
-    // cpu f64 anchor (NEVER GPU-vs-GPU, def-f8u-01). The walk is deterministic
+    // cpu f64 anchor (NEVER GPU-vs-GPU). The walk is deterministic
     // integer routing + a single f64 leaf-value write per row (no f32 accumulation),
     // so the hip result equals the cpu anchor exactly; the tie-aware assert_within
-    // (D-03a) surfaces any residual as a documented gap rather than silently passing.
+    // surfaces any residual as a documented gap rather than silently passing.
     // Reads the committed predict.txt golden (self-contained mini-parser).
     // =======================================================================
 
@@ -2824,7 +2823,7 @@ mod hip {
                 &hip, &tree, &g.rows, g.num_rows, g.num_features, bit_type, g.num_rows, None,
             )
             .unwrap_or_else(|e| panic!("hip predict `{}` failed: {e:?}", g.name));
-            // (2) f64 anchor on cubecl-cpu (never GPU-vs-GPU, def-f8u-01).
+            // (2) f64 anchor on cubecl-cpu (never GPU-vs-GPU).
             let cpu_anchor_f64 = add_prediction_to_score_on_device(
                 &cpu, &tree, &g.rows, g.num_rows, g.num_features, bit_type, g.num_rows, None,
             )
@@ -2851,27 +2850,26 @@ mod hip {
 }
 
 // ===========================================================================
-// Phase 16 Wave 0 (Plan 16-01, Task 1): synthetic build/fix/subtract fixtures.
+// Synthetic build/fix/subtract fixtures.
 //
-// Closes three VALIDATION.md Wave 0 gaps with PURE-SYNTHETIC, f64-anchored
-// fixtures (no C++ capture needed — these are the *exact* places parity
-// historically broke):
-//   (1) a sparse column set forcing CSR `row_ptr_type` ∈ {16,32,64} (§13 re-lay);
+// PURE-SYNTHETIC, f64-anchored fixtures (no C++ capture needed) covering
+// places parity has historically broken:
+//   (1) a sparse column set forcing CSR `row_ptr_type` ∈ {16,32,64} (re-lay);
 //   (2) a large-bin column forcing `NumLargeBinPartition() > 0` (the `_GlobalMemory`
-//       spill, §7.2 / Pitfall 1);
+//       spill path);
 //   (3) a purpose-built `most_freq_bin != 0` column whose FixHistogram repaired
 //       default-bin value (`leaf_total − Σ(other bins, ascending)`) is stored as a
-//       golden constant computed in PLAIN Rust f64 — NEVER from the fix kernel under
-//       test (16-04's `fix_compact_kernel`).
+//       golden constant computed in PLAIN Rust f64 — NEVER from the fix kernel
+//       under test.
 //
 // Every expected histogram is anchored to the cpu f64 fold
 // (`construct_histograms_f64_on`, CubeDim::new_1d(1)); NO GPU output is ever stored
-// as a golden (D-05, def-f8u-01). NO fixture stores a compacted (offset-shifted)
-// histogram shape — §7 is build→fix→subtract only (Pitfall 5).
+// as a golden. NO fixture stores a compacted (offset-shifted) histogram shape —
+// this covers build→fix→subtract only.
 //
 // The committed dense corpora build anchor (`tests/fixtures/kernels/histogram.txt`,
 // replayed by `kernel_parity_histogram_bit_exact_on_cpu` above) remains the C++-
-// captured half of the D-05 anchor; these synthetic builders are the partition-
+// captured half of the anchor; these synthetic builders are the partition-
 // layout / Fix / ordering half that needs no C++ toolchain to regenerate.
 // ===========================================================================
 mod kernel16_fixtures {
@@ -2880,7 +2878,7 @@ mod kernel16_fixtures {
     use lgbm_compute::runtime::{cpu_client, ActiveRuntime};
     use lgbm_compute::BinColumn;
 
-    /// `shared_hist_size` for every §13 partition layout here (the design-doc DP
+    /// `shared_hist_size` for every partition layout here (the design DP
     /// value; the SMEM budget = `shared_hist_size / 2` = 3072 bins).
     pub const SHARED_HIST_SIZE: usize = 6144;
 
@@ -2891,7 +2889,7 @@ mod kernel16_fixtures {
         pub bins: BinColumn,
         pub num_bin: u32,
         /// Logical non-zeros — selects the CSR `row_ptr_type` width {16, 32, 64}
-        /// (carried as a NUMBER; never materialized — D-04).
+        /// (carried as a NUMBER; never materialized).
         pub nnz: u64,
     }
 
@@ -2910,7 +2908,7 @@ mod kernel16_fixtures {
 
     /// Three synthetic sparse columns, each tagged with a logical nnz that forces a
     /// distinct CSR `row_ptr_type` width {16, 32, 64}. All share 8 rows so they re-lay
-    /// as one matrix (the Phase-15 `synth` shape, reused per research A3).
+    /// as one matrix.
     #[must_use]
     pub fn sparse_columns() -> Vec<SparseSynthColumn> {
         vec![
@@ -2935,7 +2933,7 @@ mod kernel16_fixtures {
         ]
     }
 
-    /// Drive the §13 sparse re-lay over the fixture and return the set of resolved
+    /// Drive the sparse re-lay over the fixture and return the set of resolved
     /// `row_ptr_bit_type` widths (the re-lay width the device actually selected) — the
     /// authoritative assertion that each of {16,32,64} is forced.
     #[must_use]
@@ -2970,7 +2968,7 @@ mod kernel16_fixtures {
     // ---- large-bin / global-spill fixture (NumLargeBinPartition() > 0) ------
     /// Per-column bin counts whose final column (4000 bins) exceeds the SMEM budget
     /// (3072 for `shared_hist_size` 6144), forcing its own large-bin partition — the
-    /// `_GlobalMemory` spill path (Pitfall 1, D-04).
+    /// `_GlobalMemory` spill path.
     #[must_use]
     pub fn large_bin_num_bin_per_column() -> Vec<usize> {
         vec![1_000, 1_000, 4_000]
@@ -2992,14 +2990,14 @@ mod kernel16_fixtures {
         pub hess: Vec<f32>,
         pub num_bin: u32,
         /// The most-frequent bin — non-zero AND in range (`0 < mfb < num_bin`), so it
-        /// exercises FixHistogram's omit-and-repair path (Pitfall 4, DEF-07-02 class).
+        /// exercises FixHistogram's omit-and-repair path.
         pub mfb: u32,
         /// Raw f64 leaf totals (`Σ grad`, `Σ hess` over the leaf's rows, ascending) —
         /// the seeds FixHistogram subtracts from.
         pub leaf_total_grad: f64,
         pub leaf_total_hess: f64,
         /// The full `2*num_bin` interleaved build histogram, anchored to the cpu f64
-        /// fold. NO compaction (Pitfall 5).
+        /// fold. NO compaction.
         pub hist: Vec<f64>,
         /// The GOLDEN repaired default-bin value = `leaf_total − Σ(other bins,
         /// ascending)`, computed in PLAIN Rust f64 — never the fix kernel under test.
@@ -3009,7 +3007,7 @@ mod kernel16_fixtures {
 
     /// Build the mfb!=0 fixture. The histogram is the cpu f64 BUILD anchor; the repaired
     /// default-bin value is computed in plain Rust f64 (the stored golden), independent
-    /// of the FixHistogram kernel under test (16-04).
+    /// of the FixHistogram kernel under test.
     #[must_use]
     pub fn mfb_fixture() -> MfbFixture {
         let num_bin = 5u32;
@@ -3017,7 +3015,7 @@ mod kernel16_fixtures {
         // bin 2 is the most-frequent (4 of 8 rows); the other in-range bins appear once.
         let bins = vec![2u32, 0, 2, 1, 2, 3, 4, 2];
         // Signed/fractional grad so cancellation is real (the cell is a difference of
-        // partial sums — the DEF-07-02-class sensitivity).
+        // partial sums).
         let grad = vec![0.5f32, -1.25, 2.0, -0.75, 3.5, -2.5, 1.0, -0.25];
         let hess = vec![1.0f32, 1.5, 2.0, 0.5, 1.25, 2.5, 0.75, 1.75];
 
@@ -3063,7 +3061,7 @@ mod kernel16_fixtures {
     }
 }
 
-/// Wave 0 (16-01 T1): the synthetic SPARSE fixture forces each CSR `row_ptr_type`
+/// The synthetic SPARSE fixture forces each CSR `row_ptr_type`
 /// width {16,32,64} across its three configured columns (assert on the *resolved*
 /// re-lay width, not just the tag).
 #[test]
@@ -3076,7 +3074,7 @@ fn kernel16_sparse_fixture_forces_all_row_ptr_widths() {
     );
 }
 
-/// Wave 0 (16-01 T1): the synthetic LARGE-BIN fixture forces the `_GlobalMemory`
+/// The synthetic LARGE-BIN fixture forces the `_GlobalMemory`
 /// spill — `divide_cuda_feature_groups` yields `num_large_bin_partition > 0`.
 #[test]
 fn kernel16_large_bin_fixture_forces_global_spill() {
@@ -3086,16 +3084,16 @@ fn kernel16_large_bin_fixture_forces_global_spill() {
     );
 }
 
-/// Wave 0 (16-01 T1): the `most_freq_bin != 0` fixture's stored golden default-bin
+/// The `most_freq_bin != 0` fixture's stored golden default-bin
 /// value equals `leaf_total − Σ(other bins, ascending)`, recomputed INDEPENDENTLY by
 /// a plain Rust f64 loop in this test (NOT the fix kernel under test), and the build
-/// anchor carries the full `2*num_bin` interleaved shape (no compaction, Pitfall 5).
+/// anchor carries the full `2*num_bin` interleaved shape (no compaction).
 #[test]
 fn fix_mfb_nonzero_repaired_default_bin_anchored() {
     let fx = kernel16_fixtures::mfb_fixture();
 
     // (a) No compacted shape: the stored build anchor is the full 2*num_bin interleaved
-    //     histogram (§7 never compacts — Pitfall 5).
+    //     histogram (this builder never compacts).
     assert_eq!(
         fx.hist.len(),
         2 * fx.num_bin as usize,

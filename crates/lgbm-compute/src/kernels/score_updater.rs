@@ -1,10 +1,7 @@
-//! Phase-20 on-device score updater (§11, ODL-16) — the resident `double`
-//! score-buffer constant ops.
-//!
-//! Owning phase: **20**. Filled by Plan **20-01** (Wave-2).
+//! On-device score updater — the resident `double` score-buffer constant ops.
 //!
 //! ## What lives here
-//! The Rust `#[cube]` port of the §11 `AddScoreConstantKernel` /
+//! The Rust `#[cube]` port of the `AddScoreConstantKernel` /
 //! `MultiplyScoreConstantKernel` — two whole-array scalar ops over the resident
 //! `double* cuda_score_` accumulator, applied to one tree's class-major slice
 //! (`offset = num_data * tree_id`):
@@ -14,26 +11,25 @@
 //!   / RF running-average — the host `ScoreUpdater::multiply_score`,
 //!   score_updater.rs:98).
 //!
-//! The per-leaf training-path `AddScore` does NOT get a fresh tree-walk kernel here
-//! (D-02): it delegates to the already-golden Phase-18
+//! The per-leaf training-path `AddScore` does NOT get a fresh tree-walk kernel here:
+//! it delegates to
 //! [`crate::kernels::predict::add_prediction_to_score_on_device`].
 //!
-//! ## Kernel shape (Pattern 1 / D-07 / D-08)
+//! ## Kernel shape
 //! Each op is a trivial elementwise `#[cube]` body over an `Array<f64>`, bounds-
 //! guarded `i < num_data`, wrapped in a `#[cube(launch_unchecked)]` kernel and a
 //! host launcher following the `objective_regression.rs::convert_output_on`
 //! skeleton (exact-size `create_from_slice` → bounds-guarded `launch_unchecked` →
-//! `read_one_unchecked`), with `unsafe` confined to the launch site (CMP-01,
-//! T-20-01-01). The `f64` score buffer is **reference-blessed** (the host
-//! `ScoreUpdater::score_` is `std::vector<double>`, score_updater.rs:31) — this is a
-//! whole-array scalar op, NOT a per-row grow/build hot loop, so D-08's "no
-//! gratuitous f64 per-row hot loop" prohibition (spike-052) does not apply.
+//! `read_one_unchecked`), with `unsafe` confined to the launch site. The `f64`
+//! score buffer is **reference-blessed** (the host `ScoreUpdater::score_` is
+//! `std::vector<double>`, score_updater.rs:31) — this is a whole-array scalar op,
+//! not a per-row grow/build hot loop.
 //!
-//! ## Anchor discipline (D-05 / D-07)
+//! ## Anchor discipline
 //! The host `lgbm_boosting::score_updater::ScoreUpdater::{add_constant,
 //! multiply_score}` f64 accumulation is the parity oracle. On the default cubecl-cpu
 //! f64 anchor the device op is **bit-exact** to it; the ROCm f32-storage mirror is
-//! held to the ~1e-6 envelope — NEVER GPU-vs-GPU (def-f8u-01). Additive and OFF by
+//! held to the ~1e-6 envelope — never compared GPU-vs-GPU. Additive and OFF by
 //! default behind the `LGBM_CUDA_ON_DEVICE` seam (the boosting-layer toggle keys off
 //! [`crate::cuda_on_device_enabled`]).
 
@@ -66,15 +62,15 @@ fn multiply_constant_body(score: &mut Array<f64>, val: f64, offset: u32, num_dat
     }
 }
 
-/// f64 cpu-anchor `AddScoreConstant` wrapper (the deterministic f64 reference,
-/// D-07). The ROCm f32-storage mirror would instantiate the same body over the
+/// f64 cpu-anchor `AddScoreConstant` wrapper (the deterministic f64 reference).
+/// The ROCm f32-storage mirror would instantiate the same body over the
 /// resident buffer.
 #[cube(launch_unchecked)]
 fn add_score_constant_kernel_f64(score: &mut Array<f64>, val: f64, offset: u32, num_data: u32) {
     add_constant_body(score, val, offset, num_data);
 }
 
-/// f64 cpu-anchor `MultiplyScoreConstant` wrapper (D-07).
+/// f64 cpu-anchor `MultiplyScoreConstant` wrapper.
 #[cube(launch_unchecked)]
 fn multiply_score_constant_kernel_f64(
     score: &mut Array<f64>,
@@ -96,7 +92,7 @@ enum ConstantOp {
 /// score_updater.rs:64): `offset = num_data * tree_id`, computed overflow-safe in
 /// `usize`. Validates `num_data >= 0`, `tree_id >= 0`, and that the whole slice
 /// `[offset, offset + num_data)` fits inside the supplied `score` buffer BEFORE any
-/// device alloc / launch (T-20-01-01 / T-20-01-02).
+/// device alloc / launch.
 fn checked_slice(score_len: usize, num_data: i32, tree_id: i32) -> Result<usize, ComputeError> {
     if num_data < 0 {
         return Err(ComputeError::Runtime {
@@ -151,8 +147,7 @@ fn apply_constant_on<R: cubecl::Runtime>(
     // SAFETY: `h_score` is sized exactly `n = score.len()` f64 cells and outlives the
     // launch. `checked_slice` has proven `offset + num_data <= n`, and the kernel
     // bounds-guards `i < num_data`, so every `score[offset + i]` access lies in
-    // `[offset, offset + num_data) ⊆ [0, n)`. cubecl unsafe is confined here
-    // (CMP-01 / T-20-01-01).
+    // `[offset, offset + num_data) ⊆ [0, n)`. cubecl unsafe is confined here.
     unsafe {
         match op {
             ConstantOp::Add => add_score_constant_kernel_f64::launch_unchecked(
@@ -185,7 +180,7 @@ fn apply_constant_on<R: cubecl::Runtime>(
 /// `offset = num_data * tree_id`). Returns the whole updated buffer.
 ///
 /// The device analog of the host `ScoreUpdater::add_constant` (score_updater.rs:82)
-/// — bit-exact to it on the cpu f64 anchor; ~1e-6 on ROCm (D-05, never GPU-vs-GPU).
+/// — bit-exact to it on the cpu f64 anchor; ~1e-6 on ROCm (never GPU-vs-GPU).
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] if `num_data < 0` / `tree_id < 0` / the `offset`
@@ -206,7 +201,7 @@ pub fn add_score_constant_on<R: cubecl::Runtime>(
 /// `offset = num_data * tree_id`). Returns the whole updated buffer.
 ///
 /// The device analog of the host `ScoreUpdater::multiply_score` (score_updater.rs:98)
-/// — bit-exact to it on the cpu f64 anchor; ~1e-6 on ROCm (D-05, never GPU-vs-GPU).
+/// — bit-exact to it on the cpu f64 anchor; ~1e-6 on ROCm (never GPU-vs-GPU).
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] if `num_data < 0` / `tree_id < 0` / the `offset`
@@ -259,7 +254,7 @@ mod tests {
         assert_eq!(got, score);
     }
 
-    /// A negative num_data / tree_id is rejected before any launch (T-20-01-02).
+    /// A negative num_data / tree_id is rejected before any launch.
     #[test]
     fn negative_inputs_rejected() {
         let client = cpu_client();
@@ -268,8 +263,7 @@ mod tests {
         assert!(add_score_constant_on(&client, &score, 3, -1, 1.0).is_err());
     }
 
-    /// A slice `[offset, offset + num_data)` that overruns the buffer is rejected
-    /// (T-20-01-01).
+    /// A slice `[offset, offset + num_data)` that overruns the buffer is rejected.
     #[test]
     fn out_of_range_slice_rejected() {
         let client = cpu_client();

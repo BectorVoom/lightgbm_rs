@@ -1,15 +1,12 @@
-//! Spike 075 — per-tree cost of the Phase-29 unconditional serial f64 root fold.
+//! Per-tree cost of the unconditional serial f64 root fold.
 //!
-//! Phase 29 (OCX-01) deleted the biased serial-f32 root sum and made
-//! `root_grad_hess_sum_device` an UNCONDITIONAL serial ascending f64 fold on a
+//! `root_grad_hess_sum_device` is an UNCONDITIONAL serial ascending f64 fold on a
 //! `CubeCount(1)`/`CubeDim(1)` single lane (bit-exactness vs the host fold requires the
-//! exact ascending order). Spike-052's rule says NO f64 hot loops on consumer NVIDIA
-//! (1/32 f64 throughput); spike-055's lesson says a parity-anchor-shaped serial kernel
-//! leaking into production is exactly how Phase 23 failed. This spike bounds the cost:
-//! a single-lane 500k-iteration dependent chain could be ~4ms/tree (register-held
-//! accumulator) or ~150ms/tree (global-memory RMW round trip per iteration) — the low
-//! end is a rounding error at a ~10s/100-tree train, the high end would DOMINATE the
-//! whole on-device A/B gap. Measure, don't model.
+//! exact ascending order). A single-lane serial f64 fold on GPU risks two very different
+//! costs depending on where the accumulator lives: ~4ms/tree (register-held accumulator)
+//! or ~150ms/tree (global-memory RMW round trip per iteration) at 500k rows — the low end
+//! is a rounding error at a ~10s/100-tree train, the high end would DOMINATE the whole
+//! on-device A/B gap. Measure, don't model.
 //!
 //! What it measures (median [p25..p75] over REPS, first WARMUP discarded, per size):
 //!   * DEVICE — `root_grad_hess_sum_device` on pre-uploaded handles: one launch + the
@@ -89,7 +86,7 @@ const DEFAULT_SIZES: &[usize] = &[1_000, 10_000, 100_000, 500_000, 1_000_000, 2_
 const DEFAULT_REPS: usize = 11;
 const WARMUP: usize = 2;
 
-/// Deterministic inline LCG (spike conventions: no `rand` dep). Yields f32 in [lo, hi).
+/// Deterministic inline LCG (no external `rand` dependency). Yields f32 in [lo, hi).
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self, lo: f32, hi: f32) -> f32 {
@@ -235,7 +232,7 @@ fn main() {
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
         // cpu runtime fallback: sign/order NOT meaningful for the GPU question (and
-        // cubecl-cpu per-launch overhead is pathological, spike-059) — build with a GPU
+        // cubecl-cpu per-launch overhead is pathological) — build with a GPU
         // feature for a real answer.
         let client = lgbm_compute::runtime::cpu_client();
         bench::<cubecl::cpu::CpuRuntime>(&client, "cpu (NOT meaningful for the GPU question)");

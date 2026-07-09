@@ -1,4 +1,4 @@
-//! Spike 002 — env-gated per-phase wall-clock accumulator for the serial
+//! Env-gated per-phase wall-clock accumulator for the serial
 //! tree-learner hot loop. Inert unless `LGBM_PHASE_PROF=1`; in that case the
 //! three growth-loop phases accumulate into process-global atomics that the
 //! bench harness prints via [`dump`]. Measurement-only; never changes train
@@ -16,9 +16,9 @@ pub static PARTITION_NS: AtomicU64 = AtomicU64::new(0);
 // subtract/compact glue), used to localize the hist-vs-split gap.
 pub static BUILD_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_NS: AtomicU64 = AtomicU64::new(0);
-// Spike-014b WHOLE-TRAIN BUDGET counters — the growth-loop phases above cover only
-// ~31–45% of GPU train wall-clock (spike-014a); these attribute the uninstrumented
-// majority. Wrapped at the boosting/binning seam, NOT nested inside the growth loop:
+// WHOLE-TRAIN BUDGET counters — the growth-loop phases above cover only part of
+// GPU train wall-clock; these attribute the uninstrumented majority. Wrapped at the
+// boosting/binning seam, NOT nested inside the growth loop:
 //   BINNING  = once-per-train `build_feature_columns` (fixed setup; bench-repeated).
 //   GRAD     = per-iter objective `get_gradients` (grad/hess compute).
 //   LEARNER  = per-iter `learner.train_*` call — SUPERSET of BEFORE+HISTSPLIT+PARTITION;
@@ -29,7 +29,7 @@ pub static BINNING_NS: AtomicU64 = AtomicU64::new(0);
 pub static GRAD_NS: AtomicU64 = AtomicU64::new(0);
 pub static LEARNER_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCORE_NS: AtomicU64 = AtomicU64::new(0);
-// quick-260621-rdu: boosting-loop attribution. TRAIN_ONE_ITER wraps the whole
+// Boosting-loop attribution. TRAIN_ONE_ITER wraps the whole
 // `gbdt.train_one_iter` call (⊇ GRAD + LEARNER + SCORE + snapshot/boost/alloc);
 // `loop_other = train − binning − Σtrain_one_iter` isolates the booster-loop tail
 // (metric eval / valid / accumulation). SNAPSHOT = the per-iter `scores().to_vec()`
@@ -37,19 +37,18 @@ pub static SCORE_NS: AtomicU64 = AtomicU64::new(0);
 pub static TRAIN_ONE_ITER_NS: AtomicU64 = AtomicU64::new(0);
 pub static SNAPSHOT_NS: AtomicU64 = AtomicU64::new(0);
 pub static METRIC_NS: AtomicU64 = AtomicU64::new(0);
-// quick-260621-rdu: per-train model-metadata setup (`feature_infos_from_rows` min/max
+// Per-train model-metadata setup (`feature_infos_from_rows` min/max
 // over the raw matrix) — outside binning AND the boosting loop.
 pub static SETUP_NS: AtomicU64 = AtomicU64::new(0);
-// Spike-014b drill-down: the per-`train_inner` (= per-TREE) resident-bin device upload
+// The per-`train_inner` (= per-TREE) resident-bin device upload
 // (`wants_resident_bins` block, learner.rs) — two `[num_features × num_data]` u32 host
 // re-allocations + a host→device `create_from_slice`, redundantly repeated every tree
 // even though the binned columns are IMMUTABLE for the whole train. A subset of
 // `in_learner_other`; GPU-only (CpuBackend `wants_resident_bins()==false`).
 pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
-// Spike-049 drill-down: break `in_learner_other` (= learner − before − hist+split −
-// partition) into its per-tree setup components, to localize the remaining post-
-// metric-fix gap (spike-048). These are all OUTSIDE the growth-loop phase guards:
+// Break `in_learner_other` (= learner − before − hist+split − partition) into its
+// per-tree setup components. These are all OUTSIDE the growth-loop phase guards:
 //   ROOT_FOLD   = the per-tree root LeafSplits::init f64 fold over ALL rows
 //                 (grad/hess sum); single-threaded CPU, backend-independent.
 //   PARTITION_NEW = per-tree DataPartition::new (alloc + fill 0..num_data); CPU.
@@ -65,17 +64,15 @@ pub static RESIDENT_RESET_NS: AtomicU64 = AtomicU64::new(0);
 // tree even when CEGB is inactive (default).
 pub static SCRATCH_NS: AtomicU64 = AtomicU64::new(0);
 
-// Spike-023 GPU per-leaf LAUNCH/ROUND-TRIP COUNT counters. The 001–022 campaign
-// optimized per-kernel throughput; the un-attacked frontier is the per-leaf loop
-// STRUCTURE — how many device launches and how many blocking host round-trips
-// (`read_one_unchecked` syncs) a tree costs. These count the per-leaf Backend entry
-// points so the round-trip floor is EMPIRICAL (not inferred), and so 024's ceiling =
-// (scan round-trips) × (per-sync cost) is computable. Inert unless LGBM_PHASE_PROF=1.
+// GPU per-leaf LAUNCH/ROUND-TRIP COUNT counters. These count how many device
+// launches and how many blocking host round-trips (`read_one_unchecked` syncs) a
+// tree costs, at the per-leaf Backend entry points, so the round-trip floor is
+// EMPIRICAL (not inferred). Inert unless LGBM_PHASE_PROF=1.
 //   BUILD_RESIDENT = standalone device histogram builds (root + smaller children).
 //   SUBTRACT_RESIDENT = on-device parent−smaller derivations (larger children).
 //   SCAN_RESIDENT = fused per-leaf scan launches = blocking readback SYNCS (the
-//                   round-trip count 024 targets halving via sibling co-packing).
-//   FUSED = build_fix_scan_resident launches (the 260608-t3t collapse, OFF by default).
+//                   round-trip count sibling co-packing targets halving).
+//   FUSED = build_fix_scan_resident launches (OFF by default).
 pub static BUILD_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
 pub static SUBTRACT_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
@@ -162,7 +159,7 @@ pub fn dump(label: &str) {
             p as f64 / 1e4 / tot
         );
     }
-    // Spike-014b WHOLE-TRAIN BUDGET. `learner` is the per-iter tree-train call and is a
+    // WHOLE-TRAIN BUDGET. `learner` is the per-iter tree-train call and is a
     // SUPERSET of before+hist+split+partition; `in_learner_other = learner − that` is the
     // previously-uninstrumented in-learner cost (per-tree GPU grad/hess upload, resident-
     // pool / partition setup, host orchestration outside the growth-phase guards).
@@ -174,7 +171,7 @@ pub fn dump(label: &str) {
     let snapshot = SNAPSHOT_NS.swap(0, Ordering::Relaxed);
     let metric = METRIC_NS.swap(0, Ordering::Relaxed);
     if binning + grad + learner + score + toi > 0 {
-        // quick-260621-rdu: in-train_one_iter overhead NOT in grad/learner/score/snapshot
+        // in-train_one_iter overhead NOT in grad/learner/score/snapshot
         // (boost_from_average, bagging, grad/hess Vec alloc, snapshot bookkeeping).
         let in_iter_other = toi.saturating_sub(grad + learner + score + snapshot);
         let setup = SETUP_NS.swap(0, Ordering::Relaxed);
@@ -190,7 +187,7 @@ pub fn dump(label: &str) {
             setup as f64 / 1e6,
         );
     }
-    // Spike-023 per-train LAUNCH/ROUND-TRIP COUNTS. `scan_resident` is the blocking
+    // Per-train LAUNCH/ROUND-TRIP COUNTS. `scan_resident` is the blocking
     // host round-trip (sync) count; build+subtract+fused+scan ≈ total device launches.
     //
     // UNIT CONTRACT (WR-01/IN-02): EVERY term summed into `device_launches=` counts
@@ -206,38 +203,35 @@ pub fn dump(label: &str) {
     let sub_cnt = SUBTRACT_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let scn_cnt = SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let fus_cnt = FUSED_CNT.swap(0, Ordering::Relaxed);
-    // L-1/SC-2: fold the on-device driver's own launch count (bumped in lgbm-compute
+    // Fold the on-device driver's own launch count (bumped in lgbm-compute
     // once per leaf-level build/subtract/scan — the host `*_RESIDENT_CNT` counters
     // stay 0 on the on-device path) into the SAME `device_launches=` total. The
-    // consumer (23-03 harness) captures the total via the SHORT regex
+    // consumer captures the total via the SHORT regex
     // `device_launches=(?P<launches>\d+)`, so `on_device=` MUST live INSIDE the
-    // parenthesized breakdown (never before the total) to keep that capture stable
-    // (Open-Q2). Without this fold an on-device train emits `device_launches=0` and the
-    // whole line is suppressed by the `> 0` guard (P-2).
+    // parenthesized breakdown (never before the total) to keep that capture stable.
+    // Without this fold an on-device train emits `device_launches=0` and the
+    // whole line is suppressed by the `> 0` guard.
     let on_dev = lgbm_compute::kernels::grow_driver::on_device_launch_count_take();
-    // spike-056 fix (25-01, ODP2-05): the ROOT + directly-built-child parallel-u64 build
-    // sub-counter. NONZERO proves the sites Phase-24 wired to the f64 single-owner fused
-    // build were CONVERTED to the parallel u64 fixed-point kernel (distinct from the
-    // subtract-path smaller child, which was already u64). Taken unconditionally so the
-    // process-global counter resets each dump; folded INSIDE the parenthetical breakdown
-    // (never before the leading total) so the 23-03 harness capture of the launch total
-    // stays byte-stable and the launch-total field key is untouched.
+    // The ROOT + directly-built-child parallel-u64 build sub-counter. NONZERO proves
+    // those sites run the parallel u64 fixed-point kernel (distinct from the
+    // subtract-path smaller child, which is already u64). Taken unconditionally so the
+    // process-global counter resets each dump; folded INSIDE the parenthetical
+    // breakdown (never before the leading total) so the harness capture of the launch
+    // total stays byte-stable and the launch-total field key is untouched.
     let on_dev_rootbuild_u64 =
         lgbm_compute::kernels::grow_driver::on_device_rootbuild_u64_count_take();
-    // spike-056 fix (25-01/25-04, ODP2-05): the NEGATIVE guard — the f64 single-owner
-    // fused build counter. It bumps ONLY via the `LGBM_ONDEVICE_F64_FUSED=1` escape hatch,
-    // so on the DEFAULT (swapped) on-device path it stays 0. Emitting it INSIDE the
-    // parenthetical breakdown (after on_device_rootbuild_u64, never before the leading
-    // total) lets the 25-04 real-CUDA A/B harness PROVE the slow spike-052 kernel did not
-    // silently return — closing the Phase-24 counter trap on BOTH signals (rootbuild>0 AND
-    // f64_fused==0) from the log, not just by code inspection. The `device_launches=` key
-    // and its `(?P<launches>\d+)` capture are untouched.
+    // The NEGATIVE guard — the f64 single-owner fused build counter. It bumps ONLY via
+    // the `LGBM_ONDEVICE_F64_FUSED=1` escape hatch, so on the DEFAULT (swapped)
+    // on-device path it stays 0. Emitting it INSIDE the parenthetical breakdown (after
+    // on_device_rootbuild_u64, never before the leading total) lets an A/B harness prove
+    // the slow f64-fused kernel did not silently return, from the log rather than by
+    // code inspection alone. The `device_launches=` key and its `(?P<launches>\d+)`
+    // capture are untouched.
     let on_dev_f64_fused =
         lgbm_compute::kernels::grow_driver::on_device_f64_fused_count_take();
-    // 26-01 (ODP3-07): the BLOCKING-READBACK sync total — DISTINCT from `device_launches`
-    // (dispatches). Counts only real device→host syncs (scan / on-device partition /
-    // tree-split readbacks; a co-packed sibling scan is ONE). Plans 02/03 collapse this
-    // class on-device; Plan 05 asserts the aggregate drop. Taken unconditionally so the
+    // The BLOCKING-READBACK sync total — DISTINCT from `device_launches` (dispatches).
+    // Counts only real device→host syncs (scan / on-device partition / tree-split
+    // readbacks; a co-packed sibling scan is ONE). Taken unconditionally so the
     // process-global counter resets each dump; folded into the COUNTS line below.
     let on_dev_syncs =
         lgbm_compute::kernels::grow_driver::on_device_sync_count_take();
@@ -246,14 +240,14 @@ pub fn dump(label: &str) {
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
         // (WR-01/IN-02): both the host `*_resident=` terms and `on_device=` use the same
         // per-leaf unit, and tree-mutation/partition dispatches are excluded on both paths.
-        // The `device_launches=` KEY is kept verbatim (no rename) so the 23-03 harness
+        // The `device_launches=` KEY is kept verbatim (no rename) so the harness
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
             "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
-    // SPIKE-077: the on-device growth-loop PHASE LEDGER — the first attribution inside the
+    // The on-device growth-loop PHASE LEDGER — attribution inside the
     // `grow_tree_on_device_resident` black box (`in_learner_other=100%` by design on that
     // path). `host_other = wall − Σ(buckets)` is the honesty check: everything the buckets
     // missed (loop bookkeeping, SplitInfo handling, allocator). Taken unconditionally so the
@@ -296,7 +290,7 @@ pub fn dump(label: &str) {
         );
     }
 
-    // Spike-049: in_learner_other sub-breakdown.
+    // in_learner_other sub-breakdown.
     let root_fold = ROOT_FOLD_NS.swap(0, Ordering::Relaxed);
     let partition_new = PARTITION_NEW_NS.swap(0, Ordering::Relaxed);
     let resident_reset = RESIDENT_RESET_NS.swap(0, Ordering::Relaxed);

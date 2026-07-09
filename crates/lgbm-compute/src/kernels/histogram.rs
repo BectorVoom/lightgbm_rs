@@ -1,4 +1,4 @@
-//! Minimal `construct_histograms` cube kernel — the D-04a determinism anchor.
+//! Minimal `construct_histograms` cube kernel — the determinism anchor.
 //!
 //! Transcribes the C++ accumulation body verbatim from
 //! `LightGBM/src/io/dense_bin.hpp:99-141` (`ConstructHistogramInner`,
@@ -15,9 +15,9 @@
 //! i.e. the histogram is laid out stride-2 interleaved `[g0,h0,g1,h1,…]` with
 //! the grad cell at `bin*2` and the hess cell at `bin*2 + 1`. Gradients and
 //! hessians are read as f32 (`score_t = float`) but summed into f64 cells
-//! (`hist_t = double`, RESEARCH Pitfall 3).
+//! (`hist_t = double`).
 //!
-//! **Determinism mandate (RESEARCH Pitfall 1, D-04/D-04a):** cubecl-cpu spawns
+//! **Determinism mandate:** cubecl-cpu spawns
 //! one OS worker thread per cube unit — it is NOT a single-threaded sequential
 //! executor. To make the f64 fold bit-stable (matching the C++ `num_threads=1`
 //! ordered fold), the kernel is launched with `CubeDim::new_1d(1)` so exactly
@@ -31,8 +31,8 @@ use crate::error::ComputeError;
 use crate::runtime::ActiveRuntime;
 
 /// The single shared `#[cube]` single-owner ordered histogram fold — the SINGLE
-/// SOURCE OF TRUTH for the deterministic fold math (260608-n9j THE MERGE; the
-/// structural analog of 260608-mc5's [`crate::kernels::split::split_scan_body`]).
+/// SOURCE OF TRUTH for the deterministic fold math; the structural analog of
+/// [`crate::kernels::split::split_scan_body`].
 ///
 /// Generic over the accumulation cell type `N: Numeric`: both the f64 cpu-anchor
 /// launch kernel ([`construct_hist_kernel`], `N = f64`) AND the f32 hip-mirror
@@ -40,18 +40,17 @@ use crate::runtime::ActiveRuntime;
 /// the single-owner ordered fold, the `UNIT_POS == 0` ownership, the ascending
 /// row order, and the `bin<<1` stride-2 cell layout exist exactly ONCE. The ONLY
 /// difference between the two launch entry points is the `N` it is instantiated
-/// with — eliminating the prior hand-duplicated fold loop (a drift hazard).
+/// with — eliminating a hand-duplicated fold loop (a drift hazard).
 ///
 /// Only `UNIT_POS == 0` executes the fold, in ascending row order, so the
-/// summation order is fixed and matches the C++ `num_threads=1` reference
-/// (RESEARCH Pitfall 1, D-04/D-04a).
+/// summation order is fixed and matches the C++ `num_threads=1` reference.
 ///
 /// Gradients/hessians are always READ as f32 (`score_t = float`); the cast
 /// `N::cast_from(grad[i])` is the accumulation widening:
-/// - For `N = f64` it is the f32→f64 widening — byte-identical to the prior
-///   `f64::cast_from(grad[i])` (the bit-exact cpu anchor, Pitfall 3).
-/// - For `N = f32` it is the identity cast — observably identical to the prior
-///   `out[ti] += grad[i]` (the ~1e-6-tolerated hip mirror, Pitfall 2/3).
+/// - For `N = f64` it is the f32→f64 widening — byte-identical to
+///   `f64::cast_from(grad[i])` (the bit-exact cpu anchor).
+/// - For `N = f32` it is the identity cast — observably identical to
+///   `out[ti] += grad[i]` (the ~1e-6-tolerated hip mirror).
 #[cube]
 fn hist_fold_body<N: Numeric>(
     binned: &Array<u32>,
@@ -59,7 +58,7 @@ fn hist_fold_body<N: Numeric>(
     hess: &Array<f32>,
     out: &mut Array<N>,
 ) {
-    // Single-owner ordered fold — the deterministic anchor (Pitfall 1).
+    // Single-owner ordered fold — the deterministic anchor.
     if UNIT_POS == 0 {
         for i in 0..binned.len() {
             // ti = bin<<1; grad cell at ti, hess cell at ti+1 (dense_bin.hpp:120).
@@ -71,16 +70,16 @@ fn hist_fold_body<N: Numeric>(
     }
 }
 
-/// The single-owner ordered f64 fold (RESEARCH Pattern 1 + `dense_bin.hpp`) — a
+/// The single-owner ordered f64 fold (mirrors `dense_bin.hpp`) — a
 /// THIN `#[cube(launch)]` wrapper that delegates to the shared generic
-/// [`hist_fold_body`] with `N = f64`. After the 260608-n9j merge this kernel
-/// holds NO fold logic of its own; the math lives once in `hist_fold_body`,
-/// shared with the f32 hip mirror.
+/// [`hist_fold_body`] with `N = f64`. This kernel holds NO fold logic of its
+/// own; the math lives once in `hist_fold_body`, shared with the f32 hip
+/// mirror.
 ///
 /// This is the **cpu anchor** path: gradients/hessians are read as f32 but
-/// summed into f64 cells (`hist_t = double`) — bit-exact vs C++ (Pitfall 3).
+/// summed into f64 cells (`hist_t = double`) — bit-exact vs C++.
 /// `f64::cast_from(grad[i])` is exactly what `N::cast_from` lowers to for
-/// `N = f64`, so this is byte-identical to the pre-merge kernel.
+/// `N = f64`.
 #[cube(launch)]
 pub fn construct_hist_kernel(
     binned: &Array<u32>,
@@ -91,17 +90,17 @@ pub fn construct_hist_kernel(
     hist_fold_body::<f64>(binned, grad, hess, out);
 }
 
-/// The f32-cell mirror of [`construct_hist_kernel`] for the no-f64 hip device
-/// (RESEARCH Pitfall 2/3, CMP-04) — a THIN `#[cube(launch)]` wrapper that
-/// delegates to the shared generic [`hist_fold_body`] with `N = f32`. IDENTICAL
-/// fold structure and row order to the f64 kernel (they share the helper) — the
-/// ONLY difference is the accumulation cell type (`f32` instead of `f64`). hip
-/// (gfx1100) cannot allocate f64, so the histogram accumulates in f32, accepting
-/// the ~1e-6-tolerated divergence from the cpu f64 anchor (the divergence the
+/// The f32-cell mirror of [`construct_hist_kernel`] for the no-f64 hip device —
+/// a THIN `#[cube(launch)]` wrapper that delegates to the shared generic
+/// [`hist_fold_body`] with `N = f32`. IDENTICAL fold structure and row order to
+/// the f64 kernel (they share the helper) — the ONLY difference is the
+/// accumulation cell type (`f32` instead of `f64`). hip (gfx1100) cannot
+/// allocate f64, so the histogram accumulates in f32, accepting the
+/// ~1e-6-tolerated divergence from the cpu f64 anchor (the divergence the
 /// oracle contract was designed to absorb, NOT a bug). The capability gate
 /// (`has_f64 == false`) routes the hip launch here; cpu keeps the f64 kernel.
 /// For `N = f32`, `N::cast_from(grad[i])` is the identity cast — observably
-/// identical to the pre-merge `out[ti] += grad[i]`.
+/// identical to `out[ti] += grad[i]`.
 #[cube(launch)]
 pub fn construct_hist_kernel_f32(
     binned: &Array<u32>,
@@ -114,8 +113,8 @@ pub fn construct_hist_kernel_f32(
 
 /// Host-side `construct_histograms` on the cpu reference runtime.
 ///
-/// Validates every kernel input at the `Backend` boundary (Security V5, threat
-/// T-04-01) BEFORE the `unsafe` launch, then runs the single-owner ordered fold
+/// Validates every kernel input at the `Backend` boundary BEFORE the `unsafe`
+/// launch, then runs the single-owner ordered fold
 /// and returns the f64 histogram `[g0,h0,g1,h1,…]` of length `2 * num_bin`.
 ///
 /// # Errors
@@ -136,11 +135,11 @@ pub fn construct_histograms_cpu(
 /// cubecl-hip (the GPU `RocmBackend`). The gfx1100 executes this f64 kernel
 /// bit-exactly to the CPU anchor (verified: `max_abs_diff=0`), even though
 /// `probe_capabilities().has_f64` is reported `false` — the flag is conservative,
-/// the f64 op is real. Same single-owner ordered fold (`CubeDim::new_1d(1)`) and V5
-/// validation as before.
+/// the f64 op is real. Same single-owner ordered fold (`CubeDim::new_1d(1)`) and
+/// input validation as before.
 ///
 /// # Errors
-/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
+/// Same as [`construct_histograms_cpu`] (length / bin-range validation).
 pub fn construct_histograms_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     binned: &[u32],
@@ -148,7 +147,7 @@ pub fn construct_histograms_f64_on<R: cubecl::Runtime>(
     hess: &[f32],
     num_bin: u32,
 ) -> Result<Vec<f64>, ComputeError> {
-    // --- V5 boundary validation (T-04-01): never panic / UB on caller input ---
+    // --- Boundary validation: never panic / UB on caller input ---
     // Shared with the f32 hip path (`construct_histograms_f32_on`); `out` is sized
     // 2 * num_bin cells, the `bin<<1` index math is overflow-guarded, and every
     // bin is range-checked.
@@ -171,13 +170,13 @@ pub fn construct_histograms_f64_on<R: cubecl::Runtime>(
     // outlives the launch. We just allocated `h_bin`/`h_grad`/`h_hess` from
     // slices of length `n` and `h_out` for `out_len` f64 cells, and the input
     // validation above guarantees every `binned[i] < num_bin` so the kernel's
-    // `out[bin*2 + 1]` write stays within the `out_len` allocation (T-04-01/02).
-    // All cubecl `unsafe` is confined to this crate (CMP-01).
+    // `out[bin*2 + 1]` write stays within the `out_len` allocation.
+    // All cubecl `unsafe` is confined to this crate.
     unsafe {
         construct_hist_kernel::launch(
             client,
             CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(1), // single unit owns the entire ordered fold (Pitfall 1)
+            CubeDim::new_1d(1), // single unit owns the entire ordered fold
             ArrayArg::from_raw_parts(h_bin, n),
             ArrayArg::from_raw_parts(h_grad, n),
             ArrayArg::from_raw_parts(h_hess, n),
@@ -189,23 +188,22 @@ pub fn construct_histograms_f64_on<R: cubecl::Runtime>(
     Ok(f64::from_bytes(&bytes).to_vec())
 }
 
-/// **Native** host f64 fold — the production cpu-anchor path (R2).
+/// **Native** host f64 fold — the production cpu-anchor path.
 ///
 /// Bit-IDENTICAL to [`construct_histograms_cpu`] (the single-unit
 /// `construct_hist_kernel`): the exact same ascending-row-order accumulation of
 /// `f32`-read gradients/hessians into `f64` cells, with the same `bin << 1` index
-/// math and the same V5 boundary validation. The cubecl-cpu kernel launches that
+/// math and the same boundary validation. The cubecl-cpu kernel launches that
 /// loop as a `CubeDim::new_1d(1)` single owner — a fixed ~20–50µs dispatch cost
 /// per call wrapping a trivial sequential loop. This native version drops that
-/// overhead (5–210× faster per call; `probe_hist` measured bit_exact=true at
-/// R=300/2000/20000) while producing byte-identical output, because the
-/// arithmetic and order are the same.
+/// overhead (5–210× faster per call) while producing byte-identical output,
+/// because the arithmetic and order are the same.
 ///
 /// `construct_histograms_cpu` is retained for the kernel-parity / ROCm-mirror
 /// tests; the f32 hip path (`construct_histograms_f32_on`) is untouched.
 ///
 /// # Errors
-/// Same as [`construct_histograms_cpu`] (length / bin-range validation, V5).
+/// Same as [`construct_histograms_cpu`] (length / bin-range validation).
 pub fn construct_histograms_cpu_native(
     binned: &[u32],
     grad: &[f32],
@@ -234,13 +232,13 @@ pub fn construct_histograms_cpu_native(
     Ok(out)
 }
 
-/// **Fold-in-place** native f64 accumulator — the per-feature build hot path (R3).
+/// **Fold-in-place** native f64 accumulator — the per-feature build hot path.
 ///
 /// Folds the SAME ascending rows as [`construct_histograms_cpu_native`] directly
 /// into a caller-owned, **caller-pre-zeroed** `out` sub-slice — NO intermediate
 /// per-feature `Vec`, NO copy. This eliminates the per-feature alloc + memset +
-/// memcpy that spike 002 localized as ~63% of low-row train time (build = 232µs/
-/// iter vs C++ 44.5µs/iter).
+/// memcpy that measurably dominated low-row train time (build = 232µs/iter vs
+/// C++ 44.5µs/iter).
 ///
 /// The arithmetic is byte-for-byte identical to `construct_histograms_cpu_native`:
 /// the same rows in the same ascending order, the same `bin << 1` cell layout, the
@@ -258,8 +256,8 @@ pub fn construct_histograms_cpu_native(
 ///
 /// # Errors
 /// - Same length / bin-range validation as [`construct_histograms_cpu_native`]
-///   (V5, runs BEFORE any write).
-/// - [`ComputeError::LengthMismatch`] if `out.len() < 2 * num_bin` (no panic, V5).
+///   (runs BEFORE any write).
+/// - [`ComputeError::LengthMismatch`] if `out.len() < 2 * num_bin` (no panic).
 pub fn accumulate_histogram_into(
     binned: &[u32],
     grad: &[f32],
@@ -268,7 +266,7 @@ pub fn accumulate_histogram_into(
     out: &mut [f64],
 ) -> Result<(), ComputeError> {
     let out_len = validate_histogram_inputs(binned, grad, hess, num_bin)?;
-    // V5: the caller's sub-slice must hold the full 2*num_bin histogram. Surface a
+    // The caller's sub-slice must hold the full 2*num_bin histogram. Surface a
     // typed error (no panic) BEFORE writing any cell.
     if out.len() < out_len {
         return Err(ComputeError::LengthMismatch {
@@ -336,37 +334,37 @@ fn validate_histogram_inputs(
 /// family approach), we allocate the fixed 256-bin max once (2 KiB ≪ the gfx1100
 /// 64 KiB LDS budget) and drive the active length with the runtime `lds_len`.
 ///
-/// Widened from `rocm` to the `gpu` umbrella (quick-260626-igc): the two LDS
+/// Gated on the `gpu` umbrella feature rather than `rocm` specifically: the two LDS
 /// construct items (`construct_hist_kernel_lds_f32` + `construct_histograms_lds_f32_on`)
 /// that cuda/wgpu reuse reference this cap, so it must compile under any GPU backend.
 /// It is a plain `usize` const — no `cubecl_hip_sys`/`rocm_client` involvement.
 #[cfg(feature = "gpu")]
 const HIST_LDS_MAX: usize = 512;
 
-/// Fixed-point quantize scale S = 2^30 (phase-11, spike-018a). The resident LDS BUILD
+/// Fixed-point quantize scale S = 2^30. The resident LDS BUILD
 /// accumulates `round(value * S)` as a two's-complement i64 stored BITS-as-u64 via
 /// integer LDS atomics (`Atomic<u64>::fetch_add`), then `fix_compact_kernel` dequantizes
 /// `(bits as i64) / S` back to f64 in its widen pass. S = 2^30 keeps ≥ ~9 fractional
-/// bits while leaving the i64 magnitude safe to ~1e9 rows × |g| ≤ 8 (spike-018b). The
+/// bits while leaving the i64 magnitude safe to ~1e9 rows × |g| ≤ 8. The
 /// build-side constant is f32 (the quantize multiplies the f32 `ord_g`/`ord_h`); the
 /// dequant-side `SCALE_F64` (in `fix_compact_kernel`) is the same value in f64.
 #[cfg(feature = "gpu")]
 const SCALE_F32: f32 = 1_073_741_824.0; // 2^30
 
-/// Row-partition (`grid_dim_y` analog) tuning — spike-007 (`.planning/spikes/007-*`).
+/// Row-partition (`grid_dim_y` analog) tuning.
 /// The LDS build launches one cube per feature; on a large leaf that is only
 /// `num_features` workgroups, starving the GPU (gfx1100 = 96 CUs). Splitting a feature's
-/// rows across `P` cubes raises occupancy. Spike measured a stable **1.3–1.4×** at
-/// `P=16` (~8 workgroups/CU); **`P=32` over-partitioned and regressed**, so `P` is a tuned
+/// rows across `P` cubes raises occupancy: `P=16` (~8 workgroups/CU) gives a stable
+/// **1.3–1.4×** speedup, while **`P=32` over-partitions and regresses**, so `P` is a tuned
 /// target, never a maximize.
 ///
 /// `ROWPART_MIN_LEAF`: below this leaf-row count, `P=1` (byte-identical to the pre-row-part
 /// kernel). Well above the `RESIDENT_MIN_NUM_DATA=12_000` resident gate and the ≤8k-row
 /// parity-test shapes, so every existing parity test runs the unchanged `P=1` path — the
-/// large-leaf f32 divergence the spike found (4e-7→~2e-5 rel) only appears above this gate.
+/// large-leaf f32 divergence (4e-7→~2e-5 rel) only appears above this gate.
 #[cfg(feature = "gpu")]
 const ROWPART_MIN_LEAF: usize = 256_000;
-/// Target cubes per Compute Unit — preserves spike-007's "~8 workgroups/CU" intent.
+/// Target cubes per Compute Unit — preserves the "~8 workgroups/CU" intent.
 /// `target_cubes = num_cu * CUBES_PER_CU` (queried at runtime, cached once).
 #[cfg(feature = "gpu")]
 const CUBES_PER_CU: u32 = 8;
@@ -375,7 +373,7 @@ const CUBES_PER_CU: u32 = 8;
 /// 64 = `8 wkgrps × 8 CU`, matching the real 8-CU Radeon 860M APU on this box.
 #[cfg(feature = "gpu")]
 const ROWPART_TARGET_CUBES_FALLBACK: u32 = 64;
-/// Spike-007 sweet spot; clamp so we never over-partition into the P=32 regression.
+/// Measured sweet spot; clamp so we never over-partition into the P=32 regression.
 #[cfg(feature = "gpu")]
 const ROWPART_P_MAX: u32 = 16;
 
@@ -408,8 +406,8 @@ fn resolve_target_cubes(env_override: Option<u32>, queried_cu: Option<u32>) -> u
 ///
 /// HIP-specific (the FFI fallback uses `cubecl_hip_sys`, a rocm-only dep), so this stays
 /// `#[cfg(feature = "rocm")]`. Non-rocm GPU backends (cuda/wgpu) use the
-/// [`ROWPART_TARGET_CUBES_FALLBACK`] heuristic via the `None`-returning twin below
-/// (quick-260627-qxl) — the resident pool is the parity win; CU-derived row-partition
+/// [`ROWPART_TARGET_CUBES_FALLBACK`] heuristic via the `None`-returning twin below —
+/// the resident pool is the parity win; CU-derived row-partition
 /// tuning is a perf refinement a CUDA build can add later by reading the cubecl-reported
 /// `num_streaming_multiprocessors` (populated on cuda).
 #[cfg(feature = "rocm")]
@@ -440,7 +438,7 @@ fn query_num_cu() -> Option<u32> {
     None
 }
 
-/// Non-rocm GPU twin (quick-260627-qxl): cuda/wgpu have no `cubecl_hip_sys`, so the
+/// Non-rocm GPU twin: cuda/wgpu have no `cubecl_hip_sys`, so the
 /// CU-count query returns `None` and [`rowpart_target_cubes`] falls back to
 /// [`ROWPART_TARGET_CUBES_FALLBACK`]. Correct (the resident pool is the parity win);
 /// a CUDA build can later read `num_streaming_multiprocessors` for a tuned target.
@@ -450,13 +448,13 @@ fn query_num_cu() -> Option<u32> {
 }
 
 /// The row-partition target-cubes value, queried at most ONCE per process and cached
-/// (`row_partition_count` runs per leaf, so the FFI CU-count query must not repeat —
-/// T-jcr-02). Resolution: env override → queried CU count × `CUBES_PER_CU` → FALLBACK
+/// (`row_partition_count` runs per leaf, so the FFI CU-count query must not repeat).
+/// Resolution: env override → queried CU count × `CUBES_PER_CU` → FALLBACK
 /// (see [`resolve_target_cubes`] / [`query_num_cu`]).
 ///
 /// Hardware note: this device is an 8-CU APU (Radeon 860M / gfx1152 spoofed as
 /// gfx1100), so the target ≈ 64 (8 × `CUBES_PER_CU`), NOT 768 (which assumed a phantom
-/// 96-CU gfx1100). Changing `P` alters the f32 partial-sum grouping (spike-007: `P≥2`
+/// 96-CU gfx1100). Changing `P` alters the f32 partial-sum grouping (`P≥2`
 /// widens GPU-vs-`P=1` divergence to ~2e-5, WITHIN the ~1e-6-best-effort ROCm gate — the
 /// GPU path was never bit-exact; the cpu f64 anchor is untouched).
 #[cfg(feature = "gpu")]
@@ -496,12 +494,12 @@ pub fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
 
 
 
-/// DEVICE-RESIDENT batched per-leaf histogram kernel (260608-nn7 L1). Identical
+/// DEVICE-RESIDENT batched per-leaf histogram kernel. Identical
 /// `(feature f, leaf-row k)` unit mapping to [`construct_leaf_hist_batched_kernel`]
 /// BUT gathers the bin from the device-resident feature-column buffer on device
 /// (`resident_bins[f * num_data + leaf_rows[k]]`) instead of from a per-leaf
-/// host-gathered `gathered_bins[idx]` re-uploaded every leaf. This is the L1 win:
-/// the `[num_features × rows]` host bin upload per leaf is replaced by a one-time
+/// host-gathered `gathered_bins[idx]` re-uploaded every leaf. This replaces the
+/// `[num_features × rows]` host bin upload per leaf with a one-time
 /// column upload (the resident buffer) + a small per-leaf `leaf_rows` index upload.
 ///
 /// `num_data` is the resident column stride (the full train row count) passed as a
@@ -510,7 +508,7 @@ pub fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
 #[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn construct_leaf_hist_resident_kernel<B: Int>(
-    resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
+    resident_bins: &Array<B>, // native bin width (u8/u16/u32)
     leaf_rows: &Array<u32>,
     ord_g: &Array<f32>,
     ord_h: &Array<f32>,
@@ -526,7 +524,7 @@ pub fn construct_leaf_hist_resident_kernel<B: Int>(
         let k = idx % r; // leaf-row position
         // Gather on device from the resident column: feature f, the leaf's k-th row.
         let row = leaf_rows[k] as usize;
-        // quick-260621-qix: native-width read widened to a u32 INDEX (value-faithful).
+        // native-width read widened to a u32 INDEX (value-faithful).
         let bin = u32::cast_from(resident_bins[f * num_data + row]) as usize;
         let cell = slot_off[f] as usize + bin * 2;
         out[cell].fetch_add(ord_g[k]);
@@ -536,8 +534,8 @@ pub fn construct_leaf_hist_resident_kernel<B: Int>(
 
 
 // ===========================================================================
-// LDS-PRIVATIZED batched/resident RAW build (260609-fw1, eo5 Finding #2 — the
-// hot-path follow-up to the single-feature `construct_hist_kernel_lds_f32`).
+// LDS-PRIVATIZED batched/resident RAW build — the
+// hot-path follow-up to the single-feature `construct_hist_kernel_lds_f32`.
 //
 // The naive batched/resident kernels above run ONE unit per `(feature, leaf-row)`
 // pair, each atomic-adding straight into the GLOBAL concatenated output — so rows
@@ -560,7 +558,7 @@ pub fn construct_leaf_hist_resident_kernel<B: Int>(
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
-    resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
+    resident_bins: &Array<B>, // native bin width (u8/u16/u32)
     leaf_rows: &Array<u32>,
     ord_g: &Array<f32>,
     ord_h: &Array<f32>,
@@ -583,7 +581,7 @@ pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
     }
     sync_cube();
     // 2. scatter THIS partition's strided rows into LDS (resident on-device gather).
-    //    Row-partitioned (260615 phase-09 / spike-007): `CubeCount = (num_features, P)`, so
+    //    Row-partitioned: `CubeCount = (num_features, P)`, so
     //    cube `(f, p)` owns row-slice `p*cd, +P*cd, …`. P comes from `CUBE_COUNT_Y`; P=1
     //    (the small/medium gate) reduces this to the prior `k=UNIT_POS, stride cd` loop
     //    byte-for-byte. All P cubes of feature f atomic-merge into the same global slot
@@ -592,7 +590,7 @@ pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
     let stride = CUBE_COUNT_Y as usize * cd;
     let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
     while k < r {
-        // quick-260621-qix: bin is read at native width B, widened to a u32 INDEX —
+        // bin is read at native width B, widened to a u32 INDEX —
         // byte-faithful to the prior u32 read (value identical, only storage narrower).
         let bin = u32::cast_from(resident_bins[col + leaf_rows[k] as usize]) as usize;
         let ti = bin * 2;
@@ -609,7 +607,7 @@ pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
     }
 }
 
-/// u64 TWO'S-COMPLEMENT FIXED-POINT resident LDS build (phase-11, spike-018/019). A
+/// u64 TWO'S-COMPLEMENT FIXED-POINT resident LDS build. A
 /// byte-for-byte twin of [`construct_leaf_hist_resident_lds_kernel`] above — IDENTICAL
 /// resident-column gather, `slot_off` sentinel `feat_len`, row-partition over
 /// `CUBE_POS_Y`/`CUBE_COUNT_Y`, per-feature LDS sub-hist, and LDS→global merge — with
@@ -619,22 +617,22 @@ pub fn construct_leaf_hist_resident_lds_kernel<B: Int>(
 /// Each grad/hess value is quantized `round(value * S)` (S = `SCALE_F32` = 2^30) to an
 /// i64, whose BITS are stored as u64; a wrapping `Atomic<u64>::fetch_add` is exactly a
 /// two's-complement signed i64 add, so the bins sum correctly with NO bias offset (each
-/// bin sums a variable row count — a bias would be wrong, spike-018b). The dequant
+/// bin sums a variable row count — a bias would be wrong). The dequant
 /// `(bits as i64) / S` happens later in `fix_compact_kernel`'s widen pass.
 ///
-/// HARD CONSTRAINT (spike-018b, CONTEXT line 24): the cell type MUST be `Atomic<u64>`
+/// HARD CONSTRAINT: the cell type MUST be `Atomic<u64>`
 /// with `.store(0u64)` / `.fetch_add(qbits)`. NEVER `Atomic<i64>` — cubecl-hip 0.10
 /// lowers `Atomic<i64>::store` to `atomicExch(long long*)`, which HIP lacks (compiles,
 /// fails at runtime). LDS stays `HIST_LDS_MAX` cells (same element COUNT, 2× bytes =
 /// 4 KiB/cube, well within the 64 KiB budget). f64 atomics not needed — the wide i64
-/// accumulator IS the precision win (~3600× better than f32 atomics, spike-018a).
+/// accumulator IS the precision win (~3600× better than f32 atomics).
 #[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
-    resident_bins: &Array<B>, // quick-260621-qix: native bin width (u8/u16/u32)
+    resident_bins: &Array<B>, // native bin width (u8/u16/u32)
     leaf_rows: &Array<u32>,
-    // 26-01 (ODP3-01/M2): grad/hess. When `resident_gh` is FALSE (host-gather path,
+    // Grad/hess. When `resident_gh` is FALSE (host-gather path,
     // unchanged) these are the PRE-GATHERED leaf-row-ordered `[R]` slices and are indexed
     // by the leaf-row position `k`. When `resident_gh` is TRUE (the on-device gather path)
     // these are the FULL once-per-grow RESIDENT `[num_data]` grad/hess buffers and are
@@ -645,7 +643,7 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
     slot_off: &Array<u32>, // length num_features + 1 (sentinel = slot_len)
     num_data: usize,
     out: &mut Array<Atomic<u64>>,
-    // 26-01 (ODP3-01/M2): comptime toggle — TRUE gathers grad/hess from the resident
+    // comptime toggle — TRUE gathers grad/hess from the resident
     // full buffers via `leaf_rows[k]`; FALSE keeps the byte-identical pre-gathered `[k]`
     // indexing (the comptime branch compiles the unused arm out, so the host-gather path
     // is unchanged). Read count `R` from `leaf_rows.len()` so it is correct for BOTH the
@@ -677,7 +675,7 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
         let row = leaf_rows[k] as usize;
         let bin = u32::cast_from(resident_bins[col + row]) as usize;
         let ti = bin * 2;
-        // 26-01 (ODP3-01/M2): comptime-select the grad/hess index — `row` gathers on device
+        // comptime-select the grad/hess index — `row` gathers on device
         // from the resident full buffers (resident_gh), `k` reads the pre-gathered slice.
         // The comptime branch is resolved at compile time, so the host-gather path emits the
         // byte-identical `ord_g[k]` access it did before.
@@ -699,10 +697,10 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
 }
 
 // ===========================================================================
-// NET-NEW (Plan 16-03 / ODL-09): the §13 feature-partition TWO-TIER build kernel.
+// The §13 feature-partition TWO-TIER build kernel.
 //
-// Lifts the shipped Phase-11 u64 fixed-point LDS accumulation body
-// (`construct_leaf_hist_resident_lds_kernel_u64`, above — left BYTE-UNCHANGED, D-03)
+// Lifts the u64 fixed-point LDS accumulation body
+// (`construct_leaf_hist_resident_lds_kernel_u64`, above — left BYTE-UNCHANGED)
 // onto the design-doc §7.1 / §13 partition geometry (`CalcConstructHistogramKernelDim`):
 //   * `CUBE_POS_X` = feature PARTITION (was one cube per FEATURE);
 //   * `UNIT_POS_X` = one COLUMN within the partition's `[off[p], off[p+1])` range;
@@ -713,19 +711,19 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
 // NO grid barrier, so the cross-block reduction MUST be a global atomic (many y-blocks
 // cover disjoint row stripes of the same partition). Dense-vs-sparse is ONE `#[cube]`
 // generic with a `#[comptime] is_sparse` branch (the §7.2 Dense/Sparse axis). The cpu
-// f64 anchor stays the single-owner `construct_histograms_f64_on` fold (D-06); this
+// f64 anchor stays the single-owner `construct_histograms_f64_on` fold; this
 // kernel is the hip path only (`Atomic<u64>` is unsupported / nondeterministic on
-// cubecl-cpu, Pitfall 7).
+// cubecl-cpu).
 // ===========================================================================
 
 
 
-/// De-quant the raw u64 fixed-point histogram to `hist_t` (f64) exactly ONCE
-/// (Plan 16-03 Task 3 / D-01/D-08): `(bits as i64) / 2^30` — the SAME 2^30 scale as the
+/// De-quant the raw u64 fixed-point histogram to `hist_t` (f64) exactly ONCE:
+/// `(bits as i64) / 2^30` — the SAME 2^30 scale as the
 /// build side ([`SCALE_F32`]), mirroring `fix_compact_kernel`'s folded dequant first pass
-/// (`(bits as i64)/SCALE_F64`). Kept a SEPARATE pass (RESEARCH Pattern 3 / Open Q1) so
+/// (`(bits as i64)/SCALE_F64`). Kept a SEPARATE pass so
 /// BUILD stays a clean u64-only accumulator and the cpu-anchor split is unentangled; the
-/// 16-04 Fix step then operates on the durable `hist_t`. Round-trip exact for
+/// Fix step then operates on the durable `hist_t`. Round-trip exact for
 /// integer-valued cells, ≤ 1/2^30 abs error otherwise — well inside the ~1e-6 ROCm gate.
 #[cfg(feature = "gpu")]
 #[must_use]
@@ -734,7 +732,7 @@ pub fn dequant_leaf_hist(raw: &[u64]) -> Vec<f64> {
     raw.iter().map(|&bits| (bits as i64) as f64 / SCALE_F64).collect()
 }
 
-/// f32 mirror of [`dequant_leaf_hist`] for the no-f64 hip device (CMP-04): the durable
+/// f32 mirror of [`dequant_leaf_hist`] for the no-f64 hip device: the durable
 /// `hist_t` on ROCm/CUDA is f32. Same 2^30 scale; the ~1e-6 ROCm gate absorbs the f32
 /// rounding (never the cpu f64 anchor).
 #[cfg(feature = "gpu")]
@@ -745,7 +743,7 @@ pub fn dequant_leaf_hist_f32(raw: &[u64]) -> Vec<f32> {
 }
 
 /// Spill-buffer cell count for the `_GlobalMemory` path (`grid_dim_y · num_total_bin · 2`),
-/// `checked_mul`-guarded (D-09 / T-16-03-03). A separate `#[must_use]` helper so the
+/// `checked_mul`-guarded. A separate `#[must_use]` helper so the
 /// overflow guard is unit-testable without a device.
 ///
 /// # Errors
@@ -772,14 +770,14 @@ pub fn spill_cells(grid_dim_y: usize, num_total_bin: usize) -> Result<usize, Com
 
 
 // ===========================================================================
-// FAITHFUL CubeCL MIRROR of CUDAConstructHistogramDenseKernel (quick-260619-j9t)
+// FAITHFUL CubeCL MIRROR of CUDAConstructHistogramDenseKernel
 //
 // Structural port of LightGBM's signature CUDA inner kernel
 // (`LightGBM-release-4.6.0.99/src/treelearner/cuda/cuda_histogram_constructor.cu`
 // lines ~18-70, `CUDAConstructHistogramDenseKernel`) — the histogram-construction
 // kernel of `cuda_single_gpu_tree_learner`. It ships as a TESTED PRIMITIVE
 // (rocm_cuda_mirror.rs), NOT wired into the production build/resident path (that
-// live wiring is the deferred follow-up DEF-f8u-01).
+// live wiring is a deferred follow-up).
 //
 // The signature CUDA structure this reproduces, distinct from the existing
 // batched/resident LDS kernels (which pre-gather `ord_g[k]` / `leaf_rows[k]`):
@@ -824,25 +822,25 @@ fn slot_off_sentinel(slot_off: &[usize], slot_len: usize) -> (Vec<u32>, u32) {
 }
 
 // ===========================================================================
-// phase-13 (13-02) — CubeCL AUTOTUNE for the histogram-BUILD row-partition `P`.
+// CubeCL AUTOTUNE for the histogram-BUILD row-partition `P`.
 //
-// CONTEXT (LOCKED): autotune is the DEFAULT rocm selector for the resident-build
+// Autotune is the DEFAULT rocm selector for the resident-build
 // `P`; `row_partition_count` becomes only the documented cold-start / cache-miss /
-// `LGBM_AUTOTUNE=0` fallback bound (NOT the steady-state selector). spike-040 found
-// the heuristic under-partitions to P=1 at the 50-feature production width (~10%
+// `LGBM_AUTOTUNE=0` fallback bound (NOT the steady-state selector). The
+// heuristic under-partitions to P=1 at the 50-feature production width (~10%
 // slow on the 8-CU APU); autotune re-derives the measured-fastest P per occupancy
 // regime and self-calibrates on any future GPU.
 //
-// Three corrections this wiring honors (gpu-kernel-autotuning.md / spikes 037-039):
-//   - FRESH-OUTPUT InputGenerator (spike-038): the build kernel ACCUMULATES via
+// Three corrections this wiring honors (see gpu-kernel-autotuning.md):
+//   - FRESH-OUTPUT InputGenerator: the build kernel ACCUMULATES via
 //     `fetch_add`, so `CloneInputGenerator` (which shares the real `out` handle)
 //     corrupts it 27× during the cold benchmark reps. `FreshOutGenerator` hands each
 //     benchmark a throwaway zeroed `out` ⇒ the real `out` is touched exactly ONCE
 //     (the final clean winning run) ⇒ grad-conservation holds.
-//   - log2(rows) occupancy-regime AutotuneKey (spike-039): keying on EXACT `rows`
+//   - log2(rows) occupancy-regime AutotuneKey: keying on EXACT `rows`
 //     is a per-leaf tuning STORM (every node a cold ~40ms tune). `LaunchKey.bucket =
 //     size_band(rows)` so every leaf in the same power-of-two decade shares a key.
-//   - serde-backed persistent cache (spike-037): the winner round-trips across
+//   - serde-backed persistent cache: the winner round-trips across
 //     processes via `target/autotune/<ver>/<device>/*.json.log`.
 //
 // The TunableSet is rebuilt FRESH each call (`Arc::new(build_pset_tunable_set(..))`,
@@ -860,13 +858,13 @@ use crate::kernels::autotune::{self, LaunchKey};
 use cubecl::tune::{local_tuner, InputGenerator, LocalTuner, Tunable, TunableSet, TuneInputs};
 
 /// The row-partition candidate set the BUILD tuner sweeps. Each entry `> ROWPART_P_MAX`
-/// is skipped (so this stays correct if the clamp ever rises). spike-040: the P4..P16
+/// is skipped (so this stays correct if the clamp ever rises). The P4..P16
 /// curve is FLAT — the only job is to AVOID P1 at the production width — so the set is
 /// deliberately coarse (do not over-fine it into a slow cold tune). `1` stays in so the
 /// tuner can still pick it for small leaves where partitioning only adds merge overhead.
 ///
-/// `pub` so the 13-04 parity gate (`oracle-harness/tests/kernel_parity.rs`) imports the
-/// SAME source of truth it sweeps (WR-02): a hand-copied mirror would silently stop
+/// `pub` so the parity gate (`oracle-harness/tests/kernel_parity.rs`) imports the
+/// SAME source of truth it sweeps: a hand-copied mirror would silently stop
 /// covering a newly-added `P`. Stays `#[cfg(feature = "rocm")]` so the default build is
 /// byte-unchanged.
 #[cfg(feature = "gpu")]
@@ -877,11 +875,11 @@ pub const BUILD_PSET: &[u32] = &[1, 4, 8, 16, 32];
 #[cfg(feature = "gpu")]
 static BUILD_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build");
 
-/// The `LGBM_AUTOTUNE_FORCE_P` debug/parity seam (consumed by 13-04's all-variants
+/// The `LGBM_AUTOTUNE_FORCE_P` debug/parity seam (consumed by the all-variants
 /// anchor gate). Reads the env FRESH on every call (mirrors `scan_cube_dim`, NOT
 /// `OnceLock`) so a parity test can pin a single `P` per-launch within one process.
 /// `Some(k)` clamps `k` to `[1, ROWPART_P_MAX]`; non-numeric / `0` / unset ⇒ `None`
-/// (fall through to autotune, then the heuristic) — NEVER a no-launch (T-13-02-01).
+/// (fall through to autotune, then the heuristic) — NEVER a no-launch.
 #[cfg(feature = "gpu")]
 fn force_row_partition() -> Option<u32> {
     std::env::var("LGBM_AUTOTUNE_FORCE_P")
@@ -903,11 +901,11 @@ fn force_row_partition() -> Option<u32> {
 ///
 /// `fixed_point` selects the u64 fixed-point twin (`out` is `Atomic<u64>`) vs the f32
 /// kernel; `width` dispatches the `<B: Int>` monomorphization on the resident buffer's
-/// native element width (quick-260621-qix). SAFETY: identical to the in-place macro
+/// native element width. SAFETY: identical to the in-place macro
 /// launches — every device access is host-proven in range before upload (`leaf_rows` ⊂
 /// `[0, num_data)`, `resident_bins.len() == num_features*num_data`, `slot_off` sentinel,
 /// `out` sized `slot_len`), so `launch_unchecked` (dropping bounds-check codegen) is sound
-/// and numerically identical (NRW-01 / CMP-01). All cubecl unsafe is confined here.
+/// and numerically identical. All cubecl unsafe is confined here.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn launch_build_at<R: cubecl::Runtime>(
@@ -935,7 +933,7 @@ fn launch_build_at<R: cubecl::Runtime>(
                     ArrayArg::from_raw_parts(inputs[4].clone(), num_features + 1),
                     num_data,
                     ArrayArg::from_raw_parts(inputs[5].clone(), slot_len),
-                    // 26-01: the autotune tuner set is host-gather-shaped (pre-gathered `[R]`
+                    // the autotune tuner set is host-gather-shaped (pre-gathered `[R]`
                     // ord_g/ord_h at inputs[2]/[3]); the resident on-device gather bypasses the
                     // tuner (direct launch in `resident_raw_build_into`), so this is always false.
                     false,
@@ -976,7 +974,7 @@ fn launch_build_at<R: cubecl::Runtime>(
     }
 }
 
-/// THE spike-038 FIX — an [`InputGenerator`] that hands each autotune BENCHMARK rep a
+/// An [`InputGenerator`] that hands each autotune BENCHMARK rep a
 /// FRESH zeroed `out` handle (slot index 5), leaving the caller's real `out` untouched
 /// until the final clean winning run. The build kernel ACCUMULATES (`fetch_add`), so a
 /// `CloneInputGenerator` (ref-count bump, same device buffer) would let every rep of
@@ -996,7 +994,7 @@ impl<R: cubecl::Runtime> InputGenerator<LaunchKey, Vec<cubecl::server::Handle>>
 {
     // Spell the GAT return through `<Vec<Handle> as TuneInputs>::At<'a>` (E0195 guard):
     // `Vec<Handle>: TuneInputs` has `At<'a> = Vec<Handle>`, but writing the concrete type
-    // here makes the closure-lifetime inference fail; mirror spike-038 exactly.
+    // here makes the closure-lifetime inference fail; keep this exact form.
     fn generate<'a>(
         &self,
         _key: &LaunchKey,
@@ -1019,8 +1017,8 @@ impl<R: cubecl::Runtime> InputGenerator<LaunchKey, Vec<cubecl::server::Handle>>
 /// [`launch_build_at`], reusing the SAME kernel + `CubeCount(num_features, P, 1)` +
 /// `CubeDim 256` the production path uses — only `P` varies), keyed by a `LaunchKey`
 /// `{ bucket: size_band(rows), feats: num_features, bins: num_bin }` (the occupancy
-/// regime, spike-039), with a [`FreshOutGenerator`] so the accumulating build is
-/// benchmark-safe (spike-038). Rebuilt fresh each call (the dimensions bake into the
+/// regime), with a [`FreshOutGenerator`] so the accumulating build is
+/// benchmark-safe. Rebuilt fresh each call (the dimensions bake into the
 /// closures); the persistent winner lives in [`BUILD_TUNER`]'s key state, not here.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
@@ -1079,27 +1077,27 @@ fn build_pset_tunable_set<R: cubecl::Runtime>(
 /// `build_leaf_histograms_resident_f32_on` (removed) and the resident chain
 /// [`build_fix_compact_resident_f64_on`] so the LDS/naive decision lives in ONE place.
 ///
-/// `fixed_point` selects the LDS BUILD cell type (phase-11):
+/// `fixed_point` selects the LDS BUILD cell type:
 ///   - `false` → f32 atomics ([`construct_leaf_hist_resident_lds_kernel`]); `h_out` is an
 ///     f32 buffer the caller reads back / widens as f32 (the readback oracle path).
 ///   - `true`  → u64 two's-complement fixed-point atomics
 ///     ([`construct_leaf_hist_resident_lds_kernel_u64`]); `h_out` is a u64 buffer the
 ///     caller dequantizes `(bits as i64)/2^30 → f64` (the live `fix_compact_kernel` path).
-/// The NAIVE >256-bin fallback ALWAYS stays f32 (CONTEXT Claude's-discretion); a caller
+/// The NAIVE >256-bin fallback ALWAYS stays f32; a caller
 /// that requests `fixed_point` MUST guarantee every feature ≤ 256 bins (the resident
 /// chain does — `max_bin ≤ 255` keeps `max_w ≤ HIST_LDS_MAX`), else the f32 naive write
 /// would be mis-dequantized. The `fixed_point` path asserts the LDS branch was taken.
 ///
-/// ROW-PARTITION `P` SELECTION (phase-13, 13-02 — LDS branch only): `P` is chosen by a
+/// ROW-PARTITION `P` SELECTION (LDS branch only): `P` is chosen by a
 /// three-way pick, DEFAULT-ON CubeCL autotune:
 ///   1. `LGBM_AUTOTUNE_FORCE_P=k` → pin a single `P=k` launch (NO tuning) — the
-///      parity/debug seam (13-04 all-variants anchor gate).
+///      parity/debug seam (the all-variants anchor gate).
 ///   2. else autotune (default) → the [`BUILD_TUNER`] picks the measured-fastest `P`
 ///      over [`BUILD_PSET`] per occupancy regime ([`LaunchKey`] = `size_band(rows)`),
 ///      benchmark-safe via [`FreshOutGenerator`] (the build ACCUMULATES). Both live
 ///      resident classes route here: the f32-resident build stays within the ~1e-6
 ///      best-effort gate across `P`; the u64 fixed-point build is parity-neutral
-///      (order-independent integer merge). 13-04 gates both vs the CPU f64 anchor.
+///      (order-independent integer merge). Both are gated vs the CPU f64 anchor.
 ///   3. else (`LGBM_AUTOTUNE=0`) → the [`row_partition_count`] heuristic + the existing
 ///      direct launch, byte-for-byte unchanged (the documented cold-start / fallback
 ///      bound). The NAIVE >256-bin path is NOT autotuned (single launch, unchanged).
@@ -1108,7 +1106,7 @@ fn build_pset_tunable_set<R: cubecl::Runtime>(
 fn resident_raw_build_into<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
-    // quick-260621-qix: element width of `resident_bins` (dispatches the kernel `<B: Int>`).
+    // Element width of `resident_bins` (dispatches the kernel `<B: Int>`).
     width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
@@ -1118,10 +1116,10 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
     gradients: &[f32],
     hessians: &[f32],
     h_out: cubecl::server::Handle,
-    // phase-11: true → u64 fixed-point LDS build; false → f32 atomics. Naive fallback is
+    // true → u64 fixed-point LDS build; false → f32 atomics. Naive fallback is
     // always f32, so callers with `fixed_point=true` must keep every feature ≤ 256 bins.
     fixed_point: bool,
-    // 26-01 (ODP3-01/M2): when Some((grad, hess, num_data)), the FULL once-per-grow
+    // when Some((grad, hess, num_data)), the FULL once-per-grow
     // device-resident grad/hess buffers are gathered ON DEVICE via `leaf_rows[k]` in the
     // u64 LDS kernel — NO host `ord_g`/`ord_h` gather and NO per-build grad/hess upload.
     // Only wired on the u64 fixed-point LDS path (the on-device resident driver arm). When
@@ -1134,7 +1132,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
     }
     let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
 
-    // ---- 26-01 (ODP3-01/M2): ON-DEVICE grad/hess gather path ----
+    // ---- ON-DEVICE grad/hess gather path ----
     // The resident grad/hess buffers were uploaded ONCE per grow; gather each leaf's
     // grad/hess ON DEVICE from them via `leaf_rows[k]` (the same row index the resident-bin
     // gather uses). This removes the per-build host `ord_g`/`ord_h` gather + `create_from_slice`
@@ -1197,12 +1195,12 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
     let h_h = client.create_from_slice(f32::as_bytes(&ord_h));
 
     if max_w <= HIST_LDS_MAX as u32 {
-        // LDS per-feature path: `P` cubes per feature (row-partitioned, spike-007), 256 units
+        // LDS per-feature path: `P` cubes per feature (row-partitioned), 256 units
         // each. P=1 on small/medium leaves ⇒ byte-identical to the prior one-cube-per-feature
         // launch. The grid's y-dim carries P; each cube of feature f atomic-merges into the
         // same global slot (additive).
         //
-        // phase-13 (13-02): `P` is now chosen by the three-way pick at the end of this
+        // `P` is chosen by the three-way pick at the end of this
         // block — `LGBM_AUTOTUNE_FORCE_P` (pin) → CubeCL autotune (default-on) →
         // `row_partition_count` (the `LGBM_AUTOTUNE=0` cold-start / fallback bound). The
         // `launch_lds_*` macros below take the partition `$p` explicitly so the FORCE_P /
@@ -1211,9 +1209,9 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // SAFETY: resident_bins sized num_features*num_data; h_rows/h_g/h_h sized rows;
         // h_slot sized num_features+1; h_out sized slot_len. Cube (f,p) reads only its
         // feature's column + slot region; bin < num_bin <= 256 keeps LDS/out indices
-        // in range. All cubecl unsafe is confined here (CMP-01).
+        // in range. All cubecl unsafe is confined here.
         //
-        // LAUNCH_UNCHECKED (NRW-01, copied from the mirror template at the cuda-mirror
+        // LAUNCH_UNCHECKED (copied from the mirror template at the cuda-mirror
         // launcher): we call `::launch_unchecked`, dropping the in-kernel per-access
         // bounds-check codegen `::launch` emits in the scatter hot loops. This is sound
         // because every device access is host-proven in range BEFORE upload:
@@ -1228,15 +1226,15 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         //     `num_bin <= 256`, the `max_w <= HIST_LDS_MAX` branch gate);
         //   - `out[base + m]` for `m < feat_len = slot_off[f+1] - slot_off[f]` stays inside
         //     that feature's slot within `slot_len` (`h_out` sized slot_len).
-        // i.e. the host-side V5 checks discharge exactly the obligations the
+        // i.e. the host-side boundary checks discharge exactly the obligations the
         // launch_unchecked contract requires, and the launch does NOT change numerics —
         // only bounds-check codegen is removed; scatter order / f32-atomic accumulation
         // is identical.
-        // quick-260621-qix: dispatch the matching `<B: Int>` monomorphization on the
+        // Dispatch the matching `<B: Int>` monomorphization on the
         // resident buffer's native width. ArrayArg element COUNT is width-independent
         // (num_features*num_data); the launch generic pins the element TYPE. Only one
         // match arm executes ⇒ the by-value handle moves are exclusive (sound).
-        // phase-11: the LDS per-feature path dispatches EITHER the u64 FIXED-POINT build
+        // The LDS per-feature path dispatches EITHER the u64 FIXED-POINT build
         // kernel (`fixed_point`, the live `fix_compact_kernel` chain) OR the f32-atomic
         // original (the readback oracle). Both kernels share an IDENTICAL signature
         // (resident gather, row-partition, slot args) — only the `out` cell type differs
@@ -1257,7 +1255,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
                         ArrayArg::from_raw_parts(h_slot.clone(), num_features + 1),
                         num_data,
                         ArrayArg::from_raw_parts(h_out.clone(), slot_len),
-                        // 26-01: host-gather path — pre-gathered `[rows]` ord_g/ord_h indexed
+                        // host-gather path — pre-gathered `[rows]` ord_g/ord_h indexed
                         // by `k` (byte-identical to master; the comptime branch compiles out).
                         false,
                     );
@@ -1304,11 +1302,10 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             }};
         }
 
-        // ---- phase-13 (13-02): three-way row-partition `P` selection ----
+        // ---- three-way row-partition `P` selection ----
         //
-        // SCOPE of the four `row_partition_count` call sites (non-silent, per the locked
-        // CONTEXT "autotune is the default; the heuristic is only the cold-start /
-        // cache-miss fallback bound" decision):
+        // SCOPE of the four `row_partition_count` call sites (autotune is the default;
+        // the heuristic is only the cold-start / cache-miss fallback bound):
         //   - HERE (`resident_raw_build_into`, this is the only WIRED site): the live
         //     steady-state GPU build for BOTH resident classes — the f32-resident path
         //     (`build_leaf_histograms_resident_f32_on`, reached via
@@ -1326,7 +1323,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         //     NOT wired — referenced only by tests/examples, never a production path.
         if let Some(k) = force_row_partition() {
             // (a) LGBM_AUTOTUNE_FORCE_P=k → pin a single P=k launch, NO tuning (the
-            //     parity/debug seam consumed by 13-04's all-variants anchor gate).
+            //     parity/debug seam consumed by the all-variants anchor gate).
             direct_launch_at_p!(k);
         } else if autotune::autotune_enabled() {
             // (b) DEFAULT (autotune on) → drive the launch through the CubeCL tuner over
@@ -1335,14 +1332,14 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             //     `h_out` exactly once. The set is rebuilt fresh (this call's dimensions);
             //     the persistent winner lives in BUILD_TUNER's LaunchKey state.
             //
-            //     WR-01 determinism note: this funnel autotunes `P` for BOTH resident
+            //     Determinism note: this funnel autotunes `P` for BOTH resident
             //     classes. On the u64 `fixed_point` path the per-cube merge is integer-
             //     additive ⇒ bit-identical across `P`. On the `!fixed_point` f32 path the
             //     merge reorders f32 reductions, so the chosen `P` perturbs the histogram
-            //     output by ~2e-5 (spike-007) and the f32 build is therefore run-to-run
+            //     output by ~2e-5 and the f32 build is therefore run-to-run
             //     NONDETERMINISTIC (which `P` wins depends on cold-tune device timing) —
             //     within the contract's documented ~1e-6 best-effort f32 gap, NOT bit-exact.
-            //     BOTH paths are anchor-pinned across all `P` by the 13-04 all-PSET gates in
+            //     BOTH paths are anchor-pinned across all `P` by the all-PSET gates in
             //     `oracle-harness/tests/kernel_parity.rs` (u64 at 1e-7, f32 at the best-
             //     effort envelope), so a future kernel change that widened f32 cross-`P`
             //     divergence is caught.
@@ -1372,7 +1369,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             direct_launch_at_p!(row_partition_count(num_features, rows));
         }
     } else {
-        // Naive fallback (a feature exceeds the 256-bin LDS cap). ALWAYS f32 (phase-11):
+        // Naive fallback (a feature exceeds the 256-bin LDS cap). ALWAYS f32:
         // the u64 fixed-point kernel is LDS-only. A `fixed_point` caller dequantizes
         // `h_out` as u64 downstream, so an f32 naive write here would be mis-decoded —
         // guard the (can't-happen for max_bin ≤ 255) case loudly rather than corrupt.
@@ -1381,7 +1378,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             "resident_raw_build_into: fixed_point u64 build requires every feature ≤ 256 \
              bins (max_w ≤ HIST_LDS_MAX); a feature exceeded the LDS cap so the f32 naive \
              fallback fired, which the u64 dequant would mis-decode. Raise max_bin handling \
-             or keep the resident chain ≤ 256 bins (phase-11 spike-018)."
+             or keep the resident chain ≤ 256 bins."
         );
         let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
@@ -1389,9 +1386,9 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         let cube_dim = 256u32;
         let cube_count = (total as u32).div_ceil(cube_dim);
         // SAFETY: identical to the prior in-place naive launch (idx<total bound,
-        // resident read in range, slot write in range). cubecl unsafe confined (CMP-01).
+        // resident read in range, slot write in range). cubecl unsafe confined.
         //
-        // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+        // LAUNCH_UNCHECKED: `::launch_unchecked` drops the in-kernel per-access
         // bounds-check codegen in the `total`-wide scatter. Every device access is
         // host-proven in range BEFORE upload:
         //   - all units guarded by the kernel's own `idx < total` (`total = num_features *
@@ -1405,10 +1402,10 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         //   - `out[cell]` / `out[cell+1]` (`cell = slot_off[f] + bin*2`) — the resident
         //     bin-range invariant (`bin < num_bin`, upload-time) keeps the write inside
         //     that feature's slot within `slot_len` (`h_out` sized `slot_len`).
-        // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
-        // launch does NOT change numerics — only bounds-check codegen is removed; the
+        // The host-side boundary checks discharge exactly the launch_unchecked obligations;
+        // the launch does NOT change numerics — only bounds-check codegen is removed; the
         // f32-atomic scatter order is identical (~1e-6 path).
-        // quick-260621-qix: native-width dispatch (see the LDS branch note above).
+        // Native-width dispatch (see the LDS branch note above).
         macro_rules! launch_naive {
             ($w:ty) => {
                 unsafe {
@@ -1436,14 +1433,14 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
     }
 }
 
-/// ON-GPU WIDEN + `FixHistogram` + compaction kernel (260608-oib L3, FOLDED by
-/// 260608-s2b Lever A). ONE cube per feature
+/// ON-GPU WIDEN + `FixHistogram` + compaction kernel, FOLDED by
+/// Lever A. ONE cube per feature
 /// (`CubeCount::Static(num_features,1,1)`, `CubeDim::new_1d(1)`), mirroring
 /// [`construct_leaf_hist_resident_kernel`] / the fused split kernel's
 /// one-cube-per-feature precedent. Cube `f` (`CUBE_POS_X`) owns ONLY its
 /// `[slot_off[f], slot_off[f] + 2*num_bin[f])` region.
 ///
-/// 260608-s2b LEVER A — the standalone `widen_f32_to_f64_kernel` launch is FOLDED
+/// LEVER A — the standalone `widen_f32_to_f64_kernel` launch is FOLDED
 /// IN as this kernel's FIRST pass: cube `f` widens its own region from the f32 RAW
 /// histogram `h_raw` into the f64 output `hist` via `f64::cast_from(...)` — the
 /// IDENTICAL cast the standalone widen performed — then runs the EXACT same in-place
@@ -1462,7 +1459,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
 /// preceded by the inline f32→f64 widen.
 ///
 /// The leaf RAW (un-bumped) `sum_gradient` / `sum_hessian` are leaf-level scalars
-/// shared across every feature (Pitfall 2: the RAW totals, NOT the `+2·kEpsilon`
+/// shared across every feature (the RAW totals, NOT the `+2·kEpsilon`
 /// bumped value). All math is f64 — gfx1100 runs f64 despite `has_f64 == false`
 /// (the fused f64 split kernel precedent). Reading the SAME f64-widened cells and
 /// folding in the SAME ascending order as the host yields a BIT-IDENTICAL buffer.
@@ -1471,7 +1468,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
 #[cfg(feature = "gpu")]
 #[cube(launch_unchecked)]
 pub fn fix_compact_kernel(
-    // phase-11: u64 FIXED-POINT RAW histogram (u64 build-kernel output) — INPUT, read-only.
+    // u64 FIXED-POINT RAW histogram (u64 build-kernel output) — INPUT, read-only.
     // Each cell holds a two's-complement i64 (stored as u64 bits) = `round(value*2^30)`.
     h_raw: &Array<u64>,
     // f64 fixed+compacted histogram — OUTPUT (caller zeroes it before launch).
@@ -1480,23 +1477,23 @@ pub fn fix_compact_kernel(
     num_bin: &Array<i32>,
     offset: &Array<i32>,
     most_freq_bin: &Array<i32>,
-    // LEAF-LEVEL scalars (retained as positional launch args). OCX-03 (29-03): no longer
+    // LEAF-LEVEL scalars (retained as positional launch args). No longer
     // used to reconstruct the mfb cell — the dense build already holds the exact mfb mass,
     // so the old `seed − Σothers` reconstruction only injected f64 residue. Prefixed `_`.
     _sum_gradient: f64,
     _sum_hessian: f64,
 ) {
-    // phase-11 dequant scale S = 2^30 (matches the build-side SCALE_F32; f64 here).
+    // Dequant scale S = 2^30 (matches the build-side SCALE_F32; f64 here).
     const SCALE_F64: f64 = 1_073_741_824.0; // 2^30
     let f = CUBE_POS_X;
     let fi = f as usize;
     let base = slot_off[fi] as usize;
     let nb = num_bin[fi];
-    // OCX-03 (29-03): mfb no longer read here — the FixHistogram overwrite was removed.
+    // mfb no longer read here — the FixHistogram overwrite was removed.
     let _mfb = most_freq_bin[fi];
     let off = offset[fi];
 
-    // ---- FOLDED DEQUANT (phase-11; was the f32→f64 widen of 260608-s2b Lever A) ----
+    // ---- FOLDED DEQUANT (was the f32→f64 widen of Lever A) ----
     // Dequantize THIS feature's whole region u64-bits → i64 → f64/2^30 into the output
     // BEFORE the fix/compact reads it (reproduces the host dequant from
     // gpu_fixedpoint_i64.rs:191 cell-by-cell). The result is an f64 buffer with the SAME
@@ -1508,7 +1505,7 @@ pub fn fix_compact_kernel(
         hist[wbi + 1] = f64::cast_from(i64::cast_from(h_raw[wbi + 1])) / SCALE_F64;
     }
 
-    // ---- FixHistogram (OCX-03, 29-03; was a VERBATIM Dataset::FixHistogram port) ----
+    // ---- FixHistogram (was a VERBATIM Dataset::FixHistogram port) ----
     // C++ `Dataset::FixHistogram` reconstructs the most-frequent bin as
     // `leaf_total − Σ_others` because the C++ DENSE build SKIPS the mfb bin for speed
     // (it is the bulk of the rows). This resident u64 build does NOT skip it — the
@@ -1517,11 +1514,11 @@ pub fn fix_compact_kernel(
     // reconstruction here OVERWROTE that correct cell with `external_seed − Σ_others`,
     // whose f64 residue (the external row-order/scan seed disagrees with the bin-grouped
     // histogram fold by non-associativity; bound ~ n·u·Σ|h|, > 1e-3 at n≳1e7) leaked into
-    // the globally-empty forced-mfb cell — the ~0.36 spike-072 item-15b phantom that fed
+    // the globally-empty forced-mfb cell — a phantom value that fed
     // the admissibility scan a fake near-empty prefix. FIX: preserve the dense-built mfb
     // cell (provably 0 for a forced-empty bin at ALL scales). No-op in the anchor regime
     // (integer grad/hess ⇒ row-order == bin-grouped ⇒ external_seed == Σ hist exactly), so
-    // every u64 anchor gate stays bit-exact. See 29-SUBTRACT-RESIDUE.md.
+    // every u64 anchor gate stays bit-exact.
     //
     // `sum_gradient`/`sum_hessian` remain in the signature as the leaf-level scalars the
     // launcher passes (positional launch args); they are intentionally no longer used to
@@ -1557,8 +1554,8 @@ pub fn fix_compact_kernel(
     }
 }
 
-/// Host launcher for the on-GPU FOLDED widen+fix+compact kernel (260608-oib L3,
-/// Task 1 form; signature updated by 260608-s2b Lever A).
+/// Host launcher for the on-GPU FOLDED widen+fix+compact kernel (Task 1 form;
+/// signature updated by Lever A).
 ///
 /// Takes ONE leaf's concatenated stride-2 f32 RAW histogram `raw` (the construct
 /// kernel's f32-atomic output — the SAME cells the host would widen to f64), the
@@ -1572,7 +1569,7 @@ pub fn fix_compact_kernel(
 /// so this launcher feeds the f32 RAW directly — bit-identical to the prior
 /// "supply pre-widened f64" form for any f32-representable RAW cell.
 ///
-/// V5 boundary validation BEFORE launch (mirrors the fused split launcher):
+/// Boundary validation BEFORE launch (mirrors the fused split launcher):
 /// `num_bin == 0` → typed error; `2*num_bin` overflow → typed error;
 /// `slot_off + 2*num_bin > raw.len()` → [`ComputeError::LengthMismatch`]; empty
 /// feats → `Ok(raw widened to f64)` with NO launch.
@@ -1581,7 +1578,7 @@ pub fn fix_compact_kernel(
 /// same order as the concatenated regions in `raw`.
 ///
 /// # Errors
-/// As above (length / overflow validation, V5).
+/// As above (length / overflow validation).
 #[cfg(feature = "gpu")]
 pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1629,7 +1626,7 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
         mfb_a.push(most_freq_bin as i32);
     }
 
-    // phase-11: `fix_compact_kernel` now consumes a u64 FIXED-POINT RAW buffer and
+    // `fix_compact_kernel` now consumes a u64 FIXED-POINT RAW buffer and
     // dequantizes `(bits as i64)/2^30 → f64` in its widen pass. This launcher receives
     // an f32 RAW histogram (the test/oracle path builds it host-side), so quantize each
     // cell `round(v*2^30) → i64 → bits-as-u64` here to match the live u64 build kernel —
@@ -1652,9 +1649,9 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     // `[slot_off[f], slot_off[f]+2*num_bin[f])` — each validated `<= raw.len()`
     // above — and `mfb < num_bin` keeps the reconstruct write in range; the
     // per-feature index arrays all have exactly `n` elements. All cubecl unsafe is
-    // confined here (CMP-01).
+    // confined here.
     //
-    // LAUNCH_UNCHECKED (NRW-01): we call `::launch_unchecked`, dropping the in-kernel
+    // LAUNCH_UNCHECKED: we call `::launch_unchecked`, dropping the in-kernel
     // per-access bounds-check codegen in the per-feature fix/compact loops. This is a
     // ZERO-numeric-risk switch: the kernel is f64 and DETERMINISTIC (one cube per
     // feature, `CubeDim::new_1d(1)`, ascending fold) so the result stays bit-exact. Every
@@ -1666,7 +1663,7 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
     //   - `mfb < num_bin` (the `do_fix` guard) keeps the reconstruct cell in the region;
     //   - the per-feature `slot_off`/`num_bin`/`offset`/`most_freq_bin` arrays all have
     //     exactly `n` elements and `f < n`.
-    // i.e. the host-side V5 checks discharge exactly the obligations the launch_unchecked
+    // i.e. the host-side boundary checks discharge exactly the obligations the launch_unchecked
     // contract requires, and the launch does NOT change numerics — only bounds-check
     // codegen is removed; the f64 fold order is identical (bit-exact).
     unsafe {
@@ -1690,16 +1687,16 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
 }
 
 // ===========================================================================
-// Plan 16-04 Task 1 (ODL-10): FixHistogram most-freq-bin repair in the hist_t
+// FixHistogram most-freq-bin repair in the hist_t
 // FLOAT domain — `docs/cuda-kernel-design.md` §7.5 FixHistogramKernel. The
-// §7 on-device path is build → fix → subtract: BUILD (16-03) accumulates the
+// §7 on-device path is build → fix → subtract: BUILD accumulates the
 // raw u64 fixed-point histogram OMITTING the most-frequent bin to save work,
-// de-quant (16-03) widens it once to `hist_t`, and FIX here reconstructs the
+// de-quant widens it once to `hist_t`, and FIX here reconstructs the
 // omitted bin as `leaf_total − Σ(other bins)`. This is a SEPARATE kernel from
 // the legacy `fix_compact_kernel`: it (a) consumes the already-de-quanted
 // `hist_t` (NOT the raw u64 — no re-quantize, no 2^30 scale), and (b) DROPS the
-// compact (offset-shift) step — compaction is a CPU-learner artifact (DEF-07-02
-// class) the §7 reference path does not perform (Pitfall 5).
+// compact (offset-shift) step — compaction is a CPU-learner artifact the §7
+// reference path does not perform.
 // ===========================================================================
 
 /// FixHistogram most-frequent-bin repair over the de-quanted `hist_t` (§7.5).
@@ -1707,11 +1704,11 @@ pub fn fix_compact_f64_on<R: cubecl::Runtime>(
 /// One cube per feature (`CUBE_POS_X = f`, `CubeDim::new_1d(1)` — the single-owner
 /// ascending fold, the load-bearing f64 order shared with `fix_compact_kernel`).
 /// Repairs ONLY when `most_freq_bin > 0 && most_freq_bin < num_bin` (the C++
-/// `if (most_freq_bin > 0)` guard plus the defensive in-range bound — Pitfall 4);
+/// `if (most_freq_bin > 0)` guard plus the defensive in-range bound);
 /// `mfb == 0` and out-of-range features are left untouched (no write).
 ///
 /// The repaired most-freq cell = the RAW (un-bumped) leaf totals `sum_gradient` /
-/// `sum_hessian` (HOST-side exact f64 scalars, shared across every feature — Pitfall 2)
+/// `sum_hessian` (HOST-side exact f64 scalars, shared across every feature)
 /// minus every OTHER bin's cell, folded in ASCENDING bin order (never reorder /
 /// parallelize on the cpu anchor — the f64 fold order is the bit-exact contract). The
 /// `i != mfb` exclusion is a branchless `select` so the guarded cell drops out without a
@@ -1739,7 +1736,7 @@ pub fn fix_histogram_mfb(
     slot_off: &Array<u32>,
     num_bin: &Array<i32>,
     most_freq_bin: &Array<i32>,
-    // LEAF-LEVEL RAW (un-bumped) f64 totals, shared across the batch (Pitfall 2).
+    // LEAF-LEVEL RAW (un-bumped) f64 totals, shared across the batch.
     sum_gradient: f64,
     sum_hessian: f64,
 ) {
@@ -1758,7 +1755,7 @@ pub fn fix_histogram_mfb(
     let mfb = most_freq_bin[fi];
 
     // C++ `if (most_freq_bin > 0)`: skip mfb == 0 (bin 0 is never folded back) AND the
-    // defensive `mfb < num_bin` out-of-range bound (Pitfall 4) — no OOB write.
+    // defensive `mfb < num_bin` out-of-range bound — no OOB write.
     let do_fix = mfb > 0 && mfb < nb;
     if do_fix {
         let mfbu = mfb as usize;
@@ -1783,25 +1780,25 @@ pub fn fix_histogram_mfb(
         hist_out[mi] = g;
         hist_out[mi + 1] = h;
     }
-    // NO compact step (Pitfall 5): §7 is build→fix→subtract; the `if off > 0`
+    // NO compact step: §7 is build→fix→subtract; the `if off > 0`
     // offset-shift belongs only to the legacy `fix_compact_kernel`.
 }
 
-/// Host launcher for [`fix_histogram_mfb`] (§7.5, ODL-10): repairs the omitted
-/// most-frequent bin over the de-quanted `hist_t` (the [`dequant_leaf_hist`] output
-/// of 16-03), in place, returning the repaired histogram. Mirrors the
-/// [`fix_compact_f64_on`] V5 launcher checks — but the `feats` tuple drops `offset`
-/// (no compaction) and the input is `hist_t` (no quantize round-trip).
+/// Host launcher for [`fix_histogram_mfb`] (§7.5): repairs the omitted
+/// most-frequent bin over the de-quanted `hist_t` (the [`dequant_leaf_hist`] output),
+/// in place, returning the repaired histogram. Mirrors the
+/// [`fix_compact_f64_on`] boundary-validated launcher checks — but the `feats` tuple drops
+/// `offset` (no compaction) and the input is `hist_t` (no quantize round-trip).
 ///
 /// `feats` is `&[(slot_off, num_bin, most_freq_bin)]` per feature, in the same order
 /// as the concatenated regions in `hist`.
 ///
-/// V5 boundary validation BEFORE launch (T-16-04-01): `num_bin == 0` → typed error;
+/// Boundary validation BEFORE launch: `num_bin == 0` → typed error;
 /// `2*num_bin` overflow → typed error; `slot_off + 2*num_bin > hist.len()` →
 /// [`ComputeError::LengthMismatch`]; empty `feats` → `Ok(hist.to_vec())` with NO launch.
 ///
 /// # Errors
-/// As above (length / overflow validation, V5).
+/// As above (length / overflow validation).
 #[cfg(feature = "gpu")]
 pub fn fix_histogram_mfb_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
@@ -1881,20 +1878,20 @@ pub fn fix_histogram_mfb_on<R: cubecl::Runtime>(
 }
 
 // ===========================================================================
-// Plan 16-04 Task 3 (ODL-10): the ConstructHistogramForLeaf entry — §7.0. The
+// The ConstructHistogramForLeaf entry — §7.0. The
 // build→de-quant→fix→rotate→subtract sequence behind the OFF-by-default
 // `LGBM_CUDA_ON_DEVICE` seam (`crate::cuda_on_device_enabled`, checked at the
 // future call site). `on_device_growth_supported()` independently stays false:
-// Phase 16 demonstrates the histogram path in isolation; the whole-tree pool SWAP
-// + growth driver are Phase 18/21.
+// this demonstrates the histogram path in isolation; the whole-tree pool SWAP
+// + growth driver are future work.
 // ===========================================================================
 
 /// The two children's `hist_in_leaf` produced by `construct_histogram_for_leaf`.
 ///
 /// `smaller` is built-from-data → de-quanted → fixed; `larger` is the subtraction-trick
 /// derived child (`parent − smaller`, §17), `None` when `larger_leaf_index < 0` (no real
-/// sibling). Consumed by Phase 17 (best-split finder); the rotation contract by Phase 18
-/// (pool swap).
+/// sibling). Consumed by the best-split finder; the rotation contract belongs to the
+/// pool-swap driver.
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone)]
 pub struct ConstructedLeafHists {
@@ -1948,13 +1945,13 @@ pub fn upload_resident_columns<R: cubecl::Runtime>(
     client.create_from_slice(u32::as_bytes(&concat))
 }
 
-// (260608-s2b Lever A) The standalone `widen_f32_to_f64_kernel` was REMOVED — its
+// (Lever A) The standalone `widen_f32_to_f64_kernel` was REMOVED — its
 // f32→f64 cast is now folded into `fix_compact_kernel`'s first pass (the inline
 // `f64::cast_from` widen), eliminating a per-leaf GPU launch. See the FOLDED WIDEN
 // block in `fix_compact_kernel`.
 
-/// DEVICE-RESIDENT build→fix→compact chain (260608-oib L3, Task 2 step 1; FOLDED to
-/// 2 launches by 260608-s2b Lever A).
+/// DEVICE-RESIDENT build→fix→compact chain (Task 2 step 1; FOLDED to
+/// 2 launches by Lever A).
 ///
 /// Runs the resident build kernel ([`construct_leaf_hist_resident_kernel`]) into an
 /// f32-atomic device buffer, then launches the on-GPU FOLDED widen+fix+compact
@@ -1967,17 +1964,17 @@ pub fn upload_resident_columns<R: cubecl::Runtime>(
 /// This is the resident analog of `build_leaf_histograms_resident_f32_on` +
 /// host fix+compact: the whole per-leaf build→fix→compact chain runs on device. The
 /// `fix_feats` carry the per-feature `(slot_off, num_bin, offset, most_freq_bin)`;
-/// `sum_gradient`/`sum_hessian` are the leaf RAW (un-bumped) totals (Pitfall 2).
+/// `sum_gradient`/`sum_hessian` are the leaf RAW (un-bumped) totals.
 ///
 /// # Errors
-/// [`ComputeError::Runtime`] on a degenerate layout; propagates the same V5
+/// [`ComputeError::Runtime`] on a degenerate layout; propagates the same
 /// validation as [`fix_compact_f64_on`] / the resident build launcher.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
-    // quick-260621-qix: native element width of `resident_bins`.
+    // native element width of `resident_bins`.
     width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
@@ -1989,18 +1986,18 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     fix_feats: &[(usize, u32, i32, u32)],
     sum_gradient: f64,
     sum_hessian: f64,
-    // 26-01 (ODP3-01/M2): when Some((grad, hess, num_data)), the on-device resident build
+    // when Some((grad, hess, num_data)), the on-device resident build
     // gathers grad/hess ON DEVICE from these once-per-grow full buffers via `leaf_rows` —
     // no host `ord_g`/`ord_h` gather + per-build upload. `gradients`/`hessians` are STILL
     // read here for the host-side overflow guard (a cheap O(rows) scan, NOT an upload).
     // None keeps the byte-identical host-gather build.
     resident_gh: Option<(cubecl::server::Handle, cubecl::server::Handle, usize)>,
 ) -> Result<(cubecl::server::Handle, usize), ComputeError> {
-    // ---- 0. PHASE-11 OVERFLOW GUARD (SPEC item 4, spike-018 README:63,113-116) ----
+    // ---- 0. OVERFLOW GUARD ----
     // The u64 fixed-point build sums `round(v * 2^30)` (i64) across a bin's rows. The
     // worst-case single-bin magnitude is `rows * max|v| * 2^30`; it MUST fit in i64 or
     // the two's-complement add wraps to a WRONG value. Bound: i64@2^30 is safe to
-    // ~1e9 rows × |g| ≤ 8 (spike-018b). We bound `max|v|` by the actual leaf grad/hess
+    // ~1e9 rows × |g| ≤ 8. We bound `max|v|` by the actual leaf grad/hess
     // (a one-pass scan of the rows we are about to accumulate) — NOT a clamp; on
     // violation we return a typed error rather than silently overflow. The grad/hess are
     // small in practice (regression residuals / Newton steps), so this never trips on
@@ -2035,7 +2032,7 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     // LDS-privatized per-feature build when every feature ≤ 256 bins (naive fallback
     // otherwise) — the SAME `resident_raw_build_into` the readback launcher uses, so
     // the resident-pool chain and the host path share one accumulation structure.
-    // phase-11: u64 fixed-point RAW merge target (was f32). The u64 LDS build accumulates
+    // u64 fixed-point RAW merge target (was f32). The u64 LDS build accumulates
     // `round(v*2^30)` as two's-complement i64-bits; `fix_compact_kernel` dequantizes
     // `(bits as i64)/2^30 → f64` in its widen pass. The grad/hess INPUTS (`h_g`/`h_h` in
     // `resident_raw_build_into`) STAY f32 — the kernel quantizes them in-kernel; ONLY this
@@ -2054,11 +2051,11 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         gradients,
         hessians,
         h_raw.clone(),
-        true, // u64 fixed-point build → dequantized in fix_compact_kernel (phase-11)
-        resident_gh, // 26-01 (ODP3-01/M2): Some ⇒ on-device grad/hess gather, no host upload
+        true, // u64 fixed-point build → dequantized in fix_compact_kernel
+        resident_gh, // Some ⇒ on-device grad/hess gather, no host upload
     );
 
-    // ---- 2. (260608-s2b Lever A) Allocate the zeroed f64 OUTPUT. The standalone
+    // ---- 2. (Lever A) Allocate the zeroed f64 OUTPUT. The standalone
     //         widen launch is GONE — the folded fix kernel below widens each feature
     //         region from `h_raw` (f32) into `h_f64` (f64) inline as its first pass,
     //         then fixes+compacts. `fix_feats` covers EVERY feature region contiguously
@@ -2111,7 +2108,7 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         // fix + compact) and `mfb < num_bin` keeps the reconstruct in range. cubecl
         // unsafe confined here.
         //
-        // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+        // LAUNCH_UNCHECKED: `::launch_unchecked` drops the in-kernel per-access
         // bounds-check codegen in the fix/compact loops. ZERO numeric risk — same f64
         // deterministic kernel as `fix_compact_f64_on` (one cube per feature, ascending
         // fold, bit-exact). Host-proven accesses BEFORE upload:
@@ -2121,8 +2118,8 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         //   - `mfb < num_bin` (the `do_fix` guard) keeps the reconstruct cell in range;
         //   - the per-feature `slot_off`/`num_bin`/`offset`/`most_freq_bin` arrays all have
         //     exactly `n` elements and `f < n`.
-        // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
-        // launch does NOT change numerics — only bounds-check codegen is removed; the f64
+        // The host-side boundary checks discharge exactly the launch_unchecked obligations;
+        // the launch does NOT change numerics — only bounds-check codegen is removed; the f64
         // fold order is identical (bit-exact).
         unsafe {
             fix_compact_kernel::launch_unchecked(
@@ -2144,13 +2141,13 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
     Ok((h_f64, slot_len))
 }
 
-/// Readback variant of [`build_fix_compact_resident_f64_on`] (260608-oib L3, Task 2
+/// Readback variant of [`build_fix_compact_resident_f64_on`] (Task 2
 /// step 1 validation): runs the SAME device-resident build→fix→compact chain but
 /// reads the f64 buffer back to a `Vec<f64>`. Used by the oracle to prove the
 /// resident chain equals the host build (`build_leaf_histograms_resident_f32_on`)
 /// + host `fix_histogram` + host `compact_histogram` (within the ~1e-6 f32-atomic
 /// RAW-build tolerance; the fix+compact step itself is bit-exact, Task 1). Not on
-/// the live path — the live wiring is deferred (see SUMMARY).
+/// the live path — the live wiring is deferred.
 ///
 /// # Errors
 /// Same as [`build_fix_compact_resident_f64_on`].
@@ -2159,7 +2156,7 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
 pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
-    // quick-260621-qix: native element width of `resident_bins`.
+    // native element width of `resident_bins`.
     width: crate::ResidentBinWidth,
     num_features: usize,
     num_data: usize,
@@ -2186,7 +2183,7 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
         fix_feats,
         sum_gradient,
         sum_hessian,
-        None, // 26-01: readback oracle keeps the host grad/hess gather (unchanged)
+        None, // readback oracle keeps the host grad/hess gather (unchanged)
     )?;
     debug_assert_eq!(len, slot_len);
     let bytes = client.read_one_unchecked(handle);
@@ -2194,7 +2191,7 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 }
 
 // ===========================================================================
-// 260608-t3t: FUSED per-feature build + fix + compact + best-split scan kernel.
+// FUSED per-feature build + fix + compact + best-split scan kernel.
 //
 // ONE cube per feature (`CubeCount::Static(num_features,1,1)`, `CubeDim::new_1d(1)`)
 // — single-owner ⇒ BIT-EXACT (the cpu-anchor f64 fold order), NO atomics, NO
@@ -2208,8 +2205,8 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 //   `construct_leaf_hist_resident_kernel`'s bin layout / resident indexing
 //   (histogram.rs:511-533) but sequential into THIS cube's f64 region.
 // Stage 2 FIX: inlines `fix_compact_kernel`'s fix logic VERBATIM
-//   (histogram.rs:674-703) — RAW (un-bumped) sum_gradient/sum_hessian seed
-//   (Pitfall 2), ascending subtract via branchless `select`.
+//   (histogram.rs:674-703) — RAW (un-bumped) sum_gradient/sum_hessian seed,
+//   ascending subtract via branchless `select`.
 // Stage 3 COMPACT: inlines `fix_compact_kernel`'s compact logic VERBATIM
 //   (histogram.rs:705-732) — offset shift + tail zero.
 // Stage 4 SCAN: calls the SHARED `split_scan_body` (split.rs:144) over the
@@ -2224,13 +2221,13 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 // unchanged (the fused gate is OFF on cpu).
 // ===========================================================================
 
-/// Fused per-feature BUILD + FIX + COMPACT + SCAN kernel (260608-t3t). See the
+/// Fused per-feature BUILD + FIX + COMPACT + SCAN kernel. See the
 /// module-level block above. Cube `f` owns its region of `hist` (f64 OUT, the
 /// resident fixed+compacted histogram, caller-zeroed) and writes its 12-cell
 /// window `out[f*12 .. f*12+12]` (the RAW SplitInfo cells, host-decoded).
 ///
 /// The LEAF-LEVEL scalars are shared across every feature: the RAW (un-bumped)
-/// `sum_gradient_raw` / `sum_hessian_raw` feed the FIX (Pitfall 2); the
+/// `sum_gradient_raw` / `sum_hessian_raw` feed the FIX; the
 /// 2*kEpsilon-BUMPED `sum_hessian_bumped` + the host `min_gain_shift` feed the SCAN
 /// (the distinct operands, matching `find_best_splits_fused_kernel`).
 #[cfg(feature = "gpu")]
@@ -2238,7 +2235,7 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_scan_fused_kernel<B: Int>(
     // Device-resident binned columns (feature-major, `f*num_data + row`) — INPUT.
-    // quick-260621-qix: native bin width (u8/u16/u32).
+    // Native bin width (u8/u16/u32).
     resident_bins: &Array<B>,
     // The leaf's row indices (subset of 0..num_data) — INPUT.
     leaf_rows: &Array<u32>,
@@ -2265,8 +2262,8 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
     // Stride of a resident column = full train row count.
     num_data_stride: usize,
     // LEAF-LEVEL scalars (shared across the batch). `sum_gradient_raw` feeds the Stage-4
-    // scan; `sum_hessian_raw` is retained as a positional launch arg but OCX-03 (29-03) no
-    // longer uses it to reconstruct the mfb cell (prefixed `_`).
+    // scan; `sum_hessian_raw` is retained as a positional launch arg but is no
+    // longer used to reconstruct the mfb cell (prefixed `_`).
     sum_gradient_raw: f64,
     _sum_hessian_raw: f64,
     use_l1: u32,
@@ -2282,16 +2279,16 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
     let fi = f as usize;
     let base = slot_off[fi] as usize;
     let nb = num_bin[fi];
-    // OCX-03 (29-03): mfb no longer read here — the Stage-2 FixHistogram overwrite was removed.
+    // mfb no longer read here — the Stage-2 FixHistogram overwrite was removed.
     let _mfb = most_freq_bin[fi];
     let off = offset[fi];
 
     // ---- Stage 1: SEQUENTIAL f64 BUILD (ascending leaf-row order = cpu anchor) ----
     // Zero this cube's region first (2 cells per bin), then gather each leaf row's
     // bin from the resident column and ASCENDING-fold f32 grad/hess into the f64
-    // cells. `f64::cast_from(score_t f32)` reproduces the C++ float->double widen
-    // (Pitfall 3); the ascending fold order matches the host sequential build EXACTLY
-    // (the bit-exact contract — non-negotiable #2). NO atomics (single-owner cube).
+    // cells. `f64::cast_from(score_t f32)` reproduces the C++ float->double widen;
+    // the ascending fold order matches the host sequential build EXACTLY
+    // (the bit-exact contract is non-negotiable). NO atomics (single-owner cube).
     for w in 0..nb {
         let wbi = base + (w as usize) * 2;
         hist[wbi] = 0.0;
@@ -2300,22 +2297,22 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
     let rows = ord_g.len();
     for k in 0..rows {
         let row = leaf_rows[k] as usize;
-        // quick-260621-qix: native-width read widened to a u32 INDEX (value-faithful).
+        // native-width read widened to a u32 INDEX (value-faithful).
         let bin = u32::cast_from(resident_bins[fi * num_data_stride + row]) as usize;
         let cell = base + bin * 2;
         hist[cell] += f64::cast_from(ord_g[k]);
         hist[cell + 1] += f64::cast_from(ord_h[k]);
     }
 
-    // ---- Stage 2: FIX (OCX-03, 29-03; was fix_compact_kernel's Dataset::FixHistogram) ----
+    // ---- Stage 2: FIX (was fix_compact_kernel's Dataset::FixHistogram) ----
     // Stage 1 above scattered EVERY leaf row (mfb bin included) into `hist`, so the built
     // mfb cell is already the exact most-frequent-bin mass. The C++ `leaf_total − Σothers`
     // reconstruction exists because the C++ dense build SKIPS the mfb bin; transcribing it
     // here overwrote the correct cell with `sum_*_raw − Σ_bin-grouped hist`, sweeping the
     // row-order-vs-bin-grouped f64 fold residue into the globally-empty forced-mfb cell
-    // (the ~0.36 spike-072 item-15b phantom). FIX: preserve the dense-built mfb cell —
+    // (a phantom value). FIX: preserve the dense-built mfb cell —
     // provably 0 for a forced-empty bin at all scales; a no-op in the anchor regime
-    // (integer grad/hess ⇒ sum_*_raw == Σ hist exactly). See 29-SUBTRACT-RESIDUE.md.
+    // (integer grad/hess ⇒ sum_*_raw == Σ hist exactly).
     //
     // `sum_gradient_raw` is still consumed by the Stage-4 scan; `sum_hessian_raw` remains a
     // launch arg but is intentionally no longer used to overwrite the built mfb cell.
@@ -2378,7 +2375,7 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
     }
 }
 
-/// Host launcher for the FUSED build+fix+compact+scan kernel (260608-t3t).
+/// Host launcher for the FUSED build+fix+compact+scan kernel.
 ///
 /// Drives [`build_fix_scan_fused_kernel`] in ONE launch. `feats` is the FULL
 /// per-feature list (every feature in fpos order) — build + fix + compact run for
@@ -2390,24 +2387,24 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
 ///
 /// Returns BOTH the resident fixed+compacted f64 histogram `Handle` (kept on device)
 /// AND one [`SplitInfo`] per SCAN-ACTIVE feature, in scan-active order (matching the
-/// learner's `batched_feats`). Mirrors the V5 validation + marshalling of
+/// learner's `batched_feats`). Mirrors the validation + marshalling of
 /// [`build_fix_compact_resident_f64_on`] AND the host pre-step + decode/accept-gate
 /// of the fused split scan (split.rs:1212-1311).
 ///
-/// The leaf RAW (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX
-/// (Pitfall 2); the launcher computes the 2*kEpsilon-BUMPED sum_hessian +
+/// The leaf RAW (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX;
+/// the launcher computes the 2*kEpsilon-BUMPED sum_hessian +
 /// min_gain_shift for the scan exactly as `find_best_splits_fused_inner` does.
 ///
 /// # Errors
 /// [`ComputeError::Runtime`] / [`ComputeError::LengthMismatch`] on degenerate
-/// layout (mirrors the fused split launcher's per-feature V5 checks + the leaf-level
+/// layout (mirrors the fused split launcher's per-feature boundary checks + the leaf-level
 /// `sum_hessian > 0` / `max_delta_step`/`path_smooth` default-path checks).
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     resident_bins: cubecl::server::Handle,
-    // quick-260621-qix: native element width of `resident_bins`.
+    // native element width of `resident_bins`.
     width: crate::ResidentBinWidth,
     num_features: usize,
     num_data_stride: usize,
@@ -2468,7 +2465,7 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
         "feats[*].slot_off must agree positionally with the pool slot_off layout"
     );
 
-    // Per-feature V5 validation + device-array assembly (BEFORE launch).
+    // Per-feature validation + device-array assembly (BEFORE launch).
     let n = feats.len();
     let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
     let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
@@ -2568,10 +2565,9 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     // region, writing `h_out[f*12 .. f*12+12]` within the n*12 allocation. `bin <
     // num_bin` (resident invariant) keeps the build cell in range; `mfb < num_bin`
     // keeps the reconstruct in range. Every per-feature index array has exactly `n`
-    // elements; every handle outlives the launch. All cubecl unsafe confined here
-    // (CMP-01).
+    // elements; every handle outlives the launch. All cubecl unsafe confined here.
     //
-    // LAUNCH_UNCHECKED (NRW-01): `::launch_unchecked` drops the in-kernel per-access
+    // LAUNCH_UNCHECKED: `::launch_unchecked` drops the in-kernel per-access
     // bounds-check codegen in the build + fix + scan loops. ZERO numeric risk — the kernel
     // is f64 and DETERMINISTIC (one cube per feature, `CubeDim::new_1d(1)`, SEQUENTIAL
     // ascending leaf-row fold, NO atomics) so it stays the bit-exact cpu-anchor order.
@@ -2589,22 +2585,22 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     //   - every per-feature param array (`slot_off`/`num_bin`/`offset`/`most_freq_bin`/
     //     `default_bin`/`skip_default_bin`/`rev_count`/`fwd_count`/`scan_active`) has
     //     exactly `n` elements and `f < n`.
-    // The host-side V5 checks discharge exactly the launch_unchecked obligations; the
-    // launch does NOT change numerics — only bounds-check codegen is removed; the f64
+    // The host-side boundary checks discharge exactly the launch_unchecked obligations;
+    // the launch does NOT change numerics — only bounds-check codegen is removed; the f64
     // sequential fold / scan order is identical (bit-exact).
     //
-    // PERF/BENEFIT (measured — quick 260619-ol8, dual-kernel single-binary interleaved A/B
+    // PERF/BENEFIT (measured — dual-kernel single-binary interleaved A/B
     // on gfx1100, `examples/launch_unchecked_ab.rs`): this is the ONE swept kernel where
     // launch_unchecked pays off measurably — ~9–16% faster launch-bound, ~40–46% (≈1.8×)
     // faster compute-bound, sign-stable with non-overlapping p25/p75 spread. Because the
     // checked/unchecked arms are bit-identical f64, the delta is PURE bounds-check codegen.
-    // It surfaces HERE (and not in the f32-atomic / resident-LDS kernels, where ol8 measured
-    // NULL) precisely because this kernel runs long SINGLE-UNIT SEQUENTIAL loops
+    // It surfaces HERE (and not in the f32-atomic / resident-LDS kernels, where measurement
+    // showed NULL) precisely because this kernel runs long SINGLE-UNIT SEQUENTIAL loops
     // (`CubeDim::new_1d(1)`, one cube per feature) — a per-access bounds branch compounds
     // over every leaf-row × bin iteration with nothing to hide behind, whereas the atomic
     // kernels are atomic-contention / memory-latency bound and mask it. So launch_unchecked
     // is strongly justified for this kernel on perf grounds, not merely safe.
-    // quick-260621-qix: dispatch the fused kernel's `<B: Int>` monomorphization on the
+    // Dispatch the fused kernel's `<B: Int>` monomorphization on the
     // resident buffer's native width (only the `resident_bins` ArrayArg type changes;
     // every other arg is width-independent). Exactly one match arm runs ⇒ the by-value
     // handle moves are exclusive.
@@ -2703,15 +2699,15 @@ pub fn build_fix_scan_resident_f64_on<R: cubecl::Runtime>(
     Ok((h_hist, slot_len, splits))
 }
 
-/// 31-07 (ODS-02): the build+fix+compact+scan portion of
+/// The build+fix+compact+scan portion of
 /// [`build_fix_scan_resident_f64_on`] WITHOUT the per-feature-array readback+decode —
 /// returns the resident histogram Handle + the raw `n*12` scan-output Handle +
 /// `min_gain_shift` so the device reduce can fold the winner on device. Byte-for-byte the
-/// SAME per-feature V5 validation + marshalling + [`build_fix_scan_fused_kernel`] launch as
+/// SAME per-feature validation + marshalling + [`build_fix_scan_fused_kernel`] launch as
 /// `build_fix_scan_resident_f64_on`; the ONLY difference is it stops BEFORE the
 /// `read_one_unchecked(h_out)` and hands the caller `h_out` instead. Duplicated (not
 /// refactored out of `build_fix_scan_resident_f64_on`) to keep that shipped function
-/// byte-unchanged (D-31-C, additive-only); the bit-exact parity test guards against drift.
+/// byte-unchanged (additive-only); the bit-exact parity test guards against drift.
 /// Assumes a NON-empty leaf (the caller handles the empty early return).
 #[cfg(feature = "gpu")]
 #[allow(clippy::type_complexity)]
@@ -2765,7 +2761,7 @@ fn build_fix_scan_fused_to_raw_handle<R: cubecl::Runtime>(
         "feats[*].slot_off must agree positionally with the pool slot_off layout"
     );
 
-    // Per-feature V5 validation + device-array assembly (BEFORE launch) — IDENTICAL.
+    // Per-feature validation + device-array assembly (BEFORE launch) — IDENTICAL.
     let n = feats.len();
     let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
     let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
@@ -2856,8 +2852,8 @@ fn build_fix_scan_fused_to_raw_handle<R: cubecl::Runtime>(
     let h_scan = client.create_from_slice(u32::as_bytes(&scan_active_a));
 
     // SAFETY: identical bounds discipline to `build_fix_scan_resident_f64_on` (every device
-    // access host-proven in range by the per-feature V5 loop above; `leaf_rows` ⊂
-    // `[0, num_data_stride)`). All cubecl unsafe confined here (CMP-01).
+    // access host-proven in range by the per-feature validation loop above; `leaf_rows` ⊂
+    // `[0, num_data_stride)`). All cubecl unsafe confined here.
     macro_rules! launch_fused {
         ($w:ty) => {
             unsafe {
@@ -2904,7 +2900,7 @@ fn build_fix_scan_fused_to_raw_handle<R: cubecl::Runtime>(
     Ok((h_hist, slot_len, h_out, out_len, min_gain_shift))
 }
 
-/// 31-07 (ODS-02, f64-fused escape-hatch arm): NO-READBACK sibling of
+/// f64-fused escape-hatch arm: NO-READBACK sibling of
 /// [`build_fix_scan_resident_f64_on`]. Launches the SAME
 /// [`build_fix_scan_fused_kernel`] (build + fix + compact + scan, all features), then —
 /// INSTEAD of reading back the `n*12` per-feature array and decoding a `Vec<SplitInfo>` —
@@ -2928,7 +2924,7 @@ fn build_fix_scan_fused_to_raw_handle<R: cubecl::Runtime>(
 /// additive sibling reusing the SAME `build_fix_scan_fused_kernel` (never modified).
 ///
 /// # Errors
-/// As [`build_fix_scan_resident_f64_on`] (per-feature V5 checks + the leaf-level
+/// As [`build_fix_scan_resident_f64_on`] (per-feature validation checks + the leaf-level
 /// `sum_hessian > 0` / `max_delta_step`/`path_smooth` default-path checks); plus
 /// [`ComputeError::LengthMismatch`] if `real_feats.len() != feats.len()` or
 /// `out_leaf >= out.len` on a non-empty leaf.
@@ -2983,7 +2979,7 @@ pub fn build_fix_scan_resident_reduce_f64_on<R: cubecl::Runtime>(
 
     // Reuse the EXISTING host-readback launcher's build+fix+compact+scan + the SAME
     // min_gain_shift, but we need the raw `h_out` handle (NOT the decoded splits). To keep
-    // `build_fix_scan_resident_f64_on` byte-unchanged (D-31-C, additive-only), this sibling
+    // `build_fix_scan_resident_f64_on` byte-unchanged (additive-only), this sibling
     // reproduces the SAME validation + launch inline via the fused-scan helper below rather
     // than editing that function. We obtain the raw scan handle + min_gain_shift, then reduce.
     let (h_hist, len, h_out, out_len, min_gain_shift) = build_fix_scan_fused_to_raw_handle(
@@ -3028,7 +3024,7 @@ mod tests {
     use super::{accumulate_histogram_into, construct_histograms_cpu_native};
     use crate::error::ComputeError;
 
-    /// 31-07 (ODS-02, f64-fused escape-hatch arm): the NO-READBACK
+    /// The f64-fused escape-hatch arm: the NO-READBACK
     /// [`super::build_fix_scan_resident_reduce_f64_on`] folds a winner into the target
     /// `SplitSoa` slot BIT-EXACT to [`super::build_fix_scan_resident_f64_on`] (host readback)
     /// + `argmax_over_resident_splits` over ONLY the scan-active features — including a case
@@ -3283,7 +3279,7 @@ mod tests {
         assert!(buf[off + cells..].iter().all(|&v| v.to_bits() == 0.0f64.to_bits()));
     }
 
-    /// An undersized `out` sub-slice is a typed `LengthMismatch`, NOT a panic (V5).
+    /// An undersized `out` sub-slice is a typed `LengthMismatch`, NOT a panic.
     #[test]
     fn accumulate_into_rejects_short_out() {
         let binned: Vec<u32> = vec![0, 1, 2];
@@ -3323,7 +3319,7 @@ mod tests {
         assert_eq!(ROWPART_TARGET_CUBES_FALLBACK, 64);
     }
 
-    /// The row-partition heuristic (spike-007): 1 on small/few-feature shapes (so the
+    /// The row-partition heuristic: 1 on small/few-feature shapes (so the
     /// build stays byte-identical to the pre-row-part kernel), a tuned P in [2, P_MAX]
     /// on large-leaf × few-feature shapes, never exceeding P_MAX (the P=32 regression
     /// guard). Pure CPU logic — no GPU. Expressed against the runtime/cached `target`
@@ -3360,7 +3356,7 @@ mod tests {
     /// APU (8 CUs, gfx1152 spoofed as gfx1100), so `query_num_cu()` should report 8 and
     /// `rowpart_target_cubes()` ≈ 64 (8 × CUBES_PER_CU), NOT the phantom-96-CU 768.
     /// Soft (eprintln + >0 check) so it never blocks the gate if the FFI query is
-    /// environment-flaky; the hard CU=8 expectation is recorded in the SUMMARY.
+    /// environment-flaky.
     #[cfg(feature = "rocm")]
     #[test]
     fn queried_cu_count_is_8() {
@@ -3388,7 +3384,7 @@ mod tests {
         }
     }
 
-    /// spike-038 grad-conservation — the BUILD-tuner load-bearing-generator proof.
+    /// Grad-conservation — the BUILD-tuner load-bearing-generator proof.
     ///
     /// Driving the build over `BUILD_PSET` with the production [`super::FreshOutGenerator`]
     /// (via [`super::build_pset_tunable_set`]) leaves the real `out` holding EXACTLY ONE
@@ -3507,8 +3503,8 @@ mod tests {
 
     /// The u64 fixed-point build is an order-independent integer additive merge, so every
     /// `P` in `BUILD_PSET` yields a BIT-IDENTICAL `out` — `P` is parity-neutral on the live
-    /// fixed-point resident path (13-04 anchors it to the CPU f64 reference). The f32 path
-    /// is NOT bit-identical across P (spike-007 ~2e-5, inside the ~1e-6 best-effort gate),
+    /// fixed-point resident path (anchored to the CPU f64 reference). The f32 path
+    /// is NOT bit-identical across P (~2e-5, inside the ~1e-6 best-effort gate),
     /// so only the u64 path is asserted bit-equal here.
     #[cfg(feature = "rocm")]
     #[test]

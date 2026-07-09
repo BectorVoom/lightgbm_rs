@@ -1,41 +1,38 @@
-//! Phase-25 25-02 (ODP2-03) — re-anchor the on-device parity gate to a valid,
-//! SAME-PRECISION integer reference.
+//! Re-anchor the on-device parity gate to a valid, SAME-PRECISION integer reference.
 //!
-//! # Why this file exists (spike-056 / def-f8u-01)
+//! # Why this file exists
 //!
-//! Phase-24's real-CUDA A/B compared the on-device **f64-deterministic** predictions
-//! against the host-CUDA **f32-nondeterministic** predictions and got `max_abs=1.0` — an
-//! INVALID cross-precision pairing. Holding two DIFFERENT-precision GPU paths to bit- (or
-//! 1e-6) equality is the documented `def-f8u-01` false-fail: a split near-tie flips under
-//! f32 rounding and cascades to ~1.0 in raw-logit space.
+//! Comparing the on-device **f64-deterministic** predictions against host-CUDA
+//! **f32-nondeterministic** predictions directly is an INVALID cross-precision pairing:
+//! holding two DIFFERENT-precision GPU paths to bit- (or 1e-6) equality is a false-fail
+//! mode — a split near-tie flips under f32 rounding and cascades to a large divergence in
+//! raw-logit space.
 //!
-//! After 25-01 the on-device histogram BUILD is the parallel **u64 fixed-point** kernel
-//! (S = 2^30). Integer accumulation is ORDER-INDEPENDENT ⇒ EXACTLY reproducible, which
-//! makes a genuine same-precision bit-exact anchor possible. This file installs the
-//! correct FIRST tier of the two-tier gate:
+//! The on-device histogram BUILD is a parallel **u64 fixed-point** kernel (S = 2^30).
+//! Integer accumulation is ORDER-INDEPENDENT ⇒ EXACTLY reproducible, which makes a genuine
+//! same-precision bit-exact anchor possible. This file installs a two-tier gate:
 //!
-//!   Tier 1 (HERE, Task 1, cpu lane): the on-device-grown tree is BIT-EXACT to an
+//!   Tier 1 (HERE, cpu lane): the on-device-grown tree is BIT-EXACT to an
 //!     INDEPENDENT **host-side integer** reference — a u64/i128 fixed-point (S = 2^30)
 //!     recomputation of the leaf outputs over the grow's OWN partition, plus an
 //!     independent integer-histogram argmax of the root split feature. The reference is
 //!     NOT a second `grow_tree_on_device_*` call (that would be the verify-vacuity
 //!     landmine — comparing the driver to itself proves nothing).
 //!
-//!     WR-02 (25-REVIEW) COVERAGE SCOPE: on the cpu lane `CpuBackend`'s
+//!     Coverage scope: on the cpu lane `CpuBackend`'s
 //!     `resident_pool_supported()` is the trait-default `false`, so the CODE UNDER TEST
 //!     here is the f64 ANCHOR arm (`build_leaf_hist` → `construct_histograms_f64_on`), NOT
 //!     the resident **u64** kernel (`build_resident_leaf`). This tier therefore anchors the
 //!     f64 STRUCTURE + integer leaf-value EQUIVALENCE — it does NOT exercise the u64 build.
-//!     The u64 build itself is CI-reachable only on the `#[cfg(feature = "rocm")]` lanes
-//!     (Task 2 below + `resident_score_ab.rs` + `cuda_on_device.rs`); a regression confined
+//!     The u64 build itself is reachable only on the `#[cfg(feature = "rocm")]` lanes
+//!     (Tier 2 below + `resident_score_ab.rs` + `cuda_on_device.rs`); a regression confined
 //!     to the u64 kernel would pass every non-rocm run. (A resident-capable cubecl-cpu
 //!     backend variant that could drive `build_resident_leaf` on the cpu lane was left out
-//!     of scope as too risky for the bit-exact hard gate — 25-REVIEW WR-02.)
+//!     of scope as too risky for the bit-exact hard gate.)
 //!
-//!   Tier 2 (Task 2 below + `resident_score_ab.rs`, rocm lane): the on-device predictions
+//!   Tier 2 (below + `resident_score_ab.rs`, rocm lane): the on-device predictions
 //!     are held to a ~1e-6 ENVELOPE vs the host-CUDA arm — a cross-precision check, NEVER
-//!     bit-exactness — so the `def-f8u-01` `max_abs=1.0` false-fail is structurally
-//!     impossible.
+//!     bit-exactness — so the invalid-pairing false-fail is structurally impossible.
 //!
 //! The cpu-f64 fold stays the bit-exact hard merge gate for the CPU anchor (untouched).
 //!
@@ -46,7 +43,7 @@
 //! cubecl-cpu f64 STRUCTURE anchor and where, because grad/hess are INTEGER-valued, the
 //! u64 fixed-point sum dequantizes BIT-EXACTLY to the f64 fold (|grad| ≤ 13, hess = 1, ≤ 8
 //! rows ⇒ every partial sum is an exactly-representable f64 integer, so addition is
-//! order-independent — the same property that makes 25-01's u64 build bit-exact).
+//! order-independent — the same property that makes the u64 build bit-exact).
 
 use lgbm_compute::gain::{calculate_splitted_leaf_output, get_split_gains};
 use lgbm_compute::kernels::grow_driver::grow_tree_on_device_driver;
@@ -56,7 +53,7 @@ use lgbm_dataset::bin_mapper::MissingType;
 use lgbm_model::Tree;
 use oracle_harness::comparator::compare_exact_f64_bits;
 
-/// The u64 fixed-point scale the 25-01 on-device build quantizes grad/hess at (S = 2^30,
+/// The u64 fixed-point scale the on-device build quantizes grad/hess at (S = 2^30,
 /// `construct_leaf_hist_resident_lds_kernel_u64`). The host-side integer reference below
 /// mirrors it: `q = round(v * S)` accumulated as `i128` (order-independent), dequantized
 /// `q as f64 / S`. On the integer-valued proving corpus this is bit-exact to the f64 fold.
@@ -253,11 +250,11 @@ fn driver_leaf_rows(layout: &lgbm_dataset::LeafPartitionLayout) -> Vec<Vec<u32>>
         .collect()
 }
 
-/// Task 1 (Test 1) — the on-device-grown tree's leaf values are BIT-EXACT to the
+/// The on-device-grown tree's leaf values are BIT-EXACT to the
 /// INDEPENDENT host-side u64 fixed-point (S = 2^30) integer reference, and the root split
 /// feature matches an independent integer-histogram argmax.
 ///
-/// WR-02 (25-REVIEW) COVERAGE SCOPE: this test runs on `CpuBackend`, whose
+/// Coverage scope: this test runs on `CpuBackend`, whose
 /// `resident_pool_supported()` is the trait-default `false`, so the driver takes the ANCHOR
 /// arm (`build_leaf_hist` → `construct_histograms_f64_on`, f64) — NOT the resident u64 build
 /// (`build_resident_leaf` → `..._u64`). What it anchors on the cpu lane is therefore the f64
@@ -265,14 +262,13 @@ fn driver_leaf_rows(layout: &lgbm_dataset::LeafPartitionLayout) -> Vec<Vec<u32>>
 /// holds because, on this integer-valued corpus, BOTH the f64 fold and the i128/u64
 /// fixed-point fold equal the exact integer sums (order-independent). The u64 resident kernel
 /// is exercised only on the `#[cfg(feature = "rocm")]` lanes (see `resident_score_ab.rs` /
-/// `cuda_on_device.rs`), consistent with the standing "on-device kernel goldens are
-/// re-transcriptions" caveat.
+/// `cuda_on_device.rs`).
 ///
-/// This is still a valid, non-tautological, SAME-precision anchor 25-01's integer build makes
+/// This is still a valid, non-tautological, SAME-precision anchor the integer build makes
 /// possible: the reference re-derives the leaf outputs and the root split feature from the
 /// raw rows via fixed-point INTEGER accumulation — NOT by a second `grow_tree_on_device_*`
 /// call, and NOT against the f32-nondeterministic host-CUDA path (that envelope lives in
-/// Task 2).
+/// the section below).
 #[test]
 fn on_device_tree_leaf_values_bit_exact_to_host_integer_reference() {
     let backend = CpuBackend;
@@ -360,7 +356,7 @@ fn on_device_tree_leaf_values_bit_exact_to_host_integer_reference() {
     );
 }
 
-/// Task 1 (Test 2) — determinism: growing the SAME corpus twice on device yields a
+/// Determinism: growing the SAME corpus twice on device yields a
 /// BYTE-IDENTICAL tree (integer accumulation ⇒ order-independent ⇒ exactly reproducible),
 /// proving the integer anchor is stable (no run-to-run drift the ~1e-6 f32 path would
 /// have). Compares every numeric field bit-for-bit (`to_bits`) plus the structural fields
@@ -442,15 +438,15 @@ fn collect_leaves_under(tree: &Tree, node_or_leaf: i32, out: &mut Vec<usize>) {
     }
 }
 
-/// Task 2 (28-05, ODF-06) — the 28-03 rewritten resident-scheduler tree is BIT-EXACT to the u64
+/// The rewritten resident-scheduler tree is BIT-EXACT to the u64
 /// fixed-point INTEGER anchor path across the WHOLE tree (every internal node value + every leaf
 /// value + the root split feature), NOT just the root+children the `_host_integer_reference` gate
-/// pins. This consolidates the ODF-06 anchor-parity gate onto the same-precision integer reference
-/// 25-01's u64 build makes possible (def-f8u-01 tier 1).
+/// pins. This consolidates the anchor-parity gate onto the same-precision integer reference
+/// the u64 build makes possible.
 ///
-/// WR-02 (25-REVIEW) COVERAGE SCOPE (identical to `_host_integer_reference`): on the cpu lane
+/// Coverage scope (identical to `_host_integer_reference`): on the cpu lane
 /// `CpuBackend::resident_pool_supported() == false`, so the CODE UNDER TEST is the f64 ANCHOR arm
-/// (the RESIDENT u64 kernel that the 28-03 scheduler drives runs ONLY on a resident backend, and
+/// (the RESIDENT u64 kernel that the resident scheduler drives runs ONLY on a resident backend, and
 /// cannot execute on cubecl-cpu — `atomic<u64>` is unimplemented there). This lane therefore
 /// anchors the f64 STRUCTURE + the integer leaf/node-value EQUIVALENCE; the ACTUAL resident
 /// scheduler is held to the ~1e-6 envelope vs this same anchor on the `#[cfg(feature = "rocm")]`
@@ -459,7 +455,7 @@ fn collect_leaves_under(tree: &Tree, node_or_leaf: i32, out: &mut Vec<usize>) {
 /// Bit-exactness holds because, on the integer-valued L2 proving corpus, BOTH the f64 fold and the
 /// i128/u64 fixed-point fold equal the exact integer sums (order-independent). The reference
 /// re-derives every node/leaf output from the raw rows via fixed-point INTEGER accumulation — NOT
-/// a second `grow_tree_on_device_*` call (the verify-vacuity landmine). The T-lsx-01 order-preserving
+/// a second `grow_tree_on_device_*` call (the verify-vacuity landmine). The order-preserving
 /// cross-feature tie-break is anchor-defined: the winner selection the driver records is what the
 /// integer reference re-scores, and the near-tie-free monotone corpus makes the choice unambiguous.
 #[test]
@@ -532,7 +528,7 @@ fn resident_tree_bit_exact_to_u64_integer_path() {
     }
 
     // (3) STRUCTURAL: the root split feature equals an independent integer-histogram argmax
-    // (T-lsx-01 anchor-defined winner over the integer sums).
+    // (anchor-defined winner over the integer sums).
     let ref_root_feature = host_integer_root_split_feature(&gf, &gradients, &hessians);
     assert!(
         ref_root_feature >= 0,
@@ -544,16 +540,16 @@ fn resident_tree_bit_exact_to_u64_integer_path() {
         tree.split_feature[0], ref_root_feature
     );
 
-    // On a rocm host, additionally hold the ACTUAL 28-03 resident-scheduler tree
+    // On a rocm host, additionally hold the ACTUAL resident-scheduler tree
     // (`RocmBackend::with_resident(true)`) to the ~1e-6 envelope vs THIS cpu-f64/integer anchor
-    // (def-f8u-01: the anchor is the cpu fold, NEVER a second GPU f32 run).
+    // (the anchor is the cpu fold, NEVER a second GPU f32 run).
     #[cfg(feature = "rocm")]
     resident_tree_within_envelope_of_integer_anchor(&gradients, &hessians, &gf, &leaf_reference);
 }
 
-/// `--features rocm` lane: the ACTUAL 28-03 resident scheduler (`RocmBackend::with_resident(true)`)
+/// `--features rocm` lane: the ACTUAL resident scheduler (`RocmBackend::with_resident(true)`)
 /// grows the tree on the hip runtime; its per-leaf values are held to the ~1e-6 f32 envelope vs the
-/// cpu-f64/u64-integer anchor `leaf_reference` (def-f8u-01: the anchor is the cpu fold, NEVER a
+/// cpu-f64/u64-integer anchor `leaf_reference` (the anchor is the cpu fold, NEVER a
 /// second GPU f32 run). This is the tree-structure companion to `resident_score_ab.rs`'s hip score
 /// within-envelope variants.
 #[cfg(feature = "rocm")]
@@ -607,15 +603,13 @@ fn resident_tree_within_envelope_of_integer_anchor(
 }
 
 // ===========================================================================
-// Task 2 — the ~1e-6 CROSS-PRECISION envelope vs the host-CUDA arm (rocm-gated).
+// The ~1e-6 CROSS-PRECISION envelope vs the host-CUDA arm (rocm-gated).
 //
-// This is the SECOND tier of the two-tier gate and the valid replacement for Phase-24's
-// f64-vs-f32 bit comparison: the on-device predictions are held to an ENVELOPE
-// `atol + rtol·|p_host|` against the host-CUDA/resident f32 arm — NEVER bit-exactness, so
-// the def-f8u-01 `max_abs=1.0` near-tie false-fail is structurally impossible. Compiled
-// out on the cpu-only lane; exercised on a rocm host (recorded in SUMMARY as the
-// Kaggle/local-GPU-verified cell). The bit-exact SAME-precision anchor lives in Task 1
-// above; the combined grow+score ~1e-6 hip cell also lives in `resident_score_ab.rs`.
+// This is the second tier of the two-tier gate: the on-device predictions are held to an
+// ENVELOPE `atol + rtol·|p_host|` against the host-CUDA/resident f32 arm — NEVER
+// bit-exactness, so a near-tie false-fail is structurally impossible. Compiled out on the
+// cpu-only lane; exercised on a rocm host. The bit-exact SAME-precision anchor lives in
+// Tier 1 above; the combined grow+score ~1e-6 hip cell also lives in `resident_score_ab.rs`.
 // ===========================================================================
 #[cfg(feature = "rocm")]
 mod rocm_envelope {
@@ -631,11 +625,11 @@ mod rocm_envelope {
     const ATOL: f64 = 1e-5;
     const RTOL: f64 = 1e-6;
 
-    /// Task 2 — the on-device predictions vs the host-CUDA/resident f32 arm within the
+    /// The on-device predictions vs the host-CUDA/resident f32 arm within the
     /// ~1e-6 envelope. On-device (u64-build) tree grown + scored on the hip runtime is the
     /// candidate; the host-CUDA f32 arm (cpu-anchor host partition scatter over the
     /// hip-grown layout) is the reference. This holds the cross-precision pair to an
-    /// ENVELOPE — the valid def-f8u-01 check that replaces the f64-vs-f32 bit comparison.
+    /// ENVELOPE, never bit-exactness.
     /// NEVER compares the on-device tree bit-exact to a host-CUDA f32 path.
     #[test]
     fn on_device_score_within_envelope_of_host_cuda() {
@@ -653,8 +647,8 @@ mod rocm_envelope {
             .expect("hip on-device resident score");
 
         // REFERENCE: the host-CUDA/resident f32 arm — the byte-unchanged host partition
-        // scatter over the SAME hip-grown (tree, layout). This is the host-CUDA arm the
-        // Phase-24 A/B mis-compared bit-exactly; here it is the ENVELOPE reference.
+        // scatter over the SAME hip-grown (tree, layout). Never compared bit-exactly to the
+        // candidate; here it is the ENVELOPE reference.
         let mut host = vec![0.0f64; layout.num_data as usize];
         for (leaf, (&begin, &count)) in layout
             .leaf_begin

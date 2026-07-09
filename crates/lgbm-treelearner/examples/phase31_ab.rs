@@ -1,15 +1,15 @@
-//! Phase 31 (ODS-02/ODS-03) — the resident on-device driver tree-stream-fingerprint A/B.
+//! The resident on-device driver tree-stream-fingerprint A/B.
 //!
-//! Proves Plans 01/03/07/08's COMBINED change (resident child seed-sums re-sourcing +
-//! the zero-readback reduce-into-frontier device→device winner fold) is BIT-EXACT at the
+//! Proves that combining the resident child seed-sums re-sourcing with
+//! the zero-readback reduce-into-frontier device→device winner fold is BIT-EXACT at the
 //! DRIVER level: the tree-stream fingerprint over a multi-tree train INCLUDING a
-//! `with_features` swap tail is IDENTICAL across ALL 3 scan arms Plan 08 re-wired —
+//! `with_features` swap tail is IDENTICAL across ALL 3 scan arms —
 //!   - co-pack default-ON            (`LGBM_SIBLING_COPACK` unset/`=1`)
 //!   - co-pack OFF                   (`LGBM_SIBLING_COPACK=0`)
 //!   - f64-fused escape hatch        (`LGBM_ONDEVICE_F64_FUSED=1`)
 //! — AND identical across the feature-set swap (no state leak from the re-sourcing +
-//! zero-readback fold on ANY arm, not just the default). This is the Phase-31 continuation
-//! of the `phase30_ab.rs` tree-stream-fingerprint lineage.
+//! zero-readback fold on ANY arm, not just the default). This harness continues the
+//! tree-stream-fingerprint approach used by `phase30_ab.rs`.
 //!
 //! ## Why subprocess-per-arm (NOT the phase30 same-session override pattern)
 //! Two of the three arm selectors are read-once process-global `OnceLock`s
@@ -21,7 +21,7 @@
 //! from start, then compare the fingerprints the workers print. The driver process itself does
 //! NO GPU work (it only spawns + parses), so no OnceLock is ever contended.
 //!
-//! Run (local hip) — build with the crate's OWN `--features rocm` (Pitfall 4: the dep-scoped
+//! Run (local hip) — build with the crate's OWN `--features rocm` (the dep-scoped
 //! `<dep>/rocm` spelling leaves the example's own `cfg(feature="rocm")` false and silently
 //! compiles the GPU arm OUT — do NOT use it here):
 //!   LGBM_CUDA_ON_DEVICE=1 LGBM_PHASE_PROF=1 \
@@ -29,11 +29,11 @@
 //!
 //! Gates (fail-closed — `assert_eq!` + non-zero exit):
 //!   (1) PARITY ACROSS ALL 3 ARMS: every arm's FULL tree-stream fingerprint is IDENTICAL
-//!       (Plans 01/03/07/08 are byte-neutral across arms — any drift is a correctness bug).
+//!       (the combined change is byte-neutral across arms — any drift is a correctness bug).
 //!   (2) SWAP-TAIL PARITY: every arm's post-`with_features` swap-tail fingerprint is IDENTICAL
 //!       (the re-sourcing + zero-readback fold leaks NO state across a feature-set change).
-//!   Each arm ALSO emits a canonical `ONDEV_GROW:` ledger line (Phase-30 format) so the Kaggle
-//!   tooling regex keeps parsing continuously across the phase.
+//!   Each arm ALSO emits a canonical `ONDEV_GROW:` ledger line (matching `phase30_ab.rs`'s
+//!   format) so the Kaggle tooling regex keeps parsing continuously.
 
 use lgbm_compute::kernels::grow_driver::{
     on_device_grow_phase_take, on_device_sync_count_take, GrowPhaseNs,
@@ -54,7 +54,7 @@ const N_TREES_SWAP: usize = 2; // extra trees after the feature-set swap (state-
 const NUM_DATA: usize = 10_000;
 const NUM_FEATURES: usize = 30;
 
-/// The 3 scan arms Plan 08 re-wired, each `(label, selector-env-var, value)`. The driver
+/// The 3 scan arms, each `(label, selector-env-var, value)`. The driver
 /// clears BOTH selector vars for every child and sets exactly the one this arm needs, so the
 /// arms never contaminate each other (co-pack default-ON is the "clear both" state ⇒ its
 /// value `"1"` is the explicit-ON spelling `sibling_copack_enabled()` treats as default).
@@ -124,7 +124,7 @@ fn main() {
     }
 }
 
-/// `true` when `LGBM_PHASE_PROF=1` — the Pitfall-4 ledger guard (`ONDEV_GROW.wall > 0`) is only
+/// `true` when `LGBM_PHASE_PROF=1` — the ledger guard (`ONDEV_GROW.wall > 0`) is only
 /// meaningful when the phase-prof gate is on; the fingerprint parity holds either way.
 #[cfg(feature = "rocm")]
 fn phase_prof_on() -> bool {
@@ -150,7 +150,7 @@ fn add_ledger(acc: &mut GrowPhaseNs, led: &GrowPhaseNs) {
 
 /// Replicate `phase_prof::dump`'s ONDEV_GROW line VERBATIM (same prefix + field order +
 /// precision) from a drained ledger, so the Kaggle `parse_growth_ledger.ONDEV_RE` regex matches
-/// a line THIS harness actually emits (Phase-30 lineage continuity).
+/// a line THIS harness actually emits, matching the format `phase30_ab.rs` uses.
 #[cfg(feature = "rocm")]
 fn emit_ondev_grow_line(label: &str, led: &GrowPhaseNs) {
     let sum = led.setup
@@ -177,22 +177,22 @@ fn emit_ondev_grow_line(label: &str, led: &GrowPhaseNs) {
     );
 }
 
-/// Phase-31 DoD extension (ODS-05): the seed-sum-readback sync bucket + the score-mirror
+/// The seed-sum-readback sync bucket + the score-mirror
 /// reference, printed as ONE compact, verbatim-capturable line APPENDED alongside — never
-/// replacing — the `ONDEV_GROW` ledger. Additive by design so the Kaggle spike-080 harness's
+/// replacing — the `ONDEV_GROW` ledger. Additive by design so the Kaggle harness's
 /// existing `ONDEV_GROW`/`COUNTS` regexes keep matching unchanged.
 ///
 /// - `blocking_readbacks(syncs)` is the REAL drained `ON_DEVICE_SYNC_CNT` total for this worker
-///   (all `N_TREES + N_TREES_SWAP` grows). Per Plan 05's independently re-derived closed form the
+///   (all `N_TREES + N_TREES_SWAP` grows). The independently re-derived closed form for the
 ///   steady per-grow count is `1 + (num_leaves-1)` = `num_leaves` (root scan + per-iteration §8.3
-///   pick export; the per-split *scan* readback — the seed-sum crossing Plan 08 retired — is
+///   pick export; the per-split *scan* readback — the seed-sum crossing — is retired, i.e.
 ///   **0**, "eliminated"). We print the total, the grow count, and the per-grow figure so the
-///   Kaggle-side / Plan-06 reader can confirm the seed-sum contribution is 0 against that form.
+///   Kaggle-side reader can confirm the seed-sum contribution is 0 against that form.
 /// - The score-mirror (`GRAD_NS`/`SCORE_NS`) bucket is a GBDT-level measurement: it is populated
 ///   only by a `Gbdt` train (lgbm-boosting), which THIS `SerialTreeLearner`-only harness never
 ///   constructs, so those statics stay 0 here. Rather than print a misleading `0`, we emit a
 ///   REFERENCE pointing at the crate that actually measures it — `oracle-harness`'s
-///   `phase31_grad_score_ab` test (Plan 05, ODS-01/ODS-04) — the split Plan 05 already made
+///   `phase31_grad_score_ab` test — a split already made
 ///   because lgbm-treelearner structurally cannot build a GBDT.
 #[cfg(feature = "rocm")]
 fn emit_phase31_ext_line(label: &str, syncs: u64, grows: u64) {
@@ -231,7 +231,7 @@ fn worker(arm: &str) {
         let (g, h) = grads(0x9e37_79b9 ^ iter as u64, NUM_DATA);
         let tree = learner.train(&g, &h, iter == 0).expect("on-device resident train");
         let led = on_device_grow_phase_take();
-        // Pitfall 4 guard: a compiled-out GPU arm ⇒ empty ledger ⇒ a vacuous "identical" pass.
+        // Guard against a compiled-out GPU arm ⇒ empty ledger ⇒ a vacuous "identical" pass.
         // Only assertable when the phase-prof gate is on (the fingerprint parity holds regardless).
         if phase_prof_on() {
             assert!(
@@ -259,7 +259,7 @@ fn worker(arm: &str) {
     }
 
     // Drain the REAL blocking-readback sync total across every grow in this worker (root scan +
-    // per-iteration §8.3 pick export; the per-split scan/seed-sum readback is 0 post-Plan-08).
+    // per-iteration §8.3 pick export; the per-split scan/seed-sum readback is 0).
     let syncs = on_device_sync_count_take();
     let grows = (N_TREES + N_TREES_SWAP) as u64;
 
@@ -340,10 +340,10 @@ fn run() {
         results.push((label.to_string(), full, swap, syncs, grows));
     }
 
-    // Emit the compact per-arm summary (for pasting into 31-AB-RESULTS.md, Plan 06). The
+    // Emit the compact per-arm summary (for pasting into the results summary). The
     // `blocking_readbacks`/`per_grow` fields carry the seed-sum-readback bucket the DoD requires;
-    // `seed_sum_scan_readback=0` is the "eliminated" claim (per-split scan readback retired, Plan
-    // 08), and per_grow should track Plan 05's `1 + (num_leaves-1)` closed form.
+    // `seed_sum_scan_readback=0` is the "eliminated" claim (per-split scan readback retired),
+    // and per_grow should track the `1 + (num_leaves-1)` closed form.
     for (arm, full, swap, syncs, grows) in &results {
         let per_grow = if *grows > 0 { *syncs as f64 / *grows as f64 } else { 0.0 };
         println!(

@@ -1,56 +1,54 @@
-//! Tri-state `LGBM_CUDA_ON_DEVICE` resolver + `on_device_default` unit tests (23-01),
-//! PLUS the consolidated 26-05 (ODP3-06) parity gate for the resident on-device tree.
+//! Tri-state `LGBM_CUDA_ON_DEVICE` resolver + `on_device_default` unit tests,
+//! PLUS the consolidated parity gate for the resident on-device tree.
 //!
-//! ## 26-05 (ODP3-06) — the consolidated resident-tree parity gate (see `resident_parity_gate`)
-//! After Plans 01-04 completed the resident control plane (grad/hess-once, on-device
-//! argmax/best-leaf/root-sum, resident row permutation, the async/stream boundary), this
-//! file adds the phase's SINGLE consolidated parity gate at the DRIVER's home crate. It
-//! proves, in one place, the three non-negotiable ODP3-06 clauses:
+//! ## The resident-tree parity gate (see `resident_parity_gate`)
+//! This file holds the crate's single consolidated parity gate for the resident
+//! on-device build, living at the driver's home crate. It proves, in one place, three
+//! non-negotiable invariants:
 //!   1. **Bit-exact vs the u64 fixed-point integer path** — the on-device-grown tree's leaf
 //!      values + root internal value + root split feature are BIT-EXACT to an INDEPENDENT
 //!      host-side u64 fixed-point (S = 2^30) integer reference (NOT a second driver call —
 //!      that would be verify-vacuity). Integer accumulation is order-independent, so on the
 //!      integer-valued L2 proving slice the u64 sum dequantizes EXACTLY to the f64 fold.
-//!      WR-02 (25-REVIEW) COVERAGE SCOPE: this clause runs on `CpuBackend`, whose
-//!      `resident_pool_supported()` is the trait-default `false`, so the code under test on
-//!      the cpu lane is the f64 ANCHOR arm — it anchors the f64 STRUCTURE + integer
-//!      leaf-value EQUIVALENCE, NOT the resident u64 kernel. The u64 build is CI-reachable
-//!      only on the `#[cfg(feature = "rocm")]` lanes (clause 2 + `resident_score_ab.rs`);
-//!      a regression confined to the u64 kernel would pass every non-rocm run. (Exposing a
-//!      resident-capable cubecl-cpu backend to drive the u64 build on the cpu lane was left
-//!      out of scope as too risky for the bit-exact hard gate.)
+//!      Coverage note: this clause runs on `CpuBackend`, whose `resident_pool_supported()`
+//!      is the trait-default `false`, so the code under test on the cpu lane is the f64
+//!      ANCHOR arm — it anchors the f64 STRUCTURE + integer leaf-value EQUIVALENCE, NOT the
+//!      resident u64 kernel. The u64 build is only reachable on the `#[cfg(feature = "rocm")]`
+//!      lanes (clause 2 + `resident_score_ab.rs`); a regression confined to the u64 kernel
+//!      would pass every non-rocm run. (Exposing a resident-capable cubecl-cpu backend to
+//!      drive the u64 build on the cpu lane was left out of scope as too risky for the
+//!      bit-exact hard gate.)
 //!   2. **~1e-6 vs the host-CUDA arm** (rocm-gated) — the on-device predictions are held to
-//!      an ENVELOPE `atol + rtol·|p_host|` against the host-CUDA f32 arm, NEVER bit-exactness.
-//!      This is the valid `def-f8u-01` cross-precision check that replaces Phase-24's invalid
-//!      f64-vs-f32 bit comparison (which produced the false `max_abs=1.0`). Both GPU trees are
-//!      pinned to the cpu-f64 anchor — NEVER GPU-f32-vs-GPU-f32.
-//!   3. **SC-4 byte-parity** — with `LGBM_CUDA_ON_DEVICE` unset the resolver is OFF (the
+//!      an ENVELOPE `atol + rtol·|p_host|` against the host-CUDA f32 arm, NEVER bit-exactness
+//!      (comparing two nondeterministic f32 paths bit/1e-6-exact would be an invalid
+//!      cross-precision check). Both GPU trees are pinned to the cpu-f64 anchor — NEVER
+//!      GPU-f32-vs-GPU-f32.
+//!   3. **Byte-parity** — with `LGBM_CUDA_ON_DEVICE` unset the resolver is OFF (the
 //!      byte-unchanged host path), and the on-device anchor grow is BYTE-IDENTICAL run to run
 //!      (the integer anchor is deterministic — no f32 drift), so the cpu/rocm merge gate is
-//!      byte-stable until the Plan-06 flip. `on_device_default()` is UNTOUCHED (stays false).
+//!      byte-stable. `on_device_default()` stays false.
 //! The cpu-f64 fold remains the bit-exact hard merge gate for the CPU anchor (untouched).
 //!
-//! ## Tri-state resolver locks (23-01)
+//! ## Tri-state resolver locks
 //!
 //! Two independent things are locked here:
 //!
-//! 1. The tri-state MAPPING (D-01, V5 exact-match closed enum) is tested through the
+//! 1. The tri-state MAPPING (exact-match closed enum) is tested through the
 //!    pure [`lgbm_compute::cuda_on_device_override_from`] helper — NOT through the
-//!    public OnceLock-cached resolver. The resolver reads the env once per process
-//!    (Pitfall P-1), so it cannot be exercised across multiple values in one test
-//!    binary; the pure helper is the OnceLock initializer's own mapping, so asserting
-//!    it asserts the real contract without fighting the cache. There is deliberately
-//!    NO test that flips the env between two reads in one process (P-1 warning sign).
+//!    public OnceLock-cached resolver. The resolver reads the env once per process,
+//!    so it cannot be exercised across multiple values in one test binary; the pure
+//!    helper is the OnceLock initializer's own mapping, so asserting it asserts the
+//!    real contract without fighting the cache. There is deliberately NO test that
+//!    flips the env between two reads in one process.
 //!
-//! 2. The DEVICE DEFAULT is OFF (SC-4 anchor): with the env unset the resolved default
-//!    is `false`, so every backend is byte-unchanged. The 25-05 evidence-gated flip
-//!    (ODP2-07) WITHHELD the change — the Phase-25 real-CUDA A/B (`25-AB-RESULTS.md`)
-//!    FAILED both bars (D-04 ≤1.05× and ~1e-6 parity), so `on_device_default()` stays
-//!    `false` and `LGBM_CUDA_ON_DEVICE="1"` remains the opt-in switch.
+//! 2. The DEVICE DEFAULT is OFF: with the env unset the resolved default is `false`,
+//!    so every backend is byte-unchanged. A real-hardware A/B evaluation of flipping
+//!    the default did not clear its performance and parity bars, so `on_device_default()`
+//!    stays `false` and `LGBM_CUDA_ON_DEVICE="1"` remains the opt-in switch.
 
 use lgbm_compute::cuda_on_device_override_from;
 
-/// D-01: exact-string closed enum. `"1"` forces on, `"0"` forces off, and EVERYTHING
+/// Exact-string closed enum. `"1"` forces on, `"0"` forces off, and EVERYTHING
 /// else (unset/empty/malformed) maps to `None` = follow the device default.
 #[test]
 fn tri_state_mapping_is_exact_closed_enum() {
@@ -65,18 +63,18 @@ fn tri_state_mapping_is_exact_closed_enum() {
     assert_eq!(cuda_on_device_override_from(Some("true")), None, "\"true\" => follow default");
 }
 
-/// The consolidated 26-05 (ODP3-06) parity gate for the fully-resident on-device tree.
+/// The consolidated parity gate for the fully-resident on-device tree.
 ///
-/// This module is the phase's SINGLE parity gate, living at the driver's home crate. It
+/// This module is the crate's single parity gate, living at the driver's home crate. It
 /// grows the tree through the SAME `grow_tree_on_device_driver` the production seam uses and
 /// pins it three ways (see the file-level doc): (1) BIT-EXACT to an independent host-side u64
 /// fixed-point integer reference, (2) ~1e-6 ENVELOPE vs the host-CUDA arm (rocm-gated, NEVER
-/// bit-exact / never GPU-f32-vs-GPU-f32 — def-f8u-01), (3) SC-4 byte-parity (flag-unset OFF +
+/// bit-exact / never GPU-f32-vs-GPU-f32), (3) byte-parity (flag-unset OFF +
 /// deterministic byte-identical grow). The integer reference is a DISTINCT code path (a
 /// fixed-point fold over the raw rows), NOT a second driver call, so it is a valid
 /// non-tautological anchor.
 ///
-/// WR-02 (25-REVIEW): clause (1) here runs on `CpuBackend` (`resident_pool_supported()` ==
+/// Clause (1) here runs on `CpuBackend` (`resident_pool_supported()` ==
 /// trait-default `false`), so on the cpu lane it anchors the f64 STRUCTURE + integer
 /// leaf-value EQUIVALENCE, NOT the resident u64 kernel — that kernel is exercised only on the
 /// rocm lane (clause 2). See the file-level clause-1 note for the full coverage scoping.
@@ -94,7 +92,7 @@ mod resident_parity_gate {
     /// tests do).
     const OFFSET_MFB_0: i32 = 1;
 
-    /// The u64 fixed-point scale the 25-01 on-device build quantizes grad/hess at (S = 2^30,
+    /// The u64 fixed-point scale the on-device build quantizes grad/hess at (S = 2^30,
     /// `construct_leaf_hist_resident_lds_kernel_u64`). The host-side integer reference below
     /// mirrors it: `q = round(v * S)` accumulated as `i128` (order-independent), dequantized
     /// `q as f64 / S`. On the integer-valued proving corpus this is bit-exact to the f64 fold.
@@ -237,7 +235,7 @@ mod resident_parity_gate {
     }
 
     /// Assert two grown trees are BYTE-IDENTICAL (structural ints direct, f64/f32 via
-    /// `to_bits`) — the SC-4 byte-parity primitive.
+    /// `to_bits`) — the byte-parity primitive.
     fn assert_tree_byte_identical(a: &Tree, b: &Tree) {
         assert_eq!(a.num_leaves, b.num_leaves, "num_leaves drift");
         assert_eq!(a.split_feature, b.split_feature, "split_feature drift");
@@ -254,12 +252,11 @@ mod resident_parity_gate {
         );
     }
 
-    /// ODP3-06 clause 1 — the on-device-grown tree is BIT-EXACT to the INDEPENDENT host-side
+    /// Clause 1 — the on-device-grown tree is BIT-EXACT to the INDEPENDENT host-side
     /// u64 fixed-point integer reference: every leaf value, the root internal value, and the
     /// root split feature. Anchored to the integer/cpu-f64 fold — NEVER GPU-f32-vs-GPU-f32
-    /// (def-f8u-01: comparing two nondeterministic f32 paths bit/1e-6-exact is the invalid
-    /// pairing that produced the false `max_abs=1.0`; the reference here is a same-precision
-    /// integer fold, not a second GPU path).
+    /// (comparing two nondeterministic f32 paths bit/1e-6-exact would be an invalid pairing;
+    /// the reference here is a same-precision integer fold, not a second GPU path).
     #[test]
     fn resident_tree_bit_exact_to_u64_integer_path() {
         let backend = CpuBackend;
@@ -330,15 +327,15 @@ mod resident_parity_gate {
         );
     }
 
-    /// ODP3-06 clause 3 — SC-4 byte-parity: with `LGBM_CUDA_ON_DEVICE` unset the resolver is
-    /// OFF (the byte-unchanged host path; `on_device_default()` stays false until the Plan-06
-    /// flip), AND the on-device anchor grow is BYTE-IDENTICAL run to run (integer accumulation
+    /// Clause 3 — byte-parity: with `LGBM_CUDA_ON_DEVICE` unset the resolver is
+    /// OFF (the byte-unchanged host path; `on_device_default()` stays false), AND the
+    /// on-device anchor grow is BYTE-IDENTICAL run to run (integer accumulation
     /// ⇒ order-independent ⇒ no f32 drift), so the cpu/rocm merge gate is byte-stable. The
     /// full "every cpu+rocm tree byte-identical to master" surface is the `learner_parity`
-    /// gate; this pins the driver-level byte stability the flip depends on.
+    /// gate; this pins the driver-level byte stability of the on-device grow.
     #[test]
     fn sc4_flag_unset_off_and_grow_byte_identical() {
-        // Flag unset ⇒ OFF (25-05 WITHHELD default). On a `cuda` build the device default is a
+        // Flag unset ⇒ OFF (the resolved default). On a `cuda` build the device default is a
         // separate contract, so guard it (mirrors `cpu_build_default_is_off_when_env_unset`).
         #[cfg(not(feature = "cuda"))]
         assert!(
@@ -364,9 +361,9 @@ mod resident_parity_gate {
         assert_eq!(layout_a.leaf_count, layout_b.leaf_count, "layout leaf_count drift (SC-4)");
     }
 
-    /// ODP3-06 clause 2 (rocm-gated) — the on-device predictions are within a ~1e-6 ENVELOPE
-    /// of the host-CUDA f32 arm, NEVER bit-exact. This is the valid def-f8u-01 cross-precision
-    /// check that replaces Phase-24's f64-vs-f32 bit comparison (`max_abs=1.0` false-fail). The
+    /// Clause 2 (rocm-gated) — the on-device predictions are within a ~1e-6 ENVELOPE
+    /// of the host-CUDA f32 arm, NEVER bit-exact — comparing two nondeterministic f32 paths
+    /// bit/1e-6-exact would be an invalid cross-precision check. The
     /// on-device (u64-build) tree grown+scored on the hip runtime is the candidate; the
     /// host-CUDA f32 arm (host partition scatter over the SAME hip-grown layout) is the
     /// reference — held to `atol + rtol·|p_host|`, an ENVELOPE, never a bit/1e-6 pairing of two
@@ -419,7 +416,7 @@ mod resident_parity_gate {
 }
 
 /// The `"0"` off-switch and `"1"` on-switch are distinguished at the mapping level
-/// (D-01) — `"0"` is a first-class force-off, not the same as unset.
+/// `"0"` is a first-class force-off, not the same as unset.
 #[test]
 fn zero_is_force_off_one_is_force_on() {
     assert_eq!(
@@ -439,32 +436,28 @@ fn zero_is_force_off_one_is_force_on() {
     );
 }
 
-/// SC-4 anchor + 26-06 verdict binding: on a `cpu` build (no `-F cuda`), with
-/// `LGBM_CUDA_ON_DEVICE` unset in a fresh process, the resolver returns `false` — the
-/// resolved default (D-09), so the cpu/rocm merge gate is byte-unchanged. Guarded
-/// `#[cfg(not(feature = "cuda"))]` because a `cuda` build's device default is a separate
-/// contract. That contract was NOT flipped: the 26-06 evidence-gated decision (ODP3-08)
-/// left `on_device_default()` = `false` because the Phase-26 real-CUDA A/B
-/// (`26-AB-RESULTS.md`) FAILED BOTH bars again — not-slower (host 1.245×/1.233×, device
-/// 1.182×/1.204×; ≫ ≤1.05×) AND ~1e-6 parity (max_abs=1.0) — even after the full resident
-/// control plane (Plans 01–05). This is the fourth consecutive deferral (24/25/26); the
-/// resolved default is bound here to that recorded leave-false verdict.
+/// On a `cpu` build (no `-F cuda`), with `LGBM_CUDA_ON_DEVICE` unset in a fresh process,
+/// the resolver returns `false` — the resolved default — so the cpu/rocm merge gate is
+/// byte-unchanged. Guarded `#[cfg(not(feature = "cuda"))]` because a `cuda` build's device
+/// default is a separate contract. That contract has not been flipped: real-hardware
+/// evaluation of flipping the default has not cleared its two bars (host/device throughput
+/// not slower, and ~1e-6 parity vs the host-CUDA arm) even with the full resident control
+/// plane in place, so the default remains false.
 #[cfg(not(feature = "cuda"))]
 #[test]
 fn cpu_build_default_is_off_when_env_unset() {
     // This test binary is invoked without LGBM_CUDA_ON_DEVICE set by the merge gate.
     // The override is None (unset) and on_device_default() is false on the cpu build,
-    // so the resolved value must be false — the WITHHELD (leave-false) 26-06 default,
-    // matching 26-AB-RESULTS.md's "both bars FAIL ⇒ stays false".
+    // so the resolved value must be false — the resolved leave-false default.
     assert!(
         !lgbm_compute::cuda_on_device_enabled(),
         "cpu-build default with env unset must be OFF (SC-4 byte-unchanged; 26-06 flip WITHHELD per 26-AB-RESULTS.md)"
     );
 }
 
-/// 25-05 off-switch escape hatch (T-25-11): regardless of the resolved default,
+/// The off-switch escape hatch: regardless of the resolved default,
 /// `LGBM_CUDA_ON_DEVICE="0"` is a first-class force-off that maps to the byte-unchanged
-/// host path. Asserted at the pure-mapping level (P-1: the OnceLock resolver reads the
+/// host path. Asserted at the pure-mapping level (the OnceLock resolver reads the
 /// env once per process, so the env cannot be flipped between reads in one binary).
 /// This lock survives a future flip of `on_device_default()` to `true` — the `"0"`
 /// branch must always force-off.

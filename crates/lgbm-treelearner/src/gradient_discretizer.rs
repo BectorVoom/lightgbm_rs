@@ -1,17 +1,17 @@
 //! `gradient_discretizer` — the numeric core of the opt-in `use_quantized_grad`
-//! APPROXIMATE training mode (phase-10, Wave 1).
+//! APPROXIMATE training mode.
 //!
 //! Verbatim port of the DETERMINISTIC path of `LightGBM/src/treelearner/
 //! gradient_discretizer.cpp` (`DiscretizeGradients`, `stochastic_rounding=false`):
 //! gradients/hessians are quantized to `i8` via a per-iteration scale derived from the
 //! max-abs value, accumulated as integers, and de-quantized (× scale) for split-finding.
 //!
-//! **This is APPROXIMATE by construction** (spike-008: even full int16 drifts ~3e-4 — far
-//! above the exact ~1e-6 contract). It is reached ONLY when `use_quantized_grad=true`; the
+//! **This is APPROXIMATE by construction** — even full int16 drifts ~3e-4, far
+//! above the exact ~1e-6 contract. It is reached ONLY when `use_quantized_grad=true`; the
 //! default exact path never touches this code. The parity target is C++
 //! `use_quantized_grad=true, stochastic_rounding=false`, NOT the f64 exact anchor.
 //!
-//! Stochastic rounding + `quant_train_renew_leaf` are deferred (Wave 6) — they need
+//! Stochastic rounding + `quant_train_renew_leaf` are deferred — they need
 //! RNG-matching, a separate parity problem. This module is deterministic-only.
 
 /// Quantization scales + the deterministic quantize/de-quantize math.
@@ -25,7 +25,7 @@ pub struct GradientDiscretizer {
     /// `stochastic_rounding` (C++ default TRUE). When set, rounding adds a per-row random
     /// `∈ [0,1)` (sign-aware) instead of `0.5` — unbiased over the ensemble. Functionally
     /// faithful to C++ but NOT bit-matched (C++ uses a precomputed mt19937 sequence); the
-    /// DETERMINISTIC path (`stochastic = false`) is the C++ parity gate (phase-10 W4).
+    /// DETERMINISTIC path (`stochastic = false`) is the C++ parity gate.
     stochastic: bool,
     /// Reproducible xorshift64 state (seeded) so `deterministic=true` stochastic runs repeat.
     rng_state: u64,
@@ -178,7 +178,7 @@ impl GradientDiscretizer {
 }
 
 /// Build the integer histogram (exact i64 grad/hess sums per bin) from a quantized buffer
-/// over `leaf_rows` — the quantized analog of `accumulate_histogram_into` (Wave 2).
+/// over `leaf_rows` — the quantized analog of `accumulate_histogram_into`.
 ///
 /// `discretized` holds `[hess_i, grad_i]` i8 pairs (from [`GradientDiscretizer::discretize`]):
 /// `discretized[2*row] = hess`, `discretized[2*row + 1] = grad`. `binned[row]` is the row's
@@ -288,7 +288,7 @@ mod tests {
         assert!(d.discretize(&[], &[]).is_empty());
     }
 
-    // ---- W6: stochastic rounding ----
+    // ---- Stochastic rounding ----
 
     /// Same seed → identical output (reproducible under `deterministic=true`).
     #[test]
@@ -331,7 +331,7 @@ mod tests {
         assert!((sto_mean - 0.3).abs() < 0.01, "stochastic should be ~unbiased: {sto_mean}");
     }
 
-    // ---- Wave 2: integer histogram ----
+    // ---- Integer histogram ----
 
     /// Int histogram sums the quantized grads/hess per bin (grad at bin*2, hess at +1).
     /// grads [1,-1,0.5,-0.5] (constant hess) at bins=4 → ints [2,-2,1,-1], hess ≡1.

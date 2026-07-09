@@ -1,5 +1,5 @@
-//! Spike 086 — launch-batching seam probe: is the on-device grow loop's device-launch
-//! count reducible, or is it already at the best-first data-dependency FLOOR?
+//! Launch-batching seam probe: is the on-device grow loop's device-launch count
+//! reducible, or is it already at the best-first data-dependency FLOOR?
 //!
 //! The launch COUNT is hardware-independent (a `bump_launch()` per real device dispatch),
 //! so this probe runs on the cpu anchor lane and its numbers TRANSFER to real CUDA —
@@ -7,8 +7,8 @@
 //! corpus at a sweep of `num_leaves` and at 3 vs 24 features, and prints:
 //!
 //!   1. the measured real-dispatch launch count per grow (anchor arm),
-//!   2. that it is INDEPENDENT of num_features (the spike-055 per-feature non-collapse is
-//!      fixed — a per-feature build+scan layout would scale these terms with num_features),
+//!   2. that it is INDEPENDENT of num_features (a per-feature build+scan layout would
+//!      scale these terms with num_features; the shipped layout collapses across features),
 //!   3. the analytic floor breakdown per split (build → subtract → scan), and
 //!   4. the COUNTERFACTUAL cost of an un-batched per-feature layout, to show how much the
 //!      already-shipped batching (feature-collapse + sibling co-pack) saved.
@@ -93,8 +93,8 @@ fn main() {
         // cpu anchor arm does NOT upload (no device residency) so its floor is the per-leaf term
         // only: 2 (root build+scan) + 4*(leaves-1) (build+subtract+2 scans per split).
         let anchor_floor = 2 + 4 * (leaves as u64 - 1);
-        // Counterfactual: a NON-batched per-feature layout (spike-055 regression) would scale
-        // the build+scan terms by num_features. Rough model: each per-split build+2 scans and the
+        // Counterfactual: a NON-batched per-feature layout would scale the build+scan
+        // terms by num_features. Rough model: each per-split build+2 scans and the
         // root build+scan become per-feature ⇒ ~ (2 + 3*(leaves-1)) * num_features + (leaves-1)
         // subtracts. We report the dominant per-feature multiple at 24 features.
         let nf = 24u64;

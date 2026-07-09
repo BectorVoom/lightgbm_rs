@@ -16,10 +16,9 @@
 //!   - `IsConstantHessian` = true (no weights).
 //!
 //! The **predict-side** transform (`ConvertOutput`) is NOT re-ported here: it
-//! already lives in [`lgbm_model::ObjectiveKind`] (Open-Q1 recommendation — keep
-//! ConvertOutput in lgbm-model; this crate owns the training side only). The
-//! `sqrt` variant's training-side label transform IS owned here (it mutates the
-//! training labels, which is a training concern).
+//! already lives in [`lgbm_model::ObjectiveKind`] — this crate owns the training
+//! side only. The `sqrt` variant's training-side label transform IS owned here
+//! (it mutates the training labels, which is a training concern).
 
 use lgbm_core::types::K_EPSILON;
 
@@ -35,9 +34,7 @@ fn sign(x: f64) -> f64 {
 
 /// The training-side objective factory enum, mirroring the C++ string-keyed
 /// `ObjectiveFunction::CreateObjectiveFunction` (one variant per supported
-/// objective). 06-02 ships only the regression L2/sqrt spine variant; the
-/// remaining objectives (regression_l1 / binary / multiclass / custom) land in
-/// 06-03+.
+/// objective).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Objective {
     /// `regression` (L2). `sqrt = true` is the `regression sqrt` variant whose
@@ -51,7 +48,7 @@ pub enum Objective {
     /// `grad = (score_t)Sign(score - label)`, `hess = 1.0f`; `BoostFromScore` is
     /// the label MEDIAN (`PercentileFun` at alpha = 0.5, NOT the mean); and
     /// `IsRenewTreeOutput() == true` — after each tree, every leaf's output is
-    /// overwritten with the median RESIDUAL of its rows (Pitfall 2/3).
+    /// overwritten with the median RESIDUAL of its rows.
     RegressionL1,
     /// `huber` (`RegressionHuberLoss`, `regression_objective.hpp:293`): a clipped
     /// L2/L1 hybrid. `grad = clamp(score-label, -alpha, +alpha)` in f64 then cast
@@ -134,10 +131,10 @@ fn mape_label_weight(label: f32) -> f32 {
 
 impl Objective {
     /// Parse the objective name (mirroring the C++ string-ctor first-token +
-    /// `sqrt` flag). 06-02 recognizes only the regression L2 family
+    /// `sqrt` flag). This recognizes only the regression L2 family
     /// (`regression`, `regression_l2`, `mse`, `l2`, `mean_squared_error`) plus the
-    /// `regression sqrt` variant. Any other name is rejected (Phase-7 / later-wave
-    /// scope) — never a silent default.
+    /// `regression sqrt` variant. Any other name is rejected — never a silent
+    /// default.
     ///
     /// # Errors
     /// [`ObjectiveError::Unsupported`] for an out-of-scope / unrecognized
@@ -168,7 +165,7 @@ impl Objective {
             // `mape` config aliases (config_auto.cpp valid-objective list):
             // `mape`, `mean_absolute_percentage_error`.
             "mape" | "mean_absolute_percentage_error" => Ok(Objective::Mape),
-            // poisson/gamma/tweedie (OBJ-04 exp/log family). poisson/tweedie carry
+            // poisson/gamma/tweedie. poisson/tweedie carry
             // params filled by `from_config` (config.h defaults: poisson_max_delta_step
             // 0.7, tweedie_variance_power 1.5); the bare-name parse seeds them so it is
             // a valid variant. gamma has no objective param.
@@ -182,7 +179,7 @@ impl Objective {
     }
 
     /// The canonical objective name (the first-token string this variant parses
-    /// from), used by the on-device routing seam (Phase-31 31-04) to classify the
+    /// from), used by the on-device routing seam to classify the
     /// objective through `lgbm_compute::device_objective_supported`. This mirrors the
     /// C++ `ObjectiveFunction::GetName()` roster; the `sqrt` L2 sub-variant still
     /// reports `"regression"` (its on-device grad/hess kernel is the L2 kernel — the
@@ -202,21 +199,20 @@ impl Objective {
         }
     }
 
-    /// Build the objective from a resolved [`lgbm_core::Config`] (D-02 — the
+    /// Build the objective from a resolved [`lgbm_core::Config`] — the
     /// builder never forks the objective name; it routes the config's
-    /// `objective` string through [`Self::parse`]).
+    /// `objective` string through [`Self::parse`].
     ///
-    /// reg_sqrt (GAP E, 06-06): in C++ `reg_sqrt` is a CONFIG flag the regression
-    /// objective reads (`RegressionL2loss::sqrt_`), independent of the objective
-    /// string. The 06-02 port keyed `sqrt` only off the `"regression sqrt"` string
-    /// token, so `config.reg_sqrt = true` (e.g. via `TrainingBuilder.reg_sqrt(true)`)
-    /// had no effect — `reg_sqrt=1` was not drivable end-to-end. Here we OR the config
-    /// flag into the parsed `sqrt` so EITHER route (the `"... sqrt"` token OR
-    /// `config.reg_sqrt`) activates the sqrt transform, matching C++.
+    /// `reg_sqrt`: in C++ `reg_sqrt` is a CONFIG flag the regression objective
+    /// reads (`RegressionL2loss::sqrt_`), independent of the objective string.
+    /// Parsing the objective string alone would miss `config.reg_sqrt` set
+    /// directly (e.g. via `TrainingBuilder.reg_sqrt(true)`) without the
+    /// `"... sqrt"` token, so here we OR the config flag into the parsed `sqrt`
+    /// so EITHER route (the `"... sqrt"` token OR `config.reg_sqrt`) activates
+    /// the sqrt transform, matching C++.
     ///
     /// # Errors
-    /// [`ObjectiveError::Unsupported`] when `config.objective` is out of 06-02
-    /// scope.
+    /// [`ObjectiveError::Unsupported`] when `config.objective` is out of scope.
     pub fn from_config(config: &lgbm_core::Config) -> Result<Objective, ObjectiveError> {
         match Objective::parse(&config.objective)? {
             Objective::Regression { sqrt } => Ok(Objective::Regression {
@@ -289,7 +285,7 @@ impl Objective {
 
     /// C++ `IsRenewTreeOutput` — false for L2 (the learner's Newton output is the
     /// final leaf value; no median-residual renewal). `regression_l1` overrides
-    /// this in 06-03.
+    /// this.
     pub fn is_renew_tree_output(&self) -> bool {
         match self {
             // L2/huber/fair: the Newton output is the final leaf value (no renewal).
@@ -343,8 +339,8 @@ impl Objective {
         }
     }
 
-    /// The C++ objective `Init` label-domain guard surfaced as a typed `Result`
-    /// (Security V5 / T-07-03-01), called once at train time before any gradient
+    /// The C++ objective `Init` label-domain guard surfaced as a typed `Result`,
+    /// called once at train time before any gradient
     /// work. poisson/gamma/tweedie require every label `>= 0` AND `Σ label != 0`
     /// (`regression_objective.hpp:417-424`); the L2/L1/huber/fair/quantile/mape
     /// objectives have no label-domain guard (they accept any finite label).
@@ -425,7 +421,7 @@ impl Objective {
                 actual: hessians.len(),
             });
         }
-        // spike-068: each arm's per-row body is unchanged; only the serial `for i in
+        // Each arm's per-row body is unchanged; only the serial `for i in
         // 0..n` loop is replaced by `apply_grad_hess` (serial below the grain floor,
         // rayon at/above it). Every output element is a pure function of its own row's
         // (score, label) written to a disjoint slot, so this is bit-exact.
@@ -832,7 +828,7 @@ mod tests {
         assert_eq!(obj.renew_leaf_output(&odd, &[0.0f32; 3]), 2.0);
     }
 
-    // ---- huber/fair/quantile/mape (Plan 07-02, OBJ-04 family A) ----
+    // ---- huber/fair/quantile/mape ----
 
     fn cfg_with(objective: &str, alpha: f64, fair_c: f64) -> lgbm_core::Config {
         let mut c = lgbm_core::Config {
@@ -997,7 +993,7 @@ mod tests {
             < ORACLE_TOL as f64);
     }
 
-    // ---- poisson/gamma/tweedie (Plan 07-03, OBJ-04 exp/log family) ----
+    // ---- poisson/gamma/tweedie ----
 
     #[test]
     fn parse_exp_log_family_names() {

@@ -1,22 +1,21 @@
-//! Spike 059 (Kaggle deliverable) — readback-cost floor on REAL CUDA.
+//! Readback-cost floor micro-benchmark, meant to run on real CUDA (e.g. Kaggle T4/P100).
 //!
-//! The spoofed 8-CU APU cannot time PCIe blocking-readback latency — the exact
-//! suspected long-pole of the on-device A/B slowdown ([[rocm-gfx1100-available]]).
-//! Only real discrete NVIDIA (Kaggle T4/P100) can. This micro-bench isolates the
-//! ONE cost the four failed A/B phases kept circling: a per-leaf BLOCKING
-//! device→host readback between dependent kernel launches.
+//! A spoofed local APU cannot time PCIe blocking-readback latency — the suspected
+//! long-pole of the on-device slowdown. Only real discrete NVIDIA hardware can. This
+//! micro-bench isolates one cost: a per-leaf BLOCKING device→host readback between
+//! dependent kernel launches.
 //!
 //! Two patterns, identical device work, differ ONLY in sync discipline:
 //!
 //!   SYNC  — N iterations, each: launch a tiny kernel THEN `read_one_unchecked`
 //!           (blocking readback). Mirrors `grow_driver.rs` scan/partition/split
-//!           per-leaf `bump_sync()` (Phase 26: 6044-9044 readbacks/grow).
+//!           per-leaf `bump_sync()` (thousands of readbacks per grow).
 //!   CHAIN — the SAME N launches chained on device (handle handoff), ONE terminal
 //!           read. Mirrors the reference §1 "handful of scalars per iteration".
 //!
 //! The SYNC/CHAIN wall-clock ratio × the ~9000 per-grow readback count bounds the
 //! floor. On a launch-latency-bound device the ratio is large; if it's ~1 the
-//! readback floor is NOT the long-pole and the on-device thesis must move again.
+//! readback floor is not the dominant cost.
 //!
 //! Run on Kaggle (real CUDA): `cargo run --release -p lgbm-compute \
 //!   --features cuda --example spike059_readback_cost`
@@ -36,7 +35,7 @@ fn tiny_kernel(input: &Array<f32>, output: &mut Array<f32>, n: u32) {
 
 fn bench<R: cubecl::Runtime>(client: &ComputeClient<R>, backend: &str) {
     const N: usize = 256; // small = launch/sync-latency bound, like a per-leaf scan
-    const ITERS: usize = 4000; // ~ the per-grow readback count (Phase 26: 6-9k)
+    const ITERS: usize = 4000; // ~ the per-grow readback count (roughly 6-9k)
     let bd = 256u32;
     let cubes = (N as u32).div_ceil(bd);
     let init = vec![0.0f32; N];

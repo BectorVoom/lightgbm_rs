@@ -136,10 +136,10 @@ impl Xentropy {
         if hessians.len() != n {
             return Err(ObjectiveError::LengthMismatch { expected: n, actual: hessians.len() });
         }
-        // spike-068: both arms' per-row bodies are unchanged; the serial `for i in
-        // 0..n` loop is replaced by `apply_grad_hess` (serial below the grain floor,
-        // rayon at/above it). Each output element is a pure function of its own row's
-        // (score, label) written to a disjoint slot, so this is bit-exact.
+        // Both arms' per-row bodies are unchanged; the serial `for i in 0..n` loop is
+        // replaced by `apply_grad_hess` (serial below the grain floor, rayon at/above
+        // it). Each output element is a pure function of its own row's (score, label)
+        // written to a disjoint slot, so this is bit-exact.
         match self.kind {
             XentropyKind::CrossEntropy => {
                 // CrossEntropy::GetGradients (no-weights, xentropy_objective.hpp:98-110):
