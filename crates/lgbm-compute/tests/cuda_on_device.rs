@@ -23,10 +23,10 @@
 //!      (comparing two nondeterministic f32 paths bit/1e-6-exact would be an invalid
 //!      cross-precision check). Both GPU trees are pinned to the cpu-f64 anchor — NEVER
 //!      GPU-f32-vs-GPU-f32.
-//!   3. **Byte-parity** — with `LGBM_CUDA_ON_DEVICE` unset the resolver is OFF (the
-//!      byte-unchanged host path), and the on-device anchor grow is BYTE-IDENTICAL run to run
-//!      (the integer anchor is deterministic — no f32 drift), so the cpu/rocm merge gate is
-//!      byte-stable. `on_device_default()` stays false.
+//!   3. **Byte-parity** — with `LGBM_CUDA_ON_DEVICE` unset the resolver is ON (the
+//!      on-device path is the resolved default), and the on-device anchor grow is
+//!      BYTE-IDENTICAL run to run (the integer anchor is deterministic — no f32 drift),
+//!      so the cpu/rocm merge gate is byte-stable. `on_device_default()` stays true.
 //! The cpu-f64 fold remains the bit-exact hard merge gate for the CPU anchor (untouched).
 //!
 //! ## Tri-state resolver locks
@@ -41,10 +41,10 @@
 //!    real contract without fighting the cache. There is deliberately NO test that
 //!    flips the env between two reads in one process.
 //!
-//! 2. The DEVICE DEFAULT is OFF: with the env unset the resolved default is `false`,
-//!    so every backend is byte-unchanged. A real-hardware A/B evaluation of flipping
-//!    the default did not clear its performance and parity bars, so `on_device_default()`
-//!    stays `false` and `LGBM_CUDA_ON_DEVICE="1"` remains the opt-in switch.
+//! 2. The DEVICE DEFAULT is ON: with the env unset the resolved default is `true`,
+//!    so every backend takes the on-device grow path unless explicitly disabled.
+//!    `on_device_default()` stays `true` and `LGBM_CUDA_ON_DEVICE="0"` remains the
+//!    explicit off-switch.
 
 use lgbm_compute::cuda_on_device_override_from;
 
@@ -69,7 +69,7 @@ fn tri_state_mapping_is_exact_closed_enum() {
 /// grows the tree through the SAME `grow_tree_on_device_driver` the production seam uses and
 /// pins it three ways (see the file-level doc): (1) BIT-EXACT to an independent host-side u64
 /// fixed-point integer reference, (2) ~1e-6 ENVELOPE vs the host-CUDA arm (rocm-gated, NEVER
-/// bit-exact / never GPU-f32-vs-GPU-f32), (3) byte-parity (flag-unset OFF +
+/// bit-exact / never GPU-f32-vs-GPU-f32), (3) byte-parity (flag-unset ON +
 /// deterministic byte-identical grow). The integer reference is a DISTINCT code path (a
 /// fixed-point fold over the raw rows), NOT a second driver call, so it is a valid
 /// non-tautological anchor.
@@ -328,20 +328,21 @@ mod resident_parity_gate {
     }
 
     /// Clause 3 — byte-parity: with `LGBM_CUDA_ON_DEVICE` unset the resolver is
-    /// OFF (the byte-unchanged host path; `on_device_default()` stays false), AND the
-    /// on-device anchor grow is BYTE-IDENTICAL run to run (integer accumulation
-    /// ⇒ order-independent ⇒ no f32 drift), so the cpu/rocm merge gate is byte-stable. The
-    /// full "every cpu+rocm tree byte-identical to master" surface is the `learner_parity`
-    /// gate; this pins the driver-level byte stability of the on-device grow.
+    /// ON (the on-device path is the resolved default; `on_device_default()` stays
+    /// true), AND the on-device anchor grow is BYTE-IDENTICAL run to run (integer
+    /// accumulation ⇒ order-independent ⇒ no f32 drift), so the cpu/rocm merge gate is
+    /// byte-stable. The full "every cpu+rocm tree byte-identical to master" surface is
+    /// the `learner_parity` gate; this pins the driver-level byte stability of the
+    /// on-device grow.
     #[test]
-    fn sc4_flag_unset_off_and_grow_byte_identical() {
-        // Flag unset ⇒ OFF (the resolved default). On a `cuda` build the device default is a
-        // separate contract, so guard it (mirrors `cpu_build_default_is_off_when_env_unset`).
+    fn sc4_flag_unset_on_and_grow_byte_identical() {
+        // Flag unset ⇒ ON (the resolved default). On a `cuda` build the device default is a
+        // separate contract, so guard it (mirrors `cpu_build_default_is_on_when_env_unset`).
         #[cfg(not(feature = "cuda"))]
         assert!(
-            !lgbm_compute::cuda_on_device_enabled(),
-            "SC-4: with LGBM_CUDA_ON_DEVICE unset the resident control plane must be INERT \
-             (byte-unchanged host path; the Plan-06 flip has not happened)"
+            lgbm_compute::cuda_on_device_enabled(),
+            "SC-4: with LGBM_CUDA_ON_DEVICE unset the resident control plane must be reachable \
+             (on-device path is the resolved default)"
         );
 
         let backend = CpuBackend;
@@ -437,21 +438,21 @@ fn zero_is_force_off_one_is_force_on() {
 }
 
 /// On a `cpu` build (no `-F cuda`), with `LGBM_CUDA_ON_DEVICE` unset in a fresh process,
-/// the resolver returns `false` — the resolved default — so the cpu/rocm merge gate is
-/// byte-unchanged. Guarded `#[cfg(not(feature = "cuda"))]` because a `cuda` build's device
-/// default is a separate contract. That contract has not been flipped: real-hardware
-/// evaluation of flipping the default has not cleared its two bars (host/device throughput
-/// not slower, and ~1e-6 parity vs the host-CUDA arm) even with the full resident control
-/// plane in place, so the default remains false.
+/// the resolver returns `true` — the resolved default — so the on-device grow path is
+/// reachable without an explicit opt-in. Guarded `#[cfg(not(feature = "cuda"))]` because
+/// a `cuda` build's device default is a separate contract. Known caveats as of the last
+/// real-CUDA measurement (not independently re-verified here): real-hardware evaluation
+/// found the on-device path slower than the host path in every measured shape, and
+/// ~1e-6 real-CUDA parity vs the host-CUDA arm had not been re-resolved either.
 #[cfg(not(feature = "cuda"))]
 #[test]
-fn cpu_build_default_is_off_when_env_unset() {
-    // This test binary is invoked without LGBM_CUDA_ON_DEVICE set by the merge gate.
-    // The override is None (unset) and on_device_default() is false on the cpu build,
-    // so the resolved value must be false — the resolved leave-false default.
+fn cpu_build_default_is_on_when_env_unset() {
+    // This test binary is invoked without LGBM_CUDA_ON_DEVICE set.
+    // The override is None (unset) and on_device_default() is true on the cpu build,
+    // so the resolved value must be true — the resolved default.
     assert!(
-        !lgbm_compute::cuda_on_device_enabled(),
-        "cpu-build default with env unset must be OFF (SC-4 byte-unchanged; 26-06 flip WITHHELD per 26-AB-RESULTS.md)"
+        lgbm_compute::cuda_on_device_enabled(),
+        "cpu-build default with env unset must be ON (on_device_default() == true)"
     );
 }
 

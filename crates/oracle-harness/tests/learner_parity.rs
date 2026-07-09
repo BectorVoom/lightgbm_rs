@@ -2244,24 +2244,25 @@ fn learner_parity_on_device_buffer_strategy_ab() {
     // (no read/write aliasing of one map buffer), locked per RESEARCH Pitfall 3.
 }
 
-/// ODL-18/ODL-19 — the expanded 5-arg `grow_tree_on_device` seam DEFERS safely this
-/// plan. Default cpu build. Asserts (a) a direct call returns `Ok(None)` (the body
-/// is not wired until 20-03b), (b) the discriminator matches the env gate exactly
-/// (`on_device_growth_supported() == (LGBM_CUDA_ON_DEVICE=="1")` — false in the
-/// byte-unchanged merge gate, true & LIVE in the env-set run), and (c) a full learner
-/// train produces the byte-identical tree to the pure host path (the fork falls
-/// THROUGH on `Ok(None)`), so the output is correct whether the fork is live or dead.
+/// The expanded 5-arg `grow_tree_on_device` seam is gated by the resolved on-device
+/// default (ON unless `LGBM_CUDA_ON_DEVICE="0"`). Asserts (a) a direct call returns
+/// `Ok(Some)` when the resolved flag is on and `Ok(None)` when explicitly forced off,
+/// (b) the discriminator matches the resolved gate exactly (`on_device_growth_supported()
+/// == effective_enabled`), and (c) when explicitly forced off (`"0"`), a full learner
+/// train produces the byte-identical tree to the pure host path (the fork falls THROUGH
+/// on `Ok(None)`) — the live-fork tree is instead pinned to the cpu f64 anchor by
+/// `learner_parity_on_device_structure_gate`.
 #[test]
-fn learner_parity_on_device_seam_defers() {
+fn learner_parity_on_device_seam_gate() {
     let backend = CpuBackend;
     let client = cpu_client();
     let (features, g, h, cfg, num_leaves, max_depth) = corpus();
     let grow_features = grow_features_of(&features, &cfg);
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
 
-    // (a) 20-03b ACTIVATED the seam: it grows (Ok(Some)) when the env is set and defers
-    // (Ok(None)) when unset (the byte-unchanged merge-gate contract). The structure gate
+    // (a) the seam grows (Ok(Some)) when the resolved flag is on (default, or "1") and
+    // defers (Ok(None)) only when explicitly forced off ("0"). The structure gate
     // cell asserts the grown tree is bit-exact; here we only assert the Some/None gating.
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
@@ -2269,23 +2270,24 @@ fn learner_parity_on_device_seam_defers() {
     assert_eq!(
         grown.is_some(),
         env_on,
-        "grow_tree_on_device grows (Ok(Some)) IFF LGBM_CUDA_ON_DEVICE==1 (else defers Ok(None))"
+        "grow_tree_on_device grows (Ok(Some)) IFF LGBM_CUDA_ON_DEVICE!=\"0\" (else defers Ok(None))"
     );
 
-    // (b) gated discriminator invariant: true IFF the env is set. When set, the fork
-    // is LIVE (on_device_eligible) and the on-device tree pins to the cpu f64 anchor.
+    // (b) gated discriminator invariant: matches the resolved effective-enabled state.
+    // When on, the fork is LIVE (on_device_eligible) and the on-device tree pins to the
+    // cpu f64 anchor.
     assert_eq!(
         backend.on_device_growth_supported(),
         env_on,
-        "on_device_growth_supported() must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip"
+        "on_device_growth_supported() must equal the resolved on-device default (LGBM_CUDA_ON_DEVICE!=\"0\")"
     );
 
-    // (c) BYTE-UNCHANGED merge-gate contract: with the env UNSET the fork defers (Ok(None))
+    // (c) forced-off contract: with the env explicitly "0" the fork defers (Ok(None))
     // and the learner's tree is bit-identical (full Tree: PartialEq) to a pure host train.
-    // (When the env is SET the fork instead takes the on-device driver, whose tree is
+    // (When the flag is on, the fork instead takes the on-device driver, whose tree is
     // STRUCTURE-bit-exact — not full-field-identical — to the anchor; that stronger
     // structural assertion lives in `learner_parity_on_device_structure_gate`, so (c) is
-    // scoped to the env-unset merge gate here.)
+    // scoped to the explicit-off case here.)
     if !env_on {
         let mut fork_learner = SerialTreeLearner::new(&backend, &client, cfg, num_leaves, max_depth)
             .with_features(features.clone());
@@ -2300,7 +2302,7 @@ fn learner_parity_on_device_seam_defers() {
 
         assert_eq!(
             fork_tree, host_tree,
-            "env-unset fork tree must equal the host-path tree (the fork defers via Ok(None))"
+            "forced-off fork tree must equal the host-path tree (the fork defers via Ok(None))"
         );
     }
 }
@@ -2465,15 +2467,14 @@ fn cpu_anchor_tree(
     cpu_learner.train(g, h, true).expect("cpu anchor train ok")
 }
 
-/// ODL-18 (20-03b): the ACTIVATED default-cpu-build STRUCTURE gate. With
-/// `LGBM_CUDA_ON_DEVICE=1` it grows a REAL continuous-feature + L2 tree through the
-/// on-device driver on the cubecl-cpu runtime (`CpuBackend::grow_tree_on_device`,
-/// 20-03a's gated CpuBackend flip) and asserts it is STRUCTURE bit-exact to the cpu
+/// The STRUCTURE gate. With `LGBM_CUDA_ON_DEVICE` unset or `"1"` it grows a REAL
+/// continuous-feature + L2 tree through the on-device driver on the cubecl-cpu runtime
+/// (`CpuBackend::grow_tree_on_device`) and asserts it is STRUCTURE bit-exact to the cpu
 /// f64 anchor (`assert_on_device_tree_matches_cpu_anchor` over `cpu_anchor_tree`),
 /// leaf values within `ROCM_LEAF_VALUE_TOL`, default_left tie-aware. With the env
-/// UNSET (the byte-unchanged merge-gate run) the seam returns `Ok(None)` and the
-/// cell asserts exactly that — so the SAME test is green in BOTH invocations and the
-/// `-- --exact` verify proves it ran (non-vacuous). NEVER GPU-vs-GPU (def-f8u-01).
+/// explicitly `"0"` the seam returns `Ok(None)` and the cell asserts exactly that — so
+/// the SAME test is green in BOTH invocations and the `-- --exact` verify proves it ran
+/// (non-vacuous). NEVER GPU-vs-GPU (def-f8u-01).
 #[test]
 fn learner_parity_on_device_structure_gate() {
     let backend = CpuBackend;
@@ -2509,19 +2510,19 @@ fn learner_parity_on_device_structure_gate() {
         "layout has one begin per grown leaf"
     );
 
-    // The cfg-less trait seam remains env-gated (byte-unchanged merge gate when unset).
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    // The cfg-less trait seam is env-gated: ON by default, "0" forces defer.
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
     if env_on {
         let (seam_tree, _seam_layout) =
-            grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
+            grown.expect("with LGBM_CUDA_ON_DEVICE unset or \"1\" the driver must grow the tree (Ok(Some))");
         assert_gpu_tree_matches_cpu_anchor(&seam_tree, &anchor, "on-device-seam");
     } else {
         assert!(
             grown.is_none(),
-            "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
+            "with LGBM_CUDA_ON_DEVICE=\"0\" the seam MUST defer (Ok(None))"
         );
     }
 
@@ -2665,18 +2666,18 @@ fn learner_parity_on_device_deep_multileaf_gate() {
         "layout leaf_count partitions all rows"
     );
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
     if env_on {
         let (seam_tree, _seam_layout) =
-            grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
+            grown.expect("with LGBM_CUDA_ON_DEVICE unset or \"1\" the driver must grow the tree (Ok(Some))");
         assert_gpu_tree_matches_cpu_anchor(&seam_tree, &anchor, "deep-multileaf-seam");
     } else {
         assert!(
             grown.is_none(),
-            "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
+            "with LGBM_CUDA_ON_DEVICE=\"0\" the seam MUST defer (Ok(None))"
         );
     }
 }
@@ -2755,18 +2756,18 @@ fn learner_parity_on_device_nosplit_gate() {
         "layout leaf_count partitions all rows (single root leaf)"
     );
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
     if env_on {
         let (seam_tree, _seam_layout) =
-            grown.expect("with LGBM_CUDA_ON_DEVICE=1 the driver must grow the tree (Ok(Some))");
+            grown.expect("with LGBM_CUDA_ON_DEVICE unset or \"1\" the driver must grow the tree (Ok(Some))");
         assert_gpu_tree_matches_cpu_anchor(&seam_tree, &anchor, "no-split-seam");
     } else {
         assert!(
             grown.is_none(),
-            "with LGBM_CUDA_ON_DEVICE unset the seam MUST defer (Ok(None)) — byte-unchanged merge gate"
+            "with LGBM_CUDA_ON_DEVICE=\"0\" the seam MUST defer (Ok(None))"
         );
     }
 }
@@ -2865,27 +2866,27 @@ fn mindata_corpus() -> (Vec<FeatureColumn>, Vec<f32>, Vec<f32>, i32, i32) {
     (vec![f0], grad, hess, 4, -1)
 }
 
-/// ODL-18H case C — a `min_sum_hessian_in_leaf` constraint observably binds and the
-/// constrained on-device tree is STRUCTURE bit-exact to the constrained cpu f64 anchor.
+/// A `min_sum_hessian_in_leaf` constraint observably binds and the constrained
+/// on-device tree is STRUCTURE bit-exact to the constrained cpu f64 anchor.
 /// Because the `Backend::grow_tree_on_device` trait seam carries NO `GainConfig`, the
-/// constrained tree is grown via `grow_tree_on_device_driver_with_cfg` (plan 21-01)
-/// called DIRECTLY — that call is ENV-INDEPENDENT, so `driver_tree` is the constrained
-/// tree in BOTH lanes.
+/// constrained tree is grown via `grow_tree_on_device_driver_with_cfg` called
+/// DIRECTLY — that call is ENV-INDEPENDENT, so `driver_tree` is the constrained tree
+/// in BOTH lanes.
 ///
 /// The constrained cpu f64 anchor (`cpu_anchor_tree`) can ONLY be built in the
-/// ENV-UNSET lane: with `LGBM_CUDA_ON_DEVICE=1`, `SerialTreeLearner` sets
-/// `on_device_eligible = on_device_growth_supported() && cuda_on_device_env()` = true
-/// and FORKS to the on-device driver via the cfg-less trait seam
-/// (`proving_slice_config`), so it silently DROPS the constrained cfg and grows the
-/// UNCONSTRAINED tree (`.planning/…/21-02` deviation — RESEARCH Pitfall 2/3 did not
-/// anticipate the learner's env-gated fork). Therefore:
-///   - ENV-UNSET lane (the constrained-parity home): `cpu_anchor_tree` honors the cfg;
-///     assert `driver_tree` STRUCTURE-bit-exact to the constrained anchor, assert the
-///     constraint binds (constrained anchor has fewer leaves than the unconstrained
-///     anchor), and assert the trait seam still defers (`Ok(None)`, byte-unchanged).
-///   - ENV=1 lane (the seam is LIVE): assert the direct constrained `driver_tree` has
-///     FEWER leaves than the unconstrained tree the LIVE trait seam grows (the
-///     constraint observably binds through the driver), plus layout row-conservation.
+/// explicit `LGBM_CUDA_ON_DEVICE="0"` lane: with the flag on (the default, or
+/// explicit `"1"`), `SerialTreeLearner` sets `on_device_eligible =
+/// on_device_growth_supported() && cuda_on_device_env()` = true and FORKS to the
+/// on-device driver via the cfg-less trait seam (`proving_slice_config`), so it
+/// silently DROPS the constrained cfg and grows the UNCONSTRAINED tree. Therefore:
+///   - Explicit `"0"` lane (the constrained-parity home): `cpu_anchor_tree` honors the
+///     cfg; assert `driver_tree` STRUCTURE-bit-exact to the constrained anchor, assert
+///     the constraint binds (constrained anchor has fewer leaves than the unconstrained
+///     anchor), and assert the trait seam still defers (`Ok(None)`).
+///   - Default-on (or explicit `"1"`) lane (the seam is LIVE): assert the direct
+///     constrained `driver_tree` has FEWER leaves than the unconstrained tree the LIVE
+///     trait seam grows (the constraint observably binds through the driver), plus
+///     layout row-conservation.
 #[test]
 fn learner_parity_on_device_mindata_gate() {
     let backend = CpuBackend;
@@ -2919,7 +2920,7 @@ fn learner_parity_on_device_mindata_gate() {
         "layout leaf_count partitions all rows"
     );
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
 
     if env_on {
         // The trait seam is LIVE and grows on-device with the cfg-less
@@ -2928,7 +2929,7 @@ fn learner_parity_on_device_mindata_gate() {
         let (seam_tree, _seam_layout) = backend
             .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("grow_tree_on_device seam ok")
-            .expect("with LGBM_CUDA_ON_DEVICE=1 the trait seam grows (Ok(Some))");
+            .expect("with LGBM_CUDA_ON_DEVICE unset or \"1\" the trait seam grows (Ok(Some))");
         assert!(
             driver_tree.num_leaves < seam_tree.num_leaves,
             "min_sum_hessian_in_leaf must observably bind: constrained driver num_leaves \
@@ -2937,7 +2938,7 @@ fn learner_parity_on_device_mindata_gate() {
             seam_tree.num_leaves
         );
     } else {
-        // ENV-UNSET: `cpu_anchor_tree` takes the PURE HOST path and honors the
+        // Explicit "0": `cpu_anchor_tree` takes the PURE HOST path and honors the
         // constrained cfg — the meaningful STRUCTURE-parity home.
         let anchor = cpu_anchor_tree(&features, &g, &h, constrained_cfg, num_leaves, max_depth);
         assert_on_device_tree_matches_cpu_anchor(&driver_tree, &anchor, "min-hessian");
@@ -2960,13 +2961,13 @@ fn learner_parity_on_device_mindata_gate() {
             unconstrained.num_leaves
         );
 
-        // The cfg-less trait seam still defers (byte-unchanged merge gate).
+        // The cfg-less trait seam still defers when explicitly forced off.
         let grown = backend
             .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("grow_tree_on_device seam ok");
         assert!(
             grown.is_none(),
-            "with LGBM_CUDA_ON_DEVICE unset the trait seam MUST defer (Ok(None)) — byte-unchanged"
+            "with LGBM_CUDA_ON_DEVICE=\"0\" the trait seam MUST defer (Ok(None))"
         );
     }
 }
@@ -3312,13 +3313,13 @@ mod hip {
         assert_gpu_tree_matches_cpu_anchor(&host_tree, &anchor, "host");
     }
 
-    /// ODL-18 (20-03b) — the ACTIVATED on-device oracle on the ROCm backend. With
-    /// `LGBM_CUDA_ON_DEVICE=1` the `GpuBackend<R>` seam grows a REAL continuous-feature
-    /// + L2 tree on the HIP runtime via the shared driver and returns `Ok(Some(..))`;
-    /// the tie-aware comparator pins it STRUCTURE-bit-exact to the cpu f64 anchor
-    /// (never a second GPU f32 path — def-f8u-01). With the env UNSET the seam defers
-    /// (`Ok(None)`), the byte-unchanged merge-gate contract. Uses the small robust
-    /// proving corpus + the driver's proving config so the anchor matches the driver.
+    /// The on-device oracle on the ROCm backend. With `LGBM_CUDA_ON_DEVICE` unset or
+    /// `"1"` the `GpuBackend<R>` seam grows a REAL continuous-feature + L2 tree on the
+    /// HIP runtime via the shared driver and returns `Ok(Some(..))`; the tie-aware
+    /// comparator pins it STRUCTURE-bit-exact to the cpu f64 anchor (never a second GPU
+    /// f32 path — def-f8u-01). With the env explicitly `"0"` the seam defers
+    /// (`Ok(None)`). Uses the small robust proving corpus + the driver's proving config
+    /// so the anchor matches the driver.
     #[test]
     fn learner_parity_on_device_oracle_host_fallback_slice0() {
         let backend = RocmBackend::with_resident(false);
@@ -3326,29 +3327,29 @@ mod hip {
         let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
         let grow_features = grow_features_of(&features, &cfg);
 
-        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
         let grown = backend
             .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("grow_tree_on_device seam ok");
         if env_on {
             let (on_device_tree, _payload) =
-                grown.expect("with LGBM_CUDA_ON_DEVICE=1 the ROCm seam must grow (Ok(Some))");
+                grown.expect("with LGBM_CUDA_ON_DEVICE unset or \"1\" the ROCm seam must grow (Ok(Some))");
             let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
             assert_on_device_tree_matches_cpu_anchor(&on_device_tree, &anchor, "rocm-on-device");
         } else {
             assert!(
                 grown.is_none(),
-                "with LGBM_CUDA_ON_DEVICE unset the ROCm seam MUST defer (Ok(None))"
+                "with LGBM_CUDA_ON_DEVICE=\"0\" the ROCm seam MUST defer (Ok(None))"
             );
         }
     }
 
-    /// ODL-18 (20-03b) — the seam is a GATED activation, byte-unchanged with the env
-    /// unset. On BOTH `CpuBackend` and a `GpuBackend` (`RocmBackend`):
-    /// (a) `on_device_growth_supported()` == `(LGBM_CUDA_ON_DEVICE == "1")` (gated
-    ///     flip), and
-    /// (b) `grow_tree_on_device(..)` returns `Ok(Some)` IFF the env is set (else
-    ///     `Ok(None)`); when set, the grown tree is STRUCTURE-bit-exact to the cpu f64
+    /// The seam is a GATED activation, ON by default. On BOTH `CpuBackend` and a
+    /// `GpuBackend` (`RocmBackend`):
+    /// (a) `on_device_growth_supported()` == the resolved effective-enabled state
+    ///     (`LGBM_CUDA_ON_DEVICE != "0"`), and
+    /// (b) `grow_tree_on_device(..)` returns `Ok(Some)` IFF that state is on (else
+    ///     `Ok(None)`); when on, the grown tree is STRUCTURE-bit-exact to the cpu f64
     ///     anchor (the driver's proving config) on BOTH backends.
     #[test]
     fn learner_parity_on_device_seam_is_provable_noop_slice0() {
@@ -3360,30 +3361,30 @@ mod hip {
         let gpu_backend = RocmBackend::with_resident(false);
 
         // (a) GATED discriminator invariant on BOTH backends.
-        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() == Ok("1");
+        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
         assert_eq!(
             cpu_backend.on_device_growth_supported(),
             env_on,
-            "CpuBackend on_device_growth_supported must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip"
+            "CpuBackend on_device_growth_supported must equal the resolved effective-enabled state"
         );
         assert_eq!(
             gpu_backend.on_device_growth_supported(),
             env_on,
-            "GpuBackend on_device_growth_supported must equal (LGBM_CUDA_ON_DEVICE==1) — gated flip \
+            "GpuBackend on_device_growth_supported must equal the resolved effective-enabled state \
              (one generic GpuBackend<R> impl shared by ROCm/CUDA/WGPU)"
         );
 
-        // (b) the seam grows (Ok(Some)) IFF the env is set — else defers (Ok(None)),
-        // the byte-unchanged merge-gate contract. When set, both backends' trees pin
-        // STRUCTURE-bit-exact to the SAME cpu f64 anchor (never GPU-vs-GPU).
+        // (b) the seam grows (Ok(Some)) IFF the resolved state is on — else defers
+        // (Ok(None)). When on, both backends' trees pin STRUCTURE-bit-exact to the
+        // SAME cpu f64 anchor (never GPU-vs-GPU).
         let cpu_grown = cpu_backend
             .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("CpuBackend grow_tree_on_device seam ok");
         let gpu_grown = gpu_backend
             .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("GpuBackend grow_tree_on_device seam ok");
-        assert_eq!(cpu_grown.is_some(), env_on, "CpuBackend seam grows IFF env set");
-        assert_eq!(gpu_grown.is_some(), env_on, "GpuBackend seam grows IFF env set");
+        assert_eq!(cpu_grown.is_some(), env_on, "CpuBackend seam grows IFF resolved state is on");
+        assert_eq!(gpu_grown.is_some(), env_on, "GpuBackend seam grows IFF resolved state is on");
         if env_on {
             let anchor = cpu_anchor_tree(&features, &g, &h, cfg, num_leaves, max_depth);
             assert_on_device_tree_matches_cpu_anchor(

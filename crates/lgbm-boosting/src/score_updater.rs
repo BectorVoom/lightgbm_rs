@@ -71,7 +71,7 @@ impl ScoreUpdater {
             score,
             num_data,
             num_class,
-            // D-09: OFF by default (env unset) so the host path is byte-unchanged.
+            // ON by default (env unset) unless LGBM_CUDA_ON_DEVICE="0".
             boosting_on_cuda: lgbm_compute::cuda_on_device_enabled(),
         }
     }

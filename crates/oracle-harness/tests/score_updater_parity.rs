@@ -101,11 +101,11 @@ fn resident_toggle_mirrors_host_accumulation() {
     compare_exact_f64_bits(resident.scores(), host.scores())
         .unwrap_or_else(|m| panic!("resident mirror != pure-host accumulation: {m:?}"));
 
-    // The env-unset default `ScoreUpdater` reports the host path (D-09).
+    // The env-unset default `ScoreUpdater` reports the on-device path (resolved default).
     let default_su = ScoreUpdater::new(num_data, num_class, None);
     assert!(
-        !default_su.boosting_on_cuda(),
-        "LGBM_CUDA_ON_DEVICE unset ⇒ boosting_on_cuda must default OFF (byte-unchanged host path)"
+        default_su.boosting_on_cuda(),
+        "LGBM_CUDA_ON_DEVICE unset ⇒ boosting_on_cuda must default ON (resolved default)"
     );
 }
 
