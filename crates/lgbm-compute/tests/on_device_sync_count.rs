@@ -220,6 +220,11 @@ fn resident_sync_lane() {
         std::env::remove_var("LGBM_SIBLING_COPACK");
         std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
+    // The RESIDENT-PERM partition arm is now DEFAULT-ON (spike093) and has its own
+    // sync closed form (asserted separately below) — pin it OFF for the legacy
+    // host-partition closed form this lane was derived for (read-once env gate ⇒
+    // in-process override). Restored to `None` at the end of the lane.
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(false));
 
     let backend = RocmBackend::with_resident(true);
     assert!(
@@ -296,5 +301,26 @@ fn resident_sync_lane() {
          resident frontier post-Plan-08; the split_on_device→pick-export swap is count-neutral); \
          got a drop of {}",
         ANCHOR_SYNC_BASELINE - syncs_3
+    );
+
+    // The RESIDENT-PERM partition arm (DEFAULT since spike093): its own EXACT sync
+    // closed form adds one small child-range readback per split (`read_leaf`, the
+    // split-point scalar the host row bookkeeping needs — the same crossing the
+    // reference CUDADataPartition::SplitInner performs) and one per-grow tail perm
+    // readback (the layout rebuild):
+    //   [1 root scan + (L-1) picks] + (L-1) read_leaf + 1 tail = 2 + 2*(L-1) = 2*L.
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(true));
+    let (syncs_rp, leaves_rp) = grow_resident(3);
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
+    assert_eq!(
+        leaves_rp, NUM_LEAVES,
+        "resident-perm lane: corpus must grow the full {NUM_LEAVES} leaves (got {leaves_rp})"
+    );
+    let analytic_rp = 2 * NUM_LEAVES as u64;
+    assert_eq!(
+        syncs_rp, analytic_rp,
+        "resident-perm lane: blocking-readback sync count {syncs_rp} must equal the analytic \
+         closed form {analytic_rp} (= 2*num_leaves: root scan + per-iteration pick + per-split \
+         child-range readback + per-grow tail perm readback; num_leaves={NUM_LEAVES})"
     );
 }

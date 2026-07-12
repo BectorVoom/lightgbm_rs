@@ -215,6 +215,11 @@ fn resident_analytic_lane() {
         // Ensure the DEFAULT (swapped) u64 build path — never the f64-fused escape hatch.
         std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
+    // The RESIDENT-PERM partition arm is now DEFAULT-ON (spike093) and has its own
+    // closed form (asserted separately below) — pin it OFF for the legacy host-partition
+    // closed form this lane was derived for. The env gate is read-once, so use the
+    // in-process override; restored to `None` at the end of the lane.
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(false));
 
     let backend = RocmBackend::with_resident(true);
     assert!(
@@ -308,5 +313,39 @@ fn resident_analytic_lane() {
          closed form {analytic} (= 4 + 3*(num_leaves-1): bin_upload + grad_hess_upload + \
          root[build+scan] + build_resident/subtract/siblings_scan per split, host partition \
          route, co-pack ON; num_leaves={NUM_LEAVES})"
+    );
+
+    // The RESIDENT-PERM partition arm (DEFAULT since spike093): its own EXACT closed
+    // form adds the once-per-grow identity (iota) seed (+1) and the 3-launch device
+    // partition per split (mark+block-scan / totals+ranges / scatter):
+    //   5 + 6*(num_leaves - 1)
+    // = bin_upload + grad_hess_upload + iota + root[build+scan]
+    //   + per split [partition(3) + build_resident + subtract + siblings_scan].
+    // The `partition_resident` tripwire must equal the split count exactly (and stayed 0
+    // on the pinned-OFF grows above by the arm-isolation the override provides).
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(true));
+    let _ = lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
+    let (launches_rp, rootbuild_rp, f64_fused_rp, leaves_rp, _) = grow_resident(3);
+    let part_res = lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
+    assert_eq!(
+        leaves_rp, NUM_LEAVES,
+        "resident-perm lane: corpus must grow the full {NUM_LEAVES} leaves (got {leaves_rp})"
+    );
+    assert!(rootbuild_rp > 0, "resident-perm lane: root build must still run the u64 kernel");
+    assert_eq!(f64_fused_rp, 0, "resident-perm lane: f64-fused must never dispatch");
+    assert_eq!(
+        part_res,
+        NUM_LEAVES as u64 - 1,
+        "resident-perm lane: the partition_resident tripwire must bump once per split \
+         (got {part_res}, expected {})",
+        NUM_LEAVES - 1
+    );
+    let analytic_rp = 5 + 6 * (NUM_LEAVES as u64 - 1);
+    assert_eq!(
+        launches_rp, analytic_rp,
+        "resident-perm lane: real-dispatch launch count {launches_rp} must equal the \
+         analytic closed form {analytic_rp} (= 5 + 6*(num_leaves-1): + iota + 3-launch \
+         device partition per split; num_leaves={NUM_LEAVES})"
     );
 }

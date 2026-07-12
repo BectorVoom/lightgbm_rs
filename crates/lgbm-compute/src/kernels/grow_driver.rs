@@ -399,8 +399,10 @@ pub fn set_fused_partition_override(v: Option<bool>) {
     FUSED_PARTITION_OVERRIDE.store(code, Ordering::Relaxed);
 }
 
-/// Read-once `LGBM_PARTITION_RESIDENT=="1"` — OPT-IN (default OFF until the
-/// real-CUDA A/B validates it): the on-device driver keeps the row permutation
+/// Read-once `LGBM_PARTITION_RESIDENT != "0"` — DEFAULT ON (validated 1.25× on
+/// real CUDA, spike093: warm-median 10.56s→8.46s, preds bit-identical, drained
+/// partition 1.90s→0.58s + build 2.36s→1.69s; `=0` restores the host-partition
+/// arm for A/B/rollback): the on-device driver keeps the row permutation
 /// RESIDENT for the whole grow (`ResidentPermPartition`, the `cuda_data_indices_`
 /// analog). Each split partitions the parent's sub-range IN PLACE on device
 /// (3 launches: fused mark+block-scan → totals-scan+child-ranges → stable scatter)
@@ -422,7 +424,7 @@ pub fn resident_perm_partition_enabled() -> bool {
     }
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("LGBM_PARTITION_RESIDENT").map(|v| v == "1").unwrap_or(false)
+        std::env::var("LGBM_PARTITION_RESIDENT").map(|v| v != "0").unwrap_or(true)
     })
 }
 

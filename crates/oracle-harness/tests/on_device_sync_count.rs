@@ -219,6 +219,13 @@ fn resident_sync_collapse_lane(anchor_baseline: u64) {
         std::env::remove_var("LGBM_SIBLING_COPACK");
         std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
+    // The RESIDENT-PERM partition arm is now DEFAULT-ON (spike093; +1 child-range
+    // readback per split + 1 tail perm readback per grow) — pin it OFF so this lane
+    // keeps asserting the host-partition closed form it was derived for (the
+    // resident-perm arm's own closed form is asserted in
+    // `lgbm-compute/tests/on_device_sync_count.rs`). Read-once env gate ⇒ in-process
+    // override; restored to `None` at the end of the lane.
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(false));
 
     let backend = RocmBackend::with_resident(true);
     assert!(
@@ -310,4 +317,7 @@ fn resident_sync_collapse_lane(anchor_baseline: u64) {
         "resident lane: the slow f64-single-owner fused build must NOT run on the default path \
          (on_device_f64_fused == 0); got {f64_fused}"
     );
+
+    // Restore the resident-perm override to the env-driven default (no state leak).
+    lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
 }
