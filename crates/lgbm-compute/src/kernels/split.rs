@@ -1872,10 +1872,24 @@ const PARGAIN_MAX_CAND: usize = 256;
 // index, so the lexicographic (gain desc, k asc) fold never prefers it (the
 // cube macro requires a literal here, not a host const).
 
-/// Pargain gate (env `LGBM_SCAN_PARGAIN`, opt-in `"1"`; default OFF until the
-/// real-CUDA A/B validates it). Only meaningful where the staged gates already
-/// hold (real device, ≤256-bin features) — the launch helpers consult it INSIDE
-/// the staged arm, so legacy/staged behavior is byte-unchanged when unset.
+/// Pargain gate (env `LGBM_SCAN_PARGAIN`, opt-in `"1"`; default OFF — MEASURED
+/// NET-NEGATIVE on P100, see below). Only meaningful where the staged gates
+/// already hold (real device, ≤256-bin features) — the launch helpers consult
+/// it INSIDE the staged arm, so legacy/staged behavior is byte-unchanged when
+/// unset.
+///
+/// VERDICT (spike094, P100, 500k×50×100 trees, order-ALTERNATED warm-median
+/// of 3, preds BIT-IDENTICAL max_abs = 0.0, counts proof scan_pargain=2980):
+/// pargain 8.89s vs staged 8.73s (0.98×), drained scan bucket 2.15s → 2.37s.
+/// Root cause: the drained scan bucket is LAUNCH/SYNC-FLOOR dominated
+/// (~0.69 ms per launch × ~3100 launches ≈ the whole bucket), not
+/// arithmetic-dominated — and P100's strong native f64 (1:2 rate) makes the
+/// serial per-candidate divisions cheap, so the phase-split's extra LDS
+/// traffic + 3 extra barriers cost more than the parallel gains save. The
+/// hatch is KEPT (bit-exact, fully gated) for consumer-class GPUs where f64
+/// runs at 1:32 and the serial divides dominate; the next scan lever on
+/// P100-class hardware is LAUNCH-COUNT reduction (fusing the per-split
+/// build→subtract→scan chain), not kernel-internal parallelism.
 #[cfg(feature = "gpu")]
 fn scan_pargain_enabled() -> bool {
     matches!(std::env::var("LGBM_SCAN_PARGAIN").as_deref(), Ok("1"))
