@@ -438,12 +438,28 @@ fn query_num_cu() -> Option<u32> {
     None
 }
 
-/// Non-rocm GPU twin: cuda/wgpu have no `cubecl_hip_sys`, so the
-/// CU-count query returns `None` and [`rowpart_target_cubes`] falls back to
-/// [`ROWPART_TARGET_CUBES_FALLBACK`]. Correct (the resident pool is the parity win);
-/// a CUDA build can later read `num_streaming_multiprocessors` for a tuned target.
+/// Non-rocm GPU twin: read cubecl's reported SM count from the CUDA client
+/// (`num_streaming_multiprocessors` is populated on cubecl-cuda 0.10 — e.g. 56 on a
+/// P100; cpu/wgpu report `None` → the heuristic fallback). Reaching this query
+/// implies a working device client (only the build launchers call it, after the
+/// resident-bin upload succeeded), so constructing the cached `cuda_client()` here
+/// is safe. Before this query, a CUDA run silently used the 64-cube APU fallback —
+/// `P=1` for EVERY build at the 50-feature production width, ~11% of a P100's
+/// thread capacity on the latency-bound gather (the spike099 root cause).
 #[cfg(all(feature = "gpu", not(feature = "rocm")))]
 fn query_num_cu() -> Option<u32> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(n) = crate::runtime::cuda_client()
+            .properties()
+            .hardware
+            .num_streaming_multiprocessors
+        {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
     None
 }
 
@@ -468,6 +484,16 @@ fn rowpart_target_cubes() -> u32 {
     })
 }
 
+/// u64 fixed-point min-leaf gate. The integer build is ORDER-INDEPENDENT across `P`
+/// (wrapping u64 atomics — bit-exact at any partition), so unlike the f32 twin the
+/// gate is purely economic: don't add `P × 2·num_bin` LDS→global merge atomics per
+/// feature on leaves too small to amortize them. At 20k rows and `P=8` the merge is
+/// ~4k adds vs ~20k row-adds per feature — well amortized. Far below the f32
+/// [`ROWPART_MIN_LEAF`] (256k), which ALSO guards f32 partial-sum regrouping that the
+/// u64 path is immune to. Spike099-validated on P100.
+#[cfg(feature = "gpu")]
+const ROWPART_MIN_LEAF_U64: usize = 20_000;
+
 /// Row partitions `P` for the LDS build: `clamp(target_cubes / num_features, 1, P_MAX)` on
 /// large leaves, else `1`. `LGBM_ROWPART_MIN` overrides the leaf threshold (benching). The
 /// `target_cubes` value is the runtime, CU-count-derived [`rowpart_target_cubes`] (cached).
@@ -475,16 +501,41 @@ fn rowpart_target_cubes() -> u32 {
 /// forced target.
 #[cfg(feature = "gpu")]
 pub fn row_partition_count(num_features: usize, leaf_rows: usize) -> u32 {
+    row_partition_count_gated(num_features, leaf_rows, ROWPART_MIN_LEAF)
+}
+
+/// The u64 fixed-point twin of [`row_partition_count`]: same target/clamp formula,
+/// but gated at [`ROWPART_MIN_LEAF_U64`] (20k) instead of 256k — the integer build is
+/// bit-exact across `P`, so mid-size leaves (the bulk of a tree's build row-work)
+/// partition too. Used by the u64 `fixed_point` launch sites ONLY; every f32 site
+/// keeps [`row_partition_count`] so its partial-sum grouping is byte-unchanged.
+#[cfg(feature = "gpu")]
+pub fn row_partition_count_u64(num_features: usize, leaf_rows: usize) -> u32 {
+    row_partition_count_gated(num_features, leaf_rows, ROWPART_MIN_LEAF_U64)
+}
+
+/// Shared tail of the two `row_partition_count*` fronts: `LGBM_ROWPART_MIN` env
+/// override (applies to BOTH — the benching knob), then the target/clamp formula.
+#[cfg(feature = "gpu")]
+fn row_partition_count_gated(num_features: usize, leaf_rows: usize, default_min: usize) -> u32 {
     let min_leaf = std::env::var("LGBM_ROWPART_MIN")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(ROWPART_MIN_LEAF);
-    if num_features == 0 || leaf_rows < min_leaf {
+        .unwrap_or(default_min);
+    if leaf_rows < min_leaf {
         return 1;
     }
-    let target = rowpart_target_cubes();
+    partition_from_target(num_features, rowpart_target_cubes())
+}
+
+/// The pure `P` formula: `clamp(target / nf, 1, P_MAX)`, `1` on degenerate/saturated
+/// shapes. Factored out of [`row_partition_count_gated`] so the CU-count → `P`
+/// mapping is unit-testable without a device, an env var, or the cached OnceLock
+/// (mirrors [`resolve_target_cubes`]'s "pure logic" property).
+#[cfg(feature = "gpu")]
+fn partition_from_target(num_features: usize, target: u32) -> u32 {
     let nf = num_features as u32;
-    if nf >= target {
+    if nf == 0 || nf >= target {
         return 1;
     }
     (target / nf).clamp(1, ROWPART_P_MAX)
@@ -1153,8 +1204,10 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         );
         let h_rows = client.create_from_slice(u32::as_bytes(leaf_rows));
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
-        // Direct P (FORCE_P override → row-partition heuristic). No autotune (see above).
-        let p = force_row_partition().unwrap_or_else(|| row_partition_count(num_features, rows));
+        // Direct P (FORCE_P override → u64 row-partition heuristic — this arm is
+        // always `fixed_point`, order-independent across P). No autotune (see above).
+        let p =
+            force_row_partition().unwrap_or_else(|| row_partition_count_u64(num_features, rows));
         // SAFETY: identical bounds contract to `launch_lds_u64` PLUS the grad/hess gather:
         // `grad_h`/`hess_h` are sized `gh_num_data` (the full train row count) and indexed by
         // `leaf_rows[k] < num_data == gh_num_data` (the caller's resident row contract), so the
@@ -1364,9 +1417,15 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
             ));
             BUILD_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
         } else {
-            // (c) LGBM_AUTOTUNE=0 → the EXISTING `row_partition_count` heuristic + direct
-            //     launch, byte-for-byte unchanged (the documented cold-start / fallback).
-            direct_launch_at_p!(row_partition_count(num_features, rows));
+            // (c) LGBM_AUTOTUNE=0 → the `row_partition_count*` heuristic + direct
+            //     launch (the documented cold-start / fallback). The u64 fixed-point
+            //     arm takes the 20k-gated twin (bit-exact across P); the f32 arm keeps
+            //     the 256k-gated original, byte-for-byte unchanged.
+            direct_launch_at_p!(if fixed_point {
+                row_partition_count_u64(num_features, rows)
+            } else {
+                row_partition_count(num_features, rows)
+            });
         }
     } else {
         // Naive fallback (a feature exceeds the 256-bin LDS cap). ALWAYS f32:
@@ -2276,11 +2335,12 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
         }
         let (grad_h, hess_h, gh_num_data) = resident_gh;
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
-        // Direct `P` (FORCE_P pin → row-partition heuristic), exactly the resident-gh
-        // branch of `resident_raw_build_into` (the autotune tuner set is
-        // host-gather-shaped, so this path bypasses it there too).
+        // Direct `P` (FORCE_P pin → u64 row-partition heuristic), exactly the
+        // resident-gh branch of `resident_raw_build_into` (the autotune tuner set is
+        // host-gather-shaped, so this path bypasses it there too; this build is always
+        // u64 fixed-point, order-independent across P).
         let p = force_row_partition()
-            .unwrap_or_else(|| row_partition_count(num_features, rows_count));
+            .unwrap_or_else(|| row_partition_count_u64(num_features, rows_count));
         // SAFETY: identical bounds contract to the resident-gh branch of
         // `resident_raw_build_into` — `rows_handle` views `rows_count` u32 row ids each
         // `< num_data == gh_num_data` (the resident perm's invariant: it is a permutation
@@ -3423,6 +3483,43 @@ mod tests {
                 if expected == 8 && actual == 4),
             "expected LengthMismatch{{8,4}}, got {err:?}"
         );
+    }
+
+    /// The pure CU-target → `P` formula ([`super::partition_from_target`]) + the
+    /// u64-vs-f32 min-leaf gates. No env/OnceLock/GPU. Pins the spike099 fix:
+    /// a queried 56-SM P100 (target = 56×8 = 448) must partition the 50-feature
+    /// production build at P=8 (was P=1 under the 64-cube APU fallback), and the
+    /// u64 twin must open the gate at 20k rows while the f32 front keeps 256k
+    /// (so f32 partial-sum grouping is byte-unchanged at every existing shape).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn partition_from_target_and_u64_gate() {
+        use super::{
+            partition_from_target, row_partition_count, row_partition_count_u64,
+            ROWPART_MIN_LEAF, ROWPART_MIN_LEAF_U64, ROWPART_P_MAX,
+        };
+        // The P100 fix: 56 SMs × 8 = 448 target → P=8 at the 50-feature width.
+        assert_eq!(partition_from_target(50, 448), 8);
+        // The old APU fallback target (64) under-partitioned the same width to P=1.
+        assert_eq!(partition_from_target(50, 64), 1);
+        // Degenerate / saturated / clamped.
+        assert_eq!(partition_from_target(0, 448), 1);
+        assert_eq!(partition_from_target(448, 448), 1);
+        assert_eq!(partition_from_target(1, 448), ROWPART_P_MAX);
+        // Gates: the u64 twin opens at 20k; the f32 front stays at 256k. Below
+        // BOTH gates (the ≤8k parity-test shapes) every front is P=1.
+        assert!(ROWPART_MIN_LEAF_U64 < ROWPART_MIN_LEAF);
+        if std::env::var("LGBM_ROWPART_MIN").is_err() {
+            assert_eq!(row_partition_count_u64(50, ROWPART_MIN_LEAF_U64 - 1), 1);
+            assert_eq!(row_partition_count(50, ROWPART_MIN_LEAF_U64), 1, "f32 gate must stay 256k");
+            assert_eq!(row_partition_count(50, 8_000), 1);
+            assert_eq!(row_partition_count_u64(50, 8_000), 1);
+            // Above both gates the two fronts agree (same target/clamp formula).
+            assert_eq!(
+                row_partition_count_u64(50, ROWPART_MIN_LEAF),
+                row_partition_count(50, ROWPART_MIN_LEAF)
+            );
+        }
     }
 
     /// `resolve_target_cubes` pure resolution order (a)→(b)→(c): env override used
