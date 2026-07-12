@@ -1688,6 +1688,57 @@ pub trait Backend {
         })
     }
 
+    /// FUSED subtraction-trick + co-pack scan: the larger child
+    /// (`larger_slot`, which reuses `parent_slot`) is derived `parent − smaller` and scanned
+    /// in ONE launch — the separate [`subtract_resident`](Backend::subtract_resident) launch is
+    /// DROPPED (the spike095/096 host-enqueue lever). Both siblings' winners fold DIRECTLY into
+    /// the frontier (via the batched two-leaf reduce), and the materialized derived-larger
+    /// histogram is stored into `larger_slot` for the next level's subtraction.
+    ///
+    /// The DEFAULT impl is the byte-unchanged two-step fallback:
+    /// [`subtract_resident`](Backend::subtract_resident) then
+    /// [`scan_resident_siblings_into_frontier`](Backend::scan_resident_siblings_into_frontier).
+    /// A GpuBackend takes the fused staged path when it applies (real device, staged ON, not
+    /// pargain, ≤ LDS cap) and otherwise falls back to the SAME two steps — so the result is
+    /// bit-identical either way and every non-fused caller is unaffected.
+    ///
+    /// # Errors
+    /// Propagates the subtract / co-scan / reduce errors of whichever path runs.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan_resident_siblings_into_frontier(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent_slot: usize,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        smaller_totals: (f64, f64, i32),
+        larger_totals: (f64, f64, i32),
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf_smaller: usize,
+        out_leaf_larger: usize,
+    ) -> Result<(), ComputeError> {
+        // Default: the two separate launches, byte-unchanged.
+        self.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
+        self.scan_resident_siblings_into_frontier(
+            client,
+            smaller_slot,
+            larger_slot,
+            slot_len,
+            feats,
+            real_feats,
+            cfg,
+            smaller_totals,
+            larger_totals,
+            frontier,
+            out_leaf_smaller,
+            out_leaf_larger,
+        )
+    }
+
     /// The ZERO-READBACK analog of
     /// [`build_fix_scan_resident`](Backend::build_fix_scan_resident) (the f64-fused escape hatch)
     /// — build+fix+compact+scan a directly-built leaf in ONE launch, STORE the fixed+compacted
@@ -4030,6 +4081,93 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             out_leaf_smaller,
             out_leaf_larger,
         )
+    }
+
+    /// GpuBackend override: fold the subtraction trick INTO the co-pack scan when the fused
+    /// staged path applies (env `LGBM_SUBTRACT_FUSE=1`, real device, staged, not pargain,
+    /// ≤ LDS cap), STORE the derived-larger histogram Handle into `larger_slot`, and fold both
+    /// winners into the frontier — a single scan launch replacing the separate
+    /// `subtract_resident` + co-scan. Otherwise falls back to those two byte-unchanged steps.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan_resident_siblings_into_frontier(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent_slot: usize,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        smaller_totals: (f64, f64, i32),
+        larger_totals: (f64, f64, i32),
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf_smaller: usize,
+        out_leaf_larger: usize,
+    ) -> Result<(), ComputeError> {
+        // Opt-in fused path (default OFF until spike097 validates on real CUDA).
+        if !kernels::grow_driver::subtract_fuse_enabled() {
+            return self.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)
+                .and_then(|()| {
+                    self.scan_resident_siblings_into_frontier(
+                        client, smaller_slot, larger_slot, slot_len, feats, real_feats, cfg,
+                        smaller_totals, larger_totals, frontier, out_leaf_smaller, out_leaf_larger,
+                    )
+                });
+        }
+        let (parent_h, smaller_h) = {
+            let mirror = self.resident_pool.borrow();
+            let parent_h = mirror.get(parent_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: "subtract_scan_resident_siblings_into_frontier: parent slot is empty"
+                        .to_string(),
+                }
+            })?;
+            let smaller_h = mirror.get(smaller_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: "subtract_scan_resident_siblings_into_frontier: smaller slot is empty"
+                        .to_string(),
+                }
+            })?;
+            (parent_h, smaller_h)
+        };
+        // Try the fused staged path. `Ok(None)` ⇒ the staged path was not taken (e.g. cubecl-cpu
+        // anchor / pargain / feature > LDS cap) ⇒ fall back to the byte-unchanged two steps.
+        let fused = kernels::split::find_best_splits_fused_siblings_subtract_reduce_into_leaves_on(
+            client,
+            smaller_h,
+            parent_h,
+            slot_len,
+            feats,
+            real_feats,
+            cfg,
+            smaller_totals,
+            larger_totals,
+            frontier.records(),
+            out_leaf_smaller,
+            out_leaf_larger,
+        )?;
+        match fused {
+            Some(larger_out) => {
+                // Materialized `parent − smaller` → store into the larger slot (for the next
+                // level's subtraction), exactly as `subtract_resident` would have.
+                kernels::grow_driver::bump_subtract_fused();
+                let mut mirror = self.resident_pool.borrow_mut();
+                if larger_slot >= mirror.len() {
+                    mirror.resize_with(larger_slot + 1, || None);
+                }
+                mirror[larger_slot] = Some(larger_out);
+                Ok(())
+            }
+            None => self
+                .subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)
+                .and_then(|()| {
+                    self.scan_resident_siblings_into_frontier(
+                        client, smaller_slot, larger_slot, slot_len, feats, real_feats, cfg,
+                        smaller_totals, larger_totals, frontier, out_leaf_smaller, out_leaf_larger,
+                    )
+                }),
+        }
     }
 
     /// The f64-fused escape hatch's zero-readback variant — build+fix+compact+scan

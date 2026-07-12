@@ -1825,6 +1825,149 @@ pub fn find_best_splits_fused_siblings_staged_kernel(
     }
 }
 
+/// FUSED-SUBTRACT twin of [`find_best_splits_fused_siblings_staged_kernel`] — folds
+/// the subtraction trick INTO the co-pack sibling scan, removing the separate
+/// `subtract_resident` launch (the spike095/096 host-enqueue lever). Sibling A
+/// (smaller) reads `hist_smaller` and scans, IDENTICALLY to the base kernel.
+/// Sibling B (larger) does NOT read a pre-subtracted buffer — it computes
+/// `d = hist_parent[bin] − hist_smaller[bin]` in its cooperative staging, WRITES `d`
+/// to `larger_out` (a FRESH buffer distinct from `hist_parent` — no read/write
+/// aliasing) so the derived larger histogram is materialized for the next level's
+/// subtraction, and stages `d` into LDS to scan. Every other stage (the REV/FWD
+/// branch scans, the merge/finalize, the output layout) is BYTE-FOR-BYTE the base
+/// kernel.
+///
+/// BIT-EXACTNESS: the subtraction is the SAME elementwise f64 `parent[i] −
+/// smaller[i]` [`subtract_hist_kernel`] computes (non-negotiable #3: the derived
+/// larger is NOT re-FixHistogram'd), so `larger_out` is bit-identical to
+/// `subtract_resident`'s output AND the LDS values sibling B scans are bit-identical
+/// to scanning that separately-subtracted buffer ⇒ the 12-cell scan output is
+/// unchanged. STAGED (real-device) only, like its base kernel.
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_subtract_staged_kernel(
+    hist_smaller: &Array<f64>,
+    hist_parent: &Array<f64>,
+    // The FRESH larger-child histogram (`parent − smaller`), written by the sibling-B
+    // cubes during staging — the materialized derived larger for future subtraction.
+    larger_out: &mut Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    n_feats: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        // FUSED SUBTRACT: stage `parent − smaller`, materialize it into `larger_out`
+        // (fresh buffer, no aliasing with `hist_parent`), and stage into LDS. One
+        // lane per `c` ⇒ each `larger_out[base+c]` written exactly once.
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            let d = hist_parent[base + c] - hist_smaller[base + c];
+            larger_out[base + c] = d;
+            sm[c] = d;
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_smaller[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        scan_rev_branch_staged(
+            &sm.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+        );
+    }
+    if UNIT_POS == 32 {
+        scan_fwd_branch_staged(
+            &sm.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            fwd_count[fi],
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
 // ============================================================================
 // PARALLEL-CANDIDATE staged scan ("pargain", `LGBM_SCAN_PARGAIN`) — the scan
 // redesign the spike092b root-cause map called for. The staged kernels above
@@ -4389,6 +4532,254 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)))
 }
 
+/// FUSED-SUBTRACT co-pack scan launcher: runs
+/// [`find_best_splits_fused_siblings_subtract_staged_kernel`] — the subtraction trick
+/// FOLDED into the co-pack sibling scan, so the caller can DROP the separate
+/// `subtract_resident` launch. Sibling A scans `hist_smaller`; sibling B scans
+/// `hist_parent − hist_smaller` and MATERIALIZES that derived larger histogram into a
+/// FRESH `larger_out` handle (returned so the caller assigns it to the larger slot).
+///
+/// STAGED-ONLY: returns `Ok(None)` when the staged path is not taken (env off, non-real
+/// device such as the cubecl-cpu anchor, PARGAIN opt-in, or a feature exceeding the LDS
+/// stage cap), so the caller falls back to the separate `subtract_resident` +
+/// [`fused_scan_siblings_to_raw_handle`] chain — byte-unchanged. On the taken path
+/// returns `(h_out, out_len, n, min_gain_shift_a, min_gain_shift_b, larger_out)`.
+///
+/// # Errors
+/// The SAME per-feature V5 validation / scope / `!(sum_hessian > 0.0)` errors as
+/// [`fused_scan_siblings_to_raw_handle`].
+#[cfg(feature = "gpu")]
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_smaller_handle: cubecl::server::Handle,
+    hist_parent_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    a_totals: (f64, f64, i32),
+    b_totals: (f64, f64, i32),
+) -> Result<
+    Option<(cubecl::server::Handle, usize, usize, f64, f64, cubecl::server::Handle)>,
+    ComputeError,
+> {
+    if feats.is_empty() {
+        return Ok(None);
+    }
+    // STAGED-capability gate (mirrors `fused_scan_siblings_to_raw_handle`'s staged
+    // branch): real device, staged ON, NOT pargain (the fused kernel is a twin of the
+    // SERIAL-branch staged kernel only), every feature ≤ the LDS stage cap. When any
+    // fails, signal fallback to the separate subtract + scan.
+    let staged_capable = scan_staged_enabled()
+        && !scan_pargain_enabled()
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && feats.iter().all(|f| (f.num_bin as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
+    if !staged_capable {
+        return Ok(None);
+    }
+    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_siblings_subtract: max_delta_step / path_smooth are \
+                     Phase-7+ scope (only the default 0.0 path is transcribed)"
+                .to_string(),
+        });
+    }
+    let (sum_gradient_a, sum_hessian_a, num_data_a) = a_totals;
+    let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(sum_hessian_a > 0.0) || !(sum_hessian_b > 0.0) {
+        return Err(ComputeError::Runtime {
+            detail: "find_best_splits_siblings_subtract: both siblings' sum_hessian must be > 0"
+                .to_string(),
+        });
+    }
+
+    // Per-feature V5 validation + device-array assembly (SHARED between siblings) —
+    // IDENTICAL to `fused_scan_siblings_to_raw_handle`.
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
+    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
+    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
+    for f in feats {
+        if f.na_as_missing {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                         implemented"
+                    .to_string(),
+            });
+        }
+        if f.num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(f.num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+            })?;
+        let end = f.slot_off.checked_add(cells).ok_or_else(|| ComputeError::Runtime {
+            detail: "find_best_splits_siblings_subtract: slot_off + region overflows".to_string(),
+        })?;
+        if end > buf_len {
+            return Err(ComputeError::LengthMismatch { expected: end, actual: buf_len });
+        }
+        let num_bin_i = f.num_bin as i32;
+        slot_off_a.push(f.slot_off as u32);
+        num_bin_a.push(num_bin_i);
+        offset_a.push(f.offset);
+        default_bin_a.push(f.default_bin as i32);
+        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
+        rev_count_a.push((num_bin_i - 1).max(0));
+        fwd_count_a.push(if f.run_forward { (num_bin_i - 1 - f.offset).max(0) } else { 0 });
+    }
+
+    let two_eps = 2.0 * f64::from(K_EPSILON);
+    let use_l1 = cfg.use_l1();
+    let sum_hessian_a_bumped = sum_hessian_a + two_eps;
+    let min_gain_shift_a = crate::gain::get_leaf_gain(
+        use_l1, sum_gradient_a, sum_hessian_a_bumped, cfg.lambda_l1, cfg.lambda_l2,
+    ) + cfg.min_gain_to_split;
+    let sum_hessian_b_bumped = sum_hessian_b + two_eps;
+    let min_gain_shift_b = crate::gain::get_leaf_gain(
+        use_l1, sum_gradient_b, sum_hessian_b_bumped, cfg.lambda_l1, cfg.lambda_l2,
+    ) + cfg.min_gain_to_split;
+
+    let out_len = 2 * n * 12;
+    let h_out = client.empty(out_len * std::mem::size_of::<f64>());
+    // The FRESH derived-larger buffer (`parent − smaller`), `buf_len` f64 cells — the
+    // sibling-B cubes write every feature region (they tile `[0, buf_len)`).
+    let larger_out = client.empty(buf_len * std::mem::size_of::<f64>());
+    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
+    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
+    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
+    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
+    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
+    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
+    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // SAFETY: geometry `Static(n, 2, 1)` guarantees CUBE_POS_X < n, CUBE_POS_Y < 2
+    // (the kernel's no-guard contract). Both hist handles + `larger_out` describe
+    // `buf_len` f64 cells; every per-feature region `[slot_off, slot_off+2*num_bin)` is
+    // validated `<= buf_len`; sibling-B cubes write ONLY their feature region of
+    // `larger_out` (disjoint across features, one lane per cell) and read `hist_parent` /
+    // `hist_smaller` at the same region; `h_out` is `2*n*12`; per-feature arrays sized `n`.
+    // `larger_out` is a FRESH handle (never aliases `hist_parent`). All cubecl unsafe
+    // confined here (CMP-01).
+    unsafe {
+        find_best_splits_fused_siblings_subtract_staged_kernel::launch(
+            client,
+            CubeCount::Static(n as u32, 2, 1),
+            CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+            ArrayArg::from_raw_parts(hist_smaller_handle, buf_len),
+            ArrayArg::from_raw_parts(hist_parent_handle, buf_len),
+            ArrayArg::from_raw_parts(larger_out.clone(), buf_len),
+            ArrayArg::from_raw_parts(h_out.clone(), out_len),
+            ArrayArg::from_raw_parts(h_slot, n),
+            ArrayArg::from_raw_parts(h_numbin, n),
+            ArrayArg::from_raw_parts(h_offset, n),
+            ArrayArg::from_raw_parts(h_defbin, n),
+            ArrayArg::from_raw_parts(h_skip, n),
+            ArrayArg::from_raw_parts(h_rev, n),
+            ArrayArg::from_raw_parts(h_fwd, n),
+            if use_l1 { 1u32 } else { 0u32 },
+            cfg.min_data_in_leaf,
+            cfg.min_sum_hessian_in_leaf,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            min_gain_shift_a,
+            sum_gradient_a,
+            sum_hessian_a_bumped,
+            num_data_a,
+            min_gain_shift_b,
+            sum_gradient_b,
+            sum_hessian_b_bumped,
+            num_data_b,
+            n as u32,
+        );
+    }
+    Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b, larger_out)))
+}
+
+/// FUSED-SUBTRACT co-pack reduce-into-leaves: the subtraction trick folded into the
+/// scan ([`fused_subtract_scan_siblings_to_raw_handle`]) followed by the batched
+/// two-leaf reduce, folding BOTH siblings' winners into `out`. Returns
+/// `Ok(Some(larger_out))` (the materialized derived-larger histogram Handle the caller
+/// assigns to the larger slot) on the fused (staged) path, or `Ok(None)` when the
+/// staged path is not taken — the caller then runs the separate `subtract_resident` +
+/// [`find_best_splits_fused_siblings_reduce_into_leaves_on`] chain.
+///
+/// # Errors
+/// As [`fused_subtract_scan_siblings_to_raw_handle`]; plus
+/// [`ComputeError::LengthMismatch`] if `real_feats.len() != feats.len()`, or
+/// [`ComputeError::Runtime`] if either `out_leaf` is out of range.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_smaller_handle: cubecl::server::Handle,
+    hist_parent_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    real_feats: &[i32],
+    cfg: &GainConfig,
+    a_totals: (f64, f64, i32),
+    b_totals: (f64, f64, i32),
+    out: &crate::kernels::best_split::SplitSoa,
+    out_leaf_a: usize,
+    out_leaf_b: usize,
+) -> Result<Option<cubecl::server::Handle>, ComputeError> {
+    if real_feats.len() != feats.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: feats.len(),
+            actual: real_feats.len(),
+        });
+    }
+    if !feats.is_empty() && (out_leaf_a >= out.len || out_leaf_b >= out.len) {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "find_best_splits_siblings_subtract_reduce: out_leaf_a {out_leaf_a} / \
+                 out_leaf_b {out_leaf_b} out of range [0, {})",
+                out.len
+            ),
+        });
+    }
+    let scanned = fused_subtract_scan_siblings_to_raw_handle(
+        client,
+        hist_smaller_handle,
+        hist_parent_handle,
+        buf_len,
+        feats,
+        cfg,
+        a_totals,
+        b_totals,
+    )?;
+    let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b, larger_out)) = scanned else {
+        return Ok(None); // fallback signal (empty feats OR staged path not taken)
+    };
+    // ONE batched dispatch folds both siblings' winners (the same batched reduce the
+    // non-fused co-pack path uses).
+    if reduce_batch_enabled() {
+        launch_reduce_into_two_leaves(
+            client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
+            min_gain_shift_a, min_gain_shift_b,
+        );
+    } else {
+        launch_reduce_into_leaf(
+            client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0, min_gain_shift_a,
+        );
+        launch_reduce_into_leaf(
+            client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12, min_gain_shift_b,
+        );
+    }
+    Ok(Some(larger_out))
+}
+
 /// CO-PACK (2-sibling) no-readback reduce-into-leaves launcher. Mirrors
 /// [`find_best_splits_fused_siblings_from_handles_on`]'s signature but writes BOTH siblings'
 /// winners DIRECTLY into two target [`SplitSoa`] slots (`out_leaf_a` / `out_leaf_b`) via TWO
@@ -5980,5 +6371,47 @@ mod tests {
         // Sanity: the two siblings resolved to their distinct expected winners.
         assert_eq!(batched.read_record(&client, 0).threshold, 12, "sibling A winner");
         assert_eq!(batched.read_record(&client, 1).threshold, 20, "sibling B winner");
+    }
+
+    /// The FUSED-SUBTRACT co-pack launcher
+    /// ([`find_best_splits_fused_siblings_subtract_reduce_into_leaves_on`]) SIGNALS FALLBACK
+    /// (`Ok(None)`, writing NOTHING into `out`) on the cubecl-cpu runtime — the staged kernel
+    /// family (SharedMemory + sync_cube) does NOT lower there, so the fused path is
+    /// real-device-only and the backend must run the byte-unchanged separate
+    /// `subtract_resident` + co-scan instead. Pins that contract (the backend's fallback
+    /// branch depends on it). The REAL kernel-vs-separate bit-exactness is the CUDA spike's
+    /// job (like the pargain / resident-perm kernel layers). GPU-gated (the launcher is
+    /// `#[cfg(feature = "gpu")]`).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn subtract_fuse_signals_fallback_on_cpu_runtime() {
+        use crate::kernels::best_split::SplitSoa;
+
+        let client = cpu_client();
+        // Two valid sibling leaf totals over the shared feature layout.
+        let (buf_a, feats, real_feats, sg_a, sh_a, nd_a) = batch_hist();
+        let (buf_b, sg_b, sh_b, nd_b) = batch_hist_b();
+        let cfg = relaxed_cfg();
+        // `hist_smaller` = A's buffer, `hist_parent` = B's buffer (stand-ins — the launcher
+        // gates on the RUNTIME before touching them).
+        let h_smaller = client.create_from_slice(f64::as_bytes(&buf_a));
+        let h_parent = client.create_from_slice(f64::as_bytes(&buf_b));
+        let out = SplitSoa::zeroed(&client, 2);
+
+        let got = find_best_splits_fused_siblings_subtract_reduce_into_leaves_on(
+            &client, h_smaller, h_parent, buf_a.len(), &feats, &real_feats, &cfg,
+            (sg_a, sh_a, nd_a), (sg_b, sh_b, nd_b), &out, 0, 1,
+        )
+        .expect("launcher must not error on the fallback path");
+        assert!(
+            got.is_none(),
+            "on the cubecl-cpu runtime the staged fused-subtract path must NOT be taken \
+             (Ok(None) fallback signal), got Some(larger_out)"
+        );
+        // And it must have written NOTHING into `out` (the caller runs the fallback that does).
+        for slot in 0..2 {
+            let rec = out.read_record(&client, slot);
+            assert!(!rec.is_valid, "slot {slot} must stay the zeroed sentinel (no fold on None)");
+        }
     }
 }

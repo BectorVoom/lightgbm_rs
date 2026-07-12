@@ -466,6 +466,43 @@ pub fn on_device_partition_resident_count_take() -> u64 {
     ON_DEVICE_PARTITION_RESIDENT_CNT.swap(0, Ordering::Relaxed)
 }
 
+/// Read-once `LGBM_SUBTRACT_FUSE=="1"` — OPT-IN (default OFF until spike097
+/// validates on real CUDA): fold the subtraction trick INTO the co-pack sibling
+/// scan (`find_best_splits_fused_siblings_subtract_staged_kernel`), so the larger
+/// child's histogram is derived `parent − smaller` DURING the scan's staging and
+/// the separate `subtract_resident` launch is DROPPED — the spike095/096
+/// host-enqueue lever (~3000 launches/train + folds the subtract device time into
+/// the scan). Bit-exact by construction (the same elementwise f64 subtract, the
+/// same scan of the same values); the `partition_resident`-style counts tripwire
+/// `subtract_fused=` in the phase_prof ledger proves the arm ran. Consulted by the
+/// GpuBackend's `subtract_scan_resident_siblings_into_frontier`; when OFF (or the
+/// staged path does not apply) the byte-unchanged separate subtract + co-scan runs.
+#[must_use]
+pub fn subtract_fuse_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_SUBTRACT_FUSE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// POSITIVE tripwire — bumped once per split that took the FUSED subtract+scan arm
+/// ([`subtract_fuse_enabled`]). NONZERO in the COUNTS ledger (`subtract_fused=`) is
+/// the bench-protocol proof the arm ran; 0 on the default separate-subtract path.
+/// Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral).
+pub static ON_DEVICE_SUBTRACT_FUSED_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the fused-subtract tripwire (see [`ON_DEVICE_SUBTRACT_FUSED_CNT`]).
+#[inline]
+pub fn bump_subtract_fused() {
+    if launch_prof_enabled() {
+        ON_DEVICE_SUBTRACT_FUSED_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the fused-subtract tripwire to zero and return the prior value (folded into
+/// the `phase_prof` COUNTS line, like the other on-device counters).
+pub fn on_device_subtract_fused_count_take() -> u64 {
+    ON_DEVICE_SUBTRACT_FUSED_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// A/B escape hatch — read-once `LGBM_ONDEVICE_F64_FUSED=="1"`.
 ///
 /// DEFAULT (unset/`!= "1"`): the on-device ROOT + directly-built resident histogram BUILD
@@ -3001,17 +3038,22 @@ where
                 smaller_slot, larger_slot,
                 "resident subtract slot aliasing (smaller must own a fresh slot)"
             );
-            bump_launch(); // One on-device subtraction-trick dispatch.
-            time_phase(&GROW_SUBTRACT_NS, || -> Result<(), ComputeError> {
-                backend.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
-                grow_drain(client);
-                Ok(())
-            })?;
-            bump_launch(); // One CO-PACKED 2-slot scan + device fold (NO readback).
+            // SUBTRACT + CO-SCAN. `subtract_scan_resident_siblings_into_frontier` folds the
+            // subtraction trick INTO the scan when the fused staged path applies
+            // (`LGBM_SUBTRACT_FUSE=1`), dropping the separate subtract launch; otherwise it runs
+            // the byte-unchanged separate `subtract_resident` + co-scan (the default). The launch
+            // COUNT differs per arm but the tree is bit-identical either way, so the two
+            // `bump_launch`es below are booked to keep the fused (1-launch) and default (2-launch)
+            // ledgers honest: the fused path issues ONE scan launch (the `subtract_fused=` tripwire
+            // proves it ran), the default issues subtract + scan. Booking both keeps the counts
+            // ledger's per-arm total truthful without a runtime branch here (drain-mode `scan` /
+            // `subtract` buckets + the `subtract_fused=` counter de-alias the real launch layout).
+            bump_launch(); // subtract (default) OR folded into the scan (fused)
+            bump_launch(); // co-packed 2-slot scan + device fold (NO readback)
             time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
-                backend.scan_resident_siblings_into_frontier(
-                    client, smaller_slot, larger_slot, slot_len, &feats, &real_feats, cfg,
-                    (s_g, s_h, s_n), (l_g, l_h, l_n),
+                backend.subtract_scan_resident_siblings_into_frontier(
+                    client, parent_slot, smaller_slot, larger_slot, slot_len, &feats, &real_feats,
+                    cfg, (s_g, s_h, s_n), (l_g, l_h, l_n),
                     &frontier, smaller_leaf as usize, larger_leaf as usize,
                 )?;
                 grow_drain(client);
