@@ -399,6 +399,71 @@ pub fn set_fused_partition_override(v: Option<bool>) {
     FUSED_PARTITION_OVERRIDE.store(code, Ordering::Relaxed);
 }
 
+/// Read-once `LGBM_PARTITION_RESIDENT=="1"` — OPT-IN (default OFF until the
+/// real-CUDA A/B validates it): the on-device driver keeps the row permutation
+/// RESIDENT for the whole grow (`ResidentPermPartition`, the `cuda_data_indices_`
+/// analog). Each split partitions the parent's sub-range IN PLACE on device
+/// (3 launches: fused mark+block-scan → totals-scan+child-ranges → stable scatter)
+/// and reads back only the 6-int child ranges; every histogram build reads its
+/// rows from an OFFSET VIEW of the device perm (no per-build `create_from_slice`
+/// row upload); the host perm is read back ONCE at the grow tail for the layout
+/// rebuild. Bit-exact by construction: the mark reuses the single-source
+/// `route_to_left`, the scatter reproduces `partition_leaf_stable`'s stable order,
+/// and the u64 build is order-independent — the `partition_resident=` COUNTS
+/// tripwire proves the arm actually ran.
+#[must_use]
+pub fn resident_perm_partition_enabled() -> bool {
+    // Same-session A/B override (mirrors `ondevice_fused_partition_enabled`): the
+    // env gate is read-once, so an in-process A/B harness flips this atomic instead.
+    match PARTITION_RESIDENT_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LGBM_PARTITION_RESIDENT").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Same-session A/B override for [`resident_perm_partition_enabled`].
+/// 0 = unset (defer to `LGBM_PARTITION_RESIDENT`), 1 = force ON, 2 = force OFF.
+static PARTITION_RESIDENT_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Harness/test hook: force the resident-perm partition arm ON (`Some(true)`), OFF
+/// (`Some(false)`), or defer to the `LGBM_PARTITION_RESIDENT` env gate (`None`).
+/// Same contract as [`set_fused_partition_override`] (the env gate is read-once and
+/// cannot be re-read mid-process; the per-split read is a `Relaxed` load).
+pub fn set_partition_resident_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    PARTITION_RESIDENT_OVERRIDE.store(code, Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire — bumped once per split partitioned on the RESIDENT-PERM arm
+/// ([`resident_perm_partition_enabled`]). A nonzero `partition_resident=` in the
+/// COUNTS ledger is the bench-protocol proof the code-under-test actually ran
+/// (the spike092 lesson: never trust a wall delta without a counts confirmation).
+/// Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral).
+pub static ON_DEVICE_PARTITION_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the resident-perm partition tripwire (see [`ON_DEVICE_PARTITION_RESIDENT_CNT`]).
+#[inline]
+fn bump_partition_resident() {
+    if launch_prof_enabled() {
+        ON_DEVICE_PARTITION_RESIDENT_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the resident-perm partition tripwire to zero and return the prior value
+/// (folded into the `phase_prof` COUNTS line, like the other on-device counters).
+pub fn on_device_partition_resident_count_take() -> u64 {
+    ON_DEVICE_PARTITION_RESIDENT_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// A/B escape hatch — read-once `LGBM_ONDEVICE_F64_FUSED=="1"`.
 ///
 /// DEFAULT (unset/`!= "1"`): the on-device ROOT + directly-built resident histogram BUILD
@@ -2308,6 +2373,44 @@ where
         grow_drain(client);
     });
 
+    // ---- RESIDENT-PERM partition arm (opt-in, `LGBM_PARTITION_RESIDENT=1`).
+    // Keep the row permutation resident for the WHOLE grow: partition each split's
+    // sub-range in place on device, feed every build its rows via an offset Handle
+    // view, and read the perm back ONCE at the tail. Gated on the backend actually
+    // exposing the resident bin buffer with matching geometry (so the mark kernel's
+    // column reads are the same values the host `f.bins` holds), and OFF under the
+    // f64-fused escape hatch (that arm's build takes host row slices; keeping the
+    // hatch matrix small). `grow_max_abs` is the grow-wide overflow-guard bound the
+    // rows-handle build uses in place of the per-leaf host scan. ----
+    let resident_perm: Option<(
+        (cubecl::server::Handle, crate::ResidentBinWidth, usize, usize),
+        crate::kernels::partition::ResidentPermPartition<R>,
+        f64,
+    )> = if resident_perm_partition_enabled() && !on_device_f64_fused_build() {
+        match backend.resident_bins_view() {
+            Some(view) if view.2 == features.len() && view.3 == num_data => {
+                let state = time_phase(&GROW_SETUP_NS, || {
+                    crate::kernels::partition::ResidentPermPartition::<R>::new(client, num_data)
+                })?;
+                bump_launch(); // the once-per-grow identity (iota) seed dispatch
+                let grow_max_abs = time_phase(&GROW_SETUP_NS, || {
+                    let mut m = 0.0f32;
+                    for &g in gradients {
+                        m = m.max(g.abs());
+                    }
+                    for &h in hessians {
+                        m = m.max(h.abs());
+                    }
+                    f64::from(m)
+                });
+                Some((view, state, grow_max_abs))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     // ---- Root init (§6.1): whole-dataset root grad/hess sum. Routed through
     // `backend.root_grad_hess_sum` (the §6.1 `CUDAInitValuesKernel` analog) so the GpuBackend arm
     // runs it on-device (ordered f64 reduction — bit-exact vs the integer path, ~1e-6 vs
@@ -2372,20 +2475,39 @@ where
         bump_launch(); // One parallel-u64 resident build dispatch.
         bump_rootbuild_u64(); // CONVERTED root site ran u64 (positive proof).
         time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
-            backend.build_resident_leaf(
-                client,
-                0,
-                &feature_bins,
-                &num_bins,
-                &slot_off,
-                slot_len,
-                &perm,
-                gradients,
-                hessians,
-                &fix_feats,
-                root_sum_g,
-                root_sum_h,
-            )?;
+            if let Some((_, rp, grow_max_abs)) = &resident_perm {
+                // RESIDENT-PERM arm: the root's rows are the identity-seeded device
+                // perm itself (0..num_data in order — same ids, same order as the
+                // host `&perm` iota below, and the u64 build is order-independent
+                // anyway ⇒ bit-identical histogram).
+                backend.build_resident_leaf_rows_handle(
+                    client,
+                    0,
+                    &slot_off,
+                    slot_len,
+                    rp.rows_view(0),
+                    num_data,
+                    &fix_feats,
+                    root_sum_g,
+                    root_sum_h,
+                    *grow_max_abs,
+                )?;
+            } else {
+                backend.build_resident_leaf(
+                    client,
+                    0,
+                    &feature_bins,
+                    &num_bins,
+                    &slot_off,
+                    slot_len,
+                    &perm,
+                    gradients,
+                    hessians,
+                    &fix_feats,
+                    root_sum_g,
+                    root_sum_h,
+                )?;
+            }
             grow_drain(client);
             Ok(())
         })?;
@@ -2607,23 +2729,62 @@ where
         // by `backend.prefers_host_partition()` inside `partition_resident_range`.
         let p_begin = leaves[best_leaf as usize].row_begin;
         let p_count = leaves[best_leaf as usize].row_count;
-        // PARTITION: the whole per-split row-routing op (host bin gather + the
-        // host-fused OR device route + the in-place perm scatter-back).
-        let split_point = time_phase(&GROW_PARTITION_NS, || {
-            partition_resident_range(
-                backend,
-                client,
-                &mut perm[p_begin..p_begin + p_count],
-                f,
-                &best,
-                partition_min_bin,
-                missing_type_u8,
-                &leaf_splits_dev,
-                new_left as usize,
-                p_begin as i32,
-                p_count as i32,
-            )
-        })?;
+        // PARTITION: the whole per-split row-routing op. RESIDENT-PERM arm: the §9
+        // mark→scan→scatter runs IN PLACE on the device perm (3 launches, no bins
+        // gather, no rows crossing) and the host reads back only the 6-int child
+        // ranges (the split-point scalar its bookkeeping needs — the same small
+        // readback the reference CUDADataPartition::SplitInner performs). Legacy
+        // arm: host bin gather + host-fused/device route + in-place host scatter.
+        let split_point = if let Some((view, rp, _)) = &resident_perm {
+            time_phase(&GROW_PARTITION_NS, || -> Result<usize, ComputeError> {
+                // Three real device dispatches (mark+block-scan / totals+ranges /
+                // scatter) + the positive COUNTS tripwire for the bench protocol.
+                bump_launch();
+                bump_launch();
+                bump_launch();
+                bump_partition_resident();
+                rp.partition_leaf(
+                    client,
+                    &view.0,
+                    view.1,
+                    best_fpos as usize * num_data,
+                    view.2 * view.3,
+                    f.num_bin,
+                    partition_min_bin,
+                    f.max_bin,
+                    f.default_bin,
+                    f.most_freq_bin,
+                    missing_type_u8,
+                    best.default_left,
+                    best.threshold,
+                    &leaf_splits_dev,
+                    new_left as usize,
+                    p_begin as i32,
+                    p_count as i32,
+                )?;
+                // ONE small blocking readback: the resident child ranges (24 B of
+                // payload) — the split point the host row bookkeeping consumes.
+                bump_sync();
+                let cr = leaf_splits_dev.read_leaf(client, new_left as usize);
+                Ok(cr.left_count as usize)
+            })?
+        } else {
+            time_phase(&GROW_PARTITION_NS, || {
+                partition_resident_range(
+                    backend,
+                    client,
+                    &mut perm[p_begin..p_begin + p_count],
+                    f,
+                    &best,
+                    partition_min_bin,
+                    missing_type_u8,
+                    &leaf_splits_dev,
+                    new_left as usize,
+                    p_begin as i32,
+                    p_count as i32,
+                )
+            })?
+        };
         let left_count = split_point as i32;
         let right_count = (p_count - split_point) as i32;
         // An out-of-range `best.threshold` would silently record a wrong REAL
@@ -2737,8 +2898,44 @@ where
             let s = &leaves[smaller_leaf as usize];
             (s.row_begin, s.row_count, s.sum_g, s.sum_h)
         };
-        let s_rows: &[u32] = &perm[s_begin..s_begin + s_count];
         let s_n = s_count as i32;
+        // Build the SMALLER child's resident histogram into `slot`: the
+        // RESIDENT-PERM arm reads the rows from an offset VIEW of the device perm
+        // (no host slice — the host perm is STALE on that arm; no per-build row
+        // upload); the legacy arm keeps the borrowed host-perm slice. The f64-fused
+        // hatch never coexists with the resident arm (gated at state creation), so
+        // its `s_rows` slice below stays host-perm-backed and correct.
+        let build_smaller = |slot: usize| -> Result<(), ComputeError> {
+            if let Some((_, rp, grow_max_abs)) = &resident_perm {
+                backend.build_resident_leaf_rows_handle(
+                    client,
+                    slot,
+                    &slot_off,
+                    slot_len,
+                    rp.rows_view(s_begin),
+                    s_count,
+                    &fix_feats,
+                    s_g,
+                    s_h,
+                    *grow_max_abs,
+                )
+            } else {
+                backend.build_resident_leaf(
+                    client,
+                    slot,
+                    &feature_bins,
+                    &num_bins,
+                    &slot_off,
+                    slot_len,
+                    &perm[s_begin..s_begin + s_count],
+                    gradients,
+                    hessians,
+                    &fix_feats,
+                    s_g,
+                    s_h,
+                )
+            }
+        };
         let (l_g, l_h, l_n) = {
             let l = &leaves[larger_leaf as usize];
             (l.sum_g, l.sum_h, l.row_count as i32)
@@ -2794,10 +2991,7 @@ where
             // `argmax_over_resident_splits` folds + `reduce_winner_into_frontier` on the anchor.
             bump_launch(); // One resident build dispatch (scan deferred to co-pack).
             time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
-                backend.build_resident_leaf(
-                    client, smaller_slot, &feature_bins, &num_bins, &slot_off, slot_len,
-                    s_rows, gradients, hessians, &fix_feats, s_g, s_h,
-                )?;
+                build_smaller(smaller_slot)?;
                 grow_drain(client);
                 Ok(())
             })?;
@@ -2834,6 +3028,10 @@ where
             } else {
                 vec![false; scan_active.len()]
             };
+            // Host-perm rows slice — valid on this arm: the resident-perm state is
+            // never created under the f64-fused hatch (gated at creation), so the
+            // host perm is authoritative here.
+            let s_rows: &[u32] = &perm[s_begin..s_begin + s_count];
             bump_launch(); // One fused build+fix+compact+scan dispatch (device→device fold).
             bump_f64_fused();
             time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
@@ -2881,10 +3079,7 @@ where
             bump_launch(); // One parallel-u64 resident build dispatch.
             bump_rootbuild_u64(); // CONVERTED directly-built site ran u64.
             time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
-                backend.build_resident_leaf(
-                    client, smaller_slot, &feature_bins, &num_bins, &slot_off, slot_len,
-                    s_rows, gradients, hessians, &fix_feats, s_g, s_h,
-                )?;
+                build_smaller(smaller_slot)?;
                 grow_drain(client);
                 Ok(())
             })?;
@@ -2938,6 +3133,15 @@ where
     // TAIL: `to_host_tree` is a per-grow device READBACK and the layout rebuild is
     // O(num_data) host work — previously entirely invisible to phase_prof (a residual suspect).
     let _tail_guard = PhaseGuard::new(&GROW_TAIL_NS);
+    // RESIDENT-PERM arm: the authoritative permutation lives on device — read it
+    // back ONCE (the single per-grow perm crossing) so the layout rebuild below
+    // groups the same rows the device partition produced. Bit-exact: the device
+    // partition is byte-equal to the host arm's stable partition, so this readback
+    // yields the identical Vec the host arm maintained incrementally.
+    if let Some((_, rp, _)) = &resident_perm {
+        bump_sync(); // one blocking per-grow readback (the tail perm crossing)
+        perm = rp.read_perm(client);
+    }
     let host_tree = tree.to_host_tree(client);
     let final_leaves = host_tree.num_leaves as usize;
     let mut indices = Vec::with_capacity(num_data);

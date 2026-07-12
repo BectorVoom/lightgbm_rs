@@ -1090,6 +1090,60 @@ pub trait Backend {
     ) {
     }
 
+    /// A cheap VIEW of the device-resident concatenated bin buffer uploaded by
+    /// [`upload_resident_bins`](Backend::upload_resident_bins):
+    /// `(handle, width, num_features, num_data)`, with feature `f`'s row `r` at
+    /// element `f * num_data + r`. Consumed by the on-device driver's
+    /// RESIDENT-PERM partition arm (its mark kernel reads the split feature's
+    /// column straight from this buffer — no per-split host `bins_sub` gather).
+    ///
+    /// DEFAULT: `None` ([`CpuBackend`] and any backend without a resident cache),
+    /// which keeps the driver on the host-partition arm — zero behavior change.
+    fn resident_bins_view(
+        &self,
+    ) -> Option<(cubecl::server::Handle, ResidentBinWidth, usize, usize)> {
+        None
+    }
+
+    /// The RESIDENT-ROWS histogram build: identical to
+    /// [`build_resident_leaf`](Backend::build_resident_leaf) except the leaf's rows
+    /// are read from a DEVICE handle (`rows` = an offset view of the resident row
+    /// permutation, `rows_count` u32 row ids) instead of a host slice — no per-build
+    /// `create_from_slice` row upload. Requires BOTH the resident bin cache AND the
+    /// per-grow resident grad/hess (the on-device gather path); `max_abs_grad_hess`
+    /// is a host-computed per-GROW bound on `max(|g|, |h|)` standing in for the
+    /// per-leaf overflow-guard scan (the rows live on device, so the exact per-leaf
+    /// max is not host-readable; the grow-wide bound is conservative and safe).
+    ///
+    /// DEFAULT: a typed error — only a resident-pool backend overrides this, and the
+    /// driver's resident-perm arm is gated on
+    /// [`resident_bins_view`](Backend::resident_bins_view) returning `Some`.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] on an unsupported backend or a missing resident
+    /// bin / grad-hess cache; the overflow-guard error as
+    /// [`build_resident_leaf`](Backend::build_resident_leaf).
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident_leaf_rows_handle(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _slot: usize,
+        _slot_off: &[usize],
+        _slot_len: usize,
+        _rows: cubecl::server::Handle,
+        _rows_count: usize,
+        _fix_feats: &[(usize, u32, i32, u32)],
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+        _max_abs_grad_hess: f64,
+    ) -> Result<(), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "build_resident_leaf_rows_handle: backend has no resident pool (the \
+                     resident-perm partition arm must be gated on resident_bins_view())"
+                .to_string(),
+        })
+    }
+
     /// Whether [`upload_resident_bins`](Backend::upload_resident_bins) actually
     /// consumes its `&[&[u32]]` argument. With narrow [`BinColumn`]
     /// storage, the learner must WIDEN each column to `u32` to call
@@ -2800,7 +2854,9 @@ fn compact_histogram_inline(hist: &mut [f64], offset: i32) {
 /// uploaded at the NARROWEST uniform width covering every feature's `BinColumn` variant
 /// (widest variant present), so the resident-reading kernels dispatch the matching
 /// `<B: Int>` monomorphization. Mirrors the host `BinColumn` u8/u16/u32 axis.
-#[cfg(feature = "gpu")]
+/// UNGATED (no `gpu` cfg): the [`Backend::resident_bins_view`] trait seam and the
+/// runtime-generic resident-perm partition kernels name it on every build; only the
+/// `GpuBackend` storage that produces it stays `gpu`-gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentBinWidth {
     U8,
@@ -3458,6 +3514,82 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             sum_gradient,
             sum_hessian,
             resident_gh,
+        )?;
+        debug_assert_eq!(len, slot_len, "resident leaf handle length");
+        let mut mirror = self.resident_pool.borrow_mut();
+        if slot >= mirror.len() {
+            mirror.resize_with(slot + 1, || None);
+        }
+        mirror[slot] = Some(handle);
+        Ok(())
+    }
+
+    // The resident-perm partition's view of the once-per-train concatenated
+    // bin buffer — `(handle, width, num_features, num_data)`. `None` until
+    // `upload_resident_bins` ran (the driver gates its resident-perm arm on this).
+    fn resident_bins_view(
+        &self,
+    ) -> Option<(cubecl::server::Handle, ResidentBinWidth, usize, usize)> {
+        self.resident_bins
+            .borrow()
+            .as_ref()
+            .map(|r| (r.handle.clone(), r.width, r.num_features, r.num_data))
+    }
+
+    /// [`build_resident_leaf`](Backend::build_resident_leaf) with the leaf rows read
+    /// from a DEVICE handle (an offset view of the resident permutation) — the
+    /// resident-perm arm's build. Unlike the host-slice twin this REQUIRES the
+    /// resident grad/hess (the rows are not host-readable, so there is no host
+    /// `ord_g`/`ord_h` gather to fall back to).
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident_leaf_rows_handle(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        slot: usize,
+        slot_off: &[usize],
+        slot_len: usize,
+        rows: cubecl::server::Handle,
+        rows_count: usize,
+        fix_feats: &[(usize, u32, i32, u32)],
+        sum_gradient: f64,
+        sum_hessian: f64,
+        max_abs_grad_hess: f64,
+    ) -> Result<(), ComputeError> {
+        let resident = self.resident_bins.borrow();
+        let Some(resident) = resident.as_ref() else {
+            return Err(ComputeError::Runtime {
+                detail: "build_resident_leaf_rows_handle: resident bin cache empty \
+                         (upload_resident_bins not called)"
+                    .to_string(),
+            });
+        };
+        let Some(gh) = self
+            .resident_grad_hess
+            .borrow()
+            .as_ref()
+            .map(|gh| (gh.grad.clone(), gh.hess.clone(), gh.num_data))
+        else {
+            return Err(ComputeError::Runtime {
+                detail: "build_resident_leaf_rows_handle: resident grad/hess missing \
+                         (upload_resident_grad_hess not called this grow)"
+                    .to_string(),
+            });
+        };
+        let (handle, len) = kernels::histogram::build_fix_compact_resident_rows_handle_f64_on(
+            client,
+            resident.handle.clone(),
+            resident.width,
+            resident.num_features,
+            resident.num_data,
+            slot_off,
+            slot_len,
+            rows,
+            rows_count,
+            fix_feats,
+            sum_gradient,
+            sum_hessian,
+            max_abs_grad_hess,
+            gh,
         )?;
         debug_assert_eq!(len, slot_len, "resident leaf handle length");
         let mut mirror = self.resident_pool.borrow_mut();

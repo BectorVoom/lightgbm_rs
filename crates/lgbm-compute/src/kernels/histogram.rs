@@ -2055,6 +2055,27 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         resident_gh, // Some ⇒ on-device grad/hess gather, no host upload
     );
 
+    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian)
+}
+
+/// The shared FIX/COMPACT tail of the resident build chains: allocate the zeroed
+/// f64 output and run the folded widen+fix+compact kernel over the u64 fixed-point
+/// RAW buffer. Extracted VERBATIM from [`build_fix_compact_resident_f64_on`] so the
+/// host-rows and resident-rows-handle builds share one tail (byte-identical
+/// launches; only the RAW-build row source differs upstream).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] / [`ComputeError::LengthMismatch`] on a degenerate
+/// `fix_feats` layout (zero `num_bin`, region overflow / out of `slot_len`).
+#[cfg(feature = "gpu")]
+fn fix_compact_from_raw_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    h_raw: cubecl::server::Handle,
+    slot_len: usize,
+    fix_feats: &[(usize, u32, i32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+) -> Result<(cubecl::server::Handle, usize), ComputeError> {
     // ---- 2. (Lever A) Allocate the zeroed f64 OUTPUT. The standalone
     //         widen launch is GONE — the folded fix kernel below widens each feature
     //         region from `h_raw` (f32) into `h_f64` (f64) inline as its first pass,
@@ -2188,6 +2209,113 @@ pub fn build_fix_compact_resident_readback_f64_on<R: cubecl::Runtime>(
     debug_assert_eq!(len, slot_len);
     let bytes = client.read_one_unchecked(handle);
     Ok(f64::from_bytes(&bytes).to_vec())
+}
+
+/// RESIDENT-ROWS twin of [`build_fix_compact_resident_f64_on`]: the leaf's rows are
+/// a DEVICE handle (`rows_handle`, an offset view of the resident row permutation —
+/// `rows_count` u32 row ids) instead of a host slice, so there is NO per-build
+/// `create_from_slice` row upload. Grad/hess are gathered ON DEVICE from the
+/// once-per-grow resident buffers (`resident_gh` is REQUIRED — the rows are not
+/// host-readable, so the host `ord_g`/`ord_h` gather fallback cannot exist here).
+///
+/// The u64 fixed-point LDS build launch is IDENTICAL to the resident-gh branch of
+/// [`resident_raw_build_into`] (same kernel, same `P` from the same
+/// `rows_count`-driven heuristic / FORCE_P pin, same slot sentinel) — only the row
+/// buffer's provenance differs, and the u64 build is order-independent
+/// integer-additive, so the output is BIT-IDENTICAL to the host-rows twin fed the
+/// same row ids.
+///
+/// `max_abs_grad_hess` replaces the per-leaf overflow-guard scan: a host-computed
+/// per-GROW bound on `max(|g|, |h|)` over ALL rows (conservative ⊇ any leaf's max,
+/// so the i64@2^30 bound it enforces is the same contract, never looser).
+///
+/// # Errors
+/// [`ComputeError::Runtime`] on the overflow bound, a >256-bin feature (the u64 LDS
+/// contract), or a degenerate `fix_feats` layout (via the shared fix/compact tail).
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    width: crate::ResidentBinWidth,
+    num_features: usize,
+    num_data: usize,
+    slot_off: &[usize],
+    slot_len: usize,
+    rows_handle: cubecl::server::Handle,
+    rows_count: usize,
+    fix_feats: &[(usize, u32, i32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+    max_abs_grad_hess: f64,
+    resident_gh: (cubecl::server::Handle, cubecl::server::Handle, usize),
+) -> Result<(cubecl::server::Handle, usize), ComputeError> {
+    // ---- 0. OVERFLOW GUARD (grow-level bound) ----
+    // Same i64@2^30 contract as the host-rows twin; `max_abs_grad_hess` bounds any
+    // leaf's `max|v|` from above (grow-wide max), so this can only be STRICTER.
+    let worst = rows_count as f64 * max_abs_grad_hess * 1_073_741_824.0_f64;
+    if worst >= i64::MAX as f64 {
+        return Err(ComputeError::Runtime {
+            detail: "fixed-point histogram accumulation may overflow i64 at S=2^30 \
+                     (rows x |value| x 2^30 exceeds i64::MAX)"
+                .to_string(),
+        });
+    }
+
+    // ---- 1. RESIDENT RAW u64 build straight off the device rows handle ----
+    let zeros_u64 = vec![0u64; slot_len];
+    let h_raw = client.create_from_slice(u64::as_bytes(&zeros_u64));
+    if rows_count > 0 && num_features > 0 {
+        let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
+        if max_w > HIST_LDS_MAX as u32 {
+            return Err(ComputeError::Runtime {
+                detail: "build_fix_compact_resident_rows_handle: the u64 fixed-point build \
+                         requires every feature <= 256 bins (LDS cap)"
+                    .to_string(),
+            });
+        }
+        let (grad_h, hess_h, gh_num_data) = resident_gh;
+        let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+        // Direct `P` (FORCE_P pin → row-partition heuristic), exactly the resident-gh
+        // branch of `resident_raw_build_into` (the autotune tuner set is
+        // host-gather-shaped, so this path bypasses it there too).
+        let p = force_row_partition()
+            .unwrap_or_else(|| row_partition_count(num_features, rows_count));
+        // SAFETY: identical bounds contract to the resident-gh branch of
+        // `resident_raw_build_into` — `rows_handle` views `rows_count` u32 row ids each
+        // `< num_data == gh_num_data` (the resident perm's invariant: it is a permutation
+        // of `0..num_data`), `resident_bins` is `num_features * num_data` elements,
+        // `h_slot` has `num_features + 1` entries, `h_raw` is `slot_len` cells, and the
+        // ≤256-bin gate keeps the LDS window in range. cubecl unsafe confined here.
+        macro_rules! launch_rows_handle {
+            ($w:ty) => {
+                unsafe {
+                    construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
+                        client,
+                        CubeCount::Static(num_features as u32, p, 1),
+                        CubeDim::new_1d(256),
+                        ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
+                        ArrayArg::from_raw_parts(rows_handle.clone(), rows_count),
+                        ArrayArg::from_raw_parts(grad_h.clone(), gh_num_data),
+                        ArrayArg::from_raw_parts(hess_h.clone(), gh_num_data),
+                        ArrayArg::from_raw_parts(h_slot.clone(), num_features + 1),
+                        num_data,
+                        ArrayArg::from_raw_parts(h_raw.clone(), slot_len),
+                        // resident_gh = TRUE: gather grad/hess on device via rows[k].
+                        true,
+                    );
+                }
+            };
+        }
+        match width {
+            crate::ResidentBinWidth::U8 => launch_rows_handle!(u8),
+            crate::ResidentBinWidth::U16 => launch_rows_handle!(u16),
+            crate::ResidentBinWidth::U32 => launch_rows_handle!(u32),
+        }
+    }
+
+    // ---- 2/3. The shared fix/compact tail (byte-identical to the host-rows twin). ----
+    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian)
 }
 
 // ===========================================================================

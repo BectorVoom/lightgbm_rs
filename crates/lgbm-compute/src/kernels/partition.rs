@@ -29,7 +29,9 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 use crate::error::ComputeError;
-use crate::kernels::data_partition::partition_on_device;
+use crate::kernels::data_partition::{
+    partition_on_device, route_to_left, scan_block_size, RouteFlags,
+};
 use crate::BinColumn;
 
 /// Per-row routing map (the `SplitInner` decision, `MissingType::None` path).
@@ -382,8 +384,11 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         &self.ranges
     }
 
-    /// Read leaf `leaf_id`'s child ranges back to the host (TEST/DEBUG ONLY —
-    /// production code keeps them resident). Panics if `leaf_id >= num_leaves`.
+    /// Read leaf `leaf_id`'s child ranges back to the host. Production use: the
+    /// RESIDENT-PERM partition arm's once-per-split split-point readback (the one
+    /// small host crossing its row bookkeeping needs — the same readback the
+    /// reference `CUDADataPartition::SplitInner` performs); also the test goldens.
+    /// Panics if `leaf_id >= num_leaves`.
     #[must_use]
     pub fn read_leaf(&self, client: &ComputeClient<R>, leaf_id: usize) -> ChildRanges {
         use cubecl::prelude::CubeElement;
@@ -521,6 +526,466 @@ pub fn partition_child_ranges_device<R: cubecl::Runtime>(
     }
 
     Ok(reordered)
+}
+
+// =========================================================================
+// DEVICE-RESIDENT permutation partition (`cuda_data_indices_` residency) —
+// the CUDADataPartition-style in-place split of the resident row permutation.
+//
+// The prior "device" arm (`partition_child_ranges_device` → `partition_on_device`)
+// still crossed the host FOUR times per split: the bins_sub host gather + upload,
+// the mark readback, the host-driven prefix sum, and the reordered-rows readback.
+// This section keeps the WHOLE permutation resident for an entire tree grow:
+//   A. `resident_mark_block_scan_kernel` — reads the split feature's column from
+//      the RESIDENT concatenated bin buffer through the resident perm sub-range,
+//      snapshots the parent's row ids, marks left/right via the SHARED
+//      [`route_to_left`] decision, and block-scans the marks (one cube per block,
+//      parallel mark + single-owner per-block exclusive scan).
+//   B. `resident_scan_totals_write_ranges_kernel` — single-owner exclusive scan of
+//      the ≤1024 block totals (in place), stashes the left total (= split point)
+//      into the sentinel cell, and writes the six child-range fields into the
+//      resident [`DeviceLeafSplits`] slot (the fused `write_child_ranges_kernel`).
+//   C. `resident_scatter_kernel` — stable scatter of the snapshot back into the
+//      resident perm sub-range (left rows first in original order, then right),
+//      exactly [`split_inner_scatter_kernel`]'s dest math.
+// 3 launches, ZERO host crossings; the host reads back only the 6-int child
+// ranges afterwards (the split-point scalar its bookkeeping needs).
+//
+// BIT-EXACTNESS: the mark reuses [`route_to_left`] verbatim (the single-source
+// decision the `partition_parity` gates pin byte-equal to the cpu f64 anchor);
+// the scatter destination math is integer-only and identical to
+// `split_inner_scatter_kernel` + `gather_route` (left dest = global exclusive
+// left rank; right dest = left total + rights-before), so the resulting
+// permutation is byte-equal to `partition_leaf_stable` on the same inputs.
+// =========================================================================
+
+/// Identity-fill (`out[i] = i`) — seeds the resident permutation at the root
+/// (`0..num_data` in order, the same ascending order the host `perm` iota had).
+#[cube(launch)]
+fn iota_u32_kernel(out: &mut Array<u32>, n: u32) {
+    let i = ABSOLUTE_POS;
+    if i < n as usize {
+        out[i] = u32::cast_from(i);
+    }
+}
+
+/// Stage A of the resident partition: per-block fused mark + snapshot + exclusive
+/// block scan over the parent's resident sub-range `perm[p_begin .. p_begin+n)`.
+///
+/// One cube per block (`CUBE_POS_X`), `block_size` elements each. The parallel
+/// phase (all units, stride `CUBE_DIM`) reads `di = perm[p_begin+i]`, snapshots it
+/// into `snap[i]`, reads the split feature's bin from the RESIDENT concatenated
+/// buffer (`bins[col_off + di]`, native width via the `<B: Int>` monomorph) and
+/// writes `to_left[i]` via the SHARED [`route_to_left`] decision (identical
+/// comptime flag fan-out to [`gen_data_to_left_kernel`]). After `sync_cube`,
+/// unit 0 serially exclusive-scans its block's marks into `local_excl` and books
+/// the block total — the same single-owner geometry as the primitives'
+/// `block_scan_body`, fused here to save a launch.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn resident_mark_block_scan_kernel<B: Int>(
+    bins: &Array<B>,
+    perm: &Array<u32>,
+    snap: &mut Array<u32>,
+    to_left: &mut Array<u32>,
+    local_excl: &mut Array<u32>,
+    block_totals: &mut Array<u32>,
+    col_off: u32,
+    p_begin: u32,
+    n: u32,
+    block_size: u32,
+    min_bin: i32,
+    max_bin: i32,
+    default_bin: i32,
+    most_freq_bin: i32,
+    threshold: i32,
+    #[comptime] miss_is_zero: bool,
+    #[comptime] miss_is_na: bool,
+    #[comptime] mfb_is_zero: bool,
+    #[comptime] mfb_is_na: bool,
+    #[comptime] min_is_max: bool,
+    #[comptime] default_left: bool,
+) {
+    let b = CUBE_POS_X as usize;
+    let bs = block_size as usize;
+    let nn = n as usize;
+    let start = b * bs;
+    let end = start + bs;
+    let lim = if end < nn { end } else { nn };
+
+    // Parallel mark + snapshot (each unit strides the block).
+    let mut i = start + UNIT_POS as usize;
+    while i < lim {
+        let di = perm[p_begin as usize + i];
+        snap[i] = di;
+        let bin = u32::cast_from(bins[col_off as usize + di as usize]) as i32;
+        to_left[i] = route_to_left(
+            bin,
+            min_bin,
+            max_bin,
+            default_bin,
+            most_freq_bin,
+            threshold,
+            miss_is_zero,
+            miss_is_na,
+            mfb_is_zero,
+            mfb_is_na,
+            min_is_max,
+            default_left,
+        );
+        i += CUBE_DIM as usize;
+    }
+    sync_cube();
+
+    // Single-owner per-block exclusive scan (visibility of the parallel phase's
+    // global writes within the cube is guaranteed by the barrier above).
+    if UNIT_POS == 0 {
+        let mut acc = 0u32;
+        let mut j = start;
+        while j < lim {
+            local_excl[j] = acc;
+            acc += to_left[j];
+            j += 1;
+        }
+        block_totals[b] = acc;
+    }
+}
+
+/// Stage B: single-owner exclusive scan of the `num_blocks` block totals IN PLACE
+/// (after this, `block_totals[b]` = left rows strictly before block `b`), the left
+/// TOTAL (= split point) stashed into the sentinel cell `block_totals[num_blocks]`,
+/// and the six child-range fields written into the resident [`DeviceLeafSplits`]
+/// slot — the fused [`write_child_ranges_kernel`], with the split point sourced
+/// ON DEVICE from the scan instead of a host scalar.
+#[cube(launch)]
+fn resident_scan_totals_write_ranges_kernel(
+    block_totals: &mut Array<u32>,
+    ranges: &mut Array<i32>,
+    num_blocks: u32,
+    leaf_id: u32,
+    p_begin: i32,
+    p_count: i32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let nb = num_blocks as usize;
+        let mut acc = 0u32;
+        let mut b = 0usize;
+        while b < nb {
+            let t = block_totals[b];
+            block_totals[b] = acc;
+            acc += t;
+            b += 1;
+        }
+        block_totals[nb] = acc;
+        let sp = i32::cast_from(acc);
+        let base = (leaf_id * 6) as usize;
+        ranges[base] = p_begin; // left_start
+        ranges[base + 1] = p_begin + sp; // left_end
+        ranges[base + 2] = sp; // left_count (the split point)
+        ranges[base + 3] = p_begin + sp; // right_start
+        ranges[base + 4] = p_begin + p_count; // right_end
+        ranges[base + 5] = p_count - sp; // right_count
+    }
+}
+
+/// Stage C: the stable scatter back into the resident perm sub-range. For element
+/// `i` of the parent's span, the global exclusive left rank is
+/// `block_totals[b] + local_excl[i]`; left rows land at that rank, right rows at
+/// `left_total + (i − rank)` — byte-for-byte [`split_inner_scatter_kernel`]'s dest
+/// math, reading the snapshot (`snap`, taken in stage A) so the in-place write to
+/// `perm` can never race its own read.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn resident_scatter_kernel(
+    snap: &Array<u32>,
+    to_left: &Array<u32>,
+    local_excl: &Array<u32>,
+    block_totals: &Array<u32>,
+    perm: &mut Array<u32>,
+    p_begin: u32,
+    n: u32,
+    block_size: u32,
+    num_blocks: u32,
+) {
+    let i = ABSOLUTE_POS;
+    if i < n as usize {
+        let b = i / (block_size as usize);
+        let excl = block_totals[b] + local_excl[i];
+        let total = block_totals[num_blocks as usize];
+        let go_left = to_left[i] == 1u32;
+        let iu = u32::cast_from(i);
+        let right_dest = total + (iu - excl);
+        let dest = select(go_left, excl, right_dest);
+        perm[p_begin as usize + dest as usize] = snap[i];
+    }
+}
+
+/// The device-resident row permutation for one tree grow (the `cuda_data_indices_`
+/// analog) plus its partition scratch. Allocated ONCE per grow; every split
+/// repartitions a sub-range IN PLACE on device (3 launches, no host crossing);
+/// the histogram build reads each leaf's rows straight out of [`Self::rows_view`]
+/// (an offset Handle view — no per-build `create_from_slice` row upload); the
+/// end-of-grow layout rebuild reads the whole buffer back ONCE
+/// ([`Self::read_perm`]).
+pub struct ResidentPermPartition<R: cubecl::Runtime> {
+    /// The resident permutation, `num_data` u32 cells. Identity after `new`.
+    perm: Handle,
+    /// Stage-A snapshot of the parent span's row ids (scatter input).
+    snap: Handle,
+    /// Stage-A left/right marks.
+    to_left: Handle,
+    /// Stage-A per-element exclusive left rank WITHIN its block.
+    local_excl: Handle,
+    /// `MAX_SCAN_BLOCKS + 1` u32 cells: per-block left totals, exclusive-scanned in
+    /// place by stage B; the sentinel cell holds the left TOTAL (split point).
+    block_totals: Handle,
+    /// Row count every span must stay within.
+    num_data: usize,
+    _runtime: PhantomData<fn() -> R>,
+}
+
+/// The block-count cap the ≤1024-iteration single-owner stage-B scan relies on
+/// (mirrors the primitives' `MAX_GLOBAL_SCAN_BLOCKS`; `scan_block_size` guarantees
+/// it for any `n`).
+const MAX_SCAN_BLOCKS: usize = 1024;
+
+impl<R: cubecl::Runtime> ResidentPermPartition<R> {
+    /// Allocate the perm + scratch buffers and seed the permutation with the
+    /// identity (`0..num_data`) via one tiny device launch.
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] if `num_data == 0`.
+    pub fn new(client: &ComputeClient<R>, num_data: usize) -> Result<Self, ComputeError> {
+        if num_data == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "ResidentPermPartition: num_data must be > 0".to_string(),
+            });
+        }
+        let bytes = num_data * core::mem::size_of::<u32>();
+        let perm = client.empty(bytes);
+        let snap = client.empty(bytes);
+        let to_left = client.empty(bytes);
+        let local_excl = client.empty(bytes);
+        let block_totals =
+            client.empty((MAX_SCAN_BLOCKS + 1) * core::mem::size_of::<u32>());
+        let cube_dim = 256u32;
+        let cube_count = (num_data as u32).div_ceil(cube_dim);
+        // SAFETY: `perm` is sized exactly `num_data` u32 cells and outlives the
+        // launch; the kernel bounds-guards `i < n`. cubecl unsafe confined here.
+        unsafe {
+            iota_u32_kernel::launch::<R>(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(cube_dim),
+                ArrayArg::from_raw_parts(perm.clone(), num_data),
+                num_data as u32,
+            );
+        }
+        Ok(Self {
+            perm,
+            snap,
+            to_left,
+            local_excl,
+            block_totals,
+            num_data,
+            _runtime: PhantomData,
+        })
+    }
+
+    /// An offset Handle VIEW of the resident permutation starting at row-slot
+    /// `begin` — the leaf's rows `perm[begin..begin+count)` for a histogram build
+    /// (`ArrayArg::from_raw_parts(view, count)` at the launch site). No copy, no
+    /// upload; `Handle` is ref-counted so the clone is cheap.
+    #[must_use]
+    pub fn rows_view(&self, begin: usize) -> Handle {
+        self.perm
+            .clone()
+            .offset_start((begin * core::mem::size_of::<u32>()) as u64)
+    }
+
+    /// Read the whole resident permutation back to the host — the ONCE-per-grow
+    /// tail crossing that feeds the host `LeafPartitionLayout` rebuild.
+    #[must_use]
+    pub fn read_perm(&self, client: &ComputeClient<R>) -> Vec<u32> {
+        use cubecl::prelude::CubeElement;
+        let bytes = client.read_one_unchecked(self.perm.clone());
+        u32::from_bytes(&bytes).to_vec()
+    }
+
+    /// Partition the parent leaf's resident span `perm[p_begin..p_begin+p_count)`
+    /// IN PLACE on device (stages A/B/C — 3 launches, no readback) and write the
+    /// child ranges into the resident [`DeviceLeafSplits`] slot `leaf_id`. The
+    /// split feature's bins are read from the RESIDENT concatenated buffer
+    /// (`resident_bins`, feature column at element offset `col_off`, uniform
+    /// native `width`).
+    ///
+    /// The caller reads the split point back afterwards via
+    /// [`DeviceLeafSplits::read_leaf`] (the one small per-split host crossing its
+    /// row bookkeeping needs).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] on a zero `num_bin`, an out-of-range `threshold`,
+    /// an out-of-bounds span, or a `leaf_id` outside the ranges struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn partition_leaf(
+        &self,
+        client: &ComputeClient<R>,
+        resident_bins: &Handle,
+        width: crate::ResidentBinWidth,
+        col_off: usize,
+        bins_len: usize,
+        num_bin: u32,
+        min_bin: u32,
+        max_bin: u32,
+        default_bin: u32,
+        most_freq_bin: u32,
+        missing_type: u8,
+        default_left: bool,
+        threshold: u32,
+        leaf_splits: &DeviceLeafSplits<R>,
+        leaf_id: usize,
+        p_begin: i32,
+        p_count: i32,
+    ) -> Result<(), ComputeError> {
+        if num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "resident partition: num_bin must be > 0".to_string(),
+            });
+        }
+        if threshold >= num_bin {
+            return Err(ComputeError::Runtime {
+                detail: format!("resident partition: threshold {threshold} >= num_bin {num_bin}"),
+            });
+        }
+        if leaf_id >= leaf_splits.num_leaves {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "resident partition: leaf_id {leaf_id} >= num_leaves {}",
+                    leaf_splits.num_leaves
+                ),
+            });
+        }
+        if p_begin < 0
+            || p_count <= 0
+            || (p_begin as usize).saturating_add(p_count as usize) > self.num_data
+        {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "resident partition: span [{p_begin}, {p_begin}+{p_count}) out of range for \
+                     num_data {}",
+                    self.num_data
+                ),
+            });
+        }
+
+        let n = p_count as usize;
+        let block_size = scan_block_size(n);
+        let num_blocks = n.div_ceil(block_size as usize);
+        debug_assert!(num_blocks <= MAX_SCAN_BLOCKS, "scan_block_size cap violated");
+
+        // The SAME flag fan-out the host anchor + `gen_data_to_left_kernel` derive —
+        // single source, so the mark decision is byte-identical.
+        let f = RouteFlags::derive(min_bin, max_bin, default_bin, most_freq_bin, missing_type, default_left);
+
+        // ---- Stage A: fused mark + snapshot + per-block exclusive scan. ----
+        // SAFETY: `bins` is bound at `bins_len` elements and every read is
+        // `col_off + di` with `di < num_data` (upload-time contract) and
+        // `col_off + num_data <= bins_len` (checked below); `perm`/`snap`/`to_left`/
+        // `local_excl` all hold `num_data` u32 cells and the kernel touches only
+        // `[p_begin, p_begin+n)` / `[0, n)` (span checked above); `block_totals`
+        // holds `MAX_SCAN_BLOCKS+1` cells and `b < num_blocks <= MAX_SCAN_BLOCKS`.
+        // cubecl unsafe confined here.
+        if col_off.saturating_add(self.num_data) > bins_len {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "resident partition: feature column [{col_off}, {col_off}+{}) out of range \
+                     for resident bins len {bins_len}",
+                    self.num_data
+                ),
+            });
+        }
+        macro_rules! launch_mark {
+            ($w:ty) => {
+                unsafe {
+                    resident_mark_block_scan_kernel::launch::<$w, R>(
+                        client,
+                        CubeCount::Static(num_blocks as u32, 1, 1),
+                        CubeDim::new_1d(256),
+                        ArrayArg::from_raw_parts(resident_bins.clone(), bins_len),
+                        ArrayArg::from_raw_parts(self.perm.clone(), self.num_data),
+                        ArrayArg::from_raw_parts(self.snap.clone(), self.num_data),
+                        ArrayArg::from_raw_parts(self.to_left.clone(), self.num_data),
+                        ArrayArg::from_raw_parts(self.local_excl.clone(), self.num_data),
+                        ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
+                        col_off as u32,
+                        p_begin as u32,
+                        n as u32,
+                        block_size,
+                        min_bin as i32,
+                        max_bin as i32,
+                        default_bin as i32,
+                        most_freq_bin as i32,
+                        threshold as i32,
+                        f.miss_is_zero,
+                        f.miss_is_na,
+                        f.mfb_is_zero,
+                        f.mfb_is_na,
+                        f.min_is_max,
+                        f.default_left,
+                    );
+                }
+            };
+        }
+        match width {
+            crate::ResidentBinWidth::U8 => launch_mark!(u8),
+            crate::ResidentBinWidth::U16 => launch_mark!(u16),
+            crate::ResidentBinWidth::U32 => launch_mark!(u32),
+        }
+
+        // ---- Stage B: block-totals scan + child-range write (single owner). ----
+        // SAFETY: `block_totals` holds `MAX_SCAN_BLOCKS+1` cells (`nb <= MAX_SCAN_BLOCKS`
+        // so the sentinel write is in range); `ranges` holds `6*num_leaves` cells and
+        // `leaf_id < num_leaves` (checked above). Single owner. cubecl unsafe confined.
+        let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
+        unsafe {
+            resident_scan_totals_write_ranges_kernel::launch::<R>(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
+                ArrayArg::from_raw_parts(leaf_splits.ranges.clone(), ranges_len),
+                num_blocks as u32,
+                leaf_id as u32,
+                p_begin,
+                p_count,
+            );
+        }
+
+        // ---- Stage C: stable scatter back into the resident span. ----
+        // SAFETY: every dest is a permutation index `< n` (left ranks `< total <= n`,
+        // right dests `total + rights_before < n`), so the write stays within
+        // `[p_begin, p_begin+n) ⊂ [0, num_data)`. Reads only stage-A/B outputs. cubecl
+        // unsafe confined here.
+        let cube_dim = 256u32;
+        let cube_count = (n as u32).div_ceil(cube_dim);
+        unsafe {
+            resident_scatter_kernel::launch::<R>(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(cube_dim),
+                ArrayArg::from_raw_parts(self.snap.clone(), self.num_data),
+                ArrayArg::from_raw_parts(self.to_left.clone(), self.num_data),
+                ArrayArg::from_raw_parts(self.local_excl.clone(), self.num_data),
+                ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
+                ArrayArg::from_raw_parts(self.perm.clone(), self.num_data),
+                p_begin as u32,
+                n as u32,
+                block_size,
+                num_blocks as u32,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
