@@ -182,6 +182,14 @@ fn linear_fit_matches_cpp() {
     };
     for dir in &cases {
         let name = dir.file_name().unwrap().to_string_lossy();
+        // The isolated fit check re-derives each leaf's rows from the FULL corpus;
+        // a bagging case fit each tree on a per-iter sampled subset we can't
+        // reconstruct here, so skip it (the e2e test covers linear+bagging).
+        if json_num(dir, "bagging_freq").unwrap_or(0.0) > 0.0
+            && json_num(dir, "bagging_fraction").unwrap_or(1.0) < 1.0
+        {
+            continue;
+        }
         let model = model_text::load(&std::fs::read_to_string(dir.join("model.txt")).unwrap()).unwrap();
         let (xr, n_rows, n_feat) = read_mat(&dir.join("X_train.csv"));
         let raw = flat_rowmajor(&xr);
@@ -244,6 +252,10 @@ fn linear_train_end_to_end_matches_cpp() {
         config.linear_tree = true;
         config.linear_lambda = json_num(dir, "linear_lambda").unwrap_or(0.0);
         config.boost_from_average = true;
+        // Row bagging (linear-tree subset path), when the golden used it.
+        config.bagging_fraction = json_num(dir, "bagging_fraction").unwrap_or(1.0);
+        config.bagging_freq = json_num(dir, "bagging_freq").unwrap_or(0.0) as i32;
+        config.bagging_seed = json_num(dir, "bagging_seed").unwrap_or(0.0) as i32;
 
         let corpus = RawCorpus::new(x_train, y_train);
         let booster = train_raw(&config, &corpus).expect("train linear");

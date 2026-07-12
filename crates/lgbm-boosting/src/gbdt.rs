@@ -1005,40 +1005,93 @@ impl<'a> Gbdt<'a> {
                             }),
                         );
                     }
-                    tree.shrinkage(shrink_rate);
-                    // Score BOTH in-bag and OOB rows predict-side over the real feature
-                    // values (bit-exact to the partition scatter on the identity-binned
-                    // corpus). OOB rows STILL get scored.
-                    // The identity-binned real feature value IS the bin index (raw
-                    // value 0..K-1); Tree::predict traverses the real-value thresholds
-                    // (the bin upper bounds) so feeding the bin index as the real value
-                    // reproduces the same leaf assignment as the train-path scatter.
-                    let features = &self.features;
-                    let feature_row = |row: i32| -> Vec<f64> {
-                        let width = features
-                            .iter()
-                            .map(|f| f.real_feature_index)
-                            .max()
-                            .map(|m| (m + 1) as usize)
-                            .unwrap_or(0);
-                        let mut v = vec![0.0f64; width];
-                        for f in features {
-                            v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
+                    // LINEAR TREE on the bagging subset (C++ `LinearTreeLearner` +
+                    // bagging). When linear_tree is on the corpus is continuous, so the
+                    // whole bagging score update must run over the RAW feature values
+                    // (the bin-index `feature_row` below is only valid for the
+                    // identity-binned corpus). We remap the subset partition's
+                    // subset-row indices to full-corpus rows (`in_bag[sr]`) so both the
+                    // fit and the in-bag score index the full-corpus raw/grad/hess
+                    // directly. The linear leaves are fit on non-first trees only; the
+                    // first (constant) tree still scores through the SAME raw path
+                    // (`add_linear_tree_train_path` falls back to `leaf_value` when a
+                    // tree carries no linear model), keeping the internal score exact so
+                    // the next tree's gradients — and hence its linear fit — match C++.
+                    let linear_mode = self.linear_tree && self.raw_features.is_some();
+                    let full_partition = if linear_mode {
+                        let fp = lgbm_treelearner::linear::remap_partition_to_full(
+                            &subset_partition,
+                            &in_bag,
+                            tree.num_leaves,
+                        );
+                        if !is_first_tree {
+                            let raw = self.raw_features.as_ref().unwrap();
+                            let nfeat = raw.len() / nd.max(1);
+                            lgbm_treelearner::linear::fit_linear_leaves(
+                                &mut tree,
+                                raw,
+                                nfeat,
+                                grad,
+                                hess,
+                                self.linear_lambda,
+                                &fp,
+                            );
                         }
-                        v
+                        Some(fp)
+                    } else {
+                        None
                     };
-                    self.score_updater.add_tree_predict_path(
-                        &tree,
-                        &in_bag,
-                        cur_tree_id,
-                        &feature_row,
-                    );
-                    self.score_updater.add_tree_predict_path(
-                        &tree,
-                        &oob,
-                        cur_tree_id,
-                        &feature_row,
-                    );
+                    tree.shrinkage(shrink_rate);
+                    if let Some(fp) = full_partition.as_ref() {
+                        // In-bag rows score via the (bin) partition membership + the
+                        // leaf's linear model (or constant leaf_value for a non-linear
+                        // tree); OOB rows score predict-side over the RAW features
+                        // (`Tree::predict` is linear-aware and routes on real thresholds).
+                        let raw = self.raw_features.as_ref().unwrap();
+                        let nfeat = raw.len() / nd.max(1);
+                        self.score_updater
+                            .add_linear_tree_train_path(&tree, fp, cur_tree_id, raw, nfeat);
+                        let raw_row = |row: i32| -> Vec<f64> {
+                            let b = row as usize * nfeat;
+                            raw[b..b + nfeat].to_vec()
+                        };
+                        self.score_updater
+                            .add_tree_predict_path(&tree, &oob, cur_tree_id, &raw_row);
+                    } else {
+                        // NON-LINEAR: score BOTH in-bag and OOB rows predict-side over the
+                        // real feature values (bit-exact to the partition scatter on the
+                        // identity-binned corpus). OOB rows STILL get scored. The
+                        // identity-binned real feature value IS the bin index (raw value
+                        // 0..K-1); Tree::predict traverses the real-value thresholds (the
+                        // bin upper bounds) so feeding the bin index as the real value
+                        // reproduces the same leaf assignment as the train-path scatter.
+                        let features = &self.features;
+                        let feature_row = |row: i32| -> Vec<f64> {
+                            let width = features
+                                .iter()
+                                .map(|f| f.real_feature_index)
+                                .max()
+                                .map(|m| (m + 1) as usize)
+                                .unwrap_or(0);
+                            let mut v = vec![0.0f64; width];
+                            for f in features {
+                                v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
+                            }
+                            v
+                        };
+                        self.score_updater.add_tree_predict_path(
+                            &tree,
+                            &in_bag,
+                            cur_tree_id,
+                            &feature_row,
+                        );
+                        self.score_updater.add_tree_predict_path(
+                            &tree,
+                            &oob,
+                            cur_tree_id,
+                            &feature_row,
+                        );
+                    }
                     let init = init_scores[cur_tree_id as usize];
                     if Objective::init_score_is_significant(init) {
                         tree.add_bias(init);

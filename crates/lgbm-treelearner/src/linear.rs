@@ -21,9 +21,41 @@
 //! - The FIRST tree of the ensemble stays constant (num_features = 0); that is the
 //!   caller's decision (do not call this for `is_first_tree`).
 
+use lgbm_dataset::LeafPartitionLayout;
 use lgbm_model::tree::{LinearModel, Tree};
 
 use crate::data_partition::DataPartition;
+
+/// Remap a bagging **subset** `DataPartition` (whose `indices_in_leaf` are
+/// SUBSET-row indices `0..in_bag.len()`) into a FULL-corpus partition whose leaves
+/// hold the original row ids `in_bag[subset_row]` (the C++
+/// `bag_mapper[index_mapper[i]]` map). This lets [`fit_linear_leaves`] and the
+/// linear score update index the full-corpus `raw`/`grad`/`hess` buffers directly.
+/// Only leaves `0..num_leaves` are copied (the grown tree's leaves).
+pub fn remap_partition_to_full(
+    subset: &DataPartition,
+    in_bag: &[i32],
+    num_leaves: i32,
+) -> DataPartition {
+    let nl = num_leaves.max(1) as usize;
+    let mut indices: Vec<u32> = Vec::with_capacity(in_bag.len());
+    let mut leaf_begin = vec![0i32; nl];
+    let mut leaf_count = vec![0i32; nl];
+    for leaf in 0..num_leaves {
+        leaf_begin[leaf as usize] = indices.len() as i32;
+        let rows = subset.indices_in_leaf(leaf);
+        leaf_count[leaf as usize] = rows.len() as i32;
+        for &sr in rows {
+            indices.push(in_bag[sr as usize] as u32);
+        }
+    }
+    DataPartition::from_payload(LeafPartitionLayout {
+        num_data: in_bag.len() as i32,
+        indices,
+        leaf_begin,
+        leaf_count,
+    })
+}
 
 /// Fit per-leaf linear models into a freshly-grown `tree`, mutating it in place
 /// (sets `is_linear` + `linear`). See the module docs for the exact algorithm.

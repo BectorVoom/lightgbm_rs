@@ -126,6 +126,16 @@ def main():
     y2 = X2 @ (rng.randn(nf2)) + 0.05 * rng.randn(N2)
     emit("reg_wide", X2, y2, base(num_leaves=15, learning_rate=0.05), n_round=8)
 
+    # Case F: linear tree WITH row bagging (each iter re-bags 70% of rows over the
+    # deterministic bagging RNG). Exercises the LinearTreeLearner subset path.
+    emit(
+        "reg_bagging",
+        X,
+        y,
+        base(bagging_fraction=0.7, bagging_freq=1, bagging_seed=17),
+        n_round=6,
+    )
+
     print(f"\nGoldens written under {OUT}")
 
 
