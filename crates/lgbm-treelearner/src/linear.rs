@@ -194,10 +194,18 @@ fn dfs_path(tree: &Tree, node: i32, acc: &mut Vec<i32>, out: &mut [Vec<i32>]) {
         return;
     }
     let n = node as usize;
-    acc.push(tree.split_feature[n]);
+    // C++ `LinearTreeLearner` excludes categorically-split features from the leaf
+    // linear model (a categorical bin id is not an ordered numeric quantity) — only
+    // push NUMERICAL split features onto the path.
+    let categorical = tree.is_categorical_split(n);
+    if !categorical {
+        acc.push(tree.split_feature[n]);
+    }
     dfs_path(tree, tree.left_child[n], acc, out);
     dfs_path(tree, tree.right_child[n], acc, out);
-    acc.pop();
+    if !categorical {
+        acc.pop();
+    }
 }
 
 /// Solve the small symmetric linear system `A θ = b` (`A` is `dim×dim` row-major,

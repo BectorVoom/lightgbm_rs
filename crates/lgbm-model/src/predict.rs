@@ -617,6 +617,24 @@ pub fn predict_raw_early_stop_mat(
 // values + its ExpectedValue base; the sum telescopes to the tree's predict).
 // ---------------------------------------------------------------------------
 
+/// C++ never wires up `PredictContrib` for `linear_tree=true` models
+/// (`predictor.hpp:89-90` builds the contrib lambda only for non-linear
+/// boosters) — `Tree::tree_shap`/`expected_value` read the constant
+/// `leaf_value` directly and have no linear-leaf-aware counterpart in C++ to
+/// port. Rather than inventing a SHAP variant with no C++ reference to stay in
+/// parity with, refuse the combination outright, matching C++.
+fn check_no_linear_trees(model: &GbdtModel) -> Result<(), ModelError> {
+    if model.trees.iter().any(|t| t.is_linear) {
+        return Err(ModelError::Unsupported {
+            detail: "predict_contrib (SHAP feature contributions) is not supported for \
+                     linear_tree=true models — matches C++ LightGBM, which never wires up \
+                     PredictContrib for linear trees"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Per-row contribution output width = `num_tree_per_iteration * (num_features+1)`
 /// (`NumPredictOneRow` for contrib, `gbdt.h`).
 #[inline]
@@ -660,6 +678,7 @@ pub fn predict_contrib_mat(
     num_rows: i32,
     num_cols: i32,
 ) -> Result<Vec<f64>, ModelError> {
+    check_no_linear_trees(model)?;
     validate_dense_shape(model, data, num_rows, num_cols)?;
     let width = row_width(model);
     let per_row = contrib_width(model);
@@ -685,6 +704,7 @@ pub fn predict_contrib_csr(
     num_rows: i32,
     num_cols: i32,
 ) -> Result<Vec<f64>, ModelError> {
+    check_no_linear_trees(model)?;
     validate_csr_shape(model, indptr, indices, values, num_rows, num_cols)?;
     let width = row_width(model);
     let per_row = contrib_width(model);
@@ -709,6 +729,7 @@ pub fn predict_contrib_csc(
     num_rows: i32,
     num_cols: i32,
 ) -> Result<Vec<f64>, ModelError> {
+    check_no_linear_trees(model)?;
     validate_csc_shape(model, indptr, indices, values, num_rows, num_cols)?;
     let width = row_width(model);
     let nrows = num_rows as usize;
@@ -1181,6 +1202,34 @@ mod tests {
         let data = vec![1.0f32];
         let err = predict_contrib_mat(&m, &data, 1, 1).unwrap_err();
         assert!(matches!(err, ModelError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn contrib_rejects_linear_tree_model() {
+        // C++ never wires up PredictContrib for linear_tree=true models
+        // (predictor.hpp:89-90) -- the Rust port must refuse it too, on all 3
+        // entry points, rather than silently returning wrong (non-linear-aware)
+        // SHAP values.
+        let mut m = model();
+        m.trees[0].is_linear = true;
+        let data = vec![1.0f32, 0.0, 0.0, 1.0];
+        assert!(matches!(
+            predict_contrib_mat(&m, &data, 2, 2).unwrap_err(),
+            ModelError::Unsupported { .. }
+        ));
+        let (indptr, indices, values) = (vec![0i64, 1, 2], vec![0i32, 1], vec![1.0f32, 1.0]);
+        assert!(matches!(
+            predict_contrib_csr(&m, &indptr, &indices, &values, 2, 2).unwrap_err(),
+            ModelError::Unsupported { .. }
+        ));
+        assert!(matches!(
+            predict_contrib_csc(&m, &indptr, &indices, &values, 2, 2).unwrap_err(),
+            ModelError::Unsupported { .. }
+        ));
+
+        // A model with ONLY non-linear trees is unaffected (regression guard).
+        let m2 = model();
+        assert!(predict_contrib_mat(&m2, &data, 2, 2).is_ok());
     }
 
     // --- early-stop driver gating (PRD-05) ---

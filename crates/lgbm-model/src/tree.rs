@@ -244,6 +244,16 @@ impl Tree {
         }
     }
 
+    /// Whether internal `node`'s split is categorical (`decision_type`'s
+    /// `CATEGORICAL_MASK` bit). Exposed for callers outside this crate (e.g. the
+    /// linear-tree leaf fit, which must exclude categorically-split features from
+    /// the leaf's linear model — C++ `LinearTreeLearner` does the same).
+    #[inline]
+    #[must_use]
+    pub fn is_categorical_split(&self, node: usize) -> bool {
+        get_decision_type(self.decision_type[node], CATEGORICAL_MASK)
+    }
+
     /// C++ `Tree::GetLeaf` (`tree.h:701-713`): descend from node 0, return `~node`.
     /// `feature_values` is the RAW per-row feature buffer (width `max_feature_idx+1`).
     pub fn get_leaf(&self, feature_values: &[f64]) -> i32 {
@@ -1349,12 +1359,19 @@ fn parse_linear_model(kv: &HashMap<&str, &str>, num_leaves: i32) -> Result<Linea
         }
     };
     check_len(&num_features, num_leaves, "num_features")?;
-    let total: i64 = num_features.iter().map(|&c| c as i64).sum();
-    if total < 0 {
-        return Err(ModelError::MalformedModel {
-            detail: "num_features contains a negative count".to_string(),
-        });
+    // T-03-03: every INDIVIDUAL count must be non-negative before it's used to
+    // slice the flat leaf_features/leaf_coeff streams below — a negative entry
+    // whose sum still happens to be non-negative (e.g. [-1, 3]) would otherwise
+    // pass the sum check, then `c as usize` wraps to a huge index and panics (or,
+    // in release, slices out of bounds) instead of returning a typed error.
+    for (i, &c) in num_features.iter().enumerate() {
+        if c < 0 {
+            return Err(ModelError::MalformedModel {
+                detail: format!("num_features[{i}]={c} is negative"),
+            });
+        }
     }
+    let total: i64 = num_features.iter().map(|&c| i64::from(c)).sum();
 
     // Flat feature-index and coefficient streams, re-grouped by num_features.
     let flat_feats = match kv.get("leaf_features") {
@@ -1367,6 +1384,17 @@ fn parse_linear_model(kv: &HashMap<&str, &str>, num_leaves: i32) -> Result<Linea
     };
     check_len(&flat_feats, total as i32, "leaf_features")?;
     check_len(&flat_coeff, total as i32, "leaf_coeff")?;
+    // T-03-03: mirrors the split_feature[i] < 0 check elsewhere in this parser —
+    // a negative leaf_features entry would otherwise escape validation here and
+    // panic later at predict time (`feature_values[*fi as usize]` in
+    // `Tree::linear_leaf_output`) instead of being rejected at load time.
+    for (i, &fi) in flat_feats.iter().enumerate() {
+        if fi < 0 {
+            return Err(ModelError::MalformedModel {
+                detail: format!("leaf_features[{i}]={fi} is negative"),
+            });
+        }
+    }
 
     let mut leaf_features: Vec<Vec<i32>> = Vec::with_capacity(nl);
     let mut leaf_coeff: Vec<Vec<f64>> = Vec::with_capacity(nl);
@@ -1850,6 +1878,60 @@ mod tests {
         let err = Tree::parse(block).unwrap_err();
         assert!(matches!(err, ModelError::MalformedModel { .. }));
         assert!(err.to_string().contains("linear"));
+    }
+
+    #[test]
+    fn linear_tree_negative_num_features_entry_is_err() {
+        // num_features=[-1, 3] sums to a non-negative total (2) that still
+        // matches the 2-token leaf_features/leaf_coeff lines below, so a
+        // sum-only check would let it through; the per-entry check must catch
+        // the individual negative count before it's used to slice the flat
+        // leaf_features/leaf_coeff streams (which would otherwise panic).
+        let block = "num_leaves=2\n\
+            num_cat=0\n\
+            split_feature=0\n\
+            threshold=0.5\n\
+            decision_type=2\n\
+            left_child=-1\n\
+            right_child=-2\n\
+            leaf_value=0.1 0.2\n\
+            leaf_count=1 1\n\
+            is_linear=1\n\
+            leaf_const=0.1 0.2\n\
+            num_features=-1 3\n\
+            leaf_features=0 1\n\
+            leaf_coeff=0.5 0.5\n\
+            shrinkage=1\n\
+            \n";
+        let err = Tree::parse(block).unwrap_err();
+        assert!(matches!(err, ModelError::MalformedModel { .. }));
+        assert!(err.to_string().contains("num_features"));
+    }
+
+    #[test]
+    fn linear_tree_negative_leaf_feature_index_is_err() {
+        // A negative leaf_features entry must be rejected at load time, not
+        // left to panic later at predict time (`Tree::linear_leaf_output`
+        // indexes `feature_values[*fi as usize]`).
+        let block = "num_leaves=2\n\
+            num_cat=0\n\
+            split_feature=0\n\
+            threshold=0.5\n\
+            decision_type=2\n\
+            left_child=-1\n\
+            right_child=-2\n\
+            leaf_value=0.1 0.2\n\
+            leaf_count=1 1\n\
+            is_linear=1\n\
+            leaf_const=0.1 0.2\n\
+            num_features=1 0\n\
+            leaf_features=-5\n\
+            leaf_coeff=0.5\n\
+            shrinkage=1\n\
+            \n";
+        let err = Tree::parse(block).unwrap_err();
+        assert!(matches!(err, ModelError::MalformedModel { .. }));
+        assert!(err.to_string().contains("leaf_features"));
     }
 
     #[test]
