@@ -3759,6 +3759,145 @@ pub(crate) fn launch_reduce_into_leaf<R: cubecl::Runtime>(
     }
 }
 
+/// The TWO-TASK batched twin of [`reduce_scan_output_into_leaf_kernel`]: ONE
+/// launch (`CubeCount::Static(2, 1, 1)`) folds BOTH co-pack siblings' winners in a
+/// single dispatch — `CUBE_POS_X` selects the sibling (0 = A/smaller reads raw
+/// window base 0 → slot `out_slot_a`; 1 = B/larger reads base `n*12` → slot
+/// `out_slot_b`). Each cube is single-owner (`UNIT_POS == 0`) and writes ONLY its
+/// own frontier slot (`out_slot_a != out_slot_b`, disjoint), so the two tasks never
+/// race — the result is BIT-IDENTICAL to the two separate
+/// [`reduce_scan_output_into_leaf_kernel`] launches it replaces (same per-slot seed,
+/// same per-feature `split_gt` fold, same net-gain conversion). Halves the co-pack
+/// reduce launch count (2 → 1) — a pure host-enqueue win (spike095: ~100µs/launch).
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn reduce_scan_output_into_two_leaves_kernel(
+    raw: &Array<f64>,
+    real_feats: &Array<f64>,
+    out_valid: &mut Array<f64>,
+    out_gain: &mut Array<f64>,
+    out_feat: &mut Array<f64>,
+    out_thr: &mut Array<f64>,
+    out_dleft: &mut Array<f64>,
+    out_ncat: &mut Array<f64>,
+    out_lsum_g: &mut Array<f64>,
+    out_lsum_h: &mut Array<f64>,
+    out_rsum_g: &mut Array<f64>,
+    out_rsum_h: &mut Array<f64>,
+    out_lval: &mut Array<f64>,
+    out_rval: &mut Array<f64>,
+    n_feats: u32,
+    out_slot_a: u32,
+    out_slot_b: u32,
+    min_gain_shift_a: f64,
+    min_gain_shift_b: f64,
+    penalty: f64,
+    neg_inf: f64,
+) {
+    let task = CUBE_POS_X;
+    if UNIT_POS == 0 {
+        // Per-sibling params (A = raw window base 0 → slot A; B = base n*12 → slot B).
+        let n = n_feats as usize;
+        let rb = select(task == 0, 0u32, n_feats * 12u32) as usize;
+        let slot = select(task == 0, out_slot_a, out_slot_b) as usize;
+        let min_gain_shift = select(task == 0, min_gain_shift_a, min_gain_shift_b);
+        // The seed + fold is IDENTICAL to the single-leaf kernel (verbatim).
+        out_valid[slot] = 0.0;
+        out_gain[slot] = neg_inf;
+        out_feat[slot] = -1.0;
+        out_thr[slot] = 0.0;
+        out_dleft[slot] = 0.0;
+        out_ncat[slot] = 0.0;
+        out_lsum_g[slot] = 0.0;
+        out_lsum_h[slot] = 0.0;
+        out_rsum_g[slot] = 0.0;
+        out_rsum_h[slot] = 0.0;
+        out_lval[slot] = 0.0;
+        out_rval[slot] = 0.0;
+        for t in 0..n {
+            let dbase = rb + t * 12;
+            let v = (raw[dbase] != 0.0) && (raw[dbase + 2] > neg_inf);
+            let strictly_gain = raw[dbase + 2] > out_gain[slot];
+            let tie_gain = raw[dbase + 2] == out_gain[slot];
+            let feat_lower = real_feats[t] < out_feat[slot];
+            let better = strictly_gain || (tie_gain && feat_lower);
+            let take = v && better;
+            out_valid[slot] = select(take, 1.0, out_valid[slot]);
+            out_gain[slot] = select(take, raw[dbase + 2], out_gain[slot]);
+            out_feat[slot] = select(take, real_feats[t], out_feat[slot]);
+            out_thr[slot] = select(take, raw[dbase + 1], out_thr[slot]);
+            out_dleft[slot] = select(take, raw[dbase + 9], out_dleft[slot]);
+            out_ncat[slot] = select(take, 0.0, out_ncat[slot]);
+            out_lsum_g[slot] = select(take, raw[dbase + 5], out_lsum_g[slot]);
+            out_lsum_h[slot] = select(take, raw[dbase + 6], out_lsum_h[slot]);
+            out_rsum_g[slot] = select(take, raw[dbase + 7], out_rsum_g[slot]);
+            out_rsum_h[slot] = select(take, raw[dbase + 8], out_rsum_h[slot]);
+            out_lval[slot] = select(take, raw[dbase + 10], out_lval[slot]);
+            out_rval[slot] = select(take, raw[dbase + 11], out_rval[slot]);
+        }
+        out_gain[slot] = (out_gain[slot] - min_gain_shift) * penalty;
+    }
+}
+
+/// Launch [`reduce_scan_output_into_two_leaves_kernel`] — ONE dispatch folding
+/// BOTH co-pack siblings' winners (sibling A raw window `[0, n*12)` → `out_slot_a`;
+/// sibling B `[n*12, 2n*12)` → `out_slot_b`). Replaces two
+/// [`launch_reduce_into_leaf`] calls. `real_feats` (shared feature layout) must have
+/// `>= n_feats` elements; `h_raw` must describe `>= 2*n_feats*12` cells; both
+/// `out_slot`s `< out.len` and DISTINCT. Bounds host-proven by the caller.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn launch_reduce_into_two_leaves<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    h_raw: cubecl::server::Handle,
+    raw_len: usize,
+    real_feats: &[i32],
+    n_feats: usize,
+    out: &crate::kernels::best_split::SplitSoa,
+    out_slot_a: usize,
+    out_slot_b: usize,
+    min_gain_shift_a: f64,
+    min_gain_shift_b: f64,
+) {
+    let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
+    let h_rf = client.create_from_slice(f64::as_bytes(&rf));
+    // SAFETY: two single-owner cubes (Route C, geometry `Static(2,1,1)`). Cube `task`
+    // seeds + folds ONLY `out_*[out_slot_{a|b}]` (both `< out.len`, DISTINCT, caller-
+    // validated ⇒ no cross-cube write race) and reads only `raw[rb .. rb + n*12)` with
+    // `rb ∈ {0, n*12}` (⇒ `raw[0 .. 2n*12) <= raw_len`, caller-validated) and
+    // `real_feats[0 .. n)` (`h_rf` sized `n_feats`). Every handle outlives the launch.
+    // All cubecl unsafe confined here (CMP-01).
+    unsafe {
+        reduce_scan_output_into_two_leaves_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(2, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(h_raw, raw_len),
+            ArrayArg::from_raw_parts(h_rf, n_feats),
+            ArrayArg::from_raw_parts(out.valid.clone(), out.len),
+            ArrayArg::from_raw_parts(out.gain.clone(), out.len),
+            ArrayArg::from_raw_parts(out.feat.clone(), out.len),
+            ArrayArg::from_raw_parts(out.thr.clone(), out.len),
+            ArrayArg::from_raw_parts(out.dleft.clone(), out.len),
+            ArrayArg::from_raw_parts(out.ncat.clone(), out.len),
+            ArrayArg::from_raw_parts(out.left_sum_gradients.clone(), out.len),
+            ArrayArg::from_raw_parts(out.left_sum_hessians.clone(), out.len),
+            ArrayArg::from_raw_parts(out.right_sum_gradients.clone(), out.len),
+            ArrayArg::from_raw_parts(out.right_sum_hessians.clone(), out.len),
+            ArrayArg::from_raw_parts(out.left_output.clone(), out.len),
+            ArrayArg::from_raw_parts(out.right_output.clone(), out.len),
+            n_feats as u32,
+            out_slot_a as u32,
+            out_slot_b as u32,
+            min_gain_shift_a,
+            min_gain_shift_b,
+            1.0f64,
+            f64::NEG_INFINITY,
+        );
+    }
+}
+
 /// Shared V5 validation + `min_gain_shift` pre-step + fused-scan launch for the
 /// no-readback reduce launchers. Byte-for-byte the SAME per-feature V5
 /// validation + the SAME `2*kEpsilon` bump + `min_gain_shift` + the SAME
@@ -4308,30 +4447,37 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
         b_totals,
     )?;
     if let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)) = scanned {
-        // Sibling A: features [0, n), raw_base 0.
-        launch_reduce_into_leaf(
-            client,
-            h_out.clone(),
-            out_len,
-            real_feats,
-            n,
-            out,
-            out_leaf_a,
-            0,
-            min_gain_shift_a,
-        );
-        // Sibling B: features [n, 2n), raw_base n*12.
-        launch_reduce_into_leaf(
+        // ONE batched dispatch folds BOTH siblings' winners (A: features [0, n) →
+        // out_leaf_a; B: features [n, 2n) → out_leaf_b). Bit-identical to the two
+        // separate `launch_reduce_into_leaf` calls it replaces (disjoint slots, same
+        // per-slot fold), at half the reduce launch count — the spike095 host-enqueue
+        // win. GPU-only: the batched kernel is `#[cfg(feature = "gpu")]`; the cpu
+        // anchor never reaches this co-pack resident path (`resident_pool_supported()
+        // == false`), so the two-call fallback is kept for the non-gpu build.
+        #[cfg(feature = "gpu")]
+        launch_reduce_into_two_leaves(
             client,
             h_out,
             out_len,
             real_feats,
             n,
             out,
+            out_leaf_a,
             out_leaf_b,
-            n * 12,
+            min_gain_shift_a,
             min_gain_shift_b,
         );
+        #[cfg(not(feature = "gpu"))]
+        {
+            launch_reduce_into_leaf(
+                client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
+                min_gain_shift_a,
+            );
+            launch_reduce_into_leaf(
+                client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
+                min_gain_shift_b,
+            );
+        }
     }
     Ok(())
 }
@@ -5735,5 +5881,86 @@ mod tests {
         let got_b = out.read_record(&client, 1);
         assert_slot_eq(&got_a, &host_a, real_feats[fpos_a as usize]);
         assert_slot_eq(&got_b, &host_b, real_feats[fpos_b as usize]);
+    }
+
+    /// The BATCHED two-leaf reduce ([`launch_reduce_into_two_leaves`], ONE dispatch)
+    /// writes BIT-IDENTICAL frontier slots to TWO separate [`launch_reduce_into_leaf`]
+    /// calls — pinning the "batching changes nothing" invariant directly (guards
+    /// against the two kernels drifting apart in future edits). Distinct per-sibling
+    /// winners + a distinct `min_gain_shift` per sibling exercise both tasks' param
+    /// selection. GPU-gated (the batched kernel is `#[cfg(feature = "gpu")]`).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn batched_two_leaf_reduce_equals_two_separate_launches() {
+        use crate::kernels::best_split::SplitSoa;
+
+        let client = cpu_client();
+        // 2n*12 raw cells: sibling A features [0, n) with a clear winner at fpos 2;
+        // sibling B features [n, 2n) with a clear winner at fpos 0 — different fpos,
+        // so a task/base mix-up would show. min_gain_shift differs per sibling.
+        let n = 4usize;
+        let mut cells = vec![0.0f64; 2 * n * 12];
+        // Sibling A (base 0): gains 3,5,9,4 → winner fpos 2.
+        put_raw(&mut cells, 0, true, 10, 3.0, false, 1.0, 2.0, 3.0, 4.0);
+        put_raw(&mut cells, 1, true, 11, 5.0, true, 5.0, 6.0, 7.0, 8.0);
+        put_raw(&mut cells, 2, true, 12, 9.0, false, 9.0, 10.0, 11.0, 12.0);
+        put_raw(&mut cells, 3, true, 13, 4.0, true, 13.0, 14.0, 15.0, 16.0);
+        // Sibling B (base n*12): gains 8,2,1,6 → winner fpos 0.
+        put_raw(&mut cells, n, true, 20, 8.0, true, 21.0, 22.0, 23.0, 24.0);
+        put_raw(&mut cells, n + 1, true, 21, 2.0, false, 25.0, 26.0, 27.0, 28.0);
+        put_raw(&mut cells, n + 2, true, 22, 1.0, true, 29.0, 30.0, 31.0, 32.0);
+        put_raw(&mut cells, n + 3, true, 23, 6.0, false, 33.0, 34.0, 35.0, 36.0);
+        let real_feats = vec![7i32, 2, 5, 3];
+        let (mgs_a, mgs_b) = (0.5, 1.25); // distinct per-sibling gain shifts
+
+        // BASELINE: two separate single-leaf launches into slots 0 and 1.
+        let base = SplitSoa::zeroed(&client, 2);
+        let h1 = client.create_from_slice(f64::as_bytes(&cells));
+        launch_reduce_into_leaf(&client, h1, cells.len(), &real_feats, n, &base, 0, 0, mgs_a);
+        let h2 = client.create_from_slice(f64::as_bytes(&cells));
+        launch_reduce_into_leaf(&client, h2, cells.len(), &real_feats, n, &base, 1, n * 12, mgs_b);
+
+        // CANDIDATE: one batched launch folding both.
+        let batched = SplitSoa::zeroed(&client, 2);
+        let hb = client.create_from_slice(f64::as_bytes(&cells));
+        launch_reduce_into_two_leaves(
+            &client, hb, cells.len(), &real_feats, n, &batched, 0, 1, mgs_a, mgs_b,
+        );
+
+        for slot in 0..2 {
+            let want = base.read_record(&client, slot);
+            let got = batched.read_record(&client, slot);
+            assert_eq!(want.is_valid, got.is_valid, "slot {slot} valid");
+            assert_eq!(want.gain.to_bits(), got.gain.to_bits(), "slot {slot} gain");
+            assert_eq!(
+                want.inner_feature_index, got.inner_feature_index,
+                "slot {slot} feat"
+            );
+            assert_eq!(want.threshold, got.threshold, "slot {slot} threshold");
+            assert_eq!(want.default_left, got.default_left, "slot {slot} default_left");
+            assert_eq!(
+                want.left_sum_gradients.to_bits(),
+                got.left_sum_gradients.to_bits(),
+                "slot {slot} lsg"
+            );
+            assert_eq!(
+                want.left_sum_hessians.to_bits(),
+                got.left_sum_hessians.to_bits(),
+                "slot {slot} lsh"
+            );
+            assert_eq!(
+                want.right_sum_gradients.to_bits(),
+                got.right_sum_gradients.to_bits(),
+                "slot {slot} rsg"
+            );
+            assert_eq!(
+                want.right_sum_hessians.to_bits(),
+                got.right_sum_hessians.to_bits(),
+                "slot {slot} rsh"
+            );
+        }
+        // Sanity: the two siblings resolved to their distinct expected winners.
+        assert_eq!(batched.read_record(&client, 0).threshold, 12, "sibling A winner");
+        assert_eq!(batched.read_record(&client, 1).threshold, 20, "sibling B winner");
     }
 }
