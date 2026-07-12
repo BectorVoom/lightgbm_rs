@@ -1825,6 +1825,853 @@ pub fn find_best_splits_fused_siblings_staged_kernel(
     }
 }
 
+// ============================================================================
+// PARALLEL-CANDIDATE staged scan ("pargain", `LGBM_SCAN_PARGAIN`) — the scan
+// redesign the spike092b root-cause map called for. The staged kernels above
+// still run each branch's WHOLE candidate walk serially on one lane, with the
+// heavy gain math (two f64 divisions per candidate, `get_split_gains`) inside
+// the serial loop while 62 lanes idle. This variant splits each branch:
+//
+//   PHASE 1 (serial, 1 lane/branch — the part that MUST stay serial): the
+//     accumulation walk, byte-for-byte the staged branch's adds in the same
+//     order (`+= select(active, …)`, the `done` freeze, `round_int` counts),
+//     but instead of computing gains it STORES each candidate's ACCUMULATED
+//     pair + count + `consider` flag to LDS. ~15 cheap ops/candidate instead
+//     of ~60 incl. two divides.
+//   PHASE 2 (parallel, 32 lanes/branch — one warp each, no intra-warp
+//     divergence between branches): each lane strides the stored candidates,
+//     derives the complementary side EXACTLY as the serial body does (one
+//     `total − accumulated` subtraction), computes the gain with the SAME
+//     `get_split_gains` cube fn, and folds a per-lane lexicographic first-max.
+//   PHASE 3 (1 lane/branch): reduce the 32 lane partials with the SAME
+//     lexicographic order and assemble the branch's 6-cell state; the existing
+//     [`merge_finalize_staged`] finishes identically.
+//
+// BIT-EXACTNESS: phase 1's f64 accumulation order is unchanged (same adds,
+// same order — storing to LDS and reloading is exact); phase 2 computes each
+// candidate's gain from bit-identical inputs with the bit-identical op
+// sequence (`total − accumulated` is literally the serial body's derivation;
+// the accumulated side is passed through untouched); and the serial `take =
+// cand_gain > best_gain` over ascending visit order selects the max-gain,
+// EARLIEST-visited candidate — exactly the lexicographic (gain desc, visit
+// order asc) maximum, which is associative + commutative, so the per-lane
+// partial + tree-shape-free serial reduction reproduces it bit-for-bit. The
+// all-candidates-invalid / zero-gain edge keeps the serial init state via the
+// `won = best_gain > 0.0` guard (serial `take` is strict against the 0.0
+// init). `is_splittable` is the OR of `valid` over every candidate, exactly
+// the serial monotone flag.
+// ============================================================================
+
+/// Per-branch candidate-state capacity (max candidates = 256-bin cap − 1,
+/// padded to 256 cells).
+#[cfg(feature = "gpu")]
+const PARGAIN_MAX_CAND: usize = 256;
+
+// Sentinel `best_k` for "no winner yet" is the in-kernel literal
+// `i32::new(2_147_483_647)` (= i32::MAX): larger than any real candidate
+// index, so the lexicographic (gain desc, k asc) fold never prefers it (the
+// cube macro requires a literal here, not a host const).
+
+/// Pargain gate (env `LGBM_SCAN_PARGAIN`, opt-in `"1"`; default OFF until the
+/// real-CUDA A/B validates it). Only meaningful where the staged gates already
+/// hold (real device, ≤256-bin features) — the launch helpers consult it INSIDE
+/// the staged arm, so legacy/staged behavior is byte-unchanged when unset.
+#[cfg(feature = "gpu")]
+fn scan_pargain_enabled() -> bool {
+    matches!(std::env::var("LGBM_SCAN_PARGAIN").as_deref(), Ok("1"))
+}
+
+/// PHASE 1, REVERSE branch: the accumulation walk of [`scan_rev_branch_staged`]
+/// with the gain/best logic REMOVED and each candidate's state STORED —
+/// `cand_ag`/`cand_ah` hold the branch-ACCUMULATED right-side pair (the serial
+/// body derives the left side from the totals each iteration; phase 2 repeats
+/// that derivation verbatim), `cand_lc` the derived left count, `cand_ok` the
+/// serial `consider` flag. Accumulation ops and order are byte-identical to the
+/// staged branch fn.
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn pargain_store_rev(
+    sm: &Slice<f64>,
+    cand_ag: &mut SliceMut<f64>,
+    cand_ah: &mut SliceMut<f64>,
+    cand_lc: &mut SliceMut<f64>,
+    cand_ok: &mut SliceMut<f64>,
+    num_bin: i32,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32, // 0|1
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+    num_data: i32,
+    rev_count: i32,
+) {
+    let skip_def = skip_default_bin != 0;
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+
+    let mut sum_right_gradient = 0.0f64;
+    let mut sum_right_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:856)
+    let mut right_count = 0i32;
+
+    let t_start = num_bin - 1 - offset;
+    let mut done = false;
+
+    for k in 0..rev_count {
+        let t = t_start - k;
+        let in_range = t >= (1 - offset);
+        let skip = skip_def && (t + offset) == default_bin;
+        let active = in_range && !skip && !done;
+        let t_safe = select(t < 0, 0i32, t);
+        let bi = (t_safe as usize) * 2;
+        let g = sm[bi];
+        let h = sm[bi + 1];
+        sum_right_gradient += select(active, g, 0.0);
+        sum_right_hessian += select(active, h, 0.0);
+        right_count += select(active, round_int(h * cnt_factor), 0i32);
+
+        let left_count = num_data - right_count;
+        let sum_left_hessian = sum_hessian - sum_right_hessian;
+        let cont =
+            right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+        let brk = left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+        done = done || (active && !cont && brk);
+        let consider = active && !cont && !done;
+
+        let ku = k as usize;
+        cand_ag[ku] = sum_right_gradient;
+        cand_ah[ku] = sum_right_hessian;
+        cand_lc[ku] = f64::cast_from(left_count);
+        cand_ok[ku] = select(consider, 1.0, 0.0);
+    }
+}
+
+/// PHASE 1, FORWARD branch: the accumulation walk of [`scan_fwd_branch_staged`],
+/// storing the branch-ACCUMULATED LEFT-side pair (the serial body derives the
+/// right side from the totals; phase 2 repeats it verbatim). See
+/// [`pargain_store_rev`].
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn pargain_store_fwd(
+    sm: &Slice<f64>,
+    cand_ag: &mut SliceMut<f64>,
+    cand_ah: &mut SliceMut<f64>,
+    cand_lc: &mut SliceMut<f64>,
+    cand_ok: &mut SliceMut<f64>,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32, // 0|1
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+    num_data: i32,
+    fwd_count: i32,
+) {
+    let skip_def = skip_default_bin != 0;
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+
+    let mut sum_left_gradient = 0.0f64;
+    let mut sum_left_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:939)
+    let mut left_count = 0i32;
+
+    let mut done = false;
+
+    for t in 0..fwd_count {
+        let skip = skip_def && (t + offset) == default_bin;
+        let active = !skip && !done;
+        let bi = (t as usize) * 2;
+        let g = sm[bi];
+        let h = sm[bi + 1];
+        sum_left_gradient += select(active, g, 0.0);
+        sum_left_hessian += select(active, h, 0.0);
+        left_count += select(active, round_int(h * cnt_factor), 0i32);
+
+        let right_count = num_data - left_count;
+        let sum_right_hessian = sum_hessian - sum_left_hessian;
+        let cont = left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+        let brk =
+            right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+        done = done || (active && !cont && brk);
+        let consider = active && !cont && !done;
+
+        let ku = t as usize;
+        cand_ag[ku] = sum_left_gradient;
+        cand_ah[ku] = sum_left_hessian;
+        cand_lc[ku] = f64::cast_from(left_count);
+        cand_ok[ku] = select(consider, 1.0, 0.0);
+    }
+}
+
+/// PHASE 2: one lane's strided walk over a branch's stored candidates. Derives
+/// the complementary side EXACTLY as the serial body does (`total −
+/// accumulated`, one subtraction each), computes the gain with the SAME
+/// [`get_split_gains`] cube fn on bit-identical inputs, and folds the per-lane
+/// lexicographic first-max (gain desc, visit order asc; the `cand_gain > 0.0`
+/// guard keeps the equality clause from ever preferring a zero-gain candidate
+/// over the serial 0.0-init state). Writes the lane's partial best + the
+/// `valid`-OR flag.
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn pargain_lane_scan(
+    cand_ag: &Slice<f64>,
+    cand_ah: &Slice<f64>,
+    cand_ok: &Slice<f64>,
+    part_gain: &mut SliceMut<f64>,
+    part_k: &mut SliceMut<f64>,
+    part_any: &mut SliceMut<f64>,
+    lane: u32, // 0..32 within the branch
+    count: i32,
+    acc_is_left: u32, // 1 ⇒ stored pair is the LEFT side (FWD); 0 ⇒ RIGHT (REV)
+    use_l1: u32,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+) {
+    let use_l1_b = use_l1 != 0;
+    let acc_left = acc_is_left != 0;
+    let mut best_gain = 0.0f64;
+    // "no winner" sentinel: above any real candidate index (exact in f64).
+    let mut best_k = 2147483647.0f64;
+    let mut any_valid = 0.0f64;
+
+    let mut k = lane as i32;
+    while k < count {
+        let ku = k as usize;
+        if cand_ok[ku] != 0.0 {
+            let acc_g = cand_ag[ku];
+            let acc_h = cand_ah[ku];
+            // The serial body's complement derivation, verbatim (one subtraction).
+            let oth_g = sum_gradient - acc_g;
+            let oth_h = sum_hessian - acc_h;
+            let left_g = select(acc_left, acc_g, oth_g);
+            let left_h = select(acc_left, acc_h, oth_h);
+            let right_g = select(acc_left, oth_g, acc_g);
+            let right_h = select(acc_left, oth_h, acc_h);
+            let current_gain =
+                get_split_gains(use_l1_b, left_g, left_h, right_g, right_h, lambda_l1, lambda_l2);
+            let valid = current_gain > min_gain_shift;
+            any_valid = select(valid, 1.0, any_valid);
+            let cand_gain = select(valid, current_gain, 0.0);
+            let kf = f64::cast_from(k);
+            // Lexicographic first-max: strictly greater gain, or equal POSITIVE
+            // gain at an earlier visit order.
+            let take = cand_gain > best_gain
+                || (cand_gain == best_gain && cand_gain > 0.0 && kf < best_k);
+            best_gain = select(take, cand_gain, best_gain);
+            best_k = select(take, kf, best_k);
+        }
+        k += 32;
+    }
+    part_gain[lane as usize] = best_gain;
+    part_k[lane as usize] = best_k;
+    part_any[lane as usize] = any_valid;
+}
+
+/// PHASE 3: reduce a branch's 32 lane partials with the SAME lexicographic
+/// order and assemble the branch's 6-cell state (`[is_splittable, best_gain,
+/// threshold, left_count, sum_left_gradient, sum_left_hessian]` — the exact
+/// layout [`merge_finalize_staged`] consumes). `thr = thr_base + thr_step * k`
+/// encodes both branches' threshold formulas (REV: `num_bin − 2 − k`; FWD:
+/// `k + offset`). The `won` guard reproduces the serial 0.0-init state when no
+/// candidate strictly beat it.
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn pargain_assemble_state(
+    part_gain: &Slice<f64>,
+    part_k: &Slice<f64>,
+    part_any: &Slice<f64>,
+    cand_ag: &Slice<f64>,
+    cand_ah: &Slice<f64>,
+    cand_lc: &Slice<f64>,
+    state: &mut SliceMut<f64>,
+    acc_is_left: u32,
+    thr_base: i32,
+    thr_step: i32,
+    sum_gradient: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+) {
+    let acc_left = acc_is_left != 0;
+    let mut best_gain = 0.0f64;
+    // "no winner" sentinel: above any real candidate index (exact in f64).
+    let mut best_k = 2147483647.0f64;
+    let mut any = 0.0f64;
+    for l in 0..32usize {
+        let g = part_gain[l];
+        let k = part_k[l];
+        any = select(part_any[l] != 0.0, 1.0, any);
+        let take = g > best_gain || (g == best_gain && g > 0.0 && k < best_k);
+        best_gain = select(take, g, best_gain);
+        best_k = select(take, k, best_k);
+    }
+    let won = best_gain > 0.0;
+    // Clamp the sentinel so the (selected-away) loads/arithmetic stay in range.
+    let k_safe = select(won, best_k, 0.0);
+    let ku = u32::cast_from(k_safe) as usize;
+    let acc_g = cand_ag[ku];
+    let acc_h = cand_ah[ku];
+    let oth_g = sum_gradient - acc_g;
+    let oth_h = sum_hessian - acc_h;
+    let slg = select(acc_left, acc_g, oth_g);
+    let slh = select(acc_left, acc_h, oth_h);
+    let lc_f = cand_lc[ku];
+    let thr = thr_base + thr_step * i32::cast_from(k_safe);
+
+    state[0] = select(any != 0.0, 1.0, 0.0);
+    state[1] = select(won, best_gain, 0.0);
+    state[2] = select(won, f64::cast_from(thr), 0.0);
+    state[3] = select(won, lc_f, 0.0);
+    state[4] = select(won, slg, 0.0);
+    state[5] = select(won, slh, 0.0);
+}
+
+/// PARGAIN single-leaf kernel: [`find_best_splits_fused_staged_kernel`]'s twin
+/// (identical signature + output) with the phase-1/2/3 split above. Lanes 0-31
+/// are the REVERSE warp, 32-63 the FORWARD warp; phase 1 runs on lanes 0/32,
+/// phase 2 on the full warps, phase 3 on lanes 0/32, and lane 0 merges via the
+/// SAME [`merge_finalize_staged`].
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_staged_par_kernel(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // LEAF-LEVEL scalars (shared across the batch).
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+    // Per-branch candidate state (phase 1 → phase 2/3).
+    let mut rev_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    // Per-lane partials (32 per branch).
+    let mut rev_pg = SharedMemory::<f64>::new(32usize);
+    let mut rev_pk = SharedMemory::<f64>::new(32usize);
+    let mut rev_pa = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pg = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pk = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pa = SharedMemory::<f64>::new(32usize);
+
+    // Cooperative stage (identical to the staged kernel).
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    let mut c = UNIT_POS as usize;
+    while c < cells {
+        sm[c] = hist[base + c];
+        c += cd;
+    }
+    sync_cube();
+
+    // PHASE 1: the two serial accumulation walkers, separate warps.
+    if UNIT_POS == 0 {
+        pargain_store_rev(
+            &sm.to_slice(),
+            &mut rev_ag.to_slice_mut(),
+            &mut rev_ah.to_slice_mut(),
+            &mut rev_lc.to_slice_mut(),
+            &mut rev_ok.to_slice_mut(),
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_store_fwd(
+            &sm.to_slice(),
+            &mut fwd_ag.to_slice_mut(),
+            &mut fwd_ah.to_slice_mut(),
+            &mut fwd_lc.to_slice_mut(),
+            &mut fwd_ok.to_slice_mut(),
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            sum_hessian,
+            num_data,
+            fwd_count[fi],
+        );
+    }
+    sync_cube();
+
+    // PHASE 2: warp-split parallel gain scans.
+    if UNIT_POS < 32 {
+        pargain_lane_scan(
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_ok.to_slice(),
+            &mut rev_pg.to_slice_mut(),
+            &mut rev_pk.to_slice_mut(),
+            &mut rev_pa.to_slice_mut(),
+            UNIT_POS,
+            rev_count[fi],
+            0u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    } else {
+        pargain_lane_scan(
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_ok.to_slice(),
+            &mut fwd_pg.to_slice_mut(),
+            &mut fwd_pk.to_slice_mut(),
+            &mut fwd_pa.to_slice_mut(),
+            UNIT_POS - 32,
+            fwd_count[fi],
+            1u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    // PHASE 3: per-branch partial reduction + state assembly, separate warps.
+    if UNIT_POS == 0 {
+        pargain_assemble_state(
+            &rev_pg.to_slice(),
+            &rev_pk.to_slice(),
+            &rev_pa.to_slice(),
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_lc.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            0u32,
+            num_bin[fi] - 2,
+            -1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_assemble_state(
+            &fwd_pg.to_slice(),
+            &fwd_pk.to_slice(),
+            &fwd_pa.to_slice(),
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_lc.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            1u32,
+            offset[fi],
+            1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            f * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
+/// PARGAIN co-packed 2-slot sibling kernel:
+/// [`find_best_splits_fused_siblings_staged_kernel`]'s twin (identical
+/// signature, geometry `(n, 2, 1)`, and output layout) with the phase-1/2/3
+/// split. See [`find_best_splits_fused_staged_par_kernel`].
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_staged_par_kernel(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    // SHARED per-feature params (length n; both siblings share the dataset layout).
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // SHARED cfg scalars.
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    // PER-SIBLING leaf scalars (A = smaller, B = larger).
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    // Per-sibling feature count (n) — the B sibling's out window offset.
+    n_feats: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+    let mut rev_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_pg = SharedMemory::<f64>::new(32usize);
+    let mut rev_pk = SharedMemory::<f64>::new(32usize);
+    let mut rev_pa = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pg = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pk = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pa = SharedMemory::<f64>::new(32usize);
+
+    // Select this cube's sibling scalars (an Array ref cannot be `select`ed, so
+    // the stage loop below branches on the sibling instead).
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    // Cooperative stage from THIS sibling's histogram (pure copy).
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_b[base + c];
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_a[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        pargain_store_rev(
+            &sm.to_slice(),
+            &mut rev_ag.to_slice_mut(),
+            &mut rev_ah.to_slice_mut(),
+            &mut rev_lc.to_slice_mut(),
+            &mut rev_ok.to_slice_mut(),
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_store_fwd(
+            &sm.to_slice(),
+            &mut fwd_ag.to_slice_mut(),
+            &mut fwd_ah.to_slice_mut(),
+            &mut fwd_lc.to_slice_mut(),
+            &mut fwd_ok.to_slice_mut(),
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            sum_hessian,
+            num_data,
+            fwd_count[fi],
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS < 32 {
+        pargain_lane_scan(
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_ok.to_slice(),
+            &mut rev_pg.to_slice_mut(),
+            &mut rev_pk.to_slice_mut(),
+            &mut rev_pa.to_slice_mut(),
+            UNIT_POS,
+            rev_count[fi],
+            0u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    } else {
+        pargain_lane_scan(
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_ok.to_slice(),
+            &mut fwd_pg.to_slice_mut(),
+            &mut fwd_pk.to_slice_mut(),
+            &mut fwd_pa.to_slice_mut(),
+            UNIT_POS - 32,
+            fwd_count[fi],
+            1u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        pargain_assemble_state(
+            &rev_pg.to_slice(),
+            &rev_pk.to_slice(),
+            &rev_pa.to_slice(),
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_lc.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            0u32,
+            num_bin[fi] - 2,
+            -1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_assemble_state(
+            &fwd_pg.to_slice(),
+            &fwd_pk.to_slice(),
+            &fwd_pa.to_slice(),
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_lc.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            1u32,
+            offset[fi],
+            1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
+/// Launch the staged single-leaf scan — the SERIAL-branch staged kernel by
+/// default, or its PARGAIN twin when `LGBM_SCAN_PARGAIN=1` (identical
+/// signature, geometry, and — by the pargain module note — bit-identical
+/// output). Single source for the four staged launch sites so the kernel
+/// choice can never diverge between them.
+///
+/// # Safety
+/// Same obligations as the direct staged launch: per-feature regions validated
+/// `<= buf_len`, out sized `n*12`, per-feature arrays sized exactly `n`, and
+/// `CubeCount::Static(n)` matching the kernels' no-guard `CUBE_POS_X < n`
+/// contract.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    n: usize,
+    hist: cubecl::server::Handle,
+    buf_len: usize,
+    h_out: cubecl::server::Handle,
+    out_len: usize,
+    h_slot: cubecl::server::Handle,
+    h_numbin: cubecl::server::Handle,
+    h_offset: cubecl::server::Handle,
+    h_defbin: cubecl::server::Handle,
+    h_skip: cubecl::server::Handle,
+    h_rev: cubecl::server::Handle,
+    h_fwd: cubecl::server::Handle,
+    use_l1: bool,
+    cfg: &GainConfig,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian_bumped: f64,
+    num_data: i32,
+) {
+    macro_rules! launch_with {
+        ($kernel:ident) => {
+            unsafe {
+                $kernel::launch(
+                    client,
+                    CubeCount::Static(n as u32, 1, 1),
+                    CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                    ArrayArg::from_raw_parts(hist.clone(), buf_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot.clone(), n),
+                    ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                    ArrayArg::from_raw_parts(h_offset.clone(), n),
+                    ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                    ArrayArg::from_raw_parts(h_skip.clone(), n),
+                    ArrayArg::from_raw_parts(h_rev.clone(), n),
+                    ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    min_gain_shift,
+                    sum_gradient,
+                    sum_hessian_bumped,
+                    num_data,
+                );
+            }
+        };
+    }
+    if scan_pargain_enabled() {
+        launch_with!(find_best_splits_fused_staged_par_kernel);
+    } else {
+        launch_with!(find_best_splits_fused_staged_kernel);
+    }
+}
+
+/// Sibling twin of [`launch_staged_single_scan`] — the co-packed 2-slot staged
+/// launch, choosing the serial-branch or PARGAIN kernel by the same gate.
+///
+/// # Safety
+/// Same obligations as the direct staged sibling launch; geometry
+/// `CubeCount::Static(n, 2, 1)` matches the kernels' `CUBE_POS_X < n`,
+/// `CUBE_POS_Y < 2` no-guard contract.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    n: usize,
+    hist_a: cubecl::server::Handle,
+    hist_b: cubecl::server::Handle,
+    buf_len: usize,
+    h_out: cubecl::server::Handle,
+    out_len: usize,
+    h_slot: cubecl::server::Handle,
+    h_numbin: cubecl::server::Handle,
+    h_offset: cubecl::server::Handle,
+    h_defbin: cubecl::server::Handle,
+    h_skip: cubecl::server::Handle,
+    h_rev: cubecl::server::Handle,
+    h_fwd: cubecl::server::Handle,
+    use_l1: bool,
+    cfg: &GainConfig,
+    a_scalars: (f64, f64, f64, i32), // (min_gain_shift, sum_gradient, sum_hessian_bumped, num_data)
+    b_scalars: (f64, f64, f64, i32),
+) {
+    macro_rules! launch_with {
+        ($kernel:ident) => {
+            unsafe {
+                $kernel::launch(
+                    client,
+                    CubeCount::Static(n as u32, 2, 1),
+                    CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                    ArrayArg::from_raw_parts(hist_a.clone(), buf_len),
+                    ArrayArg::from_raw_parts(hist_b.clone(), buf_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot.clone(), n),
+                    ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                    ArrayArg::from_raw_parts(h_offset.clone(), n),
+                    ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                    ArrayArg::from_raw_parts(h_skip.clone(), n),
+                    ArrayArg::from_raw_parts(h_rev.clone(), n),
+                    ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    a_scalars.0,
+                    a_scalars.1,
+                    a_scalars.2,
+                    a_scalars.3,
+                    b_scalars.0,
+                    b_scalars.1,
+                    b_scalars.2,
+                    b_scalars.3,
+                    n as u32,
+                );
+            }
+        };
+    }
+    if scan_pargain_enabled() {
+        launch_with!(find_best_splits_fused_siblings_staged_par_kernel);
+    } else {
+        launch_with!(find_best_splits_fused_siblings_staged_kernel);
+    }
+}
+
 /// FUSED batched per-leaf best-split launcher, **generic over the runtime** `R`.
 /// Finds the best split for EVERY feature in
 /// `feats` in ONE launch of [`find_best_splits_fused_kernel`], returning one
@@ -2145,26 +2992,25 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         // per-feature regions ≤ buf_len; out window `f*12..f*12+12` within the
         // `n*12` allocation; per-feature arrays sized exactly `n`). The launch
         // geometry guarantees CUBE_POS_X < n (CubeCount::Static(n)), matching
-        // the kernel's no-guard contract.
+        // the kernel's no-guard contract. The helper picks the serial-branch
+        // staged kernel or its bit-identical PARGAIN twin (`LGBM_SCAN_PARGAIN`).
         unsafe {
-            find_best_splits_fused_staged_kernel::launch(
+            launch_staged_single_scan(
                 client,
-                CubeCount::Static(n as u32, 1, 1),
-                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
-                ArrayArg::from_raw_parts(h_hist.clone(), buf_len),
-                ArrayArg::from_raw_parts(h_out.clone(), out_len),
-                ArrayArg::from_raw_parts(h_slot.clone(), n),
-                ArrayArg::from_raw_parts(h_numbin.clone(), n),
-                ArrayArg::from_raw_parts(h_offset.clone(), n),
-                ArrayArg::from_raw_parts(h_defbin.clone(), n),
-                ArrayArg::from_raw_parts(h_skip.clone(), n),
-                ArrayArg::from_raw_parts(h_rev.clone(), n),
-                ArrayArg::from_raw_parts(h_fwd.clone(), n),
-                if use_l1 { 1u32 } else { 0u32 },
-                cfg.min_data_in_leaf,
-                cfg.min_sum_hessian_in_leaf,
-                cfg.lambda_l1,
-                cfg.lambda_l2,
+                n,
+                h_hist.clone(),
+                buf_len,
+                h_out.clone(),
+                out_len,
+                h_slot.clone(),
+                h_numbin.clone(),
+                h_offset.clone(),
+                h_defbin.clone(),
+                h_skip.clone(),
+                h_rev.clone(),
+                h_fwd.clone(),
+                use_l1,
+                cfg,
                 min_gain_shift,
                 sum_gradient,
                 sum_hessian_bumped,
@@ -2527,36 +3373,28 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     if staged {
         // SAFETY: identical obligations to the legacy sibling launch below; the
         // geometry guarantees CUBE_POS_X < n and CUBE_POS_Y < 2, matching the
-        // kernel's no-guard contract.
+        // kernel's no-guard contract. The helper picks the serial-branch staged
+        // kernel or its bit-identical PARGAIN twin (`LGBM_SCAN_PARGAIN`).
         unsafe {
-            find_best_splits_fused_siblings_staged_kernel::launch(
+            launch_staged_siblings_scan(
                 client,
-                CubeCount::Static(n as u32, 2, 1),
-                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
-                ArrayArg::from_raw_parts(hist_a_handle.clone(), buf_len),
-                ArrayArg::from_raw_parts(hist_b_handle.clone(), buf_len),
-                ArrayArg::from_raw_parts(h_out.clone(), out_len),
-                ArrayArg::from_raw_parts(h_slot.clone(), n),
-                ArrayArg::from_raw_parts(h_numbin.clone(), n),
-                ArrayArg::from_raw_parts(h_offset.clone(), n),
-                ArrayArg::from_raw_parts(h_defbin.clone(), n),
-                ArrayArg::from_raw_parts(h_skip.clone(), n),
-                ArrayArg::from_raw_parts(h_rev.clone(), n),
-                ArrayArg::from_raw_parts(h_fwd.clone(), n),
-                if use_l1 { 1u32 } else { 0u32 },
-                cfg.min_data_in_leaf,
-                cfg.min_sum_hessian_in_leaf,
-                cfg.lambda_l1,
-                cfg.lambda_l2,
-                min_gain_shift_a,
-                sum_gradient_a,
-                sum_hessian_a_bumped,
-                num_data_a,
-                min_gain_shift_b,
-                sum_gradient_b,
-                sum_hessian_b_bumped,
-                num_data_b,
-                n as u32,
+                n,
+                hist_a_handle.clone(),
+                hist_b_handle.clone(),
+                buf_len,
+                h_out.clone(),
+                out_len,
+                h_slot.clone(),
+                h_numbin.clone(),
+                h_offset.clone(),
+                h_defbin.clone(),
+                h_skip.clone(),
+                h_rev.clone(),
+                h_fwd.clone(),
+                use_l1,
+                cfg,
+                (min_gain_shift_a, sum_gradient_a, sum_hessian_a_bumped, num_data_a),
+                (min_gain_shift_b, sum_gradient_b, sum_hessian_b_bumped, num_data_b),
             );
         }
     }
@@ -3018,25 +3856,25 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     {
         // SAFETY: identical obligations to the legacy launch below; the geometry
         // guarantees CUBE_POS_X < n, matching the kernel's no-guard contract.
+        // The helper picks the serial-branch staged kernel or its bit-identical
+        // PARGAIN twin (`LGBM_SCAN_PARGAIN`).
         unsafe {
-            find_best_splits_fused_staged_kernel::launch(
+            launch_staged_single_scan(
                 client,
-                CubeCount::Static(n as u32, 1, 1),
-                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
-                ArrayArg::from_raw_parts(hist_handle, buf_len),
-                ArrayArg::from_raw_parts(h_out.clone(), out_len),
-                ArrayArg::from_raw_parts(h_slot, n),
-                ArrayArg::from_raw_parts(h_numbin, n),
-                ArrayArg::from_raw_parts(h_offset, n),
-                ArrayArg::from_raw_parts(h_defbin, n),
-                ArrayArg::from_raw_parts(h_skip, n),
-                ArrayArg::from_raw_parts(h_rev, n),
-                ArrayArg::from_raw_parts(h_fwd, n),
-                if use_l1 { 1u32 } else { 0u32 },
-                cfg.min_data_in_leaf,
-                cfg.min_sum_hessian_in_leaf,
-                cfg.lambda_l1,
-                cfg.lambda_l2,
+                n,
+                hist_handle,
+                buf_len,
+                h_out.clone(),
+                out_len,
+                h_slot,
+                h_numbin,
+                h_offset,
+                h_defbin,
+                h_skip,
+                h_rev,
+                h_fwd,
+                use_l1,
+                cfg,
                 min_gain_shift,
                 sum_gradient,
                 sum_hessian_bumped,
@@ -3303,35 +4141,28 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     {
         // SAFETY: identical obligations to the legacy launch below; the geometry
         // guarantees CUBE_POS_X < n and CUBE_POS_Y < 2 (kernel no-guard contract).
+        // The helper picks the serial-branch staged kernel or its bit-identical
+        // PARGAIN twin (`LGBM_SCAN_PARGAIN`).
         unsafe {
-            find_best_splits_fused_siblings_staged_kernel::launch(
+            launch_staged_siblings_scan(
                 client,
-                CubeCount::Static(n as u32, 2, 1),
-                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
-                ArrayArg::from_raw_parts(hist_a_handle, buf_len),
-                ArrayArg::from_raw_parts(hist_b_handle, buf_len),
-                ArrayArg::from_raw_parts(h_out.clone(), out_len),
-                ArrayArg::from_raw_parts(h_slot, n),
-                ArrayArg::from_raw_parts(h_numbin, n),
-                ArrayArg::from_raw_parts(h_offset, n),
-                ArrayArg::from_raw_parts(h_defbin, n),
-                ArrayArg::from_raw_parts(h_skip, n),
-                ArrayArg::from_raw_parts(h_rev, n),
-                ArrayArg::from_raw_parts(h_fwd, n),
-                if use_l1 { 1u32 } else { 0u32 },
-                cfg.min_data_in_leaf,
-                cfg.min_sum_hessian_in_leaf,
-                cfg.lambda_l1,
-                cfg.lambda_l2,
-                min_gain_shift_a,
-                sum_gradient_a,
-                sum_hessian_a_bumped,
-                num_data_a,
-                min_gain_shift_b,
-                sum_gradient_b,
-                sum_hessian_b_bumped,
-                num_data_b,
-                n as u32,
+                n,
+                hist_a_handle,
+                hist_b_handle,
+                buf_len,
+                h_out.clone(),
+                out_len,
+                h_slot,
+                h_numbin,
+                h_offset,
+                h_defbin,
+                h_skip,
+                h_rev,
+                h_fwd,
+                use_l1,
+                cfg,
+                (min_gain_shift_a, sum_gradient_a, sum_hessian_a_bumped, num_data_a),
+                (min_gain_shift_b, sum_gradient_b, sum_hessian_b_bumped, num_data_b),
             );
         }
         return Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)));
