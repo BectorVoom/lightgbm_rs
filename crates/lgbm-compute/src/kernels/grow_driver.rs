@@ -330,6 +330,30 @@ fn ondevice_bin_hoist_enabled() -> bool {
     })
 }
 
+/// Read-once `LGBM_GRAD_RESIDENCY != "0"` — default ON; `=0` restores the per-iteration
+/// label f32→f64 convert + host→device label upload + fresh grad/hess device allocs
+/// (the pre-residency `get_gradients_resident_on` pattern) for same-session A/B
+/// comparison. Bit-exact either way (same kernel, same launch geometry — only buffer
+/// provenance differs).
+#[must_use]
+pub fn grad_residency_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_GRAD_RESIDENCY").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Read-once `LGBM_SCORE_FUSED_SCATTER != "0"` — default ON; `=0` restores the
+/// two-kernel `derive_leaf_map_device_handle` → `add_leaf_values_to_resident_score`
+/// per-tree resident score update (single-active-warp derive + `num_data`-length
+/// `-1`-map fill upload) for same-session A/B comparison. Bit-exact either way (each
+/// row written exactly once with the same f64 `+=` of the same leaf value).
+#[must_use]
+pub fn score_fused_scatter_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LGBM_SCORE_FUSED_SCATTER").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
 /// Read-once `LGBM_ONDEVICE_FUSED_PARTITION != "0"` — default ON (mirroring
 /// [`ondevice_bin_hoist_enabled`]). When ON, the host arm of [`partition_resident_range`]
 /// routes through [`partition_leaf_stable_fused`] (one fused pass, no `bins_sub` alloc);
@@ -1416,8 +1440,32 @@ pub struct ResidentScore<R: cubecl::Runtime> {
     score: cubecl::server::Handle,
     /// The score buffer length (one f64 per row).
     num_data: usize,
+    /// Per-train device residency for the objective's grad/hess launch
+    /// ([`GradResidency`]): the f64 labels uploaded ONCE (immutable for the whole
+    /// train) + the f32 grad/hess output buffers allocated ONCE and fully
+    /// overwritten by every launch. Built lazily on the first grad call so the
+    /// constructors stay unchanged; `OnceCell` because the per-iter caller holds
+    /// `&self` (the same shared-borrow discipline as the score handle).
+    grad_residency: std::cell::OnceCell<GradResidency>,
     /// Ties the mirror to its CubeCL runtime `R` without storing one.
     _runtime: std::marker::PhantomData<fn() -> R>,
+}
+
+/// Per-train device-resident objective launch state (owned by [`ResidentScore`]).
+/// The labels are IMMUTABLE for the whole train, so their host f32→f64 convert +
+/// 4·`num_data`-byte host→device upload runs exactly ONCE instead of every
+/// iteration; the grad/hess f32 outputs are allocated once and fully overwritten by
+/// each launch (the kernels write every `i < num_data` cell), so reusing them is
+/// value-identical to the prior per-iter `client.empty` pair while eliminating the
+/// per-iter device alloc/free churn.
+#[derive(Debug)]
+pub struct GradResidency {
+    /// The `[num_data]` f64 label buffer (uploaded once).
+    pub labels_f64: cubecl::server::Handle,
+    /// The `[num_data]` f32 gradient output (reused each iteration).
+    pub grad: cubecl::server::Handle,
+    /// The `[num_data]` f32 hessian output (reused each iteration).
+    pub hess: cubecl::server::Handle,
 }
 
 impl<R: cubecl::Runtime> ResidentScore<R> {
@@ -1430,6 +1478,7 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         Self {
             score,
             num_data,
+            grad_residency: std::cell::OnceCell::new(),
             _runtime: std::marker::PhantomData,
         }
     }
@@ -1449,8 +1498,39 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         Self {
             score,
             num_data: scores.len(),
+            grad_residency: std::cell::OnceCell::new(),
             _runtime: std::marker::PhantomData,
         }
+    }
+
+    /// The per-train [`GradResidency`] (f64 labels uploaded once + reused f32
+    /// grad/hess outputs), built lazily on the first call. `labels` must be the
+    /// train's `[num_data]` label slice; it is converted/uploaded ONLY on the first
+    /// call (the labels are immutable for the whole train, so later calls return the
+    /// cached handles without touching the host slice).
+    ///
+    /// # Errors
+    /// [`ComputeError::LengthMismatch`] if `labels.len() != self.num_data`.
+    pub fn grad_residency(
+        &self,
+        client: &cubecl::prelude::ComputeClient<R>,
+        labels: &[f32],
+    ) -> Result<&GradResidency, ComputeError> {
+        use cubecl::prelude::CubeElement;
+        if labels.len() != self.num_data {
+            return Err(ComputeError::LengthMismatch {
+                expected: self.num_data,
+                actual: labels.len(),
+            });
+        }
+        Ok(self.grad_residency.get_or_init(|| {
+            let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
+            GradResidency {
+                labels_f64: client.create_from_slice(f64::as_bytes(&labels_f64)),
+                grad: client.empty(self.num_data * core::mem::size_of::<f32>()),
+                hess: client.empty(self.num_data * core::mem::size_of::<f32>()),
+            }
+        }))
     }
 
     /// The score buffer length (one f64 per row).
@@ -1499,7 +1579,28 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
                 actual: leaf_values.len(),
             });
         }
-        // Device leaf-map derivation (no readback) → resident scatter (no readback).
+        // FUSED derive+scatter (no readback, no intermediate `num_data`-length leaf-map
+        // buffer): one lane per partition position accumulates
+        // `score[indices[k]] += leaf_value[leaf_of(k)]` in place. Replaces the
+        // `derive_leaf_map_device_handle` → `add_leaf_values_to_resident_score` chain,
+        // whose derive kernel parallelized over LEAVES (a single active warp at
+        // num_leaves=31 serially walking every row — ~O(num_data) serial device time
+        // per tree that the NEXT iteration's blocking grad readback then absorbed).
+        // Bit-exact: disjoint leaf ranges ⇒ each row written exactly once with the
+        // same f64 `+=` of the same value (see the kernel doc). `LGBM_SCORE_FUSED_SCATTER=0`
+        // restores the two-kernel chain for the same-session A/B.
+        if score_fused_scatter_enabled() {
+            return crate::kernels::predict::add_leaf_values_by_ranges_to_resident_score(
+                client,
+                &layout.indices,
+                &layout.leaf_begin,
+                &layout.leaf_count,
+                &self.score,
+                leaf_values,
+                num_data,
+            );
+        }
+        // A/B escape hatch: the pre-fusion derive→scatter chain, byte-identical result.
         let leaf_map = crate::kernels::predict::derive_leaf_map_device_handle(
             client,
             &layout.indices,

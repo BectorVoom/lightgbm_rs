@@ -29,6 +29,9 @@ pub use kernels::grow_driver::GrowFeature;
 pub use kernels::grow_driver::add_prediction_to_score_on_device_resident;
 pub use kernels::grow_driver::read_handle_f32;
 pub use kernels::grow_driver::ResidentScore;
+// The per-train grad/hess device residency (labels uploaded once + reused outputs)
+// and its A/B escape hatch, reached by the `lgbm-boosting` resident grad dispatch.
+pub use kernels::grow_driver::{grad_residency_enabled, GradResidency};
 pub use kernels::predict::derive_leaf_map_device;
 pub use kernels::split::BatchedSplitFeature;
 

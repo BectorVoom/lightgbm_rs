@@ -746,8 +746,11 @@ impl<'a> Gbdt<'a> {
         }
 
         // ---- (2) Boosting(): obj.GetGradients on the CURRENT train score ----
-        let mut gradients = vec![0.0f32; total];
-        let mut hessians = vec![0.0f32; total];
+        // Allocated lazily per arm: the resident device arm REPLACES the Vecs with the
+        // readback wholesale (`gradients = g`), so pre-zeroing 2×`total` f32 there was
+        // pure waste; the host arms need the pre-sized zero buffers for `get_gradients`.
+        let mut gradients: Vec<f32>;
+        let mut hessians: Vec<f32>;
         // The objective receives the WHOLE class-major score buffer. Single-output
         // objectives treat it as their one class; the multiclass softmax gathers
         // strided `rec[k]=score[num_data*k+i]` across classes (a
@@ -776,7 +779,7 @@ impl<'a> Gbdt<'a> {
                 .expect("resident_score is ResidentScore<B::Runtime> for this train's backend");
             match self
                 .objective
-                .get_gradients_resident_on::<B>(client, rs.score_handle(), nd, labels)
+                .get_gradients_resident_on::<B>(client, rs, nd, labels)
             {
                 // The bit-exact envelope (L2/L1/binary): device-in/device-out grad/hess,
                 // read back to host to feed the (host) tree learner. Bit-exact to the host
@@ -800,6 +803,8 @@ impl<'a> Gbdt<'a> {
                 // score stays maintained, but grad/hess falls back to the host path so the
                 // bit-exact contract is never traded for a within-tol device kernel.
                 None => {
+                    gradients = vec![0.0f32; total];
+                    hessians = vec![0.0f32; total];
                     lgbm_treelearner::phase_prof::time(
                         &lgbm_treelearner::phase_prof::GRAD_NS,
                         || {
@@ -814,6 +819,8 @@ impl<'a> Gbdt<'a> {
                 }
             }
         } else {
+            gradients = vec![0.0f32; total];
+            hessians = vec![0.0f32; total];
             lgbm_treelearner::phase_prof::time(&lgbm_treelearner::phase_prof::GRAD_NS, || {
                 self.objective.get_gradients(
                     self.score_updater.scores(),
