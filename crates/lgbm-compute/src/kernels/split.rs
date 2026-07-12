@@ -1228,6 +1228,579 @@ pub fn find_best_splits_fused_siblings_kernel(
     }
 }
 
+// ============================================================================
+// LDS-STAGED per-feature split scan — the scan-occupancy + memory-latency fix.
+//
+// The lane-per-feature fused kernels above launch `ceil(n/W)` cubes for `n`
+// features — at the production shape (n≈50, W=64) that is ONE cube, i.e. one
+// SM busy on the whole GPU, and every lane's sequential scan walks ~2·num_bin
+// dependent f64 loads straight from GLOBAL memory (~500+ cycles each, un-hidden
+// — the drain-mode scan phase measured ~1ms/launch on P100, spike084). These
+// STAGED twins change ONLY the execution geometry, never the math:
+//   * ONE CUBE PER FEATURE (`CubeCount = (n[, 2 siblings])`), so all features'
+//     scans run on different SMs concurrently;
+//   * the cube first COOPERATIVELY loads its feature's `2*num_bin` histogram
+//     cells into shared memory (`SCAN_STAGE_MAX_CELLS` ≤ 256 bins — the same
+//     cap as the LDS build), so the sequential scan's dependent loads hit LDS
+//     (~1 cycle) instead of global memory;
+//   * the REVERSE and FORWARD branches run in TWO LANES concurrently (lane 0 /
+//     lane 1), each a VERBATIM transcription of the corresponding
+//     `split_scan_body` branch, then lane 0 merges the two branch winners.
+//
+// BIT-EXACT by construction: each branch's f64 fold order is unchanged (same
+// loop, same gates, same `select` encoding — only the buffer the loads hit
+// differs, and staging is a pure copy). The two-branch merge reproduces the
+// serial shared-best-state semantics exactly (the proven
+// `find_best_split_cpu_native_2lane` combine): serial FORWARD `take` requires
+// STRICT `cand_gain > best_gain` against a running best that already includes
+// the REVERSE winner, which is equivalent to "FORWARD's within-branch first-max
+// beats REVERSE's winner strictly" — so `select(fwd_gain > rev_gain, fwd, rev)`
+// with REVERSE winning exact ties is the identical winner, threshold, counts,
+// sums, and `default_left`. `is_splittable` is the OR of the branch flags
+// (serial sets it on ANY valid candidate in either branch).
+//
+// GPU-only (`#[cfg(feature = "gpu")]`), and the launcher additionally gates on
+// the RUNTIME being a real device (`R::name(client) != "cpu"`): the cubecl-cpu
+// MLIR anchor keeps the byte-unchanged serial kernels (the bit-exact merge gate
+// must not depend on SharedMemory/sync_cube lowering there). Escape hatch:
+// `LGBM_SCAN_STAGED=0` restores the legacy lane-per-feature launch.
+// ============================================================================
+
+/// LDS staging capacity in f64 cells: `2 * 256` (one feature ≤ 256 bins, the
+/// same per-feature cap as the LDS build's `HIST_LDS_MAX`). 4 KiB of shared
+/// memory per cube; features wider than this fall back to the legacy kernel
+/// (whole-launch fallback in the launcher, never a per-feature mix).
+#[cfg(feature = "gpu")]
+const SCAN_STAGE_MAX_CELLS: usize = 512;
+
+/// Staged-scan cube width: enough lanes to make the cooperative LDS load fast
+/// (512 cells / 64 lanes = 8 strided iterations) while wasting little on the
+/// 2-active-lane scan phase. One wavefront on NVIDIA (2×32); half on AMD (64).
+#[cfg(feature = "gpu")]
+const SCAN_STAGED_CUBE_DIM: u32 = 64;
+
+/// Staged-scan gate (env `LGBM_SCAN_STAGED`, default ON). `"0"` restores the
+/// legacy lane-per-feature launch (including its autotune W-set) — the perf
+/// escape hatch / A/B seam. Read fresh per call (mirrors `scan_cube_dim`) so a
+/// test can flip it without process restart.
+#[cfg(feature = "gpu")]
+fn scan_staged_enabled() -> bool {
+    !matches!(std::env::var("LGBM_SCAN_STAGED").as_deref(), Ok("0"))
+}
+
+/// REVERSE-branch scan reading a STAGED (LDS) histogram — a VERBATIM
+/// transcription of [`split_scan_body`]'s REVERSE block (`feature_histogram.hpp
+/// :854-936`): same literal-init state, same gate order, same monotone `done`,
+/// same branchless `select` encoding, same f64 op order. Differences are purely
+/// mechanical: the histogram reads hit `sm` (the feature's region staged to
+/// shared memory, base 0) instead of the global buffer, and the branch's final
+/// best-state is written to `state[0..6]` (`[is_splittable, best_gain,
+/// threshold, left_count, sum_left_gradient, sum_left_hessian]` — threshold and
+/// count carried as exact small-integer f64s) instead of continuing into the
+/// FORWARD branch. Any drift from `split_scan_body`'s REVERSE block is a
+/// correctness bug (the Kaggle A/B gate pins new-vs-old predictions
+/// bit-identical).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn scan_rev_branch_staged(
+    sm: &Slice<f64>,
+    state: &mut SliceMut<f64>,
+    num_bin: i32,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32, // 0|1
+    use_l1: u32,           // 0|1
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+    num_data: i32,
+    rev_count: i32,
+) {
+    let l1 = lambda_l1;
+    let l2 = lambda_l2;
+    let use_l1_b = use_l1 != 0;
+    let skip_def = skip_default_bin != 0;
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+
+    let mut best_sum_left_gradient = 0.0f64;
+    let mut best_sum_left_hessian = 0.0f64;
+    let mut best_gain = 0.0f64;
+    let mut best_left_count = 0i32;
+    let mut best_threshold = 0i32;
+    let mut is_splittable = 0.0f64;
+
+    let mut sum_right_gradient = 0.0f64;
+    let mut sum_right_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:856)
+    let mut right_count = 0i32;
+
+    let t_start = num_bin - 1 - offset;
+    let count = rev_count;
+    let mut done = false;
+
+    for k in 0..count {
+        let t = t_start - k;
+        let in_range = t >= (1 - offset);
+        let skip = skip_def && (t + offset) == default_bin;
+        let active = in_range && !skip && !done;
+        let t_safe = select(t < 0, 0i32, t);
+        let bi = (t_safe as usize) * 2;
+        let g = sm[bi];
+        let h = sm[bi + 1];
+        sum_right_gradient += select(active, g, 0.0);
+        sum_right_hessian += select(active, h, 0.0);
+        right_count += select(active, round_int(h * cnt_factor), 0i32);
+
+        let left_count = num_data - right_count;
+        let sum_left_hessian = sum_hessian - sum_right_hessian;
+        let sum_left_gradient = sum_gradient - sum_right_gradient;
+        let cont =
+            right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+        let brk = left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+        done = done || (active && !cont && brk);
+        let consider = active && !cont && !done;
+
+        let current_gain = get_split_gains(
+            use_l1_b,
+            sum_left_gradient,
+            sum_left_hessian,
+            sum_right_gradient,
+            sum_right_hessian,
+            l1,
+            l2,
+        );
+        let valid = consider && current_gain > min_gain_shift;
+        is_splittable = select(valid, 1.0, is_splittable);
+        let cand_gain = select(valid, current_gain, 0.0);
+        let take = cand_gain > best_gain;
+        best_left_count = select(take, left_count, best_left_count);
+        best_sum_left_gradient = select(take, sum_left_gradient, best_sum_left_gradient);
+        best_sum_left_hessian = select(take, sum_left_hessian, best_sum_left_hessian);
+        best_threshold = select(take, t - 1 + offset, best_threshold);
+        best_gain = select(take, cand_gain, best_gain);
+    }
+
+    state[0] = is_splittable;
+    state[1] = best_gain;
+    state[2] = f64::cast_from(best_threshold);
+    state[3] = f64::cast_from(best_left_count);
+    state[4] = best_sum_left_gradient;
+    state[5] = best_sum_left_hessian;
+}
+
+/// FORWARD-branch scan reading a STAGED (LDS) histogram — a VERBATIM
+/// transcription of [`split_scan_body`]'s FORWARD block (`feature_histogram.hpp
+/// :937-1029`) with its OWN literal-init best state (the serial body continues
+/// on the REVERSE state; the standalone branch instead reports its within-branch
+/// first-max, and the lane-0 merge reproduces the serial shared-state winner —
+/// see the module note above / `find_best_split_cpu_native_2lane`). Same
+/// mechanical differences as [`scan_rev_branch_staged`]: LDS reads, 6-cell state
+/// output.
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn scan_fwd_branch_staged(
+    sm: &Slice<f64>,
+    state: &mut SliceMut<f64>,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32, // 0|1
+    use_l1: u32,           // 0|1
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+    num_data: i32,
+    fwd_count: i32,
+) {
+    let l1 = lambda_l1;
+    let l2 = lambda_l2;
+    let use_l1_b = use_l1 != 0;
+    let skip_def = skip_default_bin != 0;
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+
+    let mut best_sum_left_gradient = 0.0f64;
+    let mut best_sum_left_hessian = 0.0f64;
+    let mut best_gain = 0.0f64;
+    let mut best_left_count = 0i32;
+    let mut best_threshold = 0i32;
+    let mut is_splittable = 0.0f64;
+
+    let mut sum_left_gradient = 0.0f64;
+    let mut sum_left_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:939)
+    let mut left_count = 0i32;
+
+    let count = fwd_count;
+    let mut done = false;
+
+    for t in 0..count {
+        let skip = skip_def && (t + offset) == default_bin;
+        let active = !skip && !done;
+        let bi = (t as usize) * 2;
+        let g = sm[bi];
+        let h = sm[bi + 1];
+        sum_left_gradient += select(active, g, 0.0);
+        sum_left_hessian += select(active, h, 0.0);
+        left_count += select(active, round_int(h * cnt_factor), 0i32);
+
+        let right_count = num_data - left_count;
+        let sum_right_hessian = sum_hessian - sum_left_hessian;
+        let sum_right_gradient = sum_gradient - sum_left_gradient;
+        let cont = left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+        let brk =
+            right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+        done = done || (active && !cont && brk);
+        let consider = active && !cont && !done;
+
+        let current_gain = get_split_gains(
+            use_l1_b,
+            sum_left_gradient,
+            sum_left_hessian,
+            sum_right_gradient,
+            sum_right_hessian,
+            l1,
+            l2,
+        );
+        let valid = consider && current_gain > min_gain_shift;
+        is_splittable = select(valid, 1.0, is_splittable);
+        let cand_gain = select(valid, current_gain, 0.0);
+        let take = cand_gain > best_gain;
+        best_left_count = select(take, left_count, best_left_count);
+        best_sum_left_gradient = select(take, sum_left_gradient, best_sum_left_gradient);
+        best_sum_left_hessian = select(take, sum_left_hessian, best_sum_left_hessian);
+        best_threshold = select(take, t + offset, best_threshold);
+        best_gain = select(take, cand_gain, best_gain);
+    }
+
+    state[0] = is_splittable;
+    state[1] = best_gain;
+    state[2] = f64::cast_from(best_threshold);
+    state[3] = f64::cast_from(best_left_count);
+    state[4] = best_sum_left_gradient;
+    state[5] = best_sum_left_hessian;
+}
+
+/// Merge the two staged branch states + finalize into the feature's 12-cell
+/// `out` window — the serial shared-best-state semantics (REVERSE wins exact
+/// ties via strict `>`; `default_left` = 1.0 iff the REVERSE branch holds the
+/// winner, including the no-winner init state) followed by a VERBATIM
+/// [`split_scan_body`] finalization (`feature_histogram.hpp:1031-1056` —
+/// left/right outputs, the kEpsilon subtracted back off the reported hessians).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn merge_finalize_staged(
+    state_rev: &Slice<f64>,
+    state_fwd: &Slice<f64>,
+    out: &mut Array<f64>,
+    out_base: u32,
+    use_l1: u32,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    sum_gradient: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+    num_data: i32,
+) {
+    let ob = out_base as usize;
+    let use_l1_b = use_l1 != 0;
+    let rev_gain = state_rev[1];
+    let fwd_gain = state_fwd[1];
+    // Serial FORWARD `take` is STRICT (`cand_gain > best_gain`) against a running
+    // best that includes the REVERSE winner ⇒ FORWARD wins only strictly.
+    let take_fwd = fwd_gain > rev_gain;
+    let any_split = state_rev[0] != 0.0 || state_fwd[0] != 0.0;
+    let is_splittable = select(any_split, 1.0, 0.0);
+    let best_gain = select(take_fwd, fwd_gain, rev_gain);
+    let best_threshold_f = select(take_fwd, state_fwd[2], state_rev[2]);
+    let best_left_count_f = select(take_fwd, state_fwd[3], state_rev[3]);
+    let best_sum_left_gradient = select(take_fwd, state_fwd[4], state_rev[4]);
+    let best_sum_left_hessian = select(take_fwd, state_fwd[5], state_rev[5]);
+    // REVERSE => true=1.0 (also the no-winner init), FORWARD => false=0.0.
+    let best_default_left = select(take_fwd, 0.0, 1.0);
+    // Exact small-integer f64 → i32 round-trip (the state cells carry i32 values).
+    let best_left_count = i32::cast_from(best_left_count_f);
+
+    let eps = f64::cast_from(K_EPSILON);
+    let left_output = calculate_splitted_leaf_output(
+        use_l1_b,
+        best_sum_left_gradient,
+        best_sum_left_hessian,
+        lambda_l1,
+        lambda_l2,
+    );
+    let right_sum_gradient = sum_gradient - best_sum_left_gradient;
+    let right_sum_hessian = sum_hessian - best_sum_left_hessian;
+    let right_output = calculate_splitted_leaf_output(
+        use_l1_b,
+        right_sum_gradient,
+        right_sum_hessian,
+        lambda_l1,
+        lambda_l2,
+    );
+
+    out[ob] = is_splittable;
+    out[ob + 1] = best_threshold_f;
+    out[ob + 2] = best_gain;
+    out[ob + 3] = best_left_count_f;
+    out[ob + 4] = f64::cast_from(num_data - best_left_count);
+    out[ob + 5] = best_sum_left_gradient;
+    out[ob + 6] = best_sum_left_hessian - eps;
+    out[ob + 7] = right_sum_gradient;
+    out[ob + 8] = right_sum_hessian - eps;
+    out[ob + 9] = best_default_left;
+    out[ob + 10] = left_output;
+    out[ob + 11] = right_output;
+}
+
+/// LDS-STAGED fused per-leaf best-split kernel: ONE CUBE PER FEATURE
+/// (`CubeCount::Static(n, 1, 1)`, `CubeDim::new_1d(SCAN_STAGED_CUBE_DIM)` — the
+/// launcher launches EXACTLY `n` cubes, so no tail guard is needed and the
+/// `sync_cube()`s are unconditionally uniform). All lanes cooperatively stage
+/// the feature's `2*num_bin` histogram cells into LDS; lane 0 then runs the
+/// VERBATIM REVERSE branch and lane 1 the VERBATIM FORWARD branch concurrently;
+/// lane 0 merges + finalizes into `out[f*12..f*12+12]`. Bit-identical output to
+/// [`find_best_splits_fused_kernel`] (see the module note above).
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_staged_kernel(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // LEAF-LEVEL scalars (shared across the batch).
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+
+    // Cooperative stage: all lanes copy this feature's histogram region into LDS
+    // (a pure copy — the scan below reads the identical f64 bits). `num_bin` is
+    // validated positive before launch, so the i32→u32 widen is exact.
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    let mut c = UNIT_POS as usize;
+    while c < cells {
+        sm[c] = hist[base + c];
+        c += cd;
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        scan_rev_branch_staged(
+            &sm.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+        );
+    }
+    if UNIT_POS == 1 {
+        scan_fwd_branch_staged(
+            &sm.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            fwd_count[fi],
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            f * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
+/// LDS-STAGED co-packed 2-slot sibling best-split kernel: ONE CUBE PER
+/// (FEATURE, SIBLING) — `CubeCount::Static(n, 2, 1)`; `CUBE_POS_Y` selects the
+/// sibling (0 = A/smaller reads `hist_a`, 1 = B/larger reads `hist_b`) and its
+/// leaf scalars. Output layout identical to
+/// [`find_best_splits_fused_siblings_kernel`]: sibling A's feature `f` at
+/// `out[f*12..]`, sibling B's at `out[(n+f)*12..]`. Bit-identical results (the
+/// staged geometry note above; per-feature params are SHARED between siblings).
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_staged_kernel(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    // SHARED per-feature params (length n; both siblings share the dataset layout).
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // SHARED cfg scalars.
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    // PER-SIBLING leaf scalars (A = smaller, B = larger).
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    // Per-sibling feature count (n) — the B sibling's out window offset.
+    n_feats: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+
+    // Select this cube's sibling scalars (an Array ref cannot be `select`ed, so
+    // the stage loop below branches on the sibling instead).
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    // Cooperative stage from THIS sibling's histogram (pure copy). `num_bin` is
+    // validated positive before launch, so the i32→u32 widen is exact.
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_b[base + c];
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_a[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        scan_rev_branch_staged(
+            &sm.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+        );
+    }
+    if UNIT_POS == 1 {
+        scan_fwd_branch_staged(
+            &sm.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            fwd_count[fi],
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        // A's feature f → window f; B's → window n_feats + f (the legacy lane
+        // mapping `g = sib*n + f`).
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
 /// FUSED batched per-leaf best-split launcher, **generic over the runtime** `R`.
 /// Finds the best split for EVERY feature in
 /// `feats` in ONE launch of [`find_best_splits_fused_kernel`], returning one
@@ -1490,8 +2063,12 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     // the host-buf launcher's one-time upload — either way it describes `buf_len`
     // f64 cells and is never read back (only the SplitInfo cells are).
     let h_hist = hist_handle;
-    let zeros = vec![0.0f64; out_len];
-    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    // `out` needs NO zero-fill upload: every kernel variant (legacy lane-per-
+    // feature, staged, and the autotune probes — all OVERWRITE-class) writes all
+    // 12 cells of every feature window unconditionally at finalization, so an
+    // uninitialized device allocation is observably identical to the old
+    // uploaded-zeros buffer (one fewer H2D per scan).
+    let h_out = client.empty(out_len * std::mem::size_of::<f64>());
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
     let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
     let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
@@ -1521,6 +2098,57 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     }
     let _t_launch = std::time::Instant::now();
 
+    // STAGED cube-per-feature scan (the scan-occupancy + LDS-latency fix) —
+    // takes precedence over BOTH the autotune W-set and the legacy W launch when
+    //   * `LGBM_SCAN_STAGED != 0` (default ON — escape hatch),
+    //   * the runtime is a real device (`R::name != "cpu"`; the cubecl-cpu
+    //     anchor keeps the byte-unchanged serial kernel — the bit-exact merge
+    //     gate must not depend on LDS/sync lowering there), and
+    //   * every feature's region fits the LDS stage (≤ 256 bins — whole-launch
+    //     fallback, never a per-feature mix).
+    // Bit-identical results (see the staged-kernel module note), so no parity
+    // seam is needed; the env is purely a perf escape hatch.
+    #[cfg(feature = "gpu")]
+    let staged = scan_staged_enabled()
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
+    #[cfg(not(feature = "gpu"))]
+    let staged = false;
+
+    #[cfg(feature = "gpu")]
+    if staged {
+        // SAFETY: identical obligations to the legacy launch below (validated
+        // per-feature regions ≤ buf_len; out window `f*12..f*12+12` within the
+        // `n*12` allocation; per-feature arrays sized exactly `n`). The launch
+        // geometry guarantees CUBE_POS_X < n (CubeCount::Static(n)), matching
+        // the kernel's no-guard contract.
+        unsafe {
+            find_best_splits_fused_staged_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                ArrayArg::from_raw_parts(h_hist.clone(), buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot.clone(), n),
+                ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                ArrayArg::from_raw_parts(h_offset.clone(), n),
+                ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                ArrayArg::from_raw_parts(h_skip.clone(), n),
+                ArrayArg::from_raw_parts(h_rev.clone(), n),
+                ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift,
+                sum_gradient,
+                sum_hessian_bumped,
+                num_data,
+            );
+        }
+    }
+
     // Autotune-or-fallback selection of the scan width W.
     //   (a) autotune default-ON UNLESS `LGBM_AUTOTUNE=0` OR an explicit
     //       `LGBM_SCAN_CUBEDIM` override (the override always wins — it is the documented
@@ -1531,8 +2159,9 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     //       (covers `LGBM_AUTOTUNE=0`, an explicit `LGBM_SCAN_CUBEDIM`, and the non-rocm
     //       `scan_cube_dim()==1` bit-exact oracle path).
     #[cfg(feature = "gpu")]
-    let autotuned =
-        autotune::autotune_enabled() && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
+    let autotuned = !staged
+        && autotune::autotune_enabled()
+        && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
     #[cfg(not(feature = "gpu"))]
     let autotuned = false;
 
@@ -1571,7 +2200,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         SCAN_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
     }
 
-    if !autotuned {
+    if !autotuned && !staged {
         // Scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
         // (env `LGBM_SCAN_CUBEDIM`; rocm default W=64, W=1 = byte-identical to the
         // original) is the cube width W; `CubeCount = ceil(n / W)`. The kernel indexes
@@ -1831,10 +2460,11 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         cfg.lambda_l2,
     ) + cfg.min_gain_to_split;
 
-    // `out` packs A then B contiguously: 2*n features × 12 cells.
+    // `out` packs A then B contiguously: 2*n features × 12 cells. NO zero-fill
+    // upload: every kernel variant writes all 12 cells of every window
+    // unconditionally (see the single-slot launcher note).
     let out_len = 2 * n * 12;
-    let zeros = vec![0.0f64; out_len];
-    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    let h_out = client.empty(out_len * std::mem::size_of::<f64>());
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
     let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
     let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
@@ -1858,6 +2488,55 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         );
     }
 
+    // STAGED cube-per-(feature, sibling) scan — the SAME precedence/gates as the
+    // single-slot launcher (`LGBM_SCAN_STAGED != 0`, real device runtime, every
+    // feature ≤ 256 bins). ONE launch of `CubeCount::Static(n, 2, 1)` covers
+    // both siblings; bit-identical output layout + values (staged-kernel note).
+    #[cfg(feature = "gpu")]
+    let staged = scan_staged_enabled()
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
+    #[cfg(not(feature = "gpu"))]
+    let staged = false;
+
+    #[cfg(feature = "gpu")]
+    if staged {
+        // SAFETY: identical obligations to the legacy sibling launch below; the
+        // geometry guarantees CUBE_POS_X < n and CUBE_POS_Y < 2, matching the
+        // kernel's no-guard contract.
+        unsafe {
+            find_best_splits_fused_siblings_staged_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 2, 1),
+                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist_a_handle.clone(), buf_len),
+                ArrayArg::from_raw_parts(hist_b_handle.clone(), buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot.clone(), n),
+                ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                ArrayArg::from_raw_parts(h_offset.clone(), n),
+                ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                ArrayArg::from_raw_parts(h_skip.clone(), n),
+                ArrayArg::from_raw_parts(h_rev.clone(), n),
+                ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                num_data_a,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                num_data_b,
+                n as u32,
+            );
+        }
+    }
+
     // Autotune-or-fallback selection of the scan width W — the SAME
     // guard as the single-leaf `find_best_splits_fused_inner`, here for the co-pack
     // 2-slot sibling scan (the production hot path). The sibling kernel is the
@@ -1865,8 +2544,9 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     // also uses CloneInputGenerator; it runs under the SEPARATE `SCAN_SIBLINGS_TUNER`
     // namespace so its cache never collides with the single-leaf scan's.
     #[cfg(feature = "gpu")]
-    let autotuned =
-        autotune::autotune_enabled() && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
+    let autotuned = !staged
+        && autotune::autotune_enabled()
+        && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
     #[cfg(not(feature = "gpu"))]
     let autotuned = false;
 
@@ -1908,7 +2588,7 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
         SCAN_SIBLINGS_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
     }
 
-    if !autotuned {
+    if !autotuned && !staged {
         // CubeCount over 2*n feature-slots (the lane mapping packs A then B).
         let scan_w = scan_cube_dim();
         let cube_count = (2 * n as u32).div_ceil(scan_w);
