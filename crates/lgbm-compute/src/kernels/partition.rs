@@ -1101,14 +1101,27 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
     }
 }
 
-/// Read-once `LGBM_PARTITION_FUSE_BC=="1"` — OPT-IN (default OFF until spike098
-/// validates on real CUDA): fold the resident partition's stage B (block-totals
-/// scan + child-range write, a 1-cube trivial kernel whose whole cost is the ~91µs
-/// launch) INTO the stage-C scatter via [`resident_scatter_fused_bc_kernel`] — one
-/// fewer launch per split (~3000/train, the spike095/096 host-enqueue lever).
-/// Bit-exact by construction (the cube-per-block scatter recomputes the SAME integer
-/// exclusive base + total the stage-B scan produced). Unlike the staged scan family,
-/// the resident partition kernels lower on cubecl-cpu, so this is validated LOCALLY.
+/// Read-once `LGBM_PARTITION_FUSE_BC=="1"` — OPT-IN, default OFF (MEASURED
+/// NET-NEGATIVE on P100, see below): fold the resident partition's stage B
+/// (block-totals scan + child-range write, a 1-cube kernel whose whole cost is the
+/// ~91µs launch) INTO the stage-C scatter via [`resident_scatter_fused_bc_kernel`] —
+/// one fewer launch per split. Bit-exact by construction (the cube-per-block scatter
+/// recomputes the SAME integer exclusive base + total the stage-B scan produced), and
+/// validated LOCALLY (the partition kernels lower on cubecl-cpu, unlike the staged
+/// scan family) by `partition_bc_fusion_byte_identical_to_three_launch`.
+///
+/// VERDICT (spike098, P100, 500k×50×100 trees, order-ALTERNATED warm-median of 3,
+/// preds BIT-IDENTICAL max_abs=0.0): fusebc 8.15s vs base 7.97s (0.978×, ~180ms
+/// SLOWER); drained partition bucket 596→720ms. Root cause: to stay
+/// cubecl-cpu-runnable the fused scatter has EACH unit recompute its block base by a
+/// serial ≤1024-add sum of the raw totals (cubecl-cpu does not share SharedMemory
+/// across units, so a 1-thread-computes-into-SM design corrupts there). That
+/// per-unit redundant sum (256 units × up-to-1024 adds × up-to-1024 cubes) costs
+/// MORE device time than the ~91µs launch it removes. A SharedMemory version
+/// (1 thread computes) would fix the device cost but is real-device-only (loses the
+/// local validation) — not worth the two-path complexity for a lever this size. The
+/// hatch is KEPT (bit-exact) for hardware where launch throughput is the harder
+/// limit (weaker per-launch dispatch / fewer SMs) and the redundant sum is cheap.
 #[must_use]
 pub fn partition_fuse_bc_enabled() -> bool {
     // Same-session A/B override (mirrors the grow-driver hatches): the env gate is
