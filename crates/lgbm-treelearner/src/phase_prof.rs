@@ -243,6 +243,10 @@ pub fn dump(label: &str) {
     // total) so the `device_launches=(?P<launches>\d+)` capture stays stable.
     let on_dev_partition_resident =
         lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
+    // The PARGAIN scan tripwire (LGBM_SCAN_PARGAIN=1): one bump per staged-scan
+    // launch that dispatched the parallel-candidate kernel. NONZERO proves the
+    // pargain arm ran; 0 on the default serial-branch staged path.
+    let scan_pargain = lgbm_compute::kernels::split::scan_pargain_count_take();
     if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
         let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
@@ -252,7 +256,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the

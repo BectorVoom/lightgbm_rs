@@ -1881,6 +1881,28 @@ fn scan_pargain_enabled() -> bool {
     matches!(std::env::var("LGBM_SCAN_PARGAIN").as_deref(), Ok("1"))
 }
 
+/// POSITIVE tripwire — bumped once per staged-scan launch that dispatched the
+/// PARGAIN kernel (the bench-protocol counts proof: never trust a wall delta
+/// without ledger confirmation the code-under-test ran). Folded into the
+/// `phase_prof` COUNTS line as `scan_pargain=`. Unconditional (a Relaxed
+/// increment per LAUNCH, not per candidate — timing-neutral at ~1/split).
+#[cfg(feature = "gpu")]
+pub static SCAN_PARGAIN_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the pargain-launch tripwire to zero and return the prior value
+/// (consumed by `phase_prof::dump`). Present on every build (0 without `gpu`)
+/// so the dump site needs no cfg.
+pub fn scan_pargain_count_take() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        SCAN_PARGAIN_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        0
+    }
+}
+
 /// PHASE 1, REVERSE branch: the accumulation walk of [`scan_rev_branch_staged`]
 /// with the gain/best logic REMOVED and each candidate's state STORED —
 /// `cand_ag`/`cand_ah` hold the branch-ACCUMULATED right-side pair (the serial
@@ -2595,6 +2617,7 @@ unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
         };
     }
     if scan_pargain_enabled() {
+        SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_staged_par_kernel);
     } else {
         launch_with!(find_best_splits_fused_staged_kernel);
@@ -2666,6 +2689,7 @@ unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
         };
     }
     if scan_pargain_enabled() {
+        SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_siblings_staged_par_kernel);
     } else {
         launch_with!(find_best_splits_fused_siblings_staged_kernel);
