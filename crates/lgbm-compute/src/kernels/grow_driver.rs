@@ -466,21 +466,25 @@ pub fn on_device_partition_resident_count_take() -> u64 {
     ON_DEVICE_PARTITION_RESIDENT_CNT.swap(0, Ordering::Relaxed)
 }
 
-/// Read-once `LGBM_SUBTRACT_FUSE=="1"` — OPT-IN (default OFF until spike097
-/// validates on real CUDA): fold the subtraction trick INTO the co-pack sibling
-/// scan (`find_best_splits_fused_siblings_subtract_staged_kernel`), so the larger
+/// Read-once `LGBM_SUBTRACT_FUSE != "0"` — DEFAULT ON (validated 1.043× on real
+/// CUDA, spike097: warm-median 8.19s→7.85s, preds bit-identical, drained scan
+/// 2149→1813ms; `=0` restores the separate subtract launch for A/B/rollback):
+/// fold the subtraction trick INTO the co-pack sibling scan
+/// (`find_best_splits_fused_siblings_subtract_staged_kernel`), so the larger
 /// child's histogram is derived `parent − smaller` DURING the scan's staging and
 /// the separate `subtract_resident` launch is DROPPED — the spike095/096
-/// host-enqueue lever (~3000 launches/train + folds the subtract device time into
-/// the scan). Bit-exact by construction (the same elementwise f64 subtract, the
-/// same scan of the same values); the `partition_resident`-style counts tripwire
-/// `subtract_fused=` in the phase_prof ledger proves the arm ran. Consulted by the
-/// GpuBackend's `subtract_scan_resident_siblings_into_frontier`; when OFF (or the
-/// staged path does not apply) the byte-unchanged separate subtract + co-scan runs.
+/// host-enqueue lever (drops ~2385 subtract launches/train — the co-pack-scannable
+/// splits — and folds the subtract device time into the scan). Bit-exact by
+/// construction (the same elementwise f64 subtract, the same scan of the same
+/// values); the counts tripwire `subtract_fused=` in the phase_prof ledger proves
+/// the arm ran. Consulted by the GpuBackend's
+/// `subtract_scan_resident_siblings_into_frontier`; when OFF (or the staged path
+/// does not apply — cubecl-cpu anchor, pargain, feature > LDS cap) the
+/// byte-unchanged separate subtract + co-scan runs.
 #[must_use]
 pub fn subtract_fuse_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("LGBM_SUBTRACT_FUSE").map(|v| v == "1").unwrap_or(false))
+    *E.get_or_init(|| std::env::var("LGBM_SUBTRACT_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// POSITIVE tripwire — bumped once per split that took the FUSED subtract+scan arm
