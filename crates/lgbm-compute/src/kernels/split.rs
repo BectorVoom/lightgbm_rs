@@ -1279,13 +1279,25 @@ const SCAN_STAGE_MAX_CELLS: usize = 512;
 #[cfg(feature = "gpu")]
 const SCAN_STAGED_CUBE_DIM: u32 = 64;
 
-/// Staged-scan gate (env `LGBM_SCAN_STAGED`, default ON). `"0"` restores the
-/// legacy lane-per-feature launch (including its autotune W-set) — the perf
-/// escape hatch / A/B seam. Read fresh per call (mirrors `scan_cube_dim`) so a
-/// test can flip it without process restart.
+/// Staged-scan gate (env `LGBM_SCAN_STAGED`, default OFF — opt-in with `"1"`,
+/// the `LGBM_FUSED_FORCE` flat-to-negative-kernel precedent). Read fresh per
+/// call (mirrors `scan_cube_dim`) so a test can flip it without restart.
+///
+/// VERDICT (spike091, P100, 500k×50×100 trees, warm-median of 3, same-session
+/// A/B): staged measured NET-NEGATIVE — 10.48s (legacy) → 10.91s (staged),
+/// consistent across runs, predictions BIT-IDENTICAL (max_abs = 0.0, the
+/// correctness gate). Two reasons: (a) the scan's true DEVICE time was never
+/// the wall driver — the free-run ledger shows the wall is dominated by
+/// `pick` (the per-split blocking export absorbing all queued device work,
+/// 3100 syncs/train), partition, and ~13k per-train launch enqueues; and
+/// (b) the "concurrent" REVERSE/FORWARD lanes sit in the SAME warp
+/// (`UNIT_POS` 0 and 1), so SIMT divergence serializes them anyway — the
+/// staged kernel pays LDS staging + a 50-cube launch for no branch overlap.
+/// A future retry should put the branches in different warps (lane 0 / lane
+/// 32) — worthwhile only once pick/enqueue no longer dominate the wall.
 #[cfg(feature = "gpu")]
 fn scan_staged_enabled() -> bool {
-    !matches!(std::env::var("LGBM_SCAN_STAGED").as_deref(), Ok("0"))
+    matches!(std::env::var("LGBM_SCAN_STAGED").as_deref(), Ok("1"))
 }
 
 /// REVERSE-branch scan reading a STAGED (LDS) histogram — a VERBATIM
