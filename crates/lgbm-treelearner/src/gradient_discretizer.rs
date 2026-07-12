@@ -11,8 +11,14 @@
 //! default exact path never touches this code. The parity target is C++
 //! `use_quantized_grad=true, stochastic_rounding=false`, NOT the f64 exact anchor.
 //!
-//! Stochastic rounding + `quant_train_renew_leaf` are deferred — they need
-//! RNG-matching, a separate parity problem. This module is deterministic-only.
+//! Stochastic rounding (`new_stochastic`, C++'s `stochastic_rounding` default) is also
+//! implemented in this module (see the `stochastic` field doc below): it is functionally
+//! faithful to C++ but NOT bit-matched, since Rust uses a seeded xorshift64 rather than C++'s
+//! precomputed mt19937 sequence — the DETERMINISTIC path above remains the bit-tractable C++
+//! parity gate, while the stochastic path is verified via a magnitude-regime delta gate
+//! (`crates/oracle-harness/tests/quantized_parity.rs`). `quant_train_renew_leaf` (leaf-output
+//! renewal from the original, non-quantized gradients) is implemented at the `Gbdt` call site,
+//! not in this module.
 
 /// Quantization scales + the deterministic quantize/de-quantize math.
 ///

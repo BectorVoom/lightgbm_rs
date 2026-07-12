@@ -135,8 +135,8 @@ pub fn coerce_params_dict(params: &Bound<'_, PyDict>) -> PyResult<HashMap<String
 /// unported knob NEVER silently trains a divergent model (T-08-05-01).
 ///
 /// A key is rejected when its alias-resolved canonical name is in
-/// [`OUT_OF_SCOPE_PARAMS`] (distributed / GPU-OpenCL / linear-tree / quantized-
-/// grad — referenced from the single source of truth in `lgbm_core`, not
+/// [`OUT_OF_SCOPE_PARAMS`] (distributed / GPU-OpenCL / linear-tree —
+/// referenced from the single source of truth in `lgbm_core`, not
 /// re-typed here), OR it is `device_type` set to `gpu`/`cuda` while this wheel is
 /// CPU-only (a matching GPU backend compiled in via `--features cuda`/`rocm`/`wgpu`
 /// makes the corresponding `device_type` accepted).
@@ -153,8 +153,8 @@ pub fn reject_unimplemented(map: &HashMap<String, String>) -> PyResult<()> {
         if OUT_OF_SCOPE_PARAMS.contains(&canonical) {
             return Err(PyValueError::new_err(format!(
                 "parameter `{key}` is recognized by LightGBM but not implemented in \
-                 lightgbm_rs (out-of-scope for v1: distributed / GPU-OpenCL / linear-tree / \
-                 quantized-grad). Remove it to train, or use the C++ LightGBM for this feature."
+                 lightgbm_rs (out-of-scope for v1: distributed / GPU-OpenCL / linear-tree). \
+                 Remove it to train, or use the C++ LightGBM for this feature."
             )));
         }
         if canonical == "device_type" {
@@ -313,8 +313,21 @@ mod tests {
         m.insert("linear_tree".to_string(), "true".to_string());
         assert!(reject_unimplemented(&m).is_err());
 
+        // QGP-06: use_quantized_grad and its 3 siblings are now IN SCOPE — must be accepted.
+        for key in [
+            "use_quantized_grad",
+            "num_grad_quant_bins",
+            "quant_train_renew_leaf",
+            "stochastic_rounding",
+        ] {
+            let mut m = HashMap::new();
+            m.insert(key.to_string(), "true".to_string());
+            assert!(reject_unimplemented(&m).is_ok(), "{key} must no longer be rejected");
+        }
+
+        // Regression guard: an unrelated still-out-of-scope key is still rejected.
         let mut m = HashMap::new();
-        m.insert("use_quantized_grad".to_string(), "true".to_string());
+        m.insert("num_machines".to_string(), "2".to_string());
         assert!(reject_unimplemented(&m).is_err());
 
         let mut m = HashMap::new();

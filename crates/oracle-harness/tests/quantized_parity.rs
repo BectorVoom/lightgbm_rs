@@ -211,3 +211,54 @@ fn read_named_preds(name: &str) -> Vec<f64> {
         .map(|l| l.trim().parse::<f64>().unwrap())
         .collect()
 }
+
+/// QGP-09: drive training through the ACTUAL `Config::from_params` string-param path (not
+/// direct field mutation / `TrainingBuilder`) to prove the T-01..T-05 wiring closes the loop
+/// for a dict-style caller (Python bindings, or any future CLI/dict-driven caller).
+#[test]
+fn rust_quantized_train_from_params_matches_cpp() {
+    use std::collections::HashMap;
+
+    use lgbm::{train_raw, Config, RawCorpus};
+
+    let (rows, labels) = read_xy();
+    let golden = read_preds();
+
+    let mut m: HashMap<String, String> = HashMap::new();
+    for (k, v) in [
+        ("objective", "binary"),
+        ("num_leaves", "7"),
+        ("min_data_in_leaf", "5"),
+        ("max_bin", "63"),
+        ("learning_rate", "0.1"),
+        ("use_quantized_grad", "true"),
+        ("num_grad_quant_bins", "128"),
+        ("stochastic_rounding", "false"),
+        ("quant_train_renew_leaf", "false"),
+        ("deterministic", "true"),
+        ("force_row_wise", "true"),
+        ("num_threads", "1"),
+        ("seed", "1"),
+        ("feature_pre_filter", "false"),
+        ("num_iterations", "10"),
+    ] {
+        m.insert(k.to_string(), v.to_string());
+    }
+
+    let cfg = Config::from_params(&m).expect("from_params must accept all quantized-grad keys");
+    assert!(cfg.use_quantized_grad);
+    assert_eq!(cfg.num_grad_quant_bins, 128);
+    assert!(!cfg.stochastic_rounding);
+    assert!(!cfg.quant_train_renew_leaf);
+
+    let booster =
+        train_raw(&cfg, &RawCorpus::new(rows.clone(), labels)).expect("train via from_params config");
+    let pred: Vec<f32> = booster.predict(&rows).iter().map(|r| r[0]).collect();
+
+    let max_delta = pred
+        .iter()
+        .zip(golden.iter())
+        .map(|(a, b)| (f64::from(*a) - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(max_delta < 1e-2, "from_params-driven training diverged from C++ golden: max={max_delta:.3e}");
+}

@@ -301,6 +301,17 @@ pub struct Gbdt<'a> {
     /// `lambda_l1` / `lambda_l2` for the renewed-leaf formula `-ThresholdL1(ΣG,l1)/(ΣH+l2)`.
     quant_l1: f64,
     quant_l2: f64,
+    /// `config_->linear_tree`. When true (and raw features are supplied via
+    /// [`Self::with_linear_tree`]), each non-first tree gets per-leaf linear models
+    /// fitted after growth (`LinearTreeLearner::CalculateLinear`). The first tree of
+    /// the ensemble stays constant.
+    linear_tree: bool,
+    /// `config_->linear_lambda` — L2 penalty on the per-leaf linear coefficients.
+    linear_lambda: f64,
+    /// Row-major raw feature matrix (`num_data * num_features`, `f64`), indexed by
+    /// ORIGINAL feature index — required by the linear-tree leaf fit. `None` ⇒ the
+    /// linear-tree path is inactive even if `linear_tree` is set.
+    raw_features: Option<Vec<f64>>,
     /// The GBDT-owned, TRAIN-LIFETIME resident f64 score
     /// buffer ([`lgbm_compute::ResidentScore`]<`B::Runtime`>), type-erased because
     /// `Gbdt` is not `Backend`-generic (downcast inside the `B`-generic methods). Built
@@ -407,9 +418,29 @@ impl<'a> Gbdt<'a> {
             quant_renew_leaf: false,
             quant_l1: 0.0,
             quant_l2: 0.0,
+            linear_tree: false,
+            linear_lambda: 0.0,
+            raw_features: None,
             resident_score: None,
             resident_active: None,
         }
+    }
+
+    /// Enable linear-tree training: after each non-first tree's structure is grown,
+    /// fit per-leaf linear models over the RAW features (C++ `LinearTreeLearner`).
+    /// `raw_features` is row-major `num_data * num_features` (`f64`), indexed by
+    /// ORIGINAL feature index. No-op unless `enabled`.
+    #[must_use]
+    pub fn with_linear_tree(
+        mut self,
+        enabled: bool,
+        linear_lambda: f64,
+        raw_features: Vec<f64>,
+    ) -> Self {
+        self.linear_tree = enabled;
+        self.linear_lambda = linear_lambda;
+        self.raw_features = if enabled { Some(raw_features) } else { None };
+        self
     }
 
     /// Enable `quant_train_renew_leaf`: after each quantized tree is grown, recompute its leaf
@@ -704,6 +735,11 @@ impl<'a> Gbdt<'a> {
                 && self.bagging.is_none()
                 && self.goss.is_none()
                 && self.variant == BoostingVariant::Gbdt
+                // Linear trees fit + score on the HOST (`add_linear_tree_train_path`
+                // writes `self.score` directly); the resident device score buffer is
+                // NOT synced by that path, so its gradients would go stale after the
+                // first linear tree. Force the host path when linear_tree is on.
+                && !self.linear_tree
                 && lgbm_compute::device_objective_supported(self.objective.name())
                 && self.boosting_on_cuda();
             self.resident_active = Some(active);
@@ -1095,9 +1131,52 @@ impl<'a> Gbdt<'a> {
                 // any future device RenewTreeOutput refit slots in at the existing
                 // renew site above, NOT here — do not reorder.
                 //
+                // LINEAR TREE (C++ `LinearTreeLearner::CalculateLinear`): fit
+                // per-leaf linear models over the RAW features BEFORE shrinkage
+                // (which then folds the learning rate into leaf_const/leaf_coeff,
+                // exactly as `Tree::shrinkage` also scales leaf_value). Non-first
+                // trees only — the ensemble's first tree stays constant.
+                let linear_active =
+                    self.linear_tree && !is_first_tree && self.raw_features.is_some();
+                if linear_active {
+                    let raw = self.raw_features.as_ref().unwrap();
+                    let nfeat = raw.len() / nd.max(1);
+                    lgbm_treelearner::linear::fit_linear_leaves(
+                        &mut tree,
+                        raw,
+                        nfeat,
+                        grad,
+                        hess,
+                        self.linear_lambda,
+                        &partition,
+                    );
+                }
+                //
                 // Shrinkage BEFORE UpdateScore.
                 tree.shrinkage(shrink_rate);
-                // UpdateScore: bit-exact training-path per-leaf scatter into score_.
+                // UpdateScore. A LINEAR tree's contribution is its per-row linear
+                // output (const + Σ coeff·x), NOT the constant leaf_value the
+                // train-path scatter would add — so linear trees score through the
+                // predict-path over the raw feature rows (`Tree::predict` is
+                // linear-aware). The non-linear path keeps the bit-exact
+                // training-path per-leaf scatter into score_.
+                if linear_active {
+                    let raw = self.raw_features.as_ref().unwrap();
+                    let nfeat = raw.len() / nd.max(1);
+                    self.score_updater.add_linear_tree_train_path(
+                        &tree,
+                        &partition,
+                        cur_tree_id,
+                        raw,
+                        nfeat,
+                    );
+                    let init = init_scores[cur_tree_id as usize];
+                    if Objective::init_score_is_significant(init) {
+                        tree.add_bias(init);
+                    }
+                    self.trees.push(tree);
+                    continue;
+                }
                 // Times into the whole-train budget.
                 //
                 // RESIDENT slice: when the

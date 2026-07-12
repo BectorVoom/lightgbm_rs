@@ -197,6 +197,87 @@ fn bool_coercion_matches_cpp() {
 }
 
 // ---------------------------------------------------------------------------
+// QGP-01/03/04: quantized-gradient boolean params (`use_quantized_grad`,
+// `quant_train_renew_leaf`, `stochastic_rounding`) parse and default correctly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quantized_grad_bool_params_parse_and_default() {
+    // use_quantized_grad: default false, roundtrip true/false, invalid -> InvalidType.
+    let c = Config::from_params(&params(&[])).unwrap();
+    assert!(!c.use_quantized_grad, "default use_quantized_grad must be false");
+
+    let c = Config::from_params(&params(&[("use_quantized_grad", "true")])).unwrap();
+    assert!(c.use_quantized_grad);
+
+    let c = Config::from_params(&params(&[("use_quantized_grad", "false")])).unwrap();
+    assert!(!c.use_quantized_grad);
+
+    assert!(matches!(
+        Config::from_params(&params(&[("use_quantized_grad", "maybe")])),
+        Err(ConfigError::InvalidType { param, .. }) if param == "use_quantized_grad"
+    ));
+
+    // quant_train_renew_leaf: default false, roundtrip true/false, invalid -> InvalidType.
+    let c = Config::from_params(&params(&[])).unwrap();
+    assert!(!c.quant_train_renew_leaf, "default quant_train_renew_leaf must be false");
+
+    let c = Config::from_params(&params(&[("quant_train_renew_leaf", "true")])).unwrap();
+    assert!(c.quant_train_renew_leaf);
+
+    let c = Config::from_params(&params(&[("quant_train_renew_leaf", "false")])).unwrap();
+    assert!(!c.quant_train_renew_leaf);
+
+    assert!(matches!(
+        Config::from_params(&params(&[("quant_train_renew_leaf", "maybe")])),
+        Err(ConfigError::InvalidType { param, .. }) if param == "quant_train_renew_leaf"
+    ));
+
+    // stochastic_rounding: default TRUE (C++ config.h default), roundtrip, invalid -> InvalidType.
+    let c = Config::from_params(&params(&[])).unwrap();
+    assert!(c.stochastic_rounding, "default stochastic_rounding must be true (C++ config.h default)");
+
+    let c = Config::from_params(&params(&[("stochastic_rounding", "false")])).unwrap();
+    assert!(!c.stochastic_rounding);
+
+    let c = Config::from_params(&params(&[("stochastic_rounding", "true")])).unwrap();
+    assert!(c.stochastic_rounding);
+
+    assert!(matches!(
+        Config::from_params(&params(&[("stochastic_rounding", "maybe")])),
+        Err(ConfigError::InvalidType { param, .. }) if param == "stochastic_rounding"
+    ));
+}
+
+#[test]
+fn num_grad_quant_bins_parses_and_validates_range() {
+    let c = Config::from_params(&params(&[])).unwrap();
+    assert_eq!(c.num_grad_quant_bins, 4, "default num_grad_quant_bins");
+
+    let c = Config::from_params(&params(&[("num_grad_quant_bins", "128")])).unwrap();
+    assert_eq!(c.num_grad_quant_bins, 128);
+
+    // boundaries: 1 and 254 are valid (GradientDiscretizer::new's own 1..=254 contract).
+    let c = Config::from_params(&params(&[("num_grad_quant_bins", "1")])).unwrap();
+    assert_eq!(c.num_grad_quant_bins, 1);
+    let c = Config::from_params(&params(&[("num_grad_quant_bins", "254")])).unwrap();
+    assert_eq!(c.num_grad_quant_bins, 254);
+
+    assert!(matches!(
+        Config::from_params(&params(&[("num_grad_quant_bins", "0")])),
+        Err(ConfigError::OutOfRange { param, .. }) if param == "num_grad_quant_bins"
+    ));
+    assert!(matches!(
+        Config::from_params(&params(&[("num_grad_quant_bins", "255")])),
+        Err(ConfigError::OutOfRange { param, .. }) if param == "num_grad_quant_bins"
+    ));
+    assert!(matches!(
+        Config::from_params(&params(&[("num_grad_quant_bins", "-4")])),
+        Err(ConfigError::OutOfRange { param, .. }) if param == "num_grad_quant_bins"
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // CR-01: empty-string value == ABSENT (no-op), matching C++ Get* helpers which
 // guard on `params.count(name) > 0 && !params.at(name).empty()` (config.h
 // 1165-1218). Applies to the `seed` lookup and the six enum reads (task,

@@ -577,6 +577,7 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
         &lgbm_treelearner::phase_prof::BINNING_NS,
         || build_feature_columns_from_raw_with_config(corpus, config),
     )?;
+    let raw_features = raw_matrix_from_columns(corpus, config);
     train_inner_columns(
         config,
         corpus.num_data() as i32,
@@ -586,6 +587,7 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
         boost_obj,
         transformed_labels,
         metrics,
+        raw_features,
     )
 }
 
@@ -948,6 +950,7 @@ where
         None => vec![EvalMetric::Reg(Metric::L2)],
     };
     let features = build_feature_columns_from_raw_with_config(corpus, config)?;
+    let raw_features = raw_matrix_from_columns(corpus, config);
     train_inner_columns(
         config,
         corpus.num_data() as i32,
@@ -957,6 +960,7 @@ where
         BoostObjective::Custom(custom),
         corpus.labels.clone(),
         metrics,
+        raw_features,
     )
 }
 
@@ -1001,6 +1005,13 @@ fn train_inner_full(
         &lgbm_treelearner::phase_prof::SETUP_NS,
         || feature_infos_from_rows(&corpus.features, num_features),
     );
+    // Linear tree: the DenseCorpus is identity-binned (raw value == bin index), so
+    // its row-major `features` ARE the raw feature matrix the linear fit needs.
+    let raw_features = if config.linear_tree {
+        Some(corpus.features.iter().flatten().copied().collect::<Vec<f64>>())
+    } else {
+        None
+    };
     train_inner_columns_full(
         config,
         corpus.features.len() as i32,
@@ -1011,6 +1022,7 @@ fn train_inner_full(
         boost_obj,
         labels,
         metrics,
+        raw_features,
     )
 }
 
@@ -1028,6 +1040,7 @@ fn train_inner_columns(
     boost_obj: BoostObjective<'_>,
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
+    raw_features: Option<Vec<f64>>,
 ) -> Result<Booster, LgbmError> {
     train_inner_columns_full(
         config,
@@ -1039,7 +1052,25 @@ fn train_inner_columns(
         boost_obj,
         labels,
         metrics,
+        raw_features,
     )
+}
+
+/// Row-major (`num_data * num_features`) raw feature matrix for the linear-tree
+/// leaf fit, or `None` when `linear_tree` is off. Indexed by ORIGINAL feature
+/// index (the same space as `Tree::split_feature`).
+fn raw_matrix_from_columns(corpus: &RawCorpus, config: &Config) -> Option<Vec<f64>> {
+    if !config.linear_tree {
+        return None;
+    }
+    let (n, m) = (corpus.num_data(), corpus.num_features());
+    let mut v = vec![0.0f64; n * m];
+    for r in 0..n {
+        for c in 0..m {
+            v[r * m + c] = corpus.value(r, c);
+        }
+    }
+    Some(v)
 }
 
 /// The full column-based training driver: takes `num_data` and the precomputed
@@ -1059,6 +1090,7 @@ fn train_inner_columns_full(
     boost_obj: BoostObjective<'_>,
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
+    raw_features: Option<Vec<f64>>,
 ) -> Result<Booster, LgbmError> {
     use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};
 
@@ -1169,6 +1201,16 @@ fn train_inner_columns_full(
             config.stochastic_rounding,
         )
         .with_quant_renew_leaf(config.quant_train_renew_leaf, config.lambda_l1, config.lambda_l2);
+    // Linear tree (`config.linear_tree`): fit per-leaf linear models over the RAW
+    // features after each non-first tree grows (C++ `LinearTreeLearner`). Needs the
+    // raw continuous feature matrix (the binned columns are insufficient); the
+    // caller supplies it as row-major `num_data * num_features`. No-op when the raw
+    // matrix is absent or `linear_tree` is off.
+    if config.linear_tree {
+        if let Some(raw) = raw_features {
+            gbdt = gbdt.with_linear_tree(true, config.linear_lambda, raw);
+        }
+    }
     // DART (an enum field on Gbdt): `boosting=dart`
     // selects the DART drop+normalize variant. DART subclasses GBDT in C++ and can
     // coexist with bagging (the sample strategy is independent); the spine validates

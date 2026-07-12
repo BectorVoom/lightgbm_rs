@@ -147,6 +147,7 @@ impl TreeGolden {
             cat_threshold: Vec::new(),
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0; self.num_leaves.max(0) as usize],
             leaf_parent: vec![-1; self.num_leaves.max(0) as usize],
             split_feature_inner: vec![-1; n_internal],
