@@ -720,6 +720,87 @@ fn resident_scatter_kernel(
     }
 }
 
+/// FUSED stage B+C: the stable scatter that ALSO computes its block's exclusive
+/// base from the RAW per-block totals — folding [`resident_scan_totals_write_ranges_kernel`]
+/// (stage B) INTO the scatter so stage B is NOT a separate launch (the spike095/096
+/// host-enqueue lever: stage B is a 1-cube trivial kernel whose whole cost is the
+/// ~91µs launch). ONE CUBE PER BLOCK (`CubeCount::Static(num_blocks, 1, 1)`): cube `b`
+/// owns block `b`'s elements `[b*block_size, min((b+1)*block_size, n))`. Unit 0 serially
+/// sums the raw block totals — `base_b = Σ block_totals[0..b]` (the exclusive base, the
+/// value stage B's in-place scan wrote to `block_totals[b]`) and `total = Σ
+/// block_totals[0..num_blocks]` (the split point) — into shared memory; after the
+/// barrier every unit scatters its strided share with the IDENTICAL dest math as
+/// [`resident_scatter_kernel`]. Cube 0 additionally writes the six child-range fields
+/// (what stage B wrote). BIT-EXACT: the per-block base and total are the SAME integer
+/// sums stage B's exclusive scan produces, so `base_b + local_excl[i]` (and the total)
+/// are identical ⇒ the permutation + ranges are byte-equal to the separate-B path.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn resident_scatter_fused_bc_kernel(
+    snap: &Array<u32>,
+    to_left: &Array<u32>,
+    local_excl: &Array<u32>,
+    // RAW per-block left counts (stage A output; NOT exclusive-scanned — stage B skipped).
+    block_totals: &Array<u32>,
+    perm: &mut Array<u32>,
+    ranges: &mut Array<i32>,
+    p_begin: u32,
+    n: u32,
+    block_size: u32,
+    num_blocks: u32,
+    leaf_id: u32,
+    p_count: i32,
+) {
+    let b = CUBE_POS_X;
+    // Compute this block's exclusive base (`Σ block_totals[0..b]`) + the left TOTAL
+    // (`Σ block_totals[0..num_blocks]`) DIRECTLY from the raw per-block counts. Each unit
+    // recomputes independently (a ≤1024-add serial sum) rather than sharing via
+    // SharedMemory — cubecl-cpu does NOT share SharedMemory across units (the same
+    // primitive the staged scan family can't lower there), and a per-unit recompute keeps
+    // the kernel cubecl-cpu-runnable so the fusion is validated LOCALLY + bit-exact. The
+    // sums are integer-deterministic, so every unit gets the IDENTICAL base_b / total that
+    // stage B's exclusive scan produced.
+    let mut acc = 0u32;
+    let mut base_b = 0u32;
+    let mut k = 0u32;
+    while k < num_blocks {
+        if k == b {
+            base_b = acc; // exclusive base for block b = running sum BEFORE block b
+        }
+        acc += block_totals[k as usize];
+        k += 1;
+    }
+    let total = acc; // total left = split point
+    // Cube 0's unit 0 writes the six child-range fields (what stage B wrote), from `total`.
+    if b == 0 && UNIT_POS == 0 {
+        let sp = i32::cast_from(total);
+        let pb = i32::cast_from(p_begin);
+        let base_idx = (leaf_id * 6) as usize;
+        ranges[base_idx] = pb; // left_start
+        ranges[base_idx + 1] = pb + sp; // left_end
+        ranges[base_idx + 2] = sp; // left_count (split point)
+        ranges[base_idx + 3] = pb + sp; // right_start
+        ranges[base_idx + 4] = pb + p_count; // right_end
+        ranges[base_idx + 5] = p_count - sp; // right_count
+    }
+    // Scatter this block's elements (span index i ∈ [b*block_size, min(., n))),
+    // strided by CUBE_DIM. Dest math IDENTICAL to `resident_scatter_kernel`.
+    let start = (b * block_size) as usize;
+    let nn = n as usize;
+    let end_raw = start + block_size as usize;
+    let end = if end_raw < nn { end_raw } else { nn };
+    let mut i = start + UNIT_POS as usize;
+    while i < end {
+        let excl = base_b + local_excl[i];
+        let go_left = to_left[i] == 1u32;
+        let iu = u32::cast_from(i);
+        let right_dest = total + (iu - excl);
+        let dest = select(go_left, excl, right_dest);
+        perm[p_begin as usize + dest as usize] = snap[i];
+        i += CUBE_DIM as usize;
+    }
+}
+
 /// The device-resident row permutation for one tree grow (the `cuda_data_indices_`
 /// analog) plus its partition scratch. Allocated ONCE per grow; every split
 /// repartitions a sub-range IN PLACE on device (3 launches, no host crossing);
@@ -942,11 +1023,43 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
             crate::ResidentBinWidth::U32 => launch_mark!(u32),
         }
 
+        let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
+        if partition_fuse_bc_enabled() {
+            // ---- FUSED stage B+C (one launch): the cube-per-block scatter computes its
+            // own exclusive block base from the RAW `block_totals` (folding stage B in) and
+            // cube 0 writes the child ranges. Bit-exact to the separate B + C path (same
+            // integer sums, same dest math), one fewer launch/split — the host-enqueue win.
+            // SAFETY: `block_totals` holds the `num_blocks` raw counts (`nb <= MAX_SCAN_BLOCKS`);
+            // cube `b < num_blocks` sums `block_totals[0..num_blocks]` (in range) into 2 LDS
+            // cells; every scatter dest is a permutation index `< n` so the perm write stays in
+            // `[p_begin, p_begin+n) ⊂ [0, num_data)`; `ranges` holds `6*num_leaves` cells and
+            // `leaf_id < num_leaves`. cubecl unsafe confined here. ----
+            unsafe {
+                resident_scatter_fused_bc_kernel::launch::<R>(
+                    client,
+                    CubeCount::Static(num_blocks as u32, 1, 1),
+                    CubeDim::new_1d(256),
+                    ArrayArg::from_raw_parts(self.snap.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(self.to_left.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(self.local_excl.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
+                    ArrayArg::from_raw_parts(self.perm.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(leaf_splits.ranges.clone(), ranges_len),
+                    p_begin as u32,
+                    n as u32,
+                    block_size,
+                    num_blocks as u32,
+                    leaf_id as u32,
+                    p_count,
+                );
+            }
+            return Ok(());
+        }
+
         // ---- Stage B: block-totals scan + child-range write (single owner). ----
         // SAFETY: `block_totals` holds `MAX_SCAN_BLOCKS+1` cells (`nb <= MAX_SCAN_BLOCKS`
         // so the sentinel write is in range); `ranges` holds `6*num_leaves` cells and
         // `leaf_id < num_leaves` (checked above). Single owner. cubecl unsafe confined.
-        let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
         unsafe {
             resident_scan_totals_write_ranges_kernel::launch::<R>(
                 client,
@@ -986,6 +1099,47 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
         }
         Ok(())
     }
+}
+
+/// Read-once `LGBM_PARTITION_FUSE_BC=="1"` — OPT-IN (default OFF until spike098
+/// validates on real CUDA): fold the resident partition's stage B (block-totals
+/// scan + child-range write, a 1-cube trivial kernel whose whole cost is the ~91µs
+/// launch) INTO the stage-C scatter via [`resident_scatter_fused_bc_kernel`] — one
+/// fewer launch per split (~3000/train, the spike095/096 host-enqueue lever).
+/// Bit-exact by construction (the cube-per-block scatter recomputes the SAME integer
+/// exclusive base + total the stage-B scan produced). Unlike the staged scan family,
+/// the resident partition kernels lower on cubecl-cpu, so this is validated LOCALLY.
+#[must_use]
+pub fn partition_fuse_bc_enabled() -> bool {
+    // Same-session A/B override (mirrors the grow-driver hatches): the env gate is
+    // read-once, so an in-process A/B harness / test flips this atomic instead.
+    match PARTITION_FUSE_BC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LGBM_PARTITION_FUSE_BC").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Same-session A/B override for [`partition_fuse_bc_enabled`].
+/// 0 = unset (defer to `LGBM_PARTITION_FUSE_BC`), 1 = force ON, 2 = force OFF.
+static PARTITION_FUSE_BC_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Test/harness hook: force the partition BC-fusion ON (`Some(true)`), OFF
+/// (`Some(false)`), or defer to the env gate (`None`). Exists so a same-session A/B
+/// (the local parity test + the spike) can flip the arm in ONE process — the env
+/// gate is read-once. Timing-neutral (`Relaxed` atomic).
+pub fn set_partition_fuse_bc_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    PARTITION_FUSE_BC_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

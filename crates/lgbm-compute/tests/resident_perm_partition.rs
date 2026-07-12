@@ -64,6 +64,79 @@ struct Step {
     threshold: u32,
 }
 
+/// The adversarial multi-split step list (shared by the anchor-parity walk and the
+/// BC-fusion A/B): MissingType::{None, Zero, NaN} × default_left × mfb-varied, plus a
+/// block-boundary-straddling grandchild and a small single-block tail.
+fn walk_steps() -> Vec<Step> {
+    vec![
+        Step { feature: 0, begin: 0, count: 700, leaf_id: 0, min_bin: 1, max_bin: 15, default_bin: 16, most_freq_bin: 0, missing_type: 0, default_left: false, threshold: 7 },
+        Step { feature: 1, begin: 0, count: 350, leaf_id: 1, min_bin: 1, max_bin: 7, default_bin: 2, most_freq_bin: 0, missing_type: 1, default_left: true, threshold: 3 },
+        Step { feature: 2, begin: 350, count: 350, leaf_id: 2, min_bin: 0, max_bin: 10, default_bin: 0, most_freq_bin: 3, missing_type: 2, default_left: false, threshold: 5 },
+        Step { feature: 0, begin: 100, count: 400, leaf_id: 3, min_bin: 1, max_bin: 15, default_bin: 4, most_freq_bin: 4, missing_type: 1, default_left: false, threshold: 11 },
+        Step { feature: 1, begin: 620, count: 80, leaf_id: 4, min_bin: 1, max_bin: 7, default_bin: 0, most_freq_bin: 2, missing_type: 2, default_left: true, threshold: 1 },
+    ]
+}
+
+/// The BC-FUSION (`LGBM_PARTITION_FUSE_BC`) produces BYTE-IDENTICAL results to the
+/// default 3-launch partition — pinning the "folding stage B into the scatter changes
+/// nothing" invariant DIRECTLY on the runnable cubecl-cpu lane (the partition kernels
+/// lower there, unlike the staged scan family). Runs the SAME adversarial multi-split
+/// walk with the fusion forced OFF then ON and asserts the final perm + every split's
+/// child ranges match bit-for-bit. Uses `set_partition_fuse_bc_override` (the env gate
+/// is read-once) and restores it to `None` at the end.
+#[test]
+fn partition_bc_fusion_byte_identical_to_three_launch() {
+    use cubecl::prelude::CubeElement;
+    use lgbm_compute::kernels::partition::set_partition_fuse_bc_override;
+
+    let client = cpu_client();
+    let num_data = 700usize;
+    let num_bins = [16u32, 8, 11];
+    let cols: Vec<Vec<u32>> =
+        (0..3).map(|f| column(0x5eed + f as u64, num_data, num_bins[f])).collect();
+    let mut concat_u8: Vec<u8> = Vec::with_capacity(3 * num_data);
+    for col in &cols {
+        concat_u8.extend(col.iter().map(|&b| b as u8));
+    }
+    let bins_handle = client.create_from_slice(u8::as_bytes(&concat_u8));
+
+    // Run the whole walk under one arm; return (final perm, per-step child-range sextuples).
+    let run_arm = |fuse_bc: bool| -> (Vec<u32>, Vec<[i32; 6]>) {
+        set_partition_fuse_bc_override(Some(fuse_bc));
+        let rp = ResidentPermPartition::new(&client, num_data).expect("state alloc");
+        let leaf_splits = DeviceLeafSplits::new(&client, 8).expect("ranges alloc");
+        let mut ranges = Vec::new();
+        for s in walk_steps() {
+            rp.partition_leaf(
+                &client, &bins_handle, ResidentBinWidth::U8, s.feature * num_data, 3 * num_data,
+                num_bins[s.feature], s.min_bin, s.max_bin, s.default_bin, s.most_freq_bin,
+                s.missing_type, s.default_left, s.threshold, &leaf_splits, s.leaf_id,
+                s.begin as i32, s.count as i32,
+            )
+            .expect("partition_leaf");
+            let cr = leaf_splits.read_leaf(&client, s.leaf_id);
+            ranges.push([
+                cr.left_start, cr.left_end, cr.left_count, cr.right_start, cr.right_end,
+                cr.right_count,
+            ]);
+        }
+        (rp.read_perm(&client), ranges)
+    };
+
+    let (perm_off, ranges_off) = run_arm(false);
+    let (perm_on, ranges_on) = run_arm(true);
+    set_partition_fuse_bc_override(None);
+
+    assert_eq!(perm_off, perm_on, "BC-fused perm diverged from the 3-launch perm");
+    assert_eq!(ranges_off, ranges_on, "BC-fused child ranges diverged from the 3-launch ranges");
+    // Non-vacuity: the root split actually routed rows both ways.
+    assert!(
+        ranges_off[0][2] > 0 && ranges_off[0][5] > 0,
+        "root split must be non-trivial (both children non-empty), got {:?}",
+        ranges_off[0]
+    );
+}
+
 /// Layer 1 — the multi-split kernel-parity walk. 700 rows forces ≥3 scan blocks
 /// (`scan_block_size` floors at 256), and the step list walks numeric routing
 /// through MissingType::{None, Zero, NaN} × default_left × a min_is_max-free and

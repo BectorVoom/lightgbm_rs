@@ -2780,11 +2780,15 @@ where
         // arm: host bin gather + host-fused/device route + in-place host scatter.
         let split_point = if let Some((view, rp, _)) = &resident_perm {
             time_phase(&GROW_PARTITION_NS, || -> Result<usize, ComputeError> {
-                // Three real device dispatches (mark+block-scan / totals+ranges /
-                // scatter) + the positive COUNTS tripwire for the bench protocol.
+                // Real device dispatches: mark+block-scan, then either the fused B+C
+                // scatter (LGBM_PARTITION_FUSE_BC ⇒ 2 total) or separate totals+ranges
+                // and scatter (⇒ 3 total). The positive COUNTS tripwire for the bench
+                // protocol is bumped once per split regardless.
                 bump_launch();
                 bump_launch();
-                bump_launch();
+                if !crate::kernels::partition::partition_fuse_bc_enabled() {
+                    bump_launch();
+                }
                 bump_partition_resident();
                 rp.partition_leaf(
                     client,
