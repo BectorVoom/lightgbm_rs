@@ -1642,7 +1642,13 @@ pub fn find_best_splits_fused_staged_kernel(
             rev_count[fi],
         );
     }
-    if UNIT_POS == 1 {
+    // FORWARD in lane 32 — a DIFFERENT WARP from the REVERSE lane on NVIDIA
+    // (warp = 32 lanes), so the two serial branch scans genuinely overlap.
+    // spike091 ran FORWARD in lane 1: lanes 0 and 1 share one warp, and SIMT
+    // divergence SERIALIZES divergent branches within a warp — the "concurrent"
+    // branches ran back-to-back. (On AMD wave64 both lanes share one wavefront
+    // either way; this pick is the NVIDIA-optimal one and AMD-neutral.)
+    if UNIT_POS == 32 {
         scan_fwd_branch_staged(
             &sm.to_slice(),
             &mut state_fwd.to_slice_mut(),
@@ -1773,7 +1779,13 @@ pub fn find_best_splits_fused_siblings_staged_kernel(
             rev_count[fi],
         );
     }
-    if UNIT_POS == 1 {
+    // FORWARD in lane 32 — a DIFFERENT WARP from the REVERSE lane on NVIDIA
+    // (warp = 32 lanes), so the two serial branch scans genuinely overlap.
+    // spike091 ran FORWARD in lane 1: lanes 0 and 1 share one warp, and SIMT
+    // divergence SERIALIZES divergent branches within a warp — the "concurrent"
+    // branches ran back-to-back. (On AMD wave64 both lanes share one wavefront
+    // either way; this pick is the NVIDIA-optimal one and AMD-neutral.)
+    if UNIT_POS == 32 {
         scan_fwd_branch_staged(
             &sm.to_slice(),
             &mut state_fwd.to_slice_mut(),
@@ -2983,8 +2995,10 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     let out_len = n * 12;
-    let zeros = vec![0.0f64; out_len];
-    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    // NO zero-fill upload: the scan kernel (legacy or staged) writes all 12 cells
+    // of every feature window unconditionally, and the reduce kernel reads only
+    // those cells — an uninitialized allocation is observably identical.
+    let h_out = client.empty(out_len * std::mem::size_of::<f64>());
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
     let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
     let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
@@ -2992,6 +3006,45 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // STAGED cube-per-feature branch (opt-in `LGBM_SCAN_STAGED=1`) on the LIVE
+    // no-readback route — same gates as `find_best_splits_fused_inner` (real
+    // device runtime, every feature ≤ 256 bins). Bit-identical output cells, so
+    // the reduce launcher downstream is untouched.
+    #[cfg(feature = "gpu")]
+    if scan_staged_enabled()
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS)
+    {
+        // SAFETY: identical obligations to the legacy launch below; the geometry
+        // guarantees CUBE_POS_X < n, matching the kernel's no-guard contract.
+        unsafe {
+            find_best_splits_fused_staged_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist_handle, buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift,
+                sum_gradient,
+                sum_hessian_bumped,
+                num_data,
+            );
+        }
+        return Ok(Some((h_out, out_len, min_gain_shift)));
+    }
 
     // Direct `scan_cube_dim()` launch (bit-neutral W; no autotune — see fn doc). This is the
     // SAME `find_best_splits_fused_kernel` the host-readback path launches; only the readback
@@ -3229,8 +3282,9 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     ) + cfg.min_gain_to_split;
 
     let out_len = 2 * n * 12;
-    let zeros = vec![0.0f64; out_len];
-    let h_out = client.create_from_slice(f64::as_bytes(&zeros));
+    // NO zero-fill upload: the scan kernel (legacy or staged) writes all 12 cells
+    // of every window unconditionally (single-slot helper note).
+    let h_out = client.empty(out_len * std::mem::size_of::<f64>());
     let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
     let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
     let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
@@ -3238,6 +3292,50 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
     let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
     let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+
+    // STAGED cube-per-(feature, sibling) branch (opt-in `LGBM_SCAN_STAGED=1`) on
+    // the LIVE per-split co-pack route — the hot path (one call per split). Same
+    // gates as the single-slot helper; bit-identical output layout + cells.
+    #[cfg(feature = "gpu")]
+    if scan_staged_enabled()
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS)
+    {
+        // SAFETY: identical obligations to the legacy launch below; the geometry
+        // guarantees CUBE_POS_X < n and CUBE_POS_Y < 2 (kernel no-guard contract).
+        unsafe {
+            find_best_splits_fused_siblings_staged_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 2, 1),
+                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist_a_handle, buf_len),
+                ArrayArg::from_raw_parts(hist_b_handle, buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                num_data_a,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                num_data_b,
+                n as u32,
+            );
+        }
+        return Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)));
+    }
 
     // Direct `scan_cube_dim()` launch over 2*n feature-slots (A then B) — the SAME
     // `find_best_splits_fused_siblings_kernel` the host-readback path launches; only the
