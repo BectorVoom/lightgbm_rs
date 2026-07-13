@@ -2088,16 +2088,19 @@ pub fn set_desc_hoist_override(v: Option<bool>) {
     DESC_HOIST_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Desc-hoist gate (env `LGBM_DESC_HOIST`, opt-in `"1"`; default OFF pending the
-/// spike101 real-CUDA verdict). Read FRESH per call (mirrors `scan_staged_enabled`)
-/// so one process can A/B it; the override wins over the env. Consumed by the
-/// `gpu`-gated GpuBackend caches (the cpu build has no per-grow descriptor cache).
+/// Desc-hoist gate (env `LGBM_DESC_HOIST`, DEFAULT ON — validated 1.055× on real
+/// CUDA, spike101: hoist 7.549s vs base 7.961s warm-median, preds BIT-IDENTICAL
+/// max_abs 0.0, counts proof desc_hoist=5980 vs 0, drained build 1358→1050ms /
+/// scan 1992→1899ms; `"0"` restores the per-launch uploads for A/B/rollback).
+/// Read FRESH per call (mirrors `scan_staged_enabled`) so one process can A/B it;
+/// the override wins over the env. Consumed by the `gpu`-gated GpuBackend caches
+/// (the cpu build has no per-grow descriptor cache).
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub(crate) fn desc_hoist_enabled() -> bool {
     match DESC_HOIST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         1 => true,
         -1 => false,
-        _ => matches!(std::env::var("LGBM_DESC_HOIST").as_deref(), Ok("1")),
+        _ => !matches!(std::env::var("LGBM_DESC_HOIST").as_deref(), Ok("0")),
     }
 }
 
