@@ -21,14 +21,18 @@
 //! Scope: INSTRUMENTATION, not parity — the on-device grow's numerical faithfulness is
 //! covered by the `learner_parity` STRUCTURE gate (pinned to the cpu f64 anchor).
 //!
-//! ## Resident row permutation note (launch closed form UNCHANGED)
-//! The row permutation is resident (a device index RANGE into a single `perm` buffer)
-//! and partitions it IN PLACE per split. On the DEFAULT tested lane the partition still routes on
-//! the HOST (`prefers_host_partition()`), which issues NO device dispatch, and the build / subtract
-//! / scan dispatch layout is untouched — so the real-dispatch closed form
-//! `4 + 3*(num_leaves-1)` is UNCHANGED and still num_features-independent. (On the non-default
-//! on-device-partition arm the resident scatter is still ONE dispatch, so that arm's form is also
-//! unchanged.) No readback/dispatch is removed on the tested lane, so no closed form is revised.
+//! ## Closed forms (re-derived 2026-07-13 against measured real-GPU counts)
+//! This rocm-gated lane became RUNNABLE only with local ROCm 7.1.1; its closed forms are
+//! re-derived here from measured gfx1152 counts and account for the §8.2/§8.3 device-resident
+//! frontier pick (a per-split device pick + a once-per-grow root seed) that later rounds added.
+//! Both lanes pin pargain OFF and the SMEM partition BC-fusion OFF (both now backend-aware
+//! DEFAULT-ON on real ROCm) so the serial-staged / 3-launch-partition structure is fixed:
+//! - **Host partition route:** `5 + 4*(num_leaves-1)` = bin_upload + grad_hess_upload +
+//!   root[build+scan] + root frontier seed  +  per split [§8.3 pick + build + subtract + scan]
+//!   (host partition issues 0 device dispatch; tree-split is excluded from the counter).
+//! - **Resident-perm partition route:** `6 + 7*(num_leaves-1)` = the above + iota seed + the
+//!   3-launch device partition per split.
+//! Both stay num_features-independent (a per-feature layout would scale the build+scan terms).
 
 use lgbm_compute::kernels::grow_driver::{
     grow_tree_on_device_driver, on_device_f64_fused_count_take, on_device_launch_count_take,
@@ -214,12 +218,22 @@ fn resident_analytic_lane() {
         std::env::remove_var("LGBM_SIBLING_COPACK");
         // Ensure the DEFAULT (swapped) u64 build path — never the f64-fused escape hatch.
         std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
+        // Pin pargain OFF: this closed form is derived for the serial-staged co-pack scan.
+        // Pargain is now DEFAULT-ON for the ROCm/AMD runtime (a 1.51× scan win), which
+        // routes the co-pack through the separate-subtract fallback (subtract-fuse is a
+        // serial-staged twin, mutually exclusive with pargain) and shifts the launch
+        // layout — so pin the arm this lane documents rather than track the backend default.
+        std::env::set_var("LGBM_SCAN_PARGAIN", "0");
     }
     // The RESIDENT-PERM partition arm is now DEFAULT-ON (spike093) and has its own
     // closed form (asserted separately below) — pin it OFF for the legacy host-partition
     // closed form this lane was derived for. The env gate is read-once, so use the
     // in-process override; restored to `None` at the end of the lane.
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(false));
+    // Pin the SMEM partition BC-fusion OFF: it is DEFAULT-ON on the real ROCm runtime
+    // (spike102) and folds partition 3→2 launches, which shifts the resident-perm closed
+    // form below; both analytics here are derived for the classic 3-launch partition.
+    lgbm_compute::kernels::partition::set_partition_fuse_bc_smem_override(Some(false));
 
     let backend = RocmBackend::with_resident(true);
     assert!(
@@ -300,27 +314,33 @@ fn resident_analytic_lane() {
          would break this"
     );
 
-    // EXACT analytic real-dispatch closed form (host partition route, DEFAULT co-pack ON):
-    // bin upload (1) + grad/hess upload (1) + root [build (1) + scan (1)] + per split
-    // [build_resident (1) + subtract (1) + siblings_scan (1)] = 4 + 3*(num_leaves-1). The
-    // on-device grad/hess gather hoists the per-build host grad/hess upload to ONE
-    // once-per-grow device dispatch (num_features- AND num_leaves-independent), counted
-    // like the bin upload.
-    let analytic = 4 + 3 * (NUM_LEAVES as u64 - 1);
+    // EXACT analytic real-dispatch closed form (host partition route, DEFAULT co-pack ON,
+    // pargain + SMEM-BC pinned OFF above so the serial-staged / 3-launch structure is fixed):
+    // base = bin upload (1) + grad/hess upload (1) + root [build (1) + scan (1)] + the root's
+    // winning-split seed into the §8.3 device frontier (1) = 5; per split = §8.3 device pick (1)
+    // + build_resident (1) + subtract (1) + siblings_scan (1) = 4 (host partition = 0 device
+    // dispatch, tree-split excluded from the counter) ⇒ 5 + 4*(num_leaves-1). The +1 base
+    // (root frontier seed) and +1/split (device pick) vs the pre-frontier form (4 + 3*(nl-1))
+    // are the §8.2/§8.3 device-resident pick; this rocm-gated lane became runnable only with
+    // local ROCm 7.1.1, so the closed form is re-derived here against measured real-GPU counts.
+    let analytic = 5 + 4 * (NUM_LEAVES as u64 - 1);
     assert_eq!(
         launches_3, analytic,
         "resident lane: real-dispatch launch count {launches_3} must equal the analytic \
-         closed form {analytic} (= 4 + 3*(num_leaves-1): bin_upload + grad_hess_upload + \
+         closed form {analytic} (= 5 + 4*(num_leaves-1): bin_upload + grad_hess_upload + \
          root[build+scan] + build_resident/subtract/siblings_scan per split, host partition \
          route, co-pack ON; num_leaves={NUM_LEAVES})"
     );
 
     // The RESIDENT-PERM partition arm (DEFAULT since spike093): its own EXACT closed
     // form adds the once-per-grow identity (iota) seed (+1) and the 3-launch device
-    // partition per split (mark+block-scan / totals+ranges / scatter):
-    //   5 + 6*(num_leaves - 1)
-    // = bin_upload + grad_hess_upload + iota + root[build+scan]
-    //   + per split [partition(3) + build_resident + subtract + siblings_scan].
+    // partition per split (mark+block-scan / totals+ranges / scatter — SMEM-BC pinned OFF
+    // above, so 3 not 2):
+    //   6 + 7*(num_leaves - 1)
+    // = bin_upload + grad_hess_upload + iota + root[build+scan] + root frontier seed (§8.3)
+    //   + per split [§8.3 device pick + partition(3) + build_resident + subtract + siblings_scan].
+    // The +1 base + +1/split vs the pre-frontier form (5 + 6*(nl-1)) are the §8.2/§8.3
+    // device-resident pick (see the host-lane note above).
     // The `partition_resident` tripwire must equal the split count exactly (and stayed 0
     // on the pinned-OFF grows above by the arm-isolation the override provides).
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(true));
@@ -328,6 +348,12 @@ fn resident_analytic_lane() {
     let (launches_rp, rootbuild_rp, f64_fused_rp, leaves_rp, _) = grow_resident(3);
     let part_res = lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
+    lgbm_compute::kernels::partition::set_partition_fuse_bc_smem_override(None);
+    // Restore the backend-default pargain gate (pinned OFF at the top for the closed forms).
+    // SAFETY: single-threaded test; no concurrent env access.
+    unsafe {
+        std::env::remove_var("LGBM_SCAN_PARGAIN");
+    }
     assert_eq!(
         leaves_rp, NUM_LEAVES,
         "resident-perm lane: corpus must grow the full {NUM_LEAVES} leaves (got {leaves_rp})"
@@ -341,11 +367,11 @@ fn resident_analytic_lane() {
          (got {part_res}, expected {})",
         NUM_LEAVES - 1
     );
-    let analytic_rp = 5 + 6 * (NUM_LEAVES as u64 - 1);
+    let analytic_rp = 6 + 7 * (NUM_LEAVES as u64 - 1);
     assert_eq!(
         launches_rp, analytic_rp,
         "resident-perm lane: real-dispatch launch count {launches_rp} must equal the \
-         analytic closed form {analytic_rp} (= 5 + 6*(num_leaves-1): + iota + 3-launch \
-         device partition per split; num_leaves={NUM_LEAVES})"
+         analytic closed form {analytic_rp} (= 6 + 7*(num_leaves-1): + iota + §8.3 pick + \
+         3-launch device partition per split; num_leaves={NUM_LEAVES})"
     );
 }

@@ -2015,27 +2015,37 @@ const PARGAIN_MAX_CAND: usize = 256;
 // index, so the lexicographic (gain desc, k asc) fold never prefers it (the
 // cube macro requires a literal here, not a host const).
 
-/// Pargain gate (env `LGBM_SCAN_PARGAIN`, opt-in `"1"`; default OFF — MEASURED
-/// NET-NEGATIVE on P100, see below). Only meaningful where the staged gates
-/// already hold (real device, ≤256-bin features) — the launch helpers consult
-/// it INSIDE the staged arm, so legacy/staged behavior is byte-unchanged when
-/// unset.
+/// Pargain gate — BACKEND-AWARE default (env `LGBM_SCAN_PARGAIN=1/0` overrides
+/// either way). DEFAULT ON for the ROCm/AMD runtime (`"hip"`), OFF for CUDA/NVIDIA
+/// (`"cuda"`) and everything else. Only meaningful where the staged gates already
+/// hold (real device, ≤256-bin features) — the launch helpers consult it INSIDE the
+/// staged arm, so legacy/staged behavior is byte-unchanged on the cpu anchor.
 ///
-/// VERDICT (spike094, P100, 500k×50×100 trees, order-ALTERNATED warm-median
-/// of 3, preds BIT-IDENTICAL max_abs = 0.0, counts proof scan_pargain=2980):
-/// pargain 8.89s vs staged 8.73s (0.98×), drained scan bucket 2.15s → 2.37s.
-/// Root cause: the drained scan bucket is LAUNCH/SYNC-FLOOR dominated
-/// (~0.69 ms per launch × ~3100 launches ≈ the whole bucket), not
-/// arithmetic-dominated — and P100's strong native f64 (1:2 rate) makes the
-/// serial per-candidate divisions cheap, so the phase-split's extra LDS
-/// traffic + 3 extra barriers cost more than the parallel gains save. The
-/// hatch is KEPT (bit-exact, fully gated) for consumer-class GPUs where f64
-/// runs at 1:32 and the serial divides dominate; the next scan lever on
-/// P100-class hardware is LAUNCH-COUNT reduction (fusing the per-split
-/// build→subtract→scan chain), not kernel-internal parallelism.
+/// The two backends respond with OPPOSITE SIGN to pargain (parallel per-candidate
+/// gain + parallel argmax), so the default is per-backend:
+/// - **ROCm/AMD (default ON):** measured 1.51× scan win on gfx1152 (2026-07-13,
+///   100k×50 real-GPU drain: default staged scan 2545 ms → pargain 1269 ms; wall
+///   6136 → 4065 ms), tree BIT-EXACT to the u64 integer path + within the 500k f64
+///   envelope on real ROCm. AMD's weaker f64 makes the serial per-candidate divides
+///   expensive, so parallelizing them across 32 lanes/branch dominates the barrier
+///   cost. ROCm is the project's primary validated GPU target (CLAUDE.md).
+/// - **CUDA/NVIDIA (default OFF):** NET-NEGATIVE on P100 (spike094, order-alternated
+///   warm-median of 3, preds BIT-IDENTICAL max_abs 0.0, counts scan_pargain=2980):
+///   pargain 8.89s vs staged 8.73s (0.98×), drained scan 2.15→2.37s. P100's strong
+///   1:2 f64 makes the serial divides cheap, so the phase-split's extra LDS traffic +
+///   barriers cost more than the parallel gains save.
+///
+/// `LGBM_SCAN_PARGAIN=1` forces ON (e.g. a consumer 1:32-f64 CUDA card where AMD's
+/// calculus applies); `=0` forces OFF (e.g. same-session A/B on ROCm). Bit-exact
+/// either way — the hatch prices the wall delta, it does not gate correctness.
 #[cfg(feature = "gpu")]
-fn scan_pargain_enabled() -> bool {
-    matches!(std::env::var("LGBM_SCAN_PARGAIN").as_deref(), Ok("1"))
+fn scan_pargain_enabled(runtime_name: &str) -> bool {
+    match std::env::var("LGBM_SCAN_PARGAIN").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        // Default: ON for ROCm/AMD (the 1.51× win), OFF for CUDA/NVIDIA + cpu.
+        _ => runtime_name == "hip",
+    }
 }
 
 /// POSITIVE tripwire — bumped once per staged-scan launch that dispatched the
@@ -2948,7 +2958,7 @@ unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_pargain_enabled() {
+    if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
         SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_staged_par_kernel);
     } else {
@@ -3020,7 +3030,7 @@ unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_pargain_enabled() {
+    if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
         SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_siblings_staged_par_kernel);
     } else {
@@ -4702,7 +4712,7 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // SERIAL-branch staged kernel only), every feature ≤ the LDS stage cap. When any
     // fails, signal fallback to the separate subtract + scan.
     let staged_capable = scan_staged_enabled()
-        && !scan_pargain_enabled()
+        && !scan_pargain_enabled(<R as cubecl::Runtime>::name(client))
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && feats.iter().all(|f| (f.num_bin as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
     if !staged_capable {
