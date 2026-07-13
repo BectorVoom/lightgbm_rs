@@ -801,6 +801,87 @@ fn resident_scatter_fused_bc_kernel(
     }
 }
 
+/// SHARED-MEMORY FUSED stage B+C — the real-CUDA twin of
+/// [`resident_scatter_fused_bc_kernel`] that fixes its net-negative (spike098) root
+/// cause. IDENTICAL cube-per-block geometry, IDENTICAL bit-exact dest math, but ONE
+/// unit (unit 0) computes this block's exclusive base `Σ block_totals[0..b]` + the
+/// left total `Σ block_totals[0..num_blocks]` into SharedMemory ONCE; after the
+/// barrier every unit reads them. The redundant-sum version recomputes that ≤1024-add
+/// sum in EACH of the 256 units (256× the device work — spike098's regression); this
+/// version does it once per cube. NOT cubecl-cpu-runnable (cpu does not share
+/// SharedMemory across units — the same limit the staged scan family hits), so the
+/// caller gates it to real devices and the cpu anchor keeps the 3-launch / redundant
+/// path. Bit-exact to both: the SharedMemory base/total are the SAME integer sums.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn resident_scatter_fused_bc_smem_kernel(
+    snap: &Array<u32>,
+    to_left: &Array<u32>,
+    local_excl: &Array<u32>,
+    // RAW per-block left counts (stage A output; NOT exclusive-scanned — stage B skipped).
+    block_totals: &Array<u32>,
+    perm: &mut Array<u32>,
+    ranges: &mut Array<i32>,
+    p_begin: u32,
+    n: u32,
+    block_size: u32,
+    num_blocks: u32,
+    leaf_id: u32,
+    p_count: i32,
+) {
+    let b = CUBE_POS_X;
+    // SharedMemory[0] = this block's exclusive base (`Σ block_totals[0..b]`);
+    // SharedMemory[1] = the left TOTAL (`Σ block_totals[0..num_blocks]`, the split point).
+    // Only unit 0 computes them (the ≤`num_blocks`-add serial sum), so the redundant
+    // per-unit recompute of the fused-bc kernel is gone.
+    let mut base_total = SharedMemory::<u32>::new(2usize);
+    if UNIT_POS == 0 {
+        let mut acc = 0u32;
+        let mut base_b = 0u32;
+        let mut k = 0u32;
+        while k < num_blocks {
+            if k == b {
+                base_b = acc; // exclusive base for block b = running sum BEFORE block b
+            }
+            acc += block_totals[k as usize];
+            k += 1;
+        }
+        base_total[0] = base_b;
+        base_total[1] = acc; // total left = split point
+    }
+    sync_cube();
+    let base_b = base_total[0];
+    let total = base_total[1];
+    // Cube 0's unit 0 writes the six child-range fields (what stage B wrote), from `total`.
+    if b == 0 && UNIT_POS == 0 {
+        let sp = i32::cast_from(total);
+        let pb = i32::cast_from(p_begin);
+        let base_idx = (leaf_id * 6) as usize;
+        ranges[base_idx] = pb; // left_start
+        ranges[base_idx + 1] = pb + sp; // left_end
+        ranges[base_idx + 2] = sp; // left_count (split point)
+        ranges[base_idx + 3] = pb + sp; // right_start
+        ranges[base_idx + 4] = pb + p_count; // right_end
+        ranges[base_idx + 5] = p_count - sp; // right_count
+    }
+    // Scatter this block's elements strided by CUBE_DIM. Dest math IDENTICAL to
+    // `resident_scatter_kernel` / `resident_scatter_fused_bc_kernel`.
+    let start = (b * block_size) as usize;
+    let nn = n as usize;
+    let end_raw = start + block_size as usize;
+    let end = if end_raw < nn { end_raw } else { nn };
+    let mut i = start + UNIT_POS as usize;
+    while i < end {
+        let excl = base_b + local_excl[i];
+        let go_left = to_left[i] == 1u32;
+        let iu = u32::cast_from(i);
+        let right_dest = total + (iu - excl);
+        let dest = select(go_left, excl, right_dest);
+        perm[p_begin as usize + dest as usize] = snap[i];
+        i += CUBE_DIM as usize;
+    }
+}
+
 /// The device-resident row permutation for one tree grow (the `cuda_data_indices_`
 /// analog) plus its partition scratch. Allocated ONCE per grow; every split
 /// repartitions a sub-range IN PLACE on device (3 launches, no host crossing);
@@ -1024,6 +1105,37 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
         }
 
         let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
+        if partition_fuse_bc_smem_enabled() && <R as cubecl::Runtime>::name(client) != "cpu" {
+            // ---- SHARED-MEMORY FUSED stage B+C (one launch, real device only): the
+            // cube-per-block scatter with unit 0 computing this block's exclusive base +
+            // total ONCE into SharedMemory (vs the redundant per-unit sum below). Same
+            // 2-launch structure and bit-exact dest math; the cpu anchor never reaches
+            // here (`R::name != "cpu"` gate) so its 3-launch path is unaffected.
+            // SAFETY: identical obligations to `resident_scatter_fused_bc_kernel` — cube
+            // `b < num_blocks` reads `block_totals[0..num_blocks]` (⊂ `MAX_SCAN_BLOCKS+1`),
+            // scatters strided into `perm[p_begin..p_begin+n) ⊂ [0, num_data)`, cube 0
+            // writes `ranges[6*leaf_id .. +6)` (`leaf_id < num_leaves`). cubecl unsafe here.
+            unsafe {
+                resident_scatter_fused_bc_smem_kernel::launch::<R>(
+                    client,
+                    CubeCount::Static(num_blocks as u32, 1, 1),
+                    CubeDim::new_1d(256),
+                    ArrayArg::from_raw_parts(self.snap.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(self.to_left.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(self.local_excl.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
+                    ArrayArg::from_raw_parts(self.perm.clone(), self.num_data),
+                    ArrayArg::from_raw_parts(leaf_splits.ranges.clone(), ranges_len),
+                    p_begin as u32,
+                    n as u32,
+                    block_size,
+                    num_blocks as u32,
+                    leaf_id as u32,
+                    p_count,
+                );
+            }
+            return Ok(());
+        }
         if partition_fuse_bc_enabled() {
             // ---- FUSED stage B+C (one launch): the cube-per-block scatter computes its
             // own exclusive block base from the RAW `block_totals` (folding stage B in) and
@@ -1141,6 +1253,53 @@ pub fn partition_fuse_bc_enabled() -> bool {
 /// 0 = unset (defer to `LGBM_PARTITION_FUSE_BC`), 1 = force ON, 2 = force OFF.
 static PARTITION_FUSE_BC_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
+
+/// Read-once `LGBM_PARTITION_FUSE_BC_SMEM=="1"` — OPT-IN, default OFF pending the
+/// spike102 real-CUDA verdict. The SHARED-MEMORY BC-fusion
+/// ([`resident_scatter_fused_bc_smem_kernel`]): folds partition stage B into the
+/// scatter with ONE unit computing the block base (vs the redundant per-unit sum of
+/// [`partition_fuse_bc_enabled`], which measured net-negative on P100). Real-device
+/// ONLY — the caller ([`partition_bc_fused`]) additionally requires a non-cpu runtime
+/// because cubecl-cpu does not share SharedMemory across units. Bit-exact (same
+/// integer sums), validated on real CUDA via the driver bit-identical-preds A/B.
+#[must_use]
+pub fn partition_fuse_bc_smem_enabled() -> bool {
+    match PARTITION_FUSE_BC_SMEM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LGBM_PARTITION_FUSE_BC_SMEM").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Same-session A/B override for [`partition_fuse_bc_smem_enabled`].
+/// 0 = unset, 1 = force ON, 2 = force OFF.
+static PARTITION_FUSE_BC_SMEM_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Test/harness hook: force the SharedMemory BC-fusion ON/OFF or defer to the env.
+pub fn set_partition_fuse_bc_smem_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    PARTITION_FUSE_BC_SMEM_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The SINGLE source of truth for "does this split fuse partition stage B into the
+/// scatter (2 launches instead of 3)?" — used by BOTH [`ResidentPermPartition::partition_leaf`]
+/// (to dispatch) and the grow driver (to count launches accurately). The SharedMemory
+/// variant additionally requires a real device (cubecl-cpu cannot lower it); the
+/// redundant-sum variant runs anywhere. SMEM wins when both gates are on.
+#[must_use]
+pub fn partition_bc_fused<R: cubecl::Runtime>(client: &ComputeClient<R>) -> bool {
+    (partition_fuse_bc_smem_enabled() && <R as cubecl::Runtime>::name(client) != "cpu")
+        || partition_fuse_bc_enabled()
+}
 
 /// Test/harness hook: force the partition BC-fusion ON (`Some(true)`), OFF
 /// (`Some(false)`), or defer to the env gate (`None`). Exists so a same-session A/B

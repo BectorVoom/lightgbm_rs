@@ -129,6 +129,29 @@ fn partition_bc_fusion_byte_identical_to_three_launch() {
 
     assert_eq!(perm_off, perm_on, "BC-fused perm diverged from the 3-launch perm");
     assert_eq!(ranges_off, ranges_on, "BC-fused child ranges diverged from the 3-launch ranges");
+
+    // SharedMemory BC-fusion arm: on the cubecl-cpu runtime `partition_bc_fused` is
+    // FALSE (the SMEM kernel can't lower there), so forcing the SMEM gate ON must
+    // FALL BACK to the 3-launch path and stay byte-identical — pinning that the cpu
+    // anchor is never routed into the real-device-only kernel. (The SMEM kernel's own
+    // bit-exactness is validated on real CUDA via the driver bit-identical-preds A/B.)
+    use lgbm_compute::kernels::partition::{partition_bc_fused, set_partition_fuse_bc_smem_override};
+    assert!(
+        !partition_bc_fused(&client),
+        "on the cubecl-cpu runtime the SMEM BC-fusion must be gated OFF (no cross-unit \
+         SharedMemory), so partition_bc_fused must be false with no override set"
+    );
+    set_partition_fuse_bc_smem_override(Some(true));
+    assert!(
+        !partition_bc_fused(&client),
+        "even with LGBM_PARTITION_FUSE_BC_SMEM forced ON, the cpu runtime must stay on \
+         the 3-launch path (real-device gate)"
+    );
+    let (perm_smem, ranges_smem) = run_arm(false);
+    set_partition_fuse_bc_smem_override(None);
+    assert_eq!(perm_off, perm_smem, "SMEM-gate-on cpu run diverged (fallback broken)");
+    assert_eq!(ranges_off, ranges_smem, "SMEM-gate-on cpu ranges diverged (fallback broken)");
+
     // Non-vacuity: the root split actually routed rows both ways.
     assert!(
         ranges_off[0][2] > 0 && ranges_off[0][5] > 0,

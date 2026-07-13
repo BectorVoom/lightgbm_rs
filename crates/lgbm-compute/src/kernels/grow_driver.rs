@@ -507,6 +507,27 @@ pub fn on_device_subtract_fused_count_take() -> u64 {
     ON_DEVICE_SUBTRACT_FUSED_CNT.swap(0, Ordering::Relaxed)
 }
 
+/// POSITIVE tripwire — bumped once per split that took the SharedMemory partition
+/// BC-fusion arm (`partition_fuse_bc_smem_enabled` on a real device). NONZERO in the
+/// COUNTS ledger (`partition_bc_smem=`) is the bench-protocol proof the 2-launch SMEM
+/// partition ran (vs the 3-launch default); 0 on the default / cpu path. Inert unless
+/// `LGBM_PHASE_PROF=="1"`.
+pub static ON_DEVICE_PARTITION_BC_SMEM_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the SharedMemory BC-fusion tripwire (see [`ON_DEVICE_PARTITION_BC_SMEM_CNT`]).
+#[inline]
+fn bump_partition_bc_smem() {
+    if launch_prof_enabled() {
+        ON_DEVICE_PARTITION_BC_SMEM_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the SMEM BC-fusion tripwire to zero and return the prior value (folded into
+/// the `phase_prof` COUNTS line).
+pub fn on_device_partition_bc_smem_count_take() -> u64 {
+    ON_DEVICE_PARTITION_BC_SMEM_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// A/B escape hatch — read-once `LGBM_ONDEVICE_F64_FUSED=="1"`.
 ///
 /// DEFAULT (unset/`!= "1"`): the on-device ROOT + directly-built resident histogram BUILD
@@ -2786,10 +2807,20 @@ where
                 // protocol is bumped once per split regardless.
                 bump_launch();
                 bump_launch();
-                if !crate::kernels::partition::partition_fuse_bc_enabled() {
+                // The 3rd (stage-B totals) launch fires ONLY when NEITHER BC-fusion is
+                // active — the SharedMemory variant is real-device gated, so route the
+                // count through the single-source predicate the dispatch uses.
+                if !crate::kernels::partition::partition_bc_fused(client) {
                     bump_launch();
                 }
                 bump_partition_resident();
+                // POSITIVE proof the SMEM BC-fusion (2-launch, real-device) arm ran —
+                // distinguishes it from the redundant-sum fusion + the 3-launch default.
+                if crate::kernels::partition::partition_fuse_bc_smem_enabled()
+                    && <R as cubecl::Runtime>::name(client) != "cpu"
+                {
+                    bump_partition_bc_smem();
+                }
                 rp.partition_leaf(
                     client,
                     &view.0,
