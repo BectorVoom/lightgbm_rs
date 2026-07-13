@@ -2114,7 +2114,103 @@ pub fn build_fix_compact_resident_f64_on<R: cubecl::Runtime>(
         resident_gh, // Some ⇒ on-device grad/hess gather, no host upload
     );
 
-    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian)
+    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian, None)
+}
+
+/// Per-grow cached BUILD descriptor handles (the `LGBM_DESC_HOIST` hoist): the
+/// slot-offset SENTINEL array the u64 LDS build kernel reads + the 4 fix/compact
+/// tail arrays — ALL derived from the per-grow-constant `slot_off` / `fix_feats`,
+/// previously re-uploaded via 5 `create_from_slice` calls on EVERY build
+/// (~6100/train). Same bytes uploaded once ⇒ bit-exact by construction. `Handle`s
+/// are ref-counted (`Clone` is cheap).
+#[cfg(feature = "gpu")]
+#[derive(Clone)]
+pub struct BuildDescHandles {
+    nf: usize,
+    slot_len: usize,
+    h_slot_sentinel: cubecl::server::Handle,
+    h_fix_slot: cubecl::server::Handle,
+    h_fix_numbin: cubecl::server::Handle,
+    h_fix_offset: cubecl::server::Handle,
+    h_fix_mfb: cubecl::server::Handle,
+}
+
+#[cfg(feature = "gpu")]
+impl BuildDescHandles {
+    /// Whether this cache was built for exactly this call's geometry.
+    #[must_use]
+    pub fn matches(&self, nf: usize, slot_len: usize) -> bool {
+        self.nf == nf && self.slot_len == slot_len
+    }
+}
+
+/// Build + upload the per-grow BUILD descriptor set: the SAME sentinel assembly
+/// ([`slot_off_sentinel`]) + the SAME fix/compact validation loop + array assembly
+/// the per-launch path runs (byte-identical arrays), uploaded once.
+///
+/// # Errors
+/// The SAME fix/compact validation errors the per-launch tail raises (zero
+/// `num_bin`, region overflow, region beyond `slot_len`).
+#[cfg(feature = "gpu")]
+pub fn upload_build_desc<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    slot_off: &[usize],
+    slot_len: usize,
+    fix_feats: &[(usize, u32, i32, u32)],
+) -> Result<BuildDescHandles, ComputeError> {
+    let (slot_s, _max_w) = slot_off_sentinel(slot_off, slot_len);
+    let (fix_slot, fix_numbin, fix_offset, fix_mfb) =
+        fix_desc_arrays(fix_feats, slot_len)?;
+    Ok(BuildDescHandles {
+        nf: slot_off.len(),
+        slot_len,
+        h_slot_sentinel: client.create_from_slice(u32::as_bytes(&slot_s)),
+        h_fix_slot: client.create_from_slice(u32::as_bytes(&fix_slot)),
+        h_fix_numbin: client.create_from_slice(i32::as_bytes(&fix_numbin)),
+        h_fix_offset: client.create_from_slice(i32::as_bytes(&fix_offset)),
+        h_fix_mfb: client.create_from_slice(i32::as_bytes(&fix_mfb)),
+    })
+}
+
+/// The fix/compact tail's per-feature validation + array assembly, factored out
+/// VERBATIM from [`fix_compact_from_raw_f64_on`] so the per-launch path and the
+/// per-grow [`upload_build_desc`] hoist run the IDENTICAL loop (same arrays, same
+/// typed errors).
+#[cfg(feature = "gpu")]
+#[allow(clippy::type_complexity)]
+fn fix_desc_arrays(
+    fix_feats: &[(usize, u32, i32, u32)],
+    slot_len: usize,
+) -> Result<(Vec<u32>, Vec<i32>, Vec<i32>, Vec<i32>), ComputeError> {
+    let n = fix_feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut mfb_a: Vec<i32> = Vec::with_capacity(n);
+    for &(so, nb, off, mfb) in fix_feats {
+        if nb == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "build_fix_compact_resident: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize.checked_mul(nb as usize).ok_or_else(|| ComputeError::Runtime {
+            detail: format!("num_bin {nb} overflows the histogram length"),
+        })?;
+        let end = so.checked_add(cells).ok_or_else(|| ComputeError::Runtime {
+            detail: "build_fix_compact_resident: slot_off + region overflows".to_string(),
+        })?;
+        if end > slot_len {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: slot_len,
+            });
+        }
+        slot_off_a.push(so as u32);
+        num_bin_a.push(nb as i32);
+        offset_a.push(off);
+        mfb_a.push(mfb as i32);
+    }
+    Ok((slot_off_a, num_bin_a, offset_a, mfb_a))
 }
 
 /// The shared FIX/COMPACT tail of the resident build chains: allocate the zeroed
@@ -2134,6 +2230,12 @@ fn fix_compact_from_raw_f64_on<R: cubecl::Runtime>(
     fix_feats: &[(usize, u32, i32, u32)],
     sum_gradient: f64,
     sum_hessian: f64,
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST). `Some` with matching
+    // geometry skips the per-launch array assembly + 4 uploads AND replaces the
+    // 8·slot_len-byte zero-fill upload of `h_f64` with an uninitialized alloc —
+    // sound because `fix_compact_kernel`'s dequant pass writes EVERY cell of every
+    // feature region before any read, and `fix_feats` regions tile `[0, slot_len)`.
+    bdesc: Option<&BuildDescHandles>,
 ) -> Result<(cubecl::server::Handle, usize), ComputeError> {
     // ---- 2. (Lever A) Allocate the zeroed f64 OUTPUT. The standalone
     //         widen launch is GONE — the folded fix kernel below widens each feature
@@ -2145,43 +2247,45 @@ fn fix_compact_from_raw_f64_on<R: cubecl::Runtime>(
     //         (construct + folded fix). When `fix_feats` is empty (no features / no
     //         rows) there is nothing to widen and `h_f64` stays zeroed — matching the
     //         prior degenerate path (construct skipped ⇒ widen of zeros ⇒ zeros). ----
-    let zeros64 = vec![0.0f64; slot_len];
-    let h_f64 = client.create_from_slice(f64::as_bytes(&zeros64));
+    // A matching per-grow cache (LGBM_DESC_HOIST) authorizes the uninitialized
+    // alloc: the folded kernel's dequant pass writes EVERY cell of every feature
+    // region before any read, and the regions tile `[0, slot_len)` (entry contract),
+    // so uninitialized contents are observably identical. The zero-filled upload is
+    // kept byte-unchanged for the per-launch path (and the degenerate empty
+    // `fix_feats`, where nothing overwrites the buffer).
+    let bd_ok = bdesc.filter(|d| d.matches(fix_feats.len(), slot_len));
+    let h_f64 = if bd_ok.is_some() && !fix_feats.is_empty() {
+        client.empty(slot_len * std::mem::size_of::<f64>())
+    } else {
+        let zeros64 = vec![0.0f64; slot_len];
+        client.create_from_slice(f64::as_bytes(&zeros64))
+    };
 
     // ---- 3. ON-GPU FOLDED widen+fix+compact over the f64 buffer (Lever A kernel) ----
     if !fix_feats.is_empty() {
         let n = fix_feats.len();
-        let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
-        let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
-        let mut offset_a: Vec<i32> = Vec::with_capacity(n);
-        let mut mfb_a: Vec<i32> = Vec::with_capacity(n);
-        for &(so, nb, off, mfb) in fix_feats {
-            if nb == 0 {
-                return Err(ComputeError::Runtime {
-                    detail: "build_fix_compact_resident: num_bin must be > 0".to_string(),
-                });
+        let (h_slot, h_numbin, h_offset, h_mfb) = match bd_ok {
+            Some(d) => {
+                crate::kernels::split::SCAN_DESC_CNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (
+                    d.h_fix_slot.clone(),
+                    d.h_fix_numbin.clone(),
+                    d.h_fix_offset.clone(),
+                    d.h_fix_mfb.clone(),
+                )
             }
-            let cells = 2usize.checked_mul(nb as usize).ok_or_else(|| ComputeError::Runtime {
-                detail: format!("num_bin {nb} overflows the histogram length"),
-            })?;
-            let end = so.checked_add(cells).ok_or_else(|| ComputeError::Runtime {
-                detail: "build_fix_compact_resident: slot_off + region overflows".to_string(),
-            })?;
-            if end > slot_len {
-                return Err(ComputeError::LengthMismatch {
-                    expected: end,
-                    actual: slot_len,
-                });
+            None => {
+                let (slot_off_a, num_bin_a, offset_a, mfb_a) =
+                    fix_desc_arrays(fix_feats, slot_len)?;
+                (
+                    client.create_from_slice(u32::as_bytes(&slot_off_a)),
+                    client.create_from_slice(i32::as_bytes(&num_bin_a)),
+                    client.create_from_slice(i32::as_bytes(&offset_a)),
+                    client.create_from_slice(i32::as_bytes(&mfb_a)),
+                )
             }
-            slot_off_a.push(so as u32);
-            num_bin_a.push(nb as i32);
-            offset_a.push(off);
-            mfb_a.push(mfb as i32);
-        }
-        let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
-        let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
-        let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
-        let h_mfb = client.create_from_slice(i32::as_bytes(&mfb_a));
+        };
         // SAFETY: `h_raw` (f32 IN) and `h_f64` (f64 OUT) are both sized `slot_len`;
         // cube `f < n` reads `h_raw` and reads/writes `h_f64` only within its validated
         // `[slot_off[f], slot_off[f]+2*num_bin[f]) <= slot_len` region (inline widen +
@@ -2308,6 +2412,11 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
     sum_hessian: f64,
     max_abs_grad_hess: f64,
     resident_gh: (cubecl::server::Handle, cubecl::server::Handle, usize),
+    // Per-grow cached BUILD descriptor set (LGBM_DESC_HOIST). `Some` with matching
+    // geometry replaces the per-build sentinel + fix-tail uploads with the cached
+    // handles and authorizes the tail's uninitialized f64 alloc (same bytes, same
+    // kernels — bit-exact); anything else is the byte-unchanged per-launch path.
+    bdesc: Option<&BuildDescHandles>,
 ) -> Result<(cubecl::server::Handle, usize), ComputeError> {
     // ---- 0. OVERFLOW GUARD (grow-level bound) ----
     // Same i64@2^30 contract as the host-rows twin; `max_abs_grad_hess` bounds any
@@ -2334,7 +2443,10 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
             });
         }
         let (grad_h, hess_h, gh_num_data) = resident_gh;
-        let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+        let h_slot = match bdesc.filter(|d| d.matches(slot_off.len(), slot_len)) {
+            Some(d) => d.h_slot_sentinel.clone(),
+            None => client.create_from_slice(u32::as_bytes(&slot_s)),
+        };
         // Direct `P` (FORCE_P pin → u64 row-partition heuristic), exactly the
         // resident-gh branch of `resident_raw_build_into` (the autotune tuner set is
         // host-gather-shaped, so this path bypasses it there too; this build is always
@@ -2375,7 +2487,7 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
     }
 
     // ---- 2/3. The shared fix/compact tail (byte-identical to the host-rows twin). ----
-    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian)
+    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian, bdesc)
 }
 
 // ===========================================================================
@@ -3191,7 +3303,8 @@ pub fn build_fix_scan_resident_reduce_f64_on<R: cubecl::Runtime>(
 
     // Fold the winner into `out[out_leaf]` on device — ZERO per-feature-array readback. The
     // reduce runs over all `feats.len()` windows; inactive features decode `is_splittable=0`
-    // and are skipped by the accept-gate.
+    // and are skipped by the accept-gate. No cached `rf` handle here — the f64-fused
+    // escape hatch is A/B-only, never the default arm (per-launch upload, byte-unchanged).
     crate::kernels::split::launch_reduce_into_leaf(
         client,
         h_out,
@@ -3202,6 +3315,7 @@ pub fn build_fix_scan_resident_reduce_f64_on<R: cubecl::Runtime>(
         out_leaf,
         0,
         min_gain_shift,
+        None,
     );
 
     Ok((h_hist, len))
@@ -3778,5 +3892,53 @@ mod tests {
                 "u64 fixed-point build differs between P=1 and P={p} — must be parity-neutral"
             );
         }
+    }
+
+    /// The BUILD-side desc hoist: the fix/compact tail with CACHED descriptor handles
+    /// + the UNINITIALIZED f64 alloc produces BYTE-IDENTICAL output to the per-launch
+    /// path (zero-filled upload + fresh array uploads) — runnable on the cubecl-cpu
+    /// lane (the tail kernel is plain loops, no atomics/SharedMemory). The fixture's
+    /// `fix_feats` regions TILE `[0, slot_len)` (the entry contract that makes the
+    /// uninitialized alloc sound: the dequant pass writes every cell before any read)
+    /// and exercise all three compact arms (off=0 no-op, 0<off<nb shift+zero-tail,
+    /// off>=nb whole-region zero).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn fix_compact_tail_desc_hoist_byte_identical() {
+        use super::{fix_compact_from_raw_f64_on, upload_build_desc, BuildDescHandles};
+        use cubecl::prelude::CubeElement;
+
+        let client = crate::runtime::cpu_client();
+        // Regions: [0,16) nb=8 off=0 | [16,24) nb=4 off=2 | [24,34) nb=5 off=5 (>= nb).
+        let slot_off: Vec<usize> = vec![0, 16, 24];
+        let fix_feats: Vec<(usize, u32, i32, u32)> = vec![(0, 8, 0, 0), (16, 4, 2, 1), (24, 5, 5, 2)];
+        let slot_len = 34usize;
+        // Arbitrary quantized i64 cell values stored as two's-complement u64 bits
+        // (what the u64 build would have produced).
+        let raw: Vec<u64> = (0..slot_len).map(|i| ((i as i64 - 9) * 12_345) as u64).collect();
+
+        let run = |bdesc: Option<&BuildDescHandles>| -> Vec<u64> {
+            let h_raw = client.create_from_slice(u64::as_bytes(&raw));
+            let (h_f64, len) = fix_compact_from_raw_f64_on(
+                &client, h_raw, slot_len, &fix_feats, -1.0, 20.0, bdesc,
+            )
+            .expect("fix/compact tail");
+            assert_eq!(len, slot_len);
+            let bytes = client.read_one_unchecked(h_f64);
+            f64::from_bytes(&bytes).iter().map(|v| v.to_bits()).collect()
+        };
+
+        let base = run(None);
+        let bdesc = upload_build_desc(&client, &slot_off, slot_len, &fix_feats)
+            .expect("build desc upload");
+        assert!(bdesc.matches(slot_off.len(), slot_len));
+        let hoisted = run(Some(&bdesc));
+        assert_eq!(base, hoisted, "hoisted fix/compact tail diverged from the per-launch path");
+        // Non-vacuity: the fixture produced non-zero cells AND zeroed-tail cells.
+        assert!(base.iter().any(|&b| b != 0), "fixture must produce non-zero cells");
+        assert!(
+            base[24..34].iter().all(|&b| b == 0),
+            "off >= nb region must be fully zeroed by the compact arm"
+        );
     }
 }

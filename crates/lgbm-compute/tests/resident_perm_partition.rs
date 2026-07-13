@@ -365,6 +365,7 @@ mod real_gpu_gated {
             sum_h,
             f64::from(max_abs),
             (grad_h, hess_h, num_data),
+            None,
         )
         .expect("rows-handle build");
         assert_eq!(len, slot_len);

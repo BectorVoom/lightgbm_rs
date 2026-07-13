@@ -252,6 +252,10 @@ pub fn dump(label: &str) {
     // NONZERO proves the fused arm ran; 0 on the default separate-subtract path.
     let subtract_fused =
         lgbm_compute::kernels::grow_driver::on_device_subtract_fused_count_take();
+    // The DESC-HOIST tripwire (LGBM_DESC_HOIST=1): one bump per scan/build launch that
+    // consumed the per-grow CACHED descriptor handles instead of re-uploading them.
+    // NONZERO proves the hoist arm ran; 0 on the default per-launch-upload path.
+    let desc_hoist = lgbm_compute::kernels::split::scan_desc_count_take();
     if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
         let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
@@ -261,7 +265,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} subtract_fused={subtract_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} subtract_fused={subtract_fused} desc_hoist={desc_hoist}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the

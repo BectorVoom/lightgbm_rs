@@ -2060,6 +2060,178 @@ pub fn scan_pargain_count_take() -> u64 {
     }
 }
 
+// ===================== per-grow scan-descriptor hoist =====================
+//
+// Every fused-scan launch used to re-upload SEVEN per-feature descriptor arrays
+// (slot_off / num_bin / offset / default_bin / skip_default_bin / rev_count /
+// fwd_count) + the reduce's `rf` real-feature tie-break array — ALL derived from
+// the per-grow-CONSTANT `feats` / `real_feats` — via per-launch
+// `create_from_slice` calls (~8 small H2D uploads × ~3600 scans/train). The hoist
+// uploads them ONCE per grow ([`ScanDescHandles`], cached by the GpuBackend and
+// invalidated in `reset_resident_pool`) and passes the cached handles to the SAME
+// kernels: identical bytes, identical launch geometry ⇒ bit-exact by construction.
+// The per-launch path stays byte-unchanged for callers with no cache (tests, a
+// geometry mismatch, hatch OFF).
+
+/// Test/in-process override for the desc-hoist gate: `0` unset (env decides),
+/// `1` forced ON, `-1` forced OFF. Mirrors `set_partition_fuse_bc_override`.
+static DESC_HOIST_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(0);
+
+/// Force the desc-hoist gate for in-process A/B (`Some(true/false)`) or restore
+/// env control (`None`). Test-only seam; production reads the env.
+pub fn set_desc_hoist_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => -1,
+    };
+    DESC_HOIST_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Desc-hoist gate (env `LGBM_DESC_HOIST`, opt-in `"1"`; default OFF pending the
+/// spike101 real-CUDA verdict). Read FRESH per call (mirrors `scan_staged_enabled`)
+/// so one process can A/B it; the override wins over the env. Consumed by the
+/// `gpu`-gated GpuBackend caches (the cpu build has no per-grow descriptor cache).
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn desc_hoist_enabled() -> bool {
+    match DESC_HOIST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        -1 => false,
+        _ => matches!(std::env::var("LGBM_DESC_HOIST").as_deref(), Ok("1")),
+    }
+}
+
+/// POSITIVE tripwire — bumped once per scan launch that consumed the CACHED
+/// descriptor set (the bench-protocol counts proof). Folded into the `phase_prof`
+/// COUNTS line as `desc_hoist=`.
+pub static SCAN_DESC_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the desc-hoist tripwire to zero and return the prior value (consumed by
+/// `phase_prof::dump`).
+pub fn scan_desc_count_take() -> u64 {
+    SCAN_DESC_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The per-grow device-resident scan descriptor set: the 7 per-feature arrays every
+/// fused-scan kernel consumes + (when built with `real_feats`) the reduce kernels'
+/// `rf` tie-break array. `Handle`s are ref-counted — `Clone` is cheap. Geometry
+/// (`n`, `buf_len`) is carried so a consumer can verify the cache matches its call
+/// before trusting it (mismatch ⇒ per-launch fallback, byte-unchanged).
+#[derive(Clone)]
+pub struct ScanDescHandles {
+    n: usize,
+    buf_len: usize,
+    /// Every feature fits the staged LDS cap (`2*num_bin <= SCAN_STAGE_MAX_CELLS`) —
+    /// precomputed so the staged-branch gate needs no per-launch re-scan of `feats`.
+    /// Read only by the `gpu`-gated staged branches (the cpu build has no staged path).
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    staged_capable: bool,
+    h_slot: cubecl::server::Handle,
+    h_numbin: cubecl::server::Handle,
+    h_offset: cubecl::server::Handle,
+    h_defbin: cubecl::server::Handle,
+    h_skip: cubecl::server::Handle,
+    h_rev: cubecl::server::Handle,
+    h_fwd: cubecl::server::Handle,
+    h_rf: Option<cubecl::server::Handle>,
+}
+
+impl ScanDescHandles {
+    /// Whether this cache was built for exactly this call's geometry.
+    #[must_use]
+    pub fn matches(&self, n: usize, buf_len: usize) -> bool {
+        self.n == n && self.buf_len == buf_len
+    }
+}
+
+/// Build + upload the per-grow scan descriptor set: the SAME per-feature V5
+/// validation loop + the SAME array assembly the per-launch path runs (byte-identical
+/// arrays), uploaded once. `ctx` prefixes the two context-dependent error messages so
+/// a cache-time validation failure reads identically to the per-launch failure it
+/// replaces. `real_feats` (when given) must be the fpos-ordered real-feature-index
+/// vector with exactly `feats.len()` entries — it becomes the reduce kernels' `rf`.
+///
+/// # Errors
+/// The SAME per-feature V5 errors as the per-launch assembly (`na_as_missing`,
+/// `num_bin == 0`, region overflow, region beyond `buf_len`).
+pub fn upload_scan_desc<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    feats: &[BatchedSplitFeature],
+    real_feats: Option<&[i32]>,
+    buf_len: usize,
+    ctx: &str,
+) -> Result<ScanDescHandles, ComputeError> {
+    let n = feats.len();
+    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
+    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
+    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
+    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
+    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
+    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
+    for f in feats {
+        if f.na_as_missing {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
+                         implemented"
+                    .to_string(),
+            });
+        }
+        if f.num_bin == 0 {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_split: num_bin must be > 0".to_string(),
+            });
+        }
+        let cells = 2usize
+            .checked_mul(f.num_bin as usize)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
+            })?;
+        let end = f
+            .slot_off
+            .checked_add(cells)
+            .ok_or_else(|| ComputeError::Runtime {
+                detail: format!("{ctx}: slot_off + region overflows"),
+            })?;
+        if end > buf_len {
+            return Err(ComputeError::LengthMismatch {
+                expected: end,
+                actual: buf_len,
+            });
+        }
+        let num_bin_i = f.num_bin as i32;
+        slot_off_a.push(f.slot_off as u32);
+        num_bin_a.push(num_bin_i);
+        offset_a.push(f.offset);
+        default_bin_a.push(f.default_bin as i32);
+        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
+        rev_count_a.push((num_bin_i - 1).max(0));
+        fwd_count_a.push(if f.run_forward { (num_bin_i - 1 - f.offset).max(0) } else { 0 });
+    }
+    #[cfg(feature = "gpu")]
+    let staged_capable =
+        feats.iter().all(|f| (f.num_bin as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
+    #[cfg(not(feature = "gpu"))]
+    let staged_capable = false;
+    let h_rf = real_feats.map(|rfs| {
+        let rf: Vec<f64> = rfs.iter().take(n).map(|&r| f64::from(r)).collect();
+        client.create_from_slice(f64::as_bytes(&rf))
+    });
+    Ok(ScanDescHandles {
+        n,
+        buf_len,
+        staged_capable,
+        h_slot: client.create_from_slice(u32::as_bytes(&slot_off_a)),
+        h_numbin: client.create_from_slice(i32::as_bytes(&num_bin_a)),
+        h_offset: client.create_from_slice(i32::as_bytes(&offset_a)),
+        h_defbin: client.create_from_slice(i32::as_bytes(&default_bin_a)),
+        h_skip: client.create_from_slice(u32::as_bytes(&skip_default_bin_a)),
+        h_rev: client.create_from_slice(i32::as_bytes(&rev_count_a)),
+        h_fwd: client.create_from_slice(i32::as_bytes(&fwd_count_a)),
+        h_rf,
+    })
+}
+
 /// PHASE 1, REVERSE branch: the accumulation walk of [`scan_rev_branch_staged`]
 /// with the gain/best logic REMOVED and each candidate's state STORED —
 /// `cand_ag`/`cand_ah` hold the branch-ACCUMULATED right-side pair (the serial
@@ -3865,9 +4037,16 @@ pub(crate) fn launch_reduce_into_leaf<R: cubecl::Runtime>(
     out_slot: usize,
     raw_base: usize,
     min_gain_shift: f64,
+    // Per-grow cached `rf` handle (LGBM_DESC_HOIST): the SAME f64 image of
+    // `real_feats[..n_feats]` already device-resident. The caller guarantees the
+    // cache was built from THIS `real_feats` with length >= `n_feats` (the entry
+    // fns validate `real_feats.len() == feats.len() == n_feats` before passing it).
+    h_rf_cached: Option<cubecl::server::Handle>,
 ) {
-    let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
-    let h_rf = client.create_from_slice(f64::as_bytes(&rf));
+    let h_rf = h_rf_cached.unwrap_or_else(|| {
+        let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
+        client.create_from_slice(f64::as_bytes(&rf))
+    });
     // SAFETY: single-owner static geometry (Route C). The kernel seeds + folds `out_*[slot]`
     // (`out_slot < out.len`, caller-validated) and reads only `raw[raw_base .. raw_base +
     // n_feats*12)` (caller-validated `<= raw_len`) and `real_feats[0 .. n_feats)`
@@ -4002,9 +4181,13 @@ fn launch_reduce_into_two_leaves<R: cubecl::Runtime>(
     out_slot_b: usize,
     min_gain_shift_a: f64,
     min_gain_shift_b: f64,
+    // Per-grow cached `rf` handle (LGBM_DESC_HOIST) — see `launch_reduce_into_leaf`.
+    h_rf_cached: Option<cubecl::server::Handle>,
 ) {
-    let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
-    let h_rf = client.create_from_slice(f64::as_bytes(&rf));
+    let h_rf = h_rf_cached.unwrap_or_else(|| {
+        let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
+        client.create_from_slice(f64::as_bytes(&rf))
+    });
     // SAFETY: two single-owner cubes (Route C, geometry `Static(2,1,1)`). Cube `task`
     // seeds + folds ONLY `out_*[out_slot_{a|b}]` (both `< out.len`, DISTINCT, caller-
     // validated ⇒ no cross-cube write race) and reads only `raw[rb .. rb + n*12)` with
@@ -4063,6 +4246,10 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST). `Some` with matching
+    // geometry skips the per-launch array assembly + 7 uploads (same bytes, same
+    // kernels — bit-exact); anything else takes the byte-unchanged per-launch path.
+    desc: Option<&ScanDescHandles>,
 ) -> Result<Option<(cubecl::server::Handle, usize, f64)>, ComputeError> {
     if feats.is_empty() {
         return Ok(None);
@@ -4085,59 +4272,21 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
 
     // Per-feature V5 validation + device-array assembly (BEFORE launch) — IDENTICAL to
     // `find_best_splits_fused_inner`, including the whole-batch `na_as_missing` reject.
+    // A MATCHING per-grow cached set (`desc`) ran this same validation + uploaded these
+    // same bytes once at cache time, so it skips both (bit-exact by construction).
     let n = feats.len();
-    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
-    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
-    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
-    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
-    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
-    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
-    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
-    for f in feats {
-        if f.na_as_missing {
-            return Err(ComputeError::Runtime {
-                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
-                         implemented"
-                    .to_string(),
-            });
+    let owned_desc: ScanDescHandles;
+    let d: &ScanDescHandles = match desc {
+        Some(d) if d.matches(n, buf_len) => {
+            SCAN_DESC_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            d
         }
-        if f.num_bin == 0 {
-            return Err(ComputeError::Runtime {
-                detail: "find_best_split: num_bin must be > 0".to_string(),
-            });
+        _ => {
+            owned_desc =
+                upload_scan_desc(client, feats, None, buf_len, "find_best_splits_reduce")?;
+            &owned_desc
         }
-        let cells = 2usize
-            .checked_mul(f.num_bin as usize)
-            .ok_or_else(|| ComputeError::Runtime {
-                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
-            })?;
-        let end = f
-            .slot_off
-            .checked_add(cells)
-            .ok_or_else(|| ComputeError::Runtime {
-                detail: "find_best_splits_reduce: slot_off + region overflows".to_string(),
-            })?;
-        if end > buf_len {
-            return Err(ComputeError::LengthMismatch {
-                expected: end,
-                actual: buf_len,
-            });
-        }
-        let num_bin_i = f.num_bin as i32;
-        let rev_count = (num_bin_i - 1).max(0);
-        let fwd_count = if f.run_forward {
-            (num_bin_i - 1 - f.offset).max(0)
-        } else {
-            0
-        };
-        slot_off_a.push(f.slot_off as u32);
-        num_bin_a.push(num_bin_i);
-        offset_a.push(f.offset);
-        default_bin_a.push(f.default_bin as i32);
-        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
-        rev_count_a.push(rev_count);
-        fwd_count_a.push(fwd_count);
-    }
+    };
 
     // LEAF-LEVEL scalars ONCE — the 2*kEpsilon bump + min_gain_shift (identical math).
     let two_eps = 2.0 * f64::from(K_EPSILON);
@@ -4157,13 +4306,13 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     // of every feature window unconditionally, and the reduce kernel reads only
     // those cells — an uninitialized allocation is observably identical.
     let h_out = client.empty(out_len * std::mem::size_of::<f64>());
-    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
-    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
-    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
-    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
-    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
-    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
-    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+    let h_slot = d.h_slot.clone();
+    let h_numbin = d.h_numbin.clone();
+    let h_offset = d.h_offset.clone();
+    let h_defbin = d.h_defbin.clone();
+    let h_skip = d.h_skip.clone();
+    let h_rev = d.h_rev.clone();
+    let h_fwd = d.h_fwd.clone();
 
     // STAGED cube-per-feature branch (opt-in `LGBM_SCAN_STAGED=1`) on the LIVE
     // no-readback route — same gates as `find_best_splits_fused_inner` (real
@@ -4172,7 +4321,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     #[cfg(feature = "gpu")]
     if scan_staged_enabled()
         && <R as cubecl::Runtime>::name(client) != "cpu"
-        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS)
+        && d.staged_capable
     {
         // SAFETY: identical obligations to the legacy launch below; the geometry
         // guarantees CUBE_POS_X < n, matching the kernel's no-guard contract.
@@ -4273,6 +4422,9 @@ pub fn find_best_splits_fused_reduce_into_leaf_on<R: cubecl::Runtime>(
     num_data: i32,
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf: usize,
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST); `None` ⇒ byte-unchanged
+    // per-launch assembly. A geometry mismatch is ignored (per-launch fallback).
+    desc: Option<&ScanDescHandles>,
 ) -> Result<(), ComputeError> {
     if real_feats.len() != feats.len() {
         return Err(ComputeError::LengthMismatch {
@@ -4288,6 +4440,9 @@ pub fn find_best_splits_fused_reduce_into_leaf_on<R: cubecl::Runtime>(
             ),
         });
     }
+    // The cached `rf` is only trusted on an exact geometry match (same guard the
+    // scan helper applies); the entry validated `real_feats.len() == feats.len()`.
+    let desc_ok = desc.filter(|d| d.matches(feats.len(), buf_len));
     let scanned = fused_scan_to_raw_handle(
         client,
         hist_handle,
@@ -4297,6 +4452,7 @@ pub fn find_best_splits_fused_reduce_into_leaf_on<R: cubecl::Runtime>(
         sum_gradient,
         sum_hessian,
         num_data,
+        desc_ok,
     )?;
     if let Some((h_out, out_len, min_gain_shift)) = scanned {
         launch_reduce_into_leaf(
@@ -4309,6 +4465,7 @@ pub fn find_best_splits_fused_reduce_into_leaf_on<R: cubecl::Runtime>(
             out_leaf,
             0,
             min_gain_shift,
+            desc_ok.and_then(|d| d.h_rf.clone()),
         );
     }
     Ok(())
@@ -4334,6 +4491,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     cfg: &GainConfig,
     a_totals: (f64, f64, i32),
     b_totals: (f64, f64, i32),
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST) — see `fused_scan_to_raw_handle`.
+    desc: Option<&ScanDescHandles>,
 ) -> Result<Option<(cubecl::server::Handle, usize, usize, f64, f64)>, ComputeError> {
     if feats.is_empty() {
         return Ok(None);
@@ -4364,60 +4523,26 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
 
     // Per-feature V5 validation + device-array assembly ONCE (SHARED between siblings) —
     // IDENTICAL to `find_best_splits_fused_siblings_from_handles_on`, including the
-    // whole-batch `na_as_missing` reject.
+    // whole-batch `na_as_missing` reject. A MATCHING per-grow cached set (`desc`) ran
+    // this same validation + uploaded these same bytes once at cache time (bit-exact).
     let n = feats.len();
-    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
-    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
-    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
-    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
-    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
-    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
-    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
-    for f in feats {
-        if f.na_as_missing {
-            return Err(ComputeError::Runtime {
-                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
-                         implemented"
-                    .to_string(),
-            });
+    let owned_desc: ScanDescHandles;
+    let d: &ScanDescHandles = match desc {
+        Some(d) if d.matches(n, buf_len) => {
+            SCAN_DESC_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            d
         }
-        if f.num_bin == 0 {
-            return Err(ComputeError::Runtime {
-                detail: "find_best_split: num_bin must be > 0".to_string(),
-            });
+        _ => {
+            owned_desc = upload_scan_desc(
+                client,
+                feats,
+                None,
+                buf_len,
+                "find_best_splits_siblings_reduce",
+            )?;
+            &owned_desc
         }
-        let cells = 2usize
-            .checked_mul(f.num_bin as usize)
-            .ok_or_else(|| ComputeError::Runtime {
-                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
-            })?;
-        let end = f
-            .slot_off
-            .checked_add(cells)
-            .ok_or_else(|| ComputeError::Runtime {
-                detail: "find_best_splits_siblings_reduce: slot_off + region overflows".to_string(),
-            })?;
-        if end > buf_len {
-            return Err(ComputeError::LengthMismatch {
-                expected: end,
-                actual: buf_len,
-            });
-        }
-        let num_bin_i = f.num_bin as i32;
-        let rev_count = (num_bin_i - 1).max(0);
-        let fwd_count = if f.run_forward {
-            (num_bin_i - 1 - f.offset).max(0)
-        } else {
-            0
-        };
-        slot_off_a.push(f.slot_off as u32);
-        num_bin_a.push(num_bin_i);
-        offset_a.push(f.offset);
-        default_bin_a.push(f.default_bin as i32);
-        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
-        rev_count_a.push(rev_count);
-        fwd_count_a.push(fwd_count);
-    }
+    };
 
     // Per-sibling leaf scalars (the 2*kEpsilon bump + min_gain_shift) — IDENTICAL math.
     let two_eps = 2.0 * f64::from(K_EPSILON);
@@ -4443,13 +4568,13 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // NO zero-fill upload: the scan kernel (legacy or staged) writes all 12 cells
     // of every window unconditionally (single-slot helper note).
     let h_out = client.empty(out_len * std::mem::size_of::<f64>());
-    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
-    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
-    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
-    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
-    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
-    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
-    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+    let h_slot = d.h_slot.clone();
+    let h_numbin = d.h_numbin.clone();
+    let h_offset = d.h_offset.clone();
+    let h_defbin = d.h_defbin.clone();
+    let h_skip = d.h_skip.clone();
+    let h_rev = d.h_rev.clone();
+    let h_fwd = d.h_fwd.clone();
 
     // STAGED cube-per-(feature, sibling) branch (opt-in `LGBM_SCAN_STAGED=1`) on
     // the LIVE per-split co-pack route — the hot path (one call per split). Same
@@ -4457,7 +4582,7 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     #[cfg(feature = "gpu")]
     if scan_staged_enabled()
         && <R as cubecl::Runtime>::name(client) != "cpu"
-        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS)
+        && d.staged_capable
     {
         // SAFETY: identical obligations to the legacy launch below; the geometry
         // guarantees CUBE_POS_X < n and CUBE_POS_Y < 2 (kernel no-guard contract).
@@ -4560,6 +4685,8 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     cfg: &GainConfig,
     a_totals: (f64, f64, i32),
     b_totals: (f64, f64, i32),
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST) — see `fused_scan_to_raw_handle`.
+    desc: Option<&ScanDescHandles>,
 ) -> Result<
     Option<(cubecl::server::Handle, usize, usize, f64, f64, cubecl::server::Handle)>,
     ComputeError,
@@ -4596,48 +4723,26 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     }
 
     // Per-feature V5 validation + device-array assembly (SHARED between siblings) —
-    // IDENTICAL to `fused_scan_siblings_to_raw_handle`.
+    // IDENTICAL to `fused_scan_siblings_to_raw_handle`. A MATCHING per-grow cached set
+    // (`desc`) ran this same validation + uploaded these same bytes once (bit-exact).
     let n = feats.len();
-    let mut slot_off_a: Vec<u32> = Vec::with_capacity(n);
-    let mut num_bin_a: Vec<i32> = Vec::with_capacity(n);
-    let mut offset_a: Vec<i32> = Vec::with_capacity(n);
-    let mut default_bin_a: Vec<i32> = Vec::with_capacity(n);
-    let mut skip_default_bin_a: Vec<u32> = Vec::with_capacity(n);
-    let mut rev_count_a: Vec<i32> = Vec::with_capacity(n);
-    let mut fwd_count_a: Vec<i32> = Vec::with_capacity(n);
-    for f in feats {
-        if f.na_as_missing {
-            return Err(ComputeError::Runtime {
-                detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
-                         implemented"
-                    .to_string(),
-            });
+    let owned_desc: ScanDescHandles;
+    let d: &ScanDescHandles = match desc {
+        Some(d) if d.matches(n, buf_len) => {
+            SCAN_DESC_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            d
         }
-        if f.num_bin == 0 {
-            return Err(ComputeError::Runtime {
-                detail: "find_best_split: num_bin must be > 0".to_string(),
-            });
+        _ => {
+            owned_desc = upload_scan_desc(
+                client,
+                feats,
+                None,
+                buf_len,
+                "find_best_splits_siblings_subtract",
+            )?;
+            &owned_desc
         }
-        let cells = 2usize
-            .checked_mul(f.num_bin as usize)
-            .ok_or_else(|| ComputeError::Runtime {
-                detail: format!("num_bin {} overflows the histogram length", f.num_bin),
-            })?;
-        let end = f.slot_off.checked_add(cells).ok_or_else(|| ComputeError::Runtime {
-            detail: "find_best_splits_siblings_subtract: slot_off + region overflows".to_string(),
-        })?;
-        if end > buf_len {
-            return Err(ComputeError::LengthMismatch { expected: end, actual: buf_len });
-        }
-        let num_bin_i = f.num_bin as i32;
-        slot_off_a.push(f.slot_off as u32);
-        num_bin_a.push(num_bin_i);
-        offset_a.push(f.offset);
-        default_bin_a.push(f.default_bin as i32);
-        skip_default_bin_a.push(if f.skip_default_bin { 1u32 } else { 0u32 });
-        rev_count_a.push((num_bin_i - 1).max(0));
-        fwd_count_a.push(if f.run_forward { (num_bin_i - 1 - f.offset).max(0) } else { 0 });
-    }
+    };
 
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let use_l1 = cfg.use_l1();
@@ -4655,13 +4760,13 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // The FRESH derived-larger buffer (`parent − smaller`), `buf_len` f64 cells — the
     // sibling-B cubes write every feature region (they tile `[0, buf_len)`).
     let larger_out = client.empty(buf_len * std::mem::size_of::<f64>());
-    let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_a));
-    let h_numbin = client.create_from_slice(i32::as_bytes(&num_bin_a));
-    let h_offset = client.create_from_slice(i32::as_bytes(&offset_a));
-    let h_defbin = client.create_from_slice(i32::as_bytes(&default_bin_a));
-    let h_skip = client.create_from_slice(u32::as_bytes(&skip_default_bin_a));
-    let h_rev = client.create_from_slice(i32::as_bytes(&rev_count_a));
-    let h_fwd = client.create_from_slice(i32::as_bytes(&fwd_count_a));
+    let h_slot = d.h_slot.clone();
+    let h_numbin = d.h_numbin.clone();
+    let h_offset = d.h_offset.clone();
+    let h_defbin = d.h_defbin.clone();
+    let h_skip = d.h_skip.clone();
+    let h_rev = d.h_rev.clone();
+    let h_fwd = d.h_fwd.clone();
 
     // SAFETY: geometry `Static(n, 2, 1)` guarantees CUBE_POS_X < n, CUBE_POS_Y < 2
     // (the kernel's no-guard contract). Both hist handles + `larger_out` describe
@@ -4733,6 +4838,9 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_on<R: cubecl:
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf_a: usize,
     out_leaf_b: usize,
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST); `None` ⇒ byte-unchanged
+    // per-launch assembly. A geometry mismatch is ignored (per-launch fallback).
+    desc: Option<&ScanDescHandles>,
 ) -> Result<Option<cubecl::server::Handle>, ComputeError> {
     if real_feats.len() != feats.len() {
         return Err(ComputeError::LengthMismatch {
@@ -4749,6 +4857,7 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_on<R: cubecl:
             ),
         });
     }
+    let desc_ok = desc.filter(|d| d.matches(feats.len(), buf_len));
     let scanned = fused_subtract_scan_siblings_to_raw_handle(
         client,
         hist_smaller_handle,
@@ -4758,23 +4867,27 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_on<R: cubecl:
         cfg,
         a_totals,
         b_totals,
+        desc_ok,
     )?;
     let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b, larger_out)) = scanned else {
         return Ok(None); // fallback signal (empty feats OR staged path not taken)
     };
     // ONE batched dispatch folds both siblings' winners (the same batched reduce the
     // non-fused co-pack path uses).
+    let h_rf_cached = desc_ok.and_then(|d| d.h_rf.clone());
     if reduce_batch_enabled() {
         launch_reduce_into_two_leaves(
             client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
-            min_gain_shift_a, min_gain_shift_b,
+            min_gain_shift_a, min_gain_shift_b, h_rf_cached,
         );
     } else {
         launch_reduce_into_leaf(
             client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0, min_gain_shift_a,
+            h_rf_cached.clone(),
         );
         launch_reduce_into_leaf(
             client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12, min_gain_shift_b,
+            h_rf_cached,
         );
     }
     Ok(Some(larger_out))
@@ -4811,6 +4924,9 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf_a: usize,
     out_leaf_b: usize,
+    // Per-grow cached descriptor set (LGBM_DESC_HOIST); `None` ⇒ byte-unchanged
+    // per-launch assembly. A geometry mismatch is ignored (per-launch fallback).
+    desc: Option<&ScanDescHandles>,
 ) -> Result<(), ComputeError> {
     if real_feats.len() != feats.len() {
         return Err(ComputeError::LengthMismatch {
@@ -4827,6 +4943,7 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
             ),
         });
     }
+    let desc_ok = desc.filter(|d| d.matches(feats.len(), buf_len));
     let scanned = fused_scan_siblings_to_raw_handle(
         client,
         hist_a_handle,
@@ -4836,8 +4953,10 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
         cfg,
         a_totals,
         b_totals,
+        desc_ok,
     )?;
     if let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)) = scanned {
+        let h_rf_cached = desc_ok.and_then(|d| d.h_rf.clone());
         // ONE batched dispatch folds BOTH siblings' winners (A: features [0, n) →
         // out_leaf_a; B: features [n, 2n) → out_leaf_b). Bit-identical to the two
         // separate `launch_reduce_into_leaf` calls it replaces (disjoint slots, same
@@ -4852,27 +4971,27 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
         if reduce_batch_enabled() {
             launch_reduce_into_two_leaves(
                 client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
-                min_gain_shift_a, min_gain_shift_b,
+                min_gain_shift_a, min_gain_shift_b, h_rf_cached,
             );
         } else {
             launch_reduce_into_leaf(
                 client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
-                min_gain_shift_a,
+                min_gain_shift_a, h_rf_cached.clone(),
             );
             launch_reduce_into_leaf(
                 client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
-                min_gain_shift_b,
+                min_gain_shift_b, h_rf_cached,
             );
         }
         #[cfg(not(feature = "gpu"))]
         {
             launch_reduce_into_leaf(
                 client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
-                min_gain_shift_a,
+                min_gain_shift_a, h_rf_cached.clone(),
             );
             launch_reduce_into_leaf(
                 client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
-                min_gain_shift_b,
+                min_gain_shift_b, h_rf_cached,
             );
         }
     }
@@ -6053,7 +6172,7 @@ mod tests {
         }
         let h_raw = client.create_from_slice(f64::as_bytes(&cells));
         let out = SplitSoa::zeroed(&client, 1);
-        launch_reduce_into_leaf(&client, h_raw, cells.len(), &real_feats, 4, &out, 0, 0, 0.0);
+        launch_reduce_into_leaf(&client, h_raw, cells.len(), &real_feats, 4, &out, 0, 0, 0.0, None);
 
         let got = out.read_record(&client, 0);
         assert_slot_eq(&got, &host_best, real_feats[host_fpos as usize]);
@@ -6135,7 +6254,7 @@ mod tests {
         let h_hist2 = client.create_from_slice(f64::as_bytes(&buf));
         let out = SplitSoa::zeroed(&client, 1);
         find_best_splits_fused_reduce_into_leaf_on(
-            &client, h_hist2, buf.len(), &feats, &real_feats, &cfg, sg, sh, nd, &out, 0,
+            &client, h_hist2, buf.len(), &feats, &real_feats, &cfg, sg, sh, nd, &out, 0, None,
         )
         .expect("device reduce launcher");
         let got = out.read_record(&client, 0);
@@ -6166,7 +6285,7 @@ mod tests {
         let h_hist2 = client.create_from_slice(f64::as_bytes(&buf));
         let out = SplitSoa::zeroed(&client, 1);
         let dev_err = find_best_splits_fused_reduce_into_leaf_on(
-            &client, h_hist2, buf.len(), &feats, &real_feats, &cfg, sg, sh, nd, &out, 0,
+            &client, h_hist2, buf.len(), &feats, &real_feats, &cfg, sg, sh, nd, &out, 0, None,
         )
         .unwrap_err();
         assert!(
@@ -6224,8 +6343,8 @@ mod tests {
         let h_raw = client.create_from_slice(f64::as_bytes(&cells));
         let out = SplitSoa::zeroed(&client, 2);
         // Sibling A → slot 0 (raw_base 0); sibling B → slot 1 (raw_base n*12).
-        launch_reduce_into_leaf(&client, h_raw.clone(), cells.len(), &real_feats, 4, &out, 0, 0, 0.0);
-        launch_reduce_into_leaf(&client, h_raw, cells.len(), &real_feats, 4, &out, 1, 4 * 12, 0.0);
+        launch_reduce_into_leaf(&client, h_raw.clone(), cells.len(), &real_feats, 4, &out, 0, 0, 0.0, None);
+        launch_reduce_into_leaf(&client, h_raw, cells.len(), &real_feats, 4, &out, 1, 4 * 12, 0.0, None);
 
         let got_a = out.read_record(&client, 0);
         let got_b = out.read_record(&client, 1);
@@ -6283,7 +6402,8 @@ mod tests {
         let h_b2 = client.create_from_slice(f64::as_bytes(&buf_b));
         let out = SplitSoa::zeroed(&client, 2);
         find_best_splits_fused_siblings_reduce_into_leaves_on(
-            &client, h_a2, h_b2, buf_a.len(), &feats, &real_feats, &cfg, a_totals, b_totals, &out, 0, 1,
+            &client, h_a2, h_b2, buf_a.len(), &feats, &real_feats, &cfg, a_totals, b_totals,
+            &out, 0, 1, None,
         )
         .expect("device co-pack reduce launcher");
         let got_a = out.read_record(&client, 0);
@@ -6325,15 +6445,15 @@ mod tests {
         // BASELINE: two separate single-leaf launches into slots 0 and 1.
         let base = SplitSoa::zeroed(&client, 2);
         let h1 = client.create_from_slice(f64::as_bytes(&cells));
-        launch_reduce_into_leaf(&client, h1, cells.len(), &real_feats, n, &base, 0, 0, mgs_a);
+        launch_reduce_into_leaf(&client, h1, cells.len(), &real_feats, n, &base, 0, 0, mgs_a, None);
         let h2 = client.create_from_slice(f64::as_bytes(&cells));
-        launch_reduce_into_leaf(&client, h2, cells.len(), &real_feats, n, &base, 1, n * 12, mgs_b);
+        launch_reduce_into_leaf(&client, h2, cells.len(), &real_feats, n, &base, 1, n * 12, mgs_b, None);
 
         // CANDIDATE: one batched launch folding both.
         let batched = SplitSoa::zeroed(&client, 2);
         let hb = client.create_from_slice(f64::as_bytes(&cells));
         launch_reduce_into_two_leaves(
-            &client, hb, cells.len(), &real_feats, n, &batched, 0, 1, mgs_a, mgs_b,
+            &client, hb, cells.len(), &real_feats, n, &batched, 0, 1, mgs_a, mgs_b, None,
         );
 
         for slot in 0..2 {
@@ -6400,7 +6520,7 @@ mod tests {
 
         let got = find_best_splits_fused_siblings_subtract_reduce_into_leaves_on(
             &client, h_smaller, h_parent, buf_a.len(), &feats, &real_feats, &cfg,
-            (sg_a, sh_a, nd_a), (sg_b, sh_b, nd_b), &out, 0, 1,
+            (sg_a, sh_a, nd_a), (sg_b, sh_b, nd_b), &out, 0, 1, None,
         )
         .expect("launcher must not error on the fallback path");
         assert!(
@@ -6413,5 +6533,103 @@ mod tests {
             let rec = out.read_record(&client, slot);
             assert!(!rec.is_valid, "slot {slot} must stay the zeroed sentinel (no fold on None)");
         }
+    }
+
+    // ================= per-grow scan-descriptor hoist (LGBM_DESC_HOIST) =================
+
+    /// The HOISTED descriptor handles produce BYTE-IDENTICAL frontier folds to the
+    /// per-launch uploads — pinning "cached handles ≡ fresh uploads" directly on the
+    /// runnable cubecl-cpu lane (single-leaf entry, legacy scan + reduce). The cached
+    /// arm passes `upload_scan_desc`'s handles (incl. the cached `rf`); the baseline
+    /// passes `None`. Same histogram, same cfg ⇒ every SplitSoa field must match
+    /// bit-for-bit.
+    #[test]
+    fn desc_hoist_reduce_into_leaf_byte_identical() {
+        use crate::kernels::best_split::SplitSoa;
+
+        let client = cpu_client();
+        let (buf, feats, real_feats, sg, sh, nd) = batch_hist();
+        let cfg = relaxed_cfg();
+
+        let h1 = client.create_from_slice(f64::as_bytes(&buf));
+        let base = SplitSoa::zeroed(&client, 1);
+        find_best_splits_fused_reduce_into_leaf_on(
+            &client, h1, buf.len(), &feats, &real_feats, &cfg, sg, sh, nd, &base, 0, None,
+        )
+        .expect("baseline reduce launcher");
+
+        let desc = upload_scan_desc(&client, &feats, Some(&real_feats), buf.len(), "test")
+            .expect("desc upload");
+        assert!(desc.matches(feats.len(), buf.len()), "cache geometry must match");
+        let h2 = client.create_from_slice(f64::as_bytes(&buf));
+        let hoisted = SplitSoa::zeroed(&client, 1);
+        find_best_splits_fused_reduce_into_leaf_on(
+            &client, h2, buf.len(), &feats, &real_feats, &cfg, sg, sh, nd, &hoisted, 0,
+            Some(&desc),
+        )
+        .expect("hoisted reduce launcher");
+        // Counts tripwire: the hoisted arm bumped the shared counter at least once.
+        // (LOWER bound, not exact — the counter is process-global and the other
+        // desc-hoist tests bump it concurrently under the parallel test runner.)
+        assert!(
+            scan_desc_count_take() >= 1,
+            "the hoisted arm must consume the cache (counts tripwire)"
+        );
+
+        let want = base.read_record(&client, 0);
+        let got = hoisted.read_record(&client, 0);
+        assert!(want.is_valid, "fixture must produce a real split (non-vacuous)");
+        assert_eq!(want.is_valid, got.is_valid, "valid");
+        assert_eq!(want.gain.to_bits(), got.gain.to_bits(), "gain");
+        assert_eq!(want.inner_feature_index, got.inner_feature_index, "feat");
+        assert_eq!(want.threshold, got.threshold, "threshold");
+        assert_eq!(want.default_left, got.default_left, "default_left");
+        assert_eq!(want.left_sum_gradients.to_bits(), got.left_sum_gradients.to_bits(), "lsg");
+        assert_eq!(want.left_sum_hessians.to_bits(), got.left_sum_hessians.to_bits(), "lsh");
+        assert_eq!(want.right_sum_gradients.to_bits(), got.right_sum_gradients.to_bits(), "rsg");
+        assert_eq!(want.right_sum_hessians.to_bits(), got.right_sum_hessians.to_bits(), "rsh");
+    }
+
+    /// Same invariant on the CO-PACK siblings entry: hoisted descriptors ≡ per-launch
+    /// uploads, both frontier slots bit-identical (exercises the batched two-leaf
+    /// reduce's cached `rf` on the gpu build, the two-call fallback otherwise).
+    #[test]
+    fn desc_hoist_siblings_reduce_byte_identical() {
+        use crate::kernels::best_split::SplitSoa;
+
+        let client = cpu_client();
+        let (buf_a, feats, real_feats, sg_a, sh_a, nd_a) = batch_hist();
+        let (buf_b, sg_b, sh_b, nd_b) = batch_hist_b();
+        let cfg = relaxed_cfg();
+
+        let run = |desc: Option<&ScanDescHandles>| {
+            let h_a = client.create_from_slice(f64::as_bytes(&buf_a));
+            let h_b = client.create_from_slice(f64::as_bytes(&buf_b));
+            let out = SplitSoa::zeroed(&client, 2);
+            find_best_splits_fused_siblings_reduce_into_leaves_on(
+                &client, h_a, h_b, buf_a.len(), &feats, &real_feats, &cfg,
+                (sg_a, sh_a, nd_a), (sg_b, sh_b, nd_b), &out, 0, 1, desc,
+            )
+            .expect("siblings reduce launcher");
+            out
+        };
+        let base = run(None);
+        let desc = upload_scan_desc(&client, &feats, Some(&real_feats), buf_a.len(), "test")
+            .expect("desc upload");
+        let hoisted = run(Some(&desc));
+
+        for slot in 0..2 {
+            let want = base.read_record(&client, slot);
+            let got = hoisted.read_record(&client, slot);
+            assert_eq!(want.is_valid, got.is_valid, "slot {slot} valid");
+            assert_eq!(want.gain.to_bits(), got.gain.to_bits(), "slot {slot} gain");
+            assert_eq!(want.inner_feature_index, got.inner_feature_index, "slot {slot} feat");
+            assert_eq!(want.threshold, got.threshold, "slot {slot} threshold");
+            assert_eq!(want.default_left, got.default_left, "slot {slot} default_left");
+        }
+        assert!(
+            base.read_record(&client, 0).is_valid && base.read_record(&client, 1).is_valid,
+            "fixture must produce real splits on BOTH siblings (non-vacuous)"
+        );
     }
 }

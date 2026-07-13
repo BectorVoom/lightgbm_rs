@@ -3022,6 +3022,23 @@ pub struct GpuBackend<R: cubecl::Runtime> {
     /// grad/hess can never leak into the next grow. Interior-mutable for the same
     /// single-threaded-train reason as `resident_bins`/`resident_pool`.
     resident_grad_hess: std::cell::RefCell<Option<ResidentGradHess>>,
+    /// The per-grow cached scan-descriptor handle set (`LGBM_DESC_HOIST` hoist):
+    /// the 7 per-feature arrays + the reduce `rf` array every fused-scan launch
+    /// consumes, ALL derived from the per-grow-constant `feats`/`real_feats`,
+    /// uploaded ONCE per grow instead of per launch (~8 small H2D uploads ×
+    /// ~3600 scans/train saved). Cleared by
+    /// [`reset_resident_pool`](Backend::reset_resident_pool) so a stale prior
+    /// grow's geometry can never leak. `None` until the first scan of a grow
+    /// (or always, when the hatch is OFF). Same single-threaded-train RefCell
+    /// discipline as the other resident caches.
+    resident_scan_desc: std::cell::RefCell<Option<kernels::split::ScanDescHandles>>,
+    /// The per-grow cached BUILD descriptor handle set (`LGBM_DESC_HOIST`): the
+    /// slot-offset sentinel + fix/compact tail arrays every resident build launch
+    /// consumes, derived from the per-grow-constant `slot_off`/`fix_feats` (~5
+    /// small uploads × ~6100 builds/train saved, plus the tail's 8·slot_len-byte
+    /// zero-fill upload swapped for an uninitialized alloc). Same reset/borrow
+    /// discipline as `resident_scan_desc`.
+    resident_build_desc: std::cell::RefCell<Option<kernels::histogram::BuildDescHandles>>,
     /// Test-only toggle to FORCE the host path on RocmBackend (so the
     /// resident==host tree-equivalence test can grow the SAME f32-atomic-built tree
     /// through the host read-back/subtract/scan chain). `true` (the default) reports
@@ -3052,6 +3069,8 @@ impl<R: cubecl::Runtime> Default for GpuBackend<R> {
             resident_bins_pin: std::cell::Cell::new(false),
             resident_pool: std::cell::RefCell::new(Vec::new()),
             resident_grad_hess: std::cell::RefCell::new(None),
+            resident_scan_desc: std::cell::RefCell::new(None),
+            resident_build_desc: std::cell::RefCell::new(None),
             // Production default: the device-resident pool is enabled.
             resident_enabled: true,
             _runtime: std::marker::PhantomData,
@@ -3075,8 +3094,75 @@ impl<R: cubecl::Runtime> GpuBackend<R> {
             resident_bins_pin: std::cell::Cell::new(false),
             resident_pool: std::cell::RefCell::new(Vec::new()),
             resident_grad_hess: std::cell::RefCell::new(None),
+            resident_scan_desc: std::cell::RefCell::new(None),
+            resident_build_desc: std::cell::RefCell::new(None),
             resident_enabled: enabled,
             _runtime: std::marker::PhantomData,
+        }
+    }
+
+    /// Fetch (or build on first use) the per-grow cached scan-descriptor set for
+    /// this `(feats, real_feats, buf_len)` geometry — the `LGBM_DESC_HOIST` hoist.
+    /// Returns `None` when the hatch is OFF or the cache-time upload validation
+    /// fails (the per-launch path then re-runs the SAME validation and raises the
+    /// SAME typed error — never swallowed). A geometry change mid-train (never on
+    /// the live driver — feats are per-grow constant) rebuilds the cache.
+    fn scan_desc_cached(
+        &self,
+        client: &ComputeClient<R>,
+        feats: &[kernels::split::BatchedSplitFeature],
+        real_feats: &[i32],
+        buf_len: usize,
+    ) -> Option<kernels::split::ScanDescHandles> {
+        if !kernels::split::desc_hoist_enabled() {
+            return None;
+        }
+        let mut cache = self.resident_scan_desc.borrow_mut();
+        if let Some(d) = cache.as_ref() {
+            if d.matches(feats.len(), buf_len) {
+                return Some(d.clone());
+            }
+        }
+        match kernels::split::upload_scan_desc(
+            client,
+            feats,
+            Some(real_feats),
+            buf_len,
+            "scan_desc_hoist",
+        ) {
+            Ok(d) => {
+                *cache = Some(d.clone());
+                Some(d)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Fetch (or build on first use) the per-grow cached BUILD descriptor set for
+    /// this `(slot_off, fix_feats, slot_len)` geometry — the build-side half of the
+    /// `LGBM_DESC_HOIST` hoist. Same fallback contract as [`Self::scan_desc_cached`].
+    fn build_desc_cached(
+        &self,
+        client: &ComputeClient<R>,
+        slot_off: &[usize],
+        slot_len: usize,
+        fix_feats: &[(usize, u32, i32, u32)],
+    ) -> Option<kernels::histogram::BuildDescHandles> {
+        if !kernels::split::desc_hoist_enabled() {
+            return None;
+        }
+        let mut cache = self.resident_build_desc.borrow_mut();
+        if let Some(d) = cache.as_ref() {
+            if d.matches(slot_off.len(), slot_len) {
+                return Some(d.clone());
+            }
+        }
+        match kernels::histogram::upload_build_desc(client, slot_off, slot_len, fix_feats) {
+            Ok(d) => {
+                *cache = Some(d.clone());
+                Some(d)
+            }
+            Err(_) => None,
         }
     }
 }
@@ -3493,6 +3579,10 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         // buffers can never leak into the next tree (grad/hess are per-grow, not per-train).
         // The driver re-uploads via `upload_resident_grad_hess` before the root build.
         *self.resident_grad_hess.borrow_mut() = None;
+        // Drop the prior grow's cached scan/build descriptors (LGBM_DESC_HOIST) — the
+        // next grow's first scan/build re-uploads them (per-grow inputs).
+        *self.resident_scan_desc.borrow_mut() = None;
+        *self.resident_build_desc.borrow_mut() = None;
     }
 
     /// Build ONE leaf's histogram device-resident (build → dequant → fix → compact) via
@@ -3626,6 +3716,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
                     .to_string(),
             });
         };
+        let bdesc = self.build_desc_cached(client, slot_off, slot_len, fix_feats);
         let (handle, len) = kernels::histogram::build_fix_compact_resident_rows_handle_f64_on(
             client,
             resident.handle.clone(),
@@ -3641,6 +3732,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             sum_hessian,
             max_abs_grad_hess,
             gh,
+            bdesc.as_ref(),
         )?;
         debug_assert_eq!(len, slot_len, "resident leaf handle length");
         let mut mirror = self.resident_pool.borrow_mut();
@@ -4015,6 +4107,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
                 detail: "scan_resident_leaf_into_frontier: slot is empty".to_string(),
             })?
         };
+        let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
         kernels::split::find_best_splits_fused_reduce_into_leaf_on(
             client,
             handle,
@@ -4027,6 +4120,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             num_data,
             frontier.records(),
             out_leaf,
+            desc.as_ref(),
         )
     }
 
@@ -4067,6 +4161,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             })?;
             (smaller_h, larger_h)
         };
+        let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
         kernels::split::find_best_splits_fused_siblings_reduce_into_leaves_on(
             client,
             smaller_h,
@@ -4080,6 +4175,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             frontier.records(),
             out_leaf_smaller,
             out_leaf_larger,
+            desc.as_ref(),
         )
     }
 
@@ -4133,6 +4229,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         };
         // Try the fused staged path. `Ok(None)` ⇒ the staged path was not taken (e.g. cubecl-cpu
         // anchor / pargain / feature > LDS cap) ⇒ fall back to the byte-unchanged two steps.
+        let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
         let fused = kernels::split::find_best_splits_fused_siblings_subtract_reduce_into_leaves_on(
             client,
             smaller_h,
@@ -4146,6 +4243,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             frontier.records(),
             out_leaf_smaller,
             out_leaf_larger,
+            desc.as_ref(),
         )?;
         match fused {
             Some(larger_out) => {
