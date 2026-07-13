@@ -1254,14 +1254,17 @@ pub fn partition_fuse_bc_enabled() -> bool {
 static PARTITION_FUSE_BC_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Read-once `LGBM_PARTITION_FUSE_BC_SMEM=="1"` — OPT-IN, default OFF pending the
-/// spike102 real-CUDA verdict. The SHARED-MEMORY BC-fusion
-/// ([`resident_scatter_fused_bc_smem_kernel`]): folds partition stage B into the
-/// scatter with ONE unit computing the block base (vs the redundant per-unit sum of
-/// [`partition_fuse_bc_enabled`], which measured net-negative on P100). Real-device
-/// ONLY — the caller ([`partition_bc_fused`]) additionally requires a non-cpu runtime
-/// because cubecl-cpu does not share SharedMemory across units. Bit-exact (same
-/// integer sums), validated on real CUDA via the driver bit-identical-preds A/B.
+/// Read-once `LGBM_PARTITION_FUSE_BC_SMEM != "0"` — DEFAULT ON (validated 1.011× on
+/// P100, spike102: smembc 7.104s vs base 7.184s warm-median, preds BIT-IDENTICAL
+/// max_abs 0.0, counts partition_bc_smem=3000 vs 0, drained partition 607→467ms
+/// (−140ms — the removed stage-B launch); `"0"` restores the 3-launch partition).
+/// The SHARED-MEMORY BC-fusion ([`resident_scatter_fused_bc_smem_kernel`]): folds
+/// partition stage B into the scatter with ONE unit computing the block base into
+/// SharedMemory (vs the redundant per-unit sum of [`partition_fuse_bc_enabled`],
+/// which measured net-negative on P100 — spike098). Real-device ONLY — the caller
+/// ([`partition_bc_fused`]) additionally requires a non-cpu runtime because cubecl-cpu
+/// does not share SharedMemory across units, so the cpu f64 anchor keeps its
+/// byte-unchanged 3-launch path. Bit-exact (same integer sums).
 #[must_use]
 pub fn partition_fuse_bc_smem_enabled() -> bool {
     match PARTITION_FUSE_BC_SMEM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1271,7 +1274,7 @@ pub fn partition_fuse_bc_smem_enabled() -> bool {
     }
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("LGBM_PARTITION_FUSE_BC_SMEM").map(|v| v == "1").unwrap_or(false)
+        std::env::var("LGBM_PARTITION_FUSE_BC_SMEM").map(|v| v != "0").unwrap_or(true)
     })
 }
 
