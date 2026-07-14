@@ -17,6 +17,19 @@ during planning.**
 > `LGBM_GROW_DEFER_SYNC` flag; Wave 4 (T-11) is its P100 perf verdict, which
 > gates any later default-flip.
 
+> **⚠️ PLAN CORRECTION (2026-07-14) — Wave-2 dependency boundary was wrong.**
+> T-05's deferral is IMPOSSIBLE with only T-01..T-04: it needs split `i`'s
+> children *scanned* into the frontier within iteration `i`, before the
+> deferred read, but today's scan consumes `num_data = split_point`
+> host-side (`cnt_factor = num_data / sum_hessian`, `split.rs:172`). Two new
+> prerequisite tasks — **T-12** (on-device-`num_data` single-child scan) and
+> **T-13** (on-device-`num_data` co-pack sibling scan, the DEFAULT live ROCm
+> arm) — insert the missing capability (SPEC-DRGL-12/13). Corrected live
+> order: **T-04 → T-12 → T-13 → T-05 → T-06 → T-11.** Each of T-12/T-13 is a
+> T-04-sized deep-kernel task (TDD + real-gfx1152 byte-identity); the whole
+> T-05 payoff is a multi-session effort. See memory
+> `device-resident-grow-loop-progress §"THE BIG FINDING"`.
+
 ## Global preconditions (do once, before any Wave 1 Green step)
 
 - **P-0 Confirm dependencies (AGENTS.md rule).** No new external crate is
@@ -377,8 +390,91 @@ LGBM_CUDA_ON_DEVICE=1 LGBM_PHASE_PROF=1 LGBM_GROW_DRAIN=1 \
   test; the multi-split byte-identity requirement in Verify is mandatory,
   not optional.
 
-### T-05 — Batched `read_split(i)` + `pick(i+1)` fusion · SPEC-DRGL-05 (dep: T-04)
-- **prereqs:** T-04. **files:** Modify:
+### T-12 — Fixed-grid SCAN reading `num_data` on-device (single-child) · SPEC-DRGL-12 (dep: T-04) · NEW 2026-07-14
+- **prereqs:** T-04. **files:** Modify: `crates/lgbm-compute/src/kernels/split.rs`
+  (single-child scan kernel(s): the `find_best_split[s_fused]_kernel` path
+  that computes `cnt_factor = num_data / sum_hessian`, `split.rs:172`);
+  `scan_resident_leaf_into_frontier` launcher (`lib.rs`/`best_split.rs`) — a
+  new real-device-only variant sourcing `num_data` from `&DeviceLeafSplits`'s
+  `ranges`/`roles` record instead of the host scalar. Test: new
+  `#[cfg(feature = "rocm")]` byte-identity test (new
+  `device_numdata_scan_parity.rs` or in `resident_perm_partition.rs`).
+- **1. Red:** Add a real-device byte-identity test
+  `device_numdata_scan_byte_identical_to_host_numdata_scan` — for a fixed
+  split sequence, run TODAY's host-`num_data` `scan_resident_leaf_into_frontier`
+  and capture the frontier winner it folds; then run the new device-`num_data`
+  variant (count sourced from the resident buffer) and assert byte-identical
+  folded winner (threshold, feature, gain, counts). Expected failure: the new
+  variant/launcher does not exist yet (compile error / CpuBackend stub `Err`).
+  Run: `cargo test -p lgbm-compute --features rocm device_numdata_scan_byte_identical`.
+- **2. Green:** Add the real-device-only device-`num_data` scan variant
+  (`<R as Runtime>::name(client) != "cpu"` gated, per DRGL-04 precedent). The
+  kernel reads the child's `[begin,count)` from `ranges`/`roles` (DRGL-01/02)
+  and computes `cnt_factor` from the device count — the SAME arithmetic as the
+  host path, only the count SOURCE changes (no FP reorder). Do NOT wire into
+  the driver loop yet (T-05 owns that). Keep the host-scalar path as default.
+  Run: `cargo test -p lgbm-compute --features rocm`.
+- **3. Refactor:** factor the `cnt_factor`/`min_data` inner scan body so the
+  host-scalar and device-`num_data` variants share ONE comparison expression
+  (no reimplementation drift); add a `scan_numdata_dev=` COUNTS tripwire
+  (mirrors `scan_parprefix=`).
+  Run: `cargo test -p lgbm-compute --features rocm`.
+- **4. Verify:**
+  Run: `cargo test -p lgbm-compute --features rocm` — byte-identity across a
+  MULTI-split sequence (so a wrong `ranges`/`roles` field read surfaces on a
+  smaller-vs-larger count difference).
+  Confirm: SPEC-DRGL-12's acceptance example passes on real gfx1152.
+- **Completion Criteria:**
+  - [ ] Red test fails (variant absent) before this task's changes.
+  - [ ] Device-`num_data` single-child scan's folded winner is byte-identical
+        to the host-`num_data` scan across a multi-split sequence on gfx1152.
+  - [ ] No host `num_data` sync is introduced for the child scan.
+  - [ ] CpuBackend never dispatches the device variant (real-device-only).
+- **Risks and Guardrails:** a wrong field/offset into `ranges`/`roles` yields
+  a wrong `cnt_factor` → wrong per-window counts → a DIFFERENT split point,
+  which fails the byte-identity gate loudly; the multi-split requirement is
+  mandatory (a single split can't distinguish smaller from larger count).
+
+### T-13 — Co-pack sibling SCAN reading BOTH counts on-device · SPEC-DRGL-13 (dep: T-12) · NEW 2026-07-14
+- **prereqs:** T-12. **files:** Modify: `crates/lgbm-compute/src/kernels/split.rs`
+  (`find_best_splits_fused_siblings[_staged][_par|_parprefix]_kernel`,
+  `split.rs:928-1169` — the `num_data_a`/`num_data_b` threading);
+  `subtract_scan_resident_siblings_into_frontier` launcher. Test: new
+  `#[cfg(feature = "rocm")]` byte-identity test.
+- **1. Red:** Add `device_numdata_copack_scan_byte_identical_to_host` — for a
+  fixed corpus growing the full `num_leaves` (so the co-pack default arm runs
+  every split), capture today's host-`num_data_a/b` co-pack folded winners,
+  then run the device-`num_data` co-pack variant (smaller count from `roles`,
+  larger = `p_count - smaller` on-device) and assert BOTH siblings' winners
+  byte-identical. Expected failure: variant absent.
+  Run: `cargo test -p lgbm-compute --features rocm device_numdata_copack_scan`.
+- **2. Green:** Generalize T-12's device-`num_data` mechanism to the co-pack
+  siblings kernel, sourcing `num_data_a`/`num_data_b` on-device. Cover the
+  staged and parprefix sub-variants (the live default ROCm path is
+  siblings-staged-parprefix: co-pack default-ON + parprefix default-ON for
+  `"hip"`). Real-device-only gated; host-scalar path stays default. Do NOT
+  wire into the driver (T-05 owns that).
+  Run: `cargo test -p lgbm-compute --features rocm`.
+- **3. Refactor:** share the inner count-source helper with T-12; extend the
+  `scan_numdata_dev=` tripwire to book the co-pack path.
+  Run: `cargo test -p lgbm-compute --features rocm`.
+- **4. Verify:**
+  Run: `cargo test -p lgbm-compute --features rocm` — byte-identity over a
+  full-growth corpus in BOTH the staged and parprefix sub-variants.
+  Confirm: SPEC-DRGL-13's acceptance example passes on real gfx1152.
+- **Completion Criteria:**
+  - [ ] Red test fails (co-pack device variant absent) first.
+  - [ ] Both siblings' folded winners byte-identical to the host-count co-pack
+        scan across a full-growth sequence, staged AND parprefix sub-variants.
+  - [ ] Larger-sibling count is derived on-device (`p_count - smaller`), never
+        read back host-side.
+- **Risks and Guardrails:** a single wrong sibling count corrupts ONE child's
+  split while the other stays correct — the hardest failure to spot; require
+  the full-growth corpus and assert BOTH winners, not just one.
+
+### T-05 — Batched `read_split(i)` + `pick(i+1)` fusion · SPEC-DRGL-05 (dep: T-04, T-12, T-13)
+- **prereqs:** T-04, **T-12, T-13 (ADDED 2026-07-14 — see plan correction)**.
+  **files:** Modify:
   `crates/lgbm-compute/src/kernels/grow_driver.rs`
   (`grow_tree_on_device_resident`'s per-split loop, `:2677-3213`; new
   `read_deferred_split_and_pick` helper per §4 typed contract).
@@ -815,18 +911,21 @@ LGBM_CUDA_ON_DEVICE=1 LGBM_PHASE_PROF=1 LGBM_GROW_DRAIN=1 \
 ## Execution order & parallelism
 
 ```text
-T-00 -> T-01 -> T-02 -> T-03 -> T-04 -> T-05 -> T-06 -> T-11        (live plan)
-                                              (T-07..T-10 DROPPED)
+T-00 -> T-01 -> T-02 -> T-03 -> T-04 -> T-12 -> T-13 -> T-05 -> T-06 -> T-11
+                              (corrected 2026-07-14; T-07..T-10 DROPPED)
 ```
 
 1. **T-00** — strictly first; blocks every other task (P-2).
 2. **Wave 1 (T-01 → T-02 → T-03)** — strictly sequential; T-02 depends on
    T-01's widened buffer, T-03 depends on both.
-3. **Wave 2 (T-04 → T-05 → T-06)** — strictly sequential; T-04 is
-   isolable/testable independent of the live driver, but T-05 depends on
-   it being correct first (and adds the default-OFF `LGBM_GROW_DEFER_SYNC`
-   flag). T-06 must follow T-05 (closed form is derived FROM the shipped
-   flag-ON pattern).
+3. **Wave 2 (T-04 → T-12 → T-13 → T-05 → T-06)** — strictly sequential
+   (corrected 2026-07-14). T-04 (fixed-grid BUILD), T-12 (device-`num_data`
+   single-child SCAN), and T-13 (device-`num_data` co-pack SCAN) are each
+   isolable/testable independent of the live driver; T-05 wires all three
+   into the deferral behind the default-OFF `LGBM_GROW_DEFER_SYNC` flag. The
+   original plan omitted T-12/T-13 — the deferral is impossible without an
+   on-device-`num_data` scan (see the correction banner at the top). T-06
+   must follow T-05 (closed form is derived FROM the shipped flag-ON pattern).
 4. **~~Wave 3 (T-07..T-10)~~ [DROPPED 2026-07-14]** — not built. Rank 3 is
    out of scope; the former Wave-3 human checkpoint (PROJECT.md R-0
    reconciliation) is moot because the conflicting capability is no longer

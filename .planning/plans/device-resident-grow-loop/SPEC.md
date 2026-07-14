@@ -581,7 +581,38 @@ stable and referenced by PLAN.md tasks.
 
 ## Wave 2 — Rank 1: fixed-grid builds + batched readback fusion
 
+> **⚠️ PLAN CORRECTION (2026-07-14, session follow-up) — the Wave-2
+> dependency boundary was drawn WRONG.** SPEC-DRGL-05 lists its deps as
+> DRGL-01..04, but the deferral it describes is IMPOSSIBLE with only those:
+> fusing `read_split(i)`+`pick(i+1)` requires split `i`'s children to be
+> **built, subtracted, AND scanned** into the frontier *within* iteration
+> `i`, *before* the deferred read — yet today's SCAN family consumes
+> `num_data = split_point` **host-side** (`cnt_factor = num_data /
+> sum_hessian`, `split.rs:172`, LightGBM `feature_histogram.hpp:843`), the
+> very value `read_split(i)` reads back. So the scan cannot run in iteration
+> `i` until the host knows `split_point` — the sync we are trying to defer.
+> **Circular.** T-04 shipped only the fixed-grid *BUILD* (reads child
+> `[begin,count)` on-device); the SCAN's on-device-`num_data` capability is a
+> DRGL-08-class piece that lived in the **dropped Wave 3**. Two new
+> prerequisite specs (SPEC-DRGL-12, SPEC-DRGL-13) below insert that missing
+> capability; SPEC-DRGL-05's dependency list is corrected to require them.
+> `[VERIFIED 2026-07-14: split.rs:157,172,406,466,506,799,867,928-932,
+> 1058-1169,... — the whole find_best_split* family threads num_data as a
+> host launch scalar; memory device-resident-grow-loop-progress §"THE BIG
+> FINDING"]`. Growth-policy safety of dropping the host size/hessian/zero
+> scannability gates: the only truly host-side gate is the DEPTH cap
+> (host-known, cheap to keep host-side); the size (`min_data_in_leaf`),
+> `sum_hessian<=0`, and zero-count gates fall out of the scan's OWN
+> `min_data`+`sum_hessian` reject and are tree-identical, because an
+> unscannable leaf's no-split result is never picked by §8.3.
+
 ### SPEC-DRGL-04 — Fixed-worst-case-grid + device early-exit build/subtract/scan `Backend` trait variants
+> **IMPLEMENTATION NOTE (2026-07-14):** T-04 landed the fixed-grid *BUILD*
+> only (`construct_leaf_hist_resident_lds_kernel_u64_fixed_grid` +
+> `Backend::build_resident_leaf_rows_handle_fixed_grid`, `9c1adff`). The
+> subtract- and scan-side of the fixed-grid work is NOT in this spec; the
+> scan's device-`num_data` half is SPEC-DRGL-12/13. Subtract needs no count
+> (u64 elementwise over the fixed slot width).
 - **status:** draft
 - **implementation_state:** unimplemented
 - **principal failure reason:** deferring `read_leaf`/`read_split`'s
@@ -641,6 +672,108 @@ stable and referenced by PLAN.md tasks.
   fixed schedule (a different, later grid-sizing concern for the WHOLE
   loop, not just one build).
 
+### SPEC-DRGL-12 — Fixed-grid SCAN reading `num_data` on-device (single-child scan family) · NEW 2026-07-14
+- **status:** draft
+- **implementation_state:** unimplemented
+- **principal failure reason:** the single-child scan launchers
+  (`scan_resident_leaf_into_frontier` → `find_best_split[s_fused]_kernel`
+  family) take `num_data: i32` as a HOST launch scalar and compute
+  `cnt_factor = num_data / sum_hessian` (`split.rs:172`) inside the kernel to
+  gate `min_data_in_leaf`. To let iteration `i`'s child scan run BEFORE the
+  host reads `split_point`, the kernel must instead read the child's count
+  from the resident `DeviceLeafSplits` `ranges`/`roles` record (SPEC-DRGL-01/
+  02), device-side. A wrong field/offset read yields a WRONG `cnt_factor` →
+  wrong `left_count`/`right_count` per window → a different split point chosen
+  → non-bit-identical tree. This is the scan-side twin of DRGL-04's build.
+- **scope:** the single-child scan kernel(s) + their host launchers
+  (`split.rs`, `scan_resident_leaf_into_frontier` path in `lib.rs`/
+  `best_split.rs`); a new real-device-only variant that sources `num_data`
+  from the resident buffer instead of the host scalar. Real-device-only
+  (`<R as Runtime>::name(client) != "cpu"` gated). The host scalar path stays
+  the default until SPEC-DRGL-05 wires the device path in behind
+  `LGBM_GROW_DEFER_SYNC`.
+- **dependencies:** SPEC-DRGL-01 (widened, non-overwriting per-split
+  `ranges`), SPEC-DRGL-02 (resident `roles` giving smaller/larger begin+count
+  slots), SPEC-DRGL-04 (the fixed-grid build precedent + `ranges`/`roles`
+  device-read idiom to mirror).
+- **input type:** `split_idx: usize` + `&DeviceLeafSplits<R>` (the on-device
+  count source) in place of `num_data: i32`; all other scan args unchanged.
+- **output type:** device-resident frontier fold byte-identical to today's
+  host-`num_data` scan for the same device state.
+- **preconditions:** this split's `record_split` (DRGL-01) and
+  `assign_smaller_larger_roles_device` (DRGL-02) have completed device-side.
+- **behavior:**
+  - *Given* a child whose true count `c = split_point` (smaller) or
+    `p_count - split_point` (larger) is resident in `ranges`/`roles`, *when*
+    the device-`num_data` scan runs with the SAME histogram + leaf sums,
+    *then* the frontier winner it folds is byte-identical to the
+    host-`num_data` scan's winner (same threshold, feature, gain, counts).
+- **postconditions:** no host-visible `num_data` sync introduced for the
+  child scan (the whole point — this is what makes DRGL-05's deferral
+  possible).
+- **errors:** `ComputeError::Runtime` on dispatch failure (existing pattern).
+- **side effects:** none beyond the existing device frontier write.
+- **acceptance examples:**
+  - Given a fixed corpus/split sequence on real gfx1152, when the
+    device-`num_data` single-child scan runs, then its per-split frontier
+    winner is byte-identical to the host-`num_data` scan's — a dedicated
+    `--features rocm` byte-identity test mirroring
+    `fixed_grid_build_byte_identical_to_exact_grid` (T-04).
+- **evidence:**
+  - `[LOCAL split.rs:157,172,391-427,461-506,799-867 — num_data as host
+    launch scalar + cnt_factor]`.
+  - `[PROJECT: memory device-resident-grow-loop-progress §"Concrete remaining
+    scope" (1)]`.
+- **non-goals:** the co-pack two-child scan (SPEC-DRGL-13); the deferral
+  surgery (SPEC-DRGL-05).
+
+### SPEC-DRGL-13 — Co-pack sibling SCAN reading BOTH children's counts on-device · NEW 2026-07-14
+- **status:** draft
+- **implementation_state:** unimplemented
+- **principal failure reason:** the DEFAULT live ROCm arm is the co-pack
+  siblings scan (`subtract_scan_resident_siblings_into_frontier` →
+  `find_best_splits_fused_siblings[_staged][_par|_parprefix]_kernel`,
+  default-ON `LGBM_SIBLING_COPACK` + default-ON parprefix for `"hip"`), which
+  takes `num_data_a`/`num_data_b` (`split.rs:928-932,1165-1169`) for BOTH
+  siblings. The smaller child's count is `split_point`; the larger's is
+  `p_count - split_point`. Both must be sourced on-device (from `ranges`/
+  `roles`) for the co-pack scan to run in iteration `i` before the deferred
+  read. A single wrong sibling count silently corrupts one child's split
+  choice while leaving the other correct — the hardest failure to spot.
+- **scope:** the co-pack siblings scan kernel(s) + launcher
+  (`subtract_scan_resident_siblings_into_frontier` path) — a real-device-only
+  variant reading `num_data_a`/`num_data_b` from the resident buffer. Covers
+  the staged and parprefix sub-variants that form the live default path.
+  Real-device-only gated; host-scalar path stays default until DRGL-05.
+- **dependencies:** SPEC-DRGL-12 (the single-child device-`num_data` scan
+  mechanism it generalizes to two siblings), SPEC-DRGL-01/02/04.
+- **input type:** `split_idx: usize` + `&DeviceLeafSplits<R>` in place of
+  `num_data_a: i32, num_data_b: i32`; larger count derived on-device as
+  `p_count - smaller_count` (or read directly from the larger `roles` slot).
+- **output type:** both siblings' frontier folds byte-identical to today's
+  host-`num_data_a/b` co-pack scan.
+- **preconditions:** DRGL-01/02 records for this split are device-resident;
+  the smaller build (DRGL-04 fixed-grid) + subtract have run.
+- **behavior:**
+  - *Given* siblings with true counts `(c_s, c_l)` resident, *when* the
+    device-`num_data` co-pack scan runs, *then* BOTH folded winners are
+    byte-identical to the host-count co-pack scan for the same device state.
+- **postconditions:** no host-visible sibling-count sync introduced.
+- **errors:** `ComputeError::Runtime` on dispatch failure.
+- **side effects:** none beyond the two existing device frontier writes.
+- **acceptance examples:**
+  - Given a fixed corpus that grows the full `num_leaves` on real gfx1152,
+    when the device-`num_data` co-pack scan runs each split, then every
+    split's two folded winners are byte-identical to the host-count arm —
+    `--features rocm` byte-identity test.
+- **evidence:**
+  - `[LOCAL split.rs:928-1032 (find_best_splits_fused_two/siblings),
+    1143-1169; grow_driver.rs:3089-3127 co-pack arm]`.
+  - `[PROJECT: memory device-resident-grow-loop-progress §"Concrete remaining
+    scope" (2)]`.
+- **non-goals:** the deferral surgery (SPEC-DRGL-05); the non-copack f64/
+  default single-child arms (SPEC-DRGL-12 covers those).
+
 ### SPEC-DRGL-05 — Batched `read_split(i)` + `pick(i+1)` fusion into one `client.read` call
 - **status:** draft
 - **implementation_state:** unimplemented
@@ -668,6 +801,13 @@ stable and referenced by PLAN.md tasks.
     fixed-grid builds must all be in place — a deferred read is only
     safe once the buffer no longer overwrites, per SPEC-DRGL-01's own
     postcondition).
+  - **SPEC-DRGL-12 AND SPEC-DRGL-13 (ADDED 2026-07-14 plan correction)** —
+    the on-device-`num_data` single-child AND co-pack scans. Without these
+    the child scan in iteration `i` cannot run before the deferred read
+    (`cnt_factor = num_data / sum_hessian` needs `split_point` host-side);
+    the deferral is impossible. This is the dependency the original Wave-2
+    boundary missed. The co-pack (DRGL-13) arm is the DEFAULT live ROCm path,
+    so DRGL-05 cannot ship without it.
   - `Backend::read_batched` / `supports_async_device_copy()`
     (`grow_driver.rs:3317-3358`) — the existing batched-multi-handle-read
     contract this spec's helper calls into (not reimplements, per "Do Not
