@@ -466,6 +466,65 @@ pub fn on_device_partition_resident_count_take() -> u64 {
     ON_DEVICE_PARTITION_RESIDENT_CNT.swap(0, Ordering::Relaxed)
 }
 
+/// SPEC-DRGL-05: read-once `LGBM_GROW_DEFER_SYNC != "0"`, **DEFAULT OFF** (opt-in). When
+/// ON, the resident-perm grow loop FUSES the per-split `pick` + previous split's
+/// `read_split` into ONE batched `client.read` (deferring the split-point readback one
+/// iteration), roughly HALVING the per-split blocking-sync count. Ships OFF until the
+/// SPEC-DRGL-11 P100 A/B justifies a default flip in a separate commit (the locked "P100
+/// verdict before default-ON" decision). When OFF the loop takes today's
+/// two-separate-reads path verbatim (byte-unchanged). See T-05-DESIGN.md.
+#[must_use]
+pub fn grow_defer_sync_enabled() -> bool {
+    // Same-session A/B override (mirrors `resident_perm_partition_enabled`): the env gate
+    // is read-once, so an in-process A/B harness flips this atomic instead.
+    match GROW_DEFER_SYNC_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_GROW_DEFER_SYNC").map(|v| v != "0").unwrap_or(false))
+}
+
+/// Same-session A/B override for [`grow_defer_sync_enabled`].
+/// 0 = unset (defer to `LGBM_GROW_DEFER_SYNC`, default OFF), 1 = force ON, 2 = force OFF.
+static GROW_DEFER_SYNC_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Harness/test hook: force the sync-deferral arm ON (`Some(true)`), OFF (`Some(false)`),
+/// or defer to the `LGBM_GROW_DEFER_SYNC` env gate (`None`). Same contract as
+/// [`set_partition_resident_override`].
+pub fn set_grow_defer_sync_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    GROW_DEFER_SYNC_OVERRIDE.store(code, Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire (SPEC-DRGL-05) — bumped once per split whose previous-split
+/// `read_split` was FUSED into this iteration's `pick` batched read (the deferral arm).
+/// A nonzero `deferred_read_fused=` in the COUNTS ledger is the bench-protocol proof the
+/// deferral actually ran; 0 on the default two-separate-reads path. Inert unless
+/// `LGBM_PHASE_PROF=="1"` (parity-neutral).
+pub static ON_DEVICE_DEFERRED_READ_FUSED_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the deferred-read-fusion tripwire (see [`ON_DEVICE_DEFERRED_READ_FUSED_CNT`]).
+/// Called by the deferral arm of the grow loop (wired in the T-05 loop-restructure step).
+#[inline]
+#[allow(dead_code)]
+fn bump_deferred_read_fused() {
+    if launch_prof_enabled() {
+        ON_DEVICE_DEFERRED_READ_FUSED_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the deferred-read-fusion tripwire to zero and return the prior value (folded into
+/// the `phase_prof` COUNTS line, like the other on-device counters).
+pub fn deferred_read_fused_count_take() -> u64 {
+    ON_DEVICE_DEFERRED_READ_FUSED_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// Read-once `LGBM_SUBTRACT_FUSE != "0"` — DEFAULT ON (validated 1.043× on real
 /// CUDA, spike097: warm-median 8.19s→7.85s, preds bit-identical, drained scan
 /// 2149→1813ms; `=0` restores the separate subtract launch for A/B/rollback):

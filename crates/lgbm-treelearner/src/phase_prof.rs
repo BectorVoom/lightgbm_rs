@@ -269,6 +269,15 @@ pub fn dump(label: &str) {
     // smaller/larger child role ON DEVICE (`assign_smaller_larger_roles_device`).
     // NONZERO proves the device role kernel ran; 0 until the driver wires it in (T-03).
     let role_assign = lgbm_compute::kernels::partition::role_assign_count_take();
+    // The device-num_data scan tripwire (SPEC-DRGL-12/13): one bump per fused-scan launch
+    // that sourced num_data ON DEVICE (the deferral arm's child scans). NONZERO proves the
+    // device-num_data scan ran; 0 on the default host-scalar path.
+    let scan_numdata_dev = lgbm_compute::kernels::split::scan_numdata_dev_count_take();
+    // The deferred-read-fusion tripwire (SPEC-DRGL-05, LGBM_GROW_DEFER_SYNC=1): one bump per
+    // split whose previous read_split was fused into this iteration's pick batched read.
+    // NONZERO proves the deferral arm ran; 0 on the default two-separate-reads path.
+    let deferred_read_fused =
+        lgbm_compute::kernels::grow_driver::deferred_read_fused_count_take();
     if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
         let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
@@ -278,7 +287,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign} scan_numdata_dev={scan_numdata_dev} deferred_read_fused={deferred_read_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the
