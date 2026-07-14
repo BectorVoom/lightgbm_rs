@@ -343,39 +343,48 @@ pub const LEAF_SPLIT_STRIDE: usize = 6;
 /// The grow loop reads the ranges by handle; only the test golden reads them
 /// back ([`Self::read_leaf`]).
 pub struct DeviceLeafSplits<R: cubecl::Runtime> {
-    /// `LEAF_SPLIT_STRIDE * num_leaves` i32 cells; leaf `L` owns `[6L, 6L+6)`.
+    /// `LEAF_SPLIT_STRIDE * capacity` i32 cells; SLOT `s` owns `[6s, 6s+6)`.
+    /// Addressed by an arbitrary slot index — the grow driver uses the per-SPLIT
+    /// index so each split's record lands in a fresh, never-recycled slot (the
+    /// non-overwriting invariant a later deferred read, Wave 2, relies on: two
+    /// splits whose `new_left` leaf ids collide still get distinct records).
     ranges: Handle,
-    /// The width (leaf-id capacity) the buffer is sized for.
-    num_leaves: usize,
+    /// The number of `LEAF_SPLIT_STRIDE`-wide slots the buffer is sized for.
+    capacity: usize,
+    /// Monotonic append cursor for [`Self::record_split`] (host-driven writes).
+    /// The device resident-partition path instead writes at a driver-chosen slot,
+    /// so it does NOT advance this cursor.
+    next_split_idx: usize,
     /// Ties the struct to its CubeCL runtime `R` without storing one.
     _runtime: PhantomData<fn() -> R>,
 }
 
 impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
-    /// Allocate a zeroed child-range buffer for `num_leaves` leaf ids on the device.
+    /// Allocate a zeroed child-range buffer of `capacity` slots on the device.
     ///
     /// # Errors
-    /// [`ComputeError::Runtime`] if `num_leaves == 0`.
-    pub fn new(client: &ComputeClient<R>, num_leaves: usize) -> Result<Self, ComputeError> {
-        if num_leaves == 0 {
+    /// [`ComputeError::Runtime`] if `capacity == 0`.
+    pub fn new(client: &ComputeClient<R>, capacity: usize) -> Result<Self, ComputeError> {
+        if capacity == 0 {
             return Err(ComputeError::Runtime {
-                detail: "DeviceLeafSplits::new: num_leaves must be >= 1".to_string(),
+                detail: "DeviceLeafSplits::new: capacity must be >= 1".to_string(),
             });
         }
         use cubecl::prelude::CubeElement;
-        let zeros = vec![0i32; LEAF_SPLIT_STRIDE * num_leaves];
+        let zeros = vec![0i32; LEAF_SPLIT_STRIDE * capacity];
         let ranges = client.create_from_slice(i32::as_bytes(&zeros));
         Ok(Self {
             ranges,
-            num_leaves,
+            capacity,
+            next_split_idx: 0,
             _runtime: PhantomData,
         })
     }
 
-    /// The leaf-id capacity.
+    /// The number of `LEAF_SPLIT_STRIDE`-wide slots the buffer holds.
     #[must_use]
-    pub fn num_leaves(&self) -> usize {
-        self.num_leaves
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// A borrow of the device child-range i32 buffer handle (read on device by the grow loop).
@@ -384,18 +393,18 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         &self.ranges
     }
 
-    /// Read leaf `leaf_id`'s child ranges back to the host. Production use: the
+    /// Read SLOT `slot`'s child ranges back to the host. Production use: the
     /// RESIDENT-PERM partition arm's once-per-split split-point readback (the one
     /// small host crossing its row bookkeeping needs — the same readback the
     /// reference `CUDADataPartition::SplitInner` performs); also the test goldens.
-    /// Panics if `leaf_id >= num_leaves`.
+    /// Panics if `slot >= capacity`.
     #[must_use]
-    pub fn read_leaf(&self, client: &ComputeClient<R>, leaf_id: usize) -> ChildRanges {
+    pub fn read_split(&self, client: &ComputeClient<R>, slot: usize) -> ChildRanges {
         use cubecl::prelude::CubeElement;
-        assert!(leaf_id < self.num_leaves, "DeviceLeafSplits::read_leaf: leaf_id out of range");
+        assert!(slot < self.capacity, "DeviceLeafSplits::read_split: slot out of range");
         let bytes = client.read_one_unchecked(self.ranges.clone());
         let all = i32::from_bytes(&bytes);
-        let b = LEAF_SPLIT_STRIDE * leaf_id;
+        let b = LEAF_SPLIT_STRIDE * slot;
         ChildRanges {
             left_start: all[b],
             left_end: all[b + 1],
@@ -404,6 +413,52 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
             right_end: all[b + 4],
             right_count: all[b + 5],
         }
+    }
+
+    /// Append one split's child ranges into the next free slot (`next_split_idx`)
+    /// and return that slot. Successive calls never overwrite an earlier split's
+    /// record even when their leaf ids collide — the non-overwriting invariant a
+    /// Wave-2 deferred read depends on. Host-driven single-cell write via the same
+    /// [`write_child_ranges_kernel`] the device partition path fuses in; used by
+    /// tests and any host-side writer (the device resident-partition path instead
+    /// writes at a driver-chosen slot and does not advance the cursor).
+    ///
+    /// The six fields are derived from the split point + parent span exactly as
+    /// [`write_child_ranges_kernel`] derives them (`left_start = p_begin`,
+    /// `left_count = split_point`, `right_count = p_count - split_point`, …).
+    ///
+    /// # Panics
+    /// If the buffer is full (`next_split_idx == capacity`).
+    pub fn record_split(
+        &mut self,
+        client: &ComputeClient<R>,
+        split_point: i32,
+        p_begin: i32,
+        p_count: i32,
+    ) -> usize {
+        let slot = self.next_split_idx;
+        assert!(
+            slot < self.capacity,
+            "DeviceLeafSplits::record_split: capacity exceeded"
+        );
+        let ranges_len = LEAF_SPLIT_STRIDE * self.capacity;
+        // SAFETY: `ranges` holds `LEAF_SPLIT_STRIDE * capacity` i32 cells; `slot <
+        // capacity` (asserted), so the six writes `[6*slot, 6*slot+6)` stay in
+        // bounds. Single owner (`ABSOLUTE_POS == 0`). cubecl unsafe confined here.
+        unsafe {
+            write_child_ranges_kernel::launch::<R>(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(self.ranges.clone(), ranges_len),
+                slot as u32,
+                split_point,
+                p_begin,
+                p_count,
+            );
+        }
+        self.next_split_idx += 1;
+        slot
     }
 }
 
@@ -462,7 +517,7 @@ fn write_child_ranges_kernel(
 /// # Errors
 /// [`ComputeError`] from [`partition_on_device`] (bad `num_bin`/threshold, an
 /// out-of-range bin, a length mismatch, or a device launch/readback failure); or
-/// [`ComputeError::Runtime`] if `leaf_id >= leaf_splits.num_leaves()`.
+/// [`ComputeError::Runtime`] if `leaf_id >= leaf_splits.capacity()`.
 #[allow(clippy::too_many_arguments)]
 pub fn partition_child_ranges_device<R: cubecl::Runtime>(
     client: &ComputeClient<R>,
@@ -481,11 +536,11 @@ pub fn partition_child_ranges_device<R: cubecl::Runtime>(
     p_begin: i32,
     p_count: i32,
 ) -> Result<Vec<u32>, ComputeError> {
-    if leaf_id >= leaf_splits.num_leaves {
+    if leaf_id >= leaf_splits.capacity {
         return Err(ComputeError::Runtime {
             detail: format!(
-                "partition_child_ranges_device: leaf_id {leaf_id} >= num_leaves {}",
-                leaf_splits.num_leaves
+                "partition_child_ranges_device: slot {leaf_id} >= capacity {}",
+                leaf_splits.capacity
             ),
         });
     }
@@ -508,10 +563,10 @@ pub fn partition_child_ranges_device<R: cubecl::Runtime>(
     // §9 AggregateBlockOffset: write the child ranges into the resident device slot —
     // the split point stays on device. Static single-owner geometry (never a dynamic
     // cube count).
-    // SAFETY: `ranges` is sized `LEAF_SPLIT_STRIDE * num_leaves`; `leaf_id <
-    // num_leaves` (checked above), so the six writes `[6*leaf_id, 6*leaf_id+6)` stay
+    // SAFETY: `ranges` is sized `LEAF_SPLIT_STRIDE * capacity`; `leaf_id <
+    // capacity` (checked above), so the six writes `[6*leaf_id, 6*leaf_id+6)` stay
     // in-bounds. Single owner (`ABSOLUTE_POS == 0`). cubecl unsafe confined here.
-    let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
+    let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.capacity;
     unsafe {
         write_child_ranges_kernel::launch::<R>(
             client,
@@ -1019,11 +1074,11 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
                 detail: format!("resident partition: threshold {threshold} >= num_bin {num_bin}"),
             });
         }
-        if leaf_id >= leaf_splits.num_leaves {
+        if leaf_id >= leaf_splits.capacity {
             return Err(ComputeError::Runtime {
                 detail: format!(
-                    "resident partition: leaf_id {leaf_id} >= num_leaves {}",
-                    leaf_splits.num_leaves
+                    "resident partition: slot {leaf_id} >= capacity {}",
+                    leaf_splits.capacity
                 ),
             });
         }
@@ -1104,7 +1159,7 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
             crate::ResidentBinWidth::U32 => launch_mark!(u32),
         }
 
-        let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.num_leaves;
+        let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.capacity;
         if partition_fuse_bc_smem_enabled() && <R as cubecl::Runtime>::name(client) != "cpu" {
             // ---- SHARED-MEMORY FUSED stage B+C (one launch, real device only): the
             // cube-per-block scatter with unit 0 computing this block's exclusive base +
@@ -1404,5 +1459,63 @@ mod tests {
         let col = BinColumn::U32(vec![0, 9, 1]);
         let err = data_partition_native_on(&client, &col, 3, 0, 2, 1, 3).unwrap_err();
         assert!(matches!(err, ComputeError::BinIndexOutOfRange { .. }));
+    }
+
+    /// SPEC-DRGL-01: the per-SPLIT append-only buffer must NOT alias two splits'
+    /// records even when their `new_left` leaf ids collide. Under the OLD per-leaf-id
+    /// scheme both writes would target slot `leaf_id` and the second would clobber the
+    /// first; per-split slots keep them independent — the non-overwriting invariant a
+    /// Wave-2 deferred read depends on.
+    #[test]
+    fn device_leaf_splits_survives_leaf_id_repick() {
+        let client = cpu_client();
+        // A small grow: num_leaves = 4 ⇒ 3 splits ⇒ capacity 2*(4-1) = 6 slots.
+        let num_leaves = 4usize;
+        let capacity = 2 * (num_leaves - 1);
+        let mut ls = DeviceLeafSplits::new(&client, capacity).expect("alloc");
+
+        // Two DIFFERENT splits whose `new_left` would reuse the SAME leaf id under the
+        // old scheme; here `record_split` appends them into distinct slots 0 and 1.
+        let s_a = ls.record_split(&client, /* split_point */ 3, /* p_begin */ 0, /* p_count */ 10);
+        let s_b = ls.record_split(&client, /* split_point */ 7, /* p_begin */ 10, /* p_count */ 10);
+        assert_eq!((s_a, s_b), (0, 1), "record_split appends monotonically");
+
+        // After B's write, A's record must be UNCHANGED (no aliasing) and B independent.
+        let a = ls.read_split(&client, s_a);
+        let b = ls.read_split(&client, s_b);
+        assert_eq!(
+            a,
+            ChildRanges {
+                left_start: 0,
+                left_end: 3,
+                left_count: 3,
+                right_start: 3,
+                right_end: 10,
+                right_count: 7,
+            },
+            "split A's record survives split B's write (no aliasing)"
+        );
+        assert_eq!(
+            b,
+            ChildRanges {
+                left_start: 10,
+                left_end: 17,
+                left_count: 7,
+                right_start: 17,
+                right_end: 20,
+                right_count: 3,
+            },
+            "split B's record is independent"
+        );
+    }
+
+    /// `read_split` panics on an out-of-range slot (mirrors the old `read_leaf` guard),
+    /// so an oversized index can never silently read past the buffer.
+    #[test]
+    #[should_panic(expected = "slot out of range")]
+    fn read_split_panics_on_oversized_slot() {
+        let client = cpu_client();
+        let ls = DeviceLeafSplits::new(&client, 2).expect("alloc");
+        let _ = ls.read_split(&client, 2); // slot == capacity ⇒ out of range
     }
 }

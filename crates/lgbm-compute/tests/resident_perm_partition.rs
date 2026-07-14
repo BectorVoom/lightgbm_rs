@@ -114,7 +114,7 @@ fn partition_bc_fusion_byte_identical_to_three_launch() {
                 s.begin as i32, s.count as i32,
             )
             .expect("partition_leaf");
-            let cr = leaf_splits.read_leaf(&client, s.leaf_id);
+            let cr = leaf_splits.read_split(&client, s.leaf_id);
             ranges.push([
                 cr.left_start, cr.left_end, cr.left_count, cr.right_start, cr.right_end,
                 cr.right_count,
@@ -254,7 +254,7 @@ fn resident_perm_partition_matches_host_anchor_multi_split() {
         );
 
         // The resident child ranges must carry the host split point.
-        let cr = leaf_splits.read_leaf(&client, s.leaf_id);
+        let cr = leaf_splits.read_split(&client, s.leaf_id);
         assert_eq!(cr.left_start, s.begin as i32, "step {si}: left_start");
         assert_eq!(cr.left_count, split_point as i32, "step {si}: left_count (split point)");
         assert_eq!(cr.left_end, (s.begin + split_point) as i32, "step {si}: left_end");

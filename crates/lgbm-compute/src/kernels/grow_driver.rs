@@ -2214,7 +2214,7 @@ where
             p_begin,
             p_count,
         )?;
-        let sp = leaf_splits.read_leaf(client, leaf_id).left_count as usize;
+        let sp = leaf_splits.read_split(client, leaf_id).left_count as usize;
         (rows, sp)
     };
     // Scatter the stable-ordered global row ids back into the resident buffer IN PLACE. The
@@ -2652,10 +2652,14 @@ where
 
     // ---- The DEVICE-RESIDENT child-range struct. Each split's
     // partition (on the on-device arm) writes its child left/right start/end/count into
-    // `leaf_splits_dev[leaf_id]` ON DEVICE — the split point stays resident, not a host scalar
-    // the grow loop consumes. Allocated once (num_leaves slots), like the frontier. ----
+    // `leaf_splits_dev[split_idx]` ON DEVICE — the split point stays resident, not a host
+    // scalar the grow loop consumes. Sized per-SPLIT (`2*(num_leaves-1)` slots), NOT
+    // per-leaf-id, so every split's record lands in a fresh, never-recycled slot even when
+    // two splits' `new_left` leaf ids collide — the non-overwriting invariant a later
+    // deferred read (Wave 2) relies on. Allocated once, like the frontier. ----
+    let leaf_splits_capacity = (2 * (num_leaves as usize).saturating_sub(1)).max(1);
     let leaf_splits_dev = time_phase(&GROW_SETUP_NS, || {
-        crate::kernels::partition::DeviceLeafSplits::<R>::new(client, num_leaves as usize)
+        crate::kernels::partition::DeviceLeafSplits::<R>::new(client, leaf_splits_capacity)
     })?;
 
     // ---- A real_feature_index -> feature-position (`fpos`) reverse
@@ -2673,8 +2677,9 @@ where
 
     // ---- The best-first leaf-wise loop (serial_tree_learner.cpp:218-236): a FIXED
     // `num_leaves - 1` device schedule, broken early by the device stop signal
-    // (`best_leaf == -1`) — no host argmax drives which leaf grows next. ----
-    for _split in 0..(num_leaves - 1) {
+    // (`best_leaf == -1`) — no host argmax drives which leaf grows next. `split_idx`
+    // is the per-split slot into `leaf_splits_dev` (fresh, never-recycled per split). ----
+    for split_idx in 0..(num_leaves - 1) {
         // (§8.3): pick `best_leaf` ON DEVICE from the resident frontier — the ONLY
         // host-visible crossing this iteration is the ~8-int export (cell [6] = best_leaf, `-1`
         // = the stop signal). `prev_smaller`/`prev_larger` are the previous split's children
@@ -2836,14 +2841,15 @@ where
                     best.default_left,
                     best.threshold,
                     &leaf_splits_dev,
-                    new_left as usize,
+                    split_idx as usize,
                     p_begin as i32,
                     p_count as i32,
                 )?;
                 // ONE small blocking readback: the resident child ranges (24 B of
-                // payload) — the split point the host row bookkeeping consumes.
+                // payload) — the split point the host row bookkeeping consumes. Read
+                // from the per-split slot this iteration wrote (never a recycled leaf id).
                 bump_sync();
-                let cr = leaf_splits_dev.read_leaf(client, new_left as usize);
+                let cr = leaf_splits_dev.read_split(client, split_idx as usize);
                 Ok(cr.left_count as usize)
             })?
         } else {
@@ -2857,7 +2863,7 @@ where
                     partition_min_bin,
                     missing_type_u8,
                     &leaf_splits_dev,
-                    new_left as usize,
+                    split_idx as usize,
                     p_begin as i32,
                     p_count as i32,
                 )
