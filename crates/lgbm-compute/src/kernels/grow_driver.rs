@@ -2931,15 +2931,36 @@ where
         // ---- Assign child pool slots: SMALLER gets a FRESH slot, LARGER reuses the
         // parent slot (its resident Handle is the subtraction's parent input). ----
         let child_depth = parent_depth + 1;
-        let smaller_is_left = left_count < right_count;
+        let smaller_slot = next_slot;
+        next_slot += 1;
+        let larger_slot = parent_slot;
+        // Resolve the smaller/larger child role ON DEVICE (SPEC-DRGL-02) from the
+        // resident child-range counts: this populates the resident role slot that the
+        // Wave-2 batched read (DRGL-05) + on-device build/subtract consumers read, and
+        // fires the `role_assign=` counts tripwire. The split point stays resident.
+        // NO new blocking readback is added this wave — the host derives the SAME
+        // decision (byte-identical) via the shared `role_assignment` reference from the
+        // child-range counts it already read back (read_split). Wave 2 removes this host
+        // mirror, reading the device-resolved role from the batched readback instead.
+        crate::kernels::partition::assign_smaller_larger_roles_device(
+            client,
+            &leaf_splits_dev,
+            split_idx as usize,
+            smaller_slot as i32,
+            larger_slot as i32,
+        )?;
+        let smaller_is_left = crate::kernels::partition::role_assignment(
+            left_count,
+            right_count,
+            smaller_slot as i32,
+            larger_slot as i32,
+        )
+        .smaller_is_left;
         let (smaller_leaf, larger_leaf) = if smaller_is_left {
             (new_left, new_right)
         } else {
             (new_right, new_left)
         };
-        let smaller_slot = next_slot;
-        next_slot += 1;
-        let larger_slot = parent_slot;
         let left_slot = if smaller_is_left { smaller_slot } else { larger_slot };
         let right_slot = if smaller_is_left { larger_slot } else { smaller_slot };
 
