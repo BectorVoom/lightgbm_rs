@@ -1129,6 +1129,31 @@ pub fn find_best_splits_fused_kernel(
 /// larger count is `parent_count - split_point` (`parent_count` is host-known — the
 /// PARENT's row count, set a prior iteration, NOT the deferred value — so no new sync).
 /// `is_smaller` (0/1) selects which child this scan is for. Real-device only.
+/// SPEC-DRGL-12: resolve a child leaf's `num_data` (row count) ON DEVICE from the
+/// resident split/role record, so the scan can run before the host reads `split_point`
+/// back. Same field layout as the T-04 fixed-grid BUILD: `ranges[6*split_slot+2]` =
+/// `left_count` = `split_point`; `roles[3*split_slot]` = `smaller_is_left` (0/1); the
+/// larger count is `parent_count - split_point` (`parent_count` host-known, no sync).
+/// `is_smaller` (0/1) selects the child. Shared by the legacy and parprefix devcount
+/// twins so both compute the identical count.
+#[cfg(feature = "gpu")]
+#[cube]
+fn resolve_child_num_data(
+    ranges: &Array<i32>,
+    roles: &Array<i32>,
+    split_slot: u32,
+    is_smaller: u32,
+    parent_count: i32,
+) -> i32 {
+    let split_point = ranges[(split_slot * 6 + 2) as usize];
+    let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
+    let left_count = split_point;
+    let right_count = parent_count - split_point;
+    let smaller_count = select(smaller_is_left, left_count, right_count);
+    let larger_count = select(smaller_is_left, right_count, left_count);
+    select(is_smaller != 0, smaller_count, larger_count)
+}
+
 #[cfg(feature = "gpu")]
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
@@ -1160,13 +1185,7 @@ pub fn find_best_splits_fused_kernel_devcount(
     n_feats: u32,
 ) {
     // Resolve this child's num_data ON DEVICE (same field layout as the T-04 build).
-    let split_point = ranges[(split_slot * 6 + 2) as usize];
-    let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
-    let left_count = split_point;
-    let right_count = parent_count - split_point;
-    let smaller_count = select(smaller_is_left, left_count, right_count);
-    let larger_count = select(smaller_is_left, right_count, left_count);
-    let num_data = select(is_smaller != 0, smaller_count, larger_count);
+    let num_data = resolve_child_num_data(ranges, roles, split_slot, is_smaller, parent_count);
 
     let f = ABSOLUTE_POS as u32;
     if f < n_feats {
@@ -1960,6 +1979,212 @@ pub fn find_best_splits_fused_staged_parprefix_kernel(
     }
 }
 
+/// SPEC-DRGL-12: device-`num_data` twin of [`find_best_splits_fused_staged_parprefix_kernel`]
+/// (the LIVE default hip single-child scan). BYTE-FOR-BYTE the same parallel-prefix scan —
+/// the ONLY change is that this child's `num_data` is resolved ON DEVICE
+/// ([`resolve_child_num_data`]) from the resident split/role record instead of a host
+/// scalar. This is the variant the SPEC-DRGL-05 deferral must use on hip so the deferred
+/// tree stays byte-identical to the (parprefix) flag-OFF tree — a legacy twin would differ
+/// by ~1 ULP (parprefix reorders the f64 reduction). Real-device only.
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_staged_parprefix_kernel_devcount(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    // DEVICE `num_data` source (SPEC-DRGL-12) — REPLACES the host `num_data: i32` scalar.
+    ranges: &Array<i32>,
+    roles: &Array<i32>,
+    split_slot: u32,
+    is_smaller: u32,
+    parent_count: i32,
+) {
+    // Resolve this child's num_data ON DEVICE — the ONLY difference vs the host twin.
+    let num_data = resolve_child_num_data(ranges, roles, split_slot, is_smaller, parent_count);
+
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+    let mut rev_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_pg = SharedMemory::<f64>::new(32usize);
+    let mut rev_pk = SharedMemory::<f64>::new(32usize);
+    let mut rev_pa = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pg = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pk = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pa = SharedMemory::<f64>::new(32usize);
+    let mut ct_g = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_h = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_c = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut lmin = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    let mut c = UNIT_POS as usize;
+    while c < cells {
+        sm[c] = hist[base + c];
+        c += cd;
+    }
+    sync_cube();
+
+    // PHASE 1: all-lanes parallel prefix, rev then fwd (reuse ct/lmin scratch).
+    parprefix_store_rev(
+        &sm.to_slice(),
+        &mut rev_ag.to_slice_mut(),
+        &mut rev_ah.to_slice_mut(),
+        &mut rev_lc.to_slice_mut(),
+        &mut rev_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+    );
+    sync_cube();
+    parprefix_store_fwd(
+        &sm.to_slice(),
+        &mut fwd_ag.to_slice_mut(),
+        &mut fwd_ah.to_slice_mut(),
+        &mut fwd_lc.to_slice_mut(),
+        &mut fwd_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+    );
+    sync_cube();
+
+    // PHASE 2: warp-split parallel gain scans (unchanged from pargain).
+    if UNIT_POS < 32 {
+        pargain_lane_scan(
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_ok.to_slice(),
+            &mut rev_pg.to_slice_mut(),
+            &mut rev_pk.to_slice_mut(),
+            &mut rev_pa.to_slice_mut(),
+            UNIT_POS,
+            rev_count[fi],
+            0u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    } else {
+        pargain_lane_scan(
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_ok.to_slice(),
+            &mut fwd_pg.to_slice_mut(),
+            &mut fwd_pk.to_slice_mut(),
+            &mut fwd_pa.to_slice_mut(),
+            UNIT_POS - 32,
+            fwd_count[fi],
+            1u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    // PHASE 3 + merge (unchanged from pargain).
+    if UNIT_POS == 0 {
+        pargain_assemble_state(
+            &rev_pg.to_slice(),
+            &rev_pk.to_slice(),
+            &rev_pa.to_slice(),
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_lc.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            0u32,
+            num_bin[fi] - 2,
+            -1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_assemble_state(
+            &fwd_pg.to_slice(),
+            &fwd_pk.to_slice(),
+            &fwd_pa.to_slice(),
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_lc.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            1u32,
+            offset[fi],
+            1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            f * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
 /// LDS-STAGED co-packed 2-slot sibling best-split kernel: ONE CUBE PER
 /// (FEATURE, SIBLING) — `CubeCount::Static(n, 2, 1)`; `CUBE_POS_Y` selects the
 /// sibling (0 = A/smaller reads `hist_a`, 1 = B/larger reads `hist_b`) and its
@@ -2381,6 +2606,25 @@ pub fn scan_parprefix_count_take() -> u64 {
     #[cfg(feature = "gpu")]
     {
         SCAN_PARPREFIX_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        0
+    }
+}
+
+/// POSITIVE tripwire (SPEC-DRGL-12) — bumped once per fused-scan launch that sourced
+/// `num_data` ON DEVICE (the `Device` [`NumDataSrc`] path: parprefix twin or legacy
+/// twin). Positive proof the device-`num_data` scan actually ran, for the bench-protocol
+/// counts ledger; folded into `phase_prof` as `scan_numdata_dev=`.
+#[cfg(feature = "gpu")]
+pub static SCAN_NUMDATA_DEV_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the device-`num_data` scan tripwire to zero and return the prior value.
+pub fn scan_numdata_dev_count_take() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        SCAN_NUMDATA_DEV_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -4262,9 +4506,10 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     //     fallback, never a per-feature mix).
     // Bit-identical results (see the staged-kernel module note), so no parity
     // seam is needed; the env is purely a perf escape hatch.
-    // SPEC-DRGL-12: the Device num_data source forces the legacy lane-per-feature
-    // kernel's device-`num_data` twin — the staged/autotune width variants stay on the
-    // host-scalar path only (bit-identical output either way, so parity is preserved).
+    // SPEC-DRGL-12: the Device num_data source takes its OWN device-`num_data` launch
+    // path (`device_parprefix` below on the default hip parprefix arm, else the legacy
+    // twin in the fallback) — the HOST staged/autotune width variants stay on the
+    // host-scalar path only. `is_device` therefore forces `staged`/`autotuned` off.
     #[cfg(feature = "gpu")]
     let staged = !is_device
         && scan_staged_enabled()
@@ -4303,6 +4548,68 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                 sum_hessian_bumped,
                 num_data_host,
             );
+        }
+    }
+
+    // SPEC-DRGL-12: the Device num_data source on a real device with the parprefix scan
+    // enabled (the flag-OFF default on hip) uses the parprefix kernel's device-`num_data`
+    // TWIN — BYTE-IDENTICAL to the host parprefix scan, so a deferred (device-count) child
+    // scan reproduces the non-deferred (host-count) parprefix winner exactly. Falls back to
+    // the legacy devcount twin (below) only when parprefix is off (a non-default config).
+    #[cfg(feature = "gpu")]
+    let device_parprefix = is_device
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && scan_staged_enabled()
+        && scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
+        && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
+    #[cfg(not(feature = "gpu"))]
+    let device_parprefix = false;
+
+    #[cfg(feature = "gpu")]
+    if device_parprefix {
+        SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let NumDataSrc::Device {
+            ranges,
+            ranges_len,
+            roles,
+            roles_len,
+            split_slot,
+            is_smaller,
+            parent_count,
+        } = &num_data_src
+        {
+            // SAFETY: identical obligations to `launch_staged_single_scan`; geometry
+            // CubeCount::Static(n) matches the kernel's CUBE_POS_X < n no-guard contract.
+            unsafe {
+                find_best_splits_fused_staged_parprefix_kernel_devcount::launch(
+                    client,
+                    CubeCount::Static(n as u32, 1, 1),
+                    CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                    ArrayArg::from_raw_parts(h_hist.clone(), buf_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot.clone(), n),
+                    ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                    ArrayArg::from_raw_parts(h_offset.clone(), n),
+                    ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                    ArrayArg::from_raw_parts(h_skip.clone(), n),
+                    ArrayArg::from_raw_parts(h_rev.clone(), n),
+                    ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    min_gain_shift,
+                    sum_gradient,
+                    sum_hessian_bumped,
+                    ArrayArg::from_raw_parts(ranges.clone(), *ranges_len),
+                    ArrayArg::from_raw_parts(roles.clone(), *roles_len),
+                    *split_slot,
+                    if *is_smaller { 1u32 } else { 0u32 },
+                    *parent_count,
+                );
+            }
         }
     }
 
@@ -4358,13 +4665,14 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         SCAN_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
     }
 
-    if !autotuned && !staged {
+    if !autotuned && !staged && !device_parprefix {
         // Scan-occupancy lever: pack one feature per LANE. `scan_cube_dim()`
         // (env `LGBM_SCAN_CUBEDIM`; rocm default W=64, W=1 = byte-identical to the
         // original) is the cube width W; `CubeCount = ceil(n / W)`. The kernel indexes
         // features by the global lane `ABSOLUTE_POS` and guards `f < n_feats`, so the
         // tail cube's spare lanes no-op and the result is bit-identical to W=1 for
-        // every W.
+        // every W. SPEC-DRGL-12 fallback: a `Device` num_data source that did NOT take
+        // the parprefix twin above (parprefix off) lands here on the legacy devcount twin.
         let scan_w = scan_cube_dim();
         let cube_count = (n as u32).div_ceil(scan_w);
 
@@ -4415,6 +4723,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                 is_smaller,
                 parent_count,
             } => unsafe {
+                SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 find_best_splits_fused_kernel_devcount::launch(
                     client,
                     CubeCount::Static(cube_count, 1, 1),

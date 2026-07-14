@@ -37,28 +37,31 @@ fn gpu_client() -> cubecl::prelude::ComputeClient<GpuRt> {
     lgbm_compute::runtime::rocm_client()
 }
 
-/// Pin BOTH sides of the comparison onto the SAME (legacy lane-per-feature) scan kernel
-/// so the ONLY variable under test is the `num_data` SOURCE (host scalar vs on-device),
-/// not the scan variant. This matters: on hip the host path defaults to the staged
-/// PARPREFIX kernel, whose parallel f64 reduction reorders additions and so differs from
-/// the sequential legacy scan by ~1 ULP — a real, pre-existing cross-variant gap (hip is
-/// ~1e-6, not bit-exact) that is NOT what SPEC-DRGL-12 is about. The device-`num_data`
-/// twin (T-12) is the legacy kernel's twin, so we force the host onto legacy too
-/// (`LGBM_SCAN_STAGED=0`) for a byte-exact, correctly-attributed comparison.
+/// Pin the CubeCL autotuner off (its bench server cannot run headless). Read-once gate;
+/// set before the first scan launch. This test binary hosts a single test, so the
+/// process-global write races with nothing.
+fn pin_autotune_off() {
+    // SAFETY: test-only single value, set before any reader caches the flag.
+    unsafe { std::env::set_var("LGBM_AUTOTUNE", "0") };
+}
+
+/// Force BOTH sides of the comparison onto the SAME scan variant, so the ONLY variable
+/// under test is the `num_data` SOURCE (host scalar vs on-device), not the scan kernel.
+/// This is load-bearing: the hip scan variants are NOT bit-identical to each other — the
+/// staged PARPREFIX kernel's parallel f64 reduction reorders adds and so differs from the
+/// sequential LEGACY scan by ~1 ULP (hip is ~1e-6, not bit-exact). The device-`num_data`
+/// path mirrors the host dispatch (parprefix twin when parprefix is on, else the legacy
+/// twin), so pinning the variant on both sides gives a byte-exact comparison of each.
+/// The flags are read per-launch (not cached), so switching them mid-test is safe.
 ///
-/// (Extending the device-`num_data` path to the staged/parprefix kernels — so the
-/// deferred scan keeps the parprefix perf win on hip — is the documented follow-on
-/// within SPEC-DRGL-12/13; the legacy twin proves the num_data-sourcing MECHANISM first.)
-///
-/// `LGBM_AUTOTUNE=0` additionally pins the autotuner off (its bench server cannot run
-/// headless). Both are read-once gates set before the first scan launch; this test binary
-/// hosts a single test, so the process-global env writes race with nothing.
-fn pin_legacy_scan_variant() {
-    // SAFETY: test-only single values, set before any reader caches the flags; the only
-    // reader in this process is this one test.
+/// - `("0","0")` ⇒ legacy lane-per-feature kernel on both sides (the fallback twin).
+/// - `("1","1")` ⇒ the staged PARPREFIX kernel on both sides (the LIVE hip default —
+///   the variant SPEC-DRGL-05's deferral must reproduce byte-for-byte).
+fn force_scan_variant(staged: &str, parprefix: &str) {
+    // SAFETY: test-only, set between sequential (never concurrent) scan launches.
     unsafe {
-        std::env::set_var("LGBM_AUTOTUNE", "0");
-        std::env::set_var("LGBM_SCAN_STAGED", "0");
+        std::env::set_var("LGBM_SCAN_STAGED", staged);
+        std::env::set_var("LGBM_SCAN_PARPREFIX", parprefix);
     }
 }
 
@@ -132,14 +135,10 @@ fn assert_split_bit_identical(a: &SplitInfo, b: &SplitInfo, ctx: &str) {
     }
 }
 
-/// SPEC-DRGL-12: for a left-smaller AND a right-smaller split, and for BOTH the
-/// smaller and the larger child, the device-`num_data` scan (count resolved on device
-/// from `ranges`/`roles` + the host parent count) is byte-identical to the
-/// host-`num_data` scan fed the matching child count.
-#[test]
-fn device_numdata_scan_byte_identical_to_host_numdata_scan() {
-    pin_legacy_scan_variant();
-    let client = gpu_client();
+/// Run the full left-smaller/right-smaller × smaller/larger byte-identity sweep once, on
+/// whatever scan variant is currently forced (`variant` labels it in the assertion
+/// context). The ONLY difference between the two scans is the `num_data` source.
+fn run_parity_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &str) {
     let num_bins = [16usize, 8];
     let (hist, slot_off, sum_g, sum_h) = synth_hist(0x5ca_0d12, num_bins);
     let feats = feats_of(slot_off, num_bins);
@@ -158,28 +157,28 @@ fn device_numdata_scan_byte_identical_to_host_numdata_scan() {
         let larger_count = if smaller_is_left { right_count } else { left_count };
 
         // Resident split state: record the split point, resolve the role ON DEVICE.
-        let mut ls = DeviceLeafSplits::new(&client, 1).expect("alloc");
-        ls.record_split(&client, split_point, p_begin, p_count);
-        assign_smaller_larger_roles_device(&client, &ls, 0, 99, 98).expect("roles");
+        let mut ls = DeviceLeafSplits::new(client, 1).expect("alloc");
+        ls.record_split(client, split_point, p_begin, p_count);
+        assign_smaller_larger_roles_device(client, &ls, 0, 99, 98).expect("roles");
 
         for is_smaller in [true, false] {
             let host_num_data = if is_smaller { smaller_count } else { larger_count };
             let ctx = format!(
-                "split_point={split_point} smaller_is_left={smaller_is_left} is_smaller={is_smaller} \
-                 host_num_data={host_num_data}"
+                "variant={variant} split_point={split_point} smaller_is_left={smaller_is_left} \
+                 is_smaller={is_smaller} host_num_data={host_num_data}"
             );
 
             // HOST-num_data scan (the anchor): the child count as a host scalar.
-            let h_host = upload_f64_buffer(&client, &hist);
+            let h_host = upload_f64_buffer(client, &hist);
             let host = find_best_splits_batched_fused_f64_from_handle_on(
-                &client, h_host, hist.len(), &feats, &cfg, sum_g, sum_h, host_num_data,
+                client, h_host, hist.len(), &feats, &cfg, sum_g, sum_h, host_num_data,
             )
             .expect("host-num_data scan");
 
             // DEVICE-num_data scan: count resolved on device from ranges/roles + p_count.
-            let h_dev = upload_f64_buffer(&client, &hist);
+            let h_dev = upload_f64_buffer(client, &hist);
             let dev = find_best_splits_batched_fused_f64_devcount_from_handle_on(
-                &client,
+                client,
                 h_dev,
                 hist.len(),
                 &feats,
@@ -208,4 +207,23 @@ fn device_numdata_scan_byte_identical_to_host_numdata_scan() {
             );
         }
     }
+}
+
+/// SPEC-DRGL-12: for a left-smaller AND a right-smaller split, and for BOTH the smaller
+/// and the larger child, the device-`num_data` scan (count resolved on device from
+/// `ranges`/`roles` + the host parent count) is byte-identical to the host-`num_data`
+/// scan fed the matching child count — on BOTH the LIVE hip default (staged parprefix)
+/// AND the legacy fallback kernel. Each variant pins host+device onto the SAME kernel so
+/// the only variable is the num_data source; the parprefix case is the one SPEC-DRGL-05's
+/// deferral must reproduce byte-for-byte to keep the deferred tree == the flag-OFF tree.
+#[test]
+fn device_numdata_scan_byte_identical_to_host_numdata_scan() {
+    pin_autotune_off();
+    let client = gpu_client();
+    // LIVE hip default: staged + parprefix on both sides.
+    force_scan_variant("1", "1");
+    run_parity_sweep(&client, "parprefix");
+    // Legacy fallback: lane-per-feature kernel on both sides (parprefix off).
+    force_scan_variant("0", "0");
+    run_parity_sweep(&client, "legacy");
 }
