@@ -1691,6 +1691,44 @@ pub trait Backend {
         })
     }
 
+    /// SPEC-DRGL-12: the device-`num_data` twin of
+    /// [`scan_resident_leaf_into_frontier`](Backend::scan_resident_leaf_into_frontier) — scan
+    /// ONE resident leaf and fold its winner into frontier slot `out_leaf`, but with the
+    /// child's `num_data` resolved ON DEVICE from `leaf_splits`'s resident split/role record
+    /// (`split_idx`, `is_smaller`) + the host-known `parent_count`, instead of a host scalar.
+    /// This is what the SPEC-DRGL-05 deferral calls: the scan runs before the host reads the
+    /// split point back. On hip it uses the parprefix devcount twin, so the folded winner is
+    /// byte-identical to the non-deferred (host-count) parprefix fold. Default: typed error
+    /// (real-device capability).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] on the default; propagates the resident-scan / reduce errors
+    /// on a GpuBackend.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_resident_leaf_into_frontier_devcount(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _slot: usize,
+        _slot_len: usize,
+        _feats: &[BatchedSplitFeature],
+        _real_feats: &[i32],
+        _cfg: &GainConfig,
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+        _leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        _split_idx: usize,
+        _is_smaller: bool,
+        _parent_count: i32,
+        _frontier: &DeviceFrontier<Self::Runtime>,
+        _out_leaf: usize,
+    ) -> Result<(), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "scan_resident_leaf_into_frontier_devcount: device-resident frontier not \
+                     supported on this backend"
+                .to_string(),
+        })
+    }
+
     /// The ZERO-READBACK, CO-PACKED analog of
     /// [`scan_resident_siblings_argmax`](Backend::scan_resident_siblings_argmax) — co-scan BOTH
     /// siblings in ONE launch and fold EACH side's winner DIRECTLY into its frontier slot
@@ -4224,6 +4262,57 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             sum_gradient,
             sum_hessian,
             num_data,
+            frontier.records(),
+            out_leaf,
+            desc.as_ref(),
+        )
+    }
+
+    /// SPEC-DRGL-12: the device-`num_data` twin of
+    /// [`scan_resident_leaf_into_frontier`](Backend::scan_resident_leaf_into_frontier). Identical
+    /// scan+fold, but the child's `num_data` is resolved ON DEVICE from `leaf_splits`'s resident
+    /// `ranges`/`roles` record (`split_idx`, `is_smaller`) + the host-known `parent_count`,
+    /// instead of a host scalar — the launcher the SPEC-DRGL-05 deferred child scan calls.
+    fn scan_resident_leaf_into_frontier_devcount(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        sum_gradient: f64,
+        sum_hessian: f64,
+        leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        split_idx: usize,
+        is_smaller: bool,
+        parent_count: i32,
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf: usize,
+    ) -> Result<(), ComputeError> {
+        let handle = {
+            let mirror = self.resident_pool.borrow();
+            mirror.get(slot).and_then(|h| h.clone()).ok_or_else(|| ComputeError::Runtime {
+                detail: "scan_resident_leaf_into_frontier_devcount: slot is empty".to_string(),
+            })?
+        };
+        let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
+        kernels::split::find_best_splits_fused_reduce_into_leaf_devcount_on(
+            client,
+            handle,
+            slot_len,
+            feats,
+            real_feats,
+            cfg,
+            sum_gradient,
+            sum_hessian,
+            leaf_splits.ranges_handle().clone(),
+            kernels::partition::LEAF_SPLIT_STRIDE * leaf_splits.capacity(),
+            leaf_splits.roles_handle().clone(),
+            kernels::partition::ROLE_STRIDE * leaf_splits.capacity(),
+            split_idx as u32,
+            is_smaller,
+            parent_count,
             frontier.records(),
             out_leaf,
             desc.as_ref(),
