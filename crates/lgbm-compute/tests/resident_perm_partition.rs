@@ -417,7 +417,7 @@ mod real_gpu_gated {
                 &client, bins_handle.clone(), ResidentBinWidth::U8, 2, num_data, &slot_off,
                 slot_len, parent_view, p_count, ls.ranges_handle().clone(),
                 LEAF_SPLIT_STRIDE * ls.capacity(), ls.roles_handle().clone(),
-                ROLE_STRIDE * ls.capacity(), 0, &fix_feats, sum_g, sum_h, max_abs,
+                ROLE_STRIDE * ls.capacity(), 0, /*which=*/ 2, &fix_feats, sum_g, sum_h, max_abs,
                 (grad_h.clone(), hess_h.clone(), num_data), None,
             )
             .expect("fixed-grid build");
@@ -432,6 +432,38 @@ mod real_gpu_gated {
                 fb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "fixed-grid build must be f64-byte-identical to exact-grid \
                  (split_point {split_point}, smaller_is_left {expect_left})"
+            );
+
+            // SPEC-DRGL-05: build-LEFT (which=0) — the LEFT child's rows [p_begin, p_begin+
+            // split_point) regardless of which side is smaller — must match the exact-grid LEFT.
+            let left_rows = &perm[p_begin..p_begin + split_point];
+            let lsum_g: f64 = left_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
+            let lsum_h: f64 = left_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
+            let left_view = perm_handle.clone().offset_start((p_begin * usz) as u64);
+            let (exact_l, _) = build_fix_compact_resident_rows_handle_f64_on(
+                &client, bins_handle.clone(), ResidentBinWidth::U8, 2, num_data, &slot_off,
+                slot_len, left_view, split_point, &fix_feats, lsum_g, lsum_h, max_abs,
+                (grad_h.clone(), hess_h.clone(), num_data), None,
+            )
+            .expect("exact-grid LEFT build");
+            let parent_view_l = perm_handle.clone().offset_start((p_begin * usz) as u64);
+            let (fixed_l, _) = build_fix_compact_resident_rows_handle_f64_fixed_grid_on(
+                &client, bins_handle.clone(), ResidentBinWidth::U8, 2, num_data, &slot_off,
+                slot_len, parent_view_l, p_count, ls.ranges_handle().clone(),
+                LEAF_SPLIT_STRIDE * ls.capacity(), ls.roles_handle().clone(),
+                ROLE_STRIDE * ls.capacity(), 0, /*which=Left*/ 0, &fix_feats, lsum_g, lsum_h,
+                max_abs, (grad_h.clone(), hess_h.clone(), num_data), None,
+            )
+            .expect("fixed-grid LEFT build");
+            let el_bytes = client.read_one_unchecked(exact_l);
+            let fl_bytes = client.read_one_unchecked(fixed_l);
+            let el = f64::from_bytes(&el_bytes);
+            let fl = f64::from_bytes(&fl_bytes);
+            assert_eq!(
+                el.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fl.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "build-LEFT (which=0) must be byte-identical to exact-grid LEFT \
+                 (split_point {split_point})"
             );
         }
     }

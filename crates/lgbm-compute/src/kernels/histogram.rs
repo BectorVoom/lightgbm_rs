@@ -779,21 +779,29 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64_fixed_grid<B: Int>(
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
+    // SPEC-DRGL-05: which child to build — 0=Left 1=Right 2=Smaller 3=Larger. LEFT/RIGHT
+    // (used by the deferred loop) ignore `roles`; Smaller/Larger consult it (T-04 default=2).
+    which: u32,
 ) {
     let f = CUBE_POS_X as usize; // ONE cube per feature
     let base = slot_off[f] as usize;
     let feat_len = slot_off[f + 1] as usize - base; // = 2*num_bin[f]
     let cd = CUBE_DIM as usize;
 
-    // Resolve the SMALLER child's [begin_off, count) within the parent view ON DEVICE.
+    // Resolve the target child's [begin_off, count) within the parent view ON DEVICE.
     let split_point = ranges[(split_slot * 6 + 2) as usize] as usize;
     let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
     let p_count = parent_rows.len();
+    // `which` resolves to the LEFT range for: which==0 (Left), which==2 (Smaller) when
+    // smaller_is_left, or which==3 (Larger) when the larger child is the left partition.
+    let want_left = (which == 0u32)
+        || (which == 2u32 && smaller_is_left)
+        || (which == 3u32 && !smaller_is_left);
     // Right-child default, overwritten for the left child via a STATEMENT `if` (an
     // if-EXPRESSION unifies the `{integer}` literal with `NativeExpand<usize>` and fails).
     let mut begin_off = split_point;
     let mut count = p_count - split_point;
-    if smaller_is_left {
+    if want_left {
         begin_off = 0;
         count = split_point;
     }
@@ -2596,6 +2604,9 @@ pub fn build_fix_compact_resident_rows_handle_f64_fixed_grid_on<R: cubecl::Runti
     roles_handle: cubecl::server::Handle,
     roles_len: usize,
     split_slot: usize,
+    // SPEC-DRGL-05: which child to build (0=Left 1=Right 2=Smaller 3=Larger). T-04's
+    // build-smaller callers pass 2; the deferred loop's build-LEFT arm passes 0.
+    which: u32,
     fix_feats: &[(usize, u32, i32, u32)],
     sum_gradient: f64,
     sum_hessian: f64,
@@ -2659,6 +2670,7 @@ pub fn build_fix_compact_resident_rows_handle_f64_fixed_grid_on<R: cubecl::Runti
                         ArrayArg::from_raw_parts(ranges_handle.clone(), ranges_len),
                         ArrayArg::from_raw_parts(roles_handle.clone(), roles_len),
                         split_slot as u32,
+                        which,
                     );
                 }
             };
