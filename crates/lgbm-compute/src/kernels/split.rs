@@ -1326,6 +1326,103 @@ pub fn find_best_splits_fused_siblings_kernel(
     }
 }
 
+/// SPEC-DRGL-13: device-`num_data` twin of [`find_best_splits_fused_siblings_kernel`].
+/// Identical co-pack scan, but BOTH siblings' `num_data` are resolved ON DEVICE from the
+/// resident split/role record ([`resolve_child_num_data`]) — the smaller child's count
+/// (`is_smaller=1`) for sibling A, the larger's (`is_smaller=0`) for sibling B — instead of
+/// host `num_data_a`/`num_data_b` scalars. This lets the co-pack scan (the default live hip
+/// arm when both children are scannable) run before the host reads `split_point` back (the
+/// SPEC-DRGL-05 deferral). Real-device only. The larger count is `parent_count -
+/// split_point` (parent count host-known; no new sync).
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_kernel_devcount(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    // PER-SIBLING leaf scalars (A = smaller, B = larger) — num_data resolved on device below.
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    // DEVICE `num_data` source (SPEC-DRGL-13) — REPLACES the host num_data_a/num_data_b.
+    ranges: &Array<i32>,
+    roles: &Array<i32>,
+    split_slot: u32,
+    parent_count: i32,
+    n_feats: u32,
+) {
+    // Resolve BOTH children's num_data ON DEVICE: A = smaller, B = larger.
+    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, 1u32, parent_count);
+    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, 0u32, parent_count);
+
+    let g = ABSOLUTE_POS as u32;
+    let total = 2u32 * n_feats;
+    if g < total {
+        let fi = if g < n_feats { g } else { g - n_feats } as usize;
+        if g < n_feats {
+            split_scan_body(
+                hist_a,
+                slot_off[fi],
+                out,
+                g * 12u32,
+                num_bin[fi],
+                offset[fi],
+                default_bin[fi],
+                skip_default_bin[fi],
+                use_l1,
+                min_data_in_leaf,
+                min_sum_hessian_in_leaf,
+                lambda_l1,
+                lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a,
+                num_data_a,
+                rev_count[fi],
+                fwd_count[fi],
+            );
+        } else {
+            split_scan_body(
+                hist_b,
+                slot_off[fi],
+                out,
+                g * 12u32,
+                num_bin[fi],
+                offset[fi],
+                default_bin[fi],
+                skip_default_bin[fi],
+                use_l1,
+                min_data_in_leaf,
+                min_sum_hessian_in_leaf,
+                lambda_l1,
+                lambda_l2,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b,
+                num_data_b,
+                rev_count[fi],
+                fwd_count[fi],
+            );
+        }
+    }
+}
+
 // ============================================================================
 // LDS-STAGED per-feature split scan — the scan-occupancy + memory-latency fix.
 //
@@ -3960,6 +4057,230 @@ pub fn find_best_splits_fused_siblings_staged_parprefix_kernel(
     }
 }
 
+/// SPEC-DRGL-13: device-`num_data` twin of
+/// [`find_best_splits_fused_siblings_staged_parprefix_kernel`] (the LIVE default hip co-pack
+/// scan). BYTE-FOR-BYTE the same parallel-prefix co-pack scan — the ONLY change is that BOTH
+/// siblings' `num_data` are resolved ON DEVICE ([`resolve_child_num_data`]: A = smaller, B =
+/// larger) from the resident split/role record instead of host scalars. This is the variant
+/// SPEC-DRGL-05's deferral must use on hip so the deferred co-pack fold stays byte-identical
+/// to the (parprefix) flag-OFF fold. Real-device only.
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_staged_parprefix_kernel_devcount(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    // DEVICE `num_data` source (SPEC-DRGL-13) — REPLACES host num_data_a/num_data_b.
+    ranges: &Array<i32>,
+    roles: &Array<i32>,
+    split_slot: u32,
+    parent_count: i32,
+    n_feats: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+    let mut rev_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_pg = SharedMemory::<f64>::new(32usize);
+    let mut rev_pk = SharedMemory::<f64>::new(32usize);
+    let mut rev_pa = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pg = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pk = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pa = SharedMemory::<f64>::new(32usize);
+    let mut ct_g = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_h = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_c = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut lmin = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+
+    // Resolve BOTH children's num_data ON DEVICE — the ONLY difference vs the host twin.
+    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, 1u32, parent_count);
+    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, 0u32, parent_count);
+
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_b[base + c];
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_a[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    // PHASE 1: all-lanes parallel prefix, rev then fwd.
+    parprefix_store_rev(
+        &sm.to_slice(),
+        &mut rev_ag.to_slice_mut(),
+        &mut rev_ah.to_slice_mut(),
+        &mut rev_lc.to_slice_mut(),
+        &mut rev_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+    );
+    sync_cube();
+    parprefix_store_fwd(
+        &sm.to_slice(),
+        &mut fwd_ag.to_slice_mut(),
+        &mut fwd_ah.to_slice_mut(),
+        &mut fwd_lc.to_slice_mut(),
+        &mut fwd_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+    );
+    sync_cube();
+
+    if UNIT_POS < 32 {
+        pargain_lane_scan(
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_ok.to_slice(),
+            &mut rev_pg.to_slice_mut(),
+            &mut rev_pk.to_slice_mut(),
+            &mut rev_pa.to_slice_mut(),
+            UNIT_POS,
+            rev_count[fi],
+            0u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    } else {
+        pargain_lane_scan(
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_ok.to_slice(),
+            &mut fwd_pg.to_slice_mut(),
+            &mut fwd_pk.to_slice_mut(),
+            &mut fwd_pa.to_slice_mut(),
+            UNIT_POS - 32,
+            fwd_count[fi],
+            1u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        pargain_assemble_state(
+            &rev_pg.to_slice(),
+            &rev_pk.to_slice(),
+            &rev_pa.to_slice(),
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_lc.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            0u32,
+            num_bin[fi] - 2,
+            -1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_assemble_state(
+            &fwd_pg.to_slice(),
+            &fwd_pk.to_slice(),
+            &fwd_pa.to_slice(),
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_lc.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            1u32,
+            offset[fi],
+            1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
 /// Launch the staged single-leaf scan — the SERIAL-branch staged kernel by
 /// default, or its PARGAIN twin when `LGBM_SCAN_PARGAIN=1` (identical
 /// signature, geometry, and — by the pargain module note — bit-identical
@@ -4261,6 +4582,26 @@ pub(crate) enum NumDataSrc {
         roles_len: usize,
         split_slot: u32,
         is_smaller: bool,
+        parent_count: i32,
+    },
+}
+
+/// SPEC-DRGL-13: the co-pack (two-sibling) analog of [`NumDataSrc`]. `Host` ⇒ both siblings'
+/// counts come from the `a_totals`/`b_totals` scalars (byte-unchanged default). `Device` ⇒
+/// resolve BOTH on device from ONE resident split/role record (A = smaller via `is_smaller=1`,
+/// B = larger via `is_smaller=0`; larger = `parent_count - split_point`), so the co-pack scan
+/// can run before the host reads `split_point` back (the SPEC-DRGL-05 deferral).
+pub(crate) enum SiblingNumDataSrc {
+    /// Counts come from the `a_totals`/`b_totals` tuples (the shipped default path).
+    Host,
+    /// Device-resident counts for both siblings (real-device only), from ONE split slot.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    Device {
+        ranges: cubecl::server::Handle,
+        ranges_len: usize,
+        roles: cubecl::server::Handle,
+        roles_len: usize,
+        split_slot: u32,
         parent_count: i32,
     },
 }
@@ -5992,6 +6333,9 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     cfg: &GainConfig,
     a_totals: (f64, f64, i32),
     b_totals: (f64, f64, i32),
+    // SPEC-DRGL-13: `Host` ⇒ counts from a_totals/b_totals (byte-unchanged); `Device` ⇒ both
+    // resolved on device in the scan kernel (parprefix siblings twin on hip, else legacy twin).
+    num_data_src: SiblingNumDataSrc,
     // Per-grow cached descriptor set (LGBM_DESC_HOIST) — see `fused_scan_to_raw_handle`.
     desc: Option<&ScanDescHandles>,
 ) -> Result<Option<(cubecl::server::Handle, usize, usize, f64, f64)>, ComputeError> {
@@ -6005,6 +6349,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                 .to_string(),
         });
     }
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
+    let is_device = matches!(num_data_src, SiblingNumDataSrc::Device { .. });
     let (sum_gradient_a, sum_hessian_a, num_data_a) = a_totals;
     let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -6081,7 +6427,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // the LIVE per-split co-pack route — the hot path (one call per split). Same
     // gates as the single-slot helper; bit-identical output layout + cells.
     #[cfg(feature = "gpu")]
-    if scan_staged_enabled()
+    if !is_device
+        && scan_staged_enabled()
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && d.staged_capable
     {
@@ -6114,9 +6461,72 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
         return Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)));
     }
 
+    // SPEC-DRGL-13: the Device num_data source on a real device with parprefix enabled (the
+    // flag-OFF default on hip) uses the co-pack parprefix kernel's device-`num_data` TWIN —
+    // BYTE-IDENTICAL to the host parprefix co-pack scan, so a deferred co-pack fold reproduces
+    // the non-deferred fold exactly. Falls back to the legacy siblings devcount twin below when
+    // parprefix is off (non-default config).
+    #[cfg(feature = "gpu")]
+    if is_device
+        && <R as cubecl::Runtime>::name(client) != "cpu"
+        && scan_staged_enabled()
+        && scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
+        && d.staged_capable
+    {
+        SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let SiblingNumDataSrc::Device {
+            ranges,
+            ranges_len,
+            roles,
+            roles_len,
+            split_slot,
+            parent_count,
+        } = &num_data_src
+        {
+            // SAFETY: identical obligations to `launch_staged_siblings_scan`; geometry
+            // CubeCount::Static(n, 2) matches the kernel's CUBE_POS_X<n, CUBE_POS_Y<2 contract.
+            unsafe {
+                find_best_splits_fused_siblings_staged_parprefix_kernel_devcount::launch(
+                    client,
+                    CubeCount::Static(n as u32, 2, 1),
+                    CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                    ArrayArg::from_raw_parts(hist_a_handle, buf_len),
+                    ArrayArg::from_raw_parts(hist_b_handle, buf_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot, n),
+                    ArrayArg::from_raw_parts(h_numbin, n),
+                    ArrayArg::from_raw_parts(h_offset, n),
+                    ArrayArg::from_raw_parts(h_defbin, n),
+                    ArrayArg::from_raw_parts(h_skip, n),
+                    ArrayArg::from_raw_parts(h_rev, n),
+                    ArrayArg::from_raw_parts(h_fwd, n),
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    min_gain_shift_a,
+                    sum_gradient_a,
+                    sum_hessian_a_bumped,
+                    min_gain_shift_b,
+                    sum_gradient_b,
+                    sum_hessian_b_bumped,
+                    ArrayArg::from_raw_parts(ranges.clone(), *ranges_len),
+                    ArrayArg::from_raw_parts(roles.clone(), *roles_len),
+                    *split_slot,
+                    *parent_count,
+                    n as u32,
+                );
+            }
+        }
+        return Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)));
+    }
+
     // Direct `scan_cube_dim()` launch over 2*n feature-slots (A then B) — the SAME
     // `find_best_splits_fused_siblings_kernel` the host-readback path launches; only the
-    // readback is dropped.
+    // readback is dropped. SPEC-DRGL-13: a `Device` source that did NOT take the parprefix
+    // twin (parprefix off) lands on the legacy siblings devcount twin here.
     let scan_w = scan_cube_dim();
     let cube_count = (2 * n as u32).div_ceil(scan_w);
     // SAFETY: both histogram handles describe `buf_len` f64 cells; every per-feature region
@@ -6124,36 +6534,88 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // arrays have exactly `n` elements; lane `g` (guarded `< 2*n_feats`) reads only its
     // sibling's validated region and writes only `out[g*12 .. g*12+12]` within the `2*n*12`
     // allocation. All cubecl unsafe confined here (CMP-01).
-    unsafe {
-        find_best_splits_fused_siblings_kernel::launch(
-            client,
-            CubeCount::Static(cube_count, 1, 1),
-            CubeDim::new_1d(scan_w),
-            ArrayArg::from_raw_parts(hist_a_handle, buf_len),
-            ArrayArg::from_raw_parts(hist_b_handle, buf_len),
-            ArrayArg::from_raw_parts(h_out.clone(), out_len),
-            ArrayArg::from_raw_parts(h_slot, n),
-            ArrayArg::from_raw_parts(h_numbin, n),
-            ArrayArg::from_raw_parts(h_offset, n),
-            ArrayArg::from_raw_parts(h_defbin, n),
-            ArrayArg::from_raw_parts(h_skip, n),
-            ArrayArg::from_raw_parts(h_rev, n),
-            ArrayArg::from_raw_parts(h_fwd, n),
-            if use_l1 { 1u32 } else { 0u32 },
-            cfg.min_data_in_leaf,
-            cfg.min_sum_hessian_in_leaf,
-            cfg.lambda_l1,
-            cfg.lambda_l2,
-            min_gain_shift_a,
-            sum_gradient_a,
-            sum_hessian_a_bumped,
-            num_data_a,
-            min_gain_shift_b,
-            sum_gradient_b,
-            sum_hessian_b_bumped,
-            num_data_b,
-            n as u32,
-        );
+    match num_data_src {
+        SiblingNumDataSrc::Host => unsafe {
+            find_best_splits_fused_siblings_kernel::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(scan_w),
+                ArrayArg::from_raw_parts(hist_a_handle, buf_len),
+                ArrayArg::from_raw_parts(hist_b_handle, buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                num_data_a,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                num_data_b,
+                n as u32,
+            );
+        },
+        #[cfg(feature = "gpu")]
+        SiblingNumDataSrc::Device {
+            ranges,
+            ranges_len,
+            roles,
+            roles_len,
+            split_slot,
+            parent_count,
+        } => unsafe {
+            SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            find_best_splits_fused_siblings_kernel_devcount::launch(
+                client,
+                CubeCount::Static(cube_count, 1, 1),
+                CubeDim::new_1d(scan_w),
+                ArrayArg::from_raw_parts(hist_a_handle, buf_len),
+                ArrayArg::from_raw_parts(hist_b_handle, buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                ArrayArg::from_raw_parts(ranges, ranges_len),
+                ArrayArg::from_raw_parts(roles, roles_len),
+                split_slot,
+                parent_count,
+                n as u32,
+            );
+        },
+        #[cfg(not(feature = "gpu"))]
+        SiblingNumDataSrc::Device { .. } => {
+            return Err(ComputeError::Runtime {
+                detail: "find_best_splits_siblings_reduce (device num_data): the resident \
+                         device-num_data co-pack scan requires a GPU backend"
+                    .to_string(),
+            });
+        }
     }
     Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)))
 }
@@ -6454,6 +6916,7 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
         cfg,
         a_totals,
         b_totals,
+        SiblingNumDataSrc::Host,
         desc_ok,
     )?;
     if let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)) = scanned {
@@ -6468,6 +6931,111 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
         // `LGBM_REDUCE_BATCH=0` restores the two separate launches for same-session
         // A/B benchmarking (bit-exact either way — the hatch measures the host-enqueue
         // delta, it does NOT gate correctness).
+        #[cfg(feature = "gpu")]
+        if reduce_batch_enabled() {
+            launch_reduce_into_two_leaves(
+                client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
+                min_gain_shift_a, min_gain_shift_b, h_rf_cached,
+            );
+        } else {
+            launch_reduce_into_leaf(
+                client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
+                min_gain_shift_a, h_rf_cached.clone(),
+            );
+            launch_reduce_into_leaf(
+                client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
+                min_gain_shift_b, h_rf_cached,
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            launch_reduce_into_leaf(
+                client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
+                min_gain_shift_a, h_rf_cached.clone(),
+            );
+            launch_reduce_into_leaf(
+                client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
+                min_gain_shift_b, h_rf_cached,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// SPEC-DRGL-13: device-`num_data` twin of
+/// [`find_best_splits_fused_siblings_reduce_into_leaves_on`] — the no-readback co-pack
+/// scan+fold that resolves BOTH siblings' `num_data` ON DEVICE from ONE resident split/role
+/// record (`split_slot`, `parent_count`) instead of the host `a_totals.2`/`b_totals.2`
+/// scalars (which are IGNORED here — the sums are still used). This is the launcher the
+/// driver's deferred (SPEC-DRGL-05) co-pack scan calls. On hip it dispatches the parprefix
+/// siblings devcount twin, so both folded winners are byte-identical to the non-deferred
+/// (host-count) parprefix folds. Real-device only.
+///
+/// # Errors
+/// As [`find_best_splits_fused_siblings_reduce_into_leaves_on`]; plus a typed error if a
+/// non-GPU build reaches the device path.
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_a_handle: cubecl::server::Handle,
+    hist_b_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    real_feats: &[i32],
+    cfg: &GainConfig,
+    // (sum_gradient, sum_hessian, _num_data) per sibling — the num_data component is IGNORED
+    // (resolved on device); the sums drive min_gain_shift + the child-output finalization.
+    a_totals: (f64, f64, i32),
+    b_totals: (f64, f64, i32),
+    ranges: cubecl::server::Handle,
+    ranges_len: usize,
+    roles: cubecl::server::Handle,
+    roles_len: usize,
+    split_slot: u32,
+    parent_count: i32,
+    out: &crate::kernels::best_split::SplitSoa,
+    out_leaf_a: usize,
+    out_leaf_b: usize,
+    desc: Option<&ScanDescHandles>,
+) -> Result<(), ComputeError> {
+    if real_feats.len() != feats.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: feats.len(),
+            actual: real_feats.len(),
+        });
+    }
+    if !feats.is_empty() && (out_leaf_a >= out.len || out_leaf_b >= out.len) {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "find_best_splits_siblings_reduce_devcount: out_leaf_a {out_leaf_a} / out_leaf_b \
+                 {out_leaf_b} out of range [0, {})",
+                out.len
+            ),
+        });
+    }
+    let desc_ok = desc.filter(|d| d.matches(feats.len(), buf_len));
+    let scanned = fused_scan_siblings_to_raw_handle(
+        client,
+        hist_a_handle,
+        hist_b_handle,
+        buf_len,
+        feats,
+        cfg,
+        a_totals,
+        b_totals,
+        SiblingNumDataSrc::Device {
+            ranges,
+            ranges_len,
+            roles,
+            roles_len,
+            split_slot,
+            parent_count,
+        },
+        desc_ok,
+    )?;
+    if let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b)) = scanned {
+        let h_rf_cached = desc_ok.and_then(|d| d.h_rf.clone());
+        // Identical fold to the host launcher (num_data-independent).
         #[cfg(feature = "gpu")]
         if reduce_batch_enabled() {
             launch_reduce_into_two_leaves(

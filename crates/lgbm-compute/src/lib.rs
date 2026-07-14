@@ -1813,6 +1813,92 @@ pub trait Backend {
         )
     }
 
+    /// SPEC-DRGL-13: the device-`num_data` twin of
+    /// [`scan_resident_siblings_into_frontier`](Backend::scan_resident_siblings_into_frontier)
+    /// — co-scan BOTH siblings and fold each winner into its frontier slot, with BOTH counts
+    /// resolved ON DEVICE from `leaf_splits`'s resident split/role record (`split_idx`, +
+    /// host-known `parent_count`) instead of the `*_totals` num_data scalars. Default: typed
+    /// error (real-device capability).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] on the default; propagates the co-pack scan / reduce errors on
+    /// a GpuBackend.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_resident_siblings_into_frontier_devcount(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _smaller_slot: usize,
+        _larger_slot: usize,
+        _slot_len: usize,
+        _feats: &[BatchedSplitFeature],
+        _real_feats: &[i32],
+        _cfg: &GainConfig,
+        _smaller_sums: (f64, f64),
+        _larger_sums: (f64, f64),
+        _leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        _split_idx: usize,
+        _parent_count: i32,
+        _frontier: &DeviceFrontier<Self::Runtime>,
+        _out_leaf_smaller: usize,
+        _out_leaf_larger: usize,
+    ) -> Result<(), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "scan_resident_siblings_into_frontier_devcount: device-resident frontier not \
+                     supported on this backend"
+                .to_string(),
+        })
+    }
+
+    /// SPEC-DRGL-13: the device-`num_data` twin of
+    /// [`subtract_scan_resident_siblings_into_frontier`](Backend::subtract_scan_resident_siblings_into_frontier).
+    /// The DEFAULT (subtract-fuse OFF) path the SPEC-DRGL-05 deferred co-pack arm takes:
+    /// [`subtract_resident`](Backend::subtract_resident) (num_data-free) then
+    /// [`scan_resident_siblings_into_frontier_devcount`](Backend::scan_resident_siblings_into_frontier_devcount).
+    /// (The fused subtract+scan path, `LGBM_SUBTRACT_FUSE=1`, is opt-in default OFF and is NOT
+    /// device-num_data-wired here — the deferral requires the default two-step path.)
+    ///
+    /// # Errors
+    /// Propagates the subtract / co-scan / reduce errors of whichever path runs.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan_resident_siblings_into_frontier_devcount(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent_slot: usize,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        smaller_sums: (f64, f64),
+        larger_sums: (f64, f64),
+        leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        split_idx: usize,
+        parent_count: i32,
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf_smaller: usize,
+        out_leaf_larger: usize,
+    ) -> Result<(), ComputeError> {
+        self.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
+        self.scan_resident_siblings_into_frontier_devcount(
+            client,
+            smaller_slot,
+            larger_slot,
+            slot_len,
+            feats,
+            real_feats,
+            cfg,
+            smaller_sums,
+            larger_sums,
+            leaf_splits,
+            split_idx,
+            parent_count,
+            frontier,
+            out_leaf_smaller,
+            out_leaf_larger,
+        )
+    }
+
     /// The ZERO-READBACK analog of
     /// [`build_fix_scan_resident`](Backend::build_fix_scan_resident) (the f64-fused escape hatch)
     /// — build+fix+compact+scan a directly-built leaf in ONE launch, STORE the fixed+compacted
@@ -4367,6 +4453,71 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             cfg,
             smaller_totals,
             larger_totals,
+            frontier.records(),
+            out_leaf_smaller,
+            out_leaf_larger,
+            desc.as_ref(),
+        )
+    }
+
+    /// SPEC-DRGL-13: device-`num_data` twin of
+    /// [`scan_resident_siblings_into_frontier`](Backend::scan_resident_siblings_into_frontier).
+    /// Identical co-pack scan+fold, but BOTH siblings' counts are resolved on device from
+    /// `leaf_splits`'s `ranges`/`roles` (`split_idx`) + host `parent_count`.
+    fn scan_resident_siblings_into_frontier_devcount(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        smaller_sums: (f64, f64),
+        larger_sums: (f64, f64),
+        leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        split_idx: usize,
+        parent_count: i32,
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf_smaller: usize,
+        out_leaf_larger: usize,
+    ) -> Result<(), ComputeError> {
+        let (smaller_h, larger_h) = {
+            let mirror = self.resident_pool.borrow();
+            let smaller_h =
+                mirror.get(smaller_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                    ComputeError::Runtime {
+                        detail: "scan_resident_siblings_into_frontier_devcount: smaller slot empty"
+                            .to_string(),
+                    }
+                })?;
+            let larger_h = mirror.get(larger_slot).and_then(|h| h.clone()).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: "scan_resident_siblings_into_frontier_devcount: larger slot empty"
+                        .to_string(),
+                }
+            })?;
+            (smaller_h, larger_h)
+        };
+        let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
+        // The num_data component of the totals is ignored on the device path (resolved on
+        // device); pass a placeholder 0 alongside the real sums.
+        kernels::split::find_best_splits_fused_siblings_reduce_into_leaves_devcount_on(
+            client,
+            smaller_h,
+            larger_h,
+            slot_len,
+            feats,
+            real_feats,
+            cfg,
+            (smaller_sums.0, smaller_sums.1, 0),
+            (larger_sums.0, larger_sums.1, 0),
+            leaf_splits.ranges_handle().clone(),
+            kernels::partition::LEAF_SPLIT_STRIDE * leaf_splits.capacity(),
+            leaf_splits.roles_handle().clone(),
+            kernels::partition::ROLE_STRIDE * leaf_splits.capacity(),
+            split_idx as u32,
+            parent_count,
             frontier.records(),
             out_leaf_smaller,
             out_leaf_larger,
