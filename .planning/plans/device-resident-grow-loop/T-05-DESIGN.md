@@ -113,7 +113,48 @@ reads (batched) and the last folds into the tail perm read ⇒ ≈ `num_leaves +
 (exact form: re-derive from a fresh `bump_sync()` grep of the flag-ON path — that is
 T-06's job, DO NOT guess it here).
 
+## ⭐ REVISED APPROACH (2026-07-15, supersedes build-LEFT) — device-`out_leaf` reduce
+Deeper analysis found the build-LEFT reframe would touch the VALIDATED T-04 build +
+T-12/T-13 scans (needs a Left/Right num_data variant). A lower-risk alternative keeps
+ALL validated kernels and localizes the only irreducible `smaller_is_left` dependency —
+the FOLD TARGET — to the reduce:
+
+- Keep **build-smaller** (T-04) + the **is_smaller** devcount scans (T-12/T-13) exactly
+  as shipped. At iter i: build smaller→next_slot, subtract→parent_slot, scan smaller
+  (is_smaller=1) + larger (is_smaller=0) — all device-count, no host split_point.
+- Add a **device-`out_leaf` reduce** variant: the fold's target frontier slot is resolved
+  ON DEVICE — `smaller_leaf = roles[3*split_slot]!=0 ? new_left : new_right` (and the
+  inverse for larger) — instead of a host `out_leaf` arg. `new_left`/`new_right` are
+  host-known (best_leaf, leaves.len()); only the smaller/larger→left/right MAP is on
+  device. This is the ONLY new kernel; scans/build unchanged.
+- Everything else is host-deferrable or order-independent, so NO other smaller_is_left
+  use blocks the deferral:
+  - children `.slot` (next vs parent) — deferred to i+1 (read at split time, later).
+  - row ranges + tree-mutation counts — deferred to i+1 (design above).
+  - §8.3 self-invalidation `prev_smaller`/`prev_larger` — pass `{new_left,new_right}`
+    (the pick invalidates BOTH child slots; the set is order-independent, so no
+    smaller_is_left needed). ✅ verified against `frontier_pick_best_leaf_device`'s
+    self-invalidation semantics.
+- Net new kernel work vs build-LEFT: ONE device-`out_leaf` reduce (single + two-leaf
+  co-pack variants) instead of a Left/Right build + Left/Right scan family. Fewer
+  touched-and-revalidated kernels. **Use this approach.**
+
+Flag infra already SHIPPED (commit `439af57`): `grow_defer_sync_enabled()` (default OFF)
++ `set_grow_defer_sync_override()` + `deferred_read_fused=` tripwire + phase_prof wiring.
+
 ## Recommended task order for the executing session
+(REVISED for the device-out_leaf approach)
+1. ✅ DONE (`439af57`): `grow_defer_sync_enabled()` gate + `deferred_read_fused=` tripwire.
+2. Device-`out_leaf` reduce variant (resolve fold target from roles+new_left+new_right on
+   device) — single-child + co-pack; additive, isolation byte-identity test
+   (device-out_leaf fold == host-out_leaf fold). Keep T-04/T-12/T-13 UNCHANGED.
+3. Restructure the loop behind the flag: batched read (fuse read_split(i-1)+pick(i)),
+   deferred bookkeeping (row ranges + `.slot` + tree mutation applied at top of i for
+   i-1), device-out_leaf folds, `{new_left,new_right}` self-invalidation, tail fold.
+4. Real-device byte-identity (flag-ON == flag-OFF, re-pick + full-growth, gfx1151).
+5. Then T-06 (sync closed form), then T-11 (P100 A/B).
+
+### Original (build-LEFT) task order — SUPERSEDED, kept for reference
 1. Add `grow_defer_sync_enabled()` gate (default OFF) + `deferred_read_fused=` tripwire.
 2. Add Left/Right `resolve_child_num_data` + devcount scan/reduce entry variants
    (generalize T-12/T-13; keep is_smaller variants for their existing callers/tests).
