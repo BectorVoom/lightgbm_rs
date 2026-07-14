@@ -1134,15 +1134,18 @@ pub fn find_best_splits_fused_kernel(
 /// back. Same field layout as the T-04 fixed-grid BUILD: `ranges[6*split_slot+2]` =
 /// `left_count` = `split_point`; `roles[3*split_slot]` = `smaller_is_left` (0/1); the
 /// larger count is `parent_count - split_point` (`parent_count` host-known, no sync).
-/// `is_smaller` (0/1) selects the child. Shared by the legacy and parprefix devcount
-/// twins so both compute the identical count.
+/// `which` selects the child (SPEC-DRGL-05 generalization): `0=Left, 1=Right, 2=Smaller,
+/// 3=Larger`. LEFT/RIGHT (used by the deferred loop) read only `ranges` — NO roles — so the
+/// sums stay host-known (the pick export carries left/right sums directly); Smaller/Larger
+/// (used by the isolation tests / T-12/T-13) consult `roles[3*split_slot]`. Shared by the
+/// legacy and parprefix devcount twins so both compute the identical count.
 #[cfg(feature = "gpu")]
 #[cube]
 fn resolve_child_num_data(
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
-    is_smaller: u32,
+    which: u32,
     parent_count: i32,
 ) -> i32 {
     let split_point = ranges[(split_slot * 6 + 2) as usize];
@@ -1151,7 +1154,10 @@ fn resolve_child_num_data(
     let right_count = parent_count - split_point;
     let smaller_count = select(smaller_is_left, left_count, right_count);
     let larger_count = select(smaller_is_left, right_count, left_count);
-    select(is_smaller != 0, smaller_count, larger_count)
+    // which<2 ⇒ LEFT(0)/RIGHT(1) (no roles); else SMALLER(2)/LARGER(3).
+    let by_lr = select(which == 0u32, left_count, right_count);
+    let by_sl = select(which == 2u32, smaller_count, larger_count);
+    select(which < 2u32, by_lr, by_sl)
 }
 
 #[cfg(feature = "gpu")]
@@ -1180,12 +1186,12 @@ pub fn find_best_splits_fused_kernel_devcount(
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
-    is_smaller: u32,   // 1 => this scan is for the SMALLER child, 0 => the LARGER
+    which: u32,        // 0=Left 1=Right 2=Smaller 3=Larger (SPEC-DRGL-05 generalization)
     parent_count: i32, // host-known parent row count (upper bound; no new sync)
     n_feats: u32,
 ) {
     // Resolve this child's num_data ON DEVICE (same field layout as the T-04 build).
-    let num_data = resolve_child_num_data(ranges, roles, split_slot, is_smaller, parent_count);
+    let num_data = resolve_child_num_data(ranges, roles, split_slot, which, parent_count);
 
     let f = ABSOLUTE_POS as u32;
     if f < n_feats {
@@ -1364,12 +1370,14 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
+    which_a: u32, // sibling A's child selector (SPEC-DRGL-05: 0=Left/2=Smaller)
+    which_b: u32, // sibling B's child selector (1=Right/3=Larger)
     parent_count: i32,
     n_feats: u32,
 ) {
-    // Resolve BOTH children's num_data ON DEVICE: A = smaller, B = larger.
-    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, 1u32, parent_count);
-    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, 0u32, parent_count);
+    // Resolve BOTH children's num_data ON DEVICE per the caller's which_a/which_b.
+    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, which_a, parent_count);
+    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, which_b, parent_count);
 
     let g = ABSOLUTE_POS as u32;
     let total = 2u32 * n_feats;
@@ -2108,11 +2116,11 @@ pub fn find_best_splits_fused_staged_parprefix_kernel_devcount(
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
-    is_smaller: u32,
+    which: u32,
     parent_count: i32,
 ) {
     // Resolve this child's num_data ON DEVICE — the ONLY difference vs the host twin.
-    let num_data = resolve_child_num_data(ranges, roles, split_slot, is_smaller, parent_count);
+    let num_data = resolve_child_num_data(ranges, roles, split_slot, which, parent_count);
 
     let f = CUBE_POS_X;
     let fi = f as usize;
@@ -4093,6 +4101,8 @@ pub fn find_best_splits_fused_siblings_staged_parprefix_kernel_devcount(
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
+    which_a: u32,
+    which_b: u32,
     parent_count: i32,
     n_feats: u32,
 ) {
@@ -4121,9 +4131,9 @@ pub fn find_best_splits_fused_siblings_staged_parprefix_kernel_devcount(
     let mut ct_c = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
     let mut lmin = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
 
-    // Resolve BOTH children's num_data ON DEVICE — the ONLY difference vs the host twin.
-    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, 1u32, parent_count);
-    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, 0u32, parent_count);
+    // Resolve BOTH children's num_data ON DEVICE per the caller's which_a/which_b.
+    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, which_a, parent_count);
+    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, which_b, parent_count);
 
     let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
     let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
@@ -4581,7 +4591,8 @@ pub(crate) enum NumDataSrc {
         roles: cubecl::server::Handle,
         roles_len: usize,
         split_slot: u32,
-        is_smaller: bool,
+        /// Child selector: 0=Left 1=Right 2=Smaller 3=Larger (SPEC-DRGL-05).
+        which: u32,
         parent_count: i32,
     },
 }
@@ -4602,6 +4613,9 @@ pub(crate) enum SiblingNumDataSrc {
         roles: cubecl::server::Handle,
         roles_len: usize,
         split_slot: u32,
+        /// Sibling A/B child selectors: 0=Left 1=Right 2=Smaller 3=Larger (SPEC-DRGL-05).
+        which_a: u32,
+        which_b: u32,
         parent_count: i32,
     },
 }
@@ -4632,7 +4646,7 @@ pub fn find_best_splits_batched_fused_f64_devcount_from_handle_on<R: cubecl::Run
     roles: cubecl::server::Handle,
     roles_len: usize,
     split_slot: u32,
-    is_smaller: bool,
+    which: u32,
     parent_count: i32,
 ) -> Result<Vec<SplitInfo>, ComputeError> {
     find_best_splits_fused_inner(
@@ -4649,7 +4663,7 @@ pub fn find_best_splits_batched_fused_f64_devcount_from_handle_on<R: cubecl::Run
             roles,
             roles_len,
             split_slot,
-            is_smaller,
+            which,
             parent_count,
         },
     )
@@ -4916,7 +4930,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
             roles,
             roles_len,
             split_slot,
-            is_smaller,
+            which,
             parent_count,
         } = &num_data_src
         {
@@ -4947,7 +4961,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                     ArrayArg::from_raw_parts(ranges.clone(), *ranges_len),
                     ArrayArg::from_raw_parts(roles.clone(), *roles_len),
                     *split_slot,
-                    if *is_smaller { 1u32 } else { 0u32 },
+                    *which,
                     *parent_count,
                 );
             }
@@ -5061,7 +5075,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                 roles,
                 roles_len,
                 split_slot,
-                is_smaller,
+                which,
                 parent_count,
             } => unsafe {
                 SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5089,7 +5103,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                     ArrayArg::from_raw_parts(ranges, ranges_len),
                     ArrayArg::from_raw_parts(roles, roles_len),
                     split_slot,
-                    if is_smaller { 1u32 } else { 0u32 },
+                    which,
                     parent_count,
                     n as u32,
                 );
@@ -6020,7 +6034,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
             roles,
             roles_len,
             split_slot,
-            is_smaller,
+            which,
             parent_count,
         } = &num_data_src
         {
@@ -6051,7 +6065,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
                     ArrayArg::from_raw_parts(ranges.clone(), *ranges_len),
                     ArrayArg::from_raw_parts(roles.clone(), *roles_len),
                     *split_slot,
-                    if *is_smaller { 1u32 } else { 0u32 },
+                    *which,
                     *parent_count,
                 );
             }
@@ -6104,7 +6118,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
             roles,
             roles_len,
             split_slot,
-            is_smaller,
+            which,
             parent_count,
         } => unsafe {
             SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6132,7 +6146,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
                 ArrayArg::from_raw_parts(ranges, ranges_len),
                 ArrayArg::from_raw_parts(roles, roles_len),
                 split_slot,
-                if is_smaller { 1u32 } else { 0u32 },
+                which,
                 parent_count,
                 n as u32,
             );
@@ -6256,7 +6270,7 @@ pub fn find_best_splits_fused_reduce_into_leaf_devcount_on<R: cubecl::Runtime>(
     roles: cubecl::server::Handle,
     roles_len: usize,
     split_slot: u32,
-    is_smaller: bool,
+    which: u32,
     parent_count: i32,
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf: usize,
@@ -6291,7 +6305,7 @@ pub fn find_best_splits_fused_reduce_into_leaf_devcount_on<R: cubecl::Runtime>(
             roles,
             roles_len,
             split_slot,
-            is_smaller,
+            which,
             parent_count,
         },
         desc_ok,
@@ -6481,6 +6495,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
             roles,
             roles_len,
             split_slot,
+            which_a,
+            which_b,
             parent_count,
         } = &num_data_src
         {
@@ -6515,6 +6531,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                     ArrayArg::from_raw_parts(ranges.clone(), *ranges_len),
                     ArrayArg::from_raw_parts(roles.clone(), *roles_len),
                     *split_slot,
+                    *which_a,
+                    *which_b,
                     *parent_count,
                     n as u32,
                 );
@@ -6573,6 +6591,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
             roles,
             roles_len,
             split_slot,
+            which_a,
+            which_b,
             parent_count,
         } => unsafe {
             SCAN_NUMDATA_DEV_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6604,6 +6624,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                 ArrayArg::from_raw_parts(ranges, ranges_len),
                 ArrayArg::from_raw_parts(roles, roles_len),
                 split_slot,
+                which_a,
+                which_b,
                 parent_count,
                 n as u32,
             );
@@ -6992,6 +7014,8 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl:
     roles: cubecl::server::Handle,
     roles_len: usize,
     split_slot: u32,
+    which_a: u32,
+    which_b: u32,
     parent_count: i32,
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf_a: usize,
@@ -7029,6 +7053,8 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl:
             roles,
             roles_len,
             split_slot,
+            which_a,
+            which_b,
             parent_count,
         },
         desc_ok,

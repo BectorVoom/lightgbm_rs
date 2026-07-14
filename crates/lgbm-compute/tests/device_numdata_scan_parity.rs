@@ -194,7 +194,7 @@ fn run_parity_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
                 ls.roles_handle().clone(),
                 ROLE_STRIDE * ls.capacity(),
                 0, // split_slot
-                is_smaller,
+                if is_smaller { 2u32 } else { 3u32 }, // which: 2=Smaller, 3=Larger
                 p_count, // host-known parent row count (upper bound)
             )
             .expect("device-num_data scan");
@@ -209,6 +209,52 @@ fn run_parity_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
                 host.iter().any(|s| s.gain > f64::NEG_INFINITY),
                 "{ctx}: host scan found no split — pick a more discriminating corpus"
             );
+        }
+    }
+}
+
+/// SPEC-DRGL-05: the LEFT (which=0) and RIGHT (which=1) selectors — the framing the
+/// deferred grow loop uses (sums host-known from the pick export; num_data resolved on
+/// device with NO roles read). LEFT scan == host scan fed `num_data=split_point`; RIGHT ==
+/// host scan fed `num_data=parent_count−split_point`. Byte-identical on the parprefix
+/// variant (the live hip path). This is what makes the deferral's build-LEFT arm possible.
+#[test]
+fn device_numdata_left_right_scan_byte_identical_to_host() {
+    pin_autotune_off();
+    force_scan_variant("1", "1"); // live hip parprefix on both sides
+    let client = gpu_client();
+    let num_bins = [16usize, 8];
+    let (hist, slot_off, sum_g, sum_h) = synth_hist(0x5ca_0d12, num_bins);
+    let feats = feats_of(slot_off, num_bins);
+    let cfg = GainConfig::default();
+    let (p_begin, p_count) = (0i32, 251i32);
+    for split_point in [100i32, 160i32] {
+        let mut ls = DeviceLeafSplits::new(&client, 1).expect("alloc");
+        ls.record_split(&client, split_point, p_begin, p_count);
+        assign_smaller_larger_roles_device(&client, &ls, 0, 99, 98).expect("roles");
+        // which=0 ⇒ LEFT (num_data=split_point); which=1 ⇒ RIGHT (num_data=p_count−split_point).
+        for (which, host_num_data, side) in
+            [(0u32, split_point, "left"), (1u32, p_count - split_point, "right")]
+        {
+            let ctx = format!("split_point={split_point} which={which} side={side}");
+            let h_host = upload_f64_buffer(&client, &hist);
+            let host = find_best_splits_batched_fused_f64_from_handle_on(
+                &client, h_host, hist.len(), &feats, &cfg, sum_g, sum_h, host_num_data,
+            )
+            .expect("host scan");
+            let h_dev = upload_f64_buffer(&client, &hist);
+            let dev = find_best_splits_batched_fused_f64_devcount_from_handle_on(
+                &client, h_dev, hist.len(), &feats, &cfg, sum_g, sum_h,
+                ls.ranges_handle().clone(), LEAF_SPLIT_STRIDE * ls.capacity(),
+                ls.roles_handle().clone(), ROLE_STRIDE * ls.capacity(),
+                0, which, p_count,
+            )
+            .expect("device LEFT/RIGHT scan");
+            assert_eq!(host.len(), dev.len(), "{ctx}: feature count");
+            for (f, (h, d)) in host.iter().zip(dev.iter()).enumerate() {
+                assert_split_bit_identical(h, d, &format!("{ctx} feat={f}"));
+            }
+            assert!(host.iter().any(|s| s.gain > f64::NEG_INFINITY), "{ctx}: no split found");
         }
     }
 }
@@ -273,7 +319,7 @@ fn run_reduce_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
                 client, h_dev, hist.len(), &feats, &real_feats, &cfg, sum_g, sum_h,
                 ls.ranges_handle().clone(), LEAF_SPLIT_STRIDE * ls.capacity(),
                 ls.roles_handle().clone(), ROLE_STRIDE * ls.capacity(),
-                0, is_smaller, p_count, &soa, 1, None,
+                0, if is_smaller { 2u32 } else { 3u32 }, p_count, &soa, 1, None,
             )
             .expect("device reduce");
 
@@ -354,7 +400,7 @@ fn run_copack_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
             (sg_a, sh_a, 0), (sg_b, sh_b, 0),
             ls.ranges_handle().clone(), LEAF_SPLIT_STRIDE * ls.capacity(),
             ls.roles_handle().clone(), ROLE_STRIDE * ls.capacity(),
-            0, p_count, &soa, 2, 3, None,
+            0, 2u32, 3u32, p_count, &soa, 2, 3, None, // which_a=Smaller, which_b=Larger
         )
         .expect("device co-pack");
 
