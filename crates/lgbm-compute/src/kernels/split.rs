@@ -1116,6 +1116,85 @@ pub fn find_best_splits_fused_kernel(
     }
 }
 
+/// SPEC-DRGL-12: device-`num_data` twin of [`find_best_splits_fused_kernel`]. Identical
+/// per-feature scan (the SHARED [`split_scan_body`]) — the ONLY difference is that this
+/// child's `num_data` (its row count) is resolved ON DEVICE from the resident split/role
+/// record instead of being handed in as a host scalar. That is exactly the capability
+/// SPEC-DRGL-05's `read_split` deferral needs: once the split point is deferred, the host
+/// no longer knows the child count at scan-launch time.
+///
+/// Count resolution mirrors T-04's fixed-grid BUILD
+/// (`construct_leaf_hist_resident_lds_kernel_u64_fixed_grid`): `ranges[6*split_slot+2]`
+/// = `left_count` = `split_point`; `roles[3*split_slot]` = `smaller_is_left` (0/1); the
+/// larger count is `parent_count - split_point` (`parent_count` is host-known — the
+/// PARENT's row count, set a prior iteration, NOT the deferred value — so no new sync).
+/// `is_smaller` (0/1) selects which child this scan is for. Real-device only.
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_kernel_devcount(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    // LEAF-LEVEL scalars (shared across the batch) — as find_best_splits_fused_kernel.
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    // DEVICE `num_data` source (SPEC-DRGL-12) — REPLACES the host `num_data: i32` scalar.
+    ranges: &Array<i32>,
+    roles: &Array<i32>,
+    split_slot: u32,
+    is_smaller: u32,   // 1 => this scan is for the SMALLER child, 0 => the LARGER
+    parent_count: i32, // host-known parent row count (upper bound; no new sync)
+    n_feats: u32,
+) {
+    // Resolve this child's num_data ON DEVICE (same field layout as the T-04 build).
+    let split_point = ranges[(split_slot * 6 + 2) as usize];
+    let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
+    let left_count = split_point;
+    let right_count = parent_count - split_point;
+    let smaller_count = select(smaller_is_left, left_count, right_count);
+    let larger_count = select(smaller_is_left, right_count, left_count);
+    let num_data = select(is_smaller != 0, smaller_count, larger_count);
+
+    let f = ABSOLUTE_POS as u32;
+    if f < n_feats {
+        let fi = f as usize;
+        split_scan_body(
+            hist,
+            slot_off[fi],
+            out,
+            f * 12u32,
+            num_bin[fi],
+            offset[fi],
+            default_bin[fi],
+            skip_default_bin[fi],
+            use_l1,
+            min_data_in_leaf,
+            min_sum_hessian_in_leaf,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+            rev_count[fi],
+            fwd_count[fi],
+        );
+    }
+}
+
 /// CO-PACKED 2-slot per-leaf best-split kernel. ONE launch
 /// scans BOTH siblings of a split: the smaller child's histogram `hist_a` and the
 /// larger child's `hist_b`, over `2*n_feats` feature-slots. Global lane
@@ -3910,7 +3989,84 @@ pub fn find_best_splits_batched_fused_f64_from_handle_on<R: cubecl::Runtime>(
         cfg,
         sum_gradient,
         sum_hessian,
-        num_data,
+        NumDataSrc::Host(num_data),
+    )
+}
+
+/// The source of a fused scan's per-child `num_data` (row count). `Host` is today's
+/// default (a host scalar). `Device` (SPEC-DRGL-12, real-device only) resolves the
+/// count ON DEVICE from the resident split/role record so the scan can run BEFORE the
+/// host reads `split_point` back (the SPEC-DRGL-05 `read_split` deferral). The `Device`
+/// variant forces the legacy lane-per-feature scan kernel's device-`num_data` twin
+/// ([`find_best_splits_fused_kernel_devcount`]), bypassing the staged/autotune variants —
+/// still bit-identical, since every scan variant shares [`split_scan_body`] and the
+/// resolved count equals the host scalar it replaces.
+pub(crate) enum NumDataSrc {
+    /// Host-known child count (the shipped default path — byte-unchanged).
+    Host(i32),
+    /// Device-resident child count (real-device only). `ranges`/`roles` are the
+    /// [`DeviceLeafSplits`](crate::kernels::partition::DeviceLeafSplits) buffers;
+    /// `parent_count` is the host-known parent row count (upper bound, no new sync).
+    /// The fields are consumed only by the `#[cfg(feature = "gpu")]` launch arm, so a
+    /// cpu build reads none of them (it takes the typed-error arm instead).
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    Device {
+        ranges: cubecl::server::Handle,
+        ranges_len: usize,
+        roles: cubecl::server::Handle,
+        roles_len: usize,
+        split_slot: u32,
+        is_smaller: bool,
+        parent_count: i32,
+    },
+}
+
+/// SPEC-DRGL-12: device-`num_data` twin of
+/// [`find_best_splits_batched_fused_f64_from_handle_on`] — identical fused scan, but the
+/// child's `num_data` is resolved ON DEVICE from the resident split/role record
+/// (`ranges`/`roles` of a [`DeviceLeafSplits`](crate::kernels::partition::DeviceLeafSplits))
+/// plus the host-known `parent_count`, instead of a host `num_data` scalar. Returns the
+/// SAME `Vec<SplitInfo>` (one per feature, input order) as the host-`num_data` scan, and
+/// is byte-identical to it for the same device state — the property SPEC-DRGL-05's
+/// deferral relies on. Real-device only (the `Device` path errors on a cpu backend).
+///
+/// # Errors
+/// As [`find_best_splits_batched_fused_f64_from_handle_on`]; plus a typed error if a
+/// non-GPU build reaches the device path.
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_batched_fused_f64_devcount_from_handle_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    hist_handle: cubecl::server::Handle,
+    buf_len: usize,
+    feats: &[BatchedSplitFeature],
+    cfg: &GainConfig,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    ranges: cubecl::server::Handle,
+    ranges_len: usize,
+    roles: cubecl::server::Handle,
+    roles_len: usize,
+    split_slot: u32,
+    is_smaller: bool,
+    parent_count: i32,
+) -> Result<Vec<SplitInfo>, ComputeError> {
+    find_best_splits_fused_inner(
+        client,
+        hist_handle,
+        buf_len,
+        feats,
+        cfg,
+        sum_gradient,
+        sum_hessian,
+        NumDataSrc::Device {
+            ranges,
+            ranges_len,
+            roles,
+            roles_len,
+            split_slot,
+            is_smaller,
+            parent_count,
+        },
     )
 }
 
@@ -3932,12 +4088,25 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     cfg: &GainConfig,
     sum_gradient: f64,
     sum_hessian: f64,
-    num_data: i32,
+    num_data_src: NumDataSrc,
 ) -> Result<Vec<SplitInfo>, ComputeError> {
     // Empty batch: no launch (T-mc5-03).
     if feats.is_empty() {
         return Ok(Vec::new());
     }
+
+    // `num_data` reaches the kernel only at the launch (validation / min_gain_shift /
+    // rev-fwd counts / decode are all num_data-free). `Host` supplies it as a scalar
+    // (byte-unchanged default path); `Device` (SPEC-DRGL-12) forces the legacy kernel's
+    // device-`num_data` twin, which reads the count from the resident split/role record.
+    // `is_device` gates the staged/autotune width variants off (Device forces the legacy
+    // twin); those gates are `#[cfg(feature = "gpu")]`, so on a cpu build it is unused.
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
+    let is_device = matches!(num_data_src, NumDataSrc::Device { .. });
+    let num_data_host: i32 = match &num_data_src {
+        NumDataSrc::Host(n) => *n,
+        NumDataSrc::Device { .. } => 0, // unused on the Device path (legacy twin reads it on device)
+    };
 
     // Leaf-level, checked once: only the default smoothing/clamp path is
     // transcribed. Reject non-default values rather than mis-compute.
@@ -4093,8 +4262,12 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     //     fallback, never a per-feature mix).
     // Bit-identical results (see the staged-kernel module note), so no parity
     // seam is needed; the env is purely a perf escape hatch.
+    // SPEC-DRGL-12: the Device num_data source forces the legacy lane-per-feature
+    // kernel's device-`num_data` twin — the staged/autotune width variants stay on the
+    // host-scalar path only (bit-identical output either way, so parity is preserved).
     #[cfg(feature = "gpu")]
-    let staged = scan_staged_enabled()
+    let staged = !is_device
+        && scan_staged_enabled()
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
     #[cfg(not(feature = "gpu"))]
@@ -4128,7 +4301,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                 min_gain_shift,
                 sum_gradient,
                 sum_hessian_bumped,
-                num_data,
+                num_data_host,
             );
         }
     }
@@ -4143,7 +4316,8 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     //       (covers `LGBM_AUTOTUNE=0`, an explicit `LGBM_SCAN_CUBEDIM`, and the non-rocm
     //       `scan_cube_dim()==1` bit-exact oracle path).
     #[cfg(feature = "gpu")]
-    let autotuned = !staged
+    let autotuned = !is_device
+        && !staged
         && autotune::autotune_enabled()
         && std::env::var_os("LGBM_SCAN_CUBEDIM").is_none();
     #[cfg(not(feature = "gpu"))]
@@ -4179,7 +4353,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
             min_gain_shift,
             sum_gradient,
             sum_hessian_bumped,
-            num_data,
+            num_data_host,
         ));
         SCAN_TUNER.execute(&autotune::cache_namespace_id(), client, set, handles);
     }
@@ -4200,32 +4374,84 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
         // — and writes only `out[f*12 .. f*12+12]` within the `n*12` allocation; the
         // shared `split_scan_body` carries the same in-range / negative-`t` clamp guards
         // as the single-feature kernel. All per-feature index arrays have exactly `n`
-        // elements. All cubecl unsafe is confined here (CMP-01).
-        unsafe {
-            find_best_splits_fused_kernel::launch(
-                client,
-                CubeCount::Static(cube_count, 1, 1),
-                CubeDim::new_1d(scan_w),
-                ArrayArg::from_raw_parts(h_hist, buf_len),
-                ArrayArg::from_raw_parts(h_out.clone(), out_len),
-                ArrayArg::from_raw_parts(h_slot, n),
-                ArrayArg::from_raw_parts(h_numbin, n),
-                ArrayArg::from_raw_parts(h_offset, n),
-                ArrayArg::from_raw_parts(h_defbin, n),
-                ArrayArg::from_raw_parts(h_skip, n),
-                ArrayArg::from_raw_parts(h_rev, n),
-                ArrayArg::from_raw_parts(h_fwd, n),
-                if use_l1 { 1u32 } else { 0u32 },
-                cfg.min_data_in_leaf,
-                cfg.min_sum_hessian_in_leaf,
-                cfg.lambda_l1,
-                cfg.lambda_l2,
-                min_gain_shift,
-                sum_gradient,
-                sum_hessian_bumped,
-                num_data,
-                n as u32,
-            );
+        // elements. All cubecl unsafe is confined here (CMP-01). SPEC-DRGL-12: the
+        // `Device` num_data source launches the device-`num_data` twin
+        // ([`find_best_splits_fused_kernel_devcount`]) — SAME per-feature scan, count read
+        // from the resident split/role record instead of the host `num_data` scalar.
+        match num_data_src {
+            NumDataSrc::Host(_) => unsafe {
+                find_best_splits_fused_kernel::launch(
+                    client,
+                    CubeCount::Static(cube_count, 1, 1),
+                    CubeDim::new_1d(scan_w),
+                    ArrayArg::from_raw_parts(h_hist, buf_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot, n),
+                    ArrayArg::from_raw_parts(h_numbin, n),
+                    ArrayArg::from_raw_parts(h_offset, n),
+                    ArrayArg::from_raw_parts(h_defbin, n),
+                    ArrayArg::from_raw_parts(h_skip, n),
+                    ArrayArg::from_raw_parts(h_rev, n),
+                    ArrayArg::from_raw_parts(h_fwd, n),
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    min_gain_shift,
+                    sum_gradient,
+                    sum_hessian_bumped,
+                    num_data_host,
+                    n as u32,
+                );
+            },
+            #[cfg(feature = "gpu")]
+            NumDataSrc::Device {
+                ranges,
+                ranges_len,
+                roles,
+                roles_len,
+                split_slot,
+                is_smaller,
+                parent_count,
+            } => unsafe {
+                find_best_splits_fused_kernel_devcount::launch(
+                    client,
+                    CubeCount::Static(cube_count, 1, 1),
+                    CubeDim::new_1d(scan_w),
+                    ArrayArg::from_raw_parts(h_hist, buf_len),
+                    ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot, n),
+                    ArrayArg::from_raw_parts(h_numbin, n),
+                    ArrayArg::from_raw_parts(h_offset, n),
+                    ArrayArg::from_raw_parts(h_defbin, n),
+                    ArrayArg::from_raw_parts(h_skip, n),
+                    ArrayArg::from_raw_parts(h_rev, n),
+                    ArrayArg::from_raw_parts(h_fwd, n),
+                    if use_l1 { 1u32 } else { 0u32 },
+                    cfg.min_data_in_leaf,
+                    cfg.min_sum_hessian_in_leaf,
+                    cfg.lambda_l1,
+                    cfg.lambda_l2,
+                    min_gain_shift,
+                    sum_gradient,
+                    sum_hessian_bumped,
+                    ArrayArg::from_raw_parts(ranges, ranges_len),
+                    ArrayArg::from_raw_parts(roles, roles_len),
+                    split_slot,
+                    if is_smaller { 1u32 } else { 0u32 },
+                    parent_count,
+                    n as u32,
+                );
+            },
+            #[cfg(not(feature = "gpu"))]
+            NumDataSrc::Device { .. } => {
+                return Err(ComputeError::Runtime {
+                    detail: "find_best_splits (device num_data): the resident device-num_data \
+                             scan requires a GPU backend"
+                        .to_string(),
+                });
+            }
         }
     }
 
