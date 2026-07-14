@@ -1685,6 +1685,202 @@ pub fn find_best_splits_fused_staged_kernel(
     }
 }
 
+/// PARALLEL-PREFIX single-leaf kernel: the pargain twin with phase 1 replaced by
+/// the all-lanes [`parprefix_store_rev`]/[`parprefix_store_fwd`] chunked block-scan
+/// (rev then fwd, reusing the `ct_*`/`lmin` scratch). Phases 2/3 + merge are byte-
+/// identical to the pargain kernel. ROCm-only (gated by `scan_parprefix_enabled`).
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_staged_parprefix_kernel(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+    let mut rev_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_pg = SharedMemory::<f64>::new(32usize);
+    let mut rev_pk = SharedMemory::<f64>::new(32usize);
+    let mut rev_pa = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pg = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pk = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pa = SharedMemory::<f64>::new(32usize);
+    // Parallel-prefix scratch (chunk totals/bases + break minima), reused rev→fwd.
+    let mut ct_g = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_h = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_c = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut lmin = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    let mut c = UNIT_POS as usize;
+    while c < cells {
+        sm[c] = hist[base + c];
+        c += cd;
+    }
+    sync_cube();
+
+    // PHASE 1: all-lanes parallel prefix, rev then fwd (reuse ct/lmin scratch).
+    parprefix_store_rev(
+        &sm.to_slice(),
+        &mut rev_ag.to_slice_mut(),
+        &mut rev_ah.to_slice_mut(),
+        &mut rev_lc.to_slice_mut(),
+        &mut rev_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+    );
+    sync_cube();
+    parprefix_store_fwd(
+        &sm.to_slice(),
+        &mut fwd_ag.to_slice_mut(),
+        &mut fwd_ah.to_slice_mut(),
+        &mut fwd_lc.to_slice_mut(),
+        &mut fwd_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+    );
+    sync_cube();
+
+    // PHASE 2: warp-split parallel gain scans (unchanged from pargain).
+    if UNIT_POS < 32 {
+        pargain_lane_scan(
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_ok.to_slice(),
+            &mut rev_pg.to_slice_mut(),
+            &mut rev_pk.to_slice_mut(),
+            &mut rev_pa.to_slice_mut(),
+            UNIT_POS,
+            rev_count[fi],
+            0u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    } else {
+        pargain_lane_scan(
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_ok.to_slice(),
+            &mut fwd_pg.to_slice_mut(),
+            &mut fwd_pk.to_slice_mut(),
+            &mut fwd_pa.to_slice_mut(),
+            UNIT_POS - 32,
+            fwd_count[fi],
+            1u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    // PHASE 3 + merge (unchanged from pargain).
+    if UNIT_POS == 0 {
+        pargain_assemble_state(
+            &rev_pg.to_slice(),
+            &rev_pk.to_slice(),
+            &rev_pa.to_slice(),
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_lc.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            0u32,
+            num_bin[fi] - 2,
+            -1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_assemble_state(
+            &fwd_pg.to_slice(),
+            &fwd_pk.to_slice(),
+            &fwd_pa.to_slice(),
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_lc.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            1u32,
+            offset[fi],
+            1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            f * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
 /// LDS-STAGED co-packed 2-slot sibling best-split kernel: ONE CUBE PER
 /// (FEATURE, SIBLING) — `CubeCount::Static(n, 2, 1)`; `CUBE_POS_Y` selects the
 /// sibling (0 = A/smaller reads `hist_a`, 1 = B/larger reads `hist_b`) and its
@@ -2063,6 +2259,49 @@ pub fn scan_pargain_count_take() -> u64 {
     #[cfg(feature = "gpu")]
     {
         SCAN_PARGAIN_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        0
+    }
+}
+
+/// PARALLEL-PREFIX scan gate (env `LGBM_SCAN_PARPREFIX=1`, ROCm-only, opt-in). It
+/// REPLACES pargain's serial single-lane phase-1 accumulate with an all-lanes
+/// chunked block-scan (the scan is 84% O(num_bin)-bound on gfx1152 — the serial
+/// accumulate is the residual after pargain parallelized the gain eval). Reorders
+/// the f64 prefix adds ⇒ ~1e-6 vs the bit-exact serial (counts/break are integer-
+/// exact); allowed on the GPU ~1e-6 gate. Default OFF until the measured drain
+/// scan-bucket win flips it (like pargain's rollout). CUDA/cpu unaffected.
+#[cfg(feature = "gpu")]
+fn scan_parprefix_enabled(runtime_name: &str) -> bool {
+    match std::env::var("LGBM_SCAN_PARPREFIX").as_deref() {
+        // `=1` forces ON on either GPU backend (A/B — also valid on a consumer 1:32-f64
+        // CUDA card where AMD's calculus applies); `=0` forces OFF (same-session A/B).
+        Ok("1") => runtime_name == "hip" || runtime_name == "cuda",
+        Ok("0") => false,
+        // Default: ON for ROCm/AMD — the biggest device-compute lever on the primary
+        // validated GPU (gfx1152: scan 23.6→17.8 ms/tree = 1.34×, wall 64.0→57.0 = 1.11×;
+        // splits bit-equal to the legacy kernel, gain/tree within the ~1e-6 GPU envelope).
+        // parprefix PRECEDES pargain in the launcher, so it supersedes round-11's
+        // pargain-on-hip default. OFF for CUDA/NVIDIA (spike104: NET-NEGATIVE on P100 —
+        // cheap 1:2 f64 + occupancy starvation make the parallel-scan barriers cost more
+        // than the serial accumulate they remove) + cpu (the bit-exact anchor never runs it).
+        _ => runtime_name == "hip",
+    }
+}
+
+/// POSITIVE tripwire — bumped once per staged-scan launch that dispatched the
+/// PARPREFIX kernel (bench-protocol counts proof). Folded into `phase_prof` as
+/// `scan_parprefix=`.
+#[cfg(feature = "gpu")]
+pub static SCAN_PARPREFIX_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the parprefix-launch tripwire to zero and return the prior value.
+pub fn scan_parprefix_count_take() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        SCAN_PARPREFIX_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -2493,6 +2732,295 @@ fn pargain_assemble_state(
     state[5] = select(won, slh, 0.0);
 }
 
+// ============================================================================
+// PARALLEL-PREFIX phase 1 (LGBM_SCAN_PARPREFIX) — the all-lanes replacement for
+// pargain's single-lane serial accumulate. Each of CUBE_DIM lanes owns a
+// contiguous CHUNK of the branch's candidates, serially prefixes its chunk, then
+// lane 0 exclusive-scans the 64 chunk totals; every lane adds its base to get the
+// GLOBAL prefix (this reorders the f64 adds at chunk boundaries — the accepted
+// ~1e-6 residue; counts are integer-exact). The `done`/break recurrence is
+// reformulated as a break-POINT `tstar` = the first candidate meeting the break
+// gate (min-reduced across lanes); `consider = k<tstar && mask && !cont`. The
+// emitted (ag, ah, lc, ok) drive the UNCHANGED phase 2/3. Validated logically by
+// `parprefix_*` in tests/scan_pargain_parity.rs (bit-equal with serial prefix).
+// ============================================================================
+
+/// PARALLEL-PREFIX phase 1, FORWARD branch. All CUBE_DIM lanes cooperate. Scratch:
+/// `ct_g/ct_h/ct_c` (>= CUBE_DIM cells) hold per-lane chunk totals then exclusive
+/// bases; `lmin` (>= CUBE_DIM+1) holds per-lane break minima then `tstar` at
+/// `[CUBE_DIM]`. Emits LEFT-accumulated (ag, ah) + left_count (lc) + ok.
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn parprefix_store_fwd(
+    sm: &Slice<f64>,
+    cand_ag: &mut SliceMut<f64>,
+    cand_ah: &mut SliceMut<f64>,
+    cand_lc: &mut SliceMut<f64>,
+    cand_ok: &mut SliceMut<f64>,
+    ct_g: &mut SliceMut<f64>,
+    ct_h: &mut SliceMut<f64>,
+    ct_c: &mut SliceMut<f64>,
+    lmin: &mut SliceMut<f64>,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    fwd_count: i32,
+) {
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+    let skip_def = skip_default_bin != 0;
+    let cd = CUBE_DIM as i32;
+    let lane = UNIT_POS;
+    let chunk = (fwd_count + cd - 1) / cd;
+    let lo = lane as i32 * chunk;
+    let hi_raw = lo + chunk;
+    let hi = select(hi_raw < fwd_count, hi_raw, fwd_count);
+
+    // Step A: serial masked prefix over this lane's chunk; store LOCAL prefix.
+    let mut cg = f64::new(0.0);
+    let mut ch = f64::new(0.0);
+    let mut cc = 0i32;
+    let mut k = lo;
+    while k < hi {
+        let skip = skip_def && (k + offset) == default_bin;
+        let bi = (k as usize) * 2;
+        cg += select(skip, f64::new(0.0), sm[bi]);
+        ch += select(skip, f64::new(0.0), sm[bi + 1]);
+        cc += select(skip, 0i32, round_int(sm[bi + 1] * cnt_factor));
+        let ku = k as usize;
+        cand_ag[ku] = cg;
+        cand_ah[ku] = ch;
+        cand_lc[ku] = f64::cast_from(cc);
+        k += 1;
+    }
+    ct_g[lane as usize] = cg;
+    ct_h[lane as usize] = ch;
+    ct_c[lane as usize] = f64::cast_from(cc);
+    sync_cube();
+
+    // Step B: lane 0 exclusive-scans the chunk totals into ct_* (base per lane).
+    if lane == 0 {
+        let mut ag = f64::new(0.0);
+        let mut ah = f64::new(0.0);
+        let mut ac = f64::new(0.0);
+        let mut l = 0i32;
+        while l < cd {
+            let lu = l as usize;
+            let tg = ct_g[lu];
+            let th = ct_h[lu];
+            let tc = ct_c[lu];
+            ct_g[lu] = ag;
+            ct_h[lu] = ah;
+            ct_c[lu] = ac;
+            ag += tg;
+            ah += th;
+            ac += tc;
+            l += 1;
+        }
+    }
+    sync_cube();
+
+    // Step C: add base (+kEpsilon on h) ⇒ GLOBAL prefix; compute per-lane break min.
+    let base_g = ct_g[lane as usize];
+    let base_h = ct_h[lane as usize];
+    let base_c = ct_c[lane as usize];
+    let eps = f64::cast_from(K_EPSILON);
+    let mut my_break = f64::cast_from(fwd_count);
+    let mut k2 = lo;
+    while k2 < hi {
+        let ku = k2 as usize;
+        let gg = cand_ag[ku] + base_g;
+        let hh = cand_ah[ku] + base_h + eps;
+        let lcnt = i32::cast_from(cand_lc[ku] + base_c);
+        cand_ag[ku] = gg;
+        cand_ah[ku] = hh;
+        cand_lc[ku] = f64::cast_from(lcnt);
+        let skip = skip_def && (k2 + offset) == default_bin;
+        let right_count = num_data - lcnt;
+        let sum_right_hessian = sum_hessian - hh;
+        let cont = lcnt < min_data_in_leaf || hh < min_sum_hessian_in_leaf;
+        let brk = right_count < min_data_in_leaf || sum_right_hessian < min_sum_hessian_in_leaf;
+        let is_break = !skip && !cont && brk;
+        let kf = f64::cast_from(k2);
+        my_break = select(is_break && kf < my_break, kf, my_break);
+        k2 += 1;
+    }
+    lmin[lane as usize] = my_break;
+    sync_cube();
+
+    // Step D: lane 0 min-reduces the per-lane breaks ⇒ tstar at lmin[cd].
+    if lane == 0 {
+        let mut ts = f64::cast_from(fwd_count);
+        let mut l = 0i32;
+        while l < cd {
+            let v = lmin[l as usize];
+            ts = select(v < ts, v, ts);
+            l += 1;
+        }
+        lmin[cd as usize] = ts;
+    }
+    sync_cube();
+    let tstar = lmin[cd as usize];
+
+    // Step E: emit consider flags.
+    let mut k3 = lo;
+    while k3 < hi {
+        let ku = k3 as usize;
+        let skip = skip_def && (k3 + offset) == default_bin;
+        let hh = cand_ah[ku];
+        let lcnt = i32::cast_from(cand_lc[ku]);
+        let cont = lcnt < min_data_in_leaf || hh < min_sum_hessian_in_leaf;
+        let consider = f64::cast_from(k3) < tstar && !skip && !cont;
+        cand_ok[ku] = select(consider, f64::new(1.0), f64::new(0.0));
+        k3 += 1;
+    }
+}
+
+/// PARALLEL-PREFIX phase 1, REVERSE branch. Candidate k ↦ bin t = num_bin−1−offset−k;
+/// accumulates the RIGHT side; emits (ag=sum_right_g, ah=sum_right_h, lc=left_count).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn parprefix_store_rev(
+    sm: &Slice<f64>,
+    cand_ag: &mut SliceMut<f64>,
+    cand_ah: &mut SliceMut<f64>,
+    cand_lc: &mut SliceMut<f64>,
+    cand_ok: &mut SliceMut<f64>,
+    ct_g: &mut SliceMut<f64>,
+    ct_h: &mut SliceMut<f64>,
+    ct_c: &mut SliceMut<f64>,
+    lmin: &mut SliceMut<f64>,
+    num_bin: i32,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    rev_count: i32,
+) {
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+    let skip_def = skip_default_bin != 0;
+    let cd = CUBE_DIM as i32;
+    let lane = UNIT_POS;
+    let t_start = num_bin - 1 - offset;
+    let chunk = (rev_count + cd - 1) / cd;
+    let lo = lane as i32 * chunk;
+    let hi_raw = lo + chunk;
+    let hi = select(hi_raw < rev_count, hi_raw, rev_count);
+
+    // Step A: serial masked RIGHT-side prefix over this lane's chunk.
+    let mut cg = f64::new(0.0);
+    let mut ch = f64::new(0.0);
+    let mut cc = 0i32;
+    let mut k = lo;
+    while k < hi {
+        let t = t_start - k;
+        let in_range = t >= (1 - offset);
+        let skip = skip_def && (t + offset) == default_bin;
+        let active = in_range && !skip;
+        let t_safe = select(t < 0, 0i32, t);
+        let bi = (t_safe as usize) * 2;
+        cg += select(active, sm[bi], f64::new(0.0));
+        ch += select(active, sm[bi + 1], f64::new(0.0));
+        cc += select(active, round_int(sm[bi + 1] * cnt_factor), 0i32);
+        let ku = k as usize;
+        cand_ag[ku] = cg;
+        cand_ah[ku] = ch;
+        cand_lc[ku] = f64::cast_from(cc);
+        k += 1;
+    }
+    ct_g[lane as usize] = cg;
+    ct_h[lane as usize] = ch;
+    ct_c[lane as usize] = f64::cast_from(cc);
+    sync_cube();
+
+    if lane == 0 {
+        let mut ag = f64::new(0.0);
+        let mut ah = f64::new(0.0);
+        let mut ac = f64::new(0.0);
+        let mut l = 0i32;
+        while l < cd {
+            let lu = l as usize;
+            let tg = ct_g[lu];
+            let th = ct_h[lu];
+            let tc = ct_c[lu];
+            ct_g[lu] = ag;
+            ct_h[lu] = ah;
+            ct_c[lu] = ac;
+            ag += tg;
+            ah += th;
+            ac += tc;
+            l += 1;
+        }
+    }
+    sync_cube();
+
+    // Step C: GLOBAL right-side prefix; left_count = num_data − right_count.
+    let base_g = ct_g[lane as usize];
+    let base_h = ct_h[lane as usize];
+    let base_c = ct_c[lane as usize];
+    let eps = f64::cast_from(K_EPSILON);
+    let mut my_break = f64::cast_from(rev_count);
+    let mut k2 = lo;
+    while k2 < hi {
+        let ku = k2 as usize;
+        let gg = cand_ag[ku] + base_g;
+        let hh = cand_ah[ku] + base_h + eps;
+        let right_count = i32::cast_from(cand_lc[ku] + base_c);
+        cand_ag[ku] = gg;
+        cand_ah[ku] = hh;
+        cand_lc[ku] = f64::cast_from(num_data - right_count);
+        let t = t_start - k2;
+        let in_range = t >= (1 - offset);
+        let skip = skip_def && (t + offset) == default_bin;
+        let left_count = num_data - right_count;
+        let sum_left_hessian = sum_hessian - hh;
+        let cont = right_count < min_data_in_leaf || hh < min_sum_hessian_in_leaf;
+        let brk = left_count < min_data_in_leaf || sum_left_hessian < min_sum_hessian_in_leaf;
+        let is_break = in_range && !skip && !cont && brk;
+        let kf = f64::cast_from(k2);
+        my_break = select(is_break && kf < my_break, kf, my_break);
+        k2 += 1;
+    }
+    lmin[lane as usize] = my_break;
+    sync_cube();
+
+    if lane == 0 {
+        let mut ts = f64::cast_from(rev_count);
+        let mut l = 0i32;
+        while l < cd {
+            let v = lmin[l as usize];
+            ts = select(v < ts, v, ts);
+            l += 1;
+        }
+        lmin[cd as usize] = ts;
+    }
+    sync_cube();
+    let tstar = lmin[cd as usize];
+
+    let mut k3 = lo;
+    while k3 < hi {
+        let ku = k3 as usize;
+        let t = t_start - k3;
+        let in_range = t >= (1 - offset);
+        let skip = skip_def && (t + offset) == default_bin;
+        // right_count = num_data − left_count (lc currently holds left_count).
+        let right_count = num_data - i32::cast_from(cand_lc[ku]);
+        let hh = cand_ah[ku];
+        let cont = right_count < min_data_in_leaf || hh < min_sum_hessian_in_leaf;
+        let consider = f64::cast_from(k3) < tstar && in_range && !skip && !cont;
+        cand_ok[ku] = select(consider, f64::new(1.0), f64::new(0.0));
+        k3 += 1;
+    }
+}
+
 /// PARGAIN single-leaf kernel: [`find_best_splits_fused_staged_kernel`]'s twin
 /// (identical signature + output) with the phase-1/2/3 split above. Lanes 0-31
 /// are the REVERSE warp, 32-63 the FORWARD warp; phase 1 runs on lanes 0/32,
@@ -2895,6 +3423,220 @@ pub fn find_best_splits_fused_siblings_staged_par_kernel(
     }
 }
 
+/// PARALLEL-PREFIX co-packed sibling kernel: the pargain siblings twin with phase 1
+/// replaced by the all-lanes [`parprefix_store_rev`]/[`parprefix_store_fwd`]. This is
+/// the CO-PACK path the live grow driver uses, so it carries the measurable win.
+/// ROCm-only (gated by `scan_parprefix_enabled`).
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_staged_parprefix_kernel(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    n_feats: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+    let mut rev_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ag = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ah = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_lc = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut fwd_ok = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut rev_pg = SharedMemory::<f64>::new(32usize);
+    let mut rev_pk = SharedMemory::<f64>::new(32usize);
+    let mut rev_pa = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pg = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pk = SharedMemory::<f64>::new(32usize);
+    let mut fwd_pa = SharedMemory::<f64>::new(32usize);
+    let mut ct_g = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_h = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut ct_c = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+    let mut lmin = SharedMemory::<f64>::new(PARGAIN_MAX_CAND);
+
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_b[base + c];
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_a[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    // PHASE 1: all-lanes parallel prefix, rev then fwd.
+    parprefix_store_rev(
+        &sm.to_slice(),
+        &mut rev_ag.to_slice_mut(),
+        &mut rev_ah.to_slice_mut(),
+        &mut rev_lc.to_slice_mut(),
+        &mut rev_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+    );
+    sync_cube();
+    parprefix_store_fwd(
+        &sm.to_slice(),
+        &mut fwd_ag.to_slice_mut(),
+        &mut fwd_ah.to_slice_mut(),
+        &mut fwd_lc.to_slice_mut(),
+        &mut fwd_ok.to_slice_mut(),
+        &mut ct_g.to_slice_mut(),
+        &mut ct_h.to_slice_mut(),
+        &mut ct_c.to_slice_mut(),
+        &mut lmin.to_slice_mut(),
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+    );
+    sync_cube();
+
+    if UNIT_POS < 32 {
+        pargain_lane_scan(
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_ok.to_slice(),
+            &mut rev_pg.to_slice_mut(),
+            &mut rev_pk.to_slice_mut(),
+            &mut rev_pa.to_slice_mut(),
+            UNIT_POS,
+            rev_count[fi],
+            0u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    } else {
+        pargain_lane_scan(
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_ok.to_slice(),
+            &mut fwd_pg.to_slice_mut(),
+            &mut fwd_pk.to_slice_mut(),
+            &mut fwd_pa.to_slice_mut(),
+            UNIT_POS - 32,
+            fwd_count[fi],
+            1u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            min_gain_shift,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        pargain_assemble_state(
+            &rev_pg.to_slice(),
+            &rev_pk.to_slice(),
+            &rev_pa.to_slice(),
+            &rev_ag.to_slice(),
+            &rev_ah.to_slice(),
+            &rev_lc.to_slice(),
+            &mut state_rev.to_slice_mut(),
+            0u32,
+            num_bin[fi] - 2,
+            -1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    if UNIT_POS == 32 {
+        pargain_assemble_state(
+            &fwd_pg.to_slice(),
+            &fwd_pk.to_slice(),
+            &fwd_pa.to_slice(),
+            &fwd_ag.to_slice(),
+            &fwd_ah.to_slice(),
+            &fwd_lc.to_slice(),
+            &mut state_fwd.to_slice_mut(),
+            1u32,
+            offset[fi],
+            1i32,
+            sum_gradient,
+            sum_hessian,
+        );
+    }
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
 /// Launch the staged single-leaf scan — the SERIAL-branch staged kernel by
 /// default, or its PARGAIN twin when `LGBM_SCAN_PARGAIN=1` (identical
 /// signature, geometry, and — by the pargain module note — bit-identical
@@ -2958,7 +3700,10 @@ unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
+    if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
+        SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        launch_with!(find_best_splits_fused_staged_parprefix_kernel);
+    } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
         SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_staged_par_kernel);
     } else {
@@ -3030,7 +3775,10 @@ unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
+    if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
+        SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        launch_with!(find_best_splits_fused_siblings_staged_parprefix_kernel);
+    } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
         SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_siblings_staged_par_kernel);
     } else {

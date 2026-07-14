@@ -629,6 +629,217 @@ fn pargain_algorithm_matches_serial_on_exact_gain_ties() {
 }
 
 // =========================================================================
+// PARALLEL-PREFIX scan phase 1 (LGBM_SCAN_PARPREFIX) — algorithm-level parity.
+//
+// The kernel replaces pargain's SERIAL single-lane accumulate (`pargain_store_*`)
+// with an all-lanes prefix sum. The `done`/break recurrence is reformulated as a
+// clean masked prefix + a break-POINT `tstar` (first candidate meeting the break
+// gate); candidates at/after `tstar` are simply not `consider`ed (their frozen
+// accumulator is discarded by phase 2 anyway). These plain-Rust references compute
+// the prefix in SERIAL order, so the CONSIDERED candidates' (ag, ah, lc, ok) are
+// BIT-EQUAL to `pargain_store_*` — proving the reformulation is logically exact.
+// (The kernel's genuinely-parallel prefix additionally reorders the f64 adds, a
+// ~1e-6 residue validated separately by the on-device float-envelope test; that is
+// NOT an algorithm concern and is intentionally absent here.)
+// =========================================================================
+
+/// Parallel-prefix REVERSE store: masked serial prefix + break-point `tstar`.
+/// Considered cells match [`pargain_store_rev`] bit-for-bit.
+fn parprefix_store_rev(f: &Feat, s: &Scalars) -> Stored {
+    let count = f.rev_count().max(0) as usize;
+    let mut st = Stored {
+        ag: vec![0.0; count],
+        ah: vec![0.0; count],
+        lc: vec![0.0; count],
+        ok: vec![0.0; count],
+    };
+    let cnt_factor = f64::from(s.num_data) / s.sum_hessian;
+    let t_start = f.num_bin - 1 - f.offset;
+    let mask = |k: usize| -> bool {
+        let t = t_start - k as i32;
+        let in_range = t >= (1 - f.offset);
+        let skip = f.skip_default_bin && (t + f.offset) == f.default_bin;
+        in_range && !skip
+    };
+    // Pass 1: masked prefix (adds in k-order = the serial accumulation order).
+    let (mut pre_g, mut pre_h, mut pre_c) = (vec![0.0f64; count], vec![0.0f64; count], vec![0i32; count]);
+    let (mut sg, mut sh, mut sc) = (0.0f64, K_EPSILON, 0i32);
+    for k in 0..count {
+        if mask(k) {
+            let t = t_start - k as i32;
+            let bi = (t as usize) * 2;
+            sg += f.hist[bi];
+            sh += f.hist[bi + 1];
+            sc += round_int(f.hist[bi + 1] * cnt_factor);
+        }
+        pre_g[k] = sg;
+        pre_h[k] = sh;
+        pre_c[k] = sc;
+    }
+    // cont/brk from the clean prefix (REV: cont on the right side, brk on the left).
+    let cont = |k: usize| pre_c[k] < s.min_data_in_leaf || pre_h[k] < s.min_sum_hessian_in_leaf;
+    let brk = |k: usize| {
+        (s.num_data - pre_c[k]) < s.min_data_in_leaf
+            || (s.sum_hessian - pre_h[k]) < s.min_sum_hessian_in_leaf
+    };
+    // Pass 2: break point = first candidate that would flip `done`.
+    let mut tstar = count as i32;
+    for k in 0..count {
+        if mask(k) && !cont(k) && brk(k) {
+            tstar = k as i32;
+            break;
+        }
+    }
+    // Pass 3: emit.
+    for k in 0..count {
+        let consider = (k as i32) < tstar && mask(k) && !cont(k);
+        st.ag[k] = pre_g[k];
+        st.ah[k] = pre_h[k];
+        st.lc[k] = f64::from(s.num_data - pre_c[k]);
+        st.ok[k] = if consider { 1.0 } else { 0.0 };
+    }
+    st
+}
+
+/// Parallel-prefix FORWARD store (mask = `!skip`; LEFT-accumulated). Considered
+/// cells match [`pargain_store_fwd`] bit-for-bit.
+fn parprefix_store_fwd(f: &Feat, s: &Scalars) -> Stored {
+    let count = f.fwd_count().max(0) as usize;
+    let mut st = Stored {
+        ag: vec![0.0; count],
+        ah: vec![0.0; count],
+        lc: vec![0.0; count],
+        ok: vec![0.0; count],
+    };
+    let cnt_factor = f64::from(s.num_data) / s.sum_hessian;
+    let mask = |t: usize| !(f.skip_default_bin && (t as i32 + f.offset) == f.default_bin);
+    let (mut pre_g, mut pre_h, mut pre_c) = (vec![0.0f64; count], vec![0.0f64; count], vec![0i32; count]);
+    let (mut sg, mut sh, mut sc) = (0.0f64, K_EPSILON, 0i32);
+    for t in 0..count {
+        if mask(t) {
+            let bi = t * 2;
+            sg += f.hist[bi];
+            sh += f.hist[bi + 1];
+            sc += round_int(f.hist[bi + 1] * cnt_factor);
+        }
+        pre_g[t] = sg;
+        pre_h[t] = sh;
+        pre_c[t] = sc;
+    }
+    // FWD: cont on the left side, brk on the right.
+    let cont = |t: usize| pre_c[t] < s.min_data_in_leaf || pre_h[t] < s.min_sum_hessian_in_leaf;
+    let brk = |t: usize| {
+        (s.num_data - pre_c[t]) < s.min_data_in_leaf
+            || (s.sum_hessian - pre_h[t]) < s.min_sum_hessian_in_leaf
+    };
+    let mut tstar = count as i32;
+    for t in 0..count {
+        if mask(t) && !cont(t) && brk(t) {
+            tstar = t as i32;
+            break;
+        }
+    }
+    for t in 0..count {
+        let consider = (t as i32) < tstar && mask(t) && !cont(t);
+        st.ag[t] = pre_g[t];
+        st.ah[t] = pre_h[t];
+        st.lc[t] = f64::from(pre_c[t]);
+        st.ok[t] = if consider { 1.0 } else { 0.0 };
+    }
+    st
+}
+
+/// End-to-end 12-cell parity: serial vs PARPREFIX phase 1 (phases 2/3 unchanged).
+/// Bit-equal because the considered candidates match `pargain_store_*` exactly.
+fn assert_parprefix_parity(label: &str, f: &Feat, s: &Scalars) {
+    let serial = merge_finalize(&serial_rev(f, s), &serial_fwd(f, s), s);
+    let rev = pargain_scan_assemble(
+        &parprefix_store_rev(f, s),
+        f.rev_count(),
+        false,
+        f.num_bin - 2,
+        -1,
+        s,
+    );
+    let fwd =
+        pargain_scan_assemble(&parprefix_store_fwd(f, s), f.fwd_count(), true, f.offset, 1, s);
+    let par = merge_finalize(&rev, &fwd, s);
+    for i in 0..12 {
+        assert_eq!(
+            serial[i].to_bits(),
+            par[i].to_bits(),
+            "[{label}] cell {i}: serial {} != parprefix {}",
+            serial[i],
+            par[i]
+        );
+    }
+}
+
+#[test]
+fn parprefix_algorithm_matches_serial_fan_out() {
+    let mut lcg = Lcg(0x5ca1ab1e);
+    let cases: Vec<(i32, i32, bool, bool, bool, i32, f64)> = vec![
+        (2, 0, false, false, false, 1, 0.0),
+        (2, 1, false, true, false, 1, 0.0),
+        (8, 0, false, true, false, 1, 0.0),
+        (8, 1, true, true, false, 1, 0.0),
+        (64, 0, false, true, false, 20, 0.0),
+        (64, 1, true, true, true, 20, 0.0),
+        (255, 0, false, true, false, 1, 0.0),
+        (255, 1, true, true, false, 50, 0.0),
+        (255, 1, false, true, true, 1, 1.5),
+        (16, 1, false, true, false, 1, -100.0),
+    ];
+    for (ci, &(nb, off, skip, fwd_on, l1, min_data, mgs)) in cases.iter().enumerate() {
+        for rep in 0..8 {
+            let f = random_feat(&mut lcg, nb, off, skip, fwd_on);
+            let s = scalars_for(&f, l1, min_data, mgs);
+            assert_parprefix_parity(
+                &format!("case {ci}.{rep}: nb={nb} off={off} skip={skip} fwd={fwd_on} l1={l1}"),
+                &f,
+                &s,
+            );
+        }
+    }
+}
+
+#[test]
+fn parprefix_algorithm_matches_serial_early_done() {
+    let mut lcg = Lcg(0xdead);
+    for rep in 0..16 {
+        let f = random_feat(&mut lcg, 32, 1, false, true);
+        let mut s = scalars_for(&f, false, 1, 0.0);
+        s.min_data_in_leaf = (f64::from(s.num_data) * 0.42) as i32;
+        assert_parprefix_parity(&format!("early-done rep {rep}"), &f, &s);
+    }
+}
+
+#[test]
+fn parprefix_algorithm_matches_serial_on_exact_gain_ties() {
+    // Same empty-bin/sparse-plateau tie corpora as the pargain tie test: the
+    // break-point reformulation must not perturb the tie-break outcome.
+    let mut lcg = Lcg(0x71e);
+    for rep in 0..8 {
+        let nb = 32usize;
+        let mut hist = vec![0.0f64; nb * 2];
+        for b in (1..nb).step_by(4) {
+            hist[2 * b] = f64::from(lcg.next_u32() % 9) - 4.0;
+            hist[2 * b + 1] = 1.0;
+        }
+        let f = Feat {
+            hist,
+            num_bin: nb as i32,
+            offset: 1,
+            default_bin: 5,
+            skip_default_bin: rep % 2 == 0,
+            run_forward: true,
+        };
+        let s = scalars_for(&f, false, 1, 0.0);
+        assert_parprefix_parity(&format!("sparse plateau rep {rep}"), &f, &s);
+    }
+}
+
+// =========================================================================
 // Layer 2 — kernel-vs-kernel on a REAL GPU (cuda/rocm): the pargain kernel
 // against the legacy serial kernel, 12-cell bitwise. Runs in the CUDA spike.
 // =========================================================================
@@ -639,6 +850,7 @@ mod real_gpu_gated {
     use lgbm_compute::gain::get_leaf_gain;
     use lgbm_compute::kernels::split::{
         find_best_splits_fused_kernel, find_best_splits_fused_staged_par_kernel,
+        find_best_splits_fused_staged_parprefix_kernel,
     };
 
     #[cfg(feature = "cuda")]
@@ -715,6 +927,7 @@ mod real_gpu_gated {
             let zeros = vec![0.0f64; out_len];
             let out_a = client.create_from_slice(f64::as_bytes(&zeros));
             let out_b = client.create_from_slice(f64::as_bytes(&zeros));
+            let out_c = client.create_from_slice(f64::as_bytes(&zeros));
 
             // SAFETY: contiguous region tiling; out sized n*12; arrays sized n;
             // legacy guards lane < n_feats; pargain geometry = exactly n cubes.
@@ -766,6 +979,30 @@ mod real_gpu_gated {
                     sum_h_b,
                     num_data,
                 );
+                // PARPREFIX kernel into out_c (same signature as pargain single).
+                find_best_splits_fused_staged_parprefix_kernel::launch(
+                    &client,
+                    CubeCount::Static(n as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    ArrayArg::from_raw_parts(h_hist.clone(), buf_len),
+                    ArrayArg::from_raw_parts(out_c.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot.clone(), n),
+                    ArrayArg::from_raw_parts(h_nbn.clone(), n),
+                    ArrayArg::from_raw_parts(h_off.clone(), n),
+                    ArrayArg::from_raw_parts(h_dbn.clone(), n),
+                    ArrayArg::from_raw_parts(h_skp.clone(), n),
+                    ArrayArg::from_raw_parts(h_rv.clone(), n),
+                    ArrayArg::from_raw_parts(h_fw.clone(), n),
+                    u32::from(l1),
+                    min_data,
+                    1e-3f64,
+                    l1v,
+                    l2v,
+                    min_gain_shift,
+                    sum_g,
+                    sum_h_b,
+                    num_data,
+                );
             }
             let a = f64::from_bytes(&client.read_one_unchecked(out_a)).to_vec();
             let b = f64::from_bytes(&client.read_one_unchecked(out_b)).to_vec();
@@ -775,6 +1012,27 @@ mod real_gpu_gated {
                     y.to_bits(),
                     "case {ci} out[{i}]: legacy {x} != pargain {y}"
                 );
+            }
+            // PARPREFIX vs legacy: is_splittable EXACT, gain within ~1e-6 (f64
+            // prefix reorder is the accepted GPU-gate residue). Per feature (12 cells).
+            let c = f64::from_bytes(&client.read_one_unchecked(out_c)).to_vec();
+            for fi in 0..n {
+                let o = fi * 12;
+                assert_eq!(
+                    a[o].to_bits(),
+                    c[o].to_bits(),
+                    "case {ci} feat {fi}: is_splittable legacy {} != parprefix {}",
+                    a[o],
+                    c[o]
+                );
+                if a[o] != 0.0 {
+                    let (ga, gc) = (a[o + 2], c[o + 2]);
+                    let tol = 1e-6 * (1.0 + ga.abs());
+                    assert!(
+                        (ga - gc).abs() <= tol,
+                        "case {ci} feat {fi}: gain legacy {ga} vs parprefix {gc} (tol {tol})"
+                    );
+                }
             }
         }
     }
