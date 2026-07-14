@@ -170,16 +170,14 @@ Flag infra SHIPPED (`439af57`): `grow_defer_sync_enabled()` (default OFF) +
 
 ### Task order (CORRECT)
 1. ✅ DONE (`439af57`): flag gate + tripwire.
-2. **Generalize the devcount num_data resolve to `which ∈ {Left=0,Right=1,Smaller=2,
-   Larger=3}`** (from today's `is_smaller` bool): `left=ranges[6s+2]`, `right=parent_count−
-   left`, `smaller=select(smaller_is_left,left,right)`, `larger=` inverse. Mechanical rename
-   of the `is_smaller` param → `which: u32` across the devcount kernels / `NumDataSrc` /
-   launchers / Backend methods; existing T-12/T-13 callers+tests pass `which=2/3` (identical
-   behavior); the loop passes `which=0/1`. Add LEFT/RIGHT rows to the byte-identity tests.
-3. **build-LEFT fixed-grid variant**: build the LEFT child (rows `[p_begin, p_begin+
-   split_point)`, i.e. `begin_off=0, count=ranges[6s+2]`) into `next_slot`. Simpler than
-   T-04's smaller-resolve (no roles). Isolation test: build-LEFT hist == exact-grid LEFT.
-4. **Loop restructure** behind the flag: batched read (fuse read_split(i-1)+pick(i));
+2. ✅ DONE (`a0df0f3`): generalized the devcount num_data resolve to `which ∈ {Left=0,
+   Right=1,Smaller=2,Larger=3}` across the kernels / `NumDataSrc`/`SiblingNumDataSrc` /
+   launchers / Backend methods. T-12/T-13 tests pass `which=2/3` (unchanged); NEW
+   `device_numdata_left_right_scan_byte_identical_to_host` proves which=0/1 on gfx1151.
+3. ✅ DONE (`3278576`): build-LEFT fixed-grid variant (same `which` selector on the build
+   kernel + launcher + Backend method). Test asserts build-LEFT (which=0) == exact-grid LEFT
+   byte-for-byte on gfx1151, incl. the case where LEFT is the LARGER child.
+4. ⬜ REMAINING — **Loop restructure** behind the flag: batched read (fuse read_split(i-1)+pick(i));
    build-LEFT + subtract + LEFT/RIGHT devcount scans (which=0/1) folding host-known
    new_left/new_right; deferred bookkeeping (row ranges + `.slot` + tree mutation applied at
    top of i for i-1); `{new_left,new_right}` self-invalidation; last split folds into the
