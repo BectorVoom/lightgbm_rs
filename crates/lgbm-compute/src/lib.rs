@@ -1144,6 +1144,42 @@ pub trait Backend {
         })
     }
 
+    /// FIXED-GRID (device-early-exit) twin of
+    /// [`build_resident_leaf_rows_handle`](Backend::build_resident_leaf_rows_handle) for the
+    /// Wave-2 deferred read (SPEC-DRGL-04): builds the SMALLER child's resident histogram
+    /// into `slot` WITHOUT the host knowing the child's exact row `[begin, count)` — the
+    /// kernel resolves it on device from `leaf_splits`'s child-range + role slot `split_slot`,
+    /// iterating the PARENT's row view (`parent_rows` / `parent_row_count`, a host-known upper
+    /// bound needing NO deferred split-point readback). Byte-identical to the exact-grid build
+    /// for the same split state. Real-device-only (the resident-perm arm requires a
+    /// resident-pool backend).
+    ///
+    /// # Errors
+    /// [`ComputeError::Runtime`] on an unsupported backend / missing resident caches / the
+    /// overflow guard.
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident_leaf_rows_handle_fixed_grid(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _slot: usize,
+        _slot_off: &[usize],
+        _slot_len: usize,
+        _parent_rows: cubecl::server::Handle,
+        _parent_row_count: usize,
+        _leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        _split_slot: usize,
+        _fix_feats: &[(usize, u32, i32, u32)],
+        _sum_gradient: f64,
+        _sum_hessian: f64,
+        _max_abs_grad_hess: f64,
+    ) -> Result<(), ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "build_resident_leaf_rows_handle_fixed_grid: backend has no resident pool \
+                     (real-device-only)"
+                .to_string(),
+        })
+    }
+
     /// Whether [`upload_resident_bins`](Backend::upload_resident_bins) actually
     /// consumes its `&[&[u32]]` argument. With narrow [`BinColumn`]
     /// storage, the learner must WIDEN each column to `u32` to call
@@ -3734,6 +3770,76 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             gh,
             bdesc.as_ref(),
         )?;
+        debug_assert_eq!(len, slot_len, "resident leaf handle length");
+        let mut mirror = self.resident_pool.borrow_mut();
+        if slot >= mirror.len() {
+            mirror.resize_with(slot + 1, || None);
+        }
+        mirror[slot] = Some(handle);
+        Ok(())
+    }
+
+    fn build_resident_leaf_rows_handle_fixed_grid(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        slot: usize,
+        slot_off: &[usize],
+        slot_len: usize,
+        parent_rows: cubecl::server::Handle,
+        parent_row_count: usize,
+        leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        split_slot: usize,
+        fix_feats: &[(usize, u32, i32, u32)],
+        sum_gradient: f64,
+        sum_hessian: f64,
+        max_abs_grad_hess: f64,
+    ) -> Result<(), ComputeError> {
+        let resident = self.resident_bins.borrow();
+        let Some(resident) = resident.as_ref() else {
+            return Err(ComputeError::Runtime {
+                detail: "build_resident_leaf_rows_handle_fixed_grid: resident bin cache empty \
+                         (upload_resident_bins not called)"
+                    .to_string(),
+            });
+        };
+        let Some(gh) = self
+            .resident_grad_hess
+            .borrow()
+            .as_ref()
+            .map(|gh| (gh.grad.clone(), gh.hess.clone(), gh.num_data))
+        else {
+            return Err(ComputeError::Runtime {
+                detail: "build_resident_leaf_rows_handle_fixed_grid: resident grad/hess missing \
+                         (upload_resident_grad_hess not called this grow)"
+                    .to_string(),
+            });
+        };
+        let bdesc = self.build_desc_cached(client, slot_off, slot_len, fix_feats);
+        let ranges_len = kernels::partition::LEAF_SPLIT_STRIDE * leaf_splits.capacity();
+        let roles_len = kernels::partition::ROLE_STRIDE * leaf_splits.capacity();
+        let (handle, len) =
+            kernels::histogram::build_fix_compact_resident_rows_handle_f64_fixed_grid_on(
+                client,
+                resident.handle.clone(),
+                resident.width,
+                resident.num_features,
+                resident.num_data,
+                slot_off,
+                slot_len,
+                parent_rows,
+                parent_row_count,
+                leaf_splits.ranges_handle().clone(),
+                ranges_len,
+                leaf_splits.roles_handle().clone(),
+                roles_len,
+                split_slot,
+                fix_feats,
+                sum_gradient,
+                sum_hessian,
+                max_abs_grad_hess,
+                gh,
+                bdesc.as_ref(),
+            )?;
         debug_assert_eq!(len, slot_len, "resident leaf handle length");
         let mut mirror = self.resident_pool.borrow_mut();
         if slot >= mirror.len() {

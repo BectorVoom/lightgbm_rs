@@ -747,6 +747,89 @@ pub fn construct_leaf_hist_resident_lds_kernel_u64<B: Int>(
     }
 }
 
+/// FIXED-GRID (device-early-exit) twin of [`construct_leaf_hist_resident_lds_kernel_u64`]
+/// for the Wave-2 deferred read (SPEC-DRGL-04): the host no longer knows the smaller
+/// child's row `[begin, count)` at build-launch time (the split point is deferred), so
+/// the kernel resolves it ON DEVICE from the resident child-range + role buffers and
+/// iterates over the PARENT's row view, early-exiting past the child's real count.
+///
+/// BYTE-IDENTICAL to the exact-grid build: the LDS accumulation / quantize / merge body
+/// is copied verbatim; only the loop BOUND (`count`, resolved on device) and the row
+/// index (`parent_rows[begin_off + k]`) change. The u64 atomic add is commutative, so
+/// the same rows accumulate to the same bits regardless of the row-partition `P` the
+/// (now parent-count-sized) grid uses. Always gathers grad/hess on device by `row` (the
+/// resident-gh path — the only path the resident-perm arm takes). gpu-only.
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_leaf_hist_resident_lds_kernel_u64_fixed_grid<B: Int>(
+    resident_bins: &Array<B>, // native bin width (u8/u16/u32)
+    // The PARENT leaf's row view (length = parent row count). The smaller child is a
+    // CONTIGUOUS sub-range of it: left child = `[0, split_point)`, right child =
+    // `[split_point, p_count)` — resolved on device below.
+    parent_rows: &Array<u32>,
+    ord_g: &Array<f32>, // FULL resident grad/hess (gathered on device by row).
+    ord_h: &Array<f32>,
+    slot_off: &Array<u32>, // length num_features + 1 (sentinel = slot_len)
+    num_data: usize,
+    out: &mut Array<Atomic<u64>>,
+    // Resident per-split child-range + role buffers (SPEC-DRGL-01/02). `ranges[6*slot+2]`
+    // = left_count = split_point; `roles[3*slot]` = smaller_is_left (0/1). Read on device
+    // so the split point never crosses back to the host.
+    ranges: &Array<i32>,
+    roles: &Array<i32>,
+    split_slot: u32,
+) {
+    let f = CUBE_POS_X as usize; // ONE cube per feature
+    let base = slot_off[f] as usize;
+    let feat_len = slot_off[f + 1] as usize - base; // = 2*num_bin[f]
+    let cd = CUBE_DIM as usize;
+
+    // Resolve the SMALLER child's [begin_off, count) within the parent view ON DEVICE.
+    let split_point = ranges[(split_slot * 6 + 2) as usize] as usize;
+    let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
+    let p_count = parent_rows.len();
+    // Right-child default, overwritten for the left child via a STATEMENT `if` (an
+    // if-EXPRESSION unifies the `{integer}` literal with `NativeExpand<usize>` and fails).
+    let mut begin_off = split_point;
+    let mut count = p_count - split_point;
+    if smaller_is_left {
+        begin_off = 0;
+        count = split_point;
+    }
+
+    let sub = SharedMemory::<Atomic<u64>>::new(HIST_LDS_MAX);
+    // 1. zero this feature's active LDS cells (u64 additive-identity bits).
+    let mut c = UNIT_POS as usize;
+    while c < feat_len {
+        sub[c].store(0u64);
+        c += cd;
+    }
+    sync_cube();
+    // 2. scatter THIS partition's strided child rows into LDS (device early-exit at
+    //    `count`; rows past it belong to the sibling and are NOT accumulated).
+    let col = f * num_data;
+    let stride = CUBE_COUNT_Y as usize * cd;
+    let mut k = CUBE_POS_Y as usize * cd + UNIT_POS as usize;
+    while k < count {
+        let row = parent_rows[begin_off + k] as usize;
+        let bin = u32::cast_from(resident_bins[col + row]) as usize;
+        let ti = bin * 2;
+        let qg = u64::cast_from(i64::cast_from(f32::round(ord_g[row] * SCALE_F32)));
+        let qh = u64::cast_from(i64::cast_from(f32::round(ord_h[row] * SCALE_F32)));
+        sub[ti].fetch_add(qg);
+        sub[ti + 1].fetch_add(qh);
+        k += stride;
+    }
+    sync_cube();
+    // 3. merge LDS → this feature's global slot.
+    let mut m = UNIT_POS as usize;
+    while m < feat_len {
+        out[base + m].fetch_add(sub[m].load());
+        m += cd;
+    }
+}
+
 // ===========================================================================
 // The §13 feature-partition TWO-TIER build kernel.
 //
@@ -2487,6 +2570,107 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
     }
 
     // ---- 2/3. The shared fix/compact tail (byte-identical to the host-rows twin). ----
+    fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian, bdesc)
+}
+
+/// FIXED-GRID (device-early-exit) twin of [`build_fix_compact_resident_rows_handle_f64_on`]
+/// for the Wave-2 deferred read (SPEC-DRGL-04). The smaller child's row `[begin, count)`
+/// is resolved ON DEVICE from `leaf_splits`'s resident child-range + role slot; the host
+/// supplies only the PARENT's row view + parent row count (a safe upper bound, known
+/// WITHOUT the deferred split-point readback). Byte-identical output to the exact-grid
+/// launcher for the same split state — see the kernel doc.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_fix_compact_resident_rows_handle_f64_fixed_grid_on<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    resident_bins: cubecl::server::Handle,
+    width: crate::ResidentBinWidth,
+    num_features: usize,
+    num_data: usize,
+    slot_off: &[usize],
+    slot_len: usize,
+    parent_rows_handle: cubecl::server::Handle,
+    parent_row_count: usize,
+    ranges_handle: cubecl::server::Handle,
+    ranges_len: usize,
+    roles_handle: cubecl::server::Handle,
+    roles_len: usize,
+    split_slot: usize,
+    fix_feats: &[(usize, u32, i32, u32)],
+    sum_gradient: f64,
+    sum_hessian: f64,
+    max_abs_grad_hess: f64,
+    resident_gh: (cubecl::server::Handle, cubecl::server::Handle, usize),
+    bdesc: Option<&BuildDescHandles>,
+) -> Result<(cubecl::server::Handle, usize), ComputeError> {
+    // ---- 0. OVERFLOW GUARD — parent_row_count is the child upper bound (<= num_data,
+    // so no stricter than the root build's own guard). ----
+    let worst = parent_row_count as f64 * max_abs_grad_hess * 1_073_741_824.0_f64;
+    if worst >= i64::MAX as f64 {
+        return Err(ComputeError::Runtime {
+            detail: "fixed-point histogram accumulation may overflow i64 at S=2^30 \
+                     (rows x |value| x 2^30 exceeds i64::MAX)"
+                .to_string(),
+        });
+    }
+
+    // ---- 1. RESIDENT RAW u64 build with the child range resolved ON DEVICE ----
+    let zeros_u64 = vec![0u64; slot_len];
+    let h_raw = client.create_from_slice(u64::as_bytes(&zeros_u64));
+    if parent_row_count > 0 && num_features > 0 {
+        let (slot_s, max_w) = slot_off_sentinel(slot_off, slot_len);
+        if max_w > HIST_LDS_MAX as u32 {
+            return Err(ComputeError::Runtime {
+                detail: "build_fix_compact_resident_rows_handle_fixed_grid: the u64 fixed-point \
+                         build requires every feature <= 256 bins (LDS cap)"
+                    .to_string(),
+            });
+        }
+        let (grad_h, hess_h, gh_num_data) = resident_gh;
+        let h_slot = match bdesc.filter(|d| d.matches(slot_off.len(), slot_len)) {
+            Some(d) => d.h_slot_sentinel.clone(),
+            None => client.create_from_slice(u32::as_bytes(&slot_s)),
+        };
+        // P sized off the PARENT count (upper bound). P is order-free for the u64 fixed-
+        // point accumulate, so a parent-count-sized P yields BYTE-IDENTICAL bits to the
+        // exact-grid build's child-count-sized P.
+        let p = force_row_partition()
+            .unwrap_or_else(|| row_partition_count_u64(num_features, parent_row_count));
+        // SAFETY: identical bounds contract to `build_fix_compact_resident_rows_handle_f64_on`,
+        // plus: `parent_rows` views `parent_row_count` u32 row ids each < num_data; the kernel
+        // reads `parent_rows[begin_off + k]` with `begin_off + k < parent_row_count` (the child
+        // sub-range is contained in the parent view); `ranges` has `ranges_len` cells with
+        // `6*split_slot+2 < ranges_len` and `roles` `roles_len` with `3*split_slot < roles_len`
+        // (split_slot < capacity, caller contract). cubecl unsafe confined here.
+        macro_rules! launch_fixed_grid {
+            ($w:ty) => {
+                unsafe {
+                    construct_leaf_hist_resident_lds_kernel_u64_fixed_grid::launch_unchecked::<$w, R>(
+                        client,
+                        CubeCount::Static(num_features as u32, p, 1),
+                        CubeDim::new_1d(256),
+                        ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
+                        ArrayArg::from_raw_parts(parent_rows_handle.clone(), parent_row_count),
+                        ArrayArg::from_raw_parts(grad_h.clone(), gh_num_data),
+                        ArrayArg::from_raw_parts(hess_h.clone(), gh_num_data),
+                        ArrayArg::from_raw_parts(h_slot.clone(), num_features + 1),
+                        num_data,
+                        ArrayArg::from_raw_parts(h_raw.clone(), slot_len),
+                        ArrayArg::from_raw_parts(ranges_handle.clone(), ranges_len),
+                        ArrayArg::from_raw_parts(roles_handle.clone(), roles_len),
+                        split_slot as u32,
+                    );
+                }
+            };
+        }
+        match width {
+            crate::ResidentBinWidth::U8 => launch_fixed_grid!(u8),
+            crate::ResidentBinWidth::U16 => launch_fixed_grid!(u16),
+            crate::ResidentBinWidth::U32 => launch_fixed_grid!(u32),
+        }
+    }
+
+    // ---- 2/3. Shared fix/compact tail (byte-identical). ----
     fix_compact_from_raw_f64_on(client, h_raw, slot_len, fix_feats, sum_gradient, sum_hessian, bdesc)
 }
 

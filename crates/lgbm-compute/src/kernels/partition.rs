@@ -441,6 +441,13 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         &self.ranges
     }
 
+    /// A borrow of the device role i32 buffer handle (`ROLE_STRIDE * capacity` cells),
+    /// read on device by the fixed-grid build to resolve the smaller child's range.
+    #[must_use]
+    pub fn roles_handle(&self) -> &Handle {
+        &self.roles
+    }
+
     /// Read SLOT `slot`'s child ranges back to the host. Production use: the
     /// RESIDENT-PERM partition arm's once-per-split split-point readback (the one
     /// small host crossing its row bookkeeping needs — the same readback the

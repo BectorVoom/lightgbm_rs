@@ -334,6 +334,108 @@ mod real_gpu_gated {
         }
     }
 
+    /// SPEC-DRGL-04 (REAL GPU): the fixed-grid build (child `[begin, count)` resolved ON
+    /// DEVICE from the resident split + role, grid sized off the PARENT count) is
+    /// f64-BYTE-IDENTICAL to the exact-grid build fed the child's exact rows — for BOTH a
+    /// left-smaller and a right-smaller split (the two `begin_off` paths). A wrong
+    /// early-exit / offset would either double-process the sibling's rows or undercount.
+    #[test]
+    fn fixed_grid_build_byte_identical_to_exact_grid() {
+        use lgbm_compute::kernels::histogram::{
+            build_fix_compact_resident_rows_handle_f64_fixed_grid_on,
+            build_fix_compact_resident_rows_handle_f64_on,
+        };
+        use lgbm_compute::kernels::partition::{
+            assign_smaller_larger_roles_device, DeviceLeafSplits, LEAF_SPLIT_STRIDE, ROLE_STRIDE,
+        };
+        pin_autotune_off();
+        let client = gpu_client();
+        let num_data = 500usize;
+        let num_bins = [16u32, 8];
+        let cols: Vec<Vec<u32>> =
+            (0..2).map(|f| column(0xc04 + f as u64, num_data, num_bins[f])).collect();
+        let mut concat_u8: Vec<u8> = Vec::with_capacity(2 * num_data);
+        for col in &cols {
+            concat_u8.extend(col.iter().map(|&b| b as u8));
+        }
+        let bins_handle = client.create_from_slice(u8::as_bytes(&concat_u8));
+
+        let mut lcg = Lcg(0xf1c);
+        let gradients: Vec<f32> = (0..num_data).map(|_| (lcg.next_u32() % 17) as f32 - 8.0).collect();
+        let hessians: Vec<f32> = vec![1.0f32; num_data];
+        let mut perm: Vec<u32> = (0..num_data as u32).collect();
+        for i in (1..num_data).rev() {
+            perm.swap(i, (lcg.next_u32() as usize) % (i + 1));
+        }
+        let perm_handle = client.create_from_slice(u32::as_bytes(&perm));
+        let grad_h = client.create_from_slice(f32::as_bytes(&gradients));
+        let hess_h = client.create_from_slice(f32::as_bytes(&hessians));
+        let max_abs =
+            gradients.iter().chain(hessians.iter()).fold(0.0f32, |m, &v| m.max(v.abs())) as f64;
+
+        let slot_off: Vec<usize> = vec![0, 2 * num_bins[0] as usize];
+        let slot_len = 2 * (num_bins[0] + num_bins[1]) as usize;
+        let fix_feats: Vec<(usize, u32, i32, u32)> =
+            vec![(slot_off[0], num_bins[0], 1, 0), (slot_off[1], num_bins[1], 1, 0)];
+
+        // Parent span [p_begin, p_begin+p_count). Two splits exercise BOTH begin_off paths.
+        let (p_begin, p_count) = (137usize, 251usize);
+        let usz = core::mem::size_of::<u32>();
+        for (split_point, expect_left) in [(100usize, true), (200usize, false)] {
+            let (begin_off, child_count) = if expect_left {
+                (0usize, split_point)
+            } else {
+                (split_point, p_count - split_point)
+            };
+            let child_rows = &perm[p_begin + begin_off..p_begin + begin_off + child_count];
+            let sum_g: f64 = child_rows.iter().map(|&r| f64::from(gradients[r as usize])).sum();
+            let sum_h: f64 = child_rows.iter().map(|&r| f64::from(hessians[r as usize])).sum();
+
+            // Resident split state: record the split point + resolve the role ON DEVICE.
+            let mut ls = DeviceLeafSplits::new(&client, 2).expect("alloc");
+            ls.record_split(&client, split_point as i32, p_begin as i32, p_count as i32);
+            assign_smaller_larger_roles_device(&client, &ls, 0, 99, 98).expect("roles");
+            assert_eq!(
+                ls.read_role(&client, 0).smaller_is_left,
+                expect_left,
+                "role sanity for split_point {split_point} of {p_count}"
+            );
+
+            // EXACT-grid (shipped): the child's exact rows via an offset view + child count.
+            let child_view =
+                perm_handle.clone().offset_start(((p_begin + begin_off) * usz) as u64);
+            let (exact, elen) = build_fix_compact_resident_rows_handle_f64_on(
+                &client, bins_handle.clone(), ResidentBinWidth::U8, 2, num_data, &slot_off,
+                slot_len, child_view, child_count, &fix_feats, sum_g, sum_h, max_abs,
+                (grad_h.clone(), hess_h.clone(), num_data), None,
+            )
+            .expect("exact-grid build");
+
+            // FIXED-grid: the PARENT view + parent count; child range resolved on device.
+            let parent_view = perm_handle.clone().offset_start((p_begin * usz) as u64);
+            let (fixed, flen) = build_fix_compact_resident_rows_handle_f64_fixed_grid_on(
+                &client, bins_handle.clone(), ResidentBinWidth::U8, 2, num_data, &slot_off,
+                slot_len, parent_view, p_count, ls.ranges_handle().clone(),
+                LEAF_SPLIT_STRIDE * ls.capacity(), ls.roles_handle().clone(),
+                ROLE_STRIDE * ls.capacity(), 0, &fix_feats, sum_g, sum_h, max_abs,
+                (grad_h.clone(), hess_h.clone(), num_data), None,
+            )
+            .expect("fixed-grid build");
+
+            assert_eq!(elen, flen, "hist length");
+            let e_bytes = client.read_one_unchecked(exact);
+            let f_bytes = client.read_one_unchecked(fixed);
+            let eb = f64::from_bytes(&e_bytes);
+            let fb = f64::from_bytes(&f_bytes);
+            assert_eq!(
+                eb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "fixed-grid build must be f64-byte-identical to exact-grid \
+                 (split_point {split_point}, smaller_is_left {expect_left})"
+            );
+        }
+    }
+
     /// Layer 2 — the rows-HANDLE build (rows = an offset view into a device
     /// buffer) is f64-BIT-IDENTICAL to the host-rows twin fed the same row ids.
     #[test]
