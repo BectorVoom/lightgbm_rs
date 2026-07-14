@@ -265,6 +265,10 @@ pub fn dump(label: &str) {
     // ran; 0 on the default 3-launch / cpu path.
     let partition_bc_smem =
         lgbm_compute::kernels::grow_driver::on_device_partition_bc_smem_count_take();
+    // The ROLE-ASSIGN tripwire (SPEC-DRGL-02): one bump per split that resolved the
+    // smaller/larger child role ON DEVICE (`assign_smaller_larger_roles_device`).
+    // NONZERO proves the device role kernel ran; 0 until the driver wires it in (T-03).
+    let role_assign = lgbm_compute::kernels::partition::role_assign_count_take();
     if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
         let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
@@ -274,7 +278,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the

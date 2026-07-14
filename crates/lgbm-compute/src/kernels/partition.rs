@@ -335,6 +335,46 @@ pub struct ChildRanges {
 /// (`left_start, left_end, left_count, right_start, right_end, right_count`).
 pub const LEAF_SPLIT_STRIDE: usize = 6;
 
+/// The number of `i32` fields a [`DeviceLeafSplits`] stores per split in its
+/// PARALLEL role buffer (`smaller_is_left` as 0/1, `smaller_slot`, `larger_slot`).
+pub const ROLE_STRIDE: usize = 3;
+
+/// The device-resolved smaller/larger child role assignment for one split — the
+/// on-device analog of `serial_tree_learner`'s host `smaller_is_left` branch +
+/// pool-slot pick. Produced by [`assign_smaller_larger_roles_device`] from the
+/// resident child-range record; read back by [`DeviceLeafSplits::read_role`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoleAssignment {
+    /// `left_count < right_count` (STRICT) — the smaller child is the LEFT child.
+    /// A tie (`left_count == right_count`) is `false`, byte-identical to the host
+    /// `smaller_is_left = left_count < right_count` branch (NOT `<=`).
+    pub smaller_is_left: bool,
+    /// The histogram-pool slot the SMALLER child takes — always the fresh
+    /// `next_slot` (mirrors the host `smaller_slot = next_slot`).
+    pub smaller_slot: i32,
+    /// The slot the LARGER child reuses — always the `parent_slot` (subtraction
+    /// trick; mirrors the host `larger_slot = parent_slot`).
+    pub larger_slot: i32,
+}
+
+/// Host reference for [`assign_smaller_larger_roles_device`] — the SAME pure
+/// integer decision the on-device kernel makes, and the SAME `smaller_is_left =
+/// left_count < right_count` branch `grow_tree_on_device_resident` computes on the
+/// host today (`grow_driver.rs`). The device kernel is pinned byte-equal to this.
+#[must_use]
+pub fn role_assignment(
+    left_count: i32,
+    right_count: i32,
+    next_slot: i32,
+    parent_slot: i32,
+) -> RoleAssignment {
+    RoleAssignment {
+        smaller_is_left: left_count < right_count,
+        smaller_slot: next_slot,
+        larger_slot: parent_slot,
+    }
+}
+
 /// A device-resident per-leaf child-range struct (§9 `cuda_leaf_data_start_` /
 /// `_end_` / `_num_data_` analog), allocated once and indexed by leaf id. A single
 /// `i32` device buffer of `LEAF_SPLIT_STRIDE * num_leaves` cells;
@@ -349,6 +389,11 @@ pub struct DeviceLeafSplits<R: cubecl::Runtime> {
     /// non-overwriting invariant a later deferred read, Wave 2, relies on: two
     /// splits whose `new_left` leaf ids collide still get distinct records).
     ranges: Handle,
+    /// PARALLEL `ROLE_STRIDE * capacity` i32 buffer, SAME slot index as `ranges`:
+    /// slot `s`'s device-resolved [`RoleAssignment`] (written by
+    /// [`assign_smaller_larger_roles_device`]). Kept separate from `ranges` so the
+    /// pinned 6-field child-range layout and its write kernels are untouched.
+    roles: Handle,
     /// The number of `LEAF_SPLIT_STRIDE`-wide slots the buffer is sized for.
     capacity: usize,
     /// Monotonic append cursor for [`Self::record_split`] (host-driven writes).
@@ -373,8 +418,11 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         use cubecl::prelude::CubeElement;
         let zeros = vec![0i32; LEAF_SPLIT_STRIDE * capacity];
         let ranges = client.create_from_slice(i32::as_bytes(&zeros));
+        let role_zeros = vec![0i32; ROLE_STRIDE * capacity];
+        let roles = client.create_from_slice(i32::as_bytes(&role_zeros));
         Ok(Self {
             ranges,
+            roles,
             capacity,
             next_split_idx: 0,
             _runtime: PhantomData,
@@ -459,6 +507,23 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         }
         self.next_split_idx += 1;
         slot
+    }
+
+    /// Read SLOT `slot`'s device-resolved [`RoleAssignment`] back to the host
+    /// (the parallel role buffer, written by [`assign_smaller_larger_roles_device`]).
+    /// Panics if `slot >= capacity`.
+    #[must_use]
+    pub fn read_role(&self, client: &ComputeClient<R>, slot: usize) -> RoleAssignment {
+        use cubecl::prelude::CubeElement;
+        assert!(slot < self.capacity, "DeviceLeafSplits::read_role: slot out of range");
+        let bytes = client.read_one_unchecked(self.roles.clone());
+        let all = i32::from_bytes(&bytes);
+        let b = ROLE_STRIDE * slot;
+        RoleAssignment {
+            smaller_is_left: all[b] != 0,
+            smaller_slot: all[b + 1],
+            larger_slot: all[b + 2],
+        }
     }
 }
 
@@ -581,6 +646,101 @@ pub fn partition_child_ranges_device<R: cubecl::Runtime>(
     }
 
     Ok(reordered)
+}
+
+// =========================================================================
+// On-device smaller/larger child ROLE ASSIGNMENT (SPEC-DRGL-02) — the
+// SplitTreeStructureKernel analog. Resolves `smaller_is_left` ON DEVICE from the
+// resident child-range counts so the host no longer branches on the raw counts
+// for role/pool-slot bookkeeping (the prerequisite the Wave-2 deferred read
+// needs). Pure integer, single owner, no value read back here.
+// =========================================================================
+
+/// POSITIVE tripwire — bumped once per on-device role-assignment launch
+/// ([`assign_smaller_larger_roles_device`]); bench-protocol counts proof. Folded
+/// into `phase_prof` as `role_assign=`.
+pub static ROLE_ASSIGN_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the role-assign launch tripwire to zero and return the prior value.
+#[must_use]
+pub fn role_assign_count_take() -> u64 {
+    ROLE_ASSIGN_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve one split's smaller/larger child role ON DEVICE from the resident
+/// child-range record and write it into the parallel role slot. Reads the
+/// resident left/right counts (`ranges[6*slot+2]` / `[6*slot+5]`, never crossing
+/// back to the host) and writes `[smaller_is_left, next_slot, parent_slot]` into
+/// `roles[3*slot ..+3)`. Single owner (`ABSOLUTE_POS == 0`), integer-only.
+#[cube(launch)]
+fn assign_roles_kernel(
+    ranges: &Array<i32>,
+    roles: &mut Array<i32>,
+    slot: u32,
+    next_slot: i32,
+    parent_slot: i32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let rb = (slot * 6) as usize; // LEAF_SPLIT_STRIDE
+        let left_count = ranges[rb + 2];
+        let right_count = ranges[rb + 5];
+        let ob = (slot * 3) as usize; // ROLE_STRIDE
+        // Smaller child ALWAYS takes the fresh slot; larger reuses the parent's.
+        roles[ob + 1] = next_slot; // smaller_slot
+        roles[ob + 2] = parent_slot; // larger_slot
+        // smaller_is_left = left_count < right_count (STRICT; tie => 0). Written
+        // directly per branch — no mutable-i32 carry / `select` (cubecl-cpu MLIR).
+        if left_count < right_count {
+            roles[ob] = 1;
+        } else {
+            roles[ob] = 0;
+        }
+    }
+}
+
+/// Launch [`assign_roles_kernel`] for one split's `slot`. `next_slot`/`parent_slot`
+/// are host-known pool slots (the smaller child's fresh slot and the larger
+/// child's reused parent slot). Bumps [`ROLE_ASSIGN_CNT`]. The resolved record is
+/// read back by [`DeviceLeafSplits::read_role`] and is byte-equal to the host
+/// [`role_assignment`] reference for every input.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] if `slot >= leaf_splits.capacity()`.
+pub fn assign_smaller_larger_roles_device<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    leaf_splits: &DeviceLeafSplits<R>,
+    slot: usize,
+    next_slot: i32,
+    parent_slot: i32,
+) -> Result<(), ComputeError> {
+    if slot >= leaf_splits.capacity {
+        return Err(ComputeError::Runtime {
+            detail: format!(
+                "assign_smaller_larger_roles_device: slot {slot} >= capacity {}",
+                leaf_splits.capacity
+            ),
+        });
+    }
+    let ranges_len = LEAF_SPLIT_STRIDE * leaf_splits.capacity;
+    let roles_len = ROLE_STRIDE * leaf_splits.capacity;
+    // SAFETY: `ranges` holds `LEAF_SPLIT_STRIDE*capacity` i32 cells and `roles`
+    // `ROLE_STRIDE*capacity`; `slot < capacity` (checked), so the reads
+    // `[6*slot+2, 6*slot+5]` and writes `[3*slot, 3*slot+3)` stay in-bounds.
+    // Single owner (`ABSOLUTE_POS == 0`). cubecl unsafe confined here.
+    unsafe {
+        assign_roles_kernel::launch::<R>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(1),
+            ArrayArg::from_raw_parts(leaf_splits.ranges.clone(), ranges_len),
+            ArrayArg::from_raw_parts(leaf_splits.roles.clone(), roles_len),
+            slot as u32,
+            next_slot,
+            parent_slot,
+        );
+    }
+    ROLE_ASSIGN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 // =========================================================================
@@ -1517,5 +1677,55 @@ mod tests {
         let client = cpu_client();
         let ls = DeviceLeafSplits::new(&client, 2).expect("alloc");
         let _ = ls.read_split(&client, 2); // slot == capacity ⇒ out of range
+    }
+
+    /// SPEC-DRGL-02 (Red): the plain-Rust role reference reproduces the host
+    /// `smaller_is_left = left_count < right_count` branch (`grow_driver.rs:2934`)
+    /// for left-smaller, right-smaller, and the EXACT tie — strict `<`, NOT `<=`.
+    #[test]
+    fn role_assignment_matches_host_branch_for_all_count_orderings() {
+        let (next_slot, parent_slot) = (5, 2);
+        // left < right ⇒ smaller_is_left = true.
+        assert_eq!(
+            role_assignment(3, 7, next_slot, parent_slot),
+            RoleAssignment { smaller_is_left: true, smaller_slot: 5, larger_slot: 2 }
+        );
+        // left > right ⇒ false.
+        assert_eq!(
+            role_assignment(7, 3, next_slot, parent_slot),
+            RoleAssignment { smaller_is_left: false, smaller_slot: 5, larger_slot: 2 }
+        );
+        // TIE (left == right) ⇒ false under strict `<` — a `<=` mismatch would
+        // silently swap which child gets the fresh pool slot.
+        assert_eq!(
+            role_assignment(4, 4, next_slot, parent_slot),
+            RoleAssignment { smaller_is_left: false, smaller_slot: 5, larger_slot: 2 }
+        );
+    }
+
+    /// SPEC-DRGL-02: the on-device `assign_roles_kernel` (reading the resident
+    /// child-range counts) is byte-equal to the [`role_assignment`] reference for
+    /// left-smaller, right-smaller, and the tie — on the runnable cubecl-cpu lane.
+    #[test]
+    fn assign_roles_kernel_matches_reference_cpu() {
+        let client = cpu_client();
+        // (split_point, p_count) with p_begin 0 ⇒ left_count = split_point,
+        // right_count = p_count - split_point: left-smaller, right-smaller, tie.
+        let cases = [(3i32, 10i32), (7, 10), (5, 10)];
+        let mut ls = DeviceLeafSplits::new(&client, cases.len()).expect("alloc");
+        for &(sp, pc) in &cases {
+            ls.record_split(&client, sp, 0, pc);
+        }
+        for (slot, &(sp, pc)) in cases.iter().enumerate() {
+            let (next_slot, parent_slot) = (slot as i32 + 10, slot as i32);
+            assign_smaller_larger_roles_device(&client, &ls, slot, next_slot, parent_slot)
+                .expect("role launch");
+            let want = role_assignment(sp, pc - sp, next_slot, parent_slot);
+            assert_eq!(
+                ls.read_role(&client, slot),
+                want,
+                "slot {slot}: device role must match the host reference"
+            );
+        }
     }
 }

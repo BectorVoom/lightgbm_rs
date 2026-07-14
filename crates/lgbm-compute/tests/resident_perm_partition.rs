@@ -307,6 +307,33 @@ mod real_gpu_gated {
         unsafe { std::env::set_var("LGBM_AUTOTUNE", "0") };
     }
 
+    /// SPEC-DRGL-02 (REAL GPU): the on-device role kernel resolves `smaller_is_left`
+    /// + pool slots from the resident child-range counts byte-equal to the host
+    /// [`role_assignment`] reference on the actual device — left-smaller,
+    /// right-smaller, and the EXACT tie (strict `<`).
+    #[test]
+    fn assign_roles_kernel_matches_reference_real_gpu() {
+        use lgbm_compute::kernels::partition::{assign_smaller_larger_roles_device, role_assignment};
+        let client = gpu_client();
+        // (split_point, p_count), p_begin 0 ⇒ left_count = split_point,
+        // right_count = p_count - split_point: left-smaller, right-smaller, tie.
+        let cases = [(3i32, 10i32), (7, 10), (5, 10)];
+        let mut ls = DeviceLeafSplits::new(&client, cases.len()).expect("alloc");
+        for &(sp, pc) in &cases {
+            ls.record_split(&client, sp, 0, pc);
+        }
+        for (slot, &(sp, pc)) in cases.iter().enumerate() {
+            let (next_slot, parent_slot) = (slot as i32 + 10, slot as i32);
+            assign_smaller_larger_roles_device(&client, &ls, slot, next_slot, parent_slot)
+                .expect("role launch");
+            assert_eq!(
+                ls.read_role(&client, slot),
+                role_assignment(sp, pc - sp, next_slot, parent_slot),
+                "slot {slot}: device role must match the host reference on real GPU"
+            );
+        }
+    }
+
     /// Layer 2 — the rows-HANDLE build (rows = an offset view into a device
     /// buffer) is f64-BIT-IDENTICAL to the host-rows twin fed the same row ids.
     #[test]
