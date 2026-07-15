@@ -361,6 +361,67 @@ pub fn get_gradients_resident_on<R: cubecl::Runtime>(
     Ok((h_grad, h_hess))
 }
 
+/// [`get_gradients_resident_on`] over a per-train [`GradResidency`]
+/// (`crate::kernels::grow_driver::GradResidency`): the f64 label buffer was uploaded
+/// ONCE by [`crate::ResidentScore::grad_residency`] and the f32 grad/hess outputs are
+/// REUSED across iterations (each launch fully overwrites every `i < num_data` cell,
+/// so reuse is value-identical to the prior per-iter `client.empty` pair). This
+/// removes the per-iteration host f32→f64 label convert + `4·num_data`-byte
+/// host→device label upload + two device output allocations the non-cached launcher
+/// pays every call. SAME kernel, launch geometry, and scalar args as
+/// [`get_gradients_resident_on`] — bit-exact by construction; only the buffer
+/// provenance differs. The resident envelope is unweighted (`use_weight == false`
+/// compiles the weights read out; the 1-cell dummy is cached in the residency).
+///
+/// # Errors
+/// Currently infallible for `num_data > 0` (the `Result` mirrors the sibling
+/// launcher so call sites propagate uniformly).
+pub fn get_gradients_resident_cached_on<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    scores_handle: &Handle,
+    num_data: usize,
+    residency: &crate::kernels::grow_driver::GradResidency,
+    sigmoid: f64,
+    label_weights: Option<(f64, f64)>,
+) -> Result<(Handle, Handle), ComputeError> {
+    if num_data == 0 {
+        return Ok((client.empty(0), client.empty(0)));
+    }
+    let use_label_weight = label_weights.is_some();
+    let (lw_neg, lw_pos) = label_weights.unwrap_or((1.0, 1.0));
+    // Unweighted envelope: 1-cell dummy, never read (`use_weight == false`).
+    let h_weights = client.create_from_slice(f64::as_bytes(&[0.0f64]));
+
+    let cube_dim = 256u32;
+    let cube_count = (num_data as u32).div_ceil(cube_dim);
+
+    // SAFETY: `scores_handle`/`residency.labels_f64` are `[num_data]` f64 buffers and
+    // `residency.grad`/`residency.hess` `[num_data]` f32 buffers (all sized by
+    // `ResidentScore::grad_residency` against the SAME `num_data`); all outlive the
+    // launch. The kernel bounds-guards `i < scores.len()`; the weights dummy is never
+    // read (`use_weight == false` compiles the read out). cubecl unsafe is confined
+    // here (CMP-01).
+    unsafe {
+        grad_hess_resident_kernel_f32::launch_unchecked(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(cube_dim),
+            ArrayArg::from_raw_parts(scores_handle.clone(), num_data),
+            ArrayArg::from_raw_parts(residency.labels_f64.clone(), num_data),
+            ArrayArg::from_raw_parts(h_weights, 1),
+            ArrayArg::from_raw_parts(residency.grad.clone(), num_data),
+            ArrayArg::from_raw_parts(residency.hess.clone(), num_data),
+            sigmoid,
+            lw_neg,
+            lw_pos,
+            use_label_weight,
+            false,
+        );
+    }
+
+    Ok((residency.grad.clone(), residency.hess.clone()))
+}
+
 // --- sigmoid ConvertOutput inverse-link (elementwise) ---
 
 /// Elementwise sigmoid ConvertOutput body: `1 / (1 + exp(-sigmoid * x))`. Anchored to
@@ -612,6 +673,66 @@ mod resident_parity {
                         res_h[i],
                         host_h[i]
                     );
+                }
+            }
+        }
+    }
+
+    /// The CACHED resident launcher (per-train [`GradResidency`]) is BIT-EXACT vs
+    /// the per-call resident launcher across both `label_weights` states AND across
+    /// repeated calls over the SAME residency (the reuse contract: every launch
+    /// fully overwrites the reused grad/hess outputs, so iteration k's result is
+    /// independent of iteration k-1's residue).
+    #[test]
+    fn get_gradients_resident_cached_on_matches_uncached() {
+        use super::get_gradients_resident_cached_on;
+        use crate::ResidentScore;
+
+        let client = cpu_client();
+        let labels: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let n = labels.len();
+        let sigmoid = 1.0f64;
+
+        for scores in [
+            vec![0.5, -0.25, 1.0, -2.0, 0.0, 1.5, -3.0, 0.75],
+            vec![-1.5, 0.75, 0.0, 2.0, -0.5, -1.0, 3.0, -0.25],
+        ] {
+            let rs = ResidentScore::from_host_scores(&client, &scores);
+            // Two calls over ONE residency with different label_weights — the
+            // second call's (different) result must be its own launch's output,
+            // proving each launch fully overwrites the reused grad/hess buffers.
+            for label_weights in [Some((0.8f64, 1.3f64)), None] {
+                let residency =
+                    rs.grad_residency(&client, &labels).expect("residency builds");
+                let (cg, ch) = get_gradients_resident_cached_on(
+                    &client,
+                    rs.score_handle(),
+                    n,
+                    residency,
+                    sigmoid,
+                    label_weights,
+                )
+                .expect("cached resident binary launcher");
+
+                let scores_handle = client.create_from_slice(f64::as_bytes(&scores));
+                let (ug, uh) = get_gradients_resident_on(
+                    &client,
+                    &scores_handle,
+                    n,
+                    &labels,
+                    None,
+                    sigmoid,
+                    label_weights,
+                )
+                .expect("uncached resident binary launcher");
+
+                let cg = f32::from_bytes(&client.read_one_unchecked(cg)).to_vec();
+                let ch = f32::from_bytes(&client.read_one_unchecked(ch)).to_vec();
+                let ug = f32::from_bytes(&client.read_one_unchecked(ug)).to_vec();
+                let uh = f32::from_bytes(&client.read_one_unchecked(uh)).to_vec();
+                for i in 0..n {
+                    assert_eq!(cg[i].to_bits(), ug[i].to_bits(), "grad mismatch i={i}");
+                    assert_eq!(ch[i].to_bits(), uh[i].to_bits(), "hess mismatch i={i}");
                 }
             }
         }

@@ -1015,6 +1015,7 @@ impl<R: cubecl::Runtime> DeviceCudaTree<R> {
             cat_threshold: self.cat_threshold_host.clone(),
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: read_i32(&d.leaf_depth, nl),
             leaf_parent: read_i32(&d.leaf_parent, nl),
             split_feature_inner: read_i32(&d.split_feature_inner, nn),

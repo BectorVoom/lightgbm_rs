@@ -113,11 +113,14 @@ pub struct Config {
     /// to full precision). Used only if `use_quantized_grad`.
     pub num_grad_quant_bins: i32,
     /// `bool quant_train_renew_leaf`. config.h default: false. Renew leaf values with the
-    /// original (non-quantized) gradients. Used only if `use_quantized_grad`. Not yet implemented.
+    /// original (non-quantized) gradients. Used only if `use_quantized_grad`. Implemented and
+    /// C++-oracle-verified (`crates/oracle-harness/tests/quantized_parity.rs`).
     pub quant_train_renew_leaf: bool,
     /// `bool stochastic_rounding`. config.h default: true. Used only if `use_quantized_grad`.
-    /// The Rust quantized path currently supports DETERMINISTIC rounding only (parity-tractable);
-    /// stochastic rounding is not yet implemented.
+    /// Both deterministic and stochastic rounding are implemented (`GradientDiscretizer`); the
+    /// deterministic path (`false`) is the C++ bit-tractable parity gate, stochastic (`true`,
+    /// the default) is C++-oracle-verified via a magnitude-regime delta gate, not bit-exact RNG
+    /// matching (Rust uses xorshift64, not C++'s mt19937).
     pub stochastic_rounding: bool,
     /// `double drop_rate`. config.h default: 0.1.
     pub drop_rate: f64,
@@ -153,6 +156,13 @@ pub struct Config {
     pub monotone_constraints_method: String,
     /// `double monotone_penalty`. config.h default: 0.0.
     pub monotone_penalty: f64,
+    /// `bool linear_tree` (alias `linear_trees`). config.h default: false. When
+    /// true, each leaf carries a per-leaf linear model fitted on the raw features
+    /// (piecewise-linear tree). The first tree in the ensemble is always constant.
+    pub linear_tree: bool,
+    /// `double linear_lambda`. config.h default: 0.0. L2 regularization applied to
+    /// the per-leaf linear-model coefficients (only used when `linear_tree`).
+    pub linear_lambda: f64,
     /// `std::string forcedsplits_filename`. config.h default: "".
     pub forcedsplits_filename: String,
     /// `double refit_decay_rate`. config.h default: 0.9.
@@ -371,6 +381,8 @@ impl Default for Config {
             monotone_constraints: Vec::new(),
             monotone_constraints_method: "basic".to_string(),
             monotone_penalty: 0.0,
+            linear_tree: false,
+            linear_lambda: 0.0,
             forcedsplits_filename: String::new(),
             refit_decay_rate: 0.9,
             cegb_tradeoff: 1.0,

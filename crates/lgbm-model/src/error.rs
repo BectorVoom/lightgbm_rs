@@ -51,6 +51,19 @@ pub enum ModelError {
         /// Human-readable description of the offending shapes.
         detail: String,
     },
+
+    /// The requested operation is not supported for this model. Mirrors a C++
+    /// `Log::Fatal` site that rejects a valid-but-unsupported combination of
+    /// model + request (not malformed input) — e.g. `PredictContrib` on a
+    /// `linear_tree=true` model is refused outright in C++
+    /// (`predictor.hpp:89-90`: contrib is never wired up for linear trees), so
+    /// the Rust port refuses it too rather than inventing a SHAP variant with
+    /// no C++ counterpart to stay in parity with.
+    #[error("unsupported: {detail}")]
+    Unsupported {
+        /// Human-readable description of the unsupported combination.
+        detail: String,
+    },
 }
 
 #[cfg(test)]

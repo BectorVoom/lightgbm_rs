@@ -2944,6 +2944,32 @@ pub fn find_best_from_all_splits_device<R: cubecl::Runtime>(
     larger_leaf_index: i32,
     cur_num_leaves: usize,
 ) -> Result<PickExport, ComputeError> {
+    let h_out = find_best_from_all_splits_device_launch(
+        client,
+        frontier,
+        best_leaf_slot,
+        smaller_leaf_index,
+        larger_leaf_index,
+        cur_num_leaves,
+    )?;
+    // The ONLY device→host transfer per iteration.
+    let bytes = client.read_one_unchecked(h_out);
+    Ok(decode_pick_export(&bytes))
+}
+
+/// SPEC-DRGL-05: the LAUNCH half of [`find_best_from_all_splits_device`] — runs the §8.3
+/// argmax + self-invalidation + 18-cell export packer ON DEVICE and returns the export
+/// `Handle` (18 f64 cells) WITHOUT reading it. Lets the deferred grow loop BATCH the pick's
+/// export readback with the previous split's `read_split` into ONE `client.read`. Decode the
+/// returned handle's bytes with [`decode_pick_export`].
+pub fn find_best_from_all_splits_device_launch<R: cubecl::Runtime>(
+    client: &ComputeClient<R>,
+    frontier: &SplitSoa,
+    best_leaf_slot: &Handle,
+    smaller_leaf_index: i32,
+    larger_leaf_index: i32,
+    cur_num_leaves: usize,
+) -> Result<Handle, ComputeError> {
     validate_stage3_inputs(
         frontier.len,
         smaller_leaf_index,
@@ -3025,16 +3051,23 @@ pub fn find_best_from_all_splits_device<R: cubecl::Runtime>(
             u32::from(has_larger),
         );
     }
-    // The ONLY device→host transfer per iteration.
-    let bytes = client.read_one_unchecked(h_out);
-    let raw = f64::from_bytes(&bytes);
+    Ok(h_out)
+}
+
+/// Decode the 18-cell f64 export buffer (from [`find_best_from_all_splits_device_launch`])
+/// into a [`PickExport`]: cells `[0..8)` are exact integers (→ `i64`), `[8..18)` are the
+/// winning leaf's `f64` record. Single-sourced so the eager and batched-read paths decode
+/// identically.
+#[must_use]
+pub fn decode_pick_export(bytes: &[u8]) -> PickExport {
+    let raw = f64::from_bytes(bytes);
     let mut cells = [0i64; 8];
     for (k, slot) in cells.iter_mut().enumerate() {
         *slot = raw[k] as i64;
     }
     let mut winner = [0.0f64; 10];
     winner.copy_from_slice(&raw[8..18]);
-    Ok(PickExport { cells, winner })
+    PickExport { cells, winner }
 }
 
 // =============================================================================

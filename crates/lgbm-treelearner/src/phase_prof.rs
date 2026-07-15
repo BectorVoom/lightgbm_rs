@@ -72,11 +72,9 @@ pub static SCRATCH_NS: AtomicU64 = AtomicU64::new(0);
 //   SUBTRACT_RESIDENT = on-device parent−smaller derivations (larger children).
 //   SCAN_RESIDENT = fused per-leaf scan launches = blocking readback SYNCS (the
 //                   round-trip count sibling co-packing targets halving).
-//   FUSED = build_fix_scan_resident launches (OFF by default).
 pub static BUILD_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
 pub static SUBTRACT_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
-pub static FUSED_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Increment a count counter by 1. Inert (no-op) when the env gate is off, so it is
 /// parity-neutral and zero-overhead in the default build/tests.
@@ -202,7 +200,6 @@ pub fn dump(label: &str) {
     let bld_cnt = BUILD_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let sub_cnt = SUBTRACT_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let scn_cnt = SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
-    let fus_cnt = FUSED_CNT.swap(0, Ordering::Relaxed);
     // Fold the on-device driver's own launch count (bumped in lgbm-compute
     // once per leaf-level build/subtract/scan — the host `*_RESIDENT_CNT` counters
     // stay 0 on the on-device path) into the SAME `device_launches=` total. The
@@ -220,23 +217,60 @@ pub fn dump(label: &str) {
     // total stays byte-stable and the launch-total field key is untouched.
     let on_dev_rootbuild_u64 =
         lgbm_compute::kernels::grow_driver::on_device_rootbuild_u64_count_take();
-    // The NEGATIVE guard — the f64 single-owner fused build counter. It bumps ONLY via
-    // the `LGBM_ONDEVICE_F64_FUSED=1` escape hatch, so on the DEFAULT (swapped)
-    // on-device path it stays 0. Emitting it INSIDE the parenthetical breakdown (after
-    // on_device_rootbuild_u64, never before the leading total) lets an A/B harness prove
-    // the slow f64-fused kernel did not silently return, from the log rather than by
-    // code inspection alone. The `device_launches=` key and its `(?P<launches>\d+)`
-    // capture are untouched.
-    let on_dev_f64_fused =
-        lgbm_compute::kernels::grow_driver::on_device_f64_fused_count_take();
     // The BLOCKING-READBACK sync total — DISTINCT from `device_launches` (dispatches).
     // Counts only real device→host syncs (scan / on-device partition / tree-split
     // readbacks; a co-packed sibling scan is ONE). Taken unconditionally so the
     // process-global counter resets each dump; folded into the COUNTS line below.
     let on_dev_syncs =
         lgbm_compute::kernels::grow_driver::on_device_sync_count_take();
-    if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
-        let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
+    // The RESIDENT-PERM partition tripwire (LGBM_PARTITION_RESIDENT=1): one bump per
+    // split partitioned on the device-resident perm arm. NONZERO proves the arm ran
+    // (bench protocol: counts confirmation before trusting a wall delta); 0 on the
+    // default host-partition path. Taken unconditionally so the counter resets each
+    // dump; folded INSIDE the parenthetical breakdown (never before the leading
+    // total) so the `device_launches=(?P<launches>\d+)` capture stays stable.
+    let on_dev_partition_resident =
+        lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
+    // The PARGAIN scan tripwire (LGBM_SCAN_PARGAIN=1): one bump per staged-scan
+    // launch that dispatched the parallel-candidate kernel. NONZERO proves the
+    // pargain arm ran; 0 on the default serial-branch staged path.
+    let scan_pargain = lgbm_compute::kernels::split::scan_pargain_count_take();
+    // The PARPREFIX scan tripwire (LGBM_SCAN_PARPREFIX=1): one bump per staged-scan
+    // launch that dispatched the parallel-PREFIX kernel (replaces pargain's phase 1).
+    // NONZERO proves the parprefix arm ran.
+    let scan_parprefix = lgbm_compute::kernels::split::scan_parprefix_count_take();
+    // The FUSED-SUBTRACT tripwire (LGBM_SUBTRACT_FUSE=1): one bump per split that folded
+    // the subtraction trick into the co-pack scan (dropping the separate subtract launch).
+    // NONZERO proves the fused arm ran; 0 on the default separate-subtract path.
+    let subtract_fused =
+        lgbm_compute::kernels::grow_driver::on_device_subtract_fused_count_take();
+    // The DESC-HOIST tripwire (LGBM_DESC_HOIST=1): one bump per scan/build launch that
+    // consumed the per-grow CACHED descriptor handles instead of re-uploading them.
+    // NONZERO proves the hoist arm ran; 0 on the default per-launch-upload path.
+    let desc_hoist = lgbm_compute::kernels::split::scan_desc_count_take();
+    // The SMEM partition BC-fusion tripwire (LGBM_PARTITION_FUSE_BC_SMEM=1, real device):
+    // one bump per split that took the 2-launch SharedMemory partition. NONZERO proves it
+    // ran; 0 on the default 3-launch / cpu path.
+    let partition_bc_smem =
+        lgbm_compute::kernels::grow_driver::on_device_partition_bc_smem_count_take();
+    // The ROLE-ASSIGN tripwire (SPEC-DRGL-02): one bump per split that resolved the
+    // smaller/larger child role ON DEVICE (`assign_smaller_larger_roles_device`).
+    // NONZERO proves the device role kernel ran; 0 until the driver wires it in (T-03).
+    let role_assign = lgbm_compute::kernels::partition::role_assign_count_take();
+    // The device-num_data scan tripwire (SPEC-DRGL-12/13): one bump per fused-scan launch
+    // that sourced num_data ON DEVICE (the deferral arm's child scans). NONZERO proves the
+    // device-num_data scan ran; 0 on the default host-scalar path.
+    let scan_numdata_dev = lgbm_compute::kernels::split::scan_numdata_dev_count_take();
+    // The PLANE-PARALLEL reduce tripwire (LGBM_REDUCE_PAR=1, real device): one bump per
+    // frontier-reduce launch that dispatched a plane twin instead of the single-thread
+    // serial fold. NONZERO proves the parallel arm ran; 0 on the default serial path.
+    let reduce_par = lgbm_compute::kernels::split::reduce_par_count_take();
+    // The OFFICIAL-SHAPE scan tripwire (LGBM_SCAN_OFFICIAL=1, real device): one bump per
+    // staged-scan launch that dispatched the 256-wide one-lane-per-bin block-prefix kernel
+    // (P1b). NONZERO proves the official arm ran; 0 on the default staged/pargain/parprefix path.
+    let scan_official = lgbm_compute::kernels::split::scan_official_count_take();
+    if bld_cnt + sub_cnt + scn_cnt + on_dev > 0 {
+        let launches = bld_cnt + sub_cnt + scn_cnt + on_dev;
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
         // (WR-01/IN-02): both the host `*_resident=` terms and `on_device=` use the same
         // per-leaf unit, and tree-mutation/partition dispatches are excluded on both paths.
@@ -244,7 +278,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign} scan_numdata_dev={scan_numdata_dev} reduce_par={reduce_par} scan_official={scan_official}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the

@@ -306,18 +306,20 @@ fn update_data_index_to_leaf_kernel(
 /// `kernel_capture.cpp::SplitRouteFanout` derives them (`:516-520`) and the
 /// `Split()` dispatcher (`dense_bin.hpp:405-421`). Returned as plain bools so the
 /// host anchor and the device mark kernel launch use the identical flags.
+/// `pub(crate)` so the RESIDENT-perm partition ([`crate::kernels::partition`])
+/// derives the SAME flags for its mark kernel — single source of the flag algebra.
 #[derive(Clone, Copy, Debug)]
-struct RouteFlags {
-    miss_is_zero: bool,
-    miss_is_na: bool,
-    mfb_is_zero: bool,
-    mfb_is_na: bool,
-    min_is_max: bool,
-    default_left: bool,
+pub(crate) struct RouteFlags {
+    pub(crate) miss_is_zero: bool,
+    pub(crate) miss_is_na: bool,
+    pub(crate) mfb_is_zero: bool,
+    pub(crate) mfb_is_na: bool,
+    pub(crate) min_is_max: bool,
+    pub(crate) default_left: bool,
 }
 
 impl RouteFlags {
-    fn derive(
+    pub(crate) fn derive(
         min_bin: u32,
         max_bin: u32,
         default_bin: u32,
@@ -651,8 +653,10 @@ fn validate_categorical(bins: &BinColumn, num_bin: u32, data_indices: &[u32]) ->
 // =========================================================================
 
 /// Choose a `block_size` keeping `num_blocks <= 1024` (the primitives' single-tile
-/// cap) — `block_size >= 256`, growing for large leaves.
-fn scan_block_size(n: usize) -> u32 {
+/// cap) — `block_size >= 256`, growing for large leaves. `pub(crate)` so the
+/// resident-perm partition ([`crate::kernels::partition`]) tiles its fused
+/// mark+block-scan with the SAME geometry.
+pub(crate) fn scan_block_size(n: usize) -> u32 {
     (n.div_ceil(1024) as u32).max(256)
 }
 

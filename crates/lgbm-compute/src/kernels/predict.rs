@@ -697,6 +697,144 @@ pub fn add_leaf_values_to_resident_score<R: cubecl::Runtime>(
     Ok(())
 }
 
+/// The FUSED derive+scatter (§9+§11) resident `AddPredictionToScore`: one lane per
+/// PARTITION POSITION `k` finds its leaf by scanning the (disjoint) per-leaf
+/// `[begin, begin+count)` ranges and accumulates `score[indices[k]] +=
+/// leaf_value[leaf]` in place — replacing the two-kernel
+/// [`derive_leaf_map_device_handle`] → [`add_leaf_values_to_resident_score`] chain
+/// AND its `num_data`-length `-1`-sentinel map buffer (one fewer `num_data×4`-byte
+/// host→device fill-upload per tree). The retired derive kernel parallelized over
+/// LEAVES (≤ `num_leaves` active lanes serially walking whole leaves — a single
+/// active warp at `num_leaves=31`, ~O(num_data) serial device time per tree at 500k
+/// rows); this kernel parallelizes over the `num_positions` rows with an
+/// `O(num_leaves)` cached range scan per lane. Bit-exact by construction: the leaf
+/// ranges are disjoint, so each row is written exactly ONCE with the SAME f64 `+=`
+/// of the SAME leaf value — no reduction, no ordering dependence, identical to the
+/// two-kernel chain's result cell-for-cell.
+#[cube(launch)]
+pub(crate) fn scatter_leaf_values_by_ranges_kernel(
+    indices: &Array<u32>,
+    leaf_begin: &Array<u32>,
+    leaf_count: &Array<u32>,
+    leaf_value: &Array<f64>,
+    score: &mut Array<f64>,
+    num_leaves: u32,
+    num_positions: u32,
+    num_data: u32,
+) {
+    let k = ABSOLUTE_POS;
+    if k < num_positions as usize {
+        let ku = u32::cast_from(k);
+        // Disjoint ranges ⇒ at most one leaf matches; scan all (no break — the
+        // uniform loop keeps lane divergence bounded by num_leaves).
+        let mut leaf = i32::new(-1);
+        for l in 0..num_leaves as usize {
+            let b = leaf_begin[l];
+            let c = leaf_count[l];
+            if ku >= b && ku < b + c {
+                leaf = i32::cast_from(l);
+            }
+        }
+        if leaf >= 0 {
+            let row = indices[k];
+            // Defense-in-depth VALUE bound (mirrors `derive_leaf_map_kernel`): an
+            // out-of-range permutation entry does not write.
+            if (row as usize) < num_data as usize {
+                score[row as usize] = score[row as usize] + leaf_value[leaf as usize];
+            }
+        }
+    }
+}
+
+/// Launcher for [`scatter_leaf_values_by_ranges_kernel`] — the fused resident
+/// per-tree score scatter over a leaf-grouped partition layout. Validates the
+/// per-leaf ranges at `O(num_leaves)` on the host (non-negative, within `indices`,
+/// leaf id within `leaf_values`), uploads `indices`/ranges/leaf values, and launches
+/// one lane per position. The row-id VALUE bound is enforced in-kernel (the scatter
+/// is total — an out-of-range row simply does not write), so no `O(num_positions)`
+/// host pre-scan is paid.
+///
+/// # Errors
+/// [`ComputeError::Runtime`] on a negative `leaf_begin`/`leaf_count`;
+/// [`ComputeError::LengthMismatch`] if `leaf_begin`/`leaf_count` disagree, a leaf
+/// range overruns `indices`, or there are more leaves than `leaf_values`.
+pub fn add_leaf_values_by_ranges_to_resident_score<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    indices: &[u32],
+    leaf_begin: &[i32],
+    leaf_count: &[i32],
+    score: &Handle,
+    leaf_values: &[f64],
+    num_data: usize,
+) -> Result<(), ComputeError> {
+    if leaf_begin.len() != leaf_count.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: leaf_begin.len(),
+            actual: leaf_count.len(),
+        });
+    }
+    if leaf_begin.len() > leaf_values.len() {
+        return Err(ComputeError::LengthMismatch {
+            expected: leaf_begin.len(),
+            actual: leaf_values.len(),
+        });
+    }
+    let num_positions = indices.len();
+    let num_leaves = leaf_begin.len();
+    if num_positions == 0 || num_leaves == 0 {
+        return Ok(());
+    }
+    let mut begin_u32: Vec<u32> = Vec::with_capacity(num_leaves);
+    let mut count_u32: Vec<u32> = Vec::with_capacity(num_leaves);
+    for l in 0..num_leaves {
+        let (b, c) = (leaf_begin[l], leaf_count[l]);
+        if b < 0 || c < 0 {
+            return Err(ComputeError::Runtime {
+                detail: format!(
+                    "add_leaf_values_by_ranges_to_resident_score: leaf {l} has negative \
+                     begin/count ({b}/{c})"
+                ),
+            });
+        }
+        let end = b as usize + c as usize;
+        if end > num_positions {
+            return Err(ComputeError::LengthMismatch {
+                expected: num_positions,
+                actual: end,
+            });
+        }
+        begin_u32.push(b as u32);
+        count_u32.push(c as u32);
+    }
+
+    let h_indices = client.create_from_slice(u32::as_bytes(indices));
+    let h_begin = client.create_from_slice(u32::as_bytes(&begin_u32));
+    let h_count = client.create_from_slice(u32::as_bytes(&count_u32));
+    let h_leaf = client.create_from_slice(f64::as_bytes(leaf_values));
+    let cube_count = (num_positions as u32).div_ceil(LEAFMAP_BLOCK);
+    // SAFETY: `h_indices` sized `num_positions`, `h_begin`/`h_count` sized
+    // `num_leaves`, `h_leaf` sized `leaf_values.len() >= num_leaves`, `score` sized
+    // `num_data` f64 cells (the ResidentScore contract); all outlive the launch. The
+    // kernel bounds-guards `k < num_positions`, matches `leaf < num_leaves` only, and
+    // guards the scattered `row < num_data` — every access is in bounds.
+    unsafe {
+        scatter_leaf_values_by_ranges_kernel::launch::<R>(
+            client,
+            CubeCount::Static(cube_count, 1, 1),
+            CubeDim::new_1d(LEAFMAP_BLOCK),
+            ArrayArg::from_raw_parts(h_indices, num_positions),
+            ArrayArg::from_raw_parts(h_begin, num_leaves),
+            ArrayArg::from_raw_parts(h_count, num_leaves),
+            ArrayArg::from_raw_parts(h_leaf, leaf_values.len()),
+            ArrayArg::from_raw_parts(score.clone(), num_data),
+            num_leaves as u32,
+            num_positions as u32,
+            num_data as u32,
+        );
+    }
+    Ok(())
+}
+
 /// Validate the tree-walk inputs at the host boundary before the
 /// confined `unsafe` launch. Rejects a `rows`/`num_features` mismatch, an unequal
 /// per-feature meta length, an unequal per-node tree length, and a `num_data` too
@@ -1082,6 +1220,84 @@ mod tests {
         let rows: Vec<u32> = vec![1, 2, 3]; // 3 != 2 * 2
         assert!(matches!(
             add_prediction_to_score_on_device(&client, &tree, &rows, 2, 2, 8, 2, None),
+            Err(ComputeError::LengthMismatch { .. })
+        ));
+    }
+
+    /// The FUSED range-scatter is BIT-EXACT vs the two-kernel derive→scatter chain
+    /// over the same leaf-grouped layout and the same non-zero starting score
+    /// (each row written exactly once with the same f64 `+=`), including a leaf
+    /// permutation whose ranges are NOT ascending in leaf id.
+    #[test]
+    fn fused_ranges_scatter_matches_derive_then_scatter() {
+        let client = cpu_client();
+        let num_data = 10usize;
+        // Leaf-grouped permutation: leaf 0 -> rows {7, 2, 9}, leaf 1 -> rows {0, 4},
+        // leaf 2 -> rows {1, 3, 5, 6, 8}; ranges deliberately not in leaf order.
+        let indices: Vec<u32> = vec![0, 4, 7, 2, 9, 1, 3, 5, 6, 8];
+        let leaf_begin: Vec<i32> = vec![2, 0, 5];
+        let leaf_count: Vec<i32> = vec![3, 2, 5];
+        let leaf_values = vec![-0.5f64, 0.25, 1.75];
+        let start: Vec<f64> = (0..num_data).map(|i| i as f64 * 0.125 - 0.4).collect();
+
+        // Arm A: two-kernel chain (derive map, then map-scatter).
+        let score_a = client.create_from_slice(f64::as_bytes(&start));
+        let leaf_map =
+            derive_leaf_map_device_handle(&client, &indices, &leaf_begin, &leaf_count, num_data)
+                .expect("derive leaf map");
+        add_leaf_values_to_resident_score(&client, &leaf_map, &score_a, &leaf_values, num_data)
+            .expect("map scatter");
+
+        // Arm B: fused range scatter.
+        let score_b = client.create_from_slice(f64::as_bytes(&start));
+        add_leaf_values_by_ranges_to_resident_score(
+            &client,
+            &indices,
+            &leaf_begin,
+            &leaf_count,
+            &score_b,
+            &leaf_values,
+            num_data,
+        )
+        .expect("fused range scatter");
+
+        let a = f64::from_bytes(&client.read_one_unchecked(score_a)).to_vec();
+        let b = f64::from_bytes(&client.read_one_unchecked(score_b)).to_vec();
+        assert_eq!(a.len(), num_data);
+        for i in 0..num_data {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "row {i}: chain={} fused={}", a[i], b[i]);
+        }
+        // And every covered row actually moved off its start value (all 10 covered).
+        for i in 0..num_data {
+            assert_ne!(b[i].to_bits(), start[i].to_bits(), "row {i} was not scattered");
+        }
+    }
+
+    /// Fused-scatter host-boundary validation: negative range and overrun both reject.
+    #[test]
+    fn fused_ranges_scatter_rejects_bad_ranges() {
+        let client = cpu_client();
+        let score = client.create_from_slice(f64::as_bytes(&[0.0f64; 4]));
+        let indices: Vec<u32> = vec![0, 1, 2, 3];
+        // Negative begin.
+        assert!(matches!(
+            add_leaf_values_by_ranges_to_resident_score(
+                &client, &indices, &[-1], &[2], &score, &[0.5], 4
+            ),
+            Err(ComputeError::Runtime { .. })
+        ));
+        // Range overruns indices.
+        assert!(matches!(
+            add_leaf_values_by_ranges_to_resident_score(
+                &client, &indices, &[3], &[2], &score, &[0.5], 4
+            ),
+            Err(ComputeError::LengthMismatch { .. })
+        ));
+        // More leaves than leaf values.
+        assert!(matches!(
+            add_leaf_values_by_ranges_to_resident_score(
+                &client, &indices, &[0, 2], &[2, 2], &score, &[0.5], 4
+            ),
             Err(ComputeError::LengthMismatch { .. })
         ));
     }

@@ -18,18 +18,16 @@
 //! - **GPU/OpenCL device tuning** (deferred): `num_gpu`, `gpu_platform_id`,
 //!   `gpu_device_id`, `gpu_use_dp`. The Rust compute backend uses CubeCL (ROCm),
 //!   not the C++ OpenCL `gpu` device knobs; these have no Rust analog in v1.
-//! - **Linear-tree learner** (deferred): `linear_tree`, `linear_lambda`. The
-//!   Eigen-backed linear leaf fitting is a later-phase feature.
-//! - **Quantized-gradient training** (deferred): `use_quantized_grad`,
-//!   `num_grad_quant_bins`, `quant_train_renew_leaf`, `stochastic_rounding`.
-//!   Gradient quantization is a later-phase optimization, not part of the
-//!   baseline parity contract.
+//!
+//! (Linear-tree params `linear_tree` / `linear_lambda` are now IN scope — the
+//! per-leaf linear leaf fitting is implemented and C++-oracle-verified, see
+//! `lgbm_treelearner::linear::fit_linear_leaves`.)
 
 /// Canonical in-scope single-machine parameter names (Open Question 1).
 ///
 /// Every name here corresponds to a canonical member in
 /// `config_auto.cpp::GetMembersFromString`. The list deliberately EXCLUDES the
-/// distributed / GPU-OpenCL / linear-tree / quantized-grad groups (see the
+/// distributed / GPU-OpenCL / linear-tree groups (see the
 /// module docs). The drift-checker asserts this set covers every in-scope
 /// canonical the C++ source declares.
 pub const IN_SCOPE_PARAMS: &[&str] = &[
@@ -92,6 +90,12 @@ pub const IN_SCOPE_PARAMS: &[&str] = &[
     "monotone_constraints",
     "monotone_constraints_method",
     "monotone_penalty",
+    "linear_tree",
+    "linear_lambda",
+    "use_quantized_grad",
+    "num_grad_quant_bins",
+    "quant_train_renew_leaf",
+    "stochastic_rounding",
     "feature_contri",
     "forcedsplits_filename",
     "refit_decay_rate",
@@ -171,8 +175,7 @@ pub const IN_SCOPE_PARAMS: &[&str] = &[
 /// Canonical parameter names explicitly OUT of v1 scope (documented for the
 /// drift-checker so it skips — rather than fails on — these).
 ///
-/// Grouped exactly as in the module docs: distributed, GPU-OpenCL, linear-tree,
-/// quantized-grad.
+/// Grouped exactly as in the module docs: distributed, GPU-OpenCL.
 pub const OUT_OF_SCOPE_PARAMS: &[&str] = &[
     // distributed
     "num_machines",
@@ -185,12 +188,4 @@ pub const OUT_OF_SCOPE_PARAMS: &[&str] = &[
     "gpu_platform_id",
     "gpu_device_id",
     "gpu_use_dp",
-    // linear-tree
-    "linear_tree",
-    "linear_lambda",
-    // quantized-grad
-    "use_quantized_grad",
-    "num_grad_quant_bins",
-    "quant_train_renew_leaf",
-    "stochastic_rounding",
 ];

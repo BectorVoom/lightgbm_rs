@@ -66,6 +66,28 @@ struct PathElement {
     pweight: f64,
 }
 
+/// Per-leaf linear models for a linear tree (C++ `is_linear_` path). Present
+/// (`Some`) exactly when [`Tree::is_linear`]. Every vector is indexed by leaf and
+/// has length `num_leaves`; `leaf_features`/`leaf_coeff` inner vectors are the
+/// per-leaf feature/coefficient lists (parallel, `num_features[leaf]` long).
+///
+/// Mirrors the C++ `Tree` members `leaf_const_`, `leaf_features_`, `leaf_coeff_`
+/// (`tree.h`) and the serialized `leaf_const=`/`num_features=`/`leaf_features=`/
+/// `leaf_coeff=` fields. The learning-rate shrinkage is PRE-FOLDED into
+/// `leaf_const` and `leaf_coeff` (exactly as C++ serializes them), so linear-leaf
+/// prediction applies no further scaling.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LinearModel {
+    /// C++ `std::vector<double> leaf_const_` (len `num_leaves`) — the intercept.
+    pub leaf_const: Vec<f64>,
+    /// C++ `std::vector<std::vector<int>> leaf_features_` — ORIGINAL feature
+    /// indices used by each leaf's linear model.
+    pub leaf_features: Vec<Vec<i32>>,
+    /// C++ `std::vector<std::vector<double>> leaf_coeff_` — the coefficient for
+    /// each `leaf_features` entry (parallel to it, per leaf).
+    pub leaf_coeff: Vec<Vec<f64>>,
+}
+
 /// A single decision tree — faithful parallel-array mirror of C++ `Tree`
 /// (`tree.h`). Field names keep the C++ correspondence explicit.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,8 +126,12 @@ pub struct Tree {
     pub cat_threshold: Vec<u32>,
     /// C++ `double shrinkage_`.
     pub shrinkage: f64,
-    /// C++ `bool is_linear_` — Phase 3 in-scope models are always non-linear.
+    /// C++ `bool is_linear_`. `true` iff this tree carries per-leaf linear models
+    /// (then [`Tree::linear`] is `Some`).
     pub is_linear: bool,
+    /// Per-leaf linear models (C++ `leaf_const_`/`leaf_features_`/`leaf_coeff_`).
+    /// `Some` iff `is_linear`; `None` for an ordinary constant-leaf tree.
+    pub linear: Option<LinearModel>,
 
     // --- growth-time-only bookkeeping (Phase 5, D-07) ---
     // These four parallel arrays mirror the C++ growth-time members used by
@@ -218,6 +244,16 @@ impl Tree {
         }
     }
 
+    /// Whether internal `node`'s split is categorical (`decision_type`'s
+    /// `CATEGORICAL_MASK` bit). Exposed for callers outside this crate (e.g. the
+    /// linear-tree leaf fit, which must exclude categorically-split features from
+    /// the leaf's linear model — C++ `LinearTreeLearner` does the same).
+    #[inline]
+    #[must_use]
+    pub fn is_categorical_split(&self, node: usize) -> bool {
+        get_decision_type(self.decision_type[node], CATEGORICAL_MASK)
+    }
+
     /// C++ `Tree::GetLeaf` (`tree.h:701-713`): descend from node 0, return `~node`.
     /// `feature_values` is the RAW per-row feature buffer (width `max_feature_idx+1`).
     pub fn get_leaf(&self, feature_values: &[f64]) -> i32 {
@@ -236,15 +272,49 @@ impl Tree {
         !node
     }
 
-    /// C++ `Tree::Predict` (`tree.h:587-615`, non-linear path): the leaf value of
-    /// the leaf this row falls into. Single-leaf trees return `leaf_value[0]`.
+    /// C++ `Tree::Predict` (`tree.h:587-615`): the value of the leaf this row falls
+    /// into. For a linear tree (`is_linear`) the leaf carries a linear model
+    /// (`leaf_const + Σ coeff·x[feat]`) instead of a constant — see
+    /// [`Self::linear_leaf_output`]. Single-leaf trees route to leaf 0.
     pub fn predict(&self, feature_values: &[f64]) -> f64 {
-        if self.num_leaves > 1 {
-            let leaf = self.get_leaf(feature_values);
-            self.leaf_value[leaf as usize]
+        let leaf = if self.num_leaves > 1 {
+            self.get_leaf(feature_values) as usize
         } else {
-            self.leaf_value[0]
+            0
+        };
+        if self.is_linear {
+            self.linear_leaf_output(leaf, feature_values)
+        } else {
+            self.leaf_value[leaf]
         }
+    }
+
+    /// C++ linear-leaf evaluation (`tree.h` `Tree::Predict`, `is_linear_` branch):
+    /// `leaf_const_[leaf] + Σ_j leaf_coeff_[leaf][j] * features[leaf_features_[leaf][j]]`.
+    /// If ANY feature used by the leaf's linear model is NaN, C++ falls back to the
+    /// stored constant `leaf_value_[leaf]` (which is why both are serialized). The
+    /// learning-rate shrinkage is already folded into `leaf_const`/`leaf_coeff`.
+    ///
+    /// Public so the training loop can score the SAME leaf the data partition
+    /// assigned a row to (bin-based membership), instead of re-routing through the
+    /// real-value thresholds (which can disagree at bin boundaries).
+    #[inline]
+    pub fn linear_leaf_output(&self, leaf: usize, feature_values: &[f64]) -> f64 {
+        let Some(lin) = &self.linear else {
+            // is_linear set without a linear model — treat as constant leaf.
+            return self.leaf_value[leaf];
+        };
+        let feats = &lin.leaf_features[leaf];
+        let coeffs = &lin.leaf_coeff[leaf];
+        let mut out = lin.leaf_const[leaf];
+        for (fi, c) in feats.iter().zip(coeffs.iter()) {
+            let v = feature_values[*fi as usize];
+            if v.is_nan() {
+                return self.leaf_value[leaf];
+            }
+            out += c * v;
+        }
+        out
     }
 
     /// C++ `Tree::PredictLeafIndex` (`tree.h:650-657`): the leaf id (non-negative).
@@ -748,6 +818,18 @@ impl Tree {
             let _ = writeln!(s, "cat_threshold={}", join_u32(&self.cat_threshold));
         }
         let _ = writeln!(s, "is_linear={}", if self.is_linear { 1 } else { 0 });
+        if let Some(lin) = &self.linear {
+            // C++ `Tree::ToString` linear block (between `is_linear` and
+            // `shrinkage`): `leaf_const` (num_leaves, %.17g), `num_features`
+            // (per-leaf counts), then `leaf_features`/`leaf_coeff` — each written
+            // as `"<val> "` per element followed by ONE extra space per leaf group
+            // (so a constant leaf contributes a single trailing space).
+            let _ = writeln!(s, "leaf_const={}", join_f64_g17(&lin.leaf_const));
+            let counts: Vec<i32> = lin.leaf_features.iter().map(|f| f.len() as i32).collect();
+            let _ = writeln!(s, "num_features={}", join_ints(&counts));
+            let _ = writeln!(s, "leaf_features={}", join_leaf_groups_i32(&lin.leaf_features));
+            let _ = writeln!(s, "leaf_coeff={}", join_leaf_groups_f64_g17(&lin.leaf_coeff));
+        }
         let _ = writeln!(s, "shrinkage={}", format_g6(self.shrinkage));
         s.push('\n');
         s
@@ -801,11 +883,13 @@ impl Tree {
             None => false,
         };
 
-        if is_linear {
-            return Err(ModelError::MalformedModel {
-                detail: "linear-tree models (is_linear=1) are out of scope for Phase 3".to_string(),
-            });
-        }
+        // Linear-tree per-leaf models (C++ `is_linear_` block). Parsed here so it
+        // can be attached to BOTH the single-leaf early return and the full tree.
+        let linear = if is_linear {
+            Some(parse_linear_model(&kv, num_leaves)?)
+        } else {
+            None
+        };
 
         let leaf_count = match kv.get("leaf_count") {
             Some(v) => parse_i32_list(v, "leaf_count")?,
@@ -837,6 +921,7 @@ impl Tree {
                 cat_threshold: Vec::new(),
                 shrinkage,
                 is_linear,
+                linear,
                 // Growth-time arrays: a freshly-loaded single-leaf tree has one
                 // leaf at depth 0 with parent -1 and no splits.
                 leaf_depth: vec![0i32; num_leaves.max(0) as usize],
@@ -967,6 +1052,7 @@ impl Tree {
             cat_threshold,
             shrinkage,
             is_linear,
+            linear,
             // Growth-time arrays are NOT serialized, so a parsed model carries
             // default bookkeeping (depth 0 / parent -1 / inner-feature -1 /
             // bin-threshold 0). They are only populated by `split()` during
@@ -991,6 +1077,20 @@ impl Tree {
         }
         for v in &mut self.internal_value {
             *v = maybe_round_to_zero(*v * rate);
+        }
+        // Linear-tree leaves: the learning rate scales the per-leaf linear model
+        // too (C++ `LinearTreeLearner` folds shrinkage into `leaf_const_`/
+        // `leaf_coeff_`, matching the serialized coefficients). `MaybeRoundToZero`
+        // is NOT applied to these (the C++ linear scaling is a plain multiply).
+        if let Some(lin) = &mut self.linear {
+            for c in &mut lin.leaf_const {
+                *c *= rate;
+            }
+            for coeffs in &mut lin.leaf_coeff {
+                for c in coeffs {
+                    *c *= rate;
+                }
+            }
         }
         self.shrinkage = rate;
     }
@@ -1110,6 +1210,7 @@ impl Tree {
             // C++ forces shrinkage_ = 1.0f for a constant tree.
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0],
             leaf_parent: vec![-1],
             split_feature_inner: Vec::new(),
@@ -1152,6 +1253,35 @@ fn join_u32(v: &[u32]) -> String {
             s.push(' ');
         }
         let _ = write!(s, "{x}");
+    }
+    s
+}
+
+/// C++ `Tree::ToString` per-leaf-group layout for `leaf_features`: for each leaf,
+/// write `"<idx> "` for every feature, then ONE extra separating space. An empty
+/// (constant) leaf contributes just that single space. Matches the byte pattern
+/// e.g. `"0 1  0  0 1  "` (double space between groups, double trailing).
+fn join_leaf_groups_i32(groups: &[Vec<i32>]) -> String {
+    let mut s = String::new();
+    for g in groups {
+        for x in g {
+            let _ = write!(s, "{x} ");
+        }
+        s.push(' ');
+    }
+    s
+}
+
+/// C++ `Tree::ToString` per-leaf-group layout for `leaf_coeff` (same grouping as
+/// [`join_leaf_groups_i32`], values formatted `%.17g`).
+fn join_leaf_groups_f64_g17(groups: &[Vec<f64>]) -> String {
+    let mut s = String::new();
+    for g in groups {
+        for x in g {
+            s.push_str(&format_g17(*x));
+            s.push(' ');
+        }
+        s.push(' ');
     }
     s
 }
@@ -1202,6 +1332,85 @@ fn join_f32_g6(v: &[f32]) -> String {
 }
 
 // --- parsing helpers ---
+
+/// Parse the linear-tree per-leaf block (C++ `is_linear_` fields) into a
+/// [`LinearModel`]. `num_leaves` fixes the outer length; the flat `leaf_features`
+/// / `leaf_coeff` token streams are re-grouped by the per-leaf `num_features`
+/// counts. Whitespace grouping in the serialized form is irrelevant here because
+/// `split_whitespace` collapses the runs of spaces.
+fn parse_linear_model(kv: &HashMap<&str, &str>, num_leaves: i32) -> Result<LinearModel, ModelError> {
+    let nl = num_leaves.max(0) as usize;
+    let leaf_const = match kv.get("leaf_const") {
+        Some(v) => parse_f64_list(v, "leaf_const")?,
+        None => {
+            return Err(ModelError::MalformedModel {
+                detail: "linear tree model should contain leaf_const field".to_string(),
+            });
+        }
+    };
+    check_len(&leaf_const, num_leaves, "leaf_const")?;
+
+    let num_features = match kv.get("num_features") {
+        Some(v) => parse_i32_list(v, "num_features")?,
+        None => {
+            return Err(ModelError::MalformedModel {
+                detail: "linear tree model should contain num_features field".to_string(),
+            });
+        }
+    };
+    check_len(&num_features, num_leaves, "num_features")?;
+    // T-03-03: every INDIVIDUAL count must be non-negative before it's used to
+    // slice the flat leaf_features/leaf_coeff streams below — a negative entry
+    // whose sum still happens to be non-negative (e.g. [-1, 3]) would otherwise
+    // pass the sum check, then `c as usize` wraps to a huge index and panics (or,
+    // in release, slices out of bounds) instead of returning a typed error.
+    for (i, &c) in num_features.iter().enumerate() {
+        if c < 0 {
+            return Err(ModelError::MalformedModel {
+                detail: format!("num_features[{i}]={c} is negative"),
+            });
+        }
+    }
+    let total: i64 = num_features.iter().map(|&c| i64::from(c)).sum();
+
+    // Flat feature-index and coefficient streams, re-grouped by num_features.
+    let flat_feats = match kv.get("leaf_features") {
+        Some(v) => parse_i32_list(v, "leaf_features")?,
+        None => Vec::new(),
+    };
+    let flat_coeff = match kv.get("leaf_coeff") {
+        Some(v) => parse_f64_list(v, "leaf_coeff")?,
+        None => Vec::new(),
+    };
+    check_len(&flat_feats, total as i32, "leaf_features")?;
+    check_len(&flat_coeff, total as i32, "leaf_coeff")?;
+    // T-03-03: mirrors the split_feature[i] < 0 check elsewhere in this parser —
+    // a negative leaf_features entry would otherwise escape validation here and
+    // panic later at predict time (`feature_values[*fi as usize]` in
+    // `Tree::linear_leaf_output`) instead of being rejected at load time.
+    for (i, &fi) in flat_feats.iter().enumerate() {
+        if fi < 0 {
+            return Err(ModelError::MalformedModel {
+                detail: format!("leaf_features[{i}]={fi} is negative"),
+            });
+        }
+    }
+
+    let mut leaf_features: Vec<Vec<i32>> = Vec::with_capacity(nl);
+    let mut leaf_coeff: Vec<Vec<f64>> = Vec::with_capacity(nl);
+    let mut off = 0usize;
+    for &c in &num_features {
+        let c = c as usize;
+        leaf_features.push(flat_feats[off..off + c].to_vec());
+        leaf_coeff.push(flat_coeff[off..off + c].to_vec());
+        off += c;
+    }
+    Ok(LinearModel {
+        leaf_const,
+        leaf_features,
+        leaf_coeff,
+    })
+}
 
 fn parse_required_int(kv: &HashMap<&str, &str>, key: &str) -> Result<i32, ModelError> {
     match kv.get(key) {
@@ -1336,6 +1545,7 @@ mod tests {
             cat_threshold: Vec::new(),
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0],
             leaf_parent: vec![-1],
             split_feature_inner: Vec::new(),
@@ -1408,6 +1618,7 @@ mod tests {
             cat_threshold: vec![],
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             // Growth-time arrays are NOT serialized, so they carry the same
             // defaults the parser reconstructs (depth 0 / parent -1 / inner -1 /
             // bin 0). This keeps the parse round-trip struct-equality contract.
@@ -1440,6 +1651,7 @@ mod tests {
             cat_threshold: vec![],
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0],
             leaf_parent: vec![-1],
             split_feature_inner: vec![],
@@ -1669,6 +1881,60 @@ mod tests {
     }
 
     #[test]
+    fn linear_tree_negative_num_features_entry_is_err() {
+        // num_features=[-1, 3] sums to a non-negative total (2) that still
+        // matches the 2-token leaf_features/leaf_coeff lines below, so a
+        // sum-only check would let it through; the per-entry check must catch
+        // the individual negative count before it's used to slice the flat
+        // leaf_features/leaf_coeff streams (which would otherwise panic).
+        let block = "num_leaves=2\n\
+            num_cat=0\n\
+            split_feature=0\n\
+            threshold=0.5\n\
+            decision_type=2\n\
+            left_child=-1\n\
+            right_child=-2\n\
+            leaf_value=0.1 0.2\n\
+            leaf_count=1 1\n\
+            is_linear=1\n\
+            leaf_const=0.1 0.2\n\
+            num_features=-1 3\n\
+            leaf_features=0 1\n\
+            leaf_coeff=0.5 0.5\n\
+            shrinkage=1\n\
+            \n";
+        let err = Tree::parse(block).unwrap_err();
+        assert!(matches!(err, ModelError::MalformedModel { .. }));
+        assert!(err.to_string().contains("num_features"));
+    }
+
+    #[test]
+    fn linear_tree_negative_leaf_feature_index_is_err() {
+        // A negative leaf_features entry must be rejected at load time, not
+        // left to panic later at predict time (`Tree::linear_leaf_output`
+        // indexes `feature_values[*fi as usize]`).
+        let block = "num_leaves=2\n\
+            num_cat=0\n\
+            split_feature=0\n\
+            threshold=0.5\n\
+            decision_type=2\n\
+            left_child=-1\n\
+            right_child=-2\n\
+            leaf_value=0.1 0.2\n\
+            leaf_count=1 1\n\
+            is_linear=1\n\
+            leaf_const=0.1 0.2\n\
+            num_features=1 0\n\
+            leaf_features=-5\n\
+            leaf_coeff=0.5\n\
+            shrinkage=1\n\
+            \n";
+        let err = Tree::parse(block).unwrap_err();
+        assert!(matches!(err, ModelError::MalformedModel { .. }));
+        assert!(err.to_string().contains("leaf_features"));
+    }
+
+    #[test]
     fn does_not_panic_on_nan_feature() {
         let t = tiny_tree();
         let _ = t.predict(&[f64::NAN]);
@@ -1741,6 +2007,7 @@ mod tests {
             cat_threshold: vec![],
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0, 0, 0],
             leaf_parent: vec![-1, -1, -1],
             split_feature_inner: vec![-1, -1],
@@ -1807,6 +2074,7 @@ mod tests {
             cat_threshold: vec![],
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0],
             leaf_parent: vec![-1],
             split_feature_inner: vec![],

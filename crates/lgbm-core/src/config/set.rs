@@ -251,6 +251,17 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
     get_double(&resolved, "monotone_penalty", &mut cfg.monotone_penalty)?;
     check_ge_f("monotone_penalty", cfg.monotone_penalty, 0.0)?;
 
+    get_bool(&resolved, "linear_tree", &mut cfg.linear_tree)?;
+    get_double(&resolved, "linear_lambda", &mut cfg.linear_lambda)?;
+    check_ge_f("linear_lambda", cfg.linear_lambda, 0.0)?;
+
+    get_bool(&resolved, "use_quantized_grad", &mut cfg.use_quantized_grad)?;
+    get_int(&resolved, "num_grad_quant_bins", &mut cfg.num_grad_quant_bins)?;
+    check_ge("num_grad_quant_bins", cfg.num_grad_quant_bins, 1)?;
+    check_le("num_grad_quant_bins", cfg.num_grad_quant_bins, 254)?;
+    get_bool(&resolved, "quant_train_renew_leaf", &mut cfg.quant_train_renew_leaf)?;
+    get_bool(&resolved, "stochastic_rounding", &mut cfg.stochastic_rounding)?;
+
     get_string(&resolved, "forcedsplits_filename", &mut cfg.forcedsplits_filename);
 
     get_double(&resolved, "refit_decay_rate", &mut cfg.refit_decay_rate)?;

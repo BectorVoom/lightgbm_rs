@@ -1,0 +1,16 @@
+{
+  "objective": "regression",
+  "num_leaves": 7,
+  "learning_rate": 0.1,
+  "linear_tree": true,
+  "min_data_in_leaf": 20,
+  "num_threads": 1,
+  "verbose": -1,
+  "seed": 0,
+  "deterministic": true,
+  "force_col_wise": true,
+  "linear_lambda": 2.0,
+  "num_boost_round": 5,
+  "n_train": 800,
+  "n_feat": 4
+}

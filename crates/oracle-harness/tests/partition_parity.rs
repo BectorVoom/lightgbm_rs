@@ -265,7 +265,7 @@ fn partition_child_ranges_device_matches_split_point() {
             .unwrap_or_else(|m| panic!("PCASE `{name}` device PORDER mismatch: {m:?}"));
 
         // The child ranges (read back ONCE, test-only) equal the host split point + ranges.
-        let cr = leaf_splits.read_leaf(&client, leaf_id);
+        let cr = leaf_splits.read_split(&client, leaf_id);
         let sp = split_point as i32;
         assert_eq!(cr.left_start, p_begin, "PCASE `{name}`: left_start");
         assert_eq!(cr.left_end, p_begin + sp, "PCASE `{name}`: left_end");
@@ -275,7 +275,7 @@ fn partition_child_ranges_device_matches_split_point() {
         assert_eq!(cr.right_count, n as i32 - sp, "PCASE `{name}`: right_count");
 
         // A leaf slot that was never written stays zeroed (no cross-slot bleed).
-        let untouched = leaf_splits.read_leaf(&client, 0);
+        let untouched = leaf_splits.read_split(&client, 0);
         assert_eq!(
             [untouched.left_start, untouched.left_end, untouched.left_count],
             [0, 0, 0],

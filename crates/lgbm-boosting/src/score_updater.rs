@@ -326,6 +326,34 @@ impl ScoreUpdater {
         }
     }
 
+    /// LINEAR-tree training-score update: each row's contribution is its leaf's
+    /// per-leaf linear model (`leaf_const + Σ coeff·x`) evaluated on the RAW
+    /// features. Leaf membership comes from the tree's data `partition` (BIN-based,
+    /// from growth) — NOT from re-routing through the real-value thresholds, which
+    /// would disagree at bin boundaries and drift subsequent iterations' gradients
+    /// (matches C++ `LinearTreeLearner`'s `AddPredictionToScore` over the partition).
+    /// `raw` is row-major `num_data * num_features`, indexed by original feature.
+    pub fn add_linear_tree_train_path(
+        &mut self,
+        tree: &Tree,
+        partition: &DataPartition,
+        cur_tree_id: i32,
+        raw: &[f64],
+        num_features: usize,
+    ) {
+        if tree.num_leaves <= 1 {
+            return;
+        }
+        let off = self.offset(cur_tree_id);
+        for leaf in 0..tree.num_leaves {
+            for &row in partition.indices_in_leaf(leaf) {
+                let base = row as usize * num_features;
+                let out = tree.linear_leaf_output(leaf as usize, &raw[base..base + num_features]);
+                self.score[off + row as usize] += out;
+            }
+        }
+    }
+
     /// C++ DART `train_score_updater_->AddScore(model, cur_tree_id)`
     /// (`dart.hpp:135,171,189`): add `multiply * tree.predict(row)` to EVERY row of
     /// class `cur_tree_id`, traversing the tree by each row's real feature values.

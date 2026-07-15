@@ -143,8 +143,10 @@ mod tests {
 
     #[test]
     fn launch_key_display_and_namespace() {
+        // Pins the SHIPPED Display format (the persistent autotune cache logs carry
+        // it) — a silent format change would orphan on-disk cache entries.
         let k = LaunchKey { bucket: 10, feats: 50, bins: 256 };
-        assert_eq!(format!("{k}"), "LaunchKey(b10,f50,b256)");
+        assert_eq!(format!("{k}"), "LaunchKey(bucket=10,feats=50,bins=256)");
         assert_eq!(cache_namespace_id(), "rocm:0");
     }
 }

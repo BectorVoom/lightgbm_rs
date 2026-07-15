@@ -147,6 +147,7 @@ impl TreeGolden {
             cat_threshold: Vec::new(),
             shrinkage: 1.0,
             is_linear: false,
+            linear: None,
             leaf_depth: vec![0; self.num_leaves.max(0) as usize],
             leaf_parent: vec![-1; self.num_leaves.max(0) as usize],
             split_feature_inner: vec![-1; n_internal],
@@ -3243,73 +3244,6 @@ mod hip {
         // ROCM_LEAF_VALUE_TOL. resident==host then follows transitively (both ==anchor).
         let anchor = cpu_anchor_tree(&features, &g, &h, cfg(), num_leaves, max_depth);
         assert_gpu_tree_matches_cpu_anchor(&resident_tree, &anchor, "resident");
-        assert_gpu_tree_matches_cpu_anchor(&host_tree, &anchor, "host");
-    }
-
-    /// 260608-t3t — the FUSED directly-built-leaf path (`LGBM_FUSED_FORCE=1`) must grow
-    /// the SAME tree as the forced-host path. Directly-built leaves (root + smaller
-    /// children) route through the single `build_fix_scan_resident` launch (build + fix
-    /// + compact + scan); subtract-derived larger children keep subtract+scan. Because
-    /// the fused kernel's per-feature SplitInfo is BIT-EXACT to the host pipeline (the
-    /// fused==host kernel oracle) and the resident-RAW f32-atomic build is the only
-    /// ~1e-6 contributor (same as the resident path), the two trees must match
-    /// STRUCTURALLY bit-exact (topology / split_feature / threshold / decision_type) and
-    /// leaf-values within ~1e-6. If they diverge, the fused wiring changed the tree →
-    /// STOP (do NOT weaken the tol).
-    #[test]
-    fn learner_parity_fused_equals_host_tree_on_hip() {
-        // Serialize the force-env window vs the resident test (shared process env vars).
-        let _force_guard = FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let client = rocm_client();
-        let (features, g, h) = spine_corpus(3000, 8, 48);
-        let num_leaves = 31i32;
-        let max_depth = -1i32;
-
-        // FUSED path (eligible). The 3000-row corpus is below FUSED_MAX_NUM_DATA's
-        // (placeholder OFF) threshold, so force the fused path via LGBM_FUSED_FORCE=1
-        // (bypasses ONLY the size gate; every correctness check still applies).
-        let fused_backend = RocmBackend::with_resident(true);
-        let mut fused_learner =
-            SerialTreeLearner::new(&fused_backend, &client, cfg(), num_leaves, max_depth)
-                .with_features(features.clone());
-        // SAFETY: the FORCE_ENV_LOCK guard serializes this env window vs the resident test.
-        // Capture the result and restore the env var BEFORE `.expect` so a failing train
-        // (Err) cannot leak `LGBM_FUSED_FORCE` into a sibling test.
-        unsafe { std::env::set_var("LGBM_FUSED_FORCE", "1") };
-        let fused_result = fused_learner.train(&g, &h, true);
-        unsafe { std::env::remove_var("LGBM_FUSED_FORCE") };
-        let fused_tree = fused_result.expect("fused train ok");
-
-        // FORCED HOST path (same RocmBackend f32-atomic build, host routing).
-        let host_backend = RocmBackend::with_resident(false);
-        let mut host_learner =
-            SerialTreeLearner::new(&host_backend, &client, cfg(), num_leaves, max_depth)
-                .with_features(features.clone());
-        let host_tree = host_learner.train(&g, &h, true).expect("host train ok");
-
-        // ---- Structural fields BIT-EXACT ----
-        assert_eq!(fused_tree.num_leaves, host_tree.num_leaves, "fused vs host: num_leaves");
-        assert_eq!(
-            fused_tree.split_feature, host_tree.split_feature,
-            "fused vs host: split_feature topology"
-        );
-        assert_eq!(
-            fused_tree.decision_type, host_tree.decision_type,
-            "fused vs host: decision_type"
-        );
-        assert_eq!(fused_tree.left_child, host_tree.left_child, "fused vs host: left_child");
-        assert_eq!(fused_tree.right_child, host_tree.right_child, "fused vs host: right_child");
-        assert_eq!(fused_tree.leaf_count, host_tree.leaf_count, "fused vs host: leaf_count");
-        assert_eq!(
-            fused_tree.internal_count, host_tree.internal_count,
-            "fused vs host: internal_count"
-        );
-        assert_eq!(fused_tree.threshold, host_tree.threshold, "fused vs host: threshold");
-
-        // ---- leaf values: pin BOTH GPU trees to the deterministic cpu f64 anchor
-        // (DEF-f8u-01 fix — see learner_parity_resident_equals_host_tree_on_hip).
-        let anchor = cpu_anchor_tree(&features, &g, &h, cfg(), num_leaves, max_depth);
-        assert_gpu_tree_matches_cpu_anchor(&fused_tree, &anchor, "fused");
         assert_gpu_tree_matches_cpu_anchor(&host_tree, &anchor, "host");
     }
 

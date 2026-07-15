@@ -29,8 +29,12 @@ use lgbm_objective::{
 // `Handle`), never a GPU compute runtime — the methods stay generic over `B::Runtime`
 // via the re-exported `ComputeClient`, so the CMP-01 no-runtime gate still holds
 // (exactly the `score_updater.rs` discipline).
-use lgbm_compute::kernels::objective_binary::get_gradients_resident_on as binary_grad_hess_resident_on;
+use lgbm_compute::kernels::objective_binary::{
+    get_gradients_resident_cached_on as binary_grad_hess_resident_cached_on,
+    get_gradients_resident_on as binary_grad_hess_resident_on,
+};
 use lgbm_compute::kernels::objective_regression::{
+    get_gradients_resident_cached_on as regression_grad_hess_resident_cached_on,
     get_gradients_resident_on as regression_grad_hess_resident_on, TAG_L1, TAG_L2,
 };
 use lgbm_compute::ComputeClientReexport as ComputeClient;
@@ -230,34 +234,78 @@ impl<'a> BoostObjective<'a> {
     pub fn get_gradients_resident_on<B: Backend>(
         &self,
         client: &ComputeClient<B::Runtime>,
-        scores_handle: &Handle,
+        resident_score: &lgbm_compute::ResidentScore<B::Runtime>,
         num_data: usize,
         labels: &[f32],
     ) -> Option<Result<(Handle, Handle), ComputeError>> {
+        // Resolve the per-train GradResidency FIRST (labels uploaded once, grad/hess
+        // outputs reused across iterations — see `ResidentScore::grad_residency`), but
+        // only for the bit-exact roster below; every other objective must keep
+        // returning `None` WITHOUT touching the residency.
+        let supported = matches!(
+            self,
+            BoostObjective::Builtin(Objective::Regression { .. })
+                | BoostObjective::Builtin(Objective::RegressionL1)
+                | BoostObjective::Binary(_)
+        );
+        if !supported {
+            // Every other objective (incl. the within-tol-only huber/fair/quantile/
+            // poisson and the num_class>1 multiclass/rank, which the caller's guard
+            // already excludes) falls back to the host grad/hess path.
+            return None;
+        }
+        let scores_handle = resident_score.score_handle();
+        // A/B escape hatch (`LGBM_GRAD_RESIDENCY=0`): the pre-residency launchers —
+        // per-iteration label convert/upload + fresh grad/hess device allocs.
+        // Bit-exact either way (same kernel + launch geometry).
+        if !lgbm_compute::grad_residency_enabled() {
+            return match self {
+                BoostObjective::Builtin(Objective::Regression { .. }) => Some(
+                    regression_grad_hess_resident_on::<B::Runtime>(
+                        client, TAG_L2, scores_handle, num_data, labels, None, 0.0,
+                    ),
+                ),
+                BoostObjective::Builtin(Objective::RegressionL1) => Some(
+                    regression_grad_hess_resident_on::<B::Runtime>(
+                        client, TAG_L1, scores_handle, num_data, labels, None, 0.0,
+                    ),
+                ),
+                BoostObjective::Binary(b) => Some(binary_grad_hess_resident_on::<B::Runtime>(
+                    client,
+                    scores_handle,
+                    num_data,
+                    labels,
+                    None,
+                    b.sigmoid,
+                    None,
+                )),
+                _ => unreachable!("gated by `supported` above"),
+            };
+        }
+        let residency = match resident_score.grad_residency(client, labels) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
         match self {
             BoostObjective::Builtin(Objective::Regression { .. }) => Some(
-                regression_grad_hess_resident_on::<B::Runtime>(
-                    client, TAG_L2, scores_handle, num_data, labels, None, 0.0,
+                regression_grad_hess_resident_cached_on::<B::Runtime>(
+                    client, TAG_L2, scores_handle, num_data, residency, 0.0,
                 ),
             ),
             BoostObjective::Builtin(Objective::RegressionL1) => Some(
-                regression_grad_hess_resident_on::<B::Runtime>(
-                    client, TAG_L1, scores_handle, num_data, labels, None, 0.0,
+                regression_grad_hess_resident_cached_on::<B::Runtime>(
+                    client, TAG_L1, scores_handle, num_data, residency, 0.0,
                 ),
             ),
-            BoostObjective::Binary(b) => Some(binary_grad_hess_resident_on::<B::Runtime>(
+            BoostObjective::Binary(b) => Some(binary_grad_hess_resident_cached_on::<B::Runtime>(
                 client,
                 scores_handle,
                 num_data,
-                labels,
-                None,
+                residency,
                 b.sigmoid,
                 None,
             )),
-            // Every other objective (incl. the within-tol-only huber/fair/quantile/poisson
-            // and the num_class>1 multiclass/rank, which the caller's guard already
-            // excludes) falls back to the host grad/hess path.
-            _ => None,
+            _ => unreachable!("gated by `supported` above"),
         }
     }
 

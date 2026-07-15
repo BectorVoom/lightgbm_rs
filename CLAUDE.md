@@ -1,5 +1,3 @@
-<!-- GSD:project-start source:PROJECT.md -->
-
 ## Project
 
 **LightGBM-rs — Pure Rust LightGBM with CubeCL**
@@ -187,9 +185,7 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - Functions can take many parameters (`Tree::Split` takes ~14); pylint's "too many args" check is
 - Polymorphism is via abstract base classes + string-keyed factories (see Memory & Ownership);
 
-<!-- GSD:conventions-end -->
 
-<!-- GSD:architecture-start source:ARCHITECTURE.md -->
 
 ## Architecture
 
@@ -307,35 +303,8 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - `CHECK_*` macros (`CHECK_EQ`, `CHECK_NOTNULL`, `CHECK_GT`) assert invariants and fatal on failure.
 - `OMP_INIT_EX()/OMP_LOOP_EX_BEGIN()/OMP_THROW_EX()` propagate exceptions out of OpenMP parallel regions.
 
-## Cross-Cutting Concerns
-
-<!-- GSD:architecture-end -->
-
-<!-- GSD:skills-start source:skills/ -->
-
-
-<!-- GSD:workflow-start source:GSD defaults -->
-
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-<!-- GSD:profile-start -->
-
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->
+## kaggle notebook
+mkdir -p ~/.kaggle && echo KGAT_2966b842a0ca6e3c1029fbfea8657f97 > ~/.kaggle/access_token && chmod 600 ~/.kaggle/access_token
 
 
 @AGENTS.md

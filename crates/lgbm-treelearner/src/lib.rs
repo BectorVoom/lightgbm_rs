@@ -34,6 +34,7 @@ pub mod gradient_discretizer;
 pub mod histogram_pool;
 pub mod leaf_splits;
 pub mod learner;
+pub mod linear;
 pub mod monotone_constraints;
 pub mod resident_pool;
 pub mod split_info;
