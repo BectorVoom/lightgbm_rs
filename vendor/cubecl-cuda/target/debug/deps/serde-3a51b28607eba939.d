@@ -1,0 +1,14 @@
+/home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/deps/serde-3a51b28607eba939.d: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/build/serde-0f2c0a2b86877bbf/out/private.rs
+
+/home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/deps/libserde-3a51b28607eba939.rlib: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/build/serde-0f2c0a2b86877bbf/out/private.rs
+
+/home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/deps/libserde-3a51b28607eba939.rmeta: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/build/serde-0f2c0a2b86877bbf/out/private.rs
+
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/build/serde-0f2c0a2b86877bbf/out/private.rs:
+
+# env-dep:OUT_DIR=/home/user/Documents/workspace/lightgbm_rs/vendor/cubecl-cuda/target/debug/build/serde-0f2c0a2b86877bbf/out

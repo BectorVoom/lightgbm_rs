@@ -1,0 +1,11 @@
+{
+  "$schema": "./settings.schema.json",
+  "version": 1,
+  "models": {
+    "profile": "quality",
+    "overrides": {}
+  },
+  "implementation": {
+    "use_worktree": true
+  }
+}

@@ -328,23 +328,26 @@ mod resident_parity_gate {
     }
 
     /// Clause 3 — byte-parity: with `LGBM_CUDA_ON_DEVICE` unset the resolver is
-    /// ON (the on-device path is the resolved default; `on_device_default()` stays
-    /// true), AND the on-device anchor grow is BYTE-IDENTICAL run to run (integer
-    /// accumulation ⇒ order-independent ⇒ no f32 drift), so the cpu/rocm merge gate is
-    /// byte-stable. The full "every cpu+rocm tree byte-identical to master" surface is
-    /// the `learner_parity` gate; this pins the driver-level byte stability of the
-    /// on-device grow.
+    /// OFF (the native host path is the resolved default; `on_device_default()` is
+    /// `false`), so the gate is off by default. This test still exercises the on-device
+    /// driver DIRECTLY (bypassing the gate) to pin that the on-device anchor grow is
+    /// BYTE-IDENTICAL run to run (integer accumulation ⇒ order-independent ⇒ no f32
+    /// drift). The full "every cpu+rocm tree byte-identical to master" surface is the
+    /// `learner_parity` gate; this pins the driver-level byte stability of the on-device
+    /// grow regardless of the default.
     #[test]
-    fn sc4_flag_unset_on_and_grow_byte_identical() {
-        // Flag unset ⇒ ON (the resolved default). On a `cuda` build the device default is a
-        // separate contract, so guard it (mirrors `cpu_build_default_is_on_when_env_unset`).
+    fn sc4_flag_unset_off_and_direct_grow_byte_identical() {
+        // Flag unset ⇒ OFF (the resolved default). On a `cuda` build the device default is a
+        // separate contract, so guard it (mirrors `cpu_build_default_is_off_when_env_unset`).
         #[cfg(not(feature = "cuda"))]
         assert!(
-            lgbm_compute::cuda_on_device_enabled(),
-            "SC-4: with LGBM_CUDA_ON_DEVICE unset the resident control plane must be reachable \
-             (on-device path is the resolved default)"
+            !lgbm_compute::cuda_on_device_enabled(),
+            "SC-4: with LGBM_CUDA_ON_DEVICE unset the on-device gate must be OFF \
+             (native host path is the resolved default)"
         );
 
+        // The grow driver is invoked directly below (not through the gate), so its byte
+        // stability is still exercised even though the production default routes to host.
         let backend = CpuBackend;
         let client = cpu_client();
         let (features, gradients, hessians) = corpus();
@@ -438,21 +441,21 @@ fn zero_is_force_off_one_is_force_on() {
 }
 
 /// On a `cpu` build (no `-F cuda`), with `LGBM_CUDA_ON_DEVICE` unset in a fresh process,
-/// the resolver returns `true` — the resolved default — so the on-device grow path is
-/// reachable without an explicit opt-in. Guarded `#[cfg(not(feature = "cuda"))]` because
-/// a `cuda` build's device default is a separate contract. Known caveats as of the last
-/// real-CUDA measurement (not independently re-verified here): real-hardware evaluation
-/// found the on-device path slower than the host path in every measured shape, and
-/// ~1e-6 real-CUDA parity vs the host-CUDA arm had not been re-resolved either.
+/// the resolver returns `false` — the resolved default — so training takes the fast
+/// native host path and the experimental on-device driver is strictly opt-in. Guarded
+/// `#[cfg(not(feature = "cuda"))]` because a `cuda` build's device default is a separate
+/// contract. Rationale: the on-device driver dispatches a cubecl kernel per
+/// build/scan/subtract/partition and was measured ~30–130× slower than the native host
+/// path on cpu (and slower than host on real CUDA in every measured shape).
 #[cfg(not(feature = "cuda"))]
 #[test]
-fn cpu_build_default_is_on_when_env_unset() {
+fn cpu_build_default_is_off_when_env_unset() {
     // This test binary is invoked without LGBM_CUDA_ON_DEVICE set.
-    // The override is None (unset) and on_device_default() is true on the cpu build,
-    // so the resolved value must be true — the resolved default.
+    // The override is None (unset) and on_device_default() is false on the cpu build,
+    // so the resolved value must be false — the resolved default (opt-in on-device).
     assert!(
-        lgbm_compute::cuda_on_device_enabled(),
-        "cpu-build default with env unset must be ON (on_device_default() == true)"
+        !lgbm_compute::cuda_on_device_enabled(),
+        "cpu-build default with env unset must be OFF (on_device_default() == false)"
     );
 }
 

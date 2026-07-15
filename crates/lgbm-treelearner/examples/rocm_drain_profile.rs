@@ -14,6 +14,12 @@
 //! Knobs (env): LGBM_PROF_NDATA (100000), LGBM_PROF_NFEAT (50),
 //!   LGBM_PROF_NTREES (100), LGBM_PROF_WARMUP (1).
 
+// This harness's real body lives behind `#[cfg(feature = "rocm")]` blocks in `main`;
+// in the default (non-rocm) build those blocks vanish, so the helpers/consts/imports
+// they use look "unused". Silence those false positives without dropping the GPU arm —
+// same idiom as `grow_driver.rs`'s `cfg_attr(not(feature = "gpu"), allow(dead_code))`.
+#![cfg_attr(not(feature = "rocm"), allow(dead_code, unused_imports))]
+
 #[cfg(feature = "rocm")]
 use lgbm_compute::kernels::grow_driver::{on_device_grow_phase_take, GrowPhaseNs};
 #[cfg(feature = "rocm")]

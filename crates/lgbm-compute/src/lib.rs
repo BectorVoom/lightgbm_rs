@@ -2199,27 +2199,32 @@ fn cuda_on_device_override() -> Option<bool> {
 
 /// The compile-time device default for on-device growth when the env is unset.
 ///
-/// STAYS `false` — on-device growth is OPT-IN via `LGBM_CUDA_ON_DEVICE="1"`, so
-/// cpu / rocm / cuda builds are ALL byte-unchanged vs today.
+/// **BACKEND-AWARE**: `true` only on a `cuda`-featured build, `false` everywhere else
+/// (the default `cpu`-only build, `rocm`, `wgpu`). `LGBM_CUDA_ON_DEVICE` still overrides
+/// this in either direction on any build.
 ///
-/// On-device growth is ON by default. Known caveats as of the last real-CUDA
-/// measurement: even after removing host-side control-plane overhead, a per-leaf
-/// device-sync/readback floor (thousands of blocking readbacks per grow) was found to
-/// be the dominant residual cost on real discrete NVIDIA hardware (slower than the host
-/// path in every measured shape), and real-CUDA numerical parity against the f64 anchor
-/// had not been re-resolved either. Those issues have not been independently re-verified
-/// as fixed here — this default was flipped deliberately despite them.
-/// `LGBM_CUDA_ON_DEVICE="0"` remains the explicit off-switch back to the host path, and
-/// `="1"` is a no-op override of this same default.
+/// Rationale: the on-device driver (`grow_tree_on_device_driver_with_cfg`) dispatches a
+/// cubecl compute kernel per histogram-build / scan / subtract / partition. On the
+/// cubecl-cpu runtime each dispatch pays a queue-init + mpmc channel round-trip to worker
+/// threads; for the small per-node arithmetic that dominates CPU training this was
+/// measured at ~30–130× SLOWER than the native host `SerialTreeLearner` path (bench_train:
+/// 8k×30 = 5040ms on-device vs 92ms host) — so `cpu` must default to the native host path.
+/// The CUDA on-device driver is the active perf campaign's target
+/// (`docs/ondevice-cuda-perf-plan.md`; P1b landed a measured 1.09× P100 win over the host
+/// route), so it defaults ON for `cuda` builds. `rocm`/`wgpu` are not (yet) measured to
+/// win on-device by default and stay OFF, opt-in via `LGBM_CUDA_ON_DEVICE="1"` like before.
 ///
-/// Caveat for any future change here: `cfg!(feature = "cuda")` is evaluated in
-/// THIS crate's feature set — a mono-feature (`cuda`-only) build resolves it `true`,
-/// a dual-feature (`cpu`+`cuda`) build resolves it `true` as well, so gating on
-/// `cfg!(feature = "cuda")` instead must keep the `LGBM_CUDA_ON_DEVICE="0"` off-switch as
-/// the escape hatch.
+/// `cfg!(feature = "cuda")` is evaluated in THIS crate's OWN feature set, which mirrors
+/// the production dispatch: the `lgbm` facade (`booster.rs`) selects EXACTLY ONE backend
+/// per build via `#[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]`
+/// for `CpuBackend` — so a `--features cuda` build (even with the always-on `cpu` anchor
+/// feature also present) never actually instantiates `CpuBackend` in `train()`, and this
+/// default correctly reflects the backend that IS instantiated. A future change here must
+/// preserve that correspondence — do not read this cfg outside `lgbm-compute` without
+/// re-checking the facade's backend-selection cascade.
 #[must_use]
 fn on_device_default() -> bool {
-    true
+    cfg!(feature = "cuda")
 }
 
 #[cfg(feature = "cpu")]
@@ -5218,31 +5223,35 @@ mod core_scaled_threshold_tests {
     }
 }
 
-/// The on-device seam is ON by default and the
-/// tree-growth discriminator stays `true` unless explicitly disabled via
-/// `LGBM_CUDA_ON_DEVICE="0"`.
-#[cfg(all(test, feature = "cpu"))]
+/// The on-device seam default is BACKEND-AWARE (`on_device_default`): OFF on a
+/// `cpu`-only build (native host path), ON on a `cuda`-featured build. These tests pin
+/// the `cpu`-only-build behavior, so they are guarded `not(feature = "cuda")` — on a
+/// `cuda`-featured build `cuda_on_device_enabled()` legitimately resolves `true` (see
+/// [`on_device_default`]), which would make these assertions wrong, not the code.
+#[cfg(all(test, feature = "cpu", not(feature = "cuda")))]
 mod on_device_seam_tests {
     use super::{cuda_on_device_enabled, Backend, CpuBackend};
 
-    /// `LGBM_CUDA_ON_DEVICE` is ON by default (env unset in the test process): the
-    /// production gate the growth driver checks returns `true`, so the on-device
-    /// growth path is reachable without an explicit opt-in.
+    /// `LGBM_CUDA_ON_DEVICE` is OFF by default on a `cpu`-only build (env unset in the
+    /// test process): the production gate the growth driver checks returns `false`, so
+    /// training takes the fast native host path unless explicitly opted into.
     #[test]
-    fn cuda_on_device_seam_on_by_default() {
-        assert!(cuda_on_device_enabled(), "LGBM_CUDA_ON_DEVICE must be ON by default");
+    fn cuda_on_device_seam_off_by_default() {
+        assert!(
+            !cuda_on_device_enabled(),
+            "LGBM_CUDA_ON_DEVICE must be OFF by default on a cpu-only build (opt-in)"
+        );
     }
 
-    /// The tree-growth discriminator is `true` by default; the learner's on-device
-    /// eligibility gate ANDs this in, so trained models take the on-device grow path
-    /// unless `LGBM_CUDA_ON_DEVICE="0"` or a specific eligibility exclusion applies
-    /// (e.g. categorical + quantized-gradient combo).
+    /// The tree-growth discriminator is `false` by default on a `cpu`-only build; the
+    /// learner's on-device eligibility gate ANDs this in, so trained models take the
+    /// native host grow path unless `LGBM_CUDA_ON_DEVICE="1"` opts into the on-device driver.
     #[test]
-    fn on_device_growth_supported_stays_true() {
+    fn on_device_growth_supported_stays_false() {
         let backend = CpuBackend;
         assert!(
-            backend.on_device_growth_supported(),
-            "on_device_growth_supported must stay true by default"
+            !backend.on_device_growth_supported(),
+            "on_device_growth_supported must stay false by default on a cpu-only build (opt-in)"
         );
     }
 }

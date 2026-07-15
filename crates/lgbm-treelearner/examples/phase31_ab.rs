@@ -35,6 +35,12 @@
 //!   Each arm ALSO emits a canonical `ONDEV_GROW:` ledger line (matching `phase30_ab.rs`'s
 //!   format) so the Kaggle tooling regex keeps parsing continuously.
 
+// This harness's real body lives behind `#[cfg(feature = "rocm")]` blocks in `main`;
+// in the default (non-rocm) build those blocks vanish, so the helpers/consts/imports
+// they use look "unused". Silence those false positives without dropping the GPU arm —
+// same idiom as `grow_driver.rs`'s `cfg_attr(not(feature = "gpu"), allow(dead_code))`.
+#![cfg_attr(not(feature = "rocm"), allow(dead_code, unused_imports))]
+
 use lgbm_compute::kernels::grow_driver::{
     on_device_grow_phase_take, on_device_sync_count_take, GrowPhaseNs,
 };
