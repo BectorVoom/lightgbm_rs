@@ -177,6 +177,10 @@ fn on_device_sync_count_is_num_features_independent() {
     // fast arm and re-check num_features-independence there.
     #[cfg(feature = "rocm")]
     resident_sync_lane();
+    // SPEC-DRGL-06: the DEFERRED-sync arm (LGBM_GROW_DEFER_SYNC=1) has its own, LOWER closed
+    // form — the per-split read_split is fused into the pick read.
+    #[cfg(feature = "rocm")]
+    resident_defer_sync_lane();
 }
 
 /// `--features rocm` lane: drive the resident fast arm (`RocmBackend::with_resident(true)`)
@@ -322,5 +326,69 @@ fn resident_sync_lane() {
         "resident-perm lane: blocking-readback sync count {syncs_rp} must equal the analytic \
          closed form {analytic_rp} (= 2*num_leaves: root scan + per-iteration pick + per-split \
          child-range readback + per-grow tail perm readback; num_leaves={NUM_LEAVES})"
+    );
+}
+
+/// SPEC-DRGL-06 (`--features rocm`): the DEFERRED-sync arm (`LGBM_GROW_DEFER_SYNC=1`) on the
+/// resident-perm partition arm. The per-split `read_split` is FUSED into the pick's readback
+/// (SPEC-DRGL-05), so the eager arm's `2*num_leaves` collapses to a LOWER closed form,
+/// re-derived here from a fresh `bump_sync()` grep of the deferred loop
+/// (`grow_tree_on_device_resident`'s `grow_defer_sync_enabled()` block):
+///   - root scan (1): the shared setup's `scan_resident_and_argmax`, unchanged.
+///   - per grow-loop iteration (num_leaves-1): ONE `bump_sync` — the batched
+///     `client.read([ranges, pick_export])` that fuses the previous split's deferred
+///     `read_split` with this split's pick. (The eager arm bumps TWICE here: pick + read_split.)
+///   - grow tail (2): the LAST split's deferred `read_split` (1) + the per-grow perm readback (1).
+///     (The eager arm's tail is just the perm readback = 1; the deferral moves the last
+///     read_split here.)
+///   => 1 + (num_leaves-1) + 2 = num_leaves + 2.
+/// EXACT-equality asserted (never `<=`). The default (flag-OFF) `2*num_leaves` form is left
+/// intact above — this is an ADDITIVE lane for the opt-in arm.
+#[cfg(feature = "rocm")]
+fn resident_defer_sync_lane() {
+    use lgbm_compute::runtime::rocm_client;
+    use lgbm_compute::RocmBackend;
+    unsafe {
+        std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
+        std::env::remove_var("LGBM_SIBLING_COPACK");
+        std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
+    }
+    let backend = RocmBackend::with_resident(true);
+    let client = rocm_client();
+    let grow_defer = |num_features: usize| -> (u64, i32) {
+        let _ = on_device_sync_count_take();
+        let (features, g, h) = tiny_corpus(num_features, NUM_DATA);
+        // The deferral requires the resident-perm arm; force it ON alongside the flag.
+        lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(true));
+        lgbm_compute::kernels::grow_driver::set_grow_defer_sync_override(Some(true));
+        let (tree, _layout) =
+            grow_tree_on_device_driver(&backend, &client, &g, &h, &features, NUM_LEAVES, -1)
+                .expect("deferred resident driver must grow the tiny corpus");
+        lgbm_compute::kernels::grow_driver::set_grow_defer_sync_override(None);
+        lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
+        (on_device_sync_count_take(), tree.num_leaves)
+    };
+    let (syncs_3, leaves_3) = grow_defer(3);
+    let (syncs_12, leaves_12) = grow_defer(12);
+    assert_eq!(
+        leaves_3, NUM_LEAVES,
+        "defer lane: corpus must grow the full {NUM_LEAVES} leaves (got {leaves_3})"
+    );
+    assert_eq!(
+        syncs_3, syncs_12,
+        "defer lane: sync count must be num_features-independent (got {syncs_3} vs {syncs_12})"
+    );
+    let analytic_defer = NUM_LEAVES as u64 + 2;
+    assert_eq!(
+        syncs_3, analytic_defer,
+        "defer lane: blocking-readback sync count {syncs_3} must equal the deferred closed form \
+         {analytic_defer} (= num_leaves + 2: root scan + per-iteration fused pick/read_split + \
+         tail [last read_split + perm]; num_leaves={NUM_LEAVES}); the eager arm is 2*num_leaves"
+    );
+    // The deferral must be STRICTLY below the eager resident-perm form (the whole point).
+    assert!(
+        syncs_3 < 2 * NUM_LEAVES as u64,
+        "defer lane: {syncs_3} must be strictly below the eager 2*num_leaves = {}",
+        2 * NUM_LEAVES as u64
     );
 }
