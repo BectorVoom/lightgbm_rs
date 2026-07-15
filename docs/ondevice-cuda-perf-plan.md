@@ -392,3 +392,97 @@ predicted this; the kernel table now confirms it).
   (compute-bound APU, not P100-representative).
 - Every lever: env hatch + in-process override + local byte-identity/envelope
   gate before the Kaggle A/B; default flips only on a measured same-session win.
+
+## 9. Post-P1b root cause & the P2 host-side plan (2026-07-15)
+
+### 9.1 Root cause, restated after P1a+P1b
+
+State: rust on-device **~4.23 s** (P1b session; base 4.60 s) vs official **3.32 s**
+⇒ gap ~0.9–1.2 s (~1.3×). nsys device totals: **ours 0.719 s vs official 0.810 s —
+our device compute now BEATS official.** The scan chain, build, and reduce are no
+longer root causes. The entire remaining gap is **host-side**, decomposed
+(code-verified 2026-07-15, `grow_driver.rs` / `lib.rs` / `partition.rs`):
+
+| # | Host cost | Mechanism (verified) | Size (est.) |
+|---|---|---|---|
+| H1 | g/h round-trip per tree | objective computes g/h ON DEVICE (`get_gradients_resident_on` → `GradResidency.grad/hess` handles), the boosting loop reads them back D2H, then `grow_tree_on_device_resident` takes `&[f32]` and `upload_resident_grad_hess` re-uploads H2D (`lib.rs:3621`, fresh `create_from_slice` per tree). 8 MB moved/tree = **800 MB/train** round-trip that shouldn't exist. Plus `grow_max_abs` host scan of both arrays/tree (`grow_driver.rs:2387`) and the host iota `Vec` alloc/tree (`grow_driver.rs:2415`, dead on the resident-perm arm). | grad 0.34 s + upload share |
+| H2 | per-tree device alloc churn | `ResidentPermPartition::new` (5 buffers + iota launch), `DeviceCudaTree::new`, `DeviceFrontier::new`, `DeviceLeafSplits::new` (2 zeroed `create_from_slice` = 2 real H2D uploads) — ~10 pool allocs/frees **per tree**, ×100, each hitting cubecl's reserve/cleanup path (which takes pool-reclamation fences). | setup 0.27 s + tail share |
+| H3 | 2 blocking syncs/split | pick 8-int export + `read_split` 6-int child ranges ⇒ ~6 200 blocking reads/train; the cuEventSynchronize 1.16 s/8 802 calls bucket. Deferral (2L→L+2) measured 0.836× (T-11) — but that arm was pre-P1b (legacy-kernel scan penalty) and has since been deleted in the dead-toggle refactor. | part of 1.16 s waits |
+| H4 | per-launch dispatch storm | 53 043 `cuMemcpyHtoDAsync` (~17.7/split, 482 ms) — cubecl-cuda sm_60 per-launch info buffers + arg buffers. Upstream code, but we maintain `vendor/cubecl-cuda/` (CUDA-graph fork, currently unwired). | ~0.3–0.48 s |
+| H5 | binning | already rayon-parallel (`LGBM_PAR_BIN` default-on) on ~4 vCPU; official also bins on CPU — **its share inside official's 3.32 s has never been measured**, so the true deficit is unknown. | ≤0.86 s, likely much less |
+
+### 9.2 Phase P2 — host residency & pooling (safe, bit-exact, locally testable)
+
+Ordering: evidence first, then the levers that are bit-exact-by-construction
+(same bytes, same kernels — only *when/where* buffers live changes). Every lever:
+env hatch + `set_*_override` + counts tripwire + local byte-identity gate
+(cpu anchor + gfx1151) + same-session order-alternated warm-median-3 Kaggle A/B
+before any default flip (§8 protocol). Dependencies: cubecl stays 0.10.0 (latest
+published — verified, no upgrade lever); no new crates needed for P2.
+
+- **P2.0 Evidence re-baseline (1 Kaggle session).** Post-P1b nsys rerun with
+  `cuda_api_sum` (how much of the 1.16 s sync / 482 ms upload storm survives
+  P1a+P1b); free-run + drain ledgers; and — new — time official's
+  `Dataset` construction separately from `booster.train` to size H5 honestly.
+  Exit: an updated host-side table apportioning the ~1 s gap across H1–H5.
+- **P2.1 End-to-end device-resident g/h (attacks H1).** Add a device-handle grow
+  entry (`Option<(&Handle, &Handle)>` alongside the host slices, or a
+  `GradSource::{Host, Device}` enum like `NumDataSrc`): the boosting loop passes
+  the `GradResidency` handles straight through; `upload_resident_grad_hess`
+  becomes a no-op on that arm; `grow_max_abs` moves to a small device max-abs
+  reduce (or is folded into the existing objective kernel launch); the root fold
+  already routes through `backend.root_grad_hess_sum`. The D2H readback stays
+  ONLY for consumers that genuinely need host g/h (custom objectives, bagging
+  subset gather, the cpu anchor — all keep the host arm byte-unchanged).
+  Bit-exact by construction (identical bytes reach identical kernels).
+  Hatch `LGBM_GRAD_DEVICE_PASSTHRU`, tripwire `grad_passthru=`. Est. −0.15–0.30 s.
+- **P2.2 Per-tree device-struct pool (attacks H2).** Persist
+  `ResidentPermPartition` / `DeviceCudaTree` / `DeviceFrontier` /
+  `DeviceLeafSplits` on `GpuBackend` keyed by geometry (the `GradResidency` /
+  desc-hoist pattern, reset in `reset_resident_pool`); re-seed per tree with
+  device kernels (iota relaunch; zero-fill kernels replacing the zeroed
+  `create_from_slice` uploads — note the desc-hoist precedent: `client.empty` +
+  full overwrite where a pass writes every cell). Hatch `LGBM_GROW_POOL`,
+  tripwire `grow_pool=`. Est. −0.10–0.25 s.
+- **P2.3 Tail perm readback removal (H2/H3 tail).** The once-per-grow 2 MB
+  `read_perm` feeds the host `LeafPartitionLayout` rebuild, but the resident
+  score update already scatters by device ranges. Make the layout LAZY: keep the
+  device perm + ranges as the primary artifact; materialize the host layout only
+  for consumers that need it (linear trees, `renew_leaf_output` (l1), host score
+  paths, tests). Est. −0.05–0.10 s (200 MB D2H + 100 syncs/train).
+- **P2.4 Trivia (with P2.2).** Skip the host iota `Vec` on the resident-perm arm;
+  audit remaining per-split `create_from_slice` in the partition/treesplit
+  launchers (nsys says ~17.7 uploads/split; desc-hoist covered scan+build only).
+- **P2.5 Partition micro-shape (only if P2.0 re-confirms).** `mark_block_scan`
+  40.7 µs and `fix_compact` 25–62 µs vs official's 4–12 µs analogs — P1a-style
+  geometry review, bit-exact (u32 marks / integer scans). Est. −0.10–0.15 s device.
+
+### 9.3 Phase P3 — framework bets (each needs a user decision)
+
+- **P3.1 Fork lever on the dispatch storm (H4).** We already maintain
+  `vendor/cubecl-cuda/` with a proven server-thread hook. Options, in escalating
+  invasiveness: (a) memoize/pool the per-launch info-buffer uploads for repeated
+  identical launch shapes; (b) pre-pin a staging arena to cut `reserve→cleanup`
+  fences; (c) upstream an issue/PR with the nsys evidence. Est. −0.2–0.4 s but
+  carries fork-maintenance cost — decide after P2.0 sizes what remains.
+- **P3.2 Sync-deferral revisit (H3) — only if the post-P2 ledger shows pick/sync
+  dominant.** The T-11 0.836× verdict predates P1b: the deferred arm paid for
+  legacy-kernel scans + build-LEFT; a rebuild atop official-shape devcount scan
+  twins + co-pack (`subtract_scan_resident_siblings_into_frontier_devcount`
+  exists) could flip the sign. The arm was deleted (25a1da1) — this is a
+  re-implementation, not a re-enable. High effort; evidence-gated.
+- **P3.3 Multi-stream overlap** — still blocked on cubecl 0.10 single queue;
+  watch upstream releases.
+- **P3.4 Stop.** After P2, projected ~3.6–3.9 s vs 3.32 s (~1.1–1.2×) with
+  device compute already ahead of official — a defensible place to declare the
+  CUDA benchmark done and return to feature parity work.
+
+### 9.4 Projection
+
+| After | Expected wall (P100) | Gap vs 3.32 s |
+|---|---|---|
+| today (post-P1b) | ~4.2–4.5 s | ~1.3× |
+| P2.1 g/h passthrough | ~4.0–4.2 s | ~1.23× |
+| P2.2–P2.4 pools + tail | ~3.8–4.0 s | ~1.17× |
+| P2.5 partition | ~3.7–3.9 s | ~1.14× |
+| P3.1 fork lever (if taken) | ~3.4–3.6 s | **~1.05×** |

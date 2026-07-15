@@ -46,6 +46,12 @@
 //! (This harness sets LGBM_ONDEVICE_GROWFEAT_MEMO + the fused override itself per arm —
 //!  do NOT set LGBM_ONDEVICE_FUSED_PARTITION / LGBM_ONDEVICE_GROWFEAT_MEMO yourself.)
 
+// This harness's real body lives behind `#[cfg(feature = "rocm")]` blocks in `main`;
+// in the default (non-rocm) build those blocks vanish, so the helpers/consts/imports
+// they use look "unused". Silence those false positives without dropping the GPU arm —
+// same idiom as `grow_driver.rs`'s `cfg_attr(not(feature = "gpu"), allow(dead_code))`.
+#![cfg_attr(not(feature = "rocm"), allow(dead_code, unused_imports))]
+
 use lgbm_compute::kernels::grow_driver::{on_device_grow_phase_take, set_fused_partition_override};
 use lgbm_compute::{BinColumn, GainConfig};
 use lgbm_dataset::bin_mapper::{BinType, MissingType};
