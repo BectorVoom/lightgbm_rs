@@ -1054,8 +1054,8 @@ mod real_gpu_gated {
     use cubecl::prelude::*;
     use lgbm_compute::gain::get_leaf_gain;
     use lgbm_compute::kernels::split::{
-        find_best_splits_fused_kernel, find_best_splits_fused_staged_par_kernel,
-        find_best_splits_fused_staged_parprefix_kernel,
+        find_best_splits_fused_kernel, find_best_splits_fused_staged_official_kernel,
+        find_best_splits_fused_staged_par_kernel, find_best_splits_fused_staged_parprefix_kernel,
     };
 
     #[cfg(feature = "cuda")]
@@ -1133,6 +1133,8 @@ mod real_gpu_gated {
             let out_a = client.create_from_slice(f64::as_bytes(&zeros));
             let out_b = client.create_from_slice(f64::as_bytes(&zeros));
             let out_c = client.create_from_slice(f64::as_bytes(&zeros));
+            let out_d = client.create_from_slice(f64::as_bytes(&zeros));
+            let plane_dim = client.properties().hardware.plane_size_max;
 
             // SAFETY: contiguous region tiling; out sized n*12; arrays sized n;
             // legacy guards lane < n_feats; pargain geometry = exactly n cubes.
@@ -1208,6 +1210,33 @@ mod real_gpu_gated {
                     sum_h_b,
                     num_data,
                 );
+                // OFFICIAL kernel into out_d — 256-wide (one lane per bin), its own
+                // plane_dim arg. Same envelope contract as parprefix (is_splittable
+                // EXACT, gain ~1e-6).
+                find_best_splits_fused_staged_official_kernel::launch(
+                    &client,
+                    CubeCount::Static(n as u32, 1, 1),
+                    CubeDim::new_1d(256),
+                    ArrayArg::from_raw_parts(h_hist.clone(), buf_len),
+                    ArrayArg::from_raw_parts(out_d.clone(), out_len),
+                    ArrayArg::from_raw_parts(h_slot.clone(), n),
+                    ArrayArg::from_raw_parts(h_nbn.clone(), n),
+                    ArrayArg::from_raw_parts(h_off.clone(), n),
+                    ArrayArg::from_raw_parts(h_dbn.clone(), n),
+                    ArrayArg::from_raw_parts(h_skp.clone(), n),
+                    ArrayArg::from_raw_parts(h_rv.clone(), n),
+                    ArrayArg::from_raw_parts(h_fw.clone(), n),
+                    u32::from(l1),
+                    min_data,
+                    1e-3f64,
+                    l1v,
+                    l2v,
+                    min_gain_shift,
+                    sum_g,
+                    sum_h_b,
+                    num_data,
+                    plane_dim,
+                );
             }
             let a = f64::from_bytes(&client.read_one_unchecked(out_a)).to_vec();
             let b = f64::from_bytes(&client.read_one_unchecked(out_b)).to_vec();
@@ -1236,6 +1265,36 @@ mod real_gpu_gated {
                     assert!(
                         (ga - gc).abs() <= tol,
                         "case {ci} feat {fi}: gain legacy {ga} vs parprefix {gc} (tol {tol})"
+                    );
+                }
+            }
+            // OFFICIAL vs legacy: same envelope contract as parprefix — is_splittable
+            // + threshold EXACT (integer decisions), gain within ~1e-6 (block-prefix
+            // f64 reorder). Per feature (12 cells).
+            let d = f64::from_bytes(&client.read_one_unchecked(out_d)).to_vec();
+            for fi in 0..n {
+                let o = fi * 12;
+                assert_eq!(
+                    a[o].to_bits(),
+                    d[o].to_bits(),
+                    "case {ci} feat {fi}: is_splittable legacy {} != official {}",
+                    a[o],
+                    d[o]
+                );
+                if a[o] != 0.0 {
+                    // threshold cell (out[1]) is integer-exact under any add order.
+                    assert_eq!(
+                        a[o + 1].to_bits(),
+                        d[o + 1].to_bits(),
+                        "case {ci} feat {fi}: threshold legacy {} != official {}",
+                        a[o + 1],
+                        d[o + 1]
+                    );
+                    let (ga, gd) = (a[o + 2], d[o + 2]);
+                    let tol = 1e-6 * (1.0 + ga.abs());
+                    assert!(
+                        (ga - gd).abs() <= tol,
+                        "case {ci} feat {fi}: gain legacy {ga} vs official {gd} (tol {tol})"
                     );
                 }
             }

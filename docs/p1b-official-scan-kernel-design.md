@@ -1,11 +1,29 @@
 # P1b — Official-Shape Parallel Scan Kernel: Ready-to-Code Design
 
-Status 2026-07-15: **algorithm reformulation PROVEN + committed** (`b30b014`); the
-kernel is fully designed below and ready to cut in a FRESH session (GPU
-byte-identity debug needs headroom — do NOT start in a long context). Follows the
-Phase-0 nsys round + P1a (`745a59c`). Target: staged scan 131 µs/launch →
-official's ~7.5 µs class (nsys §5); the biggest remaining device bucket
-(313 + 87 = 400 ms/train).
+Status 2026-07-15: **KERNEL CODED + LOCALLY VALIDATED (rungs 1-3 green on real
+gfx1151); Kaggle P100 A/B (rung 4) is the remaining step.** The three kernel twins
+(`find_best_splits_fused_staged_official_kernel` / `..._siblings_..._official_kernel`
+/ `..._siblings_subtract_..._official_kernel`), the `official_branch_block` #[cube]
+helper, the f64 block collectives (`block_inclusive_scan_f64` / `block_max_f64` /
+`block_min_u32`), the `LGBM_SCAN_OFFICIAL` gate (`scan_official_enabled` +
+`set_scan_official_override`, default OFF both backends), the `scan_official=` counts
+tripwire, and the launcher wiring (official PRECEDES parprefix/pargain in
+`launch_staged_{single,siblings}_scan` + the subtract-fuse launcher, CubeDim=256 +
+`plane_dim`) are all landed in `crates/lgbm-compute/src/kernels/split.rs`. Rung-2
+(`pargain_kernel_matches_legacy_kernel_on_device` official arm) + rung-3
+(`resident_score_within_envelope_of_host_cuda` with `LGBM_SCAN_OFFICIAL=1`, anchor
+bit-exact still green) PASS on gfx1151. Work is UNCOMMITTED on
+`refactor/remove-dead-toggles`. Follows the Phase-0 nsys round + P1a (`745a59c`).
+Target: staged scan 131 µs/launch → official's ~7.5 µs class (nsys §5); the biggest
+remaining device bucket (313 + 87 = 400 ms/train).
+
+Original design (below) followed as-built; the only implementation refinement worth
+noting: `official_branch_block`'s argmax uses `block_max_f64(cand_gain)` +
+`block_min_u32(key)` with `is_splittable` folded from a separate
+`block_max_f64(valid?1:0)` OR (matching the staged kernels' independent
+`is_splittable` flag), and reads the histogram from the LDS stage (same cooperative
+staging as the staged family) rather than directly from global — keeping all three
+twins structurally identical to their staged counterparts.
 
 ## The hypothesis (why this may win where parprefix lost)
 

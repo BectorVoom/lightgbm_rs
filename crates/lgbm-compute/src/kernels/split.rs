@@ -2574,6 +2574,620 @@ pub fn find_best_splits_fused_siblings_subtract_staged_kernel(
 }
 
 // ============================================================================
+// OFFICIAL-SHAPE parallel scan ("official", `LGBM_SCAN_OFFICIAL`) — P1b. The
+// staged/pargain/parprefix kernels all keep `SCAN_STAGED_CUBE_DIM=64` and run the
+// per-candidate walk on 1-2 lanes (staged) or a 32-lane warp (pargain). Official
+// LightGBM's `FindBestSplitsForLeafKernel<<<num_tasks, 256>>>` uses ONE THREAD PER
+// BIN, a block prefix-sum across all 256 threads, then a block argmax — 4× the
+// per-feature parallelism at num_bin=255 and ~25.6k active threads (100 blocks ×
+// 256) vs the staged path's ~200 active lanes. This is the "clean full-shape
+// rewrite" the P1b design (`docs/p1b-official-scan-kernel-design.md`) calls for; the
+// hypothesis is that the 256-wide geometry wins where pargain/parprefix lost (both
+// kept CUBE_DIM=64). Default OFF both backends until the Kaggle P100 A/B settles it.
+//
+// ALGORITHM (proven bit-exact on the cpu lane, `scan_pargain_parity.rs::official_
+// branch` + `assert_official_parity`, committed `b30b014`): the serial `done`
+// early-break recurrence is REMOVED and replaced with the STATELESS per-candidate
+// guard `active && !cont && !brk` — equal to the serial considered-set because
+// reverse `right_count` is non-decreasing ⇒ `cont` monotone true→false and `brk`
+// monotone false→true, so `{consider} == {active && !cont && !brk}` with no
+// recurrence (forward symmetric). NEAR side = the directly-accumulated prefix, FAR
+// side = complement `total − acc`. Counts/threshold stay integer-exact under any add
+// order; only g/h gains reorder (block prefix) → the documented ~1e-6 GPU envelope
+// (same contract as pargain/parprefix; the cpu ANCHOR never runs this kernel).
+// ============================================================================
+
+/// Cross-plane carry width for the official block collectives — sized to the max
+/// plane width (wave64) so plane-0's exclusive-scan writes (`stage[lane]`, lane <
+/// plane_dim) never index out of bounds; the number of planes read back is only
+/// `ceil(256/plane_dim) ≤ 8`. Mirrors `best_split::STAGE1_N_PLANES_MAX` (=32, valid
+/// on the wave32/warp32 validated GPUs) but widened to 64 for robustness.
+#[cfg(feature = "gpu")]
+const OFFICIAL_SCAN_STAGE: usize = 64;
+
+/// Official-shape block width: 256 threads, one lane per bin (num_bin ≤ 255 ⇒ no
+/// striding of the scan itself; the histogram stage still strides `2*num_bin ≤ 512`
+/// cells). Matches official LightGBM's `NUM_THREADS_PER_BLOCK` for the split finder.
+#[cfg(feature = "gpu")]
+const SCAN_OFFICIAL_CUBE_DIM: u32 = 256;
+
+/// Two-level within-block f64 INCLUSIVE prefix-sum — the f64 twin of
+/// `best_split::stage1_block_scan`. `plane_inclusive_sum` intra-plane, then plane 0
+/// exclusive-scans the per-plane totals under a `SharedMemory` carry, each unit adds
+/// its plane base back. Returns `UNIT_POS`'s block-wide inclusive prefix of `v` in
+/// lane order. The plane reorder is why the gain is ~1e-6 (not bit-exact) — integer
+/// counts summed through this stay exact (< 2^53).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::manual_div_ceil)] // matches best_split::stage1_block_scan (cubecl lowering)
+fn block_inclusive_scan_f64(v: f64, plane_dim: u32) -> f64 {
+    let mut stage = SharedMemory::<f64>::new(OFFICIAL_SCAN_STAGE);
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let local = plane_inclusive_sum(v);
+    if lane == pd - 1 {
+        stage[plane_id] = local;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { f64::new(0.0) };
+        stage[lane] = plane_exclusive_sum(t);
+    }
+    sync_cube();
+    let base = stage[plane_id];
+    base + local
+}
+
+/// Block-wide f64 MAX, broadcast to EVERY lane (two-level `plane_max` + LDS carry +
+/// a 1-cell result broadcast). `ident` pads the cross-plane lanes beyond `n_planes`;
+/// callers pass a value ≤ every real input (0.0 is safe here — every input is a
+/// non-negative gain or a 0/1 flag).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::manual_div_ceil)]
+fn block_max_f64(v: f64, plane_dim: u32, ident: f64) -> f64 {
+    let mut stage = SharedMemory::<f64>::new(OFFICIAL_SCAN_STAGE);
+    let mut result = SharedMemory::<f64>::new(1usize);
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let pmax = plane_max(v);
+    if lane == 0 {
+        stage[plane_id] = pmax;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { ident };
+        let total = plane_max(t);
+        if lane == 0 {
+            result[0] = total;
+        }
+    }
+    sync_cube();
+    result[0]
+}
+
+/// Block-wide u32 MIN, broadcast to EVERY lane (two-level `plane_min` + LDS carry).
+/// `ident` (= the "no candidate" sentinel `u32::MAX`) pads the cross-plane lanes so
+/// they never win. Used for the argmax tie-break: the lowest `UNIT_POS` among the
+/// gain-tied winners (≡ the serial strict-`>` first-max, lowest k).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::manual_div_ceil)]
+fn block_min_u32(v: u32, plane_dim: u32, ident: u32) -> u32 {
+    let mut stage = SharedMemory::<u32>::new(OFFICIAL_SCAN_STAGE);
+    let mut result = SharedMemory::<u32>::new(1usize);
+    let pd = plane_dim as usize;
+    let i = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = i / pd;
+    let pmin = plane_min(v);
+    if lane == 0 {
+        stage[plane_id] = pmin;
+    }
+    sync_cube();
+    let cd = CUBE_DIM as usize;
+    let n_planes = (cd + pd - 1) / pd;
+    if plane_id == 0 {
+        let t = if lane < n_planes { stage[lane] } else { ident };
+        let total = plane_min(t);
+        if lane == 0 {
+            result[0] = total;
+        }
+    }
+    sync_cube();
+    result[0]
+}
+
+/// One official-shape branch (reverse `forward=0` or forward `forward=1`) over a
+/// STAGED (LDS) histogram, ALL `CUBE_DIM` lanes cooperating. Lane `k = UNIT_POS`
+/// owns candidate k (`k < count`; higher lanes inert). Writes the branch's 6-cell
+/// state (`[is_splittable, best_gain, threshold, left_count, sum_left_gradient,
+/// sum_left_hessian]`) that [`merge_finalize_staged`] consumes — the SAME state
+/// layout the serial [`scan_rev_branch_staged`]/[`scan_fwd_branch_staged`] produce.
+///
+/// MUST be called by every lane uniformly (the block collectives sync internally);
+/// do NOT wrap in a divergent `if UNIT_POS == …`. The NEAR side is always the
+/// directly-accumulated prefix (`acc_*`), the FAR side its complement — for reverse
+/// NEAR = right, for forward NEAR = left (the committed `official_branch`'s exact
+/// arithmetic). Real-GPU only (block collectives + f64 LDS).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn official_branch_block(
+    sm: &Slice<f64>,
+    state: &mut SliceMut<f64>,
+    forward: u32, // 0 = reverse, 1 = forward
+    num_bin: i32,
+    offset: i32,
+    default_bin: i32,
+    skip_default_bin: u32, // 0|1
+    use_l1: u32,           // 0|1
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64, // ALREADY bumped by 2*kEpsilon (host)
+    num_data: i32,
+    count: i32,
+    plane_dim: u32,
+) {
+    let fwd = forward != 0;
+    let use_l1_b = use_l1 != 0;
+    let skip_def = skip_default_bin != 0;
+    let cnt_factor = f64::cast_from(num_data) / sum_hessian;
+    let k = UNIT_POS as i32;
+    let t_start = num_bin - 1 - offset;
+
+    // ---- per-bin contribution (masked); higher lanes (k >= count) inert ----
+    // reverse: t = t_start − k with an explicit in-range gate; forward: t = k, no
+    // gate (fold via `|| fwd`). Verbatim from `official_branch`.
+    let in_count = k < count;
+    let t = select(fwd, k, t_start - k);
+    let in_range = t >= (1 - offset);
+    let in_range_eff = in_range || fwd;
+    let skip = skip_def && (t + offset) == default_bin;
+    let active = in_count && in_range_eff && !skip;
+    let t_safe = select(t < 0, 0i32, t);
+    let bi = (t_safe as usize) * 2;
+    let g_raw = sm[bi];
+    let h_raw = sm[bi + 1];
+    let g = select(active, g_raw, 0.0);
+    let h = select(active, h_raw, 0.0);
+    let qc = select(active, round_int(h_raw * cnt_factor), 0i32);
+    let qc_f = f64::cast_from(qc);
+
+    // ---- block inclusive prefix-sums in lane order (near-side accumulation) ----
+    let acc_g = block_inclusive_scan_f64(g, plane_dim);
+    // kEpsilon seed added AFTER the scan (constant offset — matches the serial
+    // `sum_*_hessian = kEpsilon` init; the plane reorder makes this ~1e-6 anyway).
+    let acc_h = block_inclusive_scan_f64(h, plane_dim) + f64::cast_from(K_EPSILON);
+    let acc_cnt_f = block_inclusive_scan_f64(qc_f, plane_dim);
+    let acc_cnt = i32::cast_from(acc_cnt_f);
+
+    // ---- near = acc, far = complement; left/right by branch direction ----
+    let sum_left_gradient = select(fwd, acc_g, sum_gradient - acc_g);
+    let sum_left_hessian = select(fwd, acc_h, sum_hessian - acc_h);
+    let left_count = select(fwd, acc_cnt, num_data - acc_cnt);
+    let sum_right_gradient = select(fwd, sum_gradient - acc_g, acc_g);
+    let sum_right_hessian = select(fwd, sum_hessian - acc_h, acc_h);
+    // NEAR (=acc) too small ⇒ `cont`; FAR (=complement) too small ⇒ `brk`. NEAR is
+    // acc regardless of direction, so no branch needed here.
+    let far_cnt = num_data - acc_cnt;
+    let far_h = sum_hessian - acc_h;
+    let cont = acc_cnt < min_data_in_leaf || acc_h < min_sum_hessian_in_leaf;
+    let brk = far_cnt < min_data_in_leaf || far_h < min_sum_hessian_in_leaf;
+    let consider = active && !cont && !brk;
+
+    let current_gain = get_split_gains(
+        use_l1_b,
+        sum_left_gradient,
+        sum_left_hessian,
+        sum_right_gradient,
+        sum_right_hessian,
+        lambda_l1,
+        lambda_l2,
+    );
+    let valid = consider && current_gain > min_gain_shift;
+    let cand_gain = select(valid, current_gain, 0.0);
+    let threshold = select(fwd, t + offset, t - 1 + offset);
+
+    // ---- block argmax (gain desc, k asc) + is_splittable OR ----
+    let flag = block_max_f64(select(valid, 1.0, 0.0), plane_dim, 0.0);
+    let gmax = block_max_f64(cand_gain, plane_dim, 0.0);
+    // `gmax` is a selected element value (max, not a reduction), so the winning
+    // lane's `cand_gain == gmax` holds bit-for-bit; `gmax > 0` excludes the all-
+    // invalid case (every valid gain > min_gain_shift ≥ 0 ⇒ cand_gain > 0).
+    let eligible = valid && cand_gain == gmax && gmax > 0.0;
+    let key = select(eligible, UNIT_POS, 4294967295u32);
+    let winner_k = block_min_u32(key, plane_dim, 4294967295u32);
+
+    // ---- lane 0 seeds the no-split state, then the winner writes its payload ----
+    if UNIT_POS == 0 {
+        state[0] = flag;
+        state[1] = 0.0;
+        state[2] = 0.0;
+        state[3] = 0.0;
+        state[4] = 0.0;
+        state[5] = 0.0;
+    }
+    sync_cube();
+    if UNIT_POS == winner_k {
+        state[1] = cand_gain;
+        state[2] = f64::cast_from(threshold);
+        state[3] = f64::cast_from(left_count);
+        state[4] = sum_left_gradient;
+        state[5] = sum_left_hessian;
+    }
+    sync_cube();
+}
+
+/// OFFICIAL-SHAPE single-leaf kernel: ONE CUBE PER FEATURE, `SCAN_OFFICIAL_CUBE_DIM`
+/// (256) lanes. Cooperatively stages the feature's histogram into LDS, then runs the
+/// all-lanes [`official_branch_block`] REVERSE then FORWARD (reusing the LDS stage),
+/// and lane 0 merges + finalizes into `out[f*12..]`. ~1e-6 vs
+/// [`find_best_splits_fused_staged_kernel`] (block prefix reorders the f64 g/h sums;
+/// counts/threshold/is_splittable are integer-exact). Real-GPU only.
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_staged_official_kernel(
+    hist: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift: f64,
+    sum_gradient: f64,
+    sum_hessian: f64,
+    num_data: i32,
+    plane_dim: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    let mut c = UNIT_POS as usize;
+    while c < cells {
+        sm[c] = hist[base + c];
+        c += cd;
+    }
+    sync_cube();
+
+    official_branch_block(
+        &sm.to_slice(),
+        &mut state_rev.to_slice_mut(),
+        0u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+        plane_dim,
+    );
+    sync_cube();
+    official_branch_block(
+        &sm.to_slice(),
+        &mut state_fwd.to_slice_mut(),
+        1u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+        plane_dim,
+    );
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            f * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
+/// OFFICIAL-SHAPE co-pack sibling twin of [`find_best_splits_fused_staged_official_kernel`]
+/// (the LIVE default arm the grow driver co-packs). `CUBE_POS_Y` selects the sibling
+/// (A = smaller, B = larger); each writes its 12-cell window (A → `f`, B → `n_feats + f`).
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_staged_official_kernel(
+    hist_a: &Array<f64>,
+    hist_b: &Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    n_feats: u32,
+    plane_dim: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_b[base + c];
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_a[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    official_branch_block(
+        &sm.to_slice(),
+        &mut state_rev.to_slice_mut(),
+        0u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+        plane_dim,
+    );
+    sync_cube();
+    official_branch_block(
+        &sm.to_slice(),
+        &mut state_fwd.to_slice_mut(),
+        1u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+        plane_dim,
+    );
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
+/// FUSED-SUBTRACT official twin of [`find_best_splits_fused_siblings_staged_official_kernel`]
+/// — sibling B stages `d = parent − smaller` into `larger_out` (fresh buffer) AND
+/// into LDS, folding the subtraction trick into the co-pack scan (the subtract-fuse
+/// lever). Byte-identical `larger_out` to the staged subtract twin; the branch scans
+/// are the official-shape block scans. Real-GPU only.
+#[cfg(feature = "gpu")]
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn find_best_splits_fused_siblings_subtract_staged_official_kernel(
+    hist_smaller: &Array<f64>,
+    hist_parent: &Array<f64>,
+    larger_out: &mut Array<f64>,
+    out: &mut Array<f64>,
+    slot_off: &Array<u32>,
+    num_bin: &Array<i32>,
+    offset: &Array<i32>,
+    default_bin: &Array<i32>,
+    skip_default_bin: &Array<u32>,
+    rev_count: &Array<i32>,
+    fwd_count: &Array<i32>,
+    use_l1: u32,
+    min_data_in_leaf: i32,
+    min_sum_hessian_in_leaf: f64,
+    lambda_l1: f64,
+    lambda_l2: f64,
+    min_gain_shift_a: f64,
+    sum_gradient_a: f64,
+    sum_hessian_a: f64,
+    num_data_a: i32,
+    min_gain_shift_b: f64,
+    sum_gradient_b: f64,
+    sum_hessian_b: f64,
+    num_data_b: i32,
+    n_feats: u32,
+    plane_dim: u32,
+) {
+    let f = CUBE_POS_X;
+    let fi = f as usize;
+    let is_b = CUBE_POS_Y != 0;
+    let mut sm = SharedMemory::<f64>::new(SCAN_STAGE_MAX_CELLS);
+    let mut state_rev = SharedMemory::<f64>::new(8usize);
+    let mut state_fwd = SharedMemory::<f64>::new(8usize);
+
+    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
+    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
+    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let num_data = select(is_b, num_data_b, num_data_a);
+
+    let base = slot_off[fi] as usize;
+    let cells = (u32::cast_from(num_bin[fi]) as usize) * 2;
+    let cd = CUBE_DIM as usize;
+    if is_b {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            let d = hist_parent[base + c] - hist_smaller[base + c];
+            larger_out[base + c] = d;
+            sm[c] = d;
+            c += cd;
+        }
+    } else {
+        let mut c = UNIT_POS as usize;
+        while c < cells {
+            sm[c] = hist_smaller[base + c];
+            c += cd;
+        }
+    }
+    sync_cube();
+
+    official_branch_block(
+        &sm.to_slice(),
+        &mut state_rev.to_slice_mut(),
+        0u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        rev_count[fi],
+        plane_dim,
+    );
+    sync_cube();
+    official_branch_block(
+        &sm.to_slice(),
+        &mut state_fwd.to_slice_mut(),
+        1u32,
+        num_bin[fi],
+        offset[fi],
+        default_bin[fi],
+        skip_default_bin[fi],
+        use_l1,
+        min_data_in_leaf,
+        min_sum_hessian_in_leaf,
+        lambda_l1,
+        lambda_l2,
+        min_gain_shift,
+        sum_gradient,
+        sum_hessian,
+        num_data,
+        fwd_count[fi],
+        plane_dim,
+    );
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let g = select(is_b, n_feats + f, f);
+        merge_finalize_staged(
+            &state_rev.to_slice(),
+            &state_fwd.to_slice(),
+            out,
+            g * 12u32,
+            use_l1,
+            lambda_l1,
+            lambda_l2,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        );
+    }
+}
+
+// ============================================================================
 // PARALLEL-CANDIDATE staged scan ("pargain", `LGBM_SCAN_PARGAIN`) — the scan
 // redesign the spike092b root-cause map called for. The staged kernels above
 // still run each branch's WHOLE candidate walk serially on one lane, with the
@@ -2711,6 +3325,73 @@ pub fn scan_parprefix_count_take() -> u64 {
     #[cfg(feature = "gpu")]
     {
         SCAN_PARPREFIX_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        0
+    }
+}
+
+/// OFFICIAL-SHAPE scan gate (`LGBM_SCAN_OFFICIAL`, P1b) — the 256-wide,
+/// one-lane-per-bin block-prefix-sum + block-argmax scan
+/// ([`find_best_splits_fused_staged_official_kernel`] et al.). **Default OFF on BOTH
+/// backends** until the Kaggle P100 A/B (`lgb-rs-p1b-official-scan`) settles whether
+/// the 256-wide geometry wins where pargain/parprefix lost (both kept CUBE_DIM=64) —
+/// unlike pargain/parprefix this has no per-backend default yet, so it must be
+/// explicitly enabled. `LGBM_SCAN_OFFICIAL=1` forces ON on either GPU backend; `=0`
+/// (or unset) OFF. The cpu anchor + planeless devices never run it. When enabled it
+/// PRECEDES parprefix/pargain in [`launch_staged_single_scan`] /
+/// [`launch_staged_siblings_scan`]. Takes the client (not just the runtime name) so
+/// the guard can require plane support and the launch can source `plane_dim` from
+/// `hardware.plane_size_max` — the same block-collective plumbing P1a's
+/// [`reduce_par_enabled`] uses.
+#[cfg(feature = "gpu")]
+pub fn scan_official_enabled<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+) -> bool {
+    if <R as cubecl::Runtime>::name(client) == "cpu" {
+        return false;
+    }
+    if client.properties().hardware.plane_size_max < 2 {
+        return false;
+    }
+    match SCAN_OFFICIAL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    matches!(std::env::var("LGBM_SCAN_OFFICIAL").as_deref(), Ok("1"))
+}
+
+/// Same-session A/B override for [`scan_official_enabled`]. 0 = unset (env decides),
+/// 1 = force ON, 2 = force OFF — mirrors [`REDUCE_PAR_OVERRIDE`] so a Kaggle spike can
+/// alternate arms in one process without re-launching.
+#[cfg(feature = "gpu")]
+static SCAN_OFFICIAL_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set/clear the in-process [`scan_official_enabled`] override (`Some(true)` = ON,
+/// `Some(false)` = OFF, `None` = defer to env).
+#[cfg(feature = "gpu")]
+pub fn set_scan_official_override(v: Option<bool>) {
+    let code = match v {
+        None => 0u8,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    SCAN_OFFICIAL_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire — bumped once per staged-scan launch that dispatched the
+/// OFFICIAL kernel (bench-protocol counts proof). Folded into `phase_prof` as
+/// `scan_official=`.
+#[cfg(feature = "gpu")]
+pub static SCAN_OFFICIAL_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the official-launch tripwire to zero and return the prior value.
+pub fn scan_official_count_take() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        SCAN_OFFICIAL_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -4354,7 +5035,38 @@ unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
+    if scan_official_enabled(client) {
+        SCAN_OFFICIAL_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plane_dim = client.properties().hardware.plane_size_max;
+        // Official runs 256-wide (one lane per bin) with its own plane_dim arg — a
+        // dedicated launch, not the SCAN_STAGED_CUBE_DIM `launch_with!` macro.
+        unsafe {
+            find_best_splits_fused_staged_official_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(SCAN_OFFICIAL_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist.clone(), buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot.clone(), n),
+                ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                ArrayArg::from_raw_parts(h_offset.clone(), n),
+                ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                ArrayArg::from_raw_parts(h_skip.clone(), n),
+                ArrayArg::from_raw_parts(h_rev.clone(), n),
+                ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift,
+                sum_gradient,
+                sum_hessian_bumped,
+                num_data,
+                plane_dim,
+            );
+        }
+    } else if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
         SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_staged_parprefix_kernel);
     } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
@@ -4429,7 +5141,42 @@ unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
+    if scan_official_enabled(client) {
+        SCAN_OFFICIAL_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plane_dim = client.properties().hardware.plane_size_max;
+        unsafe {
+            find_best_splits_fused_siblings_staged_official_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 2, 1),
+                CubeDim::new_1d(SCAN_OFFICIAL_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist_a.clone(), buf_len),
+                ArrayArg::from_raw_parts(hist_b.clone(), buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot.clone(), n),
+                ArrayArg::from_raw_parts(h_numbin.clone(), n),
+                ArrayArg::from_raw_parts(h_offset.clone(), n),
+                ArrayArg::from_raw_parts(h_defbin.clone(), n),
+                ArrayArg::from_raw_parts(h_skip.clone(), n),
+                ArrayArg::from_raw_parts(h_rev.clone(), n),
+                ArrayArg::from_raw_parts(h_fwd.clone(), n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                a_scalars.0,
+                a_scalars.1,
+                a_scalars.2,
+                a_scalars.3,
+                b_scalars.0,
+                b_scalars.1,
+                b_scalars.2,
+                b_scalars.3,
+                n as u32,
+                plane_dim,
+            );
+        }
+    } else if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
         SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_siblings_staged_parprefix_kernel);
     } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
@@ -7090,37 +7837,78 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // `hist_smaller` at the same region; `h_out` is `2*n*12`; per-feature arrays sized `n`.
     // `larger_out` is a FRESH handle (never aliases `hist_parent`). All cubecl unsafe
     // confined here (CMP-01).
-    unsafe {
-        find_best_splits_fused_siblings_subtract_staged_kernel::launch(
-            client,
-            CubeCount::Static(n as u32, 2, 1),
-            CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
-            ArrayArg::from_raw_parts(hist_smaller_handle, buf_len),
-            ArrayArg::from_raw_parts(hist_parent_handle, buf_len),
-            ArrayArg::from_raw_parts(larger_out.clone(), buf_len),
-            ArrayArg::from_raw_parts(h_out.clone(), out_len),
-            ArrayArg::from_raw_parts(h_slot, n),
-            ArrayArg::from_raw_parts(h_numbin, n),
-            ArrayArg::from_raw_parts(h_offset, n),
-            ArrayArg::from_raw_parts(h_defbin, n),
-            ArrayArg::from_raw_parts(h_skip, n),
-            ArrayArg::from_raw_parts(h_rev, n),
-            ArrayArg::from_raw_parts(h_fwd, n),
-            if use_l1 { 1u32 } else { 0u32 },
-            cfg.min_data_in_leaf,
-            cfg.min_sum_hessian_in_leaf,
-            cfg.lambda_l1,
-            cfg.lambda_l2,
-            min_gain_shift_a,
-            sum_gradient_a,
-            sum_hessian_a_bumped,
-            num_data_a,
-            min_gain_shift_b,
-            sum_gradient_b,
-            sum_hessian_b_bumped,
-            num_data_b,
-            n as u32,
-        );
+    if scan_official_enabled(client) {
+        // OFFICIAL-SHAPE subtract twin (P1b) — same subtraction trick (sibling B
+        // materializes `parent − smaller` into `larger_out`), but the branch scans
+        // are the 256-wide block scans. 256 lanes + its own `plane_dim` arg.
+        SCAN_OFFICIAL_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plane_dim = client.properties().hardware.plane_size_max;
+        unsafe {
+            find_best_splits_fused_siblings_subtract_staged_official_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 2, 1),
+                CubeDim::new_1d(SCAN_OFFICIAL_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist_smaller_handle, buf_len),
+                ArrayArg::from_raw_parts(hist_parent_handle, buf_len),
+                ArrayArg::from_raw_parts(larger_out.clone(), buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                num_data_a,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                num_data_b,
+                n as u32,
+                plane_dim,
+            );
+        }
+    } else {
+        unsafe {
+            find_best_splits_fused_siblings_subtract_staged_kernel::launch(
+                client,
+                CubeCount::Static(n as u32, 2, 1),
+                CubeDim::new_1d(SCAN_STAGED_CUBE_DIM),
+                ArrayArg::from_raw_parts(hist_smaller_handle, buf_len),
+                ArrayArg::from_raw_parts(hist_parent_handle, buf_len),
+                ArrayArg::from_raw_parts(larger_out.clone(), buf_len),
+                ArrayArg::from_raw_parts(h_out.clone(), out_len),
+                ArrayArg::from_raw_parts(h_slot, n),
+                ArrayArg::from_raw_parts(h_numbin, n),
+                ArrayArg::from_raw_parts(h_offset, n),
+                ArrayArg::from_raw_parts(h_defbin, n),
+                ArrayArg::from_raw_parts(h_skip, n),
+                ArrayArg::from_raw_parts(h_rev, n),
+                ArrayArg::from_raw_parts(h_fwd, n),
+                if use_l1 { 1u32 } else { 0u32 },
+                cfg.min_data_in_leaf,
+                cfg.min_sum_hessian_in_leaf,
+                cfg.lambda_l1,
+                cfg.lambda_l2,
+                min_gain_shift_a,
+                sum_gradient_a,
+                sum_hessian_a_bumped,
+                num_data_a,
+                min_gain_shift_b,
+                sum_gradient_b,
+                sum_hessian_b_bumped,
+                num_data_b,
+                n as u32,
+            );
+        }
     }
     Ok(Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b, larger_out)))
 }
