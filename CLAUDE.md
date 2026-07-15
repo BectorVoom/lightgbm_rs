@@ -16,11 +16,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - **Error handling**: `thiserror` for structured domain errors at library boundaries; `anyhow` for ergonomic propagation in app/high-level layers.
 - **Bindings**: Python interface must mirror the official `lightgbm` package API surface.
 
-<!-- GSD:project-end -->
-
-<!-- GSD:stack-start source:codebase/STACK.md -->
-
-## Technology Stack
 
 ## Languages
 
@@ -97,11 +92,7 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - Linux / macOS / Windows (incl. MinGW, Cygwin). Windows networking links `ws2_32`, `iphlpapi`.
 - Distribution channels: CLI binary, C/C++ shared lib, PyPI wheel (`build-python.sh`), CRAN package (`build-cran-package.sh`), NuGet (`.ci/create-nuget.py`), Docker images (`docker/dockerfile-cli`, `dockerfile-python`, `dockerfile-r`, `docker/gpu/`).
 
-<!-- GSD:stack-end -->
 
-<!-- GSD:conventions-start source:CONVENTIONS.md -->
-
-## Conventions
 
 ## Linters & Formatters Present
 
@@ -131,8 +122,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - `typedef int32_t comm_size_t;` — network/communication sizes (line 59)
 - Function-pointer typedefs `PredictFunction`, `ReduceFunction`, `AllgatherFunction`, etc.
 
-## Header Organization
-
 ## OpenMP Pragma Conventions
 
 #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
@@ -148,8 +137,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - **Factory functions return raw owning pointers** that the caller immediately wraps:
 - Non-owning references to shared data are passed as raw pointers / `const&` (e.g.
 - Construction-from-string is a recurring pattern: `Tree(const char* str, size_t* used_len)`
-
-## Error Handling
 
 ## Logging
 
@@ -186,14 +173,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - Polymorphism is via abstract base classes + string-keyed factories (see Memory & Ownership);
 
 
-
-## Architecture
-
-## System Overview
-
-```text
-
-```
 
 ## Component Responsibilities
 
@@ -246,11 +225,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - Purpose: Collective communication for distributed training.
 - Location: `src/network/` (MPI `linkers_mpi.cpp`, socket `linkers_socket.cpp`).
 
-## Data Flow
-
-### Training Path (raw data → ensemble)
-
-### Prediction Path (model → scores)
 
 ### Model Serialization
 
@@ -290,13 +264,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - **Histogram pool memory:** Tree learners use a fixed-size histogram pool with the subtraction trick; memory is sized by `num_leaves` × total bins.
 - **Immutability:** `Dataset` is read-only after `FinishLoad()`; histograms and partitions are the only per-tree mutable structures.
 
-## Anti-Patterns
-
-### Heavy template instantiation across device/quantization axes
-
-### Stringly-typed factories
-
-### `#ifdef USE_CUDA` scattered through hot paths
 
 ## Error Handling
 
