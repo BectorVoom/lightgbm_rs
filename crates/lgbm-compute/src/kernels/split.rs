@@ -2751,7 +2751,7 @@ pub fn scan_numdata_dev_count_take() -> u64 {
 // geometry mismatch, hatch OFF).
 
 /// Test/in-process override for the desc-hoist gate: `0` unset (env decides),
-/// `1` forced ON, `-1` forced OFF. Mirrors `set_partition_fuse_bc_override`.
+/// `1` forced ON, `-1` forced OFF. Mirrors `set_partition_fuse_bc_smem_override`.
 static DESC_HOIST_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(0);
 
 /// Force the desc-hoist gate for in-process A/B (`Some(true/false)`) or restore

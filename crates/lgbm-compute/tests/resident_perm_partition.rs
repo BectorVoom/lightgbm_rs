@@ -77,17 +77,17 @@ fn walk_steps() -> Vec<Step> {
     ]
 }
 
-/// The BC-FUSION (`LGBM_PARTITION_FUSE_BC`) produces BYTE-IDENTICAL results to the
-/// default 3-launch partition — pinning the "folding stage B into the scatter changes
-/// nothing" invariant DIRECTLY on the runnable cubecl-cpu lane (the partition kernels
-/// lower there, unlike the staged scan family). Runs the SAME adversarial multi-split
-/// walk with the fusion forced OFF then ON and asserts the final perm + every split's
-/// child ranges match bit-for-bit. Uses `set_partition_fuse_bc_override` (the env gate
-/// is read-once) and restores it to `None` at the end.
+/// On the cubecl-cpu runtime the SMEM BC-fusion (`LGBM_PARTITION_FUSE_BC_SMEM`) must be
+/// gated OFF — the SMEM kernel can't lower there (no cross-unit SharedMemory), so
+/// `partition_bc_fused` stays FALSE and the partition takes the 3-launch path. Forcing
+/// the SMEM gate ON must therefore be a NO-OP on cpu: the walk stays byte-identical to
+/// the default. Pins that the cpu anchor is never routed into the real-device-only
+/// kernel. (The SMEM kernel's own bit-exactness is validated on real CUDA via the driver
+/// bit-identical-preds A/B.)
 #[test]
-fn partition_bc_fusion_byte_identical_to_three_launch() {
+fn smem_bc_fusion_gated_off_on_cpu_stays_byte_identical() {
     use cubecl::prelude::CubeElement;
-    use lgbm_compute::kernels::partition::set_partition_fuse_bc_override;
+    use lgbm_compute::kernels::partition::{partition_bc_fused, set_partition_fuse_bc_smem_override};
 
     let client = cpu_client();
     let num_data = 700usize;
@@ -100,9 +100,8 @@ fn partition_bc_fusion_byte_identical_to_three_launch() {
     }
     let bins_handle = client.create_from_slice(u8::as_bytes(&concat_u8));
 
-    // Run the whole walk under one arm; return (final perm, per-step child-range sextuples).
-    let run_arm = |fuse_bc: bool| -> (Vec<u32>, Vec<[i32; 6]>) {
-        set_partition_fuse_bc_override(Some(fuse_bc));
+    // Run the whole walk; return (final perm, per-step child-range sextuples).
+    let run_arm = || -> (Vec<u32>, Vec<[i32; 6]>) {
         let rp = ResidentPermPartition::new(&client, num_data).expect("state alloc");
         let leaf_splits = DeviceLeafSplits::new(&client, 8).expect("ranges alloc");
         let mut ranges = Vec::new();
@@ -123,31 +122,20 @@ fn partition_bc_fusion_byte_identical_to_three_launch() {
         (rp.read_perm(&client), ranges)
     };
 
-    let (perm_off, ranges_off) = run_arm(false);
-    let (perm_on, ranges_on) = run_arm(true);
-    set_partition_fuse_bc_override(None);
-
-    assert_eq!(perm_off, perm_on, "BC-fused perm diverged from the 3-launch perm");
-    assert_eq!(ranges_off, ranges_on, "BC-fused child ranges diverged from the 3-launch ranges");
-
-    // SharedMemory BC-fusion arm: on the cubecl-cpu runtime `partition_bc_fused` is
-    // FALSE (the SMEM kernel can't lower there), so forcing the SMEM gate ON must
-    // FALL BACK to the 3-launch path and stay byte-identical — pinning that the cpu
-    // anchor is never routed into the real-device-only kernel. (The SMEM kernel's own
-    // bit-exactness is validated on real CUDA via the driver bit-identical-preds A/B.)
-    use lgbm_compute::kernels::partition::{partition_bc_fused, set_partition_fuse_bc_smem_override};
     assert!(
         !partition_bc_fused(&client),
         "on the cubecl-cpu runtime the SMEM BC-fusion must be gated OFF (no cross-unit \
          SharedMemory), so partition_bc_fused must be false with no override set"
     );
+    let (perm_off, ranges_off) = run_arm();
+
     set_partition_fuse_bc_smem_override(Some(true));
     assert!(
         !partition_bc_fused(&client),
         "even with LGBM_PARTITION_FUSE_BC_SMEM forced ON, the cpu runtime must stay on \
          the 3-launch path (real-device gate)"
     );
-    let (perm_smem, ranges_smem) = run_arm(false);
+    let (perm_smem, ranges_smem) = run_arm();
     set_partition_fuse_bc_smem_override(None);
     assert_eq!(perm_off, perm_smem, "SMEM-gate-on cpu run diverged (fallback broken)");
     assert_eq!(ranges_off, ranges_smem, "SMEM-gate-on cpu ranges diverged (fallback broken)");
