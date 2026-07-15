@@ -840,6 +840,211 @@ fn parprefix_algorithm_matches_serial_on_exact_gain_ties() {
 }
 
 // =========================================================================
+// OFFICIAL-SHAPE reformulation (P1b — LGBM_SCAN_OFFICIAL). One thread per bin,
+// block prefix-sum (in scan order) → per-thread candidate gain with the
+// STATELESS guard, block argmax. The load-bearing novelty: the serial `done`
+// early-break is REMOVED and replaced by the per-candidate guard `!cont && !brk`.
+//
+// ## Why the guard reproduces the serial considered-set EXACTLY
+// In the reverse walk `right_count` is non-decreasing in k (every `round_int(h *
+// cnt_factor) >= 0`), so `left_count = num_data - right_count` and
+// `sum_left_hessian` are non-increasing ⇒ `brk` (left too small) is monotone
+// false→true, and `cont` (right too small) is monotone true→false. The serial
+// `done` flips true at the FIRST k in the `!cont` region with `brk` true and
+// suppresses that k and all after; since `brk` is monotone, `{k: consider}` =
+// `{k: active && !cont && !brk}` — no recurrence needed. (Forward is symmetric
+// with left/right swapped.) The prefix sums here run in the SAME k-order as the
+// serial running sums ⇒ this reference is BIT-IDENTICAL to serial; only the
+// KERNEL's plane-scan reorders the f64 adds (the documented ~1e-6, exactly as
+// pargain/parprefix). So this asserts the DECISION PROCEDURE is the serial one.
+
+/// Stateless per-bin candidate for one branch, in scan order (k = 0..count).
+fn official_branch(f: &Feat, s: &Scalars, forward: bool) -> BranchState {
+    let cnt_factor = f64::from(s.num_data) / s.sum_hessian;
+    let count = if forward { f.fwd_count() } else { f.rev_count() };
+    let t_start = f.num_bin - 1 - f.offset; // reverse anchor
+    // Running prefix sums in scan order (bit-identical to the serial accumulate).
+    let mut acc_g = 0.0f64;
+    let mut acc_h = K_EPSILON; // the branch's kEpsilon seed (:856)
+    let mut acc_cnt = 0i32;
+    let mut best_gain = 0.0f64;
+    let mut best_left_count = 0i32;
+    let mut best_sum_left_gradient = 0.0f64;
+    let mut best_sum_left_hessian = 0.0f64;
+    let mut best_threshold = 0i32;
+    let mut is_splittable = 0.0f64;
+    for k in 0..count {
+        // Bin index + activeness (verbatim from the serial branches).
+        let (t, active, bi) = if forward {
+            let t = k;
+            let skip = f.skip_default_bin && (t + f.offset) == f.default_bin;
+            (t, !skip, (t as usize) * 2)
+        } else {
+            let t = t_start - k;
+            let in_range = t >= (1 - f.offset);
+            let skip = f.skip_default_bin && (t + f.offset) == f.default_bin;
+            let t_safe = if t < 0 { 0 } else { t };
+            (t, in_range && !skip, (t_safe as usize) * 2)
+        };
+        if active {
+            acc_g += f.hist[bi];
+            acc_h += f.hist[bi + 1];
+            acc_cnt += round_int(f.hist[bi + 1] * cnt_factor);
+        }
+        // The NEAR side is the DIRECTLY accumulated sum (bit-identical to the
+        // serial running sum); the FAR side is the complement `total - acc`.
+        // Reverse accumulates the RIGHT side, forward the LEFT — mirror each
+        // serial branch's exact arithmetic so the gain inputs match bit-for-bit.
+        let (
+            sum_left_gradient,
+            sum_left_hessian,
+            left_count,
+            sum_right_gradient,
+            sum_right_hessian,
+            right_count,
+        ) = if forward {
+            (
+                acc_g,
+                acc_h,
+                acc_cnt,
+                s.sum_gradient - acc_g,
+                s.sum_hessian - acc_h,
+                s.num_data - acc_cnt,
+            )
+        } else {
+            (
+                s.sum_gradient - acc_g,
+                s.sum_hessian - acc_h,
+                s.num_data - acc_cnt,
+                acc_g,
+                acc_h,
+                acc_cnt,
+            )
+        };
+        // Stateless guards — `cont` = near side too small, `brk` = far side too
+        // small (the monotone pair; no `done` recurrence).
+        let (cont, brk) = if forward {
+            (
+                left_count < s.min_data_in_leaf || sum_left_hessian < s.min_sum_hessian_in_leaf,
+                right_count < s.min_data_in_leaf || sum_right_hessian < s.min_sum_hessian_in_leaf,
+            )
+        } else {
+            (
+                right_count < s.min_data_in_leaf || sum_right_hessian < s.min_sum_hessian_in_leaf,
+                left_count < s.min_data_in_leaf || sum_left_hessian < s.min_sum_hessian_in_leaf,
+            )
+        };
+        let consider = active && !cont && !brk;
+        let current_gain = get_split_gains(
+            s.use_l1,
+            sum_left_gradient,
+            sum_left_hessian,
+            sum_right_gradient,
+            sum_right_hessian,
+            s.lambda_l1,
+            s.lambda_l2,
+        );
+        let valid = consider && current_gain > s.min_gain_shift;
+        if valid {
+            is_splittable = 1.0;
+        }
+        let cand_gain = if valid { current_gain } else { 0.0 };
+        // Argmax with the serial first-max (strict `>`, lowest k wins on a tie).
+        if cand_gain > best_gain {
+            best_left_count = left_count;
+            best_sum_left_gradient = sum_left_gradient;
+            best_sum_left_hessian = sum_left_hessian;
+            best_threshold = if forward { t + f.offset } else { t - 1 + f.offset };
+            best_gain = cand_gain;
+        }
+    }
+    [
+        is_splittable,
+        best_gain,
+        f64::from(best_threshold),
+        f64::from(best_left_count),
+        best_sum_left_gradient,
+        best_sum_left_hessian,
+    ]
+}
+
+fn assert_official_parity(label: &str, f: &Feat, s: &Scalars) {
+    let serial = merge_finalize(&serial_rev(f, s), &serial_fwd(f, s), s);
+    let off = merge_finalize(
+        &official_branch(f, s, false),
+        &official_branch(f, s, true),
+        s,
+    );
+    for i in 0..12 {
+        assert_eq!(
+            serial[i].to_bits(),
+            off[i].to_bits(),
+            "[{label}] cell {i}: serial {} != official {}",
+            serial[i],
+            off[i]
+        );
+    }
+}
+
+#[test]
+fn official_algorithm_matches_serial_fan_out() {
+    let mut lcg = Lcg(0x0ff1c1a1);
+    let cases: Vec<(i32, i32, bool, bool, bool, i32, f64)> = vec![
+        (255, 1, false, true, false, 1, 0.0),
+        (255, 1, true, true, true, 20, 0.0),
+        (128, 0, false, true, false, 1, 0.1),
+        (64, 1, true, false, false, 5, 0.0),
+        (16, 1, false, true, true, 3, 0.5),
+        (2, 1, false, false, false, 1, 0.0),
+    ];
+    for (nb, off, skip, fwd, l1, mind, mgs) in cases {
+        for rep in 0..6 {
+            let f = random_feat(&mut lcg, nb, off, skip, fwd);
+            let s = scalars_for(&f, l1, mind, mgs);
+            assert_official_parity(&format!("nb={nb} off={off} rep={rep}"), &f, &s);
+        }
+    }
+}
+
+#[test]
+fn official_algorithm_matches_serial_early_done() {
+    // High min_data forces the `brk` break early — the guard must drop exactly
+    // the same tail the serial `done` recurrence does.
+    let mut lcg = Lcg(0xd02e);
+    for rep in 0..12 {
+        let f = random_feat(&mut lcg, 255, 1, rep % 2 == 0, true);
+        // min_data just below half ⇒ break fires mid-scan on both branches.
+        let s = scalars_for(&f, rep % 3 == 0, 40, 0.0);
+        assert_official_parity(&format!("early-done rep {rep}"), &f, &s);
+    }
+}
+
+#[test]
+fn official_algorithm_matches_serial_on_exact_gain_ties() {
+    // Sparse/empty-bin plateaus create exact-gain ties; the parallel argmax's
+    // (gain desc, k asc) first-max must match the serial strict-`>` first-max.
+    let mut lcg = Lcg(0x71e5);
+    for rep in 0..8 {
+        let nb = 32usize;
+        let mut hist = vec![0.0f64; nb * 2];
+        for b in (1..nb).step_by(4) {
+            hist[2 * b] = f64::from(lcg.next_u32() % 9) - 4.0;
+            hist[2 * b + 1] = 1.0;
+        }
+        let f = Feat {
+            hist,
+            num_bin: nb as i32,
+            offset: 1,
+            default_bin: 5,
+            skip_default_bin: rep % 2 == 0,
+            run_forward: true,
+        };
+        let s = scalars_for(&f, false, 1, 0.0);
+        assert_official_parity(&format!("sparse plateau rep {rep}"), &f, &s);
+    }
+}
+
+// =========================================================================
 // Layer 2 — kernel-vs-kernel on a REAL GPU (cuda/rocm): the pargain kernel
 // against the legacy serial kernel, 12-cell bitwise. Runs in the CUDA spike.
 // =========================================================================
