@@ -72,11 +72,9 @@ pub static SCRATCH_NS: AtomicU64 = AtomicU64::new(0);
 //   SUBTRACT_RESIDENT = on-device parent−smaller derivations (larger children).
 //   SCAN_RESIDENT = fused per-leaf scan launches = blocking readback SYNCS (the
 //                   round-trip count sibling co-packing targets halving).
-//   FUSED = build_fix_scan_resident launches (OFF by default).
 pub static BUILD_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
 pub static SUBTRACT_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_RESIDENT_CNT: AtomicU64 = AtomicU64::new(0);
-pub static FUSED_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Increment a count counter by 1. Inert (no-op) when the env gate is off, so it is
 /// parity-neutral and zero-overhead in the default build/tests.
@@ -202,7 +200,6 @@ pub fn dump(label: &str) {
     let bld_cnt = BUILD_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let sub_cnt = SUBTRACT_RESIDENT_CNT.swap(0, Ordering::Relaxed);
     let scn_cnt = SCAN_RESIDENT_CNT.swap(0, Ordering::Relaxed);
-    let fus_cnt = FUSED_CNT.swap(0, Ordering::Relaxed);
     // Fold the on-device driver's own launch count (bumped in lgbm-compute
     // once per leaf-level build/subtract/scan — the host `*_RESIDENT_CNT` counters
     // stay 0 on the on-device path) into the SAME `device_launches=` total. The
@@ -269,8 +266,8 @@ pub fn dump(label: &str) {
     // NONZERO proves the deferral arm ran; 0 on the default two-separate-reads path.
     let deferred_read_fused =
         lgbm_compute::kernels::grow_driver::deferred_read_fused_count_take();
-    if bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev > 0 {
-        let launches = bld_cnt + sub_cnt + scn_cnt + fus_cnt + on_dev;
+    if bld_cnt + sub_cnt + scn_cnt + on_dev > 0 {
+        let launches = bld_cnt + sub_cnt + scn_cnt + on_dev;
         // `device_launches=` is a build+subtract+scan subtotal at PER-LEAF granularity
         // (WR-01/IN-02): both the host `*_resident=` terms and `on_device=` use the same
         // per-leaf unit, and tree-mutation/partition dispatches are excluded on both paths.
@@ -278,7 +275,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign} scan_numdata_dev={scan_numdata_dev} deferred_read_fused={deferred_read_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign} scan_numdata_dev={scan_numdata_dev} deferred_read_fused={deferred_read_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the

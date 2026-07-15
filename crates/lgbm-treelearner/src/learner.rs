@@ -288,14 +288,6 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// through the device-handle slot mirror (keeping histograms resident). `false`
     /// (the default, and ALWAYS on CpuBackend) takes the byte-unchanged host path.
     resident_eligible: bool,
-    /// When `true`, directly-built leaves (root + smaller children) on the
-    /// small/medium fused-eligible band route through the FUSED build+fix+compact+scan
-    /// kernel (`Backend::build_fix_scan_resident`) — ONE launch instead of construct +
-    /// fix + scan = 3. The subtract-derived larger children KEEP subtract+scan; large
-    /// keeps the atomic-parallel resident chain. Computed ONCE at the top of
-    /// `train_inner` via [`crate::resident_pool::fused_directly_built_eligible`]; `false`
-    /// (default, ALWAYS on CpuBackend) takes the existing resident/host routing.
-    fused_eligible: bool,
     /// Whether THIS learner is eligible to grow whole
     /// trees on-device. The base gate is computed at [`new`](Self::new) as
     /// `backend.on_device_growth_supported()` alone (that method already
@@ -602,8 +594,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             capture_snapshots: false,
             // Default OFF: recomputed per train in `train_inner`.
             resident_eligible: false,
-            // Default OFF: recomputed per train in `train_inner`.
-            fused_eligible: false,
             // Cache the on-device eligibility ONCE here (NOT in
             // train_inner). The AND-gate makes CpuBackend (discriminator false) —
             // and GpuBackend<R> (false in Slice 0) — ineligible regardless of the
@@ -1009,33 +999,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             capture_snapshots,
             &self.cfg,
         );
-
-        // The FUSED directly-built-leaf gate (small/medium band). Same
-        // fail-safe correctness spine as `resident_eligible`, but targets the launch-
-        // bound small/medium band where the 3-launch resident chain loses to host. When
-        // on, directly-built leaves (root + smaller children) use ONE fused launch
-        // (build+fix+compact+scan); subtract-derived larger children + large keep their
-        // existing routing. The fused path uses the SAME resident pool mirror (it stores
-        // the fixed+compacted Handle into the slot), so `subtract_resident` still works.
-        // `LGBM_FUSED_FORCE` overrides the size gate for benching. ALWAYS false on
-        // CpuBackend (backend_supported false) → byte-unchanged host path.
-        self.fused_eligible = crate::resident_pool::fused_directly_built_eligible(
-            self.backend.resident_pool_supported(),
-            num_data,
-            &features,
-            &self.constraints,
-            capture_snapshots,
-            &self.cfg,
-        );
-        // The fused directly-built path stores its Handle into the resident pool mirror
-        // (so the subtract-derived larger child finds its parent). When the fused gate
-        // is on but the plain resident gate is off (the small/medium band), enable the
-        // resident pool machinery so the larger child's `subtract_resident` + the slot
-        // mirror reset/move bookkeeping are live. (When `resident_eligible` is already
-        // true this is a no-op.)
-        if self.fused_eligible {
-            self.resident_eligible = true;
-        }
 
         // force_row_wise / force_col_wise: the two strategies
         // differ ONLY in the histogram-build ORDER, not the result. On the
@@ -1897,15 +1860,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // path (the spine pulls SplitInfos from the resident scan; categorical/monotone/
         // extra-trees inline branches are unreachable when eligible; capture_snapshots is
         // off). `None` (ineligible / CpuBackend) is the byte-unchanged host path.
-        // On the FUSED directly-built path, the build is FUSED into the scan
-        // (one `build_fix_scan_resident` launch in `scan_leaf_histogram`), so we SKIP the
-        // standalone `build_resident_leaf_into` here. The fused scan stores the
-        // fixed+compacted Handle into `smaller_slot`, so the subtract-derived larger
-        // child still finds its parent. `smaller_fused` signals the fused scan path.
-        let smaller_fused = self.fused_eligible;
         // The UNIFIED host build+fix+scan path is the CpuBackend
-        // directly-built (smaller/root) leaf analog of `smaller_fused`. It is eligible
-        // ONLY when neither GPU-fused nor resident (i.e. CpuBackend), and gated by
+        // directly-built (smaller/root) leaf analog. It is eligible
+        // ONLY when NOT resident (i.e. CpuBackend), and gated by
         // `unified_bfs_threshold()` keyed on the feature count (the same scan-work proxy
         // as `par_scan_threshold` — narrow leaves regressed badly). When
         // set, the standalone `build_leaf_histogram_into` below is SKIPPED; the build is
@@ -1916,13 +1873,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // alone routed it into the erroring default. Only CpuBackend returns true here.
         let smaller_unified =
             self.backend.host_unified_fused_supported()
-                && !smaller_fused && !self.resident_eligible
+                && !self.resident_eligible
                 && features.len() >= lgbm_compute::unified_bfs_threshold();
-        let smaller_resident_slot = if smaller_fused {
-            // No separate build — the fused scan builds+fixes+compacts+scans in 1 launch
-            // and stores the Handle into smaller_slot.
-            Some(smaller_slot)
-        } else if self.resident_eligible {
+        let smaller_resident_slot = if self.resident_eligible {
             self.build_resident_leaf_into(
                 features,
                 gradients,
@@ -1951,40 +1904,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 smaller_splits,
                 pool.buffer_mut(smaller_slot),
             );
-            None
-        };
-        // ---- FUSED-path exception to the scan deferral (subtract-empty-slot fix). ----
-        // On the FUSED directly-built path the smaller child's "scan" is ALSO its histogram
-        // BUILD+store: `scan_leaf_histogram`'s `build_fix_scan_resident` launch is the ONLY
-        // thing that puts the smaller Handle into `smaller_slot`. The co-pack deferral
-        // (below) moves the smaller scan PAST `subtract_resident` — fine for the resident
-        // scan-only path (its histogram is already built+resident), but on the fused path it
-        // leaves `smaller_slot` EMPTY when the larger child's `subtract_resident` derives
-        // `parent − smaller` → "subtract_resident: smaller slot is empty". Co-pack NEVER fires
-        // on the fused path anyway (its gate requires `!smaller_fused`), so deferring buys the
-        // fused path nothing. Restore the earlier order: run the smaller fused
-        // build+scan NOW, before the larger subtract, and reuse the records at the deferred site.
-        let smaller_records_early: Option<Vec<FeatureSplitRecord>> = if smaller_fused {
-            Some(self.scan_leaf_histogram(
-                features,
-                slot_off,
-                smaller_leaf,
-                smaller_splits,
-                pool.buffer_mut(smaller_slot),
-                best_split_per_leaf,
-                best_split_feature,
-                smaller_node_mask.as_deref(),
-                data_partition,
-                parent_splittable.as_deref(),
-                smaller_resident_slot,
-                smaller_fused,
-                smaller_unified,
-                None,
-                None,
-                gradients,
-                hessians,
-            )?)
-        } else {
             None
         };
         // ---- LARGER child: derive by subtraction (parent − smaller) in the pool,
@@ -2183,7 +2102,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let smaller_scannable =
             smaller_splits.sum_hessians > 0.0 && smaller_splits.num_data_in_leaf > 0;
         let smaller_resident_only =
-            smaller_resident_slot == Some(smaller_slot) && !smaller_fused && !smaller_unified;
+            smaller_resident_slot == Some(smaller_slot) && !smaller_unified;
         // Build the SHARED spine batch for both siblings and require equality. When the
         // spines match, this is the `feats` the co-packed kernel scans for BOTH.
         let copack_feats: Option<Vec<BatchedSplitFeature>> = if self.resident_eligible
@@ -2262,40 +2181,31 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         // ---- SMALLER child scan (DEFERRED to here so it can co-pack with the larger
         // child). When co-packed, `smaller_precomputed` carries the co-packed results;
-        // otherwise this is the byte-unchanged single-slot resident / host scan. On the
-        // FUSED path the scan already ran EARLY (`smaller_records_early`, before the larger
-        // subtract — see the fix above), so reuse those records instead of re-launching the
-        // build+scan (which would also re-store the slot needlessly). ----
-        let smaller_records = if let Some(records) = smaller_records_early {
-            records
-        } else {
-            self.scan_leaf_histogram(
-                features,
-                slot_off,
-                smaller_leaf,
-                smaller_splits,
-                pool.buffer_mut(smaller_slot),
-                best_split_per_leaf,
-                best_split_feature,
-                smaller_node_mask.as_deref(),
-                data_partition,
-                parent_splittable.as_deref(),
-                smaller_resident_slot,
-                smaller_fused,
-                smaller_unified,
-                // The directly-built smaller child is never subtract-unified.
-                None,
-                smaller_precomputed,
-                gradients,
-                hessians,
-            )?
-        };
+        // otherwise this is the byte-unchanged single-slot resident / host scan. ----
+        let smaller_records = self.scan_leaf_histogram(
+            features,
+            slot_off,
+            smaller_leaf,
+            smaller_splits,
+            pool.buffer_mut(smaller_slot),
+            best_split_per_leaf,
+            best_split_feature,
+            smaller_node_mask.as_deref(),
+            data_partition,
+            parent_splittable.as_deref(),
+            smaller_resident_slot,
+            smaller_unified,
+            // The directly-built smaller child is never subtract-unified.
+            None,
+            smaller_precomputed,
+            gradients,
+            hessians,
+        )?;
 
         if larger_leaf >= 0 {
             let larger_slot = larger_slot_id.expect("non-root larger child must hold a pool slot");
-            // The larger child is subtract-derived (parent − smaller),
-            // NEVER fused-built — it reads its histogram via the resident subtract
-            // Handle (or host buffer), so `fused_build = false`.
+            // The larger child is subtract-derived (parent − smaller) — it reads its
+            // histogram via the resident subtract Handle (or host buffer).
             larger_records = self.scan_leaf_histogram(
                 features,
                 slot_off,
@@ -2308,7 +2218,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 data_partition,
                 parent_splittable.as_deref(),
                 larger_resident_slot,
-                false,
                 // The larger child is never BUILD-unified (no per-feature
                 // fold), but it CAN be SUBTRACT-unified — `larger_unified`
                 // routes the scan through `subtract_scan` (fused subtract→scan) using the
@@ -2595,20 +2504,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // ZERO categorical/monotone/extra-trees features, so those inline branches are
         // unreachable and `buf` is not read on the spine path.
         resident_slot: Option<usize>,
-        // When `true` (the fused directly-built path), the SPINE batched
-        // scan is replaced by ONE `backend.build_fix_scan_resident` launch that BUILDS
-        // (sequential f64), fixes, compacts, AND scans the leaf in a single launch —
-        // storing the fixed+compacted Handle into `resident_slot` (so the subtract-
-        // derived larger child still finds its parent) and returning the per-feature
-        // SplitInfos. Requires `resident_slot == Some(slot)`. The build inputs are the
-        // FULL-corpus `gradients`/`hessians` (the launcher gathers leaf rows on device).
-        // `false` keeps the existing scan-only path (host buf or resident-Handle scan).
-        fused_build: bool,
         // When `true` (CpuBackend directly-built smaller leaf, above
         // `unified_bfs_threshold`), the SPINE scan is preceded by ONE rayon region that
         // BUILDS (per-feature private fold), fixes, compacts EVERY feature into `buf`
         // (complete for the subtract-derived larger child) AND scans the spine subset —
-        // the host f64 analog of `fused_build`/`build_fix_scan_resident`. The standalone
+        // the host f64 analog of the GPU resident build+scan. The standalone
         // `build_leaf_histogram_into` at the seam is SKIPPED for this leaf. `false` keeps
         // the existing host-buf scan (the buffer is pre-built by the seam).
         unified_build: bool,
@@ -2762,7 +2662,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // The UNIFIED host build+fix+scan branch. Builds (per-feature
         // private fold), fixes, compacts EVERY feature into `buf` (COMPLETE for the
         // subtract-derived larger child) AND scans the spine subset (`scan_active`),
-        // inside ONE rayon region — the host f64 analog of the GPU `fused_build`. The
+        // inside ONE rayon region — the host f64 analog of the GPU resident build+scan. The
         // returned `Vec<Option<SplitInfo>>` is fpos-ordered; we extract the `Some`
         // (scan-active) entries in ascending fpos into `batched_splits`, which is EXACTLY
         // `batched_feats` order (Pass 1 pushed spine features in ascending fpos), so the
@@ -2778,8 +2678,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // `split_scan_body` ran on device, only co-packed into one launch, so each
             // entry is byte-identical to the single-slot resident scan it replaces.
             debug_assert!(
-                subtract_inputs.is_none() && !unified_build && !fused_build,
-                "co-packed precomputed splits are mutually exclusive with the unified/fused/subtract paths"
+                subtract_inputs.is_none() && !unified_build,
+                "co-packed precomputed splits are mutually exclusive with the unified/subtract paths"
             );
             // The contract that the co-packed `splits` align slot-for-slot
             // with THIS leaf's independently-re-derived `batched_feats` is
@@ -2874,49 +2774,6 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             )?;
             // Extract scan-active SplitInfos in ascending fpos ⇒ batched_feats order.
             per_feat.into_iter().flatten().collect::<Vec<SplitInfo>>()
-        } else if fused_build {
-            let slot = resident_slot
-                .expect("fused_build requires a resident slot to store the histogram Handle");
-            let leaf_rows = data_partition.indices_in_leaf(leaf);
-            // The fused kernel BUILDS+fixes+compacts EVERY feature (the resident
-            // histogram must be COMPLETE for the subtract-derived larger child), but
-            // SCANS only the spine subset that passed Pass-1's gates. `all_feats` is the
-            // full per-feature param list (fpos order); `scan_active[fpos]` is true iff
-            // the feature is in `batched_feats` (`spine_batch_index[fpos].is_some()`).
-            // The launcher returns SplitInfos for scan-active features in order, which
-            // is EXACTLY `batched_feats` order (Pass 1 pushed in ascending fpos).
-            let all_feats: Vec<BatchedSplitFeature> = features
-                .iter()
-                .enumerate()
-                .map(|(fpos, f)| BatchedSplitFeature {
-                    slot_off: slot_off[fpos],
-                    num_bin: f.num_bin,
-                    offset: f.offset,
-                    default_bin: f.default_bin,
-                    most_freq_bin: f.most_freq_bin,
-                    skip_default_bin: f.skip_default_bin(),
-                    na_as_missing: f.na_as_missing(),
-                    run_forward: f.run_forward(),
-                })
-                .collect();
-            let scan_active: Vec<bool> =
-                spine_batch_index.iter().map(|idx| idx.is_some()).collect();
-            crate::phase_prof::bump(&crate::phase_prof::FUSED_CNT);
-            self.backend.build_fix_scan_resident(
-                self.client,
-                slot,
-                slot_off,
-                buf.len(),
-                leaf_rows,
-                gradients,
-                hessians,
-                &all_feats,
-                &scan_active,
-                &self.cfg,
-                sum_g,
-                sum_h,
-                num_data_in_leaf,
-            )?
         } else if let Some(slot) = resident_slot {
             crate::phase_prof::bump(&crate::phase_prof::SCAN_RESIDENT_CNT);
             self.backend.scan_resident_leaf(
