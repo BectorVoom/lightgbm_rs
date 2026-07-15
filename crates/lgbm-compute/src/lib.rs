@@ -2229,8 +2229,7 @@ pub trait Backend {
 /// single-owner ordered f64 fold in [`kernels::histogram`].
 /// THE production seam gate for the on-device histogram/tree path.
 ///
-/// `LGBM_CUDA_ON_DEVICE` is a TRI-STATE toggle, read ONCE (OnceLock-cached,
-/// mirroring [`split_2lane_enabled`]):
+/// `LGBM_CUDA_ON_DEVICE` is a TRI-STATE toggle, read ONCE (OnceLock-cached):
 /// - `"1"` ⇒ force ON,
 /// - `"0"` ⇒ force OFF (the explicit off-switch fallback),
 /// - unset / empty / any other value ⇒ follow the device default
@@ -2273,9 +2272,7 @@ pub fn cuda_on_device_override_from(s: Option<&str>) -> Option<bool> {
 ///
 /// Read ONCE per process via [`cuda_on_device_override_from`]. Returns
 /// `Some(true)`/`Some(false)` when the operator forces the toggle, `None` when the
-/// env is unset/empty/malformed (defer to [`on_device_default`]). NOT
-/// `#[cfg(feature="cpu")]`-gated (unlike [`split_2lane_enabled`]) because cuda/rocm
-/// builds resolve it too.
+/// env is unset/empty/malformed (defer to [`on_device_default`]).
 fn cuda_on_device_override() -> Option<bool> {
     use std::sync::OnceLock;
     static E: OnceLock<Option<bool>> = OnceLock::new();
@@ -2305,18 +2302,6 @@ fn cuda_on_device_override() -> Option<bool> {
 #[must_use]
 fn on_device_default() -> bool {
     true
-}
-
-/// Opt-in gate for the additive 2-lane native split scan. Read
-/// ONCE from `LGBM_SPLIT_2LANE` (`"1"` => on). OFF by default: the serial
-/// [`kernels::split::find_best_split_cpu_native`] is the bit-exact source of truth
-/// and the production path; the 2-lane variant is selected only for the explicit
-/// A/B latency measurement (it produces byte-identical SplitInfos either way).
-#[cfg(feature = "cpu")]
-fn split_2lane_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("LGBM_SPLIT_2LANE").map(|v| v == "1").unwrap_or(false))
 }
 
 #[cfg(feature = "cpu")]
@@ -2433,44 +2418,20 @@ impl Backend for CpuBackend {
         // Native f64 scan — bit-identical to the single-unit find_best_split_
         // kernel, without the per-(feature,leaf) cubecl launch. The cubecl path
         // stays in find_best_split_cpu for kernel-parity / ROCm-mirror tests.
-        //
-        // An OPT-IN additive 2-lane variant runs the REVERSE and
-        // FORWARD passes on two rayon lanes (bit-identical winner — see
-        // `find_best_split_cpu_native_2lane`). Gated behind `LGBM_SPLIT_2LANE=1` so
-        // the DEFAULT path is the unchanged serial source of truth; the 2-lane path
-        // is only selected for the explicit A/B measurement. Both paths produce
-        // byte-identical SplitInfos (asserted by `split_2lane_equals_serial_*`).
-        if split_2lane_enabled() {
-            kernels::split::find_best_split_cpu_native_2lane(
-                hist,
-                cfg,
-                num_bin,
-                offset,
-                default_bin,
-                most_freq_bin,
-                skip_default_bin,
-                na_as_missing,
-                run_forward,
-                sum_gradient,
-                sum_hessian,
-                num_data,
-            )
-        } else {
-            kernels::split::find_best_split_cpu_native(
-                hist,
-                cfg,
-                num_bin,
-                offset,
-                default_bin,
-                most_freq_bin,
-                skip_default_bin,
-                na_as_missing,
-                run_forward,
-                sum_gradient,
-                sum_hessian,
-                num_data,
-            )
-        }
+        kernels::split::find_best_split_cpu_native(
+            hist,
+            cfg,
+            num_bin,
+            offset,
+            default_bin,
+            most_freq_bin,
+            skip_default_bin,
+            na_as_missing,
+            run_forward,
+            sum_gradient,
+            sum_hessian,
+            num_data,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
