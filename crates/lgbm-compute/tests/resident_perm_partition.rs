@@ -654,4 +654,95 @@ mod real_gpu_gated {
         assert_eq!(layout_off.leaf_begin, layout_on.leaf_begin, "leaf_begin drift");
         assert_eq!(layout_off.leaf_count, layout_on.leaf_count, "leaf_count drift");
     }
+
+    /// SPEC-DRGL-05 (REAL GPU): the sync-DEFERRAL arm (`LGBM_GROW_DEFER_SYNC=1`) grows a
+    /// tree + layout BYTE-IDENTICAL to the default eager arm — for BOTH a full-growth corpus
+    /// and a depth-capped one (exercising the deferral's depth-cap sentinel fold). Partition
+    /// resident is forced ON (the deferral requires the resident-perm arm). This is the
+    /// flag-ON == flag-OFF gate the deferral must pass before any default flip.
+    #[test]
+    fn deferred_sync_arm_grows_byte_identical_tree() {
+        use lgbm_compute::kernels::grow_driver::{
+            grow_tree_on_device_driver, set_grow_defer_sync_override, set_partition_resident_override,
+        };
+        use lgbm_compute::{GpuBackend, GrowFeature};
+        use lgbm_dataset::bin_mapper::{BinType, MissingType};
+
+        pin_autotune_off();
+        let num_data = 600usize;
+        let num_bins = [12u32, 7, 9];
+        let missing = [MissingType::None, MissingType::Zero, MissingType::None];
+        let cols: Vec<Vec<u32>> =
+            (0..3).map(|f| column(0xd21f + f as u64, num_data, num_bins[f])).collect();
+        let features: Vec<GrowFeature> = (0..3)
+            .map(|f| GrowFeature {
+                bins: BinColumn::new(cols[f].clone(), num_bins[f]),
+                num_bin: num_bins[f],
+                offset: 1,
+                min_bin: 0,
+                max_bin: num_bins[f] - 1,
+                default_bin: num_bins[f],
+                most_freq_bin: 0,
+                missing_type: missing[f],
+                bin_upper_bound: (0..num_bins[f]).map(|b| b as f64 + 0.5).collect(),
+                real_feature_index: f as i32,
+                bin_type: BinType::Numerical,
+                bin_to_category: Vec::new(),
+                cat_smooth: 10.0,
+                cat_l2: 10.0,
+                max_cat_threshold: 32,
+                max_cat_to_onehot: 4,
+                min_data_per_group: 100,
+            })
+            .collect();
+        let mut lcg = Lcg(0x9add);
+        let gradients: Vec<f32> =
+            (0..num_data).map(|_| (lcg.next_u32() % 21) as f32 - 10.0).collect();
+        let hessians: Vec<f32> = vec![1.0f32; num_data];
+
+        let backend = GpuBackend::<GpuRt>::default();
+        let client = gpu_client();
+        // The deferral requires the resident-perm arm; force it ON for both flag states.
+        set_partition_resident_override(Some(true));
+        let bits = |xs: &[f64]| xs.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+
+        // Two shapes: full growth (max_depth=-1) and a depth cap (=3, exercises the sentinel).
+        for (num_leaves, max_depth) in [(16i32, -1i32), (16, 3)] {
+            let grow = || {
+                grow_tree_on_device_driver(
+                    &backend, &client, &gradients, &hessians, &features, num_leaves, max_depth,
+                )
+                .expect("resident driver grow")
+            };
+            set_grow_defer_sync_override(Some(false));
+            let (tree_off, layout_off) = grow();
+            set_grow_defer_sync_override(Some(true));
+            let (tree_on, layout_on) = grow();
+            set_grow_defer_sync_override(None);
+
+            let ctx = format!("num_leaves={num_leaves} max_depth={max_depth}");
+            assert!(tree_off.num_leaves > 2, "{ctx}: corpus must split multiple times");
+            assert_eq!(tree_off.num_leaves, tree_on.num_leaves, "{ctx}: num_leaves drift");
+            assert_eq!(tree_off.split_feature, tree_on.split_feature, "{ctx}: split_feature drift");
+            assert_eq!(tree_off.left_child, tree_on.left_child, "{ctx}: left_child drift");
+            assert_eq!(tree_off.right_child, tree_on.right_child, "{ctx}: right_child drift");
+            assert_eq!(bits(&tree_off.threshold), bits(&tree_on.threshold), "{ctx}: threshold drift");
+            assert_eq!(bits(&tree_off.leaf_value), bits(&tree_on.leaf_value), "{ctx}: leaf_value drift");
+            assert_eq!(
+                bits(&tree_off.internal_value),
+                bits(&tree_on.internal_value),
+                "{ctx}: internal_value drift"
+            );
+            assert_eq!(tree_off.leaf_count, tree_on.leaf_count, "{ctx}: leaf_count(tree) drift");
+            assert_eq!(
+                tree_off.internal_count,
+                tree_on.internal_count,
+                "{ctx}: internal_count drift"
+            );
+            assert_eq!(layout_off.indices, layout_on.indices, "{ctx}: layout indices drift");
+            assert_eq!(layout_off.leaf_begin, layout_on.leaf_begin, "{ctx}: leaf_begin drift");
+            assert_eq!(layout_off.leaf_count, layout_on.leaf_count, "{ctx}: leaf_count drift");
+        }
+        set_partition_resident_override(None);
+    }
 }
