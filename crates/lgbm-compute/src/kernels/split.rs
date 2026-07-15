@@ -3334,22 +3334,34 @@ pub fn scan_parprefix_count_take() -> u64 {
 
 /// OFFICIAL-SHAPE scan gate (`LGBM_SCAN_OFFICIAL`, P1b) — the 256-wide,
 /// one-lane-per-bin block-prefix-sum + block-argmax scan
-/// ([`find_best_splits_fused_staged_official_kernel`] et al.). **Default OFF on BOTH
-/// backends** until the Kaggle P100 A/B (`lgb-rs-p1b-official-scan`) settles whether
-/// the 256-wide geometry wins where pargain/parprefix lost (both kept CUBE_DIM=64) —
-/// unlike pargain/parprefix this has no per-backend default yet, so it must be
-/// explicitly enabled. `LGBM_SCAN_OFFICIAL=1` forces ON on either GPU backend; `=0`
-/// (or unset) OFF. The cpu anchor + planeless devices never run it. When enabled it
-/// PRECEDES parprefix/pargain in [`launch_staged_single_scan`] /
-/// [`launch_staged_siblings_scan`]. Takes the client (not just the runtime name) so
-/// the guard can require plane support and the launch can source `plane_dim` from
+/// ([`find_best_splits_fused_staged_official_kernel`] et al.). Backend-aware default
+/// (like pargain/parprefix), set by the measured Kaggle P100 A/B
+/// (`lgb-rs-p1b-official-scan`, 2026-07-15):
+/// - **CUDA/NVIDIA (default ON):** 256-wide wins where pargain/parprefix (CUBE_DIM=64)
+///   lost — base 4.604s → official 4.233s = **1.0876× (−371ms)**, preds BIT-IDENTICAL
+///   (max_abs 0.0, no split flipped on the bench corpus despite the ~1e-6 internal
+///   gain reorder), counts scan_official=2980, CUDA parity gate green; nsys shows the
+///   scan kernel drop **131 µs → 16–20 µs/launch** (the subtract-fuse twin 20.1 µs
+///   ×2385, single-scan 16.1 µs), approaching official LightGBM's ~7.5 µs class.
+/// - **ROCm/AMD (default OFF):** parprefix is already the proven hip scan winner
+///   ([[cudagraph-campaign]] 1.33× scan); a gfx1151 drain (2026-07-15) put official at
+///   714 ms/scan vs parprefix 691 ms (~3% slower, within box noise) — no win, so hip
+///   keeps parprefix. Official stays available on hip via `LGBM_SCAN_OFFICIAL=1`.
+///
+/// `=1` forces ON on either GPU backend; `=0` forces OFF (reverts the CUDA default —
+/// e.g. to restore the bit-exact-by-construction staged scan). The cpu anchor +
+/// planeless devices never run it (so the f64 merge gate + bit-exact anchor tests are
+/// untouched). When enabled it PRECEDES parprefix/pargain in the staged launchers +
+/// the subtract-fuse launcher. Takes the client (not just the runtime name) so the
+/// guard can require plane support and the launch can source `plane_dim` from
 /// `hardware.plane_size_max` — the same block-collective plumbing P1a's
 /// [`reduce_par_enabled`] uses.
 #[cfg(feature = "gpu")]
 pub fn scan_official_enabled<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
 ) -> bool {
-    if <R as cubecl::Runtime>::name(client) == "cpu" {
+    let name = <R as cubecl::Runtime>::name(client);
+    if name == "cpu" {
         return false;
     }
     if client.properties().hardware.plane_size_max < 2 {
@@ -3360,7 +3372,13 @@ pub fn scan_official_enabled<R: cubecl::Runtime>(
         2 => return false,
         _ => {}
     }
-    matches!(std::env::var("LGBM_SCAN_OFFICIAL").as_deref(), Ok("1"))
+    match std::env::var("LGBM_SCAN_OFFICIAL").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        // Default: ON for CUDA (the measured 1.0876× P100 win), OFF for hip
+        // (parprefix wins there) + everything else.
+        _ => name == "cuda",
+    }
 }
 
 /// Same-session A/B override for [`scan_official_enabled`]. 0 = unset (env decides),

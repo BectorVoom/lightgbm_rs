@@ -1,7 +1,19 @@
 # P1b — Official-Shape Parallel Scan Kernel: Ready-to-Code Design
 
-Status 2026-07-15: **KERNEL CODED + LOCALLY VALIDATED (rungs 1-3 green on real
-gfx1151); Kaggle P100 A/B (rung 4) is the remaining step.** The three kernel twins
+Status 2026-07-15: **SHIPPED — rung-4 Kaggle P100 A/B is a WIN; CUDA default flipped
+ON.** `lgb-rs-p1b-official-scan` (P100, order-alt warm-median-3, 500k×50×100): base
+4.604s → official **4.233s = 1.0876× (−371ms)**, preds **BIT-IDENTICAL (max_abs 0.0)**,
+counts scan_official=2980/0, TREE_COUNT_OK, CUDA parity gate green; nsys shows the scan
+kernel drop **131 µs → 16–20 µs/launch** (subtract-fuse twin 20.1 µs ×2385, single
+16.1 µs) — the first lever to beat the scan wall where pargain/parprefix both lost.
+Default flipped ON for **CUDA only** (`_ => name == "cuda"` in `scan_official_enabled`);
+hip stays parprefix (gfx1151 drain: official 714 ms/scan vs parprefix 691 ms, ~3%
+slower, no win). Hatch `LGBM_SCAN_OFFICIAL=0` reverts; cpu anchor untouched (never runs
+it → bit-exact merge gate `resident_tree_bit_exact_to_u64_integer_path` on CpuBackend
+unaffected). Earlier status (kernel coded + rungs 1-3) preserved below.
+
+Status 2026-07-15 (superseded): **KERNEL CODED + LOCALLY VALIDATED (rungs 1-3 green on
+real gfx1151); Kaggle P100 A/B (rung 4) is the remaining step.** The three kernel twins
 (`find_best_splits_fused_staged_official_kernel` / `..._siblings_..._official_kernel`
 / `..._siblings_subtract_..._official_kernel`), the `official_branch_block` #[cube]
 helper, the f64 block collectives (`block_inclusive_scan_f64` / `block_max_f64` /
