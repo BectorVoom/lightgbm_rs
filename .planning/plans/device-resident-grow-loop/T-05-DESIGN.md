@@ -168,6 +168,45 @@ export makes the LEFT/RIGHT sums host-known:
 Flag infra SHIPPED (`439af57`): `grow_defer_sync_enabled()` (default OFF) +
 `set_grow_defer_sync_override()` + `deferred_read_fused=` tripwire + phase_prof wiring.
 
+## ⭐ STEP-4 IMPLEMENTATION NOTES (derived 2026-07-15, ready to execute)
+Concrete plan for the loop, refined from a full read of `grow_tree_on_device_resident`
+(grow_driver.rs ~2388-3277) + the frontier pick internals:
+
+**Do it as a SEPARATE `grow_tree_on_device_resident_deferred` fn** dispatched when
+`grow_defer_sync_enabled()` (else the existing fn, byte-unchanged → merge gate safe). Reuse
+the setup (2408-2676) and tail (3242-3277) verbatim; only the per-split loop body differs.
+
+**The deferred loop is a UNIFORM path (simpler than flag-OFF's co-pack/default/f64 arms):**
+each iteration: build-LEFT(which=0)→`next_slot`, subtract→RIGHT in `parent_slot`, scan-LEFT
+(which=0, sum=`export.left_sum_*`)→fold `new_left`, scan-RIGHT(which=1, sum=`export.right_sum_*`)
+→fold `new_right`. Byte-identical to flag-OFF because the u64 histogram is order-free and the
+LEFT/RIGHT devcount scans == host scans (all proven, gfx1151+P100).
+- **Only DEFERRED one iteration:** children `row_begin`/`row_count` (need split_point) AND the
+  `split_tree_scheduled` tree mutation (counts need split_point). Applied at the TOP of iter
+  i+1 for split i (and the LAST split in the tail). `.slot` is HOST-KNOWN at i in build-LEFT
+  (LEFT=next_slot, RIGHT=parent_slot — no smaller_is_left), as are sums(export)/depth.
+- **Scannability:** keep only the host DEPTH cap (fold no-split sentinel for depth-capped
+  children instead of scanning); size/hessian gates fall out of the scan's own reject
+  (num_data-driven), tree-identical (unscannable ⇒ sentinel ⇒ never picked). VERIFY the
+  scan-sentinel fold == `reduce_winner_into_frontier(none)` byte-for-byte (likely; test it).
+- **§8.3 self-invalidation:** pass `prev_smaller=new_left(i-1)`, `prev_larger=new_right(i-1)`
+  (order-independent set — the pick invalidates both child slots).
+- **Tree-mutation ordering invariant holds:** at iter i's deferred step, splits 0..i-2 are
+  applied (i-1 mutations ⇒ tree.num_leaves=i) and split i-1's new_right=i ⇒ assert i==i. ✔
+
+**THE BATCHED-READ REFACTOR (the one real new plumbing):** today
+`DeviceFrontier::frontier_pick_best_leaf` LAUNCHES the pick kernel AND does the one blocking
+`client.read` of the 8-int export internally (best_split.rs ~2401-2411). To fuse it with the
+previous split's `read_split`, split it into (a) launch-pick-writing-export-to-a-handle (no
+read) and (b) a `read_deferred_split_and_pick` that does ONE
+`client.read(vec![leaf_splits.ranges_handle, pick_export_handle])` and decodes BOTH. Add this
+as a NEW additive frontier method (don't mutate the existing atomic one — flag-OFF keeps it).
+`read_batched` (lib.rs:1287) already does the multi-handle drain.
+
+**Validation:** new rocm/cuda test — grow a fixed corpus flag-OFF vs
+`set_grow_defer_sync_override(Some(true))`, assert byte-identical tree + layout, on BOTH a
+re-pick corpus and a full-growth corpus. This is the headroom-hungry GPU-debug loop.
+
 ### Task order (CORRECT)
 1. ✅ DONE (`439af57`): flag gate + tripwire.
 2. ✅ DONE (`a0df0f3`): generalized the devcount num_data resolve to `which ∈ {Left=0,
