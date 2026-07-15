@@ -5566,6 +5566,259 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
 // for the cross-LEAF pick).
 // ============================================================================
 
+/// PLANE-PARALLEL reduce gate (`LGBM_REDUCE_PAR`, P1a of the nsys round —
+/// `docs/ondevice-cuda-perf-plan.md` §5). The serial reduce kernels run ONE thread
+/// walking `n_feats * 12` f64 cells from global memory (~119 µs/launch on P100 vs
+/// official's 3.7 µs analog — 283 ms/train on the co-pack reduce alone); the plane
+/// twins fold lane-strided subsets and pick the winner with two plane collectives.
+/// BIT-EXACT by construction (see `reduce_window_par_body`), so the hatch is
+/// benchmark-only. REAL-DEVICE ONLY: cubecl-cpu has `plane_size == 1` / no plane
+/// ops — the cpu anchor keeps the serial kernel byte-unchanged. DEFAULT ON
+/// (`LGBM_REDUCE_PAR=0` reverts): P100 A/B `lgb-rs-p1a-reduce-par` (2026-07-15,
+/// order-alternated warm-median-of-3, 500k×50×100) measured 5.177→4.880 s =
+/// 1.061× with preds bit-identical (max_abs 0.0) and the kernel at 3.5 µs vs
+/// 119 µs serial (nsys); counts proof reduce_par=2880 vs 0. hip byte-identity
+/// gates green on gfx1151 (`reduce_par_parity`, `cuda_on_device` 7/7 forced-ON).
+#[cfg(feature = "gpu")]
+pub fn reduce_par_enabled<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+) -> bool {
+    if <R as cubecl::Runtime>::name(client) == "cpu" {
+        return false;
+    }
+    if client.properties().hardware.plane_size_max < 2 {
+        return false;
+    }
+    match REDUCE_PAR_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| !matches!(std::env::var("LGBM_REDUCE_PAR").as_deref(), Ok("0")))
+}
+
+/// Same-session A/B override for [`reduce_par_enabled`]. 0 = unset (env decides),
+/// 1 = force ON, 2 = force OFF. The cpu/plane hard gates still apply.
+#[cfg(feature = "gpu")]
+static REDUCE_PAR_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test/harness hook: force the plane-parallel reduce ON/OFF or defer to the env.
+#[cfg(feature = "gpu")]
+pub fn set_reduce_par_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    REDUCE_PAR_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire — bumped once per reduce launch that dispatched a PLANE-PARALLEL
+/// twin (bench-protocol counts proof). Folded into the `phase_prof` COUNTS line as
+/// `reduce_par=`.
+#[cfg(feature = "gpu")]
+pub static REDUCE_PAR_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Swap the plane-parallel-reduce tripwire to zero and return the prior value
+/// (consumed by `phase_prof::dump`). Present on every build (0 without `gpu`).
+pub fn reduce_par_count_take() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        REDUCE_PAR_CNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        0
+    }
+}
+
+/// PLANE-PARALLEL cross-feature reduce BODY — the all-lanes twin of the serial
+/// fold in [`reduce_scan_output_into_leaf_kernel`]. Every unit of ONE plane
+/// strides the `n_feats` raw records with the IDENTICAL accept-gate + two-key
+/// `split_gt` compare (strictly-greater raw gain, exact-tie → lower real feature
+/// key), then two plane collectives (`plane_max` on the lane-best gain,
+/// `plane_min` on the feature key among gain-tied lanes) select the winner lane,
+/// which re-reads its record's cells and writes the slot.
+///
+/// ## Why this is BIT-EXACT (not ~1e-6)
+/// Within one window the (raw_gain desc, real_feat asc) key set is STRICTLY
+/// totally ordered: feature keys are distinct per record, and NaN gains are
+/// excluded by the accept-gate (`raw_gain > neg_inf` is false for NaN). A strict
+/// total order has a UNIQUE maximum, so ANY reduction order — lane-strided local
+/// folds + plane collectives here, ascending single-thread walk in the serial
+/// kernel — selects the SAME record. The winning fields are copied verbatim from
+/// the same raw cells, and the net-gain transform
+/// `(raw_gain - min_gain_shift) * penalty` is the identical single f64 op.
+/// The all-invalid window writes the identical seed sentinel (valid=0,
+/// gain=`(neg_inf - min_gain_shift) * penalty`, feat=-1, rest 0).
+#[cfg(feature = "gpu")]
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn reduce_window_par_body(
+    raw: &Array<f64>,
+    real_feats: &Array<f64>,
+    out_valid: &mut Array<f64>,
+    out_gain: &mut Array<f64>,
+    out_feat: &mut Array<f64>,
+    out_thr: &mut Array<f64>,
+    out_dleft: &mut Array<f64>,
+    out_ncat: &mut Array<f64>,
+    out_lsum_g: &mut Array<f64>,
+    out_lsum_h: &mut Array<f64>,
+    out_rsum_g: &mut Array<f64>,
+    out_rsum_h: &mut Array<f64>,
+    out_lval: &mut Array<f64>,
+    out_rval: &mut Array<f64>,
+    rb_u: u32,
+    n_feats: u32,
+    slot_u: u32,
+    min_gain_shift: f64,
+    penalty: f64,
+    neg_inf: f64,
+) {
+    let rb = rb_u as usize;
+    let n = n_feats as usize;
+    let slot = slot_u as usize;
+    // Lane-local fold over the strided subset — the serial compare verbatim,
+    // carried in f64 locals (real-device only; no cpu-MLIR local-carry limits).
+    let mut lv = f64::new(0.0);
+    let mut lg = neg_inf;
+    let mut lf = f64::new(-1.0);
+    let mut lt = f64::new(0.0);
+    let mut t = UNIT_POS as usize;
+    while t < n {
+        let dbase = rb + t * 12;
+        let v = (raw[dbase] != 0.0) && (raw[dbase + 2] > neg_inf);
+        let strictly_gain = raw[dbase + 2] > lg;
+        let tie_gain = raw[dbase + 2] == lg;
+        let feat_lower = real_feats[t] < lf;
+        let take = v && (strictly_gain || (tie_gain && feat_lower));
+        lv = select(take, 1.0, lv);
+        lg = select(take, raw[dbase + 2], lg);
+        lf = select(take, real_feats[t], lf);
+        lt = select(take, f64::cast_from(t as u32), lt);
+        t += CUBE_DIM as usize;
+    }
+    // Plane argmax: max gain over the plane, then min feature key among the
+    // gain-tied lanes. Invalid lanes hold (neg_inf, -1) and get a +inf key, so
+    // they never tie a valid lane (a valid lane's gain is > neg_inf by the gate).
+    let any = plane_max(lv);
+    let m = plane_max(lg);
+    let pos_inf = f64::new(0.0) - neg_inf;
+    let fk = select(lg == m, lf, pos_inf);
+    let fmin = plane_min(fk);
+    let win = (lv != 0.0) && (lg == m) && (lf == fmin);
+    if win {
+        // EXACTLY ONE lane: distinct feature keys ⇒ (m, fmin) names one record.
+        let dbase = rb + (u32::cast_from(lt) as usize) * 12;
+        out_valid[slot] = 1.0;
+        out_feat[slot] = lf;
+        out_thr[slot] = raw[dbase + 1];
+        out_dleft[slot] = raw[dbase + 9];
+        out_ncat[slot] = 0.0;
+        out_lsum_g[slot] = raw[dbase + 5];
+        out_lsum_h[slot] = raw[dbase + 6];
+        out_rsum_g[slot] = raw[dbase + 7];
+        out_rsum_h[slot] = raw[dbase + 8];
+        out_lval[slot] = raw[dbase + 10];
+        out_rval[slot] = raw[dbase + 11];
+        out_gain[slot] = (lg - min_gain_shift) * penalty;
+    }
+    if (any == 0.0) && (UNIT_POS == 0u32) {
+        // No valid record: the serial kernel's final state is its seed with the
+        // net-gain transform applied — reproduce it verbatim.
+        out_valid[slot] = 0.0;
+        out_feat[slot] = -1.0;
+        out_thr[slot] = 0.0;
+        out_dleft[slot] = 0.0;
+        out_ncat[slot] = 0.0;
+        out_lsum_g[slot] = 0.0;
+        out_lsum_h[slot] = 0.0;
+        out_rsum_g[slot] = 0.0;
+        out_rsum_h[slot] = 0.0;
+        out_lval[slot] = 0.0;
+        out_rval[slot] = 0.0;
+        out_gain[slot] = (neg_inf - min_gain_shift) * penalty;
+    }
+}
+
+/// PLANE-PARALLEL twin of [`reduce_scan_output_into_leaf_kernel`] — one plane
+/// (`CubeDim = plane_size`), same args, same slot writes. Dispatched by
+/// [`launch_reduce_into_leaf`] under [`reduce_par_enabled`].
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn reduce_scan_output_into_leaf_par_kernel(
+    raw: &Array<f64>,
+    real_feats: &Array<f64>,
+    out_valid: &mut Array<f64>,
+    out_gain: &mut Array<f64>,
+    out_feat: &mut Array<f64>,
+    out_thr: &mut Array<f64>,
+    out_dleft: &mut Array<f64>,
+    out_ncat: &mut Array<f64>,
+    out_lsum_g: &mut Array<f64>,
+    out_lsum_h: &mut Array<f64>,
+    out_rsum_g: &mut Array<f64>,
+    out_rsum_h: &mut Array<f64>,
+    out_lval: &mut Array<f64>,
+    out_rval: &mut Array<f64>,
+    raw_base: u32,
+    n_feats: u32,
+    out_slot: u32,
+    min_gain_shift: f64,
+    penalty: f64,
+    neg_inf: f64,
+) {
+    reduce_window_par_body(
+        raw, real_feats, out_valid, out_gain, out_feat, out_thr, out_dleft, out_ncat,
+        out_lsum_g, out_lsum_h, out_rsum_g, out_rsum_h, out_lval, out_rval, raw_base, n_feats,
+        out_slot, min_gain_shift, penalty, neg_inf,
+    );
+}
+
+/// PLANE-PARALLEL twin of [`reduce_scan_output_into_two_leaves_kernel`] — TWO
+/// cubes of one plane each (`CubeCount::Static(2,1,1)`), cube `task` folds its
+/// sibling window into its slot exactly as the serial twin. Dispatched by
+/// [`launch_reduce_into_two_leaves`] under [`reduce_par_enabled`].
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn reduce_scan_output_into_two_leaves_par_kernel(
+    raw: &Array<f64>,
+    real_feats: &Array<f64>,
+    out_valid: &mut Array<f64>,
+    out_gain: &mut Array<f64>,
+    out_feat: &mut Array<f64>,
+    out_thr: &mut Array<f64>,
+    out_dleft: &mut Array<f64>,
+    out_ncat: &mut Array<f64>,
+    out_lsum_g: &mut Array<f64>,
+    out_lsum_h: &mut Array<f64>,
+    out_rsum_g: &mut Array<f64>,
+    out_rsum_h: &mut Array<f64>,
+    out_lval: &mut Array<f64>,
+    out_rval: &mut Array<f64>,
+    n_feats: u32,
+    out_slot_a: u32,
+    out_slot_b: u32,
+    min_gain_shift_a: f64,
+    min_gain_shift_b: f64,
+    penalty: f64,
+    neg_inf: f64,
+) {
+    let task = CUBE_POS_X;
+    let rb = select(task == 0, 0u32, n_feats * 12u32);
+    let slot = select(task == 0, out_slot_a, out_slot_b);
+    let min_gain_shift = select(task == 0, min_gain_shift_a, min_gain_shift_b);
+    reduce_window_par_body(
+        raw, real_feats, out_valid, out_gain, out_feat, out_thr, out_dleft, out_ncat,
+        out_lsum_g, out_lsum_h, out_rsum_g, out_rsum_h, out_lval, out_rval, rb, n_feats, slot,
+        min_gain_shift, penalty, neg_inf,
+    );
+}
+
 /// Cross-FEATURE reduce BODY. Decodes one leaf's raw `n*12`-cell scan
 /// window (`find_best_splits_fused_kernel` / `find_best_splits_fused_siblings_kernel`
 /// / `build_fix_scan_fused_kernel` all emit the SAME layout) with the SAME
@@ -5678,7 +5931,7 @@ fn reduce_scan_output_into_leaf_kernel(
 /// `>= raw_base + n_feats*12` cells; `out_slot < out.len`. All bounds are host-proven by
 /// the callers' V5 validation before launch.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn launch_reduce_into_leaf<R: cubecl::Runtime>(
+pub fn launch_reduce_into_leaf<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     h_raw: cubecl::server::Handle,
     raw_len: usize,
@@ -5698,6 +5951,44 @@ pub(crate) fn launch_reduce_into_leaf<R: cubecl::Runtime>(
         let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
         client.create_from_slice(f64::as_bytes(&rf))
     });
+    // PLANE-PARALLEL twin (LGBM_REDUCE_PAR, real-device only) — bit-exact winner,
+    // one plane instead of one thread. Same args, same slot writes.
+    #[cfg(feature = "gpu")]
+    if reduce_par_enabled(client) {
+        let pd = client.properties().hardware.plane_size_max;
+        REDUCE_PAR_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: identical bounds contract to the serial launch below (caller-proven);
+        // the kernel folds only `out_*[out_slot]` and reads only the caller-validated
+        // `raw` window + `real_feats[0..n)`. Every handle outlives the launch.
+        unsafe {
+            reduce_scan_output_into_leaf_par_kernel::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(pd),
+                ArrayArg::from_raw_parts(h_raw, raw_len),
+                ArrayArg::from_raw_parts(h_rf, n_feats),
+                ArrayArg::from_raw_parts(out.valid.clone(), out.len),
+                ArrayArg::from_raw_parts(out.gain.clone(), out.len),
+                ArrayArg::from_raw_parts(out.feat.clone(), out.len),
+                ArrayArg::from_raw_parts(out.thr.clone(), out.len),
+                ArrayArg::from_raw_parts(out.dleft.clone(), out.len),
+                ArrayArg::from_raw_parts(out.ncat.clone(), out.len),
+                ArrayArg::from_raw_parts(out.left_sum_gradients.clone(), out.len),
+                ArrayArg::from_raw_parts(out.left_sum_hessians.clone(), out.len),
+                ArrayArg::from_raw_parts(out.right_sum_gradients.clone(), out.len),
+                ArrayArg::from_raw_parts(out.right_sum_hessians.clone(), out.len),
+                ArrayArg::from_raw_parts(out.left_output.clone(), out.len),
+                ArrayArg::from_raw_parts(out.right_output.clone(), out.len),
+                raw_base as u32,
+                n_feats as u32,
+                out_slot as u32,
+                min_gain_shift,
+                1.0f64,
+                f64::NEG_INFINITY,
+            );
+        }
+        return;
+    }
     // SAFETY: single-owner static geometry (Route C). The kernel seeds + folds `out_*[slot]`
     // (`out_slot < out.len`, caller-validated) and reads only `raw[raw_base .. raw_base +
     // n_feats*12)` (caller-validated `<= raw_len`) and `real_feats[0 .. n_feats)`
@@ -5821,7 +6112,7 @@ fn reduce_scan_output_into_two_leaves_kernel(
 /// `out_slot`s `< out.len` and DISTINCT. Bounds host-proven by the caller.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
-fn launch_reduce_into_two_leaves<R: cubecl::Runtime>(
+pub fn launch_reduce_into_two_leaves<R: cubecl::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     h_raw: cubecl::server::Handle,
     raw_len: usize,
@@ -5839,6 +6130,44 @@ fn launch_reduce_into_two_leaves<R: cubecl::Runtime>(
         let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
         client.create_from_slice(f64::as_bytes(&rf))
     });
+    // PLANE-PARALLEL twin (LGBM_REDUCE_PAR, real-device only) — bit-exact winners,
+    // two one-plane cubes instead of two single threads.
+    if reduce_par_enabled(client) {
+        let pd = client.properties().hardware.plane_size_max;
+        REDUCE_PAR_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: identical bounds contract to the serial launch below (caller-proven):
+        // cube `task` folds ONLY `out_*[out_slot_{a|b}]` (distinct) and reads its
+        // `raw` window + `real_feats[0..n)`. Every handle outlives the launch.
+        unsafe {
+            reduce_scan_output_into_two_leaves_par_kernel::launch_unchecked(
+                client,
+                CubeCount::Static(2, 1, 1),
+                CubeDim::new_1d(pd),
+                ArrayArg::from_raw_parts(h_raw, raw_len),
+                ArrayArg::from_raw_parts(h_rf, n_feats),
+                ArrayArg::from_raw_parts(out.valid.clone(), out.len),
+                ArrayArg::from_raw_parts(out.gain.clone(), out.len),
+                ArrayArg::from_raw_parts(out.feat.clone(), out.len),
+                ArrayArg::from_raw_parts(out.thr.clone(), out.len),
+                ArrayArg::from_raw_parts(out.dleft.clone(), out.len),
+                ArrayArg::from_raw_parts(out.ncat.clone(), out.len),
+                ArrayArg::from_raw_parts(out.left_sum_gradients.clone(), out.len),
+                ArrayArg::from_raw_parts(out.left_sum_hessians.clone(), out.len),
+                ArrayArg::from_raw_parts(out.right_sum_gradients.clone(), out.len),
+                ArrayArg::from_raw_parts(out.right_sum_hessians.clone(), out.len),
+                ArrayArg::from_raw_parts(out.left_output.clone(), out.len),
+                ArrayArg::from_raw_parts(out.right_output.clone(), out.len),
+                n_feats as u32,
+                out_slot_a as u32,
+                out_slot_b as u32,
+                min_gain_shift_a,
+                min_gain_shift_b,
+                1.0f64,
+                f64::NEG_INFINITY,
+            );
+        }
+        return;
+    }
     // SAFETY: two single-owner cubes (Route C, geometry `Static(2,1,1)`). Cube `task`
     // seeds + folds ONLY `out_*[out_slot_{a|b}]` (both `< out.len`, DISTINCT, caller-
     // validated ⇒ no cross-cube write race) and reads only `raw[rb .. rb + n*12)` with
