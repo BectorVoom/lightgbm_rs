@@ -153,16 +153,6 @@ pub fn on_device_sync_count_take() -> u64 {
 /// `phase_prof` COUNTS line. Inert unless `LGBM_PHASE_PROF=="1"` (parity-neutral).
 pub static ON_DEVICE_ROOTBUILD_U64_CNT: AtomicU64 = AtomicU64::new(0);
 
-/// NEGATIVE guard — bumped iff the on-device driver dispatches the f64 single-owner fused
-/// build (`Backend::build_fix_scan_resident` → `build_fix_scan_resident_f64_on`), which is
-/// reachable ONLY via the `LGBM_ONDEVICE_F64_FUSED=1` A/B escape hatch
-/// ([`on_device_f64_fused_build`]). It MUST stay 0 on the DEFAULT (parallel-u64) path; the
-/// launch-count test asserts `== 0` so the slower f64 kernel can never silently become the
-/// default on-device build again. Only the DRIVER bumps this, so it can never be polluted
-/// by the host-learner fused path that legitimately keeps using `build_fix_scan_resident`.
-/// Inert unless `LGBM_PHASE_PROF=="1"`.
-pub static ON_DEVICE_F64_FUSED_CNT: AtomicU64 = AtomicU64::new(0);
-
 /// Bump the converted-site parallel-u64 build tripwire (see [`ON_DEVICE_ROOTBUILD_U64_CNT`]).
 #[inline]
 fn bump_rootbuild_u64() {
@@ -171,25 +161,11 @@ fn bump_rootbuild_u64() {
     }
 }
 
-/// Bump the f64-single-owner-fused negative guard (see [`ON_DEVICE_F64_FUSED_CNT`]).
-#[inline]
-fn bump_f64_fused() {
-    if launch_prof_enabled() {
-        ON_DEVICE_F64_FUSED_CNT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// Swap the converted-site u64-build tripwire to zero and return the prior value. Called by
 /// `phase_prof::dump` (folds into the COUNTS line) and by the launch-count test (POSITIVE
 /// assertion, `> 0`).
 pub fn on_device_rootbuild_u64_count_take() -> u64 {
     ON_DEVICE_ROOTBUILD_U64_CNT.swap(0, Ordering::Relaxed)
-}
-
-/// Swap the f64-fused negative-guard counter to zero and return the prior value. Called by
-/// the launch-count test (NEGATIVE assertion, `== 0` after the swap).
-pub fn on_device_f64_fused_count_take() -> u64 {
-    ON_DEVICE_F64_FUSED_CNT.swap(0, Ordering::Relaxed)
 }
 
 // ---- The on-device growth-loop PHASE LEDGER (env-gated, parity-neutral). ----
@@ -585,22 +561,6 @@ fn bump_partition_bc_smem() {
 /// the `phase_prof` COUNTS line).
 pub fn on_device_partition_bc_smem_count_take() -> u64 {
     ON_DEVICE_PARTITION_BC_SMEM_CNT.swap(0, Ordering::Relaxed)
-}
-
-/// A/B escape hatch — read-once `LGBM_ONDEVICE_F64_FUSED=="1"`.
-///
-/// DEFAULT (unset/`!= "1"`): the on-device ROOT + directly-built resident histogram BUILD
-/// runs on the PARALLEL u64 fixed-point kernel, which replaced the f64 single-owner
-/// `CubeDim::new_1d(1)` row-fold kernel measured to be substantially slower on real
-/// consumer NVIDIA hardware. `LGBM_ONDEVICE_F64_FUSED=1` restores the OLD f64 single-owner
-/// fused build+scan at those two sites so a real-CUDA A/B can quantify the u64-vs-f64
-/// difference side-by-side. It is NEVER the default — the hard constraint is "do NOT
-/// default the on-device path to the f64 fused kernel."
-fn on_device_f64_fused_build() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("LGBM_ONDEVICE_F64_FUSED").map(|v| v == "1").unwrap_or(false)
-    })
 }
 
 /// One feature column's ADDITIVE grow-loop input — the faithful lgbm-compute-local
@@ -1962,6 +1922,11 @@ fn sibling_copack_enabled() -> bool {
 /// ([`crate::Backend::scan_resident_siblings`]) scan paths so all three fold their
 /// results into `(SplitInfo, feature-position)` identically. Returns `(-inf, -1)` when
 /// nothing is admissible.
+///
+/// Now a test-only oracle: `scan_resident_leaf_argmax` folds the winner on-device, so the
+/// production grow loop no longer calls this host fold; the resident-scan parity tests still
+/// use it to prove device == host argmax.
+#[cfg_attr(not(test), allow(dead_code))]
 fn argmax_over_splits(
     splits: &[SplitInfo],
     feats: &[BatchedSplitFeature],
@@ -2451,12 +2416,6 @@ where
             run_forward: f.num_bin > 2 && f.missing_type == MissingType::Zero,
         })
         .collect();
-    // The fused `build_fix_scan_resident` SCANS `scan_active[fpos]` features and returns
-    // one SplitInfo per active feature IN ORDER. The driver scans EVERY feature (like
-    // `scan_resident_and_argmax`, which passes the full `feats` and drops `na_as_missing`
-    // in the argmax), so all features are scan-active ⇒ the returned Vec is one SplitInfo
-    // per feature in fpos order, aligning 1:1 with `feats`/`features` for the argmax.
-    let scan_active: Vec<bool> = vec![true; features.len()];
     // The fpos-ordered real-feature-index vector — the tie-break KEY the
     // on-device cross-feature argmax (`scan_resident_leaf_argmax` / `scan_resident_siblings_argmax`,
     // §8.2) folds by, so the winner is bit-identical to the host `argmax_over_splits`.
@@ -2501,15 +2460,14 @@ where
     // sub-range in place on device, feed every build its rows via an offset Handle
     // view, and read the perm back ONCE at the tail. Gated on the backend actually
     // exposing the resident bin buffer with matching geometry (so the mark kernel's
-    // column reads are the same values the host `f.bins` holds), and OFF under the
-    // f64-fused escape hatch (that arm's build takes host row slices; keeping the
-    // hatch matrix small). `grow_max_abs` is the grow-wide overflow-guard bound the
-    // rows-handle build uses in place of the per-leaf host scan. ----
+    // column reads are the same values the host `f.bins` holds). `grow_max_abs` is the
+    // grow-wide overflow-guard bound the rows-handle build uses in place of the per-leaf
+    // host scan. ----
     let resident_perm: Option<(
         (cubecl::server::Handle, crate::ResidentBinWidth, usize, usize),
         crate::kernels::partition::ResidentPermPartition<R>,
         f64,
-    )> = if resident_perm_partition_enabled() && !on_device_f64_fused_build() {
+    )> = if resident_perm_partition_enabled() {
         match backend.resident_bins_view() {
             Some(view) if view.2 == features.len() && view.3 == num_data => {
                 let state = time_phase(&GROW_SETUP_NS, || {
@@ -2559,42 +2517,12 @@ where
     // build+scan is never co-packed (co-pack only applies to the split loop's two
     // children).
     //
-    // DEFAULT: the on-device root build runs the PARALLEL u64 fixed-point resident
-    // build (`build_resident_leaf`) followed by a separate resident SCAN — this
-    // replaced an f64 single-owner `build_fix_scan_resident` fused kernel that measured
-    // substantially slower on real NVIDIA hardware. `build_resident_leaf` stores the
-    // fixed+compacted f64 Handle into slot 0 (identical to what the fused path stored),
-    // so a later split can still subtract from the root. The f64 fused build is
-    // reachable ONLY via the `LGBM_ONDEVICE_F64_FUSED=1` A/B escape hatch, NEVER
-    // default.
-    let (root_best, root_fpos) = if on_device_f64_fused_build() {
-        // ESCAPE HATCH ONLY (A/B): the old f64 single-owner fused build+scan.
-        bump_launch();
-        bump_f64_fused();
-        // The fused build+scan reads its SplitInfos back — ONE blocking readback.
-        bump_sync();
-        // The f64 fused build+scan is ONE launch — booked to BUILD (escape hatch
-        // only, never the default arm; a nonzero f64_fused counter flags the attribution).
-        let root_splits = time_phase(&GROW_BUILD_NS, || {
-            backend.build_fix_scan_resident(
-                client,
-                0,
-                &slot_off,
-                slot_len,
-                &perm,
-                gradients,
-                hessians,
-                &feats,
-                &scan_active,
-                cfg,
-                root_sum_g,
-                root_sum_h,
-                num_data as i32,
-            )
-        })?;
-        argmax_over_splits(&root_splits, &feats, features)
-    } else {
-        // DEFAULT: parallel-u64 resident BUILD into slot 0, then resident SCAN.
+    // The on-device root build runs the PARALLEL u64 fixed-point resident
+    // build (`build_resident_leaf`) followed by a separate resident SCAN.
+    // `build_resident_leaf` stores the fixed+compacted f64 Handle into slot 0, so a
+    // later split can still subtract from the root.
+    let (root_best, root_fpos) = {
+        // parallel-u64 resident BUILD into slot 0, then resident SCAN.
         bump_launch(); // One parallel-u64 resident build dispatch.
         bump_rootbuild_u64(); // CONVERTED root site ran u64 (positive proof).
         time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
@@ -3487,15 +3415,7 @@ where
         // `scan_resident_siblings` launch (+ ONE readback) scans both. Bit-exact by
         // construction: each feature's sequential scan is identical to the two single-slot
         // scans; only WHICH launch runs it changes ⇒ tree STRUCTURE is unchanged.
-        // The f64-fused A/B hatch must actually revert the CHILD builds,
-        // not just the root. Co-pack (default-ON) otherwise runs the u64 `build_resident_leaf`
-        // whenever both siblings are scannable, so `LGBM_ONDEVICE_F64_FUSED=1` alone would
-        // leave every smaller child on u64 and contaminate the u64-vs-f64 delta. Gating
-        // `use_copack` on `!on_device_f64_fused_build()` forces the separate-scan f64 arm to
-        // take over the children too, so the hatch does what its name/docs claim WITHOUT
-        // requiring the operator to ALSO set `LGBM_SIBLING_COPACK=0`.
         let use_copack = sibling_copack_enabled()
-            && !on_device_f64_fused_build()
             && smaller_scannable
             && larger_scannable;
         // Each arm folds BOTH children's winners DIRECTLY into the resident
@@ -3546,59 +3466,6 @@ where
                 grow_drain(client);
                 Ok(())
             })?;
-        } else if on_device_f64_fused_build() {
-            // f64-fused ESCAPE HATCH (A/B, LGBM_ONDEVICE_F64_FUSED=1): build+fix+compact+scan the
-            // smaller child and fold its winner DIRECTLY into the frontier (device→device, NO
-            // readback). The BUILD runs UNCONDITIONALLY (required for the subtraction trick
-            // even when the smaller child is unscannable); when NOT scannable, an all-false scan
-            // mask makes every window decode `is_splittable=0` so the frontier slot gets the
-            // no-split sentinel (histogram still built for the subtract). Subtract to derive the
-            // larger child, then scan it into the frontier (or seed the sentinel).
-            let smaller_active: Vec<bool> = if smaller_scannable {
-                scan_active.clone()
-            } else {
-                vec![false; scan_active.len()]
-            };
-            // Host-perm rows slice — valid on this arm: the resident-perm state is
-            // never created under the f64-fused hatch (gated at creation), so the
-            // host perm is authoritative here.
-            let s_rows: &[u32] = &perm[s_begin..s_begin + s_count];
-            bump_launch(); // One fused build+fix+compact+scan dispatch (device→device fold).
-            bump_f64_fused();
-            time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
-                backend.build_fix_scan_resident_into_frontier(
-                    client, smaller_slot, &slot_off, slot_len, s_rows, gradients, hessians,
-                    &feats, &smaller_active, &real_feats, cfg, s_g, s_h, s_n,
-                    &frontier, smaller_leaf as usize,
-                )?;
-                grow_drain(client);
-                Ok(())
-            })?;
-            debug_assert_ne!(
-                smaller_slot, larger_slot,
-                "resident subtract slot aliasing (smaller must own a fresh slot)"
-            );
-            bump_launch(); // One on-device subtraction-trick dispatch.
-            time_phase(&GROW_SUBTRACT_NS, || -> Result<(), ComputeError> {
-                backend.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
-                grow_drain(client);
-                Ok(())
-            })?;
-            if larger_scannable {
-                bump_launch(); // One single-slot scan dispatch (device→device fold).
-                time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
-                    backend.scan_resident_leaf_into_frontier(
-                        client, larger_slot, slot_len, &feats, &real_feats, cfg, l_g, l_h, l_n,
-                        &frontier, larger_leaf as usize,
-                    )?;
-                    grow_drain(client);
-                    Ok(())
-                })?;
-            } else {
-                reduce_winner_into_frontier(
-                    backend, client, &frontier, larger_leaf as usize, &SplitInfo::none(), -1,
-                )?;
-            }
         } else {
             // DEFAULT: parallel-u64 resident BUILD of the smaller child,
             // subtract to derive the larger child, then fold EACH scannable child's winner DIRECTLY

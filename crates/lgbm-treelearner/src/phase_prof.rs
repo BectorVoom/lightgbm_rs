@@ -220,15 +220,6 @@ pub fn dump(label: &str) {
     // total stays byte-stable and the launch-total field key is untouched.
     let on_dev_rootbuild_u64 =
         lgbm_compute::kernels::grow_driver::on_device_rootbuild_u64_count_take();
-    // The NEGATIVE guard — the f64 single-owner fused build counter. It bumps ONLY via
-    // the `LGBM_ONDEVICE_F64_FUSED=1` escape hatch, so on the DEFAULT (swapped)
-    // on-device path it stays 0. Emitting it INSIDE the parenthetical breakdown (after
-    // on_device_rootbuild_u64, never before the leading total) lets an A/B harness prove
-    // the slow f64-fused kernel did not silently return, from the log rather than by
-    // code inspection alone. The `device_launches=` key and its `(?P<launches>\d+)`
-    // capture are untouched.
-    let on_dev_f64_fused =
-        lgbm_compute::kernels::grow_driver::on_device_f64_fused_count_take();
     // The BLOCKING-READBACK sync total — DISTINCT from `device_launches` (dispatches).
     // Counts only real device→host syncs (scan / on-device partition / tree-split
     // readbacks; a co-packed sibling scan is ONE). Taken unconditionally so the
@@ -287,7 +278,7 @@ pub fn dump(label: &str) {
         // regex `device_launches=(?P<launches>\d+)` still matches; the unit is annotated
         // by the trailing `launch_unit=...` token instead of by renaming the field.
         eprintln!(
-            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} on_device_f64_fused={on_dev_f64_fused} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign} scan_numdata_dev={scan_numdata_dev} deferred_read_fused={deferred_read_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
+            "[phase_prof:{label}] COUNTS: device_launches={launches} (build_resident={bld_cnt} subtract_resident={sub_cnt} scan_resident={scn_cnt} fused={fus_cnt} on_device={on_dev} on_device_rootbuild_u64={on_dev_rootbuild_u64} partition_resident={on_dev_partition_resident} scan_pargain={scan_pargain} scan_parprefix={scan_parprefix} subtract_fused={subtract_fused} desc_hoist={desc_hoist} partition_bc_smem={partition_bc_smem} role_assign={role_assign} scan_numdata_dev={scan_numdata_dev} deferred_read_fused={deferred_read_fused}) | scan_roundtrips(syncs)={scn_cnt} | blocking_readbacks(syncs)={on_dev_syncs} | launch_unit=build+subtract+scan,per-leaf"
         );
     }
     // The on-device growth-loop PHASE LEDGER — attribution inside the

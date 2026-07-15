@@ -212,19 +212,16 @@ fn on_device_sync_count_collapses_to_num_leaves() {
 /// dropping the resident-perm arm further to `L + 2` — see `resident_defer_sync_collapse_lane`.)
 #[cfg(feature = "rocm")]
 fn resident_sync_collapse_lane(anchor_baseline: u64) {
-    use lgbm_compute::kernels::grow_driver::{
-        on_device_f64_fused_count_take, on_device_rootbuild_u64_count_take,
-    };
+    use lgbm_compute::kernels::grow_driver::on_device_rootbuild_u64_count_take;
     use lgbm_compute::runtime::rocm_client;
     use lgbm_compute::{Backend, RocmBackend};
 
     // DEFAULT host partition route (on-device partition adds one readback/split), default co-pack ON
-    // (the closed form is co-pack-dependent), default u64 build (never the f64-fused hatch).
+    // (the closed form is co-pack-dependent).
     // SAFETY: single-threaded test; no concurrent env access.
     unsafe {
         std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
         std::env::remove_var("LGBM_SIBLING_COPACK");
-        std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
     // The RESIDENT-PERM partition arm is now DEFAULT-ON (spike093; +1 child-range
     // readback per split + 1 tail perm readback per grow) — pin it OFF so this lane
@@ -241,10 +238,9 @@ fn resident_sync_collapse_lane(anchor_baseline: u64) {
     );
     let client = rocm_client();
 
-    let grow_resident = |num_features: usize| -> (u64, u64, u64, i32) {
+    let grow_resident = |num_features: usize| -> (u64, u64, i32) {
         let _ = on_device_sync_count_take();
         let _ = on_device_rootbuild_u64_count_take();
-        let _ = on_device_f64_fused_count_take();
         let (features, g, h) = dominant_corpus(num_features, 64, 512);
         let (tree, _layout) = grow_tree_on_device_driver(
             &backend,
@@ -259,13 +255,12 @@ fn resident_sync_collapse_lane(anchor_baseline: u64) {
         (
             on_device_sync_count_take(),
             on_device_rootbuild_u64_count_take(),
-            on_device_f64_fused_count_take(),
             tree.num_leaves,
         )
     };
 
-    let (syncs_3, rootbuild_u64, f64_fused, leaves_3) = grow_resident(3);
-    let (syncs_12, _, _, leaves_12) = grow_resident(12);
+    let (syncs_3, rootbuild_u64, leaves_3) = grow_resident(3);
+    let (syncs_12, _, leaves_12) = grow_resident(12);
 
     assert_eq!(
         leaves_3, COLLAPSE_NUM_LEAVES,
@@ -328,11 +323,6 @@ fn resident_sync_collapse_lane(anchor_baseline: u64) {
         "resident lane: the converted parallel-u64 resident build must have run \
          (on_device_rootbuild_u64 > 0); got {rootbuild_u64}"
     );
-    assert_eq!(
-        f64_fused, 0,
-        "resident lane: the slow f64-single-owner fused build must NOT run on the default path \
-         (on_device_f64_fused == 0); got {f64_fused}"
-    );
 
     // Restore the resident-perm override to the env-driven default (no state leak).
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
@@ -351,7 +341,6 @@ fn resident_defer_sync_collapse_lane() {
     unsafe {
         std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
         std::env::remove_var("LGBM_SIBLING_COPACK");
-        std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
     let backend = RocmBackend::with_resident(true);
     let client = rocm_client();

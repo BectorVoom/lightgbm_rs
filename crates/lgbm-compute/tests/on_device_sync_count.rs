@@ -198,13 +198,12 @@ fn on_device_sync_count_is_num_features_independent() {
 ///     back the ~10-cell winner ONCE per grow-loop iteration (grow_driver.rs ~:2443).
 ///   - per-split scan readbacks: ZERO. Every scanned child's winner is folded device→device
 ///     into the resident frontier
-///     (`scan_resident_leaf_into_frontier` / `scan_resident_siblings_into_frontier` /
-///     `build_fix_scan_resident_into_frontier`) — NO `bump_sync`, on ALL 3 arms (co-pack
-///     default-ON, `LGBM_SIBLING_COPACK=0`, `LGBM_ONDEVICE_F64_FUSED=1`).
+///     (`scan_resident_leaf_into_frontier` / `scan_resident_siblings_into_frontier`)
+///     — NO `bump_sync`, on BOTH arms (co-pack default-ON, `LGBM_SIBLING_COPACK=0`).
 ///   - partition readbacks: ZERO on the DEFAULT host partition route (`prefers_host_partition`);
 ///     the on-device partition arm's `bump_sync` (~:1993) is not on this lane.
 /// Builds / subtracts / uploads / the scheduled tree-split (R3, no-readback) never bump. The
-/// count is num_features-independent AND identical across all 3 arms.
+/// count is num_features-independent AND identical across both arms.
 ///
 /// This closed form supersedes an earlier `1 + 2*(num_leaves-1)` form that counted a
 /// per-split co-packed siblings scan readback: the zero-readback reduce-into-frontier fold
@@ -216,13 +215,11 @@ fn resident_sync_lane() {
     use lgbm_compute::{Backend, RocmBackend};
 
     // Ensure the DEFAULT host partition route (on-device partition would add one readback per
-    // split) AND default co-pack ON (the closed form is co-pack-dependent), and the default
-    // (u64-swapped) build (never the f64-fused escape hatch, which adds a fused-scan readback).
+    // split) AND default co-pack ON (the closed form is co-pack-dependent).
     // SAFETY: single-threaded test; no concurrent env access.
     unsafe {
         std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
         std::env::remove_var("LGBM_SIBLING_COPACK");
-        std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
     // The RESIDENT-PERM partition arm is now DEFAULT-ON (spike093) and has its own
     // sync closed form (asserted separately below) — pin it OFF for the legacy
@@ -351,7 +348,6 @@ fn resident_defer_sync_lane() {
     unsafe {
         std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
         std::env::remove_var("LGBM_SIBLING_COPACK");
-        std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
     }
     let backend = RocmBackend::with_resident(true);
     let client = rocm_client();
@@ -369,7 +365,7 @@ fn resident_defer_sync_lane() {
         (on_device_sync_count_take(), tree.num_leaves)
     };
     let (syncs_3, leaves_3) = grow_defer(3);
-    let (syncs_12, leaves_12) = grow_defer(12);
+    let (syncs_12, _leaves_12) = grow_defer(12);
     assert_eq!(
         leaves_3, NUM_LEAVES,
         "defer lane: corpus must grow the full {NUM_LEAVES} leaves (got {leaves_3})"

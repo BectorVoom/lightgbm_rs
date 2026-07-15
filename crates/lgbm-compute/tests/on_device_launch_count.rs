@@ -35,8 +35,7 @@
 //! Both stay num_features-independent (a per-feature layout would scale the build+scan terms).
 
 use lgbm_compute::kernels::grow_driver::{
-    grow_tree_on_device_driver, on_device_f64_fused_count_take, on_device_launch_count_take,
-    on_device_rootbuild_u64_count_take,
+    grow_tree_on_device_driver, on_device_launch_count_take, on_device_rootbuild_u64_count_take,
 };
 use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::{BinColumn, CpuBackend, GrowFeature};
@@ -165,21 +164,9 @@ fn on_device_launch_count_is_num_features_independent() {
          {per_leaf_collapse_bound} (= 2 + 4*(num_leaves-1), num_leaves={NUM_LEAVES})"
     );
 
-    // NEGATIVE guard, CI-reachable on the cpu anchor lane: the f64 single-owner fused build
-    // (`build_fix_scan_resident_f64_on`, a much slower kernel) is NEVER dispatched on the
-    // default on-device path. The cpu anchor arm does not enter the resident driver at all,
-    // so this is trivially 0 here; the rocm resident lane below exercises the real SWAPPED
-    // path where the guard is load-bearing (it asserts == 0 there too, on the arm that USED
-    // to dispatch the f64 fused build). Drain the positive counter as well so no
-    // process-global state leaks into the resident lane's per-grow reads.
+    // Drain the positive counter so no process-global state leaks into the resident
+    // lane's per-grow reads.
     let _ = on_device_rootbuild_u64_count_take();
-    let f64_fused = on_device_f64_fused_count_take();
-    assert_eq!(
-        f64_fused, 0,
-        "on-device f64 single-owner fused build must NEVER dispatch on the default path \
-         (LGBM_ONDEVICE_F64_FUSED unset); got {f64_fused} — the spike-052 slow kernel silently \
-         returned to the on-device build"
-    );
 
     // On a rocm host, additionally assert the EXACT analytic real-dispatch closed form on
     // the resident fast arm (and re-check num_features-independence there), PLUS the
@@ -216,8 +203,6 @@ fn resident_analytic_lane() {
     unsafe {
         std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
         std::env::remove_var("LGBM_SIBLING_COPACK");
-        // Ensure the DEFAULT (swapped) u64 build path — never the f64-fused escape hatch.
-        std::env::remove_var("LGBM_ONDEVICE_F64_FUSED");
         // Pin pargain OFF: this closed form is derived for the serial-staged co-pack scan.
         // Pargain is now DEFAULT-ON for the ROCm/AMD runtime (a 1.51× scan win), which
         // routes the co-pack through the separate-subtract fallback (subtract-fuse is a
@@ -242,13 +227,12 @@ fn resident_analytic_lane() {
     );
     let client = rocm_client();
 
-    // Returns (launches, rootbuild_u64_count, f64_fused_count, num_leaves, leaf_count) for
-    // THIS grow only — all four process-global counters are drained before and read after so
+    // Returns (launches, rootbuild_u64_count, num_leaves, leaf_count) for
+    // THIS grow only — all process-global counters are drained before and read after so
     // each grow's figures are isolated.
-    let grow_resident = |num_features: usize| -> (u64, u64, u64, i32, Vec<i32>) {
+    let grow_resident = |num_features: usize| -> (u64, u64, i32, Vec<i32>) {
         let _ = on_device_launch_count_take();
         let _ = on_device_rootbuild_u64_count_take();
-        let _ = on_device_f64_fused_count_take();
         let (features, g, h) = tiny_corpus(num_features, NUM_DATA);
         let (tree, layout) =
             grow_tree_on_device_driver(&backend, &client, &g, &h, &features, NUM_LEAVES, -1)
@@ -256,14 +240,13 @@ fn resident_analytic_lane() {
         (
             on_device_launch_count_take(),
             on_device_rootbuild_u64_count_take(),
-            on_device_f64_fused_count_take(),
             tree.num_leaves,
             layout.leaf_count,
         )
     };
 
-    let (launches_3, rootbuild_3, f64_fused_3, leaves_3, leaf_count_3) = grow_resident(3);
-    let (launches_12, _rootbuild_12, f64_fused_12, leaves_12, _) = grow_resident(12);
+    let (launches_3, rootbuild_3, leaves_3, leaf_count_3) = grow_resident(3);
+    let (launches_12, _rootbuild_12, leaves_12, _) = grow_resident(12);
 
     // POSITIVE proof: the root + directly-built build sites actually ran the PARALLEL u64
     // fixed-point kernel — a nonzero root-build sub-counter (>= 1 for the root; the co-pack
@@ -273,21 +256,6 @@ fn resident_analytic_lane() {
         rootbuild_3 > 0,
         "on-device root/directly-built build must dispatch the parallel u64 kernel (rootbuild \
          sub-counter > 0), got {rootbuild_3} — the converted sites did not run u64"
-    );
-
-    // NEGATIVE guard: the f64 single-owner fused build must NEVER be dispatched on the
-    // default on-device path — this is the arm that could otherwise silently run
-    // `build_fix_scan_resident_f64_on` (a much slower kernel). `== 0` at BOTH feature
-    // counts so the slow kernel can never silently return on-device.
-    assert_eq!(
-        f64_fused_3, 0,
-        "resident lane: f64 single-owner fused build must NEVER dispatch on the default swapped \
-         path, got {f64_fused_3}"
-    );
-    assert_eq!(
-        f64_fused_12, 0,
-        "resident lane: f64 single-owner fused build must NEVER dispatch on the default swapped \
-         path (12 features), got {f64_fused_12}"
     );
 
     // The corpus must reach the full leaf count with every leaf scannable (>= 2 rows) so
@@ -345,7 +313,7 @@ fn resident_analytic_lane() {
     // on the pinned-OFF grows above by the arm-isolation the override provides).
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(true));
     let _ = lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
-    let (launches_rp, rootbuild_rp, f64_fused_rp, leaves_rp, _) = grow_resident(3);
+    let (launches_rp, rootbuild_rp, leaves_rp, _) = grow_resident(3);
     let part_res = lgbm_compute::kernels::grow_driver::on_device_partition_resident_count_take();
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
     lgbm_compute::kernels::partition::set_partition_fuse_bc_smem_override(None);
@@ -359,7 +327,6 @@ fn resident_analytic_lane() {
         "resident-perm lane: corpus must grow the full {NUM_LEAVES} leaves (got {leaves_rp})"
     );
     assert!(rootbuild_rp > 0, "resident-perm lane: root build must still run the u64 kernel");
-    assert_eq!(f64_fused_rp, 0, "resident-perm lane: f64-fused must never dispatch");
     assert_eq!(
         part_res,
         NUM_LEAVES as u64 - 1,
