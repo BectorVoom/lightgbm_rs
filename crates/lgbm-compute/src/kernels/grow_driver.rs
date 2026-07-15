@@ -317,19 +317,6 @@ pub fn grad_residency_enabled() -> bool {
     *E.get_or_init(|| std::env::var("LGBM_GRAD_RESIDENCY").map(|v| v != "0").unwrap_or(true))
 }
 
-/// Read-once `LGBM_SCORE_FUSED_SCATTER != "0"` — default ON; `=0` restores the
-/// two-kernel `derive_leaf_map_device_handle` → `add_leaf_values_to_resident_score`
-/// per-tree resident score update (single-active-warp derive + `num_data`-length
-/// `-1`-map fill upload) for same-session A/B comparison. Bit-exact either way (each
-/// row written exactly once with the same f64 `+=` of the same leaf value).
-#[must_use]
-pub fn score_fused_scatter_enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("LGBM_SCORE_FUSED_SCATTER").map(|v| v != "0").unwrap_or(true)
-    })
-}
-
 /// Read-once `LGBM_ONDEVICE_FUSED_PARTITION != "0"` — default ON (mirroring
 /// [`ondevice_bin_hoist_enabled`]). When ON, the host arm of [`partition_resident_range`]
 /// routes through [`partition_leaf_stable_fused`] (one fused pass, no `bins_sub` alloc);
@@ -1735,30 +1722,12 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         // num_leaves=31 serially walking every row — ~O(num_data) serial device time
         // per tree that the NEXT iteration's blocking grad readback then absorbed).
         // Bit-exact: disjoint leaf ranges ⇒ each row written exactly once with the
-        // same f64 `+=` of the same value (see the kernel doc). `LGBM_SCORE_FUSED_SCATTER=0`
-        // restores the two-kernel chain for the same-session A/B.
-        if score_fused_scatter_enabled() {
-            return crate::kernels::predict::add_leaf_values_by_ranges_to_resident_score(
-                client,
-                &layout.indices,
-                &layout.leaf_begin,
-                &layout.leaf_count,
-                &self.score,
-                leaf_values,
-                num_data,
-            );
-        }
-        // A/B escape hatch: the pre-fusion derive→scatter chain, byte-identical result.
-        let leaf_map = crate::kernels::predict::derive_leaf_map_device_handle(
+        // same f64 `+=` of the same value (see the kernel doc).
+        crate::kernels::predict::add_leaf_values_by_ranges_to_resident_score(
             client,
             &layout.indices,
             &layout.leaf_begin,
             &layout.leaf_count,
-            num_data,
-        )?;
-        crate::kernels::predict::add_leaf_values_to_resident_score(
-            client,
-            &leaf_map,
             &self.score,
             leaf_values,
             num_data,

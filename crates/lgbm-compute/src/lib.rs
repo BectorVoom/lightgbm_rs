@@ -3276,10 +3276,9 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
     // Route the rocm partition on the HOST via the shipped
     // fused path instead of the per-split device round-trip — faster at narrow widths,
     // wash at wide, parity within ~1e-6 (not a bit-exact swap). The device round-trip
-    // is pure overhead on shared DDR5 (the build reads host indices_ either way). Default ON;
-    // LGBM_ROCM_HOST_PARTITION=0 forces the old device round-trip for benching/rollback.
+    // is pure overhead on shared DDR5 (the build reads host indices_ either way).
     fn prefers_host_partition(&self) -> bool {
-        !matches!(std::env::var("LGBM_ROCM_HOST_PARTITION").as_deref(), Ok("0"))
+        true
     }
 
     // GATED on-device-growth discriminator, mirroring

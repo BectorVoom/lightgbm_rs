@@ -6860,21 +6860,11 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_on<R: cubecl:
     // ONE batched dispatch folds both siblings' winners (the same batched reduce the
     // non-fused co-pack path uses).
     let h_rf_cached = desc_ok.and_then(|d| d.h_rf.clone());
-    if reduce_batch_enabled() {
-        launch_reduce_into_two_leaves(
-            client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
-            min_gain_shift_a, min_gain_shift_b, h_rf_cached,
-        );
-    } else {
-        launch_reduce_into_leaf(
-            client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0, min_gain_shift_a,
-            h_rf_cached.clone(),
-        );
-        launch_reduce_into_leaf(
-            client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12, min_gain_shift_b,
-            h_rf_cached,
-        );
-    }
+    // ONE batched dispatch folds both siblings in one CubeCount::Static(2,1,1) launch.
+    launch_reduce_into_two_leaves(
+        client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
+        min_gain_shift_a, min_gain_shift_b, h_rf_cached,
+    );
     Ok(Some(larger_out))
 }
 
@@ -6950,25 +6940,11 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
         // win. GPU-only: the batched kernel is `#[cfg(feature = "gpu")]`; the cpu
         // anchor never reaches this co-pack resident path (`resident_pool_supported()
         // == false`), so the two-call fallback is kept for the non-gpu build.
-        // `LGBM_REDUCE_BATCH=0` restores the two separate launches for same-session
-        // A/B benchmarking (bit-exact either way — the hatch measures the host-enqueue
-        // delta, it does NOT gate correctness).
         #[cfg(feature = "gpu")]
-        if reduce_batch_enabled() {
-            launch_reduce_into_two_leaves(
-                client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
-                min_gain_shift_a, min_gain_shift_b, h_rf_cached,
-            );
-        } else {
-            launch_reduce_into_leaf(
-                client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
-                min_gain_shift_a, h_rf_cached.clone(),
-            );
-            launch_reduce_into_leaf(
-                client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
-                min_gain_shift_b, h_rf_cached,
-            );
-        }
+        launch_reduce_into_two_leaves(
+            client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
+            min_gain_shift_a, min_gain_shift_b, h_rf_cached,
+        );
         #[cfg(not(feature = "gpu"))]
         {
             launch_reduce_into_leaf(
@@ -7063,21 +7039,10 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl:
         let h_rf_cached = desc_ok.and_then(|d| d.h_rf.clone());
         // Identical fold to the host launcher (num_data-independent).
         #[cfg(feature = "gpu")]
-        if reduce_batch_enabled() {
-            launch_reduce_into_two_leaves(
-                client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
-                min_gain_shift_a, min_gain_shift_b, h_rf_cached,
-            );
-        } else {
-            launch_reduce_into_leaf(
-                client, h_out.clone(), out_len, real_feats, n, out, out_leaf_a, 0,
-                min_gain_shift_a, h_rf_cached.clone(),
-            );
-            launch_reduce_into_leaf(
-                client, h_out, out_len, real_feats, n, out, out_leaf_b, n * 12,
-                min_gain_shift_b, h_rf_cached,
-            );
-        }
+        launch_reduce_into_two_leaves(
+            client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
+            min_gain_shift_a, min_gain_shift_b, h_rf_cached,
+        );
         #[cfg(not(feature = "gpu"))]
         {
             launch_reduce_into_leaf(
@@ -7091,18 +7056,6 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl:
         }
     }
     Ok(())
-}
-
-/// Reduce-batching gate (env `LGBM_REDUCE_BATCH != "0"`, default ON). When ON the
-/// co-pack sibling reduce folds BOTH siblings in one `CubeCount::Static(2,1,1)`
-/// dispatch ([`launch_reduce_into_two_leaves`]); `=0` restores the two separate
-/// [`launch_reduce_into_leaf`] launches. BIT-EXACT either way (disjoint frontier
-/// slots, identical per-slot fold) — the hatch exists ONLY so a same-session A/B
-/// harness can price the host-enqueue delta (spike096). Read-once.
-#[cfg(feature = "gpu")]
-fn reduce_batch_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| !matches!(std::env::var("LGBM_REDUCE_BATCH").as_deref(), Ok("0")))
 }
 
 /// **Native** host f64 best-split scan — the production cpu-anchor path (R2).
