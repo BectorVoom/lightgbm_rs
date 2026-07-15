@@ -138,8 +138,7 @@ fn anchor_sync_count(num_features: usize) -> (u64, i32) {
 /// num_features-INDEPENDENT (O(num_leaves), no per-feature inflation), and equals the documented
 /// pre-collapse baseline `1 + 3*(L-1)`. The rocm RESIDENT lane (hardware-only) asserts the genuine
 /// collapse to `1 + (L-1) = L` (the co-packed sibling scan folds device→device — corrected
-/// 2026-07-15 from a stale `1 + 2*(L-1)`) plus the u64 build sub-counters, and — with
-/// `LGBM_GROW_DEFER_SYNC=1` — the further deferral collapse to `L + 2`.
+/// 2026-07-15 from a stale `1 + 2*(L-1)`) plus the u64 build sub-counters.
 #[test]
 fn on_device_sync_count_collapses_to_num_leaves() {
     // Enable the read-once phase-prof gate BEFORE the FIRST counter read. `bump_sync`/`take`
@@ -193,11 +192,6 @@ fn on_device_sync_count_collapses_to_num_leaves() {
     // real resident launchers (the lane cubecl-cpu cannot execute — atomic<u64> unimplemented).
     #[cfg(feature = "rocm")]
     resident_sync_collapse_lane(anchor_baseline);
-    // SPEC-DRGL-06: the DEFERRED-sync arm (LGBM_GROW_DEFER_SYNC=1) at L=31 — proves the
-    // deferred closed form scales as `L + 2` (constant +2, not a coincidence at L=8 in the
-    // lgbm-compute lane).
-    #[cfg(feature = "rocm")]
-    resident_defer_sync_collapse_lane();
 }
 
 /// `--features rocm` lane: drive the resident fast arm (`RocmBackend::with_resident(true)`) and
@@ -207,9 +201,7 @@ fn on_device_sync_count_collapses_to_num_leaves() {
 /// `on_device_f64_fused == 0`. The per-split co-packed sibling SCAN readback is folded
 /// device→device into the resident frontier (retired). (Corrected 2026-07-15: an earlier doc
 /// claimed the sub-`1 + 2*(L-1)` collapse was "not yet implemented" — it IS; the device→device
-/// sibling-reduce fold retired that scan readback. The eager arm's remaining lever is the
-/// per-split `read_split`, which the opt-in `LGBM_GROW_DEFER_SYNC` deferral fuses into the pick,
-/// dropping the resident-perm arm further to `L + 2` — see `resident_defer_sync_collapse_lane`.)
+/// sibling-reduce fold retired that scan readback.)
 #[cfg(feature = "rocm")]
 fn resident_sync_collapse_lane(anchor_baseline: u64) {
     use lgbm_compute::kernels::grow_driver::on_device_rootbuild_u64_count_take;
@@ -328,55 +320,3 @@ fn resident_sync_collapse_lane(anchor_baseline: u64) {
     lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
 }
 
-/// SPEC-DRGL-06 (`--features rocm`): the DEFERRED-sync arm (`LGBM_GROW_DEFER_SYNC=1`) on the
-/// resident-perm partition arm, at `COLLAPSE_NUM_LEAVES=31`. The per-split `read_split` is
-/// fused into the pick readback (SPEC-DRGL-05), so the eager resident-perm `2*L` form drops to
-/// `L + 2` (root scan + per-iteration fused pick/read_split + tail [last read_split + perm]).
-/// Asserting it at L=31 (vs the lgbm-compute lane's L=8) pins the `+2` CONSTANT — proof the
-/// closed form is `L + 2`, not a coincidental match at one leaf count.
-#[cfg(feature = "rocm")]
-fn resident_defer_sync_collapse_lane() {
-    use lgbm_compute::runtime::rocm_client;
-    use lgbm_compute::RocmBackend;
-    unsafe {
-        std::env::remove_var("LGBM_ROCM_HOST_PARTITION");
-        std::env::remove_var("LGBM_SIBLING_COPACK");
-    }
-    let backend = RocmBackend::with_resident(true);
-    let client = rocm_client();
-    let grow_defer = |num_features: usize| -> (u64, i32) {
-        let _ = on_device_sync_count_take();
-        let (features, g, h) = dominant_corpus(num_features, 64, 512);
-        lgbm_compute::kernels::grow_driver::set_partition_resident_override(Some(true));
-        lgbm_compute::kernels::grow_driver::set_grow_defer_sync_override(Some(true));
-        let (tree, _layout) = grow_tree_on_device_driver(
-            &backend, &client, &g, &h, &features, COLLAPSE_NUM_LEAVES, -1,
-        )
-        .expect("deferred resident driver must grow the dominant corpus");
-        lgbm_compute::kernels::grow_driver::set_grow_defer_sync_override(None);
-        lgbm_compute::kernels::grow_driver::set_partition_resident_override(None);
-        (on_device_sync_count_take(), tree.num_leaves)
-    };
-    let (syncs_3, leaves_3) = grow_defer(3);
-    let (syncs_12, _) = grow_defer(12);
-    assert_eq!(
-        leaves_3, COLLAPSE_NUM_LEAVES,
-        "defer collapse lane: must grow the full {COLLAPSE_NUM_LEAVES} leaves (got {leaves_3})"
-    );
-    assert_eq!(
-        syncs_3, syncs_12,
-        "defer collapse lane: sync count must be num_features-independent ({syncs_3} vs {syncs_12})"
-    );
-    let analytic_defer = COLLAPSE_NUM_LEAVES as u64 + 2;
-    assert_eq!(
-        syncs_3, analytic_defer,
-        "defer collapse lane: blocking-readback count {syncs_3} must equal the deferred closed \
-         form {analytic_defer} (= L + 2 at L={COLLAPSE_NUM_LEAVES}); the eager resident-perm arm \
-         is 2*L = {}",
-        2 * COLLAPSE_NUM_LEAVES as u64
-    );
-    assert!(
-        syncs_3 < 2 * COLLAPSE_NUM_LEAVES as u64,
-        "defer collapse lane: {syncs_3} must be strictly below the eager 2*L"
-    );
-}
