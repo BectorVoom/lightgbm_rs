@@ -2824,20 +2824,11 @@ where
 
             let mut deferred: Option<Deferred> = None;
             for split_idx in 0..(num_leaves - 1) {
-                // ---- Apply the PREVIOUS split's deferred bookkeeping (read split_point at
-                // the top of this iteration). Phase 4a: a separate blocking read. ----
-                if let Some(d) = deferred.take() {
-                    bump_deferred_read_fused();
-                    bump_sync();
-                    let sp = leaf_splits_dev.read_split(client, d.split_idx).left_count as usize;
-                    apply_deferred(&mut leaves, &mut tree, &d, sp)?;
-                }
-                // ---- §8.3 device pick (unchanged) ----
+                // ---- §8.3 device pick: LAUNCH into a handle (no read yet). ----
                 bump_launch();
-                bump_sync();
                 let cur_num_leaves = leaves.len();
-                let export = time_phase(&GROW_PICK_NS, || {
-                    backend.frontier_pick_best_leaf_device(
+                let pick_h = time_phase(&GROW_PICK_NS, || {
+                    backend.frontier_pick_best_leaf_device_launch(
                         client,
                         &frontier,
                         prev_smaller,
@@ -2845,6 +2836,33 @@ where
                         cur_num_leaves,
                     )
                 })?;
+                // ---- ONE batched blocking read (SPEC-DRGL-05 fusion): the PREVIOUS split's
+                // child ranges (the deferred `read_split`) + this split's pick export in a
+                // single `client.read`. This HALVES the per-split sync count vs the eager
+                // arm's two separate reads. The root iteration has no deferred split, so it
+                // reads only the pick export. ----
+                bump_sync();
+                let export = if let Some(d) = deferred.take() {
+                    bump_deferred_read_fused();
+                    let mut bufs = backend.read_batched(
+                        client,
+                        vec![leaf_splits_dev.ranges_handle().clone(), pick_h],
+                    );
+                    let export_bytes = bufs.pop().expect("pick export buffer");
+                    let ranges_bytes = bufs.pop().expect("ranges buffer");
+                    let sp = crate::kernels::partition::DeviceLeafSplits::<R>::decode_split(
+                        &ranges_bytes,
+                        d.split_idx,
+                    )
+                    .left_count as usize;
+                    apply_deferred(&mut leaves, &mut tree, &d, sp)?;
+                    crate::kernels::best_split::decode_pick_export(&export_bytes)
+                } else {
+                    let mut bufs = backend.read_batched(client, vec![pick_h]);
+                    crate::kernels::best_split::decode_pick_export(
+                        &bufs.pop().expect("pick export buffer"),
+                    )
+                };
                 let best_leaf = export.cells[6] as i32;
                 if best_leaf < 0 {
                     break;

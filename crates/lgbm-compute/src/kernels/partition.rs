@@ -455,10 +455,19 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
     /// Panics if `slot >= capacity`.
     #[must_use]
     pub fn read_split(&self, client: &ComputeClient<R>, slot: usize) -> ChildRanges {
-        use cubecl::prelude::CubeElement;
         assert!(slot < self.capacity, "DeviceLeafSplits::read_split: slot out of range");
         let bytes = client.read_one_unchecked(self.ranges.clone());
-        let all = i32::from_bytes(&bytes);
+        Self::decode_split(&bytes, slot)
+    }
+
+    /// SPEC-DRGL-05: decode slot `slot`'s child ranges from an ALREADY-read `ranges` byte
+    /// buffer (the bytes [`Self::ranges_handle`] yields). Lets the deferred grow loop batch the
+    /// `read_split` readback with the pick export into ONE `client.read` and decode afterward,
+    /// instead of `read_split`'s own blocking read. Byte-identical decode.
+    #[must_use]
+    pub fn decode_split(bytes: &[u8], slot: usize) -> ChildRanges {
+        use cubecl::prelude::CubeElement;
+        let all = i32::from_bytes(bytes);
         let b = LEAF_SPLIT_STRIDE * slot;
         ChildRanges {
             left_start: all[b],

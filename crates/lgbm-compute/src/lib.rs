@@ -612,6 +612,27 @@ impl<R: cubecl::Runtime> DeviceFrontier<R> {
         )
     }
 
+    /// SPEC-DRGL-05: the LAUNCH half of [`frontier_pick_best_leaf`] — runs the §8.3 pick ON
+    /// DEVICE and returns the 18-cell export `Handle` WITHOUT reading it, so the deferred grow
+    /// loop can batch the readback with the previous split's `read_split` into one
+    /// `client.read`. Decode with [`kernels::best_split::decode_pick_export`].
+    pub fn frontier_pick_best_leaf_launch(
+        &self,
+        client: &ComputeClient<R>,
+        smaller_leaf_index: i32,
+        larger_leaf_index: i32,
+        cur_num_leaves: usize,
+    ) -> Result<cubecl::server::Handle, ComputeError> {
+        kernels::best_split::find_best_from_all_splits_device_launch(
+            client,
+            &self.records,
+            &self.best_leaf,
+            smaller_leaf_index,
+            larger_leaf_index,
+            cur_num_leaves,
+        )
+    }
+
     /// Read back the device `best_leaf` slot (TEST/DEBUG; the control loop keeps it resident).
     /// The slot is an exact-integer `f64` (`-1.0` = none) decoded to `i32`.
     #[must_use]
@@ -1577,6 +1598,24 @@ pub trait Backend {
         Err(ComputeError::Runtime {
             detail: "frontier_pick_best_leaf_device: device-resident frontier not supported on \
                      this backend (the CpuBackend anchor uses the host fold)"
+                .to_string(),
+        })
+    }
+
+    /// SPEC-DRGL-05: the LAUNCH half of [`frontier_pick_best_leaf_device`] — runs the §8.3
+    /// pick ON DEVICE and returns the export `Handle` WITHOUT reading it, so the deferred grow
+    /// loop can batch the readback with the previous split's `read_split`. Default: typed error.
+    fn frontier_pick_best_leaf_device_launch(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _frontier: &DeviceFrontier<Self::Runtime>,
+        _smaller_leaf_index: i32,
+        _larger_leaf_index: i32,
+        _cur_num_leaves: usize,
+    ) -> Result<cubecl::server::Handle, ComputeError> {
+        Err(ComputeError::Runtime {
+            detail: "frontier_pick_best_leaf_device_launch: device-resident frontier not \
+                     supported on this backend"
                 .to_string(),
         })
     }
@@ -4229,6 +4268,24 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         cur_num_leaves: usize,
     ) -> Result<kernels::best_split::PickExport, ComputeError> {
         frontier.frontier_pick_best_leaf(
+            client,
+            smaller_leaf_index,
+            larger_leaf_index,
+            cur_num_leaves,
+        )
+    }
+
+    /// SPEC-DRGL-05: launch-only §8.3 pick — returns the export handle without reading it (for
+    /// the deferred loop's batched read).
+    fn frontier_pick_best_leaf_device_launch(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        frontier: &DeviceFrontier<Self::Runtime>,
+        smaller_leaf_index: i32,
+        larger_leaf_index: i32,
+        cur_num_leaves: usize,
+    ) -> Result<cubecl::server::Handle, ComputeError> {
+        frontier.frontier_pick_best_leaf_launch(
             client,
             smaller_leaf_index,
             larger_leaf_index,
