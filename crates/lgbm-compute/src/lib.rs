@@ -1654,48 +1654,6 @@ pub trait Backend {
         })
     }
 
-    /// FUSED directly-built-leaf path — build + fix + compact + scan a
-    /// leaf's per-feature histogram in ONE launch. Builds the leaf's histogram
-    /// DEVICE-RESIDENT (sequential f64 fold ⇒ bit-exact), fixes+compacts it, and
-    /// scans it for every SCAN-ACTIVE feature's best split — STORING the
-    /// fixed+compacted f64 Handle into mirror slot `slot` (so `subtract_resident` can
-    /// still derive the larger child from it) AND returning one [`SplitInfo`] per
-    /// SCAN-ACTIVE feature in order. `feats` is the FULL per-feature list (fpos order)
-    /// — build+fix+compact run for EVERY feature so the resident histogram is COMPLETE
-    /// for the subtraction trick — and `scan_active[fpos]` selects which features are
-    /// scanned (the spine subset that passed the learner's gates). Collapses
-    /// `build_resident_leaf` + `scan_resident_leaf` (3 launches) into 1. The leaf RAW
-    /// (un-bumped) `sum_gradient_raw` / `sum_hessian_raw` feed the FIX, the
-    /// launcher derives the 2*kEpsilon-bumped scan operand internally. Default: typed
-    /// error (never called on cpu — the fused gate is off there).
-    ///
-    /// # Errors
-    /// [`ComputeError::Runtime`] (unsupported) on the default; propagates the fused
-    /// kernel errors on RocmBackend.
-    #[allow(clippy::too_many_arguments)]
-    fn build_fix_scan_resident(
-        &self,
-        _client: &ComputeClient<Self::Runtime>,
-        _slot: usize,
-        _slot_off: &[usize],
-        _slot_len: usize,
-        _leaf_rows: &[u32],
-        _gradients: &[f32],
-        _hessians: &[f32],
-        _feats: &[BatchedSplitFeature],
-        _scan_active: &[bool],
-        _cfg: &GainConfig,
-        _sum_gradient_raw: f64,
-        _sum_hessian_raw: f64,
-        _num_data: i32,
-    ) -> Result<Vec<SplitInfo>, ComputeError> {
-        Err(ComputeError::Runtime {
-            detail: "build_fix_scan_resident: device-resident fused path not supported on this \
-                     backend"
-                .to_string(),
-        })
-    }
-
     /// The ZERO-READBACK analog of
     /// [`scan_resident_leaf_argmax`](Backend::scan_resident_leaf_argmax) — scan ONE resident
     /// leaf and fold its cross-feature winner (gain + threshold + default_left + 4 child sums +
@@ -1945,49 +1903,9 @@ pub trait Backend {
         )
     }
 
-    /// The ZERO-READBACK analog of
-    /// [`build_fix_scan_resident`](Backend::build_fix_scan_resident) (the f64-fused escape hatch)
-    /// — build+fix+compact+scan a directly-built leaf in ONE launch, STORE the fixed+compacted
-    /// f64 histogram Handle into mirror slot `slot` (so `subtract_resident` still finds it), AND
-    /// fold the scan winner DIRECTLY into frontier slot `out_leaf` on device, NO
-    /// per-feature-array readback. `scan_active` all-false ⇒ every window decodes
-    /// `is_splittable=0` ⇒ the frontier slot gets the no-valid-split sentinel (the driver passes
-    /// all-false when the leaf is not scannable, so the histogram is still built for the subtract
-    /// but no winner is recorded). Default: typed error.
-    ///
-    /// # Errors
-    /// [`ComputeError::Runtime`] on the default; propagates the fused-build / reduce errors on
-    /// GpuBackend.
-    #[allow(clippy::too_many_arguments)]
-    fn build_fix_scan_resident_into_frontier(
-        &self,
-        _client: &ComputeClient<Self::Runtime>,
-        _slot: usize,
-        _slot_off: &[usize],
-        _slot_len: usize,
-        _leaf_rows: &[u32],
-        _gradients: &[f32],
-        _hessians: &[f32],
-        _feats: &[BatchedSplitFeature],
-        _scan_active: &[bool],
-        _real_feats: &[i32],
-        _cfg: &GainConfig,
-        _sum_gradient_raw: f64,
-        _sum_hessian_raw: f64,
-        _num_data: i32,
-        _frontier: &DeviceFrontier<Self::Runtime>,
-        _out_leaf: usize,
-    ) -> Result<(), ComputeError> {
-        Err(ComputeError::Runtime {
-            detail: "build_fix_scan_resident_into_frontier: device-resident fused path not \
-                     supported on this backend"
-                .to_string(),
-        })
-    }
-
     /// UNIFIED host per-feature `{build → fix → compact → scan}` for
     /// the directly-built (smaller/root) leaf, run inside ONE rayon region — the host f64
-    /// analog of [`build_fix_scan_resident`](Backend::build_fix_scan_resident).
+    /// analog of the GPU resident fused build+scan.
     ///
     /// Each feature folds its OWN private histogram (cache-hot in the building thread),
     /// runs `fix_histogram` (RAW sums + `most_freq_bin` reconstruct) + `compact`
@@ -4282,63 +4200,6 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         )
     }
 
-    /// FUSED build+fix+compact+scan for a directly-built leaf. Reads the
-    /// resident bin cache, runs the SINGLE fused-kernel launch (build → fix →
-    /// compact → scan), STORES the returned fixed+compacted f64 Handle into mirror
-    /// slot `slot` (so `subtract_resident` finds it as the parent), and returns the
-    /// per-feature SplitInfos. Errors if the resident bin cache is empty (defensive).
-    #[allow(clippy::too_many_arguments)]
-    fn build_fix_scan_resident(
-        &self,
-        client: &ComputeClient<Self::Runtime>,
-        slot: usize,
-        slot_off: &[usize],
-        slot_len: usize,
-        leaf_rows: &[u32],
-        gradients: &[f32],
-        hessians: &[f32],
-        feats: &[BatchedSplitFeature],
-        scan_active: &[bool],
-        cfg: &GainConfig,
-        sum_gradient_raw: f64,
-        sum_hessian_raw: f64,
-        num_data: i32,
-    ) -> Result<Vec<SplitInfo>, ComputeError> {
-        let resident = self.resident_bins.borrow();
-        let Some(resident) = resident.as_ref() else {
-            return Err(ComputeError::Runtime {
-                detail: "build_fix_scan_resident: resident bin cache empty (upload_resident_bins \
-                         not called)"
-                    .to_string(),
-            });
-        };
-        let (handle, len, splits) = kernels::histogram::build_fix_scan_resident_f64_on(
-            client,
-            resident.handle.clone(),
-            resident.width,
-            resident.num_features,
-            resident.num_data,
-            slot_off,
-            slot_len,
-            leaf_rows,
-            gradients,
-            hessians,
-            feats,
-            scan_active,
-            cfg,
-            sum_gradient_raw,
-            sum_hessian_raw,
-            num_data,
-        )?;
-        debug_assert_eq!(len, slot_len, "fused resident leaf handle length");
-        let mut mirror = self.resident_pool.borrow_mut();
-        if slot >= mirror.len() {
-            mirror.resize_with(slot + 1, || None);
-        }
-        mirror[slot] = Some(handle);
-        Ok(splits)
-    }
-
     /// Scan the resident leaf and fold its winner DIRECTLY into the frontier
     /// slot via [`kernels::split::find_best_splits_fused_reduce_into_leaf_on`] — no host argmax
     /// readback (the winner lives device-resident, handed to the driver only through the §8.3
@@ -4645,69 +4506,6 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         }
     }
 
-    /// The f64-fused escape hatch's zero-readback variant — build+fix+compact+scan
-    /// in ONE launch via [`kernels::histogram::build_fix_scan_resident_reduce_f64_on`], STORE the
-    /// fixed+compacted f64 Handle into mirror slot `slot` (for `subtract_resident`), and fold the
-    /// scan winner DIRECTLY into frontier slot `out_leaf` — no per-feature-array readback.
-    #[allow(clippy::too_many_arguments)]
-    fn build_fix_scan_resident_into_frontier(
-        &self,
-        client: &ComputeClient<Self::Runtime>,
-        slot: usize,
-        slot_off: &[usize],
-        slot_len: usize,
-        leaf_rows: &[u32],
-        gradients: &[f32],
-        hessians: &[f32],
-        feats: &[BatchedSplitFeature],
-        scan_active: &[bool],
-        real_feats: &[i32],
-        cfg: &GainConfig,
-        sum_gradient_raw: f64,
-        sum_hessian_raw: f64,
-        num_data: i32,
-        frontier: &DeviceFrontier<Self::Runtime>,
-        out_leaf: usize,
-    ) -> Result<(), ComputeError> {
-        let resident = self.resident_bins.borrow();
-        let Some(resident) = resident.as_ref() else {
-            return Err(ComputeError::Runtime {
-                detail: "build_fix_scan_resident_into_frontier: resident bin cache empty \
-                         (upload_resident_bins not called)"
-                    .to_string(),
-            });
-        };
-        let (handle, len) = kernels::histogram::build_fix_scan_resident_reduce_f64_on(
-            client,
-            resident.handle.clone(),
-            resident.width,
-            resident.num_features,
-            resident.num_data,
-            slot_off,
-            slot_len,
-            leaf_rows,
-            gradients,
-            hessians,
-            feats,
-            scan_active,
-            real_feats,
-            cfg,
-            sum_gradient_raw,
-            sum_hessian_raw,
-            num_data,
-            frontier.records(),
-            out_leaf,
-        )?;
-        debug_assert_eq!(len, slot_len, "fused resident leaf handle length");
-        // `resident` borrows `self.resident_bins`; `resident_pool` is a SEPARATE RefCell, so the
-        // mutable borrow below does not conflict (mirrors `build_fix_scan_resident`).
-        let mut mirror = self.resident_pool.borrow_mut();
-        if slot >= mirror.len() {
-            mirror.resize_with(slot + 1, || None);
-        }
-        mirror[slot] = Some(handle);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
