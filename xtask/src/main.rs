@@ -289,6 +289,7 @@ fn main() -> Result<()> {
         Some("rank-oracle-capture") => rank_oracle_capture(),
         Some("advanced-oracle-capture") => advanced_oracle_capture(),
         Some("na-missing-oracle-capture") => na_missing_oracle_capture(),
+        Some("gain-params-oracle-capture") => gain_params_oracle_capture(),
         Some(other) => {
             bail!(
                 "unknown subcommand `{other}` \
@@ -299,7 +300,8 @@ fn main() -> Result<()> {
                  rf-oracle-capture | metric-oracle-capture | categorical-oracle-capture | \
                  constraints-oracle-capture | \
                  predict-mode-oracle-capture | rank-oracle-capture | \
-                 advanced-oracle-capture | na-missing-oracle-capture)"
+                 advanced-oracle-capture | na-missing-oracle-capture | \
+                 gain-params-oracle-capture)"
             );
         }
         None => {
@@ -1145,6 +1147,81 @@ fn na_missing_oracle_capture() -> Result<()> {
     eprintln!(
         "Re-run `cargo run -p xtask -- na-missing-oracle-capture` and confirm \
          `git diff --stat crates/oracle-harness/tests/fixtures/na_missing/` \
+         is empty (idempotent capture) before committing."
+    );
+    Ok(())
+}
+
+/// T-G5-4 (SPEC-G5-4): capture THREE real-binary gain-param goldens — one each
+/// for `feature_contri` (penalty), `max_delta_step`, and `path_smooth` — each a
+/// single deterministic split-tree with exactly ONE param non-default, via
+/// `xtask/py/gain_params_oracle_capture.py`. Mirrors [`na_missing_oracle_capture`]'s
+/// structure (three golden files instead of one).
+fn gain_params_oracle_capture() -> Result<()> {
+    let root = workspace_root()?;
+
+    let python = resolve_capture_python()?;
+    let script = root.join("xtask/py/gain_params_oracle_capture.py");
+    if !script.is_file() {
+        bail!("capture script {} not found", script.display());
+    }
+
+    eprintln!(
+        "xtask gain-params-oracle-capture: using python {} (lightgbm {} expected) ...",
+        python.display(),
+        LEARNER_ORACLE_LIGHTGBM_VERSION
+    );
+    run(
+        Command::new(&python).arg("-c").arg(format!(
+            "import lightgbm,sys; \
+             assert lightgbm.__version__=='{ver}', \
+             'lightgbm '+lightgbm.__version__+' != recorded {ver}'",
+            ver = LEARNER_ORACLE_LIGHTGBM_VERSION
+        )),
+        "lightgbm version check",
+    )
+    .context(
+        "the capture interpreter must have lightgbm importable at the recorded version. \
+         Set $LGBM_CAPTURE_PYTHON to a python (e.g. a venv) with \
+         `pip install lightgbm==4.6.0`. `cargo test` does NOT need this.",
+    )?;
+
+    for which in ["penalty", "max_delta_step", "path_smooth"] {
+        // Fixtures live under the TRACKED oracle-harness crate dir — NEVER the
+        // untracked LightGBM/ tree.
+        let fixtures_dir = root
+            .join("crates/oracle-harness/tests/fixtures/gain_params")
+            .join(which);
+        std::fs::create_dir_all(&fixtures_dir)
+            .with_context(|| format!("creating fixtures dir {}", fixtures_dir.display()))?;
+        let model_real = fixtures_dir.join("model_real.txt");
+
+        eprintln!(
+            "xtask gain-params-oracle-capture: training the {which} corpus on real \
+             lib_lightgbm and dumping the golden ..."
+        );
+        run(
+            Command::new(&python)
+                .arg(&script)
+                .arg(which)
+                .arg(&model_real)
+                .arg(LEARNER_ORACLE_SEED.to_string())
+                .arg(LEARNER_ORACLE_LIGHTGBM_VERSION),
+            "gain_params_oracle_capture.py",
+        )?;
+
+        if !model_real.is_file() {
+            bail!("capture completed but {} was not written", model_real.display());
+        }
+        eprintln!(
+            "xtask gain-params-oracle-capture: done ({which}). Wrote {}.",
+            model_real.display()
+        );
+    }
+
+    eprintln!(
+        "Re-run `cargo run -p xtask -- gain-params-oracle-capture` and confirm \
+         `git diff --stat crates/oracle-harness/tests/fixtures/gain_params/` \
          is empty (idempotent capture) before committing."
     );
     Ok(())

@@ -150,6 +150,30 @@ fn round_int_f32(x: f32) -> i32 {
 /// (`na_as_missing` is rejected upstream on those paths, P-4) — `0u32` is a
 /// true no-op here (every na_as_missing-gated term selects its "false" branch),
 /// so this extension does not perturb their existing behavior.
+///
+/// `max_delta_step` (G5-2, T-G5-2): the C++ `config->max_delta_step` leaf-output
+/// clamp (`CalculateSplittedLeafOutput`'s `USE_MAX_OUTPUT` branch,
+/// feature_histogram.hpp:716-738). When non-zero, BOTH the per-candidate scan
+/// gain (`GetSplitGains<..,USE_MAX_OUTPUT,..>`) AND the finalization leaf
+/// outputs dispatch to the clamped form ([`crate::gain::get_split_gains_clamped`]
+/// / [`crate::gain::calculate_splitted_leaf_output_clamped`]) instead of the
+/// closed-form fast path. Every caller OTHER than [`find_best_split_kernel`]
+/// passes `0.0f64` (`max_delta_step` is rejected upstream on those paths, P-4) —
+/// a true no-op (the `!= 0.0` dispatch below always selects the unchanged
+/// closed-form path), so this extension does not perturb their existing behavior.
+///
+/// `path_smooth` / `parent_output` (G5-3, T-G5-3): the C++ `config->path_smooth`
+/// leaf-output blend-toward-parent (`CalculateSplittedLeafOutput`'s
+/// `USE_SMOOTHING` branch, feature_histogram.hpp:733-736). When `path_smooth !=
+/// 0.0`, BOTH the per-candidate scan gain AND the finalization leaf outputs
+/// dispatch to the smoothed form ([`crate::gain::get_split_gains_smoothed`] /
+/// [`crate::gain::calculate_splitted_leaf_output_smoothed`]), using that SIDE's
+/// own row count (`left_count`/`right_count`) as the smoothing `num_data`
+/// (`feature_histogram.hpp:772-778`). `max_delta_step` and `path_smooth`
+/// non-default SIMULTANEOUSLY is rejected upstream (the composed clamp+smooth
+/// form is not transcribed). Every caller OTHER than [`find_best_split_kernel`]
+/// passes `0.0f64`/`0.0f64` — a true no-op, so this extension does not perturb
+/// their existing behavior.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 pub fn split_scan_body(
@@ -173,6 +197,9 @@ pub fn split_scan_body(
     num_data: i32,
     rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1-na_as_missing)
     fwd_count: i32, // host-computed FORWARD iteration count = max(0, num_bin-1-offset [+1 iff na_as_missing&&offset==1])
+    max_delta_step: f64, // G5-2 (T-G5-2); 0.0 is a true no-op (see doc above)
+    path_smooth: f64,    // G5-3 (T-G5-3); 0.0 is a true no-op (see doc above)
+    parent_output: f64,  // G5-3; ignored (no-op) when path_smooth == 0.0
 ) {
     // `hb`/`ob` are the feature's base offsets into the (concatenated) histogram and
     // the 12-cell `out` window. They are 0,0 for the single-feature kernel.
@@ -182,6 +209,8 @@ pub fn split_scan_body(
     let l2 = lambda_l2;
     let use_l1_b = use_l1 != 0;
     let skip_def = skip_default_bin != 0;
+    let use_clamp = max_delta_step != 0.0;
+    let use_smooth = path_smooth != 0.0;
 
     // GET_GRAD(hist, i) = hist[i<<1]; GET_HESS(hist, i) = hist[(i<<1)+1]
     // (bin.h:45). `cnt_factor = num_data / sum_hessian` (feature_histogram.hpp:843).
@@ -286,15 +315,44 @@ pub fn split_scan_body(
             // Always COMPUTE the gain (no early-out in branchless form), then gate
             // it to the 0.0 sentinel unless this is a valid candidate beating
             // min_gain_shift (:913). The winner update is a chain of `select`s.
-            let current_gain = get_split_gains(
-                use_l1_b,
-                sum_left_gradient,
-                sum_left_hessian,
-                sum_right_gradient,
-                sum_right_hessian,
-                l1,
-                l2,
-            );
+            // G5-2/G5-3: clamped/smoothed-vs-closed-form dispatch (see
+            // split_scan_body's doc).
+            let current_gain = if use_smooth {
+                crate::gain::get_split_gains_smoothed(
+                    use_l1_b,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                    path_smooth,
+                    left_count,
+                    right_count,
+                    parent_output,
+                )
+            } else if use_clamp {
+                crate::gain::get_split_gains_clamped(
+                    use_l1_b,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                    max_delta_step,
+                )
+            } else {
+                get_split_gains(
+                    use_l1_b,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                )
+            };
             let valid = consider && current_gain > min_gain_shift;
             is_splittable = select(valid, 1.0, is_splittable);
             let cand_gain = select(valid, current_gain, 0.0); // 0.0 == sentinel (never beats best on invalid)
@@ -388,15 +446,44 @@ pub fn split_scan_body(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
 
-            let current_gain = get_split_gains(
-                use_l1_b,
-                sum_left_gradient,
-                sum_left_hessian,
-                sum_right_gradient,
-                sum_right_hessian,
-                l1,
-                l2,
-            );
+            // G5-2/G5-3: same clamped/smoothed-vs-closed-form dispatch as the
+            // REVERSE branch.
+            let current_gain = if use_smooth {
+                crate::gain::get_split_gains_smoothed(
+                    use_l1_b,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                    path_smooth,
+                    left_count,
+                    right_count,
+                    parent_output,
+                )
+            } else if use_clamp {
+                crate::gain::get_split_gains_clamped(
+                    use_l1_b,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                    max_delta_step,
+                )
+            } else {
+                get_split_gains(
+                    use_l1_b,
+                    sum_left_gradient,
+                    sum_left_hessian,
+                    sum_right_gradient,
+                    sum_right_hessian,
+                    l1,
+                    l2,
+                )
+            };
             let valid = consider && current_gain > min_gain_shift;
             is_splittable = select(valid, 1.0, is_splittable);
             let cand_gain = select(valid, current_gain, 0.0); // 0.0 == sentinel (never beats best on invalid)
@@ -416,19 +503,64 @@ pub fn split_scan_body(
     // min_gain_shift` accept gate + the `- min_gain_shift` / `* penalty`
     // adjustments; here we emit the RAW winner state. We DO compute the f64
     // outputs + subtract kEpsilon back off the reported hessians (:1042/:1053)
-    // so the launcher has the exact SplitInfo cells.
+    // so the launcher has the exact SplitInfo cells. G5-2/G5-3: clamped/smoothed
+    // dispatch, same as the per-candidate scan gain above.
     let eps = f64::cast_from(K_EPSILON);
-    let left_output = calculate_splitted_leaf_output(
-        use_l1_b,
-        best_sum_left_gradient,
-        best_sum_left_hessian,
-        l1,
-        l2,
-    );
+    let best_right_count = num_data - best_left_count;
+    let left_output = if use_smooth {
+        crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1_b,
+            best_sum_left_gradient,
+            best_sum_left_hessian,
+            l1,
+            l2,
+            path_smooth,
+            best_left_count,
+            parent_output,
+        )
+    } else if use_clamp {
+        crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1_b,
+            best_sum_left_gradient,
+            best_sum_left_hessian,
+            l1,
+            l2,
+            max_delta_step,
+        )
+    } else {
+        calculate_splitted_leaf_output(
+            use_l1_b,
+            best_sum_left_gradient,
+            best_sum_left_hessian,
+            l1,
+            l2,
+        )
+    };
     let right_sum_gradient = sum_gradient - best_sum_left_gradient;
     let right_sum_hessian = sum_hessian - best_sum_left_hessian;
-    let right_output =
-        calculate_splitted_leaf_output(use_l1_b, right_sum_gradient, right_sum_hessian, l1, l2);
+    let right_output = if use_smooth {
+        crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1_b,
+            right_sum_gradient,
+            right_sum_hessian,
+            l1,
+            l2,
+            path_smooth,
+            best_right_count,
+            parent_output,
+        )
+    } else if use_clamp {
+        crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1_b,
+            right_sum_gradient,
+            right_sum_hessian,
+            l1,
+            l2,
+            max_delta_step,
+        )
+    } else {
+        calculate_splitted_leaf_output(use_l1_b, right_sum_gradient, right_sum_hessian, l1, l2)
+    };
 
     out[ob] = is_splittable; // already an f64 flag (0.0 / 1.0)
     out[ob + 1] = f64::cast_from(best_threshold);
@@ -472,6 +604,9 @@ pub fn find_best_split_kernel(
     num_data: i32,
     rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1-na_as_missing)
     fwd_count: i32, // host-computed FORWARD iteration count
+    max_delta_step: f64, // G5-2 (T-G5-2); 0.0 is a true no-op
+    path_smooth: f64,    // G5-3 (T-G5-3); 0.0 is a true no-op
+    parent_output: f64,  // G5-3; ignored (no-op) when path_smooth == 0.0
 ) {
     split_scan_body(
         hist,
@@ -494,6 +629,9 @@ pub fn find_best_split_kernel(
         num_data,
         rev_count,
         fwd_count,
+        max_delta_step,
+        path_smooth,
+        parent_output,
     );
 }
 
@@ -531,6 +669,7 @@ pub fn find_best_split_cpu(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
+    parent_output: f64,
 ) -> Result<SplitInfo, ComputeError> {
     find_best_split_f64_on(
         client,
@@ -546,6 +685,7 @@ pub fn find_best_split_cpu(
         sum_gradient,
         sum_hessian,
         num_data,
+        parent_output,
     )
 }
 
@@ -571,6 +711,7 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
+    parent_output: f64,
 ) -> Result<SplitInfo, ComputeError> {
     // --- V5 boundary validation (T-04-01) ---
     // NA_AS_MISSING (feature_histogram.hpp:945-961, T-G4-1) is now transcribed in
@@ -605,17 +746,21 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
                 .to_string(),
         });
     }
-    // Only the default no-op output-clamp / smoothing path is transcribed. Reject
-    // non-default values rather than silently mis-computing.
+    // G5-2: max_delta_step is now transcribed (below); path_smooth remains
+    // Phase-7+ scope for this host target (T-G5-3). The composed clamp+smooth
+    // case (both non-default simultaneously) is NOT transcribed (see the
+    // matching note in `find_best_split_cpu_native`); reject that combination
+    // explicitly rather than silently picking one.
     //
-    // This rejection is load-bearing: the on-device seam binds the learner's REAL
-    // `GainConfig` (not a permissive proving slice), so a learner cfg carrying a
-    // non-zero max_delta_step / path_smooth must keep ERRORING here rather than
+    // The path_smooth rejection is load-bearing: the on-device seam binds the
+    // learner's REAL `GainConfig` (not a permissive proving slice), so a learner
+    // cfg carrying a non-zero path_smooth must keep ERRORING here rather than
     // silently enabling unimplemented semantics on device.
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+    if cfg.max_delta_step != 0.0 && cfg.path_smooth != 0.0 {
         return Err(ComputeError::Runtime {
-            detail: "find_best_split: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
+            detail: "find_best_split: max_delta_step and path_smooth combined is Phase-7+ \
+                     scope (each is individually supported; the composed clamp+smooth \
+                     leaf-output formula is not yet transcribed)"
                 .to_string(),
         });
     }
@@ -644,13 +789,40 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     // `min_gain_shift` by only a single f64 ULP. `min_gain_shift` computed from the
     // bumped sum_hessian is bit-exact to the reference implementation.
     let use_l1 = cfg.use_l1();
-    let gain_shift = crate::gain::get_leaf_gain(
-        use_l1,
-        sum_gradient,
-        sum_hessian_bumped,
-        cfg.lambda_l1,
-        cfg.lambda_l2,
-    );
+    // G5-2/G5-3: BeforeNumerical dispatches to the clamped/smoothed GetLeafGain
+    // form whenever max_delta_step/path_smooth != 0.0 — see the matching note in
+    // `find_best_split_cpu_native`.
+    let use_clamp = cfg.max_delta_step != 0.0;
+    let use_smooth = cfg.path_smooth != 0.0;
+    let gain_shift = if use_smooth {
+        crate::gain::get_leaf_gain_smoothed(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.path_smooth,
+            num_data,
+            parent_output,
+        )
+    } else if use_clamp {
+        crate::gain::get_leaf_gain_clamped(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+        )
+    } else {
+        crate::gain::get_leaf_gain(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+        )
+    };
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     // Host-computed iteration counts (the loops are bounded RANGE loops on the
@@ -721,6 +893,9 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
             num_data,
             rev_count,
             fwd_count,
+            cfg.max_delta_step,
+            cfg.path_smooth,
+            parent_output,
         );
     }
 
@@ -1183,6 +1358,9 @@ pub fn find_best_splits_fused_kernel(
             num_data,
             rev_count[fi],
             fwd_count[fi],
+            0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+            0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+            0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
         );
     }
 }
@@ -1288,6 +1466,9 @@ pub fn find_best_splits_fused_kernel_devcount(
             num_data,
             rev_count[fi],
             fwd_count[fi],
+            0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+            0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+            0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
         );
     }
 }
@@ -1378,6 +1559,9 @@ pub fn find_best_splits_fused_siblings_kernel(
                 num_data_a,
                 rev_count[fi],
                 fwd_count[fi],
+                0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+                0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+                0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
             );
         } else {
             split_scan_body(
@@ -1401,6 +1585,9 @@ pub fn find_best_splits_fused_siblings_kernel(
                 num_data_b,
                 rev_count[fi],
                 fwd_count[fi],
+                0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+                0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+                0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
             );
         }
     }
@@ -1479,6 +1666,9 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
                 num_data_a,
                 rev_count[fi],
                 fwd_count[fi],
+                0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+                0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+                0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
             );
         } else {
             split_scan_body(
@@ -1502,6 +1692,9 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
                 num_data_b,
                 rev_count[fi],
                 fwd_count[fi],
+                0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+                0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+                0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
             );
         }
     }
@@ -7216,6 +7409,7 @@ pub fn find_best_split_cpu_native(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
+    parent_output: f64,
 ) -> Result<SplitInfo, ComputeError> {
     use crate::gain::{calculate_splitted_leaf_output as calc_out, get_leaf_gain, get_split_gains};
 
@@ -7247,10 +7441,18 @@ pub fn find_best_split_cpu_native(
                 .to_string(),
         });
     }
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
+    // G5-2/G5-3: max_delta_step AND path_smooth are now transcribed (below), each
+    // independently. The composed clamp+smooth case (both non-default
+    // simultaneously) is NOT transcribed — C++ selects BOTH template bools
+    // together (`CalculateSplittedLeafOutput<USE_L1, USE_MAX_OUTPUT,
+    // USE_SMOOTHING>` applies the clamp, THEN the smoothing blend), which this
+    // host target does not yet compose; reject that combination explicitly
+    // rather than silently picking one.
+    if cfg.max_delta_step != 0.0 && cfg.path_smooth != 0.0 {
         return Err(ComputeError::Runtime {
-            detail: "find_best_split: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
+            detail: "find_best_split: max_delta_step and path_smooth combined is Phase-7+ \
+                     scope (each is individually supported; the composed clamp+smooth \
+                     leaf-output formula is not yet transcribed)"
                 .to_string(),
         });
     }
@@ -7259,13 +7461,44 @@ pub fn find_best_split_cpu_native(
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let sum_hessian_bumped = sum_hessian + two_eps;
     let use_l1 = cfg.use_l1();
-    let gain_shift = get_leaf_gain(
-        use_l1,
-        sum_gradient,
-        sum_hessian_bumped,
-        cfg.lambda_l1,
-        cfg.lambda_l2,
-    );
+    // G5-2/G5-3: BeforeNumerical's whole-leaf `gain_shift` (feature_histogram.hpp:
+    // 198-200) uses `GetLeafGain<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>` — the
+    // SAME clamped/smoothed form the per-candidate scan gain below uses —
+    // whenever `max_delta_step`/`path_smooth != 0.0` (C++ selects the
+    // corresponding template bool at the per-CONFIG dispatch, not per-call). The
+    // smoothing form's `num_data` here is the WHOLE parent leaf's `num_data`
+    // (the fn parameter), matching `BeforeNumerical(..., num_data, parent_output)`.
+    let use_clamp = cfg.max_delta_step != 0.0;
+    let use_smooth = cfg.path_smooth != 0.0;
+    let gain_shift = if use_smooth {
+        crate::gain::get_leaf_gain_smoothed(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.path_smooth,
+            num_data,
+            parent_output,
+        )
+    } else if use_clamp {
+        crate::gain::get_leaf_gain_clamped(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+        )
+    } else {
+        get_leaf_gain(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+        )
+    };
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     let num_bin_i = num_bin as i32;
@@ -7333,15 +7566,49 @@ pub fn find_best_split_cpu_native(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
             if consider {
-                let current_gain = get_split_gains(
-                    use_l1,
-                    sum_left_gradient,
-                    sum_left_hessian,
-                    sum_right_gradient,
-                    sum_right_hessian,
-                    l1,
-                    l2,
-                );
+                // G5-2/G5-3: GetSplitGains<false, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>
+                // (feature_histogram.hpp:757-797) — the per-candidate scan gain
+                // dispatches to the clamped or smoothed form whenever
+                // max_delta_step/path_smooth != 0.0, NOT the closed-form fast path
+                // (which is only valid at !USE_MAX_OUTPUT && !USE_SMOOTHING). The
+                // smoothing form's per-side `num_data` is that side's OWN row
+                // count (left_count/right_count), per `get_split_gains_smoothed`'s doc.
+                let current_gain = if use_smooth {
+                    crate::gain::get_split_gains_smoothed(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                        cfg.path_smooth,
+                        left_count,
+                        right_count,
+                        parent_output,
+                    )
+                } else if use_clamp {
+                    crate::gain::get_split_gains_clamped(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                        cfg.max_delta_step,
+                    )
+                } else {
+                    get_split_gains(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                    )
+                };
                 if current_gain > min_gain_shift {
                     is_splittable = true;
                     if current_gain > best_gain {
@@ -7407,15 +7674,44 @@ pub fn find_best_split_cpu_native(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
             if consider {
-                let current_gain = get_split_gains(
-                    use_l1,
-                    sum_left_gradient,
-                    sum_left_hessian,
-                    sum_right_gradient,
-                    sum_right_hessian,
-                    l1,
-                    l2,
-                );
+                // G5-2/G5-3: same clamped/smoothed-vs-closed-form dispatch as the
+                // REVERSE branch.
+                let current_gain = if use_smooth {
+                    crate::gain::get_split_gains_smoothed(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                        cfg.path_smooth,
+                        left_count,
+                        right_count,
+                        parent_output,
+                    )
+                } else if use_clamp {
+                    crate::gain::get_split_gains_clamped(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                        cfg.max_delta_step,
+                    )
+                } else {
+                    get_split_gains(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                    )
+                };
                 if current_gain > min_gain_shift {
                     is_splittable = true;
                     if current_gain > best_gain {
@@ -7433,10 +7729,58 @@ pub fn find_best_split_cpu_native(
 
     // ---- finalization (feature_histogram.hpp:1031-1056), same operand orders ----
     let eps = f64::from(K_EPSILON);
-    let left_output = calc_out(use_l1, best_sum_left_gradient, best_sum_left_hessian, l1, l2);
+    let best_right_count = num_data - best_left_count;
+    // G5-2/G5-3: CalculateSplittedLeafOutput<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>
+    // — the final winner's leaf outputs dispatch identically to the scan's
+    // per-candidate form.
+    let left_output = if use_smooth {
+        crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1,
+            best_sum_left_gradient,
+            best_sum_left_hessian,
+            l1,
+            l2,
+            cfg.path_smooth,
+            best_left_count,
+            parent_output,
+        )
+    } else if use_clamp {
+        crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1,
+            best_sum_left_gradient,
+            best_sum_left_hessian,
+            l1,
+            l2,
+            cfg.max_delta_step,
+        )
+    } else {
+        calc_out(use_l1, best_sum_left_gradient, best_sum_left_hessian, l1, l2)
+    };
     let right_sum_gradient = sum_gradient - best_sum_left_gradient;
     let right_sum_hessian = sum_hessian_bumped - best_sum_left_hessian;
-    let right_output = calc_out(use_l1, right_sum_gradient, right_sum_hessian, l1, l2);
+    let right_output = if use_smooth {
+        crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1,
+            right_sum_gradient,
+            right_sum_hessian,
+            l1,
+            l2,
+            cfg.path_smooth,
+            best_right_count,
+            parent_output,
+        )
+    } else if use_clamp {
+        crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1,
+            right_sum_gradient,
+            right_sum_hessian,
+            l1,
+            l2,
+            cfg.max_delta_step,
+        )
+    } else {
+        calc_out(use_l1, right_sum_gradient, right_sum_hessian, l1, l2)
+    };
 
     // Accept gate (:1031): is_splittable && best_gain > -inf (finite). Reported
     // gain is best_gain - min_gain_shift (penalty == 1).
@@ -7908,6 +8252,7 @@ mod tests {
             sum_gradient,
             sum_hessian,
             num_data,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("split should succeed");
 
@@ -7934,6 +8279,7 @@ mod tests {
         };
         let si = find_best_split_cpu(
             &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, 4.0, 4.0, 8,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("call ok");
         assert_eq!(si.gain, f64::NEG_INFINITY, "no split -> kMinScore");
@@ -7967,9 +8313,227 @@ mod tests {
             1.0,
             1.0,
             4,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .unwrap_err();
         assert!(matches!(err, ComputeError::LengthMismatch { .. }));
+    }
+
+    /// G5-2 (SPEC-G5-2): non-default `max_delta_step` must no longer be rejected
+    /// by [`find_best_split_cpu_native`], and the returned leaf outputs must
+    /// cross-check against [`crate::gain::calculate_splitted_leaf_output_clamped`]
+    /// computed independently from the returned per-side sums (the internal RAW
+    /// sums the scan used, i.e. the reported `left_sum_hessian`/`right_sum_hessian`
+    /// with `kEpsilon` added back, per the `:1042/:1053` doc note on
+    /// [`SplitInfo`]).
+    #[test]
+    fn find_best_split_cpu_native_admits_max_delta_step() {
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.7,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let si = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data,
+            0.0f64, // parent_output: test default (no path_smooth)
+        )
+        .expect("max_delta_step must no longer be rejected");
+        assert!(si.gain.is_finite(), "expected a finite-gain split, got {si:?}");
+        let use_l1 = cfg.use_l1();
+        let eps = f64::from(K_EPSILON);
+        let expected_left = crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1,
+            si.left_sum_gradient,
+            si.left_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+        );
+        let expected_right = crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1,
+            si.right_sum_gradient,
+            si.right_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+        );
+        assert_eq!(si.left_output, expected_left);
+        assert_eq!(si.right_output, expected_right);
+        // Sanity: the clamp is actually exercised (both leaf outputs are within
+        // the [-0.7, 0.7] envelope) for this fixture, not silently falling
+        // through to the unclamped base path.
+        assert!(si.left_output.abs() <= 0.7 + 1e-12, "{}", si.left_output);
+        assert!(si.right_output.abs() <= 0.7 + 1e-12, "{}", si.right_output);
+    }
+
+    /// G5-2 (SPEC-G5-2): the KERNEL host target ([`find_best_split_cpu`], which
+    /// dispatches to [`find_best_split_f64_on`]) must ALSO admit non-default
+    /// `max_delta_step`, and — being the SAME shared [`split_scan_body`] the
+    /// native fn's independent transcription is checked against — must produce
+    /// the IDENTICAL `SplitInfo` as [`find_best_split_cpu_native`] on the same
+    /// inputs (the existing kernel-vs-native parity idiom this file already uses
+    /// for na_as_missing).
+    #[test]
+    fn find_best_split_cpu_admits_max_delta_step_matches_native() {
+        let client = cpu_client();
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.7,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let si_kernel = find_best_split_cpu(
+            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient,
+            sum_hessian, num_data,
+            0.0f64, // parent_output: test default (no path_smooth)
+        )
+        .expect("max_delta_step must no longer be rejected by the kernel host target");
+        let si_native = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data,
+            0.0f64, // parent_output: test default (no path_smooth)
+        )
+        .expect("native");
+        assert_eq!(si_kernel, si_native, "kernel vs native must be bit-identical");
+        assert!(si_kernel.left_output.abs() <= 0.7 + 1e-12);
+        assert!(si_kernel.right_output.abs() <= 0.7 + 1e-12);
+    }
+
+    /// G5-3 (SPEC-G5-3): non-default `path_smooth` (+ a fixed `parent_output`)
+    /// must no longer be rejected by [`find_best_split_cpu_native`], and the
+    /// returned leaf outputs must cross-check against
+    /// [`crate::gain::calculate_splitted_leaf_output_smoothed`] computed
+    /// independently from the returned per-side sums + counts (the internal RAW
+    /// sums the scan used, i.e. the reported `left_sum_hessian`/`right_sum_hessian`
+    /// with `kEpsilon` added back) — the idiom the plan's Red step describes: "a
+    /// cross-check against the already-tested gain.rs function, not a fresh
+    /// hand-derivation".
+    #[test]
+    fn find_best_split_cpu_native_admits_path_smooth() {
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let parent_output = 0.25_f64;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 2.0,
+            ..Default::default()
+        };
+        let si = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data, parent_output,
+        )
+        .expect("path_smooth must no longer be rejected");
+        assert!(si.gain.is_finite(), "expected a finite-gain split, got {si:?}");
+        let use_l1 = cfg.use_l1();
+        let eps = f64::from(K_EPSILON);
+        let expected_left = crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1,
+            si.left_sum_gradient,
+            si.left_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.path_smooth,
+            si.left_count,
+            parent_output,
+        );
+        let expected_right = crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1,
+            si.right_sum_gradient,
+            si.right_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.path_smooth,
+            si.right_count,
+            parent_output,
+        );
+        assert_eq!(si.left_output, expected_left);
+        assert_eq!(si.right_output, expected_right);
+    }
+
+    /// G5-3: the KERNEL host target ([`find_best_split_cpu`]) must ALSO admit
+    /// non-default `path_smooth`, and must produce the IDENTICAL `SplitInfo` as
+    /// [`find_best_split_cpu_native`] on the same inputs.
+    #[test]
+    fn find_best_split_cpu_admits_path_smooth_matches_native() {
+        let client = cpu_client();
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let parent_output = 0.25_f64;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 2.0,
+            ..Default::default()
+        };
+        let si_kernel = find_best_split_cpu(
+            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient,
+            sum_hessian, num_data, parent_output,
+        )
+        .expect("path_smooth must no longer be rejected by the kernel host target");
+        let si_native = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data, parent_output,
+        )
+        .expect("native");
+        assert_eq!(si_kernel, si_native, "kernel vs native must be bit-identical");
+    }
+
+    /// G5-2/G5-3: `max_delta_step` and `path_smooth` non-default SIMULTANEOUSLY is
+    /// explicitly rejected (the composed clamp+smooth leaf-output formula is not
+    /// transcribed) — an honest typed error, not a silent pick-one.
+    #[test]
+    fn find_best_split_cpu_native_rejects_combined_clamp_and_smooth() {
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.7,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 2.0,
+            ..Default::default()
+        };
+        let err = find_best_split_cpu_native(
+            &hist, &cfg, 4, 0, 4, 0, false, false, true, -1.0, 20.0, 20, 0.25,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ComputeError::Runtime { .. }));
     }
 
     /// UPDATED (T-G4-1, was `find_best_split_na_as_missing_is_typed_error`):
@@ -8016,6 +8580,7 @@ mod tests {
             -1.0,
             20.0,
             20,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("na_as_missing must now be admitted and computed, not a typed error");
         assert_eq!(split.threshold, 1, "FORWARD t=1 wins over REVERSE t=1");
@@ -8105,6 +8670,7 @@ mod tests {
             0.0,
             4.0,
             4,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("na_as_missing must be admitted and computed (T-G4-1)");
         assert_eq!(correct.threshold, 1);
@@ -8132,6 +8698,7 @@ mod tests {
             &client, &hist, &cfg, num_bin, 1, 0, 0, false, true,
             false, // run_forward=false: the PRE-FIX (buggy) dispatch for NaN
             0.0, 4.0, 4,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("REVERSE-only must still succeed (it's a valid, just WRONG, split)");
         assert_eq!(
@@ -8182,11 +8749,13 @@ mod tests {
             let native = find_best_split_cpu_native(
                 hist, &cfg, num_bin, offset, 0, 0, false, true, true, sum_gradient, sum_hessian,
                 num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("native: na_as_missing must be admitted");
             let kernel = find_best_split_cpu(
                 &client, hist, &cfg, num_bin, offset, 0, 0, false, true, true, sum_gradient,
                 sum_hessian, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("kernel: na_as_missing must be admitted");
             assert!(
@@ -8238,6 +8807,7 @@ mod tests {
         let serial = find_best_split_cpu_native(
             hist, cfg, num_bin, offset, default_bin, most_freq_bin, skip_default_bin, false,
             run_forward, sum_gradient, sum_hessian, num_data,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("serial ok");
         let twolane = find_best_split_cpu_native_2lane(
@@ -8368,6 +8938,7 @@ mod tests {
         let serial = find_best_split_cpu_native(
             &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
             num_data,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .expect("serial ok");
         let twolane = find_best_split_cpu_native_2lane(

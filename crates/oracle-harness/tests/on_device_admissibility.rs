@@ -256,6 +256,7 @@ fn scan(cfg: &GainConfig, hist: &[f64], sum_g: f64, sum_h: f64, num_data: i32, n
             &client, hist, cfg, num_bin, /*offset*/ 0, /*default_bin*/ num_bin,
             /*most_freq_bin*/ 0, /*skip_default_bin*/ false, /*na_as_missing*/ false,
             /*run_forward*/ true, sum_g, sum_h, num_data,
+            /*parent_output*/ 0.0,
         )
         .expect("find_best_split")
 }

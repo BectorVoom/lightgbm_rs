@@ -437,6 +437,12 @@ pub struct LearnerConstraints {
     pub cegb_penalty_feature_coupled: Vec<f64>,
     /// Per-feature lazy penalty.
     pub cegb_penalty_feature_lazy: Vec<f64>,
+    /// `feature_contri` (G5-1, SPEC-G5-1): per-feature split-gain penalty,
+    /// indexed by REAL feature index (`FeatureColumn::real_feature_index`).
+    /// Empty ⇒ every feature's penalty is 1.0 (no-op). C++ doc: `gain[i] =
+    /// max(0, feature_contri[i]) * gain[i]` — floored at 0.0 at the consumer.
+    /// Distinct from the CEGB penalty above.
+    pub feature_contri: Vec<f64>,
     /// A pre-parsed forced-split tree (from `forced_splits_filename`
     /// JSON). `None` ⇒ no forced split (the spine path).
     pub forced_splits: Option<crate::forced_splits::ForcedSplitNode>,
@@ -2641,6 +2647,17 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
         let num_data_in_leaf = leaf_splits.num_data_in_leaf;
+        // G5-3 (SPEC-G5-3, OQ-2): `parent_output` — the SPLITTING leaf's own
+        // output, C++ `SerialTreeLearner::GetParentOutput` / `LeafSplits::weight()`
+        // (leaf_splits.rs:49-51, "the leaf output ... used as parent_output for
+        // path-smoothing (no-op on the spine)"), already seeded per-leaf through
+        // the growth loop (root: the plain unsmoothed closed-form output, which is
+        // bit-exact to C++'s ROOT special case at the default max_delta_step==0.0 —
+        // see `GetParentOutput`, serial_tree_learner.cpp:1005-1017; non-root: the
+        // winning `SplitInfo.left_output`/`right_output` this leaf was created
+        // with, serial_tree_learner.cpp:853-870). No-op (unread) when
+        // `self.cfg.path_smooth == 0.0`.
+        let parent_output = leaf_splits.weight;
 
         let mut records: Vec<FeatureSplitRecord> = Vec::with_capacity(features.len());
         let mut leaf_best = SplitInfo::none();
@@ -2837,6 +2854,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
+                parent_output,
             )?;
             // Extract scan-active SplitInfos in ascending fpos ⇒ batched_feats order.
             per_feat.into_iter().flatten().collect::<Vec<SplitInfo>>()
@@ -2872,6 +2890,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
+                parent_output,
             )?;
             // Extract scan-active SplitInfos in ascending fpos ⇒ batched_feats order.
             per_feat.into_iter().flatten().collect::<Vec<SplitInfo>>()
@@ -2939,6 +2958,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
+                parent_output,
             )?
         };
 
@@ -3000,7 +3020,24 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     sum_h_bumped,
                     num_data_in_leaf,
                 );
-                let split = cat.split;
+                let mut split = cat.split;
+                // ---- G5-1: feature_contri per-feature split-gain penalty
+                // (feature_histogram.hpp:174 `output->gain *= meta_->penalty`,
+                // applied INSIDE FindBestThreshold/FindBestThresholdCategoricalInner
+                // — the SAME `FindBestThreshold` entry point dispatches to BOTH the
+                // numerical and categorical scan bodies via `find_best_threshold_fun_`,
+                // so C++ penalizes categorical splits identically). Applied
+                // UNCONDITIONALLY (matching C++), BEFORE the splittability record.
+                // Empty vector / out-of-range index ⇒ penalty 1.0 (no-op). C++ doc:
+                // `gain[i] = max(0, feature_contri[i]) * gain[i]`.
+                let fc = self
+                    .constraints
+                    .feature_contri
+                    .get(f.real_feature_index as usize)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.0);
+                split.gain *= fc;
                 this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
                 // Categorical features have no per-bin numeric gain arrays; the
                 // numeric snapshot uses empty rev/fwd for them (the categorical
@@ -3106,6 +3143,26 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 let _ = (skip_default_bin, na_as_missing, run_forward);
                 batched_splits[bi]
             };
+
+            // ---- G5-1: feature_contri per-feature split-gain penalty
+            // (feature_histogram.hpp:174 `output->gain *= meta_->penalty`, applied
+            // INSIDE `FindBestThreshold` — i.e. UPSTREAM of / BEFORE
+            // ComputeBestSplitForFeature's CEGB subtract (:989-992) and monotone
+            // multiply (:993-997) below, per `serial_tree_learner.cpp:983-997`. The
+            // penalty and CEGB's additive subtract do NOT commute, so this MUST be
+            // the FIRST per-feature gain adjustment. Applied UNCONDITIONALLY
+            // (matching C++, which does not gate on is_splittable_), BEFORE the
+            // splittability record below. Empty vector / out-of-range index ⇒
+            // penalty 1.0 (no-op). C++ doc: `gain[i] = max(0, feature_contri[i]) *
+            // gain[i]`. ----
+            let fc = self
+                .constraints
+                .feature_contri
+                .get(f.real_feature_index as usize)
+                .copied()
+                .unwrap_or(1.0)
+                .max(0.0);
+            split.gain *= fc;
 
             // Record this feature's RAW splittability (C++ is_splittable_, set in
             // FindBestThresholdSequentially when current_gain > min_gain_shift) —
@@ -4760,6 +4817,63 @@ mod tests {
             penalized.num_leaves,
             spine.num_leaves
         );
+    }
+
+    #[test]
+    fn feature_contri_halves_split_gain() {
+        // G5-1 (SPEC-G5-1 G/W/T): feature_contri = [0.5, 1.0] on feature 0 (the
+        // unconstrained winner, per `forced_split_root_overrides_unconstrained_winner`)
+        // must make the recorded root split_gain EXACTLY half the default
+        // (feature_contri empty ⇒ implicit 1.0) gain, with the SAME winning
+        // feature/threshold (0.5 halves the gain but does not flip the argmax here).
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (f, g, h) = two_feature_corpus();
+        let spine = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 2, -1)
+            .with_features(f.clone())
+            .train(&g, &h, true)
+            .unwrap();
+        let penalized = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 2, -1)
+            .with_features(f)
+            .with_constraints(LearnerConstraints {
+                feature_contri: vec![0.5, 1.0],
+                ..Default::default()
+            })
+            .train(&g, &h, true)
+            .unwrap();
+        assert_eq!(spine.split_feature[0], 0, "sanity: feature 0 is the unconstrained winner");
+        assert_eq!(
+            penalized.split_feature[0], 0,
+            "feature_contri=[0.5,1.0] must not change the winning feature here"
+        );
+        assert_eq!(penalized.threshold[0], spine.threshold[0]);
+        assert_eq!(
+            penalized.split_gain[0],
+            spine.split_gain[0] * 0.5,
+            "feature_contri=0.5 must exactly halve the recorded split_gain"
+        );
+    }
+
+    #[test]
+    fn path_smooth_trains_end_to_end_through_the_learner() {
+        // G5-3 (SPEC-G5-3, OQ-2): a non-default `path_smooth` must no longer make
+        // `train()` return a typed error — the learner's `find_best_splits_batched`
+        // call site now supplies `parent_output` (`leaf_splits.weight`) end-to-end,
+        // for BOTH the root split (leaf_splits.weight seeded from the plain
+        // closed-form output) AND a SECOND, non-root split (leaf_splits.weight
+        // seeded from the parent's winning SplitInfo.left_output/right_output —
+        // `init_child`/`Init(leaf, ..., weight)`), exercising the full per-leaf
+        // parent_output threading, not just the root.
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let (f, g, h) = two_feature_corpus();
+        let mut cfg = relaxed_cfg();
+        cfg.path_smooth = 2.0;
+        let tree = SerialTreeLearner::new(&backend, &client, cfg, 4, -1)
+            .with_features(f)
+            .train(&g, &h, true)
+            .expect("path_smooth must no longer be rejected end-to-end through the learner");
+        assert!(tree.num_leaves >= 2, "at least the root split grew");
     }
 
     /// A minimal 2-leaf tree for the score-scatter test (leaf 0 = -3.0, leaf 1 =

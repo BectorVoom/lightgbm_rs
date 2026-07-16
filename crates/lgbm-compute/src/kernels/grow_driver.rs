@@ -1065,6 +1065,10 @@ fn scan_leaf<R: cubecl::Runtime>(
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
+                // parent_output: inert (G5-3) — this proving-slice driver's `cfg`
+                // hard-codes path_smooth: 0.0 (:829), so `use_smooth` is always
+                // false here; on-device grow loop is out of scope for G5.
+                0.0f64,
             )?;
             (si, Vec::new())
         };

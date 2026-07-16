@@ -1985,6 +1985,7 @@ fn run_constraints_cell(name: &str) {
         cegb_penalty_split: sidecar.cegb_penalty_split,
         cegb_penalty_feature_coupled: sidecar.cegb_penalty_feature_coupled.clone(),
         cegb_penalty_feature_lazy: Vec::new(),
+        feature_contri: Vec::new(),
         forced_splits: forced,
     };
     let _ = &sidecar.monotone_constraints_method; // method axis recorded; basic ported

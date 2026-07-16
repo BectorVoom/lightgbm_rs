@@ -277,6 +277,10 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
     get_double_vec(&resolved, "cegb_penalty_feature_lazy", &mut cfg.cegb_penalty_feature_lazy)?;
     get_double_vec(&resolved, "cegb_penalty_feature_coupled", &mut cfg.cegb_penalty_feature_coupled)?;
 
+    // G5-1: feature_contri (config_auto.cpp:469-470 `Common::StringToArray<double>(tmp_str, ',')`
+    // — no CHECK on entry values; the `max(0, ...)` floor is applied at the consumer, not parse time).
+    get_double_vec(&resolved, "feature_contri", &mut cfg.feature_contri)?;
+
     get_double(&resolved, "path_smooth", &mut cfg.path_smooth)?;
     check_ge_f("path_smooth", cfg.path_smooth, 0.0)?;
 

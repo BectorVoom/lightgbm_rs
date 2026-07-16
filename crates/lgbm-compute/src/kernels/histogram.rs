@@ -2856,6 +2856,7 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
             off,
             default_bin[fi],
             skip_default_bin[fi],
+            0u32, // na_as_missing: inert (G4; on-device grow loop rejects na_as_missing upstream)
             use_l1,
             min_data_in_leaf,
             min_sum_hessian_in_leaf,
@@ -2867,6 +2868,9 @@ pub fn build_fix_scan_fused_kernel<B: Int>(
             num_data,
             rev_count[fi],
             fwd_count[fi],
+            0.0f64, // max_delta_step: inert (G5-2, P-4 rejected upstream)
+            0.0f64, // path_smooth: inert (G5-3, P-4 rejected upstream)
+            0.0f64, // parent_output: inert (G5-3, no-op when path_smooth == 0.0)
         );
     }
 }

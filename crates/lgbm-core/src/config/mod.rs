@@ -177,6 +177,13 @@ pub struct Config {
     /// `std::vector<double> cegb_penalty_feature_coupled`. config.h default: []
     /// (empty). Per-feature coupled cost penalty (ADV-05).
     pub cegb_penalty_feature_coupled: Vec<f64>,
+    /// `std::vector<double> feature_contri` (config.h:535-539; aliases
+    /// `feature_contrib`/`fc`/`fp`/`feature_penalty`). config.h default: [] (empty).
+    /// Per-feature split-gain penalty: C++ doc "used to control feature's split
+    /// gain, will use `gain[i] = max(0, feature_contri[i]) * gain[i]` to replace
+    /// the split gain of i-th feature" — distinct from the CEGB penalty above.
+    /// G5-1.
+    pub feature_contri: Vec<f64>,
     /// `double path_smooth`. config.h default: 0.
     pub path_smooth: f64,
     /// `std::string interaction_constraints`. config.h default: "".
@@ -389,6 +396,7 @@ impl Default for Config {
             cegb_penalty_split: 0.0,
             cegb_penalty_feature_lazy: Vec::new(),
             cegb_penalty_feature_coupled: Vec::new(),
+            feature_contri: Vec::new(),
             path_smooth: 0.0,
             interaction_constraints: String::new(),
             verbosity: 1,

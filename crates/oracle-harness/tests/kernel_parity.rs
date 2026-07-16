@@ -597,6 +597,7 @@ fn kernel_parity_split_bit_exact_on_cpu() {
                 c.sum_gradient,
                 c.sum_hessian,
                 c.num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .unwrap_or_else(|e| panic!("SPLIT case `{}`: find_best_split failed: {e:?}", c.name));
 
@@ -758,7 +759,7 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
         }
         let one = std::slice::from_ref(f);
         let batched = backend
-            .find_best_splits_batched(&client, &buf, one, &cfg, sg, sh, nd)
+            .find_best_splits_batched(&client, &buf, one, &cfg, sg, sh, nd, 0.0f64)
             .unwrap_or_else(|e| panic!("batched find_best_splits_batched failed: {e:?}"));
         assert_eq!(batched.len(), 1, "one feature -> one SplitInfo");
         let bsi = batched[0];
@@ -780,6 +781,7 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
                 sg,
                 sh,
                 nd,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .unwrap_or_else(|e| panic!("per-feature find_best_split failed: {e:?}"));
 
@@ -821,7 +823,7 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
     // i-th per-feature call with the SAME shared totals.
     let (sg, sh, nd) = (8.0f64, 8.0f64, 8i32);
     let multi = backend
-        .find_best_splits_batched(&client, &buf, &feats, &cfg, sg, sh, nd)
+        .find_best_splits_batched(&client, &buf, &feats, &cfg, sg, sh, nd, 0.0f64)
         .unwrap_or_else(|e| panic!("multi-feature batched call failed: {e:?}"));
     assert_eq!(multi.len(), feats.len(), "one SplitInfo per input feature");
     for (i, f) in feats.iter().enumerate() {
@@ -831,6 +833,7 @@ fn kernel_parity_batched_equals_per_feature_on_cpu() {
             .find_best_split(
                 &client, hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
                 f.skip_default_bin, f.na_as_missing, f.run_forward, sg, sh, nd,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .unwrap_or_else(|e| panic!("multi per-feature find_best_split failed: {e:?}"));
         let got = [
@@ -941,6 +944,7 @@ fn kernel_parity_fused_equals_per_feature_and_native() {
         let per = find_best_split_f64_on(
             &client, hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
             f.skip_default_bin, f.na_as_missing, f.run_forward, sg, sh, nd,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .unwrap_or_else(|e| panic!("per-feature find_best_split_f64_on failed: {e:?}"));
 
@@ -948,6 +952,7 @@ fn kernel_parity_fused_equals_per_feature_and_native() {
         let nat = find_best_split_cpu_native(
             hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin, f.skip_default_bin,
             f.na_as_missing, f.run_forward, sg, sh, nd,
+            0.0f64, // parent_output: test default (no path_smooth)
         )
         .unwrap_or_else(|e| panic!("native find_best_split_cpu_native failed: {e:?}"));
 

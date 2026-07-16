@@ -146,6 +146,14 @@ fn adv_constraint_params_parse_with_aliases() {
     assert_eq!(c.cegb_penalty_split, 0.1);
     assert_eq!(c.cegb_penalty_feature_coupled, vec![1.0, 2.0]);
     assert_eq!(c.cegb_penalty_feature_lazy, vec![0.5, 0.5]);
+    // G5-1 feature_contri (config.h:535-539, aliases feature_contrib/fc/fp/
+    // feature_penalty; config_auto.cpp:470 `Common::StringToArray<double>(tmp_str, ',')`
+    // — comma-separated doubles, same parse as the cegb vectors above).
+    let c = Config::from_params(&params(&[("feature_contri", "0.5,1.0")])).unwrap();
+    assert_eq!(c.feature_contri, vec![0.5, 1.0]);
+    // alias `fc`.
+    let c = Config::from_params(&params(&[("fc", "0.0,2.0,1.0")])).unwrap();
+    assert_eq!(c.feature_contri, vec![0.0, 2.0, 1.0]);
 }
 
 #[test]

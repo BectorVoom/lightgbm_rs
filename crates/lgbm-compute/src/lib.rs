@@ -714,6 +714,10 @@ pub trait Backend {
     ///   [`ComputeError::Runtime`] (the NA_AS_MISSING forward branch is deferred
     ///   — never a silent wrong answer).
     /// - `sum_gradient` / `sum_hessian` / `num_data` — the leaf totals.
+    /// - `parent_output` (G5-3) — the SPLITTING leaf's own output (C++
+    ///   `SerialTreeLearner::GetParentOutput` / `LeafSplits::weight()`), read by
+    ///   `path_smooth`'s blend-toward-parent term. Ignored (no-op) when
+    ///   `cfg.path_smooth == 0.0`.
     ///
     /// Returns a [`SplitInfo`]; `gain == f64::NEG_INFINITY` (C++ `kMinScore`)
     /// signals "no valid split found".
@@ -739,6 +743,7 @@ pub trait Backend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<SplitInfo, ComputeError>;
 
     /// Partition a leaf's rows left/right by a feature threshold, mirroring the
@@ -1005,6 +1010,7 @@ pub trait Backend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<Vec<SplitInfo>, ComputeError> {
         let mut out = Vec::with_capacity(feats.len());
         for f in feats {
@@ -1040,6 +1046,7 @@ pub trait Backend {
                 sum_gradient,
                 sum_hessian,
                 num_data,
+                parent_output,
             )?;
             out.push(si);
         }
@@ -2041,6 +2048,7 @@ pub trait Backend {
         _sum_gradient: f64,
         _sum_hessian: f64,
         _num_data: i32,
+        _parent_output: f64,
     ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
         Err(ComputeError::Runtime {
             detail: "build_fix_scan: unified host build+fix+scan not supported on this backend"
@@ -2093,6 +2101,7 @@ pub trait Backend {
         _sum_gradient: f64,
         _sum_hessian: f64,
         _num_data: i32,
+        _parent_output: f64,
     ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
         Err(ComputeError::Runtime {
             detail: "subtract_scan: unified host subtract+scan not supported on this backend"
@@ -2429,6 +2438,7 @@ impl Backend for CpuBackend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<SplitInfo, ComputeError> {
         // Native f64 scan — bit-identical to the single-unit find_best_split_
         // kernel, without the per-(feature,leaf) cubecl launch. The cubecl path
@@ -2440,6 +2450,10 @@ impl Backend for CpuBackend {
         // the DEFAULT path is the unchanged serial source of truth; the 2-lane path
         // is only selected for the explicit A/B measurement. Both paths produce
         // byte-identical SplitInfos (asserted by `split_2lane_equals_serial_*`).
+        // G5-3: `find_best_split_cpu_native_2lane` is OUT of P-4's mandatory-Green
+        // scope and keeps rejecting non-default path_smooth upstream of ever
+        // reading a parent_output value, so `parent_output` is NOT threaded into
+        // it (its signature is unchanged).
         if split_2lane_enabled() {
             kernels::split::find_best_split_cpu_native_2lane(
                 hist,
@@ -2469,6 +2483,7 @@ impl Backend for CpuBackend {
                 sum_gradient,
                 sum_hessian,
                 num_data,
+                parent_output,
             )
         }
     }
@@ -2577,6 +2592,7 @@ impl Backend for CpuBackend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<Vec<SplitInfo>, ComputeError> {
         // Sub-threshold (incl. empty): the trait-default serial loop verbatim —
         // zero behavior change, and the per-feature dispatch overhead that would
@@ -2617,6 +2633,7 @@ impl Backend for CpuBackend {
                     sum_gradient,
                     sum_hessian,
                     num_data,
+                    parent_output,
                 )?;
                 out.push(si);
             }
@@ -2679,6 +2696,7 @@ impl Backend for CpuBackend {
                     sum_gradient,
                     sum_hessian,
                     num_data,
+                    parent_output,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2703,6 +2721,7 @@ impl Backend for CpuBackend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
         self.build_fix_scan_impl(
             client,
@@ -2717,6 +2736,7 @@ impl Backend for CpuBackend {
             sum_gradient,
             sum_hessian,
             num_data,
+            parent_output,
         )
     }
 
@@ -2737,6 +2757,7 @@ impl Backend for CpuBackend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
         self.subtract_scan_impl(
             client,
@@ -2749,6 +2770,7 @@ impl Backend for CpuBackend {
             sum_gradient,
             sum_hessian,
             num_data,
+            parent_output,
         )
     }
 }
@@ -2779,6 +2801,7 @@ impl CpuBackend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
         use rayon::prelude::*;
 
@@ -2882,6 +2905,7 @@ impl CpuBackend {
                             sum_gradient,
                             sum_hessian,
                             num_data,
+                            parent_output,
                         )
                     })?)
                 } else {
@@ -2943,6 +2967,7 @@ impl CpuBackend {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<Vec<Option<SplitInfo>>, ComputeError> {
         use rayon::prelude::*;
 
@@ -3025,6 +3050,7 @@ impl CpuBackend {
                         sum_gradient,
                         sum_hessian,
                         num_data,
+                        parent_output,
                     )?)
                 } else {
                     None
@@ -3506,6 +3532,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
+        parent_output: f64,
     ) -> Result<SplitInfo, ComputeError> {
         kernels::split::find_best_split_f64_on(
             client,
@@ -3521,6 +3548,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             sum_gradient,
             sum_hessian,
             num_data,
+            parent_output,
         )
     }
 
@@ -5031,6 +5059,7 @@ mod build_fix_scan_tests {
             .build_fix_scan(
                 &client, &mut buf, &refs, &leaf_rows, &grads, &hess, &feats, &scan_active, &cfg,
                 sum_g, sum_h, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("unified region");
 
@@ -5046,6 +5075,7 @@ mod build_fix_scan_tests {
                 .find_best_split(
                     &client, &hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
                     f.skip_default_bin, f.na_as_missing, f.run_forward, sum_g, sum_h, num_data,
+                    0.0f64, // parent_output: test default (no path_smooth)
                 )
                 .expect("two-step scan");
             let got = unified[fpos].expect("scan-active feature has a SplitInfo");
@@ -5099,6 +5129,7 @@ mod build_fix_scan_tests {
             .build_fix_scan(
                 &client, &mut got_buf, &refs, &leaf_rows, &grads, &hess, &feats, &scan_active, &cfg,
                 sum_g, sum_h, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("unified region");
 
@@ -5124,6 +5155,7 @@ mod build_fix_scan_tests {
             .build_fix_scan(
                 &client, &mut buf, &refs, &leaf_rows, &grads, &hess, &feats, &scan_active, &cfg,
                 sum_g, sum_h, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("unified region");
         assert!(res[0].is_some(), "feature 0 active -> Some");
@@ -5180,6 +5212,7 @@ mod build_fix_scan_tests {
             .subtract_scan(
                 &client, &parent, &smaller, &mut larger_buf, &feats, &scan_active, &cfg, sum_g,
                 sum_h, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("subtract_scan");
 
@@ -5197,6 +5230,7 @@ mod build_fix_scan_tests {
                 .find_best_split(
                     &client, hist, &cfg, f.num_bin, f.offset, f.default_bin, f.most_freq_bin,
                     f.skip_default_bin, f.na_as_missing, f.run_forward, sum_g, sum_h, num_data,
+                    0.0f64, // parent_output: test default (no path_smooth)
                 )
                 .expect("two-step scan");
             let g = got[fpos].expect("scan-active feature has a SplitInfo");
@@ -5233,6 +5267,7 @@ mod build_fix_scan_tests {
             .subtract_scan(
                 &client, &parent, &smaller, &mut larger_buf, &feats, &scan_active, &cfg, sum_g,
                 sum_h, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect("subtract_scan");
         assert!(res[0].is_some(), "feature 0 active -> Some");
@@ -5262,6 +5297,7 @@ mod build_fix_scan_tests {
             .subtract_scan(
                 &client, &parent, &smaller, &mut larger_buf, &feats, &scan_active, &cfg, sum_g,
                 sum_h, num_data,
+                0.0f64, // parent_output: test default (no path_smooth)
             )
             .expect_err("short larger_buf must error");
         assert!(matches!(err, ComputeError::LengthMismatch { .. }), "got {err:?}");

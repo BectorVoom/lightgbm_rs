@@ -27,6 +27,14 @@ fn representative_defaults_match_cpp() {
 }
 
 #[test]
+fn feature_contri_default_is_empty() {
+    // G5-1: `feature_contri` (config.h:539) default `[]` — an empty vector means
+    // every feature's penalty is implicitly 1.0 (no-op) at the consumer.
+    let c = Config::default();
+    assert_eq!(c.feature_contri, Vec::<f64>::new());
+}
+
+#[test]
 fn string_defaults_match_cpp() {
     let c = Config::default();
     assert_eq!(c.objective, "regression");
