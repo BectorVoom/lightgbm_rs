@@ -729,6 +729,14 @@ impl Booster {
         lgbm_model::model_text::save(&self.model)
     }
 
+    /// Serialize the model to the LightGBM JSON dump (`GBDT::DumpModel`),
+    /// byte-compatible with `lib_lightgbm` 4.6's `LGBM_BoosterDumpModel`.
+    /// Every float uses `%.17g`; a presentation format (no training path).
+    /// Delegates to [`lgbm_model::json::dump_model`].
+    pub fn dump_model(&self) -> String {
+        lgbm_model::json::dump_model(&self.model)
+    }
+
     /// Write the model text to `path`. An I/O failure is mapped to a typed
     /// [`LgbmError::Io`] so the caller never panics.
     ///
@@ -2202,6 +2210,19 @@ mod tests {
             .build()
             .unwrap();
         train(&cfg, &spine_corpus()).expect("train ok")
+    }
+
+    #[test]
+    fn dump_model_facade_matches_module() {
+        let booster = trained_spine();
+        // Pure orchestration: the facade returns exactly the module output over
+        // the booster's model (no recomputation), and is a well-formed JSON dump.
+        assert_eq!(
+            booster.dump_model(),
+            lgbm_model::json::dump_model(booster.model())
+        );
+        assert!(booster.dump_model().starts_with("{\"name\":\"tree\","));
+        assert!(booster.dump_model().contains("\"tree_info\":["));
     }
 
     #[test]

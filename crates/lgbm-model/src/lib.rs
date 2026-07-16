@@ -22,6 +22,7 @@
 pub mod ensemble;
 pub mod error;
 pub mod format;
+pub mod json;
 pub mod model_text;
 pub mod objective;
 pub mod predict;
