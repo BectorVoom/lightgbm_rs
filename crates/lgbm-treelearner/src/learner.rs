@@ -34,7 +34,6 @@
 
 use std::sync::Arc;
 
-use lgbm_compute::error::ComputeError;
 use lgbm_compute::gain::{calculate_splitted_leaf_output, GainConfig};
 use lgbm_compute::{Backend, BatchedSplitFeature};
 pub use lgbm_compute::BinColumn;
@@ -176,15 +175,21 @@ impl FeatureColumn {
     }
 
     /// The authoritative C++ FORWARD-branch dispatch flag
-    /// (`feature_histogram.hpp:420-429`). LightGBM dispatches BOTH the REVERSE and
-    /// FORWARD `FindBestThresholdSequentially` ONLY for
-    /// `num_bin > 2 && missing_type == Zero`; for `missing_type == None` (and
-    /// `num_bin <= 2`) it runs the REVERSE branch ONLY, so `FindBestThreshold:170`'s
-    /// pre-set `default_left = true` survives → `decision_type == 2`. This is a
-    /// verbatim transcription of that truth table (it equals `skip_default_bin()`
-    /// here; the deferred NaN case is a typed error before this is reached).
+    /// (`feature_histogram.hpp:396-441`, verified against the checked-out 4.6
+    /// tree). LightGBM dispatches BOTH the REVERSE and FORWARD
+    /// `FindBestThresholdSequentially` for `num_bin > 2 && missing_type != None`
+    /// — i.e. for BOTH `missing_type == Zero` (SKIP_DEFAULT_BIN=true,
+    /// NA_AS_MISSING=false) AND `missing_type == NaN` (SKIP_DEFAULT_BIN=false,
+    /// NA_AS_MISSING=true, `feature_histogram.hpp:408-418`); for
+    /// `missing_type == None` (and `num_bin <= 2`) it runs the REVERSE branch
+    /// ONLY, so `FindBestThreshold:170`'s pre-set `default_left = true` survives
+    /// → `decision_type == 2`. Was previously gated to `missing_type == Zero`
+    /// only (a bug — checker Issue 2): with `run_forward == false` for a NaN
+    /// feature, `find_best_split`'s FORWARD pass never ran (`fwd_count = 0`),
+    /// so a `na_as_missing` feature was scanned REVERSE-only and could pick the
+    /// wrong split. Fixed to the verbatim `missing_type != None` truth table.
     fn run_forward(&self) -> bool {
-        self.num_bin > 2 && self.missing_type == MissingType::Zero
+        self.num_bin > 2 && self.missing_type != MissingType::None
     }
 
     /// The real-value threshold a split at `threshold_bin` records on the tree
@@ -1110,15 +1115,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         num_bin: f.num_bin,
                     });
                 }
-                if f.na_as_missing() {
-                    // NA_AS_MISSING forward branch deferred — surface the
-                    // compute layer's typed error rather than silently mis-routing.
-                    return Err(TreeLearnerError::Compute(ComputeError::Runtime {
-                        detail: "train: na_as_missing feature (num_bin>2 && missing_type==NaN) \
-                                 is deferred (NA_AS_MISSING forward branch not implemented)"
-                            .to_string(),
-                    }));
-                }
+                // T-G4-3 (SPEC-G4-3): the NA_AS_MISSING typed-error gate that
+                // used to live here is removed — T-G4-1 (histogram-scan fold,
+                // `find_best_split_cpu_native`/`find_best_split_f64_on`) and
+                // T-G4-2 (partition routing, `DataPartition::split`) now
+                // correctly admit and compute `na_as_missing` features.
             }
             // The full feature set validated cleanly — memoize so trees 2+ over the
             // SAME feature set skip the scan. Reset on every `self.features =`
@@ -3712,6 +3713,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // raw min_bin for offset==0). max_bin / most_freq_bin are unchanged; the
         // partition `--th` body stays verbatim.
         let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
+        // T-G4-2 (SPEC-G4-2): NA rows on an `na_as_missing` feature route down
+        // the winning split's default branch (`best.default_left`) — the SAME
+        // direction the histogram scan (T-G4-1) already attributed the missing
+        // bin to for the winning candidate.
         data_partition.split(
             self.backend,
             self.client,
@@ -3723,6 +3728,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             f.max_bin,
             best.threshold,
             f.most_freq_bin,
+            f.na_as_missing(),
+            best.default_left,
         )?;
 
         // Grow the node. split_gain stores best.gain + min_gain_to_split (added
@@ -4798,7 +4805,7 @@ mod tests {
         let (lc, rc) = part
             .split(
                 &backend, &client, 0, 1, &f.bins, f.num_bin, f.min_bin, f.max_bin,
-                /*threshold*/ 1, f.most_freq_bin,
+                /*threshold*/ 1, f.most_freq_bin, false, false,
             )
             .expect("partition split ok");
         // The exact split counts depend on the partition's threshold convention;
@@ -4860,7 +4867,7 @@ mod tests {
         let (lc, rc) = part
             .split(
                 &backend, &client, 0, 1, &f.bins, f.num_bin, f.min_bin, f.max_bin, 1,
-                f.most_freq_bin,
+                f.most_freq_bin, false, false,
             )
             .expect("partition split ok");
         assert!(lc > 0 && rc > 0);
@@ -4975,7 +4982,12 @@ mod tests {
             .expect_err("num_leaves < 1 must be a typed error");
         assert!(matches!(err3, TreeLearnerError::InvalidNumLeaves { .. }));
 
-        // (d) na_as_missing feature is the deferred typed error.
+        // (d) UPDATED (T-G4-3, was ".expect_err(...)"): na_as_missing training
+        // now SUCCEEDS (SPEC-G4-3 — the typed-error gate is removed once T-G4-1
+        // (histogram-scan fold) and T-G4-2 (partition routing) are correct).
+        // `splittable_feature()`'s corpus already has 2 rows at bin=3 (the
+        // NaN sentinel, `num_bin-1`); reinterpreting `missing_type=NaN` makes
+        // this a genuine `na_as_missing` feature (`num_bin>2 && NaN`).
         let na_feat = FeatureColumn {
             num_bin: 4,
             missing_type: MissingType::NaN,
@@ -4983,10 +4995,14 @@ mod tests {
         };
         let mut learner4 = SerialTreeLearner::new(&backend, &client, relaxed_cfg(), 8, -1)
             .with_features(vec![na_feat]);
-        let err4 = learner4
+        let tree4 = learner4
             .train(&g, &vec![1.0f32; 8], true)
-            .expect_err("na_as_missing is deferred -> typed error");
-        assert!(matches!(err4, TreeLearnerError::Compute(_)));
+            .expect("na_as_missing training must now succeed (T-G4-3)");
+        assert!(
+            tree4.num_leaves >= 2,
+            "a real split must have grown on the na_as_missing feature, got num_leaves={}",
+            tree4.num_leaves
+        );
     }
 
     /// Conservation: left_count + right_count of the root split == num_data, and
