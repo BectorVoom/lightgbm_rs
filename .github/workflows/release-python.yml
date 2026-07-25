@@ -18,8 +18,7 @@
 #        Workflow: release-python.yml   Environment: pypi
 #   3. (Recommended) Create a GitHub Environment named `pypi` on the repo.
 #
-# The default CPU-only wheel is built. GPU wheels (--features cuda/rocm/wgpu) need a
-# matching toolkit/hardware and are intentionally NOT part of this release pipeline.
+# Both default CPU-only wheel and AMD ROCm GPU wheel (--features rocm) are built and published.
 name: Release Python package
 
 on:
@@ -60,6 +59,28 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-x86_64
+          path: dist
+
+  linux-rocm:
+    name: Build ROCm wheel (linux, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build ROCm wheels (manylinux_2_34, x86_64)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: "2_34"
+          rust-toolchain: "1.95.0"
+          before-script-linux: "pip install patchelf"
+          args: --release --features rocm --out dist ${{ env.MANIFEST }}
+          sccache: "true"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-rocm-x86_64
           path: dist
 
   macos:
@@ -124,7 +145,7 @@ jobs:
   release:
     name: Publish to PyPI
     runs-on: ubuntu-latest
-    needs: [linux, macos, windows, sdist]
+    needs: [linux, linux-rocm, macos, windows, sdist]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     environment: pypi
     permissions:
