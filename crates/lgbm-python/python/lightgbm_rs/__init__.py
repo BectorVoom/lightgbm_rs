@@ -7,8 +7,27 @@ LightGBM code can switch ``import lightgbm`` -> ``import lightgbm_rs`` for the
 in-scope APIs.
 """
 
-from ._core import Booster, Dataset, LightGBMError
-from ._core import train as _core_train
+try:
+    from ._core import Booster, Dataset, LightGBMError
+    from ._core import train as _core_train
+except ImportError as _exc:
+    if "cannot allocate memory in static TLS block" in str(_exc):
+        raise ImportError(
+            f"{_exc}\n\n"
+            "This is glibc's static-TLS-surplus limit being exceeded when "
+            "loading _core.abi3.so (it embeds LLVM, for the cubecl-cpu JIT "
+            "backend, which declares many thread_local variables) via "
+            "Python's dlopen(). It is not specific to any one Python version "
+            "-- it depends on your glibc build and what else is already "
+            "loaded in the process.\n"
+            "Workaround (glibc >= 2.35): set the static TLS surplus before "
+            "starting Python, e.g.:\n"
+            "    GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 python ...\n"
+            "or export it in your shell profile. See "
+            "https://sourceware.org/glibc/wiki/DebuggingDynamicLinker for more "
+            "on this glibc limit."
+        ) from _exc
+    raise
 from .callback import (
     CallbackEnv,
     EarlyStopException,

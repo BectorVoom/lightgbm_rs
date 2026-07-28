@@ -32,3 +32,25 @@ maturin develop --release   # inside this directory, into your active venv
 
 See the workspace root for the full project, license, and the numerical-parity
 contract.
+
+## Known issue: `ImportError: cannot allocate memory in static TLS block`
+
+`_core.abi3.so` embeds LLVM (used by the cubecl-cpu JIT backend), which
+declares many `thread_local` globals. On some glibc builds this exceeds the
+small "static TLS surplus" glibc reserves for shared objects loaded late via
+`dlopen()` (which is how Python imports extension modules), and the import
+fails with this error. It depends on your glibc version and what else is
+already loaded in the process — it is **not** tied to any specific Python
+version (reproduces on 3.13 and 3.14 alike on a recent glibc; the package's
+0.0.5 release predates the embedded-LLVM backend and is unaffected).
+
+Confirmed workaround (glibc >= 2.35, i.e. most current distros): raise the
+static TLS surplus before starting Python:
+
+```bash
+GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 python -c "import lightgbm_rs"
+```
+
+or export `GLIBC_TUNABLES` in your shell profile / the environment your
+process runs in. `2048` was sufficient in testing; `4096` leaves headroom.
+The import error message includes this same guidance.
