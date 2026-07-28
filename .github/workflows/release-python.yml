@@ -69,6 +69,17 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Tag ROCm build with a +rocm local version segment
+        # maturin derives the wheel's version (and filename) from this
+        # crate's Cargo.toml (pyproject.toml declares `dynamic = ["version"]`).
+        # Without a distinguishing segment, this job and the `linux` job both
+        # produce a wheel named identically
+        # (lightgbm_rs-X.Y.Z-cp311-abi3-manylinux_2_34_x86_64.whl), and the
+        # release job's `merge-multiple` artifact download silently clobbers
+        # one with the other, corrupting the ZIP that gets uploaded to PyPI.
+        # Appending `+rocm` (a valid PEP 440 local version label) gives the
+        # ROCm wheel a distinct filename so both survive the merge intact.
+        run: sed -i 's/^version = "\(.*\)"/version = "\1+rocm"/' crates/lgbm-python/Cargo.toml
       - name: Build ROCm wheels (manylinux_2_34, x86_64)
         uses: PyO3/maturin-action@v1
         with:
