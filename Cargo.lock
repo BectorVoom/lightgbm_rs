@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "lgbm-python"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "lgbm",
  "lgbm-core",
