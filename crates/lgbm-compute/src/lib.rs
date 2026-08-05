@@ -262,7 +262,14 @@ fn build_histograms_into(
     ord_g: &[f32],
     ord_h: &[f32],
     parallel: bool,
+    used: Option<&[bool]>,
 ) -> Vec<f64> {
+    // `used` is the C++ `is_feature_used` build mask (`serial_tree_learner.cpp:387-397`
+    // = `is_feature_used_bytree` ∧ parent-splittable). A masked-out feature's region is
+    // left ZEROED — never folded and never read: every consumer (both siblings' scans,
+    // and the subtract-derived larger child) gates on a SUBSET of this same mask.
+    // `None` ⇒ build every feature (the spine default, byte-unchanged).
+    let is_used = |fpos: usize| used.is_none_or(|m| m.get(fpos).copied().unwrap_or(true));
     let mut out = vec![0.0f64; slot_len];
     if parallel {
         use rayon::prelude::*;
@@ -273,21 +280,29 @@ fn build_histograms_into(
         // sub-slices of one shared `out`) measured worse due to cache-coherence /
         // false-sharing traffic exceeding the alloc+copy it would remove. Keep the
         // private accumulators.
-        let hists: Vec<Vec<f64>> = (0..feature_bins.len())
+        //
+        // Masked-out features are filtered BEFORE the par_iter so they cost no rayon
+        // task at all (the point of the mask is to not do the work).
+        let hists: Vec<(usize, Vec<f64>)> = (0..feature_bins.len())
+            .filter(|&fpos| is_used(fpos))
+            .collect::<Vec<_>>()
             .into_par_iter()
             .map(|fpos| {
                 let mut h = vec![0.0f64; 2 * num_bins[fpos] as usize];
                 fold_one_feature(feature_bins[fpos], leaf_rows, ord_g, ord_h, &mut h);
-                h
+                (fpos, h)
             })
             .collect();
-        for (fpos, h) in hists.into_iter().enumerate() {
+        for (fpos, h) in hists {
             out[slot_off[fpos]..slot_off[fpos] + h.len()].copy_from_slice(&h);
         }
     } else {
         let max_cells = num_bins.iter().copied().max().map_or(0, |m| 2 * m as usize);
         let mut scratch = vec![0.0f64; max_cells];
         for (fpos, &bins) in feature_bins.iter().enumerate() {
+            if !is_used(fpos) {
+                continue;
+            }
             let cells = 2 * num_bins[fpos] as usize;
             for c in scratch[..cells].iter_mut() {
                 *c = 0.0;
@@ -307,7 +322,21 @@ fn par_build_threshold() -> usize {
     std::env::var("LGBM_PAR_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(16384)
+        // 16384 was too high: with `num_leaves=31` over 200k rows the AVERAGE leaf
+        // holds ~6.5k rows, so nearly every non-root build fell to the serial path
+        // and the 8-core run scaled only 1.64x over 1-core.
+        //
+        // Measured 2026-08-05 (200k x 50, binary, 100 iters, 8 rayon threads,
+        // warm median of 3, fusion disabled) — train wall by threshold:
+        //   16384 -> 2457ms   4096 -> 2236ms   1024 -> 2121ms
+        //     256 -> 2086ms     64 -> 2102ms      0 -> 2031ms
+        // Monotone down to ~256 then flat-to-noisy. 1024 is chosen over 0 as the
+        // conservative point: it captures most of the win (14%) while still keeping
+        // genuinely tiny leaves serial, so a box with higher rayon dispatch cost
+        // than this one cannot regress on small trains. Parity-neutral — the
+        // parallel and serial paths fold in the SAME order into disjoint regions
+        // (`build_histograms_parallel_equals_serial`).
+        .unwrap_or(1024)
 }
 
 /// The feature-count at/above which a per-leaf SPLIT SCAN parallelizes across
@@ -343,17 +372,20 @@ fn par_scan_threshold() -> usize {
 /// drive the gate so low it parallelizes a trivially-narrow leaf (narrow leaves regress
 /// badly under fork/join overhead). 32 = the lowest feature count measurement found a
 /// sign-stable win at.
+#[cfg_attr(not(test), allow(dead_code))]
 const THRESHOLD_FLOOR: usize = 32;
 
 /// Ceiling for a core-scaled unified-fusion threshold: never let a 1–2 core machine
 /// drive the gate so high it effectively disables the fusion forever. 256 sits just
 /// above the highest measured crossover.
+#[cfg_attr(not(test), allow(dead_code))]
 const THRESHOLD_CEILING: usize = 256;
 
 /// Slope of the additive-log core-scaling, in feature-counts per doubling of cores.
 /// Fitted to the measured BFS crossover deltas (≈30 at 2 cores → ≈80 at 16 cores over
 /// log2-span 3 ⇒ ≈17 per log2 step). Applied to BOTH anchors so the relative shape is
 /// shared; the per-anchor offset (100 vs 130) shifts the whole curve.
+#[cfg_attr(not(test), allow(dead_code))]
 const THRESHOLD_LOG2_SLOPE: f64 = 17.0;
 
 /// The rayon global-pool size, queried EXACTLY ONCE. The unified
@@ -367,6 +399,7 @@ const THRESHOLD_LOG2_SLOPE: f64 = 17.0;
 /// production default agree. `available_parallelism` reports the hardware count and would
 /// DIVERGE from the pool whenever `RAYON_NUM_THREADS` is set — silently breaking that
 /// agreement.
+#[cfg_attr(not(test), allow(dead_code))]
 fn rayon_cores() -> usize {
     use std::sync::OnceLock;
     static CORES: OnceLock<usize> = OnceLock::new();
@@ -394,6 +427,7 @@ fn rayon_cores() -> usize {
 /// rayon pool on a 16-core box, which isolates parallelism but NOT a real low-core
 /// machine's smaller cache / lower bandwidth — so off-16 it is a heuristic, and the
 /// `LGBM_UNIFIED_*` env overrides remain the escape hatch.
+#[cfg_attr(not(test), allow(dead_code))]
 fn core_scaled_threshold(anchor_at_16: usize, cores: usize) -> usize {
     let cores = cores.max(1) as f64;
     // log2(16/cores): +ve below 16 cores (lower threshold), 0 at 16, −ve above (higher).
@@ -438,7 +472,23 @@ pub fn unified_bfs_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_BFS_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| core_scaled_threshold(100, rayon_cores()))
+        // DISABLED BY DEFAULT — the fused path is INCORRECT, not merely slower.
+        //
+        // Measured 2026-08-05 on 200k x 50 continuous features, binary objective,
+        // 100 iterations: with the fusion engaged the run produces SIX trees
+        // instead of 100, first-tree split gains of ~4.9e8 instead of ~1.0e4, and
+        // predictions that overflow to ~3.4e38. The two-step path on the same
+        // inputs produces the correct 100-tree model. Because the old default was
+        // `core_scaled_threshold(100, cores)` the gate FIRED only on machines with
+        // few rayon threads (<= 2 cores ⇒ threshold 32..49), so the same build
+        // silently trained a BROKEN model on a small box and a correct one on a
+        // large box — a thread-count-dependent model.
+        //
+        // `usize::MAX` keeps the path env-reachable (`LGBM_UNIFIED_BFS_THRESHOLD=0`)
+        // for debugging the defect, but never selects it. Re-enable ONLY once a
+        // parity test pins the fused output against the two-step output; see the
+        // regression test `unified_fusion_defaults_are_disabled`.
+        .unwrap_or(usize::MAX)
 }
 
 /// The feature-count at/above which the subtract-derived (larger / use_subtract) child's
@@ -473,7 +523,11 @@ pub fn unified_subscan_threshold() -> usize {
     std::env::var("LGBM_UNIFIED_SUBSCAN_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| core_scaled_threshold(130, rayon_cores()))
+        // DISABLED BY DEFAULT for the same reason as [`unified_bfs_threshold`] —
+        // the two fusions were measured together and the broken output could not be
+        // attributed to one of them alone, so both are off until the defect is
+        // isolated. Env-reachable for that investigation.
+        .unwrap_or(usize::MAX)
 }
 
 /// The compute backend seam.
@@ -888,6 +942,26 @@ pub trait Backend {
     /// compaction stay in the caller (they read per-leaf sums + the compaction
     /// offset), applied to each feature's region of the returned RAW buffer.
     ///
+    /// # The `used` build mask (`feature_fraction`)
+    ///
+    /// `used[fpos] == false` SKIPS feature `fpos` entirely — no gather, no fold, no
+    /// rayon task — and leaves its output region ZEROED. This is the C++
+    /// `is_feature_used` gate that `ConstructHistograms` receives
+    /// (`serial_tree_learner.cpp:387-400`), namely
+    /// `is_feature_used_bytree(f) ∧ parent_histogram[f].is_splittable()`.
+    ///
+    /// It deliberately does NOT include the per-node `feature_fraction_bynode` draw:
+    /// C++ builds and scans every bytree-selected feature and applies the bynode mask
+    /// only to the final split argmax (`ComputeBestSplitForFeature`'s
+    /// `if (new_split > *best_split && is_feature_used)`). Folding bynode into the
+    /// BUILD would be wrong — the subtract-derived sibling draws a DIFFERENT bynode
+    /// mask, so a feature skipped for one child can still be needed by the other.
+    ///
+    /// Skipping is safe precisely because every consumer of the buffer gates on a
+    /// SUBSET of this mask: both siblings' scans intersect it with their own bynode
+    /// draw, and the subtract-derived larger child reads only what its own scan
+    /// gates. `None` ⇒ build every feature (the spine default, byte-unchanged).
+    ///
     /// # Bin-range precondition (V5)
     /// The hot fold below is **branchless**: it reads `bins[row]` and folds it into
     /// `scratch[bin*2 (+1)]` with NO per-element `bin < num_bin` check. This is a
@@ -924,6 +998,7 @@ pub trait Backend {
         leaf_rows: &[u32],
         gradients: &[f32],
         hessians: &[f32],
+        used: Option<&[bool]>,
     ) -> Result<Vec<f64>, ComputeError> {
         // Gather the ordered gradients/hessians ONCE per leaf — they are
         // identical across every feature (only the bin column differs), so a
@@ -962,7 +1037,7 @@ pub trait Backend {
         // regressed small trains significantly on rayon dispatch overhead.
         let parallel = r >= par_build_threshold();
         let out = build_histograms_into(
-            feature_bins, num_bins, slot_off, slot_len, leaf_rows, &ord_g, &ord_h, parallel,
+            feature_bins, num_bins, slot_off, slot_len, leaf_rows, &ord_g, &ord_h, parallel, used,
         );
         Ok(out)
     }
@@ -4550,11 +4625,44 @@ mod par_build_tests {
         let ord_h: Vec<f32> = (0..rows).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
         let refs: Vec<&BinColumn> = cols.iter().collect();
 
-        let serial = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, false);
-        let parallel = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, true);
+        let serial = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, false, None);
+        let parallel = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, true, None);
         assert_eq!(serial.len(), parallel.len());
         for (i, (s, p)) in serial.iter().zip(&parallel).enumerate() {
             assert_eq!(s.to_bits(), p.to_bits(), "cell {i}: serial {s} != parallel {p} (not bit-identical)");
+        }
+
+        // ---- The `feature_fraction` build mask (C++ `is_feature_used`) ----
+        // A masked build must be BIT-IDENTICAL to the unmasked build on every
+        // selected feature's region and exactly ZERO elsewhere — i.e. the mask
+        // removes work without perturbing a single retained cell. This is what makes
+        // skipping the build safe: the scan's own (subset) mask can only ever read
+        // regions this build actually wrote.
+        let used: Vec<bool> = (0..refs.len()).map(|f| f % 2 == 0).collect();
+        for &par in &[false, true] {
+            let masked = build_histograms_into(
+                &refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, par, Some(&used),
+            );
+            for fpos in 0..refs.len() {
+                let cells = 2 * num_bins[fpos] as usize;
+                let range = slot_off[fpos]..slot_off[fpos] + cells;
+                if used[fpos] {
+                    for i in range {
+                        assert_eq!(
+                            masked[i].to_bits(),
+                            serial[i].to_bits(),
+                            "parallel={par} feature {fpos} cell {i}: masked build perturbed a SELECTED cell"
+                        );
+                    }
+                } else {
+                    for i in range {
+                        assert_eq!(
+                            masked[i], 0.0,
+                            "parallel={par} feature {fpos} cell {i}: skipped region must stay zeroed"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -4843,7 +4951,7 @@ mod build_fix_scan_tests {
         // Two-step reference buffer: batched raw build, then per-feature fix+compact.
         let mut want_buf = backend
             .build_leaf_histograms_raw(
-                &client, &refs, &num_bins, &slot_off, slot_len, &leaf_rows, &grads, &hess,
+                &client, &refs, &num_bins, &slot_off, slot_len, &leaf_rows, &grads, &hess, None,
             )
             .expect("raw build");
         for (fpos, f) in feats.iter().enumerate() {
@@ -5215,11 +5323,43 @@ mod core_scaled_threshold_tests {
             std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
             std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
         }
-        // With env cleared, the derived default is in the sane clamp band.
-        let b = unified_bfs_threshold();
-        let s = unified_subscan_threshold();
-        assert!((THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&b));
-        assert!((THRESHOLD_FLOOR..=THRESHOLD_CEILING).contains(&s));
+        // With env cleared, BOTH fusions are DISABLED (see below).
+        assert_eq!(unified_bfs_threshold(), usize::MAX);
+        assert_eq!(unified_subscan_threshold(), usize::MAX);
+    }
+
+    /// REGRESSION GATE for the unified-fusion defect (found 2026-08-05).
+    ///
+    /// The fused build+fix+scan path produces a STRUCTURALLY WRONG model — on
+    /// 200k x 50 continuous features it yielded 6 trees instead of 100, split gains
+    /// ~4.9e8 instead of ~1.0e4, and predictions overflowing to ~3.4e38. The old
+    /// `core_scaled_threshold` default made the gate fire only on machines with few
+    /// rayon threads, so the SAME build trained a broken model on a small box and a
+    /// correct one on a large box.
+    ///
+    /// Both gates must therefore default to "never fires". Re-enabling either one
+    /// requires a parity test pinning the fused output against the two-step output;
+    /// this assertion is what forces that conversation.
+    #[test]
+    fn unified_fusion_defaults_are_disabled() {
+        // Guard against a stale env leaking in from another test in this binary.
+        unsafe {
+            std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
+            std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
+        }
+        assert_eq!(
+            unified_bfs_threshold(),
+            usize::MAX,
+            "the unified BFS fusion is DEFECTIVE and must stay disabled by default"
+        );
+        assert_eq!(
+            unified_subscan_threshold(),
+            usize::MAX,
+            "the unified subscan fusion must stay disabled by default"
+        );
+        // The clamp band constants stay referenced so the (still env-reachable)
+        // core-scaling helper keeps its coverage.
+        assert!(THRESHOLD_FLOOR < THRESHOLD_CEILING);
     }
 }
 

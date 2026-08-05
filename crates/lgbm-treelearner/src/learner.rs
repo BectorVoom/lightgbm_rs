@@ -205,6 +205,11 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     backend: &'b B,
     client: &'b ComputeClient<B::Runtime>,
     cfg: GainConfig,
+    /// `config.histogram_pool_size` (MB) — the histogram-pool memory budget that
+    /// sizes the LRU slot count (`serial_tree_learner.cpp:34-47`). `-1` (the C++
+    /// default) means unbounded: one slot per leaf. Parity-neutral: a smaller pool
+    /// only evicts and recomputes more, it never changes a histogram.
+    histogram_pool_size: f64,
     num_leaves: i32,
     max_depth: i32,
     /// The spine's per-feature columns (set via [`with_features`](Self::with_features)).
@@ -396,6 +401,15 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// Lazily built on the first tree (survives `with_features`); rebuilt only if the
     /// geometry ever changes. Bit-exact (same slot semantics as within-tree reuse).
     hist_pool: Option<HistogramPool>,
+    /// The `ColSampler` PERSISTED ACROSS TREES, mirroring C++ `SerialTreeLearner`'s
+    /// `ColSampler col_sampler_` member (`serial_tree_learner.h:234`), which is
+    /// constructed ONCE with `random_(feature_fraction_seed)` and re-drawn per tree by
+    /// `BeforeTrain`'s `col_sampler_.ResetByTree()` (`serial_tree_learner.cpp:293`).
+    ///
+    /// Constructing a FRESH sampler per tree (the previous behavior) re-seeded the
+    /// PRNG every tree, so every tree selected the SAME `feature_fraction` subset
+    /// instead of advancing through the stream — a silent parity break against C++.
+    col_sampler_cache: Option<ColSampler>,
 }
 
 /// Advanced learner constraints — the inactive `Default` is the
@@ -424,9 +438,39 @@ pub struct LearnerConstraints {
     pub cegb_penalty_feature_coupled: Vec<f64>,
     /// Per-feature lazy penalty.
     pub cegb_penalty_feature_lazy: Vec<f64>,
+    /// `config.feature_contri` — per-feature split-gain MULTIPLIER, indexed by
+    /// REAL feature index (`FeatureMetainfo::penalty`, feature_histogram.hpp:1445).
+    /// Empty ⇒ the C++ `penalty = 1.0` default (no multiply at all).
+    pub feature_contri: Vec<f64>,
     /// A pre-parsed forced-split tree (from `forced_splits_filename`
     /// JSON). `None` ⇒ no forced split (the spine path).
     pub forced_splits: Option<crate::forced_splits::ForcedSplitNode>,
+}
+
+impl LearnerConstraints {
+    /// Build the learner's constraint/penalty bundle from a [`lgbm_core::Config`]
+    /// — the single production seam that carries the per-feature C++ knobs
+    /// (`monotone_constraints`, `interaction_constraints`, `cegb_*`,
+    /// `feature_contri`, `extra_trees`) from the config bag into the tree learner.
+    ///
+    /// `forced_splits` is NOT loaded here: `forcedsplits_filename` names a file,
+    /// and this is a pure (no-I/O) conversion. The facade reads and parses that
+    /// file, then assigns [`Self::forced_splits`].
+    pub fn from_config(config: &lgbm_core::Config) -> Self {
+        Self {
+            monotone_constraints: config.monotone_constraints.clone(),
+            monotone_penalty: config.monotone_penalty,
+            interaction_constraints: config.interaction_constraints_vector(),
+            extra_trees: config.extra_trees,
+            extra_seed: config.extra_seed,
+            cegb_tradeoff: config.cegb_tradeoff,
+            cegb_penalty_split: config.cegb_penalty_split,
+            cegb_penalty_feature_coupled: config.cegb_penalty_feature_coupled.clone(),
+            cegb_penalty_feature_lazy: config.cegb_penalty_feature_lazy.clone(),
+            feature_contri: config.feature_contri.clone(),
+            forced_splits: None,
+        }
+    }
 }
 
 
@@ -584,6 +628,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             subtract_audit: None,
             best_cat_threshold: std::cell::RefCell::new(Vec::new()),
             constraints: LearnerConstraints::default(),
+            histogram_pool_size: -1.0,
             monotone: std::cell::RefCell::new(None),
             cegb: std::cell::RefCell::new(None),
             branch_features: std::cell::RefCell::new(Vec::new()),
@@ -624,6 +669,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             build_num_bins: std::cell::RefCell::new(Vec::new()),
             // Built lazily on the first tree, reused across all trees.
             hist_pool: None,
+            col_sampler_cache: None,
         }
     }
 
@@ -1099,13 +1145,37 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // valid — no trivial-feature dropping at this layer); InnerFeatureIndex is
         // the identity.
         let valid_feature_indices: Vec<i32> = features.iter().map(|f| f.real_feature_index).collect();
-        let mut col_sampler = self.col_sampling.map(|(ff, ffn, seed)| {
-            // num_features here is the COUNT of feature columns; is_feature_used_ is
-            // indexed by real_feature_index, so size it to cover the max index + 1.
-            let max_real = valid_feature_indices.iter().copied().max().unwrap_or(-1);
-            let nf = (max_real + 1).max(num_features as i32) as usize;
-            ColSampler::new(ff, ffn, seed, valid_feature_indices.clone(), nf)
-        });
+        // C++ keeps ONE `col_sampler_` for the whole train and draws from its seeded
+        // PRNG TWICE before the first tree is grown, then once per tree after:
+        //
+        //   `SetTrainingData()` ends with `ResetByTree()`  (col_sampler.hpp:51),
+        //     called once at learner Init (serial_tree_learner.cpp:59)   → draw 1
+        //   `BeforeTrain()` calls `ResetByTree()` per tree (…cpp:293)    → draw 2 (tree 0)
+        //                                                                  draw 3 (tree 1) …
+        //
+        // so C++ tree N uses draw N+2. `ColSampler::new` performs the Init draw
+        // (`SetTrainingData`'s), and the per-tree `reset_by_tree()` below performs
+        // `BeforeTrain`'s — INCLUDING on the first tree, which is what puts Rust on the
+        // same draw as C++.
+        //
+        // Two bugs lived here before: the sampler was rebuilt per tree (re-seeding the
+        // PRNG, so every tree drew the SAME subset), and the first tree consumed the
+        // Init draw instead of `BeforeTrain`'s (shifting every tree's subset by one).
+        let mut col_sampler = match (self.col_sampler_cache.take(), self.col_sampling) {
+            (cached, Some((ff, ffn, seed))) => {
+                let mut cs = cached.unwrap_or_else(|| {
+                    // num_features here is the COUNT of feature columns; is_feature_used_
+                    // is indexed by real_feature_index, so size it to cover max index + 1.
+                    let max_real = valid_feature_indices.iter().copied().max().unwrap_or(-1);
+                    let nf = (max_real + 1).max(num_features as i32) as usize;
+                    ColSampler::new(ff, ffn, seed, valid_feature_indices.clone(), nf)
+                });
+                cs.reset_by_tree();
+                Some(cs)
+            }
+            // Sampling disabled (or disabled after having been enabled): drop any cache.
+            (_, None) => None,
+        };
         // Record the per-tree selection (ResetByTree result) for the TRL-08 golden.
         if let Some(cs) = col_sampler.as_ref() {
             trace.bytree_selected = valid_feature_indices
@@ -1168,10 +1238,23 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // tree's contents but every slot is fully overwritten before any read
         // (see `build_leaf_histogram_into`'s full zero+fill and the subtract path's
         // copy_from_slice), so this is bit-exact with a fresh pool.
-        let want_cache = self.num_leaves.max(1) as usize;
+        // `histogram_pool_size` (MB) caps the number of physical slots; the C++
+        // default (-1) means "one slot per leaf". A smaller pool only forces more
+        // LRU evictions (recompute), never a different histogram, so this is
+        // parity-neutral — it trades speed for memory exactly as C++ does.
+        let total_num_bins: usize = self.features.iter().map(|f| f.num_bin as usize).sum();
+        let fresh = || {
+            HistogramPool::with_pool_size(
+                self.num_leaves,
+                slot_len,
+                self.histogram_pool_size,
+                total_num_bins,
+            )
+        };
+        let want_cache = fresh().cache_size();
         let mut pool = match self.hist_pool.take() {
             Some(p) if p.cache_size() == want_cache && p.hist_len() == slot_len => p,
-            _ => HistogramPool::new(self.num_leaves, slot_len),
+            _ => fresh(),
         };
         pool.reset_map();
         // When eligible, reset the device-handle slot mirror alongside the
@@ -1421,6 +1504,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // Hand the pool back for the next tree to reuse (the per-tree
         // alloc+zero+page-fault is paid once per train, not once per tree).
         self.hist_pool = Some(pool);
+        // Hand the col-sampler back too, so the NEXT tree's `reset_by_tree()` advances
+        // the same PRNG stream instead of restarting it (C++ `col_sampler_` is a
+        // learner member for exactly this reason).
+        self.col_sampler_cache = col_sampler;
         Ok((tree, snapshots, trace, data_partition))
     }
 
@@ -1586,6 +1673,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 leaf,
                 &leaf_splits,
                 pool.buffer_mut(slot),
+                // The forced-split path has no col-sampler/parent context in scope;
+                // build every feature exactly as before (byte-unchanged).
+                None,
             );
             let fpos = features
                 .iter()
@@ -1788,6 +1878,18 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             None
         };
 
+        // The per-TREE `is_feature_used_bytree` flags (`feature_fraction`), read out
+        // HERE because `col_sampler` is an `Option<&mut ColSampler>` that the GetByNode
+        // draw block below consumes. Read-only: this is the tree-level draw made once
+        // in `ResetByTree`, not a per-node draw, so reading it early cannot perturb the
+        // RNG call sequence the bynode goldens pin.
+        let bytree_used: Option<Vec<bool>> = col_sampler.as_ref().map(|cs| {
+            features
+                .iter()
+                .map(|f| cs.is_feature_used_bytree(f.real_feature_index))
+                .collect()
+        });
+
         // ColSampler.GetByNode draw ORDER (serial_tree_learner.cpp:479,487): the
         // SMALLER leaf is drawn FIRST (always), the LARGER leaf SECOND (only when a
         // larger child exists, i.e. not the root). Each call advances the shared
@@ -1826,6 +1928,52 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             (Some(smaller_eff), larger_eff)
         } else {
             (None, None)
+        };
+
+        // The per-TREE scan gate, as `i8` for the scan's mask API. NOTE this is the
+        // BYTREE mask ONLY — the per-node (`feature_fraction_bynode`) draw is handed to
+        // the scan separately as its ARGMAX gate, matching C++ where `is_feature_used`
+        // (bytree) selects what is scanned and `GetByNode` selects what may WIN.
+        let bytree_scan_mask: Option<Vec<i8>> = bytree_used
+            .as_ref()
+            .map(|b| b.iter().map(|&u| i8::from(u)).collect());
+
+        // ---- The C++ `is_feature_used` BUILD mask (serial_tree_learner.cpp:387-400) ----
+        //
+        //   is_feature_used[f] = is_feature_used_bytree(f) ∧ parent_hist[f].is_splittable()
+        //
+        // and `ConstructHistograms(is_feature_used, use_subtract)` skips the rest. The
+        // Rust port previously built EVERY feature and applied the mask only at scan
+        // time, so `feature_fraction` bought no build-time saving at all — measured
+        // 2028 ms at `feature_fraction=0.5` versus 2033 ms at 1.0, while the build is
+        // ~67% of train wall.
+        //
+        // Note what is deliberately ABSENT: the per-node `feature_fraction_bynode`
+        // draw. C++ builds every bytree-selected feature and applies the bynode mask
+        // only to the split argmax, because the two siblings draw DIFFERENT bynode
+        // masks off one shared parent histogram — folding bynode into the build would
+        // starve the sibling's subtract. `smaller_node_mask` / `larger_node_mask`
+        // (bytree ∧ bynode) remain the SCAN gates and are subsets of this mask, which
+        // is exactly what makes skipping safe.
+        //
+        // `None` (no col-sampler and no retained parent) ⇒ build everything, the
+        // byte-unchanged spine default.
+        let build_used: Option<Vec<bool>> = if bytree_used.is_some() || parent_splittable.is_some() {
+            Some(
+                (0..features.len())
+                    .map(|fpos| {
+                        let bytree = bytree_used
+                            .as_ref()
+                            .is_none_or(|b| b.get(fpos).copied().unwrap_or(true));
+                        let splittable = parent_splittable
+                            .as_ref()
+                            .is_none_or(|ps| ps.get(fpos).copied().unwrap_or(true));
+                        bytree && splittable
+                    })
+                    .collect(),
+            )
+        } else {
+            None
         };
 
         // The smaller leaf's seeded sums vs the larger leaf's. `split_inner` seeds
@@ -1903,6 +2051,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 smaller_leaf,
                 smaller_splits,
                 pool.buffer_mut(smaller_slot),
+                build_used.as_deref(),
             );
             None
         };
@@ -2049,6 +2198,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                             larger_leaf,
                             larger_splits,
                             &mut direct,
+                            // Same mask as the smaller build the subtraction used,
+                            // or the audit would diff a masked build against an
+                            // unmasked derivation and report a phantom residue.
+                            build_used.as_deref(),
                         );
                         audit.borrow_mut().push((derived.clone(), direct));
                     }
@@ -2068,6 +2221,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     larger_leaf,
                     larger_splits,
                     pool.buffer_mut(larger_slot),
+                    build_used.as_deref(),
                 );
                 None
             };
@@ -2125,14 +2279,14 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 features,
                 slot_off,
                 smaller_leaf,
-                smaller_node_mask.as_deref(),
+                bytree_scan_mask.as_deref(),
                 parent_splittable.as_deref(),
             );
             let larger_feats = self.spine_batched_feats(
                 features,
                 slot_off,
                 larger_leaf,
-                larger_node_mask.as_deref(),
+                bytree_scan_mask.as_deref(),
                 parent_splittable.as_deref(),
             );
             // Identical spine membership (and non-empty) ⇒ co-packable with ONE shared
@@ -2190,6 +2344,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             pool.buffer_mut(smaller_slot),
             best_split_per_leaf,
             best_split_feature,
+            bytree_scan_mask.as_deref(),
             smaller_node_mask.as_deref(),
             data_partition,
             parent_splittable.as_deref(),
@@ -2214,6 +2369,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 pool.buffer_mut(larger_slot),
                 best_split_per_leaf,
                 best_split_feature,
+                bytree_scan_mask.as_deref(),
                 larger_node_mask.as_deref(),
                 data_partition,
                 parent_splittable.as_deref(),
@@ -2262,6 +2418,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         leaf: i32,
         leaf_splits: &LeafSplits,
         buf: &mut [f64],
+        used: Option<&[bool]>,
     ) {
         let _g = crate::phase_prof::guard(&crate::phase_prof::BUILD_NS);
         let sum_g = leaf_splits.sum_gradients;
@@ -2308,12 +2465,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 leaf_rows,
                 gradients,
                 hessians,
+                used,
             )
             .expect("build_leaf_histograms_raw on a validated leaf cannot fail");
         // Host-side FixHistogram + compaction per feature (they read this leaf's
         // sums + the per-feature compaction offset — kept in the learner, byte-for-
         // byte the same ops in the same order as before).
         for (fpos, f) in features.iter().enumerate() {
+            // A masked-out feature was never folded (its region is zeroed), so
+            // FixHistogram + compaction would only shuffle zeros. Skip it: the
+            // caller's scans gate on a subset of `used`, so nothing reads it.
+            if used.is_some_and(|m| !m.get(fpos).copied().unwrap_or(true)) {
+                continue;
+            }
             let cells = 2 * f.num_bin as usize;
             let range = slot_off[fpos]..slot_off[fpos] + cells;
             // Run FixHistogram + compaction IN PLACE on a &mut sub-slice of the
@@ -2412,32 +2576,25 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         &self,
         features: &[FeatureColumn],
         slot_off: &[usize],
-        leaf: i32,
+        // Retained for signature symmetry with `scan_leaf_histogram`'s Pass 1; the
+        // leaf-dependent interaction lookup that used it moved to the argmax gate.
+        _leaf: i32,
         used_features: Option<&[i8]>,
         parent_splittable: Option<&[bool]>,
     ) -> Vec<BatchedSplitFeature> {
-        let interaction_allowed: Option<std::collections::HashSet<i32>> =
-            if self.constraints.interaction_constraints.is_empty() {
-                None
-            } else {
-                Some(self.interaction_allowed_features(leaf))
-            };
+        // NOTE: no interaction filter here. Interaction constraints are folded into
+        // C++ `GetByNode`, which gates the ARGMAX, not scan membership — so a
+        // constrained feature still appears in the batched scan set.
         let monotone_active = self.monotone.borrow().is_some();
         let mut batched_feats: Vec<BatchedSplitFeature> = Vec::with_capacity(features.len());
         for (fpos, f) in features.iter().enumerate() {
-            if let Some(mask) = used_features {
-                if mask.get(fpos).copied().unwrap_or(1) == 0 {
-                    continue;
-                }
+            if let Some(mask) = used_features
+                && mask.get(fpos).copied().unwrap_or(1) == 0
+            {
+                continue;
             }
-            if let Some(ps) = parent_splittable {
-                if !ps.get(fpos).copied().unwrap_or(true) {
-                    continue;
-                }
-            }
-            if interaction_allowed
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&f.real_feature_index))
+            if let Some(ps) = parent_splittable
+                && !ps.get(fpos).copied().unwrap_or(true)
             {
                 continue;
             }
@@ -2493,6 +2650,19 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         best_split_per_leaf: &mut [SplitInfo],
         best_split_feature: &mut [i32],
         used_features: Option<&[i8]>,
+        // The per-node column-sampling mask (`feature_fraction_bynode`, with any
+        // interaction constraints folded in) — C++ `ColSampler::GetByNode`. It gates
+        // ONLY the cross-feature ARGMAX, never the scan: `ComputeBestSplitForFeature`
+        // runs FixHistogram + FindBestThreshold for every `is_feature_used` feature
+        // and applies this mask solely at
+        // `if (new_split > *best_split && is_feature_used) *best_split = new_split;`
+        // (serial_tree_learner.cpp:1000-1002).
+        //
+        // Gating the SCAN on it instead — the port's previous behavior — left
+        // `is_splittable_` FALSE for every bynode-excluded feature, and that false
+        // propagates to both children through `parent_splittable`, permanently
+        // removing features C++ would still consider at deeper nodes.
+        node_used: Option<&[i8]>,
         data_partition: &DataPartition,
         parent_splittable: Option<&[bool]>,
         // When `Some(slot)` (resident-eligible), the SPINE batched scan
@@ -2590,19 +2760,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let mut spine_batch_index: Vec<Option<usize>> = vec![None; features.len()];
         let monotone_active = self.monotone.borrow().is_some();
         for (fpos, f) in features.iter().enumerate() {
-            if let Some(mask) = used_features {
-                if mask.get(fpos).copied().unwrap_or(1) == 0 {
-                    continue;
-                }
+            if let Some(mask) = used_features
+                && mask.get(fpos).copied().unwrap_or(1) == 0
+            {
+                continue;
             }
-            if let Some(ps) = parent_splittable {
-                if !ps.get(fpos).copied().unwrap_or(true) {
-                    continue;
-                }
-            }
-            if interaction_allowed
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&f.real_feature_index))
+            if let Some(ps) = parent_splittable
+                && !ps.get(fpos).copied().unwrap_or(true)
             {
                 continue;
             }
@@ -2798,14 +2962,36 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             )?
         };
 
+        // The ARGMAX admissibility predicate: `node_used` (feature_fraction_bynode)
+        // AND the interaction constraint. Both are C++ `GetByNode` outputs — the
+        // interaction filter is folded INTO the bynode mask there (col_sampler.hpp:
+        // 91-111) — so both gate the winner selection, NOT the scan. A feature that
+        // fails this is still scanned (so its `is_splittable_` is set from real data);
+        // it simply cannot become this leaf's best split.
+        let argmax_admissible = |fpos: usize, real_feature_index: i32| -> bool {
+            if let Some(mask) = node_used
+                && mask.get(fpos).copied().unwrap_or(1) == 0
+            {
+                return false;
+            }
+            if interaction_allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&real_feature_index))
+            {
+                return false;
+            }
+            true
+        };
+
         for (fpos, f) in features.iter().enumerate() {
             // ColSampler gate (serial_tree_learner.cpp: `if (!is_feature_used[fi])
-            // continue;`). On the spine (`used_features == None`) every feature is
-            // scanned.
-            if let Some(mask) = used_features {
-                if mask.get(fpos).copied().unwrap_or(1) == 0 {
-                    continue;
-                }
+            // continue;`). This is the PER-TREE `is_feature_used_bytree` mask only —
+            // the per-node draw lands in `argmax_admissible` above. On the spine
+            // (`used_features == None`) every feature is scanned.
+            if let Some(mask) = used_features
+                && mask.get(fpos).copied().unwrap_or(1) == 0
+            {
+                continue;
             }
             // ---- Parent-splittability gate (serial_tree_learner.cpp:395-399) ----
             // When this leaf is derived against a retained parent histogram
@@ -2819,19 +3005,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // rounds to 0). Without the gate Rust selects a split C++ never
             // considers. `None` (smaller child
             // / root) ⇒ no gate, every feature scanned.
-            if let Some(ps) = parent_splittable {
-                if !ps.get(fpos).copied().unwrap_or(true) {
-                    continue;
-                }
-            }
-            // Interaction gate: skip a feature not allowed to co-occur with
-            // this node's branch features (additive — no-op when inactive).
-            if interaction_allowed
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&f.real_feature_index))
+            if let Some(ps) = parent_splittable
+                && !ps.get(fpos).copied().unwrap_or(true)
             {
                 continue;
             }
+            // NOTE: the interaction gate is NOT applied here. C++ folds interaction
+            // constraints into `GetByNode`'s mask, which gates the ARGMAX only
+            // (`argmax_admissible` below) — the feature is still scanned so its
+            // `is_splittable_` reflects real data.
             let cells = 2 * f.num_bin as usize;
             let hist = &buf[slot_off[fpos]..slot_off[fpos] + cells];
 
@@ -2856,8 +3038,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     sum_h_bumped,
                     num_data_in_leaf,
                 );
-                let split = cat.split;
+                let mut split = cat.split;
                 this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
+                // `feature_contri` applies to CATEGORICAL features too: the C++
+                // multiply lives in `FindBestThreshold` (feature_histogram.hpp:174),
+                // which dispatches to the categorical scan through the same
+                // `find_best_threshold_fun_` pointer.
+                if let Some(penalty) = self.feature_penalty(f.real_feature_index) {
+                    split.gain *= penalty;
+                }
                 // Categorical features have no per-bin numeric gain arrays; the
                 // numeric snapshot uses empty rev/fwd for them (the categorical
                 // diagnostics live in the dedicated categorical golden, not here).
@@ -2868,6 +3057,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     split,
                 });
                 if split.gain > K_MIN_SCORE
+                    && argmax_admissible(fpos, f.real_feature_index)
                     && split_gt(&split, f.real_feature_index, &leaf_best, leaf_best_feature)
                 {
                     leaf_best = split;
@@ -2968,6 +3158,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // BEFORE any CEGB / monotone gain post-processing, exactly as C++ sets
             // the flag inside the scan, not after ComputeBestSplitForFeature.
             this_leaf_splittable[fpos] = split.gain > K_MIN_SCORE;
+            // ---- feature_contri: MULTIPLY the gain by this feature's penalty
+            // (`FeatureHistogram::FindBestThreshold`, feature_histogram.hpp:174:
+            // `output->gain *= meta_->penalty`, where `penalty =
+            // config->feature_contri[real_fidx]`, :1445-1449).
+            //
+            // Ordering is load-bearing and matches C++ exactly: the penalty lands
+            // AFTER `is_splittable_` is recorded (C++ sets that flag inside the
+            // scan, before the multiply) and BEFORE the CEGB subtraction and the
+            // monotone penalty. Applied unconditionally when configured — the C++
+            // code multiplies the raw value with no `> kMinScore` guard, so a
+            // gated (`kMinScore`) gain is scaled too. ----
+            if let Some(penalty) = self.feature_penalty(f.real_feature_index) {
+                split.gain *= penalty;
+            }
             // ---- CEGB: SUBTRACT the per-split cost penalty from the gain
             // (ComputeBestSplitForFeature, serial_tree_learner.cpp:988-992) BEFORE
             // the argmax. No-op when CEGB inactive. ----
@@ -3021,8 +3225,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 split,
             });
 
-            // Cross-feature argmax via split_gt (gain, then smaller feature).
+            // Cross-feature argmax via split_gt (gain, then smaller feature), gated by
+            // the per-node mask + interaction constraint (C++
+            // `if (new_split > *best_split && is_feature_used)`).
             if split.gain > K_MIN_SCORE
+                && argmax_admissible(fpos, f.real_feature_index)
                 && split_gt(&split, f.real_feature_index, &leaf_best, leaf_best_feature)
             {
                 leaf_best = split;
@@ -3348,6 +3555,27 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             right_output: mk_output(right_g_for_output, right_h_raw),
             default_left: true,
         }
+    }
+
+    /// This feature's `config.feature_contri` split-gain multiplier, or `None`
+    /// when `feature_contri` is unset (the C++ `penalty = 1.0` default, which we
+    /// skip entirely rather than multiply by one).
+    ///
+    /// Indexed by the ORIGINAL (real) feature index, matching the C++
+    /// `config->feature_contri[real_fidx]` lookup in
+    /// `FeatureHistogramPool::SetFeatureInfo` (feature_histogram.hpp:1445). An
+    /// out-of-range index yields `None` — the length is validated once up front
+    /// (`GBDT::Init` `CHECK_EQ`, mirrored at the facade), so this is defence in
+    /// depth, never a silent partial application.
+    #[inline]
+    fn feature_penalty(&self, real_feature_index: i32) -> Option<f64> {
+        if self.constraints.feature_contri.is_empty() {
+            return None;
+        }
+        usize::try_from(real_feature_index)
+            .ok()
+            .and_then(|i| self.constraints.feature_contri.get(i))
+            .copied()
     }
 
     /// Host re-scan of the per-bin gain arrays (REVERSE + FORWARD) on a FIXED
@@ -3906,6 +4134,17 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     #[must_use]
     pub fn with_constraints(mut self, constraints: LearnerConstraints) -> Self {
         self.constraints = constraints;
+        self
+    }
+
+    /// Set `config.histogram_pool_size` — the histogram-pool budget in MEGABYTES
+    /// that caps the LRU slot count (`serial_tree_learner.cpp:34-47`). `<= 0` (the
+    /// C++ `-1` default) means unbounded: one slot per leaf.
+    ///
+    /// Parity-neutral by construction: a smaller pool only forces more evictions
+    /// and recomputation, never a different histogram or split.
+    pub fn with_histogram_pool_size(mut self, megabytes: f64) -> Self {
+        self.histogram_pool_size = megabytes;
         self
     }
 

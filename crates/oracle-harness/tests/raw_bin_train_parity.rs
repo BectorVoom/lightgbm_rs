@@ -61,7 +61,7 @@ fn spine_corpus() -> DenseCorpus {
     let labels = vec![
         2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
     ];
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// All leaf values across the model's trees, flattened in tree-then-leaf order

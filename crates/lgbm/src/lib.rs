@@ -14,14 +14,16 @@
 pub mod booster;
 pub mod builder;
 pub mod error;
+pub mod eval_metric;
 
 // --- public training API (Phase 6) ---
 pub use booster::{
     train, train_custom, train_custom_raw_with_metric, train_custom_with_metric, train_raw,
-    train_with_valid, Booster, CustomMetricClosure, DenseCorpus, RawCorpus,
+    train_with_valid, Booster, CustomMetricClosure, DenseCorpus, PredictOutput, RawCorpus,
 };
 pub use booster::{build_feature_columns_from_raw, build_feature_columns_from_raw_with_config};
 pub use builder::TrainingBuilder;
+pub use eval_metric::{create_metrics, EvalMetric};
 pub use error::LgbmError;
 
 // --- core config (the single source of truth, D-02) ---

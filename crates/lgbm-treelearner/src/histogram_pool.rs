@@ -62,7 +62,51 @@ impl HistogramPool {
     /// `num_leaves` caps the slot count (`cache_size = num_leaves`); `hist_len` is
     /// the per-slot histogram length (`2 * num_bin`).
     pub fn new(num_leaves: i32, hist_len: usize) -> Self {
-        let cache_size = num_leaves.max(1) as usize;
+        Self::with_cache_size(num_leaves.max(1) as usize, hist_len)
+    }
+
+    /// `SerialTreeLearner::Init`'s pool sizing (`serial_tree_learner.cpp:34-47`):
+    /// derive the slot count from `config.histogram_pool_size` (the pool budget in
+    /// MEGABYTES) instead of defaulting to one slot per leaf.
+    ///
+    /// ```text
+    /// pool_size_mb <= 0  → num_leaves                       (unbounded: the default)
+    /// otherwise          → pool_size_mb * 1024 * 1024 / total_histogram_size
+    /// then clamped to    → max(2, ·) then min(·, num_leaves)
+    /// ```
+    ///
+    /// `total_histogram_size` is `kHistEntrySize * Σ FeatureNumBin(i)` where
+    /// `kHistEntrySize = 2 * sizeof(hist_t) = 16` bytes (bin.h:39).
+    ///
+    /// A smaller pool is NOT a numerical change — it only forces more LRU evictions,
+    /// which cost recomputation, never a different histogram. Guarded against a
+    /// zero `total_histogram_size` (a feature-less dataset) so the division and the
+    /// `as` cast can never trap or wrap.
+    pub fn with_pool_size(
+        num_leaves: i32,
+        hist_len: usize,
+        histogram_pool_size_mb: f64,
+        total_num_bins: usize,
+    ) -> Self {
+        /// `kHistEntrySize = 2 * sizeof(hist_t)` (bin.h:39); `hist_t` is `double`.
+        const K_HIST_ENTRY_SIZE: usize = 2 * std::mem::size_of::<f64>();
+
+        let num_leaves = num_leaves.max(1);
+        let total_histogram_size = K_HIST_ENTRY_SIZE.saturating_mul(total_num_bins);
+        let mut max_cache_size = if histogram_pool_size_mb <= 0.0 || total_histogram_size == 0 {
+            num_leaves
+        } else {
+            let budget = histogram_pool_size_mb * 1024.0 * 1024.0 / total_histogram_size as f64;
+            // C++ `static_cast<int>` truncates toward zero; clamp first so a huge
+            // budget cannot overflow i32 (UB in C++, a saturating cast here).
+            budget.clamp(0.0, i32::MAX as f64) as i32
+        };
+        max_cache_size = max_cache_size.max(2);
+        max_cache_size = max_cache_size.min(num_leaves);
+        Self::with_cache_size(max_cache_size.max(1) as usize, hist_len)
+    }
+
+    fn with_cache_size(cache_size: usize, hist_len: usize) -> Self {
         Self {
             cache_size,
             buffers: vec![0.0f64; cache_size * hist_len],

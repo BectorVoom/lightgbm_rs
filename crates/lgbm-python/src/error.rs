@@ -22,9 +22,12 @@ pyo3::create_exception!(
 ///
 /// - `Config` / `InvalidCorpus` / `InvalidConstraintLength` -> `ValueError`
 ///   (these are caller-input defects — bad params or malformed data).
-/// - `Objective` / `Metric` / `Model` / `Boosting` / `Io` / `CustomMetric`
-///   -> `lightgbm_rs.LightGBMError` (engine-side failures, mirroring the
-///   official package's `LightGBMError`).
+/// - `Objective` / `Metric` / `Model` / `Boosting` / `Io` / `CustomMetric` /
+///   `Unsupported` -> `lightgbm_rs.LightGBMError` (engine-side failures,
+///   mirroring the official package's `LightGBMError`). `Unsupported` reports a
+///   capability this build cannot honor for the given input (e.g. a ranking
+///   metric with no query boundaries) — an engine limitation, not bad user input,
+///   so it does NOT map to `ValueError`.
 pub fn from_lgbm_error(err: LgbmError) -> PyErr {
     let msg = err.to_string();
     match err {
@@ -36,7 +39,8 @@ pub fn from_lgbm_error(err: LgbmError) -> PyErr {
         | LgbmError::Model(_)
         | LgbmError::Boosting(_)
         | LgbmError::Io { .. }
-        | LgbmError::CustomMetric { .. } => LightGBMError::new_err(msg),
+        | LgbmError::CustomMetric { .. }
+        | LgbmError::Unsupported { .. } => LightGBMError::new_err(msg),
     }
 }
 

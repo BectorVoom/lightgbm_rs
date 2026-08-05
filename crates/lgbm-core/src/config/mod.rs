@@ -177,6 +177,13 @@ pub struct Config {
     /// `std::vector<double> cegb_penalty_feature_coupled`. config.h default: []
     /// (empty). Per-feature coupled cost penalty (ADV-05).
     pub cegb_penalty_feature_coupled: Vec<f64>,
+    /// `std::vector<double> feature_contri` (config.h:539; aliases
+    /// `feature_contrib`/`fc`/`fp`/`feature_penalty`). Empty by default. Per-feature
+    /// split-gain multiplier: the best-threshold gain of feature `i` is scaled by
+    /// `feature_contri[i]` (`FeatureHistogram::FindBestThreshold`,
+    /// `feature_histogram.hpp:174`, via `FeatureMetainfo::penalty`). Length must
+    /// equal the total feature count when non-empty (`gbdt.cpp:60-62`).
+    pub feature_contri: Vec<f64>,
     /// `double path_smooth`. config.h default: 0.
     pub path_smooth: f64,
     /// `std::string interaction_constraints`. config.h default: "".
@@ -195,6 +202,11 @@ pub struct Config {
     pub snapshot_freq: i32,
     /// `int max_bin`. config.h default: 255.
     pub max_bin: i32,
+    /// `std::vector<int> max_bin_by_feature` (config.h:409). Empty by default.
+    /// Per-feature `max_bin` override applied at `BinMapper` construction
+    /// (`dataset_loader.cpp:614-651`). When non-empty its length must equal the
+    /// feature count and every entry must be `> 1`.
+    pub max_bin_by_feature: Vec<i32>,
     /// `int min_data_in_bin`. config.h default: 3.
     pub min_data_in_bin: i32,
     /// `int bin_construct_sample_cnt`. config.h default: 200000.
@@ -295,6 +307,24 @@ pub struct Config {
     pub label_gain: Vec<f64>,
 
     // --- Metric config ---
+    /// `std::vector<std::string> metric` (config.h:1043; aliases `metrics`/
+    /// `metric_types`). Empty by default — `GetMetricType` (config.cpp:152-162)
+    /// fills it from the OBJECTIVE name when the user supplies no `metric=`, and
+    /// every entry is canonicalized through `ParseMetricAlias` + deduplicated
+    /// (order-preserving) by `ParseMetrics` (config.cpp:130-142).
+    ///
+    /// An explicit `metric=None` (or `null`/`na`/`custom`) canonicalizes to the
+    /// single entry `"custom"`, which disables built-in evaluation.
+    pub metric: Vec<String>,
+    /// `std::vector<double> auc_mu_weights` (config.h:1077). Empty by default —
+    /// the equal-weight matrix is then derived. When non-empty it must hold
+    /// exactly `num_class * num_class` entries; see [`Config::auc_mu_weights_matrix`].
+    pub auc_mu_weights: Vec<f64>,
+    /// `std::vector<std::vector<double>> auc_mu_weights_matrix` (config.h:1152) —
+    /// the DERIVED `num_class x num_class` class-pair weight matrix produced by
+    /// `Config::GetAucMuWeights` (config.cpp:218-247), not a user-settable
+    /// parameter. Zero diagonal; off-diagonal entries must be non-zero.
+    pub auc_mu_weights_matrix: Vec<Vec<f64>>,
     /// `int metric_freq`. config.h default: 1.
     pub metric_freq: i32,
     /// `bool is_provide_training_metric`. config.h default: false.
@@ -319,6 +349,53 @@ pub struct Config {
     pub objective_seed: i32,
     /// `int extra_seed`. config.h default: 6 (overwritten by seed derivation).
     pub extra_seed: i32,
+}
+
+impl Config {
+    /// C++ `Config::GetInteractionConstraints` (config.cpp:248-254) — parse the
+    /// `interaction_constraints` STRING into the derived
+    /// `interaction_constraints_vector`: the groups of REAL feature indices that
+    /// are allowed to co-occur on one root-to-leaf path.
+    ///
+    /// Faithful to `Common::StringToArrayofArrays<int>(s, '[', ']', ',')`:
+    /// `SplitBrackets` extracts each `[...]` run (unbalanced/stray brackets are
+    /// simply skipped, never an error), then each run is split on `,`.
+    ///
+    /// Unlike C++ — whose `StringToArray` calls `Log::Fatal` on a non-integer
+    /// entry — an unparsable entry is DROPPED here rather than aborting the
+    /// process; the config boundary never panics on hostile input (Security V5).
+    /// Empty string ⇒ empty vector (no constraint).
+    pub fn interaction_constraints_vector(&self) -> Vec<Vec<i32>> {
+        if self.interaction_constraints.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut open = false;
+        let mut start = 0usize;
+        for (pos, ch) in self.interaction_constraints.char_indices() {
+            if ch == '[' {
+                open = true;
+                start = pos + ch.len_utf8();
+            } else if ch == ']' && open {
+                if start < pos {
+                    out.push(parse_i32_list(&self.interaction_constraints[start..pos]));
+                }
+                open = false;
+            }
+        }
+        out
+    }
+}
+
+/// `Common::StringToArray<int>(s, ',')` — split on `,` (empty segments dropped by
+/// `Common::Split`) and parse each piece, dropping unparsable entries. Whitespace
+/// around an entry is trimmed, which C++ tolerates via `strtol`'s leading-space
+/// skip; a trailing space would make C++'s `Atoi` stop at the space, same result.
+fn parse_i32_list(s: &str) -> Vec<i32> {
+    s.split(',')
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.trim().parse::<i32>().ok())
+        .collect()
 }
 
 impl Default for Config {
@@ -389,6 +466,7 @@ impl Default for Config {
             cegb_penalty_split: 0.0,
             cegb_penalty_feature_lazy: Vec::new(),
             cegb_penalty_feature_coupled: Vec::new(),
+            feature_contri: Vec::new(),
             path_smooth: 0.0,
             interaction_constraints: String::new(),
             verbosity: 1,
@@ -398,6 +476,7 @@ impl Default for Config {
             saved_feature_importance_type: 0,
             snapshot_freq: -1,
             max_bin: 255,
+            max_bin_by_feature: Vec::new(),
             min_data_in_bin: 3,
             bin_construct_sample_cnt: 200000,
             is_enable_sparse: true,
@@ -447,6 +526,9 @@ impl Default for Config {
             lambdarank_position_bias_regularization: 0.0,
             label_gain: Vec::new(),
 
+            metric: Vec::new(),
+            auc_mu_weights: Vec::new(),
+            auc_mu_weights_matrix: Vec::new(),
             metric_freq: 1,
             is_provide_training_metric: false,
             multi_error_top_k: 1,

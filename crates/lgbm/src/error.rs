@@ -75,6 +75,17 @@ pub enum LgbmError {
         detail: String,
     },
 
+    /// A configured capability cannot be honored by the corpus/facade in use —
+    /// e.g. a query-grouped ranking metric (`ndcg`/`map`) evaluated over a corpus
+    /// that carries no query/group boundaries. Facade-owned: the metric object
+    /// itself is valid, it just cannot run against this input, so the caller gets
+    /// a precise typed error instead of a silent wrong value.
+    #[error("unsupported in this context: {name}")]
+    Unsupported {
+        /// Human-readable description of what is unsupported and why.
+        name: String,
+    },
+
     /// A per-feature constraint/penalty vector (`monotone_constraints`,
     /// `cegb_penalty_feature_coupled`, or `cegb_penalty_feature_lazy`) was
     /// non-empty but its length did not equal `num_features` (T-07-11-02).

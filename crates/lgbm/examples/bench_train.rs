@@ -61,7 +61,7 @@ fn make_corpus(s: &Size) -> DenseCorpus {
         features.push(frow);
         labels.push((acc * 0.01) as f32);
     }
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// Median of a slice of durations (sorts a copy).

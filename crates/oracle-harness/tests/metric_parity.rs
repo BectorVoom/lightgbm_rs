@@ -267,17 +267,49 @@ fn builder_accepts_extended_metric_names() {
     use lgbm::TrainingBuilder;
     // The builder routes a comma-separated metric list through params (MET-02). It
     // must accept every new metric name without rejecting the config at build time.
-    let list = "quantile,huber,fair,poisson,mape,gamma,gamma_deviance,tweedie,\
+    //
+    // The list is split by objective FAMILY because `CheckParamConflict`
+    // (config.cpp:328-339) rejects a multiclass metric under a non-multiclass
+    // objective. Verified against `lightgbm==4.6.0`: the combined list with
+    // `objective=regression` fails with "Multiclass objective and metrics don't
+    // match", so a single-list assertion would pin behavior the C++ reference does
+    // NOT have.
+    let non_multiclass = "quantile,huber,fair,poisson,mape,gamma,gamma_deviance,tweedie,\
                 cross_entropy,cross_entropy_lambda,kullback_leibler,\
-                average_precision,multi_error,auc_mu";
+                average_precision";
     let _cfg = TrainingBuilder::new()
         .objective("regression")
-        .metric(list)
+        .metric(non_multiclass)
         .num_iterations(1)
         .num_leaves(2)
         .min_data_in_leaf(1)
         .build()
         .expect("builder must accept the extended metric list");
+
+    // The multiclass metrics are accepted under a MULTICLASS objective.
+    let _cfg = TrainingBuilder::new()
+        .objective("multiclass")
+        .num_class(3)
+        .metric("multi_logloss,multi_error,auc_mu")
+        .num_iterations(1)
+        .num_leaves(2)
+        .min_data_in_leaf(1)
+        .build()
+        .expect("builder must accept the multiclass metric list under a multiclass objective");
+
+    // ...and REJECTED under a non-multiclass one, matching the C++ Log::Fatal.
+    let err = TrainingBuilder::new()
+        .objective("regression")
+        .metric("multi_error")
+        .num_iterations(1)
+        .num_leaves(2)
+        .min_data_in_leaf(1)
+        .build()
+        .expect_err("a multiclass metric under a regression objective must be rejected");
+    assert!(
+        err.to_string().contains("don't match"),
+        "expected the C++ objective/metric mismatch error, got: {err}"
+    );
 
     // Each new metric name parses through its relevant metric-layer factory
     // (the names the multi-metric list routes to). This is the routing contract:

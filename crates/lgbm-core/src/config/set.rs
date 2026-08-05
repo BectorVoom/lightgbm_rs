@@ -29,7 +29,7 @@ use crate::config::alias::resolve_alias;
 use crate::config::Config;
 use crate::error::ConfigError;
 use crate::random::Random;
-use crate::types::K_EPSILON;
+use crate::types::{K_EPSILON, K_ZERO_THRESHOLD};
 
 impl Config {
     /// Build a [`Config`] from a parameter map, reproducing the C++
@@ -100,6 +100,16 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
         // No closed enum in C++ (ParseObjectiveAlias is a passthrough for
         // unknowns), but the validation tests expect "nonsense" → UnknownValue.
         cfg.objective = parse_objective(v)?;
+    }
+    // `GetMetricType` (config.cpp:152-162) runs AFTER the objective is resolved and
+    // BEFORE GetDeviceType: an explicit `metric=` is lowercased and split/dedup'd by
+    // `ParseMetrics`; when the key is absent (or empty) the metric list is derived
+    // from the OBJECTIVE name instead. Note the C++ guard is `metric->empty() &&
+    // value.size() == 0`, so an explicit `metric=` that parses to an EMPTY list
+    // (e.g. `metric=","`) stays empty rather than falling back to the objective.
+    match present(&resolved, "metric") {
+        Some(v) => cfg.metric = parse_metrics(&v.to_lowercase()),
+        None => cfg.metric = parse_metrics(&cfg.objective),
     }
     if let Some(v) = present(&resolved, "device_type") {
         cfg.device_type = parse_device_type(v)?;
@@ -277,6 +287,8 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
     get_double_vec(&resolved, "cegb_penalty_feature_lazy", &mut cfg.cegb_penalty_feature_lazy)?;
     get_double_vec(&resolved, "cegb_penalty_feature_coupled", &mut cfg.cegb_penalty_feature_coupled)?;
 
+    get_double_vec(&resolved, "feature_contri", &mut cfg.feature_contri)?;
+
     get_double(&resolved, "path_smooth", &mut cfg.path_smooth)?;
     check_ge_f("path_smooth", cfg.path_smooth, 0.0)?;
 
@@ -290,6 +302,15 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
 
     get_int(&resolved, "max_bin", &mut cfg.max_bin)?;
     check_gt("max_bin", cfg.max_bin, 1)?;
+
+    // `max_bin_by_feature` — the C++ `CHECK_GT(min_element, 1)` lives in
+    // `dataset_loader.cpp:616` (it also checks the length against num_col, which
+    // the config layer cannot know). Validate the per-entry bound here so a
+    // hostile value fails at the config boundary rather than deep in binning.
+    get_int_vec(&resolved, "max_bin_by_feature", &mut cfg.max_bin_by_feature)?;
+    for &b in &cfg.max_bin_by_feature {
+        check_gt("max_bin_by_feature", b, 1)?;
+    }
 
     get_int(&resolved, "min_data_in_bin", &mut cfg.min_data_in_bin)?;
     check_gt("min_data_in_bin", cfg.min_data_in_bin, 0)?;
@@ -390,6 +411,11 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
         check_gt("eval_at", k, 0)?;
     }
 
+    // `auc_mu_weights` — flat row-major `num_class x num_class`; validated and
+    // folded into `auc_mu_weights_matrix` by `get_auc_mu_weights` below (which
+    // runs after `num_class` is read, exactly as `Config::Set` orders it).
+    get_double_vec(&resolved, "auc_mu_weights", &mut cfg.auc_mu_weights)?;
+
     get_int(&resolved, "metric_freq", &mut cfg.metric_freq)?;
     check_gt("metric_freq", cfg.metric_freq, 0)?;
 
@@ -397,6 +423,13 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
 
     get_int(&resolved, "multi_error_top_k", &mut cfg.multi_error_top_k)?;
     check_gt("multi_error_top_k", cfg.multi_error_top_k, 0)?;
+
+    // --- Post-extraction derivations (config.cpp:282-287, in C++ order) ------
+    // `GetAucMuWeights()` then the `std::sort(eval_at)`. The sort is observable:
+    // the per-`@k` metric names and their value order follow the SORTED cutoffs,
+    // so `eval_at=5,1` must evaluate as `ndcg@1, ndcg@5`.
+    get_auc_mu_weights(&mut cfg)?;
+    cfg.eval_at.sort_unstable();
 
     // --- Stage 4: CheckParamConflict (in-scope mutations + fatals) -----------
     check_param_conflict(&mut cfg, num_leaves_explicit)?;
@@ -485,6 +518,21 @@ fn check_param_conflict(cfg: &mut Config, num_leaves_explicit: bool) -> Result<(
         });
     }
 
+    // Every configured metric must agree with the objective's multiclass-ness
+    // (config.cpp:328-339). A multiclass objective with e.g. `metric=l2`, or a
+    // binary objective with `metric=multi_logloss`, is a hard error in C++.
+    for metric_type in &cfg.metric {
+        if is_multiclass_metric(metric_type, cfg.num_class) != objective_multiclass {
+            return Err(ConfigError::Conflict {
+                detail: format!(
+                    "multiclass objective and metrics don't match \
+                     (objective `{}`, metric `{metric_type}`)",
+                    cfg.objective
+                ),
+            });
+        }
+    }
+
     // max_depth > 0 && num_leaves NOT explicitly set → num_leaves = 2^max_depth
     // when that is more restrictive (config.cpp lines 384-398).
     if cfg.max_depth > 0 && !num_leaves_explicit {
@@ -517,6 +565,16 @@ fn check_param_conflict(cfg: &mut Config, num_leaves_explicit: bool) -> Result<(
         cfg.min_data_in_leaf = 1;
     }
 
+    // `num_machines <= 1` → NOT parallel → tree_learner is FORCED to "serial"
+    // (config.cpp:341-347). `num_machines` is out of v1 scope (single-node only),
+    // so it is always 1 here and this reset always fires: `tree_learner=data` /
+    // `feature` / `voting` degrade to serial exactly as C++ does on one machine.
+    //
+    // Without this, the port would ACCEPT a distributed tree_learner and silently
+    // train a serial model while claiming the requested learner — the C++ reset is
+    // what makes that behavior correct rather than a lie.
+    cfg.tree_learner = "serial".to_string();
+
     // boosting == goss → boosting = gbdt, data_sample_strategy = goss (463-468).
     if cfg.boosting == "goss" {
         cfg.boosting = "gbdt".to_string();
@@ -534,6 +592,122 @@ fn check_param_conflict(cfg: &mut Config, num_leaves_explicit: bool) -> Result<(
 /// C++ `CheckMultiClassObjective` (config.cpp lines 310-312).
 fn is_multiclass_objective(objective: &str) -> bool {
     objective == "multiclass" || objective == "multiclassova"
+}
+
+/// C++ `CheckParamConflict`'s per-metric multiclass predicate (config.cpp:329-333):
+/// a metric belongs to the multiclass family when it is a multiclass OBJECTIVE
+/// name, one of the three genuinely multiclass metrics, or `custom` with
+/// `num_class > 1`.
+fn is_multiclass_metric(metric_type: &str, num_class: i32) -> bool {
+    is_multiclass_objective(metric_type)
+        || metric_type == "multi_logloss"
+        || metric_type == "multi_error"
+        || metric_type == "auc_mu"
+        || (metric_type == "custom" && num_class > 1)
+}
+
+/// C++ `ParseMetrics` (config.cpp lines 130-142): split on `,`, canonicalize each
+/// entry through [`parse_metric_alias`], and keep the FIRST occurrence of each
+/// canonical name (order-preserving dedup).
+///
+/// Empty segments are dropped, mirroring `Common::Split` (common.h:102-122),
+/// which never emits a zero-length piece. No trimming — C++ does not trim either,
+/// so `"l2, rmse"` yields `["l2", " rmse"]` exactly as upstream does.
+pub fn parse_metrics(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for piece in value.split(',') {
+        if piece.is_empty() {
+            continue;
+        }
+        let canonical = parse_metric_alias(piece);
+        if !out.iter().any(|m| m == &canonical) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+/// C++ `ParseMetricAlias` (config.h lines 1290-1318): map a metric name (or an
+/// objective name, for the `GetMetricType` fallback) to its canonical metric
+/// name. Unrecognized names pass through unchanged — the metric FACTORY, not the
+/// config layer, is where an unknown metric becomes an error, matching C++.
+///
+/// `none` / `null` / `custom` / `na` all canonicalize to `custom`, the sentinel
+/// that disables built-in evaluation.
+pub fn parse_metric_alias(type_: &str) -> String {
+    match type_ {
+        "regression" | "regression_l2" | "l2" | "mean_squared_error" | "mse" => "l2",
+        "l2_root" | "root_mean_squared_error" | "rmse" => "rmse",
+        "regression_l1" | "l1" | "mean_absolute_error" | "mae" => "l1",
+        "binary_logloss" | "binary" => "binary_logloss",
+        "ndcg" | "lambdarank" | "rank_xendcg" | "xendcg" | "xe_ndcg" | "xe_ndcg_mart"
+        | "xendcg_mart" => "ndcg",
+        "map" | "mean_average_precision" => "map",
+        "multi_logloss" | "multiclass" | "softmax" | "multiclassova" | "multiclass_ova" | "ova"
+        | "ovr" => "multi_logloss",
+        "xentropy" | "cross_entropy" => "cross_entropy",
+        "xentlambda" | "cross_entropy_lambda" => "cross_entropy_lambda",
+        "kldiv" | "kullback_leibler" => "kullback_leibler",
+        "mean_absolute_percentage_error" | "mape" => "mape",
+        "none" | "null" | "custom" | "na" => "custom",
+        other => other,
+    }
+    .to_string()
+}
+
+/// C++ `Config::GetAucMuWeights` (config.cpp lines 218-247): derive the
+/// `num_class x num_class` [`Config::auc_mu_weights_matrix`] from the flat
+/// `auc_mu_weights` vector.
+///
+/// Empty input → the equal-weight matrix (ones off-diagonal, zero diagonal).
+/// Otherwise the length must be exactly `num_class^2`, the diagonal is FORCED to
+/// zero (C++ logs and overwrites a non-zero diagonal rather than failing), and
+/// every off-diagonal entry must be non-zero (C++ `Log::Fatal` → typed `Err`
+/// here). The zero test uses `kZeroThreshold`, matching C++.
+fn get_auc_mu_weights(cfg: &mut Config) -> Result<(), ConfigError> {
+    let nc = cfg.num_class.max(0) as usize;
+    if cfg.auc_mu_weights.is_empty() {
+        let mut m = vec![vec![1.0f64; nc]; nc];
+        for (i, row) in m.iter_mut().enumerate() {
+            row[i] = 0.0;
+        }
+        cfg.auc_mu_weights_matrix = m;
+        return Ok(());
+    }
+    if cfg.auc_mu_weights.len() != nc * nc {
+        return Err(ConfigError::OutOfRange {
+            param: "auc_mu_weights".to_string(),
+            value: cfg.auc_mu_weights.len().to_string(),
+            bound: format!("exactly num_class * num_class = {}", nc * nc),
+        });
+    }
+    let mut m = vec![vec![0.0f64; nc]; nc];
+    // `(i, j)` are the class-pair coordinates AND the flat index `i * nc + j` into
+    // the user-supplied vector, so the row/column indices carry meaning here — the
+    // enumerate() rewrite clippy suggests would obscure the C++ correspondence.
+    for (i, row) in m.iter_mut().enumerate() {
+        for (j, slot) in row.iter_mut().enumerate() {
+            if i == j {
+                // C++ only LOGS when a non-zero diagonal entry is overwritten.
+                *slot = 0.0;
+            } else {
+                let v = cfg.auc_mu_weights[i * nc + j];
+                if v.abs() < K_ZERO_THRESHOLD {
+                    return Err(ConfigError::OutOfRange {
+                        param: "auc_mu_weights".to_string(),
+                        value: v.to_string(),
+                        bound: format!(
+                            "non-zero for the off-diagonal entry at position {}",
+                            i * nc + j
+                        ),
+                    });
+                }
+                *slot = v;
+            }
+        }
+    }
+    cfg.auc_mu_weights_matrix = m;
+    Ok(())
 }
 
 // --- Typed getters: parse only if present & non-empty (C++ GetInt/Double/...) ---

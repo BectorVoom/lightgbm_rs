@@ -34,97 +34,36 @@ use lgbm_compute::runtime::cpu_client;
 use lgbm_compute::CpuBackend;
 use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::{BinMapper, MissingType};
-use lgbm_metric::{BinaryMetric, Metric, MultiLogloss};
+use lgbm_metric::Metric;
 use lgbm_model::{GbdtModel, ObjectiveKind};
 use lgbm_objective::{
     Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, Xentropy,
 };
-use lgbm_treelearner::learner::FeatureColumn;
+use lgbm_treelearner::learner::{FeatureColumn, LearnerConstraints};
 use lgbm_treelearner::BinColumn;
 use lgbm_treelearner::{offset_for_most_freq_bin, SerialTreeLearner};
 
 use crate::error::LgbmError;
 
-/// One configured eval metric — either a regression metric (raw-score) or a
-/// binary metric (prob-space / AUC). Unifies the per-round eval-history loop
-/// across objectives.
-/// A user-supplied custom-metric (feval) closure: `(raw_scores, labels) ->
-/// (name, value, is_higher_better)`, mirroring the C++ `_EvalFunctionWrapper`
-/// contract the Python `feval` marshals into. The closure is called once
-/// per eval cadence with the SAME `(scores, labels)` the built-in metrics see,
-/// so it feeds the SAME eval-history loop.
-pub type CustomMetricClosure = Box<dyn Fn(&[f64], &[f32]) -> (String, f64, bool) + Send>;
+pub use crate::eval_metric::{create_metrics, CustomMetricClosure, EvalMetric};
 
-enum EvalMetric {
-    /// A regression metric (`l1`/`l2`/`rmse`) over the raw score.
-    Reg(Metric),
-    /// A binary metric (`binary_logloss`/`binary_error`/`auc`).
-    Bin(BinaryMetric),
-    /// The `multi_logloss` metric over the class-major score buffer.
-    Multi(MultiLogloss),
-    /// A user custom-metric (feval) closure. Its `name()` and value come
-    /// from the closure; it feeds the SAME eval-history loop as the built-ins.
-    Custom(CustomMetricClosure),
-}
-
-impl EvalMetric {
-    fn name(&self) -> String {
-        match self {
-            EvalMetric::Reg(m) => m.name().to_string(),
-            EvalMetric::Bin(m) => m.name().to_string(),
-            EvalMetric::Multi(m) => m.name().to_string(),
-            // The custom-metric name is dynamic; resolve it by calling the closure
-            // with empty inputs is NOT valid, so we record the name lazily during
-            // eval. For the history-key setup we expose a stable placeholder that
-            // the first eval overwrites. To keep the name stable we instead cache
-            // it on first construction is not possible (closure is opaque), so the
-            // caller (train path) uses the closure-returned name from eval.
-            EvalMetric::Custom(_) => "custom".to_string(),
-        }
-    }
-
-    fn eval(&self, scores: &[f64], labels: &[f32]) -> Result<f64, LgbmError> {
-        match self {
-            EvalMetric::Reg(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
-            EvalMetric::Bin(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
-            EvalMetric::Multi(m) => m.eval(scores, labels).map_err(LgbmError::Metric),
-            EvalMetric::Custom(f) => {
-                let (_name, value, _higher) = f(scores, labels);
-                // A NaN / non-finite custom value is surfaced as a typed error,
-                // never silently recorded.
-                if !value.is_finite() {
-                    return Err(LgbmError::CustomMetric {
-                        detail: "custom metric (feval) returned a non-finite value".into(),
-                    });
-                }
-                Ok(value)
-            }
-        }
-    }
-
-    /// The closure-supplied metric name (for `Custom`) or the built-in name. For
-    /// `Custom` this calls the closure with the actual eval inputs so the recorded
-    /// history key matches the user's name.
-    fn resolved_name(&self, scores: &[f64], labels: &[f32]) -> String {
-        match self {
-            EvalMetric::Custom(f) => f(scores, labels).0,
-            other => other.name(),
-        }
-    }
-
-    /// C++ `factor_to_bigger_better` — `+1` for AUC, `-1` for the losses. Drives
-    /// the early-stopping comparison direction.
-    fn factor_to_bigger_better(&self) -> f64 {
-        match self {
-            EvalMetric::Reg(m) => m.factor_to_bigger_better(),
-            EvalMetric::Bin(m) => m.factor_to_bigger_better(),
-            // multi_logloss is a loss: lower is better.
-            EvalMetric::Multi(_) => -1.0,
-            // The custom metric's direction is dynamic; default to "lower is
-            // better" for the ES factor (the value-recording path is unaffected).
-            EvalMetric::Custom(_) => -1.0,
-        }
-    }
+/// The result of a CONFIG-DRIVEN prediction
+/// ([`Booster::predict_with_config`]) — one variant per C++ prediction MODE, so
+/// the differing element types (`f32` scores, `u32` leaf ids, `f64`
+/// contributions) stay typed instead of being flattened into one buffer.
+///
+/// Every variant is ROW-MAJOR with a fixed per-row width.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PredictOutput {
+    /// Transformed or raw scores, `num_tree_per_iteration` values per row
+    /// (`predict_raw_score` decides which).
+    Score(Vec<f32>),
+    /// Per-tree leaf indices, `num_iteration * num_tree_per_iteration` per row
+    /// (`predict_leaf_index`).
+    LeafIndex(Vec<u32>),
+    /// SHAP contributions, `(num_features + 1) * num_tree_per_iteration` per row —
+    /// the trailing slot of each block is the base value (`predict_contrib`).
+    Contrib(Vec<f64>),
 }
 
 /// A dense, identity-binned training corpus: raw integer-valued features (one
@@ -140,6 +79,11 @@ pub struct DenseCorpus {
     pub features: Vec<Vec<f64>>,
     /// Per-row labels (length `num_data`).
     pub labels: Vec<f32>,
+    /// Query/group boundaries (`Metadata::query_boundaries`): `num_queries + 1`
+    /// cumulative row offsets starting at `0` and ending at `num_data`. Empty when
+    /// the corpus is not query-grouped. Required by the query-grouped ranking
+    /// METRICS (`ndcg`/`map`); the pointwise metrics ignore it.
+    pub query_boundaries: Vec<i32>,
 }
 
 /// LightGBM's real per-bin upper bound for an identity-binned integer feature:
@@ -287,6 +231,11 @@ pub struct RawCorpus {
     /// Real-feature indices (columns) to bin as CATEGORICAL via
     /// [`BinMapper::find_bin_categorical`]. Empty ⇒ all numeric.
     pub categorical_features: Vec<usize>,
+    /// Query/group boundaries (`Metadata::query_boundaries`): `num_queries + 1`
+    /// cumulative row offsets starting at `0` and ending at `num_data`. Empty when
+    /// the corpus is not query-grouped. Required by the query-grouped ranking
+    /// METRICS (`ndcg`/`map`); the pointwise metrics ignore it.
+    pub query_boundaries: Vec<i32>,
     /// The binning + training [`Config`] (`max_bin`, `min_data_in_bin`,
     /// `bin_construct_sample_cnt`, `data_random_seed`, `use_missing`,
     /// `zero_as_missing`, `min_data_in_leaf`). Defaults to [`Config::default`].
@@ -328,6 +277,7 @@ impl RawCorpus {
             num_cols,
             labels,
             categorical_features: Vec::new(),
+            query_boundaries: Vec::new(),
             config: Config::default(),
         }
     }
@@ -354,6 +304,7 @@ impl RawCorpus {
             num_cols,
             labels,
             categorical_features: Vec::new(),
+            query_boundaries: Vec::new(),
             config: Config::default(),
         }
     }
@@ -474,6 +425,16 @@ pub fn build_feature_columns_from_raw_with_config(
     }
 
     let cfg = bin_config;
+    // `max_bin_by_feature` must cover every feature when set (dataset_loader.cpp:615
+    // `CHECK_EQ(num_col, max_bin_by_feature.size())`); a short vector would
+    // silently fall back to the global `max_bin` for the tail features.
+    if !cfg.max_bin_by_feature.is_empty() && cfg.max_bin_by_feature.len() != num_features {
+        return Err(LgbmError::InvalidConstraintLength {
+            param: "max_bin_by_feature",
+            actual: cfg.max_bin_by_feature.len(),
+            num_features,
+        });
+    }
     // The pre-filter threshold is OFF by default (no min_data_in_leaf filtering of
     // bins) for the facade — matching the in-memory sample path. The BinMapper
     // builders take care of scaling internally.
@@ -488,11 +449,21 @@ pub fn build_feature_columns_from_raw_with_config(
         // column-major store already lays feature j out contiguously).
         let column: &[f64] = corpus.column(j);
 
+        // `max_bin_by_feature[j]` overrides the global `max_bin` for this feature
+        // (dataset_loader.cpp:643-654: the whole vector is either empty or
+        // per-feature). Length is validated against num_features before this loop,
+        // so `get` can only miss on a corpus/config mismatch already rejected.
+        let feature_max_bin = cfg
+            .max_bin_by_feature
+            .get(j)
+            .copied()
+            .unwrap_or(cfg.max_bin);
+
         // Build the per-column BinMapper (Route A).
         let mapper: BinMapper = if corpus.categorical_features.contains(&j) {
             BinMapper::find_bin_categorical(
                 column.to_vec(),
-                cfg.max_bin,
+                feature_max_bin,
                 cfg.min_data_in_bin,
                 cfg.min_data_in_leaf,
                 pre_filter,
@@ -503,7 +474,7 @@ pub fn build_feature_columns_from_raw_with_config(
         } else {
             BinMapper::find_bin_from_column(
                 column,
-                cfg.max_bin,
+                feature_max_bin,
                 cfg.min_data_in_bin,
                 cfg.min_data_in_leaf,
                 pre_filter,
@@ -561,16 +532,16 @@ pub fn build_feature_columns_from_raw_with_config(
 /// [`LgbmError`] for an invalid corpus, an unsupported objective/metric, or a
 /// loop/learner failure — never a panic.
 pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmError> {
-    let first = config.objective.split_whitespace().next().unwrap_or("");
     // Resolve the objective over a thin DenseCorpus view (labels only are used by
     // resolve_objective's label guards; the features are NOT read there, so the
     // view carries an empty feature matrix — no col→row transpose).
     let label_view = DenseCorpus {
         features: Vec::new(),
         labels: corpus.labels.clone(),
+        query_boundaries: Vec::new(),
     };
     let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
-    let metrics = eval_metrics_for(first, config);
+    let metrics = create_metrics(config);
     // Wrap the RAW→bin step in BINNING_NS so phase_prof attributes it correctly
     // (previously only the DenseCorpus path's build_feature_columns was wrapped).
     let features = lgbm_treelearner::phase_prof::time(
@@ -588,6 +559,7 @@ pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmErr
         transformed_labels,
         metrics,
         raw_features,
+        &corpus.query_boundaries,
     )
 }
 
@@ -668,6 +640,129 @@ impl Booster {
         rows.iter()
             .map(|r| self.model.predict_raw(r, start_iteration, num_iteration))
             .collect()
+    }
+
+    /// CONFIG-DRIVEN prediction — the Rust mirror of the C++ `Predictor`
+    /// constructor (`predictor.hpp:41-120`), which selects the prediction MODE and
+    /// iteration RANGE from the `Config` rather than from call arguments.
+    ///
+    /// Reads, in the C++ precedence order:
+    /// - `predict_contrib` → SHAP contributions (wins over leaf-index and raw)
+    /// - `predict_leaf_index` → per-tree leaf ids
+    /// - `predict_raw_score` → untransformed scores (no `ConvertOutput`)
+    /// - otherwise the transformed prediction
+    ///
+    /// and in every mode the `[start_iteration_predict, num_iteration_predict)`
+    /// window (`num_iteration_predict <= 0` = "to the end"), plus
+    /// `pred_early_stop` / `pred_early_stop_freq` / `pred_early_stop_margin`.
+    ///
+    /// `predict_disable_shape_check` relaxes the "input has at least
+    /// `max_feature_idx + 1` columns" check, matching the C++ parameter of the
+    /// same name (`c_api.cpp` shape guard).
+    ///
+    /// Output is row-major, `outputs_per_row()` values per row.
+    ///
+    /// # Errors
+    /// [`LgbmError::Model`] on a shape mismatch (unless disabled) or an
+    /// unsupported mode/model combination (e.g. `predict_contrib` with linear
+    /// trees) — never a panic.
+    pub fn predict_with_config(
+        &self,
+        config: &Config,
+        rows: &[Vec<f64>],
+    ) -> Result<PredictOutput, LgbmError> {
+        let num_rows = rows.len() as i32;
+        let num_cols = rows.first().map_or(0, Vec::len) as i32;
+        // Flatten row-major into the f32 matrix the `lgbm-model` predict entry
+        // points take. A ragged input is rejected here rather than mis-indexed.
+        let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * num_cols as usize);
+        for r in rows {
+            if r.len() as i32 != num_cols {
+                return Err(LgbmError::InvalidCorpus {
+                    detail: format!(
+                        "ragged predict input: row of width {} among rows of width {num_cols}",
+                        r.len()
+                    ),
+                });
+            }
+            flat.extend(r.iter().map(|&v| v as f32));
+        }
+        // `predict_disable_shape_check`: the model-side entry points enforce the
+        // column count, so a disabled check pads narrow rows with 0.0 (the value a
+        // missing feature takes) up to the model's expected width.
+        let required = (self.model.max_feature_idx + 1).max(0);
+        let (flat, num_cols) = if config.predict_disable_shape_check && num_cols < required {
+            let mut padded = Vec::with_capacity(rows.len() * required as usize);
+            for r in flat.chunks(num_cols.max(0) as usize) {
+                padded.extend_from_slice(r);
+                padded.resize(padded.len() + (required - num_cols) as usize, 0.0);
+            }
+            (padded, required)
+        } else {
+            (flat, num_cols)
+        };
+
+        let m = &self.model;
+        let start = config.start_iteration_predict;
+        let num_iter = config.num_iteration_predict;
+        Ok(if config.predict_contrib {
+            PredictOutput::Contrib(
+                lgbm_model::predict::predict_contrib_mat(m, &flat, num_rows, num_cols)
+                    .map_err(LgbmError::Model)?,
+            )
+        } else if config.predict_leaf_index {
+            PredictOutput::LeafIndex(
+                lgbm_model::predict::predict_leaf_index_mat(m, &flat, num_rows, num_cols)
+                    .map_err(LgbmError::Model)?,
+            )
+        } else if config.pred_early_stop {
+            // Early-stopped prediction is RAW-score only in C++ (the early-stop
+            // callback inspects the raw margin), so it ignores predict_raw_score.
+            let (scores, _stopped_at) = lgbm_model::predict::predict_raw_early_stop_mat(
+                m,
+                &flat,
+                num_rows,
+                num_cols,
+                config.pred_early_stop_freq,
+                config.pred_early_stop_margin,
+            )
+            .map_err(LgbmError::Model)?;
+            PredictOutput::Score(scores)
+        } else if config.predict_raw_score {
+            PredictOutput::Score(
+                lgbm_model::predict::predict_raw_mat_range(
+                    m, &flat, num_rows, num_cols, start, num_iter,
+                )
+                .map_err(LgbmError::Model)?,
+            )
+        } else if start != 0 || num_iter >= 0 {
+            // A restricted iteration window with the transform applied: take the
+            // raw window, then run the objective's ConvertOutput per row.
+            let raw = lgbm_model::predict::predict_raw_mat_range(
+                m, &flat, num_rows, num_cols, start, num_iter,
+            )
+            .map_err(LgbmError::Model)?;
+            let width = self.outputs_per_row();
+            let mut out = Vec::with_capacity(raw.len());
+            let mut conv = vec![0.0f64; width];
+            for chunk in raw.chunks(width.max(1)) {
+                let raw64: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
+                self.objective_kind.convert(&raw64, &mut conv);
+                out.extend(conv.iter().map(|&v| v as f32));
+            }
+            PredictOutput::Score(out)
+        } else {
+            PredictOutput::Score(
+                lgbm_model::predict::predict_mat(m, &flat, num_rows, num_cols)
+                    .map_err(LgbmError::Model)?,
+            )
+        })
+    }
+
+    /// Number of score outputs per row (`num_tree_per_iteration`): `1` for
+    /// regression/binary, `num_class` for multiclass.
+    pub fn outputs_per_row(&self) -> usize {
+        self.objective_kind.num_output()
     }
 
     /// Per-feature split-count importance. Delegates to the C++-faithful
@@ -782,9 +877,8 @@ impl Booster {
 pub fn train(config: &Config, corpus: &DenseCorpus) -> Result<Booster, LgbmError> {
     // Resolve the training-side objective from config.objective. The custom-closure
     // path is `train_custom`.
-    let first = config.objective.split_whitespace().next().unwrap_or("");
     let (boost_obj, transformed_labels) = resolve_objective(config, corpus)?;
-    let metrics = eval_metrics_for(first, config);
+    let metrics = create_metrics(config);
     train_inner(config, corpus, boost_obj, transformed_labels, metrics)
 }
 
@@ -849,9 +943,8 @@ pub fn train_with_valid(
     corpus: &DenseCorpus,
     valid: &DenseCorpus,
 ) -> Result<Booster, LgbmError> {
-    let first = config.objective.split_whitespace().next().unwrap_or("");
     let (boost_obj, transformed_labels) = resolve_objective(config, corpus)?;
-    let metrics = eval_metrics_for(first, config);
+    let metrics = create_metrics(config);
     train_inner_full(config, corpus, Some(valid), boost_obj, transformed_labels, metrics)
 }
 
@@ -961,6 +1054,7 @@ where
         corpus.labels.clone(),
         metrics,
         raw_features,
+        &corpus.query_boundaries,
     )
 }
 
@@ -1025,6 +1119,7 @@ fn train_inner_full(
         labels,
         metrics,
         raw_features,
+        &corpus.query_boundaries,
     )
 }
 
@@ -1043,6 +1138,7 @@ fn train_inner_columns(
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
     raw_features: Option<Vec<f64>>,
+    train_query_boundaries: &[i32],
 ) -> Result<Booster, LgbmError> {
     train_inner_columns_full(
         config,
@@ -1055,6 +1151,7 @@ fn train_inner_columns(
         labels,
         metrics,
         raw_features,
+        train_query_boundaries,
     )
 }
 
@@ -1107,8 +1204,19 @@ fn train_inner_columns_full(
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
     raw_features: Option<Vec<f64>>,
+    train_query_boundaries: &[i32],
 ) -> Result<Booster, LgbmError> {
     use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};
+
+    // Query/group boundaries for the ranking METRICS. `&[]` means "not
+    // query-grouped": the pointwise metrics ignore it and `EvalMetric::eval`
+    // turns it into `None`, which a ranking metric reports as a typed error
+    // rather than silently evaluating over one implicit query.
+    let train_query_boundaries =
+        (!train_query_boundaries.is_empty()).then_some(train_query_boundaries);
+    let valid_query_boundaries = valid
+        .map(|v| v.query_boundaries.as_slice())
+        .filter(|qb| !qb.is_empty());
 
     let objective_string = canonical_objective_string(config);
     let objective_kind = ObjectiveKind::parse(&objective_string)
@@ -1141,6 +1249,10 @@ fn train_inner_columns_full(
             "cegb_penalty_feature_lazy",
             config.cegb_penalty_feature_lazy.len(),
         ),
+        // `GBDT::Init` (gbdt.cpp:60-62) CHECK_EQs feature_contri against
+        // num_total_features; without this a short vector would silently leave the
+        // tail features unpenalized.
+        ("feature_contri", config.feature_contri.len()),
     ] {
         if len != 0 && len != num_features {
             return Err(LgbmError::InvalidConstraintLength {
@@ -1184,6 +1296,33 @@ fn train_inner_columns_full(
     #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
     let client = wgpu_client();
     let gain = GainConfig::from_config(config);
+    // The per-feature constraint/penalty bundle. Everything in it (monotone
+    // constraints, interaction constraints, CEGB, extra-trees, feature_contri) is
+    // implemented in the learner but reaches it ONLY through `with_constraints` —
+    // without this call the facade would validate `monotone_constraints` and then
+    // silently train an unconstrained model.
+    let mut learner_constraints = LearnerConstraints::from_config(config);
+    // `forcedsplits_filename` names a JSON file; load + parse it here (the pure
+    // `from_config` conversion does no I/O). A missing/malformed file is a typed
+    // error, never a silently ignored constraint.
+    if !config.forcedsplits_filename.is_empty() {
+        let src = std::fs::read_to_string(&config.forcedsplits_filename).map_err(|e| {
+            LgbmError::Io {
+                detail: format!(
+                    "forcedsplits_filename `{}`: {e}",
+                    config.forcedsplits_filename
+                ),
+            }
+        })?;
+        learner_constraints.forced_splits =
+            lgbm_treelearner::parse_forced_splits(&src, num_features as i32)
+                .map_err(|e| LgbmError::InvalidCorpus {
+                    detail: format!(
+                        "forcedsplits_filename `{}`: {e}",
+                        config.forcedsplits_filename
+                    ),
+                })?;
+    }
     let mut learner = SerialTreeLearner::new(
         &backend,
         &client,
@@ -1191,7 +1330,25 @@ fn train_inner_columns_full(
         config.num_leaves,
         config.max_depth,
     )
-    .with_features(features.clone());
+    .with_features(features.clone())
+    .with_constraints(learner_constraints)
+    .with_histogram_pool_size(config.histogram_pool_size);
+    // `feature_fraction` / `feature_fraction_bynode` (`ColSampler`, C++
+    // `col_sampler_` in `SerialTreeLearner`). Like the constraint bundle above, the
+    // sampler is implemented and oracle-tested in the learner but reached it ONLY via
+    // `with_feature_fraction`, which nothing outside `learner_parity` called — so
+    // `feature_fraction` parsed, validated, and then trained an UNSAMPLED model.
+    //
+    // Enabled only when a fraction is actually below 1.0: `ColSampler::new(1.0, 1.0,
+    // ..)` performs no draw, but skipping construction entirely keeps the default
+    // spine byte-identical AND avoids paying for the per-node mask work.
+    if config.feature_fraction < 1.0 || config.feature_fraction_bynode < 1.0 {
+        learner = learner.with_feature_fraction(
+            config.feature_fraction,
+            config.feature_fraction_bynode,
+            config.feature_fraction_seed,
+        );
+    }
 
     // ---- the GBDT loop (optionally with bagging / GOSS) ----
     // GOSS (data_sample_strategy=goss) and bagging are mutually exclusive — GOSS
@@ -1333,11 +1490,18 @@ fn train_inner_columns_full(
     // it — we therefore re-derive valid scores by predicting the grown trees per iter
     // (which carry the AddBias-folded init), needing no separate init injection.
 
+    // One spec per OUTPUT VALUE (a multi-`@k` ranking metric contributes several),
+    // so the early-stopping row layout matches the eval row the loop pushes.
     let metric_specs: Vec<MetricSpec> = metrics
         .iter()
-        .map(|m| MetricSpec {
-            name: m.name(),
-            factor_to_bigger_better: m.factor_to_bigger_better(),
+        .flat_map(|m| {
+            m.names()
+                .into_iter()
+                .zip(m.factors())
+                .map(|(name, factor_to_bigger_better)| MetricSpec {
+                    name,
+                    factor_to_bigger_better,
+                })
         })
         .collect();
     let mut early = EarlyStopping::new(
@@ -1356,19 +1520,22 @@ fn train_inner_columns_full(
     // opt in via `is_provide_training_metric=true` (the C++ behavior).
     let provide_train = config.is_provide_training_metric;
     let metric_freq = config.metric_freq.max(1);
-    let mut train_eval_history: Vec<(String, Vec<f64>)> = metrics
+    // History is keyed per OUTPUT VALUE, not per metric object: `ndcg` with
+    // `eval_at=[1,3,5]` is one metric contributing three named values
+    // (`ndcg@1`/`ndcg@3`/`ndcg@5`), mirroring C++ `Metric::GetName()` returning a
+    // `vector<string>`. `flat_names` is that flattened view.
+    let flat_names: Vec<String> = metrics.iter().flat_map(EvalMetric::names).collect();
+    let mut train_eval_history: Vec<(String, Vec<f64>)> = flat_names
         .iter()
-        .map(|m| (format!("training {}", m.name()), Vec::new()))
+        .map(|n| (format!("training {n}"), Vec::new()))
         .collect();
-    let mut valid_eval_history: Vec<(String, Vec<f64>)> = metrics
+    let mut valid_eval_history: Vec<(String, Vec<f64>)> = flat_names
         .iter()
-        .map(|m| (format!("valid_0 {}", m.name()), Vec::new()))
+        .map(|n| (format!("valid_0 {n}"), Vec::new()))
         .collect();
     // The legacy training-only eval history (keyed by bare metric name).
-    let mut legacy_eval_history: Vec<(String, Vec<f64>)> = metrics
-        .iter()
-        .map(|m| (m.name(), Vec::new()))
-        .collect();
+    let mut legacy_eval_history: Vec<(String, Vec<f64>)> =
+        flat_names.iter().map(|n| (n.clone(), Vec::new())).collect();
 
     let mut iter_scores: Vec<Vec<f64>> = Vec::new();
     let mut iter_grad_hess: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
@@ -1437,23 +1604,27 @@ fn train_inner_columns_full(
 
         // Training metrics: history is metric_freq-gated.
         if do_eval && provide_train {
-            for (mi, m) in metrics.iter().enumerate() {
+            let mut out = 0usize;
+            for m in &metrics {
                 // Time the per-iter training-metric eval over all rows.
-                let v = lgbm_treelearner::phase_prof::time(
+                let vs = lgbm_treelearner::phase_prof::time(
                     &lgbm_treelearner::phase_prof::METRIC_NS,
-                    || m.eval(cur_score, corpus_labels),
+                    || m.eval(cur_score, corpus_labels, train_query_boundaries),
                 )?;
                 // A custom-metric (feval) key is resolved lazily from the closure
                 // (the placeholder "custom" set at history-setup is overwritten on
                 // the first eval with the user-supplied name) so the recorded
                 // history key matches the user's metric name.
-                if matches!(m, EvalMetric::Custom(_)) {
-                    let name = m.resolved_name(cur_score, corpus_labels);
-                    legacy_eval_history[mi].0 = name.clone();
-                    train_eval_history[mi].0 = format!("training {name}");
+                if m.is_custom() {
+                    let name = m.resolved_names(cur_score, corpus_labels).remove(0);
+                    legacy_eval_history[out].0 = name.clone();
+                    train_eval_history[out].0 = format!("training {name}");
                 }
-                train_eval_history[mi].1.push(v);
-                legacy_eval_history[mi].1.push(v);
+                for v in vs {
+                    train_eval_history[out].1.push(v);
+                    legacy_eval_history[out].1.push(v);
+                    out += 1;
+                }
             }
         }
 
@@ -1463,13 +1634,14 @@ fn train_inner_columns_full(
         // metric_freq_thins_eval_history test stays green); feed `row` to
         // `early.update` whenever ES is on (EVERY iteration).
         if valid_nd > 0 && (do_eval || es_enabled) {
-            let mut row = Vec::with_capacity(metrics.len());
-            for (mi, m) in metrics.iter().enumerate() {
-                let v = m.eval(&valid_score, &valid_labels)?;
-                if do_eval {
-                    valid_eval_history[mi].1.push(v);
+            let mut row = Vec::with_capacity(flat_names.len());
+            for m in &metrics {
+                for v in m.eval(&valid_score, &valid_labels, valid_query_boundaries)? {
+                    if do_eval {
+                        valid_eval_history[row.len()].1.push(v);
+                    }
+                    row.push(v);
                 }
-                row.push(v);
             }
             if es_enabled {
                 let stop = early.update(it, &EvalSnapshot { values: vec![row] });
@@ -1551,35 +1723,6 @@ fn format_sigmoid(sigmoid: f64) -> String {
     }
 }
 
-/// The per-objective default eval metrics (matching the capture's `metric=` list):
-/// `[l2, rmse]` for regression, `[l1, l2, rmse]` for regression_l1,
-/// `[binary_logloss, binary_error, auc]` for binary, `[multi_logloss]` for
-/// multiclass/multiclassova.
-fn eval_metrics_for(objective_first_token: &str, config: &Config) -> Vec<EvalMetric> {
-    let sigmoid = config.sigmoid;
-    match objective_first_token {
-        "binary" => vec![
-            EvalMetric::Bin(BinaryMetric::BinaryLogloss { sigmoid }),
-            EvalMetric::Bin(BinaryMetric::BinaryError { sigmoid }),
-            EvalMetric::Bin(BinaryMetric::Auc),
-        ],
-        "multiclass" | "softmax" => vec![EvalMetric::Multi(MultiLogloss::new(
-            ObjectiveKind::Multiclass { num_class: config.num_class },
-            config.num_class,
-        ))],
-        "multiclassova" | "multiclass_ova" | "ova" | "ovr" => {
-            vec![EvalMetric::Multi(MultiLogloss::new(
-                ObjectiveKind::MulticlassOva { num_class: config.num_class, sigmoid },
-                config.num_class,
-            ))]
-        }
-        "regression_l1" | "l1" | "mean_absolute_error" | "mae" => {
-            vec![EvalMetric::Reg(Metric::L1), EvalMetric::Reg(Metric::L2), EvalMetric::Reg(Metric::Rmse)]
-        }
-        _ => vec![EvalMetric::Reg(Metric::L2), EvalMetric::Reg(Metric::Rmse)],
-    }
-}
-
 /// `feature_names=` for the model text: `Column_0 Column_1 ...` (the LightGBM
 /// default when no names are supplied — matching the capture).
 fn feature_names(num_features: usize) -> String {
@@ -1657,7 +1800,7 @@ mod tests {
         let labels = vec![
             2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
         ];
-        DenseCorpus { features, labels }
+        DenseCorpus { features, labels, query_boundaries: Vec::new() }
     }
 
     #[test]
@@ -1931,6 +2074,7 @@ mod tests {
         let valid_corpus = DenseCorpus {
             features: spine_corpus().features,
             labels: vec![10.0f32; 12], // constant => valid metric plateaus
+            query_boundaries: Vec::new(),
         };
         let cfg = TrainingBuilder::new()
             .objective("regression")
@@ -2034,6 +2178,7 @@ mod tests {
         let corpus = DenseCorpus {
             features: vec![vec![0.0], vec![2.0]],
             labels: vec![1.0, 2.0],
+            query_boundaries: Vec::new(),
         };
         assert!(build_feature_columns(&corpus).is_err());
     }

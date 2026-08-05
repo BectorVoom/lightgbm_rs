@@ -36,7 +36,11 @@
 use cubecl::prelude::*;
 
 use crate::error::ComputeError;
-use crate::kernels::primitives::{prefix_sum_exclusive_u32_on, prefix_sum_inclusive_u16_on};
+use crate::kernels::primitives::prefix_sum_exclusive_u32_on;
+// Used ONLY by the `#[cfg(debug_assertions)]` tail-consistency check below, so the
+// import must carry the same gate or a release build warns it unused.
+#[cfg(debug_assertions)]
+use crate::kernels::primitives::prefix_sum_inclusive_u16_on;
 use crate::kernels::split_info::SplitScalars;
 use crate::BinColumn;
 

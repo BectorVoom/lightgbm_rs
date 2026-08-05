@@ -52,11 +52,14 @@ impl MultiError {
         }
     }
 
-    /// C++ `MultiErrorMetric::Name`: `multi_error` (top_k==1) else `multi_error@k`.
-    pub fn name(&self) -> &'static str {
-        // The @k suffix is dynamic in C++; for the in-scope default (k==1) we report
-        // the canonical `multi_error`. Only the default top-k is exercised by the parity.
-        "multi_error"
+    /// C++ `MultiErrorMetric::Name` (multiclass_metric.hpp:153-158): `multi_error`
+    /// when `multi_error_top_k == 1`, else `multi_error@<k>`.
+    pub fn name(&self) -> String {
+        if self.top_k == 1 {
+            "multi_error".to_string()
+        } else {
+            format!("multi_error@{}", self.top_k)
+        }
     }
 
     /// C++ `factor_to_bigger_better`: `-1` (a loss).
@@ -136,6 +139,24 @@ impl AucMu {
         Self {
             num_class: nc,
             class_weights,
+        }
+    }
+
+    /// Construct from the DERIVED `num_class x num_class` weight matrix
+    /// (`Config::auc_mu_weights_matrix`, produced by `Config::GetAucMuWeights`),
+    /// mirroring `AucMuMetric::Init` (`multiclass_metric.hpp:187`).
+    ///
+    /// A matrix whose shape does not match `num_class` falls back to the
+    /// equal-weight default — the same effective behavior as a C++ `Config` that
+    /// never ran `GetAucMuWeights` (an empty matrix), and never a panic.
+    pub fn with_weights(num_class: i32, class_weights: &[Vec<f64>]) -> Self {
+        let nc = num_class.max(0) as usize;
+        if class_weights.len() != nc || class_weights.iter().any(|r| r.len() != nc) {
+            return Self::new(num_class);
+        }
+        Self {
+            num_class: nc,
+            class_weights: class_weights.to_vec(),
         }
     }
 

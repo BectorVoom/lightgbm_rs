@@ -94,6 +94,36 @@ fn bench_config(objective: &str) -> Config {
         .expect("config builds");
     cfg.max_bin = 255;
     cfg.data_random_seed = 1;
+
+    // Per-parameter benchmarking: `LGBM_BENCH_PARAMS="num_leaves=63,max_bin=127"`
+    // re-resolves the whole config through `Config::from_params` with the overrides
+    // applied on top of the pinned baseline, so a sweep measures the parameter's
+    // real cost through the SAME code path a user's params dict takes (alias
+    // resolution, CHECK validation and conflict mutations included).
+    if let Ok(spec) = std::env::var("LGBM_BENCH_PARAMS")
+        && !spec.trim().is_empty()
+    {
+        let mut params: std::collections::HashMap<String, String> = [
+            ("objective", objective),
+            ("num_iterations", "100"),
+            ("learning_rate", "0.1"),
+            ("num_leaves", "31"),
+            ("seed", "1"),
+            ("deterministic", "true"),
+            ("max_bin", "255"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for kv in spec.split(',') {
+            if let Some((k, v)) = kv.split_once('=') {
+                params.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        let mut c = Config::from_params(&params).expect("bench params build");
+        c.data_random_seed = 1;
+        return c;
+    }
     cfg
 }
 

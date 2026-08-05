@@ -48,7 +48,7 @@ fn spine_corpus() -> DenseCorpus {
     let labels = vec![
         2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
     ];
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// The binary spine corpus, identical to `boosting_oracle_capture.py::binary_corpus`
@@ -60,7 +60,7 @@ fn binary_corpus() -> DenseCorpus {
     let labels = vec![
         0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
     ];
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// A builder shared across the cells: 10 iters, lr 0.1, num_leaves 4,
@@ -123,7 +123,7 @@ fn multiclass_corpus() -> DenseCorpus {
     let labels = vec![
         0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.0, 1.0, 2.0,
     ];
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// The number of classes for the multiclass cells (matches the capture).
@@ -946,7 +946,7 @@ fn goss_corpus() -> DenseCorpus {
         .map(|i| vec![(i / 4) as f64, (i % 3) as f64])
         .collect();
     let labels: Vec<f32> = (0..n).map(|i| (i as f32) * 1.5 + 1.0).collect();
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// The GOSS capture control (mirrors `goss_oracle_capture.py`).
@@ -1391,6 +1391,7 @@ fn matrix_valid_corpus(train: &DenseCorpus) -> DenseCorpus {
     DenseCorpus {
         features: train.features.clone(),
         labels: vec![10.0f32; train.features.len()],
+        query_boundaries: Vec::new(),
     }
 }
 
@@ -3477,7 +3478,7 @@ fn rf_single_corpus() -> DenseCorpus {
     let labels = vec![
         2.0f32, 3.0, 5.0, 6.0, 9.0, 10.0, 12.0, 13.0, 16.0, 17.0, 19.0, 20.0,
     ];
-    DenseCorpus { features, labels }
+    DenseCorpus { features, labels, query_boundaries: Vec::new() }
 }
 
 /// Build the RF single-output parity cell. RF is selected via `boosting=rf` with
