@@ -262,8 +262,23 @@ impl HistogramPool {
             let (lo, hi) = self.buffers.split_at_mut(d_base);
             (&mut hi[..n], &lo[s_base..s_base + n])
         };
-        for (dc, sc) in d.iter_mut().zip(s) {
-            *dc -= *sc;
+        // Crew-chunked above 8192 cells: pure element-wise op over disjoint
+        // contiguous ranges ⇒ cell values and order are UNCHANGED (bit-exact
+        // regardless of chunking); below the threshold the serial loop runs.
+        let crew = lgbm_compute::crew::Crew::global();
+        if n >= 8192 && crew.is_parallel() {
+            let chunk = n.div_ceil(crew.n_threads()).max(1);
+            let mut pairs: Vec<(&mut [f64], &[f64])> =
+                d.chunks_mut(chunk).zip(s.chunks(chunk)).collect();
+            lgbm_compute::crew::for_each_mut(&mut pairs, |_, (dc_run, sc_run)| {
+                for (dc, sc) in dc_run.iter_mut().zip(sc_run.iter()) {
+                    *dc -= *sc;
+                }
+            });
+        } else {
+            for (dc, sc) in d.iter_mut().zip(s) {
+                *dc -= *sc;
+            }
         }
     }
 

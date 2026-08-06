@@ -49,13 +49,17 @@ fn par_partition_min() -> usize {
         std::env::var("LGBM_PAR_PARTITION_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            // Swept 2026-08-06 (200k×50, binary, 100 iters, M1 8-thread), train wall:
+            // Swept 2026-08-06 under RAYON (200k×50, binary, 100 iters, M1 8-thread):
             //   65536 → 2072ms   16384 → 2009ms   8192 → 1981ms
             //    4096 → 2008ms    2048 → 2023ms
-            // 8192 is the minimum; below it rayon dispatch overhead on small leaves
-            // wins back the parallel gain. Both arms are byte-identical
+            // Re-swept the same day after the partition moved to the SPIN CREW
+            // (~2µs dispatch vs rayon's ~30µs; `num_leaves=255` where mid-size
+            // splits dominate): 8192 → 4239ms, 2048 → 4179ms, 1024 → 4277ms,
+            // 512 → 4121ms — flat within noise below 2048. 2048 is the new
+            // default (captures the crew win; leaves genuinely tiny splits
+            // serial). Both arms are byte-identical
             // (`[left ascending | right ascending]`), so this is parity-neutral.
-            .unwrap_or(8192)
+            .unwrap_or(2048)
     })
 }
 
@@ -490,12 +494,22 @@ impl DataPartition {
         num_bin: u32,
         go_right: &(impl Fn(u32) -> bool + Sync),
     ) -> Result<(i32, i32), ComputeError> {
-        use rayon::prelude::*;
+        use lgbm_compute::crew;
 
-        // Block the leaf's rows: B = min(num_threads, ceil(count/min_block)) blocks.
+        // Block the leaf's rows: B = min(crew_threads, ceil(count/min_block)) blocks.
+        // The spin crew replaces the rayon fork/join (~30µs) with a ~2µs dispatch;
+        // blocking factor only shapes scratch layout, never the `[left|right]`
+        // output bits (ascending-block tiling below), so any B is bit-exact.
         let min_block = 4096usize;
         let max_blocks = count.div_ceil(min_block).max(1);
-        let n_blocks_target = rayon::current_num_threads().max(1).min(max_blocks).max(1);
+        // Blocks follow whichever pool executes: the crew when it can
+        // parallelize, else the rayon fallback (`for_each_mut_or_rayon`).
+        let pool_threads = if crew::Crew::global().is_parallel() {
+            crew::Crew::global().n_threads()
+        } else {
+            rayon::current_num_threads().max(1)
+        };
+        let n_blocks_target = pool_threads.min(max_blocks).max(1);
         let block = count.div_ceil(n_blocks_target).max(1);
 
         // ---- pass 1 (parallel): disjoint field borrows — read `self.indices[begin..]`,
@@ -505,34 +519,46 @@ impl DataPartition {
         let right_scratch = &mut self.part_right[..count];
 
         // Per block: (left_count, right_count, lowest_bad_index_within_block).
-        let results: Vec<BlockResult> = left_scratch
-            .par_chunks_mut(block)
-            .zip(right_scratch.par_chunks_mut(block))
-            .zip(indices_slice.par_chunks(block))
-            .enumerate()
-            .map(|(bi, ((lchunk, rchunk), ichunk))| {
-                let base = bi * block;
-                let mut lc = 0usize;
-                let mut rc = 0usize;
-                let mut bad: Option<(usize, u32)> = None;
-                for (j, &row) in ichunk.iter().enumerate() {
-                    let b = feature_bins.bin(row as usize);
-                    if b >= num_bin {
-                        // First (lowest local) bad in this block; global min taken below.
-                        bad = Some((base + j, b));
-                        break;
-                    }
-                    // BRANCHLESS scatter — see the serial arm's note: write both
-                    // heads, advance one counter. Same routing ⇒ same output bits.
-                    let gr = go_right(b);
-                    rchunk[rc] = row;
-                    lchunk[lc] = row;
-                    rc += usize::from(gr);
-                    lc += usize::from(!gr);
-                }
-                (lc, rc, bad)
+        struct Pass1Block<'a> {
+            lchunk: &'a mut [u32],
+            rchunk: &'a mut [u32],
+            ichunk: &'a [u32],
+            out: BlockResult,
+        }
+        let mut blocks: Vec<Pass1Block<'_>> = left_scratch
+            .chunks_mut(block)
+            .zip(right_scratch.chunks_mut(block))
+            .zip(indices_slice.chunks(block))
+            .map(|((lchunk, rchunk), ichunk)| Pass1Block {
+                lchunk,
+                rchunk,
+                ichunk,
+                out: (0, 0, None),
             })
             .collect();
+        crew::for_each_mut_or_rayon(&mut blocks, |bi, blk| {
+            let base = bi * block;
+            let mut lc = 0usize;
+            let mut rc = 0usize;
+            let mut bad: Option<(usize, u32)> = None;
+            for (j, &row) in blk.ichunk.iter().enumerate() {
+                let b = feature_bins.bin(row as usize);
+                if b >= num_bin {
+                    // First (lowest local) bad in this block; global min taken below.
+                    bad = Some((base + j, b));
+                    break;
+                }
+                // BRANCHLESS scatter — see the serial arm's note: write both
+                // heads, advance one counter. Same routing ⇒ same output bits.
+                let gr = go_right(b);
+                blk.rchunk[rc] = row;
+                blk.lchunk[lc] = row;
+                rc += usize::from(gr);
+                lc += usize::from(!gr);
+            }
+            blk.out = (lc, rc, bad);
+        });
+        let results: Vec<BlockResult> = blocks.iter().map(|b| b.out).collect();
 
         // Reduce per-block lowest-bad to the GLOBAL lowest leaf position. `self.indices`
         // is still UNMUTATED (pass-1 wrote only scratch), so return before pass-2.
@@ -575,17 +601,15 @@ impl DataPartition {
             rrem = tail;
         }
 
-        left_parts
-            .into_par_iter()
-            .zip(right_parts.into_par_iter())
-            .enumerate()
-            .for_each(|(bi, (ldst, rdst))| {
-                let base = bi * block;
-                let lc = ldst.len();
-                let rc = rdst.len();
-                ldst.copy_from_slice(&part_left[base..base + lc]);
-                rdst.copy_from_slice(&part_right[base..base + rc]);
-            });
+        let mut pass2: Vec<(&mut [u32], &mut [u32])> =
+            left_parts.into_iter().zip(right_parts).collect();
+        crew::for_each_mut_or_rayon(&mut pass2, |bi, (ldst, rdst)| {
+            let base = bi * block;
+            let lc = ldst.len();
+            let rc = rdst.len();
+            ldst.copy_from_slice(&part_left[base..base + lc]);
+            rdst.copy_from_slice(&part_right[base..base + rc]);
+        });
 
         Ok((total_left as i32, (count - total_left) as i32))
     }

@@ -31,6 +31,15 @@ cubecl-hip-sys = { version = "7", optional = true }
 # on the hot path. serde 1.x is the canonical, pre-vetted crate already in the lockfile.
 serde = { version = "1", features = ["derive"], optional = true }
 
+# macOS-only: `sysctlbyname("hw.perflevel0.physicalcpu")` so the spin crew's
+# default size is the PERFORMANCE-core count on Apple Silicon — spinning workers
+# scheduled onto E-cores measurably regress the crew (255-leaf bench: 8 threads
+# 4267ms vs 4 threads 3903ms on an M1 4P+4E), and the C++ reference shows the
+# same shape (LightGBM 4.6 best nthread = 4 on this box). libc is already a
+# transitive dep (cubecl lockfile), so this adds no new supply-chain surface.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 # `cpu` (default) keeps the cubecl-cpu reference runtime always available — it is
 # the D-04 deterministic anchor, not an optional path. `rocm` is opt-in so a

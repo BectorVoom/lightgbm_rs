@@ -2144,6 +2144,7 @@ dependencies = [
  "lgbm-core",
  "lgbm-dataset",
  "lgbm-model",
+ "libc",
  "oracle-harness",
  "rayon",
  "serde",

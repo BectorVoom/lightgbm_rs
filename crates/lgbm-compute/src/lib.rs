@@ -10,6 +10,7 @@
 //! re-exported [`ComputeError`]), never on `cubecl` directly — that is the whole
 //! point of the seam, and the `cmp01_containment` guard test enforces it.
 
+pub mod crew;
 pub mod device_metric;
 pub mod device_objective;
 pub mod error;
@@ -365,10 +366,22 @@ fn build_histograms_into(
         groups.push(grp);
     }
     if parallel {
-        use rayon::prelude::*;
-        groups.par_iter_mut().for_each(|grp| {
-            fold_feature_group_into(feature_bins, leaf_rows, ord_g, ord_h, grp);
-        });
+        // The spin crew replaces the rayon fork/join here: same group tasks,
+        // same disjoint outputs, same per-feature fold order ⇒ byte-identical
+        // (the crew only schedules; `build_histograms_parallel_equals_serial`
+        // pins the arm equality). Falls back to rayon when the crew is disabled
+        // (`LGBM_CREW=0` with rayon still multi-threaded).
+        let cw = crew::Crew::global();
+        if cw.is_parallel() {
+            crew::for_each_mut(&mut groups, |_, grp| {
+                fold_feature_group_into(feature_bins, leaf_rows, ord_g, ord_h, grp);
+            });
+        } else {
+            use rayon::prelude::*;
+            groups.par_iter_mut().for_each(|grp| {
+                fold_feature_group_into(feature_bins, leaf_rows, ord_g, ord_h, grp);
+            });
+        }
     } else {
         for grp in &mut groups {
             fold_feature_group_into(feature_bins, leaf_rows, ord_g, ord_h, grp);
@@ -677,13 +690,17 @@ fn par_build_threshold() -> usize {
         // warm median of 3, fusion disabled) — train wall by threshold:
         //   16384 -> 2457ms   4096 -> 2236ms   1024 -> 2121ms
         //     256 -> 2086ms     64 -> 2102ms      0 -> 2031ms
-        // Monotone down to ~256 then flat-to-noisy. 1024 is chosen over 0 as the
-        // conservative point: it captures most of the win (14%) while still keeping
-        // genuinely tiny leaves serial, so a box with higher rayon dispatch cost
-        // than this one cannot regress on small trains. Parity-neutral — the
+        // Monotone down to ~256 then flat-to-noisy. 1024 was chosen over 0 as the
+        // conservative point under RAYON dispatch (~30µs/region).
+        //
+        // Re-swept 2026-08-06 under the SPIN CREW (~2µs dispatch;
+        // `num_leaves=255`, where small-leaf builds dominate): 1024 -> 5196ms,
+        // 256 -> 4743ms, 64 -> 4618ms, 0 -> 4723ms. 64 is the new default: the
+        // crew's dispatch floor is ~15× lower, so only genuinely tiny folds
+        // (<64 rows × features) still lose to it. Parity-neutral — the
         // parallel and serial paths fold in the SAME order into disjoint regions
         // (`build_histograms_parallel_equals_serial`).
-        .unwrap_or(1024)
+        .unwrap_or(64)
 }
 
 /// The feature-count at/above which a per-leaf SPLIT SCAN parallelizes across
@@ -709,10 +726,25 @@ fn par_build_threshold() -> usize {
 /// `LGBM_PAR_SCAN_THRESHOLD=0` (or any small value) to force the parallel path on
 /// for the bit-exact parity proof / future re-measurement.
 fn par_scan_threshold() -> usize {
-    std::env::var("LGBM_PAR_SCAN_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(usize::MAX)
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LGBM_PAR_SCAN_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                // Under rayon this arm was a measured LOSS at every width (a
+                // fork/join costs ~30µs, a 50-feature scan ~50µs), hence the old
+                // usize::MAX default. The spin crew's ~2µs dispatch flips that:
+                // parallelize whenever the leaf scans at least 16 features.
+                // Serial when the crew cannot parallelize (LGBM_CREW=0 or a
+                // 1-thread pool) — the scan stays the §8 serial anchor path.
+                if crew::Crew::global().is_parallel() {
+                    16
+                } else {
+                    usize::MAX
+                }
+            })
+    })
 }
 
 /// Floor for a core-scaled unified-fusion threshold: never let a many-core machine
@@ -2962,8 +2994,6 @@ impl Backend for CpuBackend {
             return Ok(out);
         }
 
-        use rayon::prelude::*;
-
         // 1) Hoisted validation in ascending feature order ⇒ deterministic error:
         //    return the LOWEST-index offending feature's error, identical to the
         //    serial loop's first-failure behavior. Records each feature's validated
@@ -2991,36 +3021,39 @@ impl Backend for CpuBackend {
             ranges.push((f.slot_off, end));
         }
 
-        // 2) ONE fork/join per leaf, amortized across all features. `par_iter()`
-        //    preserves order ⇒ out[i] corresponds to feats[i]. find_best_split takes
-        //    `&self` + `client: &ComputeClient` (shared refs) and `buf` is `&[f64]`
-        //    (shared) ⇒ Send+Sync-safe to fan out; the validated ranges make each
-        //    closure infallible.
-        let out: Vec<SplitInfo> = feats
-            .par_iter()
-            .zip(ranges.par_iter())
-            .map(|(f, &(start, end))| {
-                let hist = &buf[start..end];
-                // SAFETY of unwrap-free path: find_best_split itself only errors on
-                // region-length issues already validated above; treat any residual
-                // error as a hard fault by propagating through a Result collect.
-                self.find_best_split(
-                    client,
-                    hist,
-                    cfg,
-                    f.num_bin,
-                    f.offset,
-                    f.default_bin,
-                    f.most_freq_bin,
-                    f.skip_default_bin,
-                    f.na_as_missing,
-                    f.run_forward,
-                    sum_gradient,
-                    sum_hessian,
-                    num_data,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // 2) ONE crew region per leaf (~2µs dispatch), amortized across all
+        //    features. Each task writes slot `i` of `results` ⇒ out[i] corresponds
+        //    to feats[i] exactly as the serial loop orders them; each feature's
+        //    scan is the byte-untouched `find_best_split`. Error propagation stays
+        //    deterministic: the lowest-index error wins in the serial collect below
+        //    (region-length errors were already hoisted, so errors here are
+        //    residual hard faults only).
+        let mut results: Vec<Option<Result<SplitInfo, ComputeError>>> =
+            vec![None; feats.len()];
+        crew::for_each_mut(&mut results, |i, slot| {
+            let f = &feats[i];
+            let (start, end) = ranges[i];
+            let hist = &buf[start..end];
+            *slot = Some(self.find_best_split(
+                client,
+                hist,
+                cfg,
+                f.num_bin,
+                f.offset,
+                f.default_bin,
+                f.most_freq_bin,
+                f.skip_default_bin,
+                f.na_as_missing,
+                f.run_forward,
+                sum_gradient,
+                sum_hessian,
+                num_data,
+            ));
+        });
+        let mut out = Vec::with_capacity(feats.len());
+        for slot in results {
+            out.push(slot.expect("crew ran every index")?);
+        }
         Ok(out)
     }
 

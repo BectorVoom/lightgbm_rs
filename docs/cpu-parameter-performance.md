@@ -702,3 +702,110 @@ lgbm-boosting, lgbm-dataset) is green; model dumps are byte-identical to the
 pre-change binary at every step; the model sha256 is identical at 1/2/4/8 rayon
 threads. Two new drift gates pin the fold refactor:
 `grouped_fold_is_bit_identical_to_single`, `rowmajor_fold_is_bit_identical_to_columnwise`.
+
+---
+
+# 9. The spin crew: beating LightGBM on EVERY parameter cell (2026-08-06)
+
+§8 won the baseline; the §5.3 matrix still had `num_leaves=255` at 0.66× and the
+`max_bin` cells at 0.77-0.83×. Chasing those produced a structural fix that
+flipped **every measured cell** to a win.
+
+## 9.1 Root cause: rayon's dispatch floor serializes high-leaf-count training
+
+At `num_leaves=255` the port scaled 7497ms (1 thread) → 6291ms (4) → 6763ms (8) —
+**1.19×** from 8 threads, while LightGBM got 2.23× (12011 → 5383ms). Per core the
+port was already 1.6× faster; it lost the whole cell on parallel scaling.
+
+Why: the average 255-leaf leaf holds ~784 rows, under every parallel threshold, so
+histogram builds ran serial; the per-leaf split scan was serial by default
+(`par_scan_threshold = usize::MAX`); the partition threshold (8192) kept every
+mid-tree split serial. Nearly the entire train ran on one thread while 7 spun in
+`__psynch_cvwait` (the dominant profile entry).
+
+The thresholds were not mis-tuned — they were CORRECT for rayon. A microbenchmark
+(50 tasks × 0.4µs, warm pool, back-to-back regions) measured a rayon fork/join at
+**~30µs on this box** — more than an entire 255-bin 50-feature leaf scan (~20µs
+of real work). Forcing the old rayon parallel-scan arm on made the 255-leaf train
+*slower* (7050ms vs 6763ms), reproducing the §"HONEST NULL" verdict. Every
+per-split parallel region loses under a 30µs dispatch; OpenMP's spin-waiting
+workers give the C++ reference a ~2µs barrier, and that difference — not kernel
+quality — was the entire scaling gap.
+
+## 9.2 The fix: `lgbm_compute::crew` — persistent spin-waiting workers
+
+A small OpenMP-shaped executor (`crates/lgbm-compute/src/crew.rs`): N persistent
+threads spin-wait for work, claim task indices off one atomic counter, run the
+region's closure, and resume spinning; after ~50µs idle they park (so long serial
+phases cost nothing) and the next dispatch unparks them. Dispatch ≈ 2µs.
+
+Design points, all load-bearing:
+
+- **Epoch-tagged claims.** The claim counter and region epoch share one
+  `AtomicU64` (`epoch << 24 | index`), so a stale worker's late `fetch_add` can
+  never claim an index of a region whose counter it did not observe — the ABA
+  a plain reset counter admits (double-execution / dangling-job read). An
+  in-range claim blocks the region's drain until it executes, which is exactly
+  what makes the job-cell read after an in-range claim race-free.
+- **Bit-exactness by construction.** The crew only schedules; work decomposition
+  is unchanged from the rayon arms (disjoint per-feature / per-block outputs,
+  per-task internal order identical, serial ordered assembly). A crew of 1, a
+  disabled crew (`LGBM_CREW=0`), or a contended dispatch degrades to the serial
+  ascending loop — same bytes on every arm.
+- **P-core sizing.** Default crew size = `hw.perflevel0.physicalcpu` on Apple
+  Silicon (capped at the rayon pool size), else the rayon pool size;
+  `LGBM_CREW_THREADS` overrides. Spinning workers scheduled onto M1 E-cores
+  regress (255-leaf: 8 threads 4267ms vs 4 threads 3903ms) — the same shape as
+  LightGBM's own best-nthread=4 on this box.
+- Panic in a task poisons the region and re-panics on the dispatcher; nested
+  dispatch falls back serial (no deadlock). Both are unit-gated.
+
+Converted to the crew: the histogram group-fold (`build_histograms_into`), the
+per-leaf batched split scan (`find_best_splits_batched`), the in-place sibling
+subtract (`HistogramPool::subtract_into`, chunked element-wise), and both passes
+of the block-parallel partition (`partition_parallel`, via
+`for_each_mut_or_rayon` so `LGBM_CREW=0` restores the rayon shape).
+
+Thresholds retuned for the ~15× lower dispatch floor (sweeps in the source
+comments): `par_build_threshold` 1024 → **64**, `par_partition_min` 8192 →
+**2048**, `par_scan_threshold` usize::MAX → **16 features** (crew only; stays
+serial when the crew cannot parallelize).
+
+## 9.3 Results — final same-session interleaved A/B
+
+200k×50 binary, 100 iters; LightGBM 4.6.0 at its BEST `num_threads ∈ {1,4,8}`
+per cell, `lightgbm_rs` at pure defaults; warm median of 3, engines interleaved.
+
+| cell | lightgbm_rs (ms) | LightGBM best (ms) | speedup | was (§5.3) |
+|---|---:|---:|---:|---:|
+| baseline (`num_leaves=31 max_bin=255`) | 1204 | 1843 (8t) | **1.53×** | 0.88× |
+| `num_leaves=15` | 855 | 1278 (8t) | **1.49×** | 0.88× |
+| `num_leaves=63` | 1617 | 2441 (4t) | **1.51×** | 0.82× |
+| `num_leaves=255` | 3575 | 5100 (4t) | **1.43×** | 0.66× |
+| `max_bin=15` | 1027 | 1218 (4t) | **1.19×** | 0.77× |
+| `max_bin=63` | 1064 | 1284 (4t) | **1.21×** | 0.78× |
+| `max_bin=511` | 2208 | 2352 (8t) | **1.07×** | 0.80× |
+| single-thread baseline | 2920 | 4389 (1t) | **1.50×** | — |
+
+Every cell is now faster than LightGBM's best thread count, including the three
+this section set out to fix. The 255-leaf phase split moved from
+`build=3198 / scan=2257 / partition=589` ms to
+`build=2475 / scan=795 / partition=266` ms — the scan cost is real compute (97%
+inside `find_best_split_cpu_native`, verified by call-tree sampling) and now
+parallelizes at a dispatch price that doesn't eat the win.
+
+`max_bin=511` (1.07×) is the thinnest margin: wider bins double the scan work
+per feature and the 255-bin-tuned quad-fold ILP does not widen with them. Not
+pursued further here.
+
+## 9.4 Verification
+
+- Model dumps byte-identical to the pre-crew binary (`cmp`) for baseline,
+  `num_leaves=255`, and `max_bin=511`; identical with the crew forced off
+  (`LGBM_CREW=0`) and across the legacy-threshold environment.
+- Model sha256 identical at `RAYON_NUM_THREADS=1/2/4/8`.
+- Full workspace suite: **1138 passed, 0 failed**, including 7 new crew unit
+  gates (exactly-once claims, repeated regions, disjoint `&mut` fan-out, nested
+  dispatch, cross-thread dispatch, panic poisoning).
+- New dependency: `libc` (macOS-only, for the P-core `sysctlbyname`) — already a
+  transitive dep of the cubecl lockfile; no new supply-chain surface.
