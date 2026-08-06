@@ -1,3 +1,4 @@
+pub mod arena;
 pub mod capture;
 pub(crate) mod command;
 pub(crate) mod communication;

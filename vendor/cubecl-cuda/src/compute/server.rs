@@ -650,6 +650,8 @@ impl CudaServer {
             .compilation_options
             .supports_features
             .grid_constants;
+        // LIGHTGBM_RS FORK: launch-path segment profiler (CUBECL_CUDA_LAUNCH_PROF=1).
+        let prof_entry = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
         let mut command = self.command(
             stream_id,
             bindings.buffers.iter(),
@@ -661,6 +663,7 @@ impl CudaServer {
 
         // CP1: after command()/streams.resolve (cross-stream fencing runs here).
         unsafe { crate::compute::capture::cp(1) };
+        let prof_cp1 = prof_entry.map(|_| std::time::Instant::now());
 
         let count = match count {
             CubeCount::Static(x, y, z) => (x, y, z),
@@ -683,6 +686,7 @@ impl CudaServer {
             }
         };
 
+        let mut arena_resource: Option<crate::compute::storage::gpu::GpuResource> = None;
         let (info_const, info_binding) = if grid_constants {
             let info = &bindings.info;
 
@@ -696,13 +700,28 @@ impl CudaServer {
         } else {
             let mut handle = Option::None;
             if !bindings.info.data.is_empty() {
-                handle = Some(command.create_with_data(bytemuck::cast_slice(&bindings.info.data))?);
+                let info_bytes: &[u8] = bytemuck::cast_slice(&bindings.info.data);
+                // LIGHTGBM_RS FORK: route the per-launch info upload through the
+                // persistent arena when enabled (CUBECL_CUDA_INFO_ARENA=1) — no pool
+                // reserve, no staging Bytes, no drop-queue pressure. Falls back to the
+                // default path on any miss (other stream / oversized / alloc failure).
+                if crate::compute::arena::arena_enabled() {
+                    let stream_sys = command.stream_sys();
+                    // SAFETY: inside a `Command` the CUDA context is current on this
+                    // thread and `stream_sys` is the live stream all subsequent work
+                    // (including this kernel) is enqueued on.
+                    arena_resource = unsafe { crate::compute::arena::arena_upload(stream_sys, info_bytes) };
+                }
+                if arena_resource.is_none() {
+                    handle = Some(command.create_with_data(info_bytes)?);
+                }
             }
             (None, handle)
         };
 
         // CP2: after count resolve + info-buffer build (create_with_data alloc/copy).
         unsafe { crate::compute::capture::cp(2) };
+        let prof_cp2 = prof_entry.map(|_| std::time::Instant::now());
 
         let mut resources = bindings
             .tensor_maps
@@ -714,6 +733,7 @@ impl CudaServer {
 
         // CP3: after resource resolution.
         unsafe { crate::compute::capture::cp(3) };
+        let prof_cp3 = prof_entry.map(|_| std::time::Instant::now());
 
         let mut tensor_maps = Vec::with_capacity(bindings.tensor_maps.len());
 
@@ -880,6 +900,11 @@ impl CudaServer {
                 .into_iter()
                 .map(|s| command.resource(s.binding()).expect("Resource to exist")),
         );
+        // LIGHTGBM_RS FORK: the arena-backed info buffer takes the same (last) binding
+        // slot the pooled info handle would have occupied.
+        if let Some(res) = arena_resource {
+            resources.push(res);
+        }
 
         command.kernel(
             kernel_id,
@@ -894,6 +919,16 @@ impl CudaServer {
 
         // CP4: after the kernel launch + drop-queue flush.
         unsafe { crate::compute::capture::cp(4) };
+        if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (prof_entry, prof_cp1, prof_cp2, prof_cp3)
+        {
+            let now = std::time::Instant::now();
+            crate::compute::arena::record_launch(
+                (t1 - t0).as_nanos() as u64,
+                (t2 - t1).as_nanos() as u64,
+                (t3 - t2).as_nanos() as u64,
+                (now - t3).as_nanos() as u64,
+            );
+        }
 
         Ok(())
     }

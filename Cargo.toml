@@ -24,6 +24,15 @@ thiserror = "2.0.18"
 anyhow = "1.0.102"
 cubecl = "0.10.0"
 
+# Perf forks of the cubecl transport layer (see docs/ondevice-cuda-perf-plan.md §12).
+# Both default to byte-for-byte upstream behavior; the levers are env-gated:
+#   CUBECL_DEVICE_INLINE=1    — inline device handle (no server thread / channel hops)
+#   CUBECL_CUDA_INFO_ARENA=1  — persistent ring for per-launch info uploads (sm_60)
+#   CUBECL_CUDA_LAUNCH_PROF=1 — launch-path host-cost profiler (stderr)
+[patch.crates-io]
+cubecl-common = { path = "vendor/cubecl-common" }
+cubecl-cuda = { path = "vendor/cubecl-cuda" }
+
 # Release profile tuned for the compute-heavy training path. Parity-neutral:
 # these flags change codegen, not floating-point semantics (no fast-math). Fat LTO
 # + a single codegen unit let the optimizer inline across the boosting →

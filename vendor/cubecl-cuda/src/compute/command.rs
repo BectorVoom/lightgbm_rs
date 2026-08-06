@@ -60,6 +60,12 @@ impl<'a> Command<'a> {
             .get_resource(binding.memory, binding.offset_start, binding.offset_end)
     }
 
+    /// LIGHTGBM_RS FORK: the raw `CUstream` of the current stream — used by the
+    /// transient-upload arena to enqueue its info-buffer copy in stream order.
+    pub fn stream_sys(&mut self) -> *mut cudarc::driver::sys::CUstream_st {
+        self.streams.current().sys
+    }
+
     /// Get the stream cursor.
     pub fn cursor(&self) -> u64 {
         self.streams.cursor
@@ -400,6 +406,11 @@ impl<'a> Command<'a> {
     /// * `Ok(Handle)` - A handle to the newly allocated and populated GPU memory.
     /// * `Err(IoError)` - If the allocation or data copy fails.
     pub fn create_with_data(&mut self, data: &[u8]) -> Result<Handle, IoError> {
+        if crate::compute::arena::prof_enabled() {
+            use core::sync::atomic::Ordering;
+            crate::compute::arena::CREATE_DATA_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::compute::arena::CREATE_DATA_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
         let mut staging =
             self.reserve_pinned(data.len(), None)
                 .ok_or_else(|| IoError::Unknown {
@@ -483,7 +494,16 @@ impl<'a> Command<'a> {
         // in-progress capture (CUDA_ERROR_ILLEGAL_STATE at end_capture). Deferring drops
         // across a short captured region is safe.
         if !crate::compute::capture::is_capturing_now() && stream.drop_queue.should_flush() {
+            // LIGHTGBM_RS FORK: the flush syncs a fence from the previous cycle — a
+            // periodic BLOCKING stall in free-run mode. Count/time it under the profiler.
+            let prof_start = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
             stream.drop_queue.flush(|| Fence::new(stream.sys));
+            if let Some(start) = prof_start {
+                use core::sync::atomic::Ordering;
+                crate::compute::arena::DROP_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+                crate::compute::arena::DROP_FLUSH_NS
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
 
         if let Err(err) = result {

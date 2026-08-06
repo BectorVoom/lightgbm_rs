@@ -51,6 +51,9 @@ impl Fence {
     /// Wait for the [Fence] to be reached, ensuring that all previous tasks enqueued to the
     /// [stream](CUstream_st) are completed.
     pub fn wait_sync(self) -> Result<(), ServerError> {
+        // LIGHTGBM_RS FORK: blocking fence waits are a first-class cost in the
+        // launch/sync-storm profile — count them when the launch profiler is on.
+        let prof_start = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
         // SAFETY: `self.event` is a valid event created in `Fence::new`. We synchronize
         // (block) until the event completes, then destroy it. `self` is consumed so the
         // event cannot be double-freed.
@@ -67,6 +70,13 @@ impl Fence {
                     backtrace: BackTrace::capture(),
                 }
             })?;
+        }
+
+        if let Some(start) = prof_start {
+            use core::sync::atomic::Ordering;
+            crate::compute::arena::FENCE_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::compute::arena::FENCE_WAIT_NS
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         Ok(())

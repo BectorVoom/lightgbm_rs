@@ -33,3 +33,4 @@ crates/lgbm-python/python/lightgbm_rs/_core*.so
 /kaggle_out*/
 /kaggle_push*/
 /kaggle_run*/
+vendor/*/target/

@@ -1,1 +1,0 @@
-{"rustc":7458672600737419911,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[14838782261747655585,"build_script_build",false,13497528455988393123]],"local":[{"Precalculated":"1783916177.300536089s (Cargo.lock)"}],"rustflags":["-C","link-arg=-fuse-ld=mold"],"config":0,"compile_kind":0}
