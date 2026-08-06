@@ -518,10 +518,21 @@ pub fn calculate_splitted_leaf_output_full(
 
     // USE_SMOOTHING: verbatim precedence — `ret * nps / (nps + 1)`, NOT
     // `ret * (nps / (nps + 1))` (the two differ in the last bit).
-    let ps = select(use_smoothing, path_smooth, 1.0);
-    let n_over_ps = num_data as f64 / ps;
-    let blended = clamped * n_over_ps / (n_over_ps + 1.0) + parent_output / (n_over_ps + 1.0);
-    select(use_smoothing, blended, clamped)
+    //
+    // A UNIFORM branch, not a `select` chain: `use_smoothing` is a config scalar
+    // (identical across every lane — the C++ template bool), so there is no
+    // divergence, and the smoothing-OFF arm must not pay the three f64 divides
+    // of the blend (this per-bin helper is the scan kernels' hot inner loop —
+    // an earlier always-compute-then-select form measurably regressed the scan).
+    // Bit-exact either way: the OFF arm returns exactly the value the select
+    // form selected. Runtime-`if` on a uniform bool is the same lowering
+    // [`get_leaf_gain`]'s `if use_l1` already relies on (cubecl-cpu safe).
+    if use_smoothing {
+        let n_over_ps = num_data as f64 / path_smooth;
+        clamped * n_over_ps / (n_over_ps + 1.0) + parent_output / (n_over_ps + 1.0)
+    } else {
+        clamped
+    }
 }
 
 /// `GetLeafGain<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>`
@@ -554,23 +565,33 @@ pub fn get_leaf_gain_full(
     num_data: i32,
     parent_output: f64,
 ) -> f64 {
-    let closed = get_leaf_gain(use_l1, sum_gradients, sum_hessians, l1, l2);
-    let output = calculate_splitted_leaf_output_full(
-        use_l1,
-        sum_gradients,
-        sum_hessians,
-        l1,
-        l2,
-        max_delta_step,
-        use_smoothing,
-        path_smooth,
-        num_data,
-        parent_output,
-    );
-    let given = get_leaf_gain_given_output(use_l1, sum_gradients, sum_hessians, l1, l2, output);
-    // `USE_MAX_OUTPUT || USE_SMOOTHING` — both are config-level predicates.
+    // `USE_MAX_OUTPUT || USE_SMOOTHING` — both are config-level predicates, so
+    // this is a UNIFORM branch (the C++ template-bool dispatch), not per-lane
+    // divergence. The default (both OFF) arm computes ONLY the closed form —
+    // this helper runs twice per candidate bin in every scan kernel's inner
+    // loop, and an earlier always-compute-then-`select` form paid ~5 f64
+    // divides per side where the closed form pays 1 (a measurable scan
+    // regression). Bit-exact on both arms: each returns exactly the value the
+    // select form selected. Runtime-`if` on a uniform bool is the lowering
+    // [`get_leaf_gain`]'s `if use_l1` already relies on (cubecl-cpu safe).
     let use_given = max_delta_step > 0.0 || use_smoothing;
-    select(use_given, given, closed)
+    if use_given {
+        let output = calculate_splitted_leaf_output_full(
+            use_l1,
+            sum_gradients,
+            sum_hessians,
+            l1,
+            l2,
+            max_delta_step,
+            use_smoothing,
+            path_smooth,
+            num_data,
+            parent_output,
+        );
+        get_leaf_gain_given_output(use_l1, sum_gradients, sum_hessians, l1, l2, output)
+    } else {
+        get_leaf_gain(use_l1, sum_gradients, sum_hessians, l1, l2)
+    }
 }
 
 /// `GetSplitGains<USE_MC=false, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>`
@@ -778,10 +799,14 @@ pub fn calculate_splitted_leaf_output_full_f32(
     let pos = select(base > 0.0f32, 1.0f32, 0.0f32);
     let neg = select(base < 0.0f32, 1.0f32, 0.0f32);
     let clamped = select(clamp, (pos - neg) * max_delta_step, base);
-    let ps = select(use_smoothing, path_smooth, 1.0f32);
-    let n_over_ps = num_data as f32 / ps;
-    let blended = clamped * n_over_ps / (n_over_ps + 1.0f32) + parent_output / (n_over_ps + 1.0f32);
-    select(use_smoothing, blended, clamped)
+    // Uniform branch, mirroring the f64 twin — the smoothing-OFF arm skips the
+    // three divides of the blend (bit-exact: returns the selected value).
+    if use_smoothing {
+        let n_over_ps = num_data as f32 / path_smooth;
+        clamped * n_over_ps / (n_over_ps + 1.0f32) + parent_output / (n_over_ps + 1.0f32)
+    } else {
+        clamped
+    }
 }
 
 /// f32 mirror of [`get_leaf_gain_full`] (the no-f64 hip path).
@@ -799,22 +824,26 @@ pub fn get_leaf_gain_full_f32(
     num_data: i32,
     parent_output: f32,
 ) -> f32 {
-    let closed = get_leaf_gain_f32(use_l1, sum_gradients, sum_hessians, l1, l2);
-    let output = calculate_splitted_leaf_output_full_f32(
-        use_l1,
-        sum_gradients,
-        sum_hessians,
-        l1,
-        l2,
-        max_delta_step,
-        use_smoothing,
-        path_smooth,
-        num_data,
-        parent_output,
-    );
-    let given = get_leaf_gain_given_output_f32(use_l1, sum_gradients, sum_hessians, l1, l2, output);
+    // Uniform branch, mirroring the f64 twin — the default arm computes ONLY
+    // the closed form (this is the scan kernels' per-bin hot path).
     let use_given = max_delta_step > 0.0f32 || use_smoothing;
-    select(use_given, given, closed)
+    if use_given {
+        let output = calculate_splitted_leaf_output_full_f32(
+            use_l1,
+            sum_gradients,
+            sum_hessians,
+            l1,
+            l2,
+            max_delta_step,
+            use_smoothing,
+            path_smooth,
+            num_data,
+            parent_output,
+        );
+        get_leaf_gain_given_output_f32(use_l1, sum_gradients, sum_hessians, l1, l2, output)
+    } else {
+        get_leaf_gain_f32(use_l1, sum_gradients, sum_hessians, l1, l2)
+    }
 }
 
 /// f32 mirror of [`get_split_gains_full`] (the no-f64 hip path).

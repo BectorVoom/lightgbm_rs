@@ -486,3 +486,86 @@ published — verified, no upgrade lever); no new crates needed for P2.
 | P2.2–P2.4 pools + tail | ~3.8–4.0 s | ~1.17× |
 | P2.5 partition | ~3.7–3.9 s | ~1.14× |
 | P3.1 fork lever (if taken) | ~3.4–3.6 s | **~1.05×** |
+
+## 10. P2 v1 RESULTS (2026-08-06, Kaggle P100, `lgb-rs-p2-host-residency`)
+
+Corpus/protocol unchanged (500k×50 regression, 100 trees, nl=31, order-rotated
+warm-median-3, fresh process per run; official = lightgbm 4.6.0 pip source
+build with `USE_CUDA=ON`; rs base = origin/main `8138757` + the P2.1/P2.2 diff,
+hatches OFF).
+
+| arm | warm-median | verdict |
+|---|---|---|
+| official | **2.836 s** | official IMPROVED vs the July image (3.32 → 2.84 s) |
+| rs_base | **6.128 s** | ~1.5 s REGRESSION vs the P1b-era 4.60 s base (see below) |
+| rs_pass (P2.1) | 5.949 s | **WIN 1.030×** — preds byte-identical, counts 100/100, drained `upload` 330→23 ms → **default flipped ON** |
+| rs_pool (P2.2) | 6.148 s | **WASH** — drained `setup` unchanged (cubecl allocs are cheap on this image) → default stays OFF, hatch kept |
+| rs_p2 | 6.006 s | passthru carries the stack |
+
+Gates all green: 100 trees every run; rs arms byte-identical (max_abs = 0.0);
+official envelope 3.07e-5.
+
+Drained rs_base ledger (per 100-tree train): grow wall 4406 ms = build 1237 +
+scan 1114 + partition 561 + pick 325 + upload 330 + setup 269 + treesplit 201 +
+reduce 182 + tail 104 + rootfold 70; outside grow: binning 920, grad 371,
+score 191, snapshot 94.
+
+**Regression root cause (code-confirmed, fix validated locally):** the
+max_delta_step/path_smooth port (`9cc111c`) made `get_leaf_gain_full` — called
+twice per candidate bin in every scan kernel — ALWAYS compute the closed form,
+the clamped-output form AND the smoothing blend (~5 f64 divides per side vs 1),
+then `select` the closed form when both features are OFF. C++ compiles those
+axes away as template bools (`USE_MAX_OUTPUT`/`USE_SMOOTHING`). Fix: uniform
+runtime branches in `get_leaf_gain_full` / `calculate_splitted_leaf_output_full`
+(+ f32 mirrors) — bit-exact on both arms (each returns exactly the value the
+select form selected); gain_params/advanced parity fixtures green. Measured in
+v2 (`lgb-rs-p2v2-gainfix`, two-wheel same-session A/B).
+
+Accounting note: BOTH walls include binning/Dataset construction (official's
+Dataset is lazy — it bins inside `train()`; ours bins inside `train()` too), so
+the comparison is honest end-to-end.
+
+## 11. P2 v2 RESULTS (2026-08-07, Kaggle P100, `lgb-rs-p2v2-gainfix`)
+
+Two-wheel same-session A/B (wheel A = v1 diff / gain helpers unfixed; wheel B =
+gain fix + P2.4 host-copy trivia), same corpus/protocol as v1.
+
+| arm | warm-median | delta |
+|---|---|---|
+| official | 2.793 s | (2.836 in v1 — stable) |
+| rs_old (wheel A) | 6.079 s | v1 rs_base twin (6.128) — reproducible |
+| rs_fix (wheel B) | 5.903 s | gain fix + trivia = **1.030×** |
+| rs_fix_pass (B + passthru) | **5.720 s** | cumulative **1.063×** vs rs_old |
+
+Gates: 100 trees every run; rs_fix and rs_fix_pass preds BYTE-IDENTICAL to
+rs_old (max_abs = 0.0 — the gain-fix bit-exactness claim held on hardware);
+official envelope 3.07e-5.
+
+**Mechanism finding (drain ledgers):** the drained scan bucket did NOT move
+(1091 → 1085 ms) — the gain fix's win is the P2.4 host copies (snapshot 88→43,
+in_iter_other 146→93) plus scan-kernel device time recovered under free-run
+overlap. The drained grow (4.05 s) is dominated by dispatch: ~18 500 launches +
+6 200 blocking syncs/train through cubecl 0.10, at this image's per-launch/sync
+cost. Free-run wall (5.72) ≈ drain wall (5.96) − 0.24 — the loop is nearly
+serialized by its 2 blocking syncs/split, so device/host overlap recovers
+almost nothing.
+
+**Post-P2 state: rs 5.72 s vs official 2.79 s (2.05×).** The July "~1.3× gap"
+numbers do not transfer: Kaggle image changes moved official 3.32→2.79 s and
+our dispatch-bound wall the OTHER way (the ~1.5 s "regression" vs the P1b-era
+4.60 s base is at most ~0.18 s code regression — the rest is the image's
+launch/sync cost profile, which hits our 185-launch/62-sync-per-tree structure
+far harder than official's fused-kernel CUDA path).
+
+### Where the remaining 2× lives (next campaign, in order)
+
+1. **Launch-count structure** — level-batched build/scan (one launch per tree
+   LEVEL, not per split) is the only lever that attacks the ~18.5k
+   launches/train. Big redesign, multi-session.
+2. **Sync-count** — the 2 blocking syncs/split (pick export + read_leaf). The
+   T-11 sync-deferral verdict (0.836×, 2026-07-15) was measured on a
+   CHEAP-launch image; on today's dispatch-cost profile the sign could flip.
+   The deferred arm was deleted (dead-toggle refactor) — re-implementation.
+3. **Binning 0.84–0.96 s** — rayon-parallel already; official pays a similar
+   CPU cost inside its wall, so this is parity, not deficit.
+4. cubecl-upstream (dispatch cost, multi-stream) — tracked, out of our tree.
