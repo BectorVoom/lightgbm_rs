@@ -1023,8 +1023,9 @@ fn kernel_parity_sibling_copack_equals_two_scans_on_cpu() {
 
     let cfg = copack_cfg();
     // DIFFERENT leaf totals per sibling (smaller A vs larger-derived B).
-    let a_totals = (5.0f64, 40.0f64, 40i32);
-    let b_totals = (-3.0f64, 64.0f64, 64i32);
+    // 4th slot = the sibling's `parent_output` (inert at the default path_smooth).
+    let a_totals = (5.0f64, 40.0f64, 40i32, 0.0f64);
+    let b_totals = (-3.0f64, 64.0f64, 64i32, 0.0f64);
 
     // (a) Co-packed 2-slot scan: two Handles -> one launch -> (co_a, co_b).
     let h_a = upload_f64_buffer(&client, &buf_a);
@@ -2024,8 +2025,9 @@ mod hip {
         let (buf_a, buf_b) = super::copack_two_histograms();
         let cfg = super::copack_cfg();
         // DIFFERENT leaf totals per sibling (smaller A vs larger-derived B).
-        let a_totals = (5.0f64, 40.0f64, 40i32);
-        let b_totals = (-3.0f64, 64.0f64, 64i32);
+        // 4th slot = the sibling's `parent_output` (inert at the default path_smooth).
+        let a_totals = (5.0f64, 40.0f64, 40i32, 0.0f64);
+        let b_totals = (-3.0f64, 64.0f64, 64i32, 0.0f64);
 
         // ---- (a) BYTE-IDENTICAL: co-pack (co_a, co_b) == two single-slot scans. ----
         let h_a = upload_f64_buffer(&hip, &buf_a);

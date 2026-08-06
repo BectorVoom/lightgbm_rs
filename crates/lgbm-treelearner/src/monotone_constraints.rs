@@ -26,7 +26,8 @@
 //! tracked honestly (never tolerance-weakened).
 
 use lgbm_compute::gain::{
-    calculate_splitted_leaf_output, get_leaf_gain, get_leaf_gain_given_output, GainConfig, SplitInfo,
+    calculate_splitted_leaf_output_full, get_leaf_gain_full, get_leaf_gain_given_output, GainConfig,
+    SplitInfo,
 };
 
 /// The per-leaf output clamp `[min, max]` (`monotone_constraints.hpp:24-31`).
@@ -162,9 +163,26 @@ fn calc_output_clamped(
     cfg: &GainConfig,
     sum_g: f64,
     sum_h: f64,
+    // This side's row count — the smoothing weight (`num_data / path_smooth`) is
+    // per-leaf, so left and right are NOT interchangeable here.
+    num_data: i32,
     constraint: &BasicConstraint,
 ) -> f64 {
-    let mut ret = calculate_splitted_leaf_output(cfg.use_l1(), sum_g, sum_h, cfg.lambda_l1, cfg.lambda_l2);
+    // Inner `CalculateSplittedLeafOutput<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>`
+    // first (base -> max_delta_step clamp -> smoothing blend), THEN the monotone
+    // `[min,max]` clamp — the C++ nesting order at feature_histogram.hpp:745-753.
+    let mut ret = calculate_splitted_leaf_output_full(
+        cfg.use_l1(),
+        sum_g,
+        sum_h,
+        cfg.lambda_l1,
+        cfg.lambda_l2,
+        cfg.max_delta_step,
+        cfg.use_smoothing(),
+        cfg.path_smooth,
+        num_data,
+        cfg.parent_output,
+    );
     if ret < constraint.min {
         ret = constraint.min;
     } else if ret > constraint.max {
@@ -186,11 +204,13 @@ fn split_gain_mc(
     sum_left_h: f64,
     sum_right_g: f64,
     sum_right_h: f64,
+    left_count: i32,
+    right_count: i32,
     monotone_type: i8,
     constraint: &BasicConstraint,
 ) -> f64 {
-    let left_output = calc_output_clamped(cfg, sum_left_g, sum_left_h, constraint);
-    let right_output = calc_output_clamped(cfg, sum_right_g, sum_right_h, constraint);
+    let left_output = calc_output_clamped(cfg, sum_left_g, sum_left_h, left_count, constraint);
+    let right_output = calc_output_clamped(cfg, sum_right_g, sum_right_h, right_count, constraint);
     if (monotone_type > 0 && left_output > right_output)
         || (monotone_type < 0 && left_output < right_output)
     {
@@ -235,7 +255,18 @@ pub fn find_best_split_monotone(
     let use_l1 = cfg.use_l1();
     let l1 = cfg.lambda_l1;
     let l2 = cfg.lambda_l2;
-    let gain_shift = get_leaf_gain(use_l1, sum_g, sum_hessian, l1, l2);
+    let gain_shift = get_leaf_gain_full(
+        use_l1,
+        sum_g,
+        sum_hessian,
+        l1,
+        l2,
+        cfg.max_delta_step,
+        cfg.use_smoothing(),
+        cfg.path_smooth,
+        num_data,
+        cfg.parent_output,
+    );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
     let cnt_factor = f64::from(num_data) / sum_hessian;
     let round_int = |x: f64| -> i32 { (x + f64::from(0.5f32)) as i32 };
@@ -280,6 +311,8 @@ pub fn find_best_split_monotone(
                 sum_left_hessian,
                 sum_right_gradient,
                 sum_right_hessian,
+                left_count,
+                right_count,
                 monotone_type,
                 constraint,
             );
@@ -337,6 +370,8 @@ pub fn find_best_split_monotone(
                 sum_left_hessian,
                 sum_right_gradient,
                 sum_right_hessian,
+                left_count,
+                right_count,
                 monotone_type,
                 constraint,
             );
@@ -392,8 +427,10 @@ fn build_split(
     let eps = f64::from(lgbm_core::types::K_EPSILON);
     let right_sum_gradient = sum_gradient - left_sum_gradient;
     let right_sum_hessian = sum_hessian - left_sum_hessian;
-    let left_output = calc_output_clamped(cfg, left_sum_gradient, left_sum_hessian, constraint);
-    let right_output = calc_output_clamped(cfg, right_sum_gradient, right_sum_hessian, constraint);
+    let left_output =
+        calc_output_clamped(cfg, left_sum_gradient, left_sum_hessian, left_count, constraint);
+    let right_output =
+        calc_output_clamped(cfg, right_sum_gradient, right_sum_hessian, right_count, constraint);
     SplitInfo {
         threshold,
         gain,

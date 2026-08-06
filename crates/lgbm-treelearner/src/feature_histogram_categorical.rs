@@ -25,7 +25,10 @@
 //! with the `(x + 0.5f32 as f64) as i32` form used by the numeric spine
 //! (`learner.rs:1098`) so the count reconstruction is bit-identical.
 
-use lgbm_compute::gain::{calculate_splitted_leaf_output, get_leaf_gain, get_split_gains, GainConfig};
+use lgbm_compute::gain::{
+    calculate_splitted_leaf_output_full, get_leaf_gain_full, get_leaf_gain_given_output,
+    get_split_gains_full, GainConfig,
+};
 use lgbm_compute::gain::SplitInfo;
 use lgbm_core::types::K_EPSILON;
 
@@ -112,11 +115,46 @@ pub fn find_best_threshold_categorical(
     let mut best_sum_left_gradient: f64 = 0.0;
     let mut best_sum_left_hessian: f64 = 0.0;
 
-    // gain_shift uses the ORIGINAL l2 (the deliberate asymmetry,
-    // feature_histogram.cpp:164-168: GetLeafGain<...,false>(sum_gradient,
-    // sum_hessian, l1, lambda_l2, max_delta_step=0, path_smooth=0, num_data, 0)).
-    // Our `get_leaf_gain` is the `!USE_MAX_OUTPUT && !USE_SMOOTHING` fast path.
-    let gain_shift = get_leaf_gain(use_l1, sum_gradient, sum_hessian, l1, cfg.lambda_l2);
+    // The C++ USE_MAX_OUTPUT / USE_SMOOTHING template axes.
+    let mds = cfg.max_delta_step;
+    let smoothing = cfg.use_smoothing();
+    let ps = cfg.path_smooth;
+    let parent = cfg.parent_output;
+
+    // `gain_shift` uses the ORIGINAL l2 (the deliberate asymmetry,
+    // feature_histogram.cpp:157-169), and the categorical path takes a DIFFERENT
+    // shape under smoothing than the numeric one does:
+    //
+    // ```cpp
+    // if (USE_SMOOTHING) {
+    //   gain_shift = GetLeafGainGivenOutput<USE_L1>(g, h, l1, l2, parent_output);
+    // } else {
+    //   // "special case for no smoothing to preserve existing behaviour": the
+    //   // parent output is computed with the LARGER categorical l2 while
+    //   // min_split_gain uses the original l2.
+    //   gain_shift = GetLeafGain<USE_L1, USE_MAX_OUTPUT, false>(
+    //       g, h, l1, l2, max_delta_step, 0, num_data, 0);
+    // }
+    // ```
+    //
+    // Note the smoothing branch evaluates the gain AT `parent_output` itself, not
+    // at a re-derived leaf output — transcribed verbatim.
+    let gain_shift = if smoothing {
+        get_leaf_gain_given_output(use_l1, sum_gradient, sum_hessian, l1, cfg.lambda_l2, parent)
+    } else {
+        get_leaf_gain_full(
+            use_l1,
+            sum_gradient,
+            sum_hessian,
+            l1,
+            cfg.lambda_l2,
+            mds,
+            false,
+            0.0,
+            num_data,
+            0.0,
+        )
+    };
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     let bin_start = 1 - offset;
@@ -159,7 +197,7 @@ pub fn find_best_threshold_categorical(
             }
             let sum_other_gradient = sum_gradient - grad;
             // current split gain (other | this), this-side hess bumped by +kEpsilon.
-            let current_gain = get_split_gains(
+            let current_gain = get_split_gains_full(
                 use_l1,
                 sum_other_gradient,
                 sum_other_hessian,
@@ -167,6 +205,12 @@ pub fn find_best_threshold_categorical(
                 hess + eps,
                 l1,
                 l2,
+                mds,
+                smoothing,
+                ps,
+                other_count,
+                cnt,
+                parent,
             );
             if current_gain <= min_gain_shift {
                 t += 1;
@@ -198,6 +242,10 @@ pub fn find_best_threshold_categorical(
             use_l1,
             l1,
             l2_for_output,
+            mds,
+            smoothing,
+            ps,
+            parent,
             eps,
             true,
             offset,
@@ -276,7 +324,7 @@ pub fn find_best_threshold_categorical(
             cnt_cur_group = 0;
 
             let sum_right_gradient = sum_gradient - sum_left_gradient;
-            let current_gain = get_split_gains(
+            let current_gain = get_split_gains_full(
                 use_l1,
                 sum_left_gradient,
                 sum_left_hessian,
@@ -284,6 +332,12 @@ pub fn find_best_threshold_categorical(
                 sum_right_hessian,
                 l1,
                 l2,
+                mds,
+                smoothing,
+                ps,
+                left_count,
+                right_count,
+                parent,
             );
             if current_gain <= min_gain_shift {
                 i += 1;
@@ -315,6 +369,10 @@ pub fn find_best_threshold_categorical(
         use_l1,
         l1,
         l2,
+        mds,
+        smoothing,
+        ps,
+        parent,
         eps,
         false,
         offset,
@@ -344,6 +402,11 @@ fn finalize(
     use_l1: bool,
     l1: f64,
     l2: f64,
+    // The C++ USE_MAX_OUTPUT / USE_SMOOTHING axes + the leaf's parent output.
+    mds: f64,
+    smoothing: bool,
+    ps: f64,
+    parent: f64,
     eps: f64,
     use_onehot: bool,
     offset: i32,
@@ -356,25 +419,38 @@ fn finalize(
         return CategoricalSplit::none();
     }
 
-    let left_output = calculate_splitted_leaf_output(
+    let right_count_out = num_data - best_left_count;
+    // Each side's smoothing weight uses that side's OWN row count
+    // (feature_histogram.cpp:343-355).
+    let left_output = calculate_splitted_leaf_output_full(
         use_l1,
         best_sum_left_gradient,
         best_sum_left_hessian,
         l1,
         l2,
+        mds,
+        smoothing,
+        ps,
+        best_left_count,
+        parent,
     );
     let left_count = best_left_count;
     let left_sum_gradient = best_sum_left_gradient;
     let left_sum_hessian = best_sum_left_hessian - eps;
 
-    let right_output = calculate_splitted_leaf_output(
+    let right_output = calculate_splitted_leaf_output_full(
         use_l1,
         sum_gradient - best_sum_left_gradient,
         sum_hessian - best_sum_left_hessian,
         l1,
         l2,
+        mds,
+        smoothing,
+        ps,
+        right_count_out,
+        parent,
     );
-    let right_count = num_data - best_left_count;
+    let right_count = right_count_out;
     let right_sum_gradient = sum_gradient - best_sum_left_gradient;
     let right_sum_hessian = sum_hessian - best_sum_left_hessian - eps;
 

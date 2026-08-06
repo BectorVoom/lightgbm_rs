@@ -472,3 +472,114 @@ The remaining out-of-scope parameters are unchanged and documented in
 `lgbm_core::config::scope` (distributed learning, OpenCL device tuning) or are
 CLI / dataset-loader-layer file and column specs, enumerated with their reason in
 the string-param golden's `skipped` map.
+
+---
+
+# 7. `max_delta_step` and `path_smooth` implemented (2026-08-06)
+
+§6 listed both as the only remaining unimplemented parameters — they returned a typed
+`ComputeError` ("only the default 0.0 path is transcribed") from six rejection sites in
+the split kernels. Both are now implemented.
+
+## 7.1 What they are
+
+They are the C++ `USE_MAX_OUTPUT` and `USE_SMOOTHING` template axes of
+`FeatureHistogram`, selected once per feature histogram from the config
+(`feature_histogram.hpp:248-270`): `max_delta_step > 0` and `path_smooth > kEpsilon`.
+
+```text
+ret = -ThresholdL1(g, l1) / (h + l2)                          // base
+if USE_MAX_OUTPUT && max_delta_step > 0 && |ret| > max_delta_step:
+    ret = Sign(ret) * max_delta_step                          // clamp
+if USE_SMOOTHING:
+    ret = ret*n/ps / (n/ps + 1) + parent_output / (n/ps + 1)  // blend toward parent
+```
+
+Either axis ALSO switches the gain FORM: `GetLeafGain` stops returning the closed form
+`sg²/(h+λ)` and returns `GetLeafGainGivenOutput` evaluated at the computed output.
+They are equal in exact arithmetic and differ in floating point, so the switch is
+observable even when the clamp never binds.
+
+## 7.2 What had to be threaded
+
+`path_smooth` needs two things the split path did not carry: each candidate side's
+OWN row count, and the leaf's `parent_output`
+(C++ `SerialTreeLearner::GetParentOutput`). The counts were already computed in every
+scan. `parent_output` now rides in `GainConfig` — C++ passes `(config, parent_output)`
+as a pair into every gain call, and bundling them avoids a signature change at ~90
+sites. The two co-packed-sibling paths are the exception: siblings have DIFFERENT
+parent outputs, so theirs travel in the per-leaf totals tuple.
+
+`LeafSplits::weight` supplies it and already encodes both branches of
+`GetParentOutput` without a `tree->num_leaves() == 1` test: the root carries its own
+clamped, un-smoothed output (`init`), a child carries the output its parent split
+assigned it (`init_from_split`).
+
+Converted: the shared `#[cube] split_scan_body` (and the five launch kernels that call
+it), the native host scan `find_best_split_cpu_native`, the categorical finder, the
+monotone finder, the extra-trees randomized finder, the forced-split threshold
+gatherer, and the snapshot re-scan.
+
+## 7.3 A latent bug the axes exposed
+
+Both scan bodies initialized `best_gain = 0.0` instead of C++'s `kMinScore` (-inf),
+justified by "every valid gain is non-negative because gains are `g²/(h+λ)` sums".
+That justification dies under the given-output form, which is freely negative. A leaf
+whose every candidate had negative gain kept `best_gain = 0.0` and `best_threshold = 0`
+while `is_splittable` still went true, so the launcher reported a BOGUS split at bin 0
+with net gain `0 - min_gain_shift` — large and POSITIVE whenever `min_gain_shift` is
+negative, which then won the best-first race. The host scan now uses `-inf` directly;
+the `#[cube]` body uses a `has_best` flag because cubecl-cpu requires loop-carried
+mutables to init from literals.
+
+## 7.4 Verification
+
+New gate: `crates/oracle-harness/tests/path_smooth_parity.rs` +
+`fixtures/path_smooth/` — 13 cells vs `lightgbm==4.6.0` spanning both axes, their
+combination, and their interaction with `lambda_l1`, over 16-leaf trees (smoothing
+CHAINS through depth, so a stump cannot see a `parent_output` error). It asserts raw
+predictions AND the per-tree leaf values, plus that every active cell's C++ model
+differs from the all-defaults control (so the sweep cannot pass against an
+implementation that ignores the parameters).
+
+**12 of 13 cells reach parity within `ORACLE_TOL`; the whole pre-existing suite is
+unchanged and green.**
+
+### The 13th cell
+
+`max_delta_step = 0.05` with no smoothing is mathematically DEGENERATE on this corpus:
+it binds so tightly that at many thresholds BOTH children clamp to the same output, and
+then `GetLeafGain(left) + GetLeafGain(right) == GetLeafGain(whole leaf) == gain_shift`
+holds EXACTLY in real arithmetic. The split's net gain is exactly zero, so
+`is_splittable_` turns on a strict `>` between two differently-associated
+floating-point sums. This port lands ONE ULP above (`1.78e-15` on a gain of `8.85`);
+the C++ build lands exactly at zero. C++ then propagates non-splittability to both
+children (`serial_tree_learner.cpp:390-395`), so one feature vanishes from a whole
+subtree and the models diverge visibly (0.01 absolute).
+
+It is a boundary artifact, not a formula error — demonstrated by perturbing the
+parameter by 2 parts per million:
+
+| `max_delta_step` | C++ tree-0 split features | C++ 4th split gain |
+|---|---|---|
+| 0.0499999 | 3 1 1 5 … | 0.533999 |
+| 0.05 | 3 1 1 5 … | 0.534 |
+| 0.0500001 | 3 1 1 **3** … | **1.334** |
+
+At `0.0500001` C++ produces EXACTLY this port's answer. Both engines agree on the
+arithmetic and disagree only about which side of a tie they land on. The residual ULP
+is consistent with C++ being built with clang's default `-ffp-contract=on`, which may
+fuse `a*b + c*d` into an FMA where Rust — which never auto-contracts — rounds twice.
+The cell is KEPT in the fixture and pinned in `KNOWN_ULP_BOUNDARY`, which asserts it
+stays the ONLY divergence and fails if it ever starts matching.
+
+## 7.5 GPU scan variants
+
+The LDS-staged / official / pargain / parprefix scan kernels (`--features gpu`) are
+performance forks of `split_scan_body`, each re-transcribing the scan against a
+different memory layout and each implementing only the default gain. Rather than fork
+the new semantics into five more bodies that no GPU-less CI can execute, they DECLINE
+via `scan_variants_applicable(cfg)` when either axis is active, and the launcher falls
+through to the shared body — the reference every variant must reproduce anyway. So the
+parameters work on every backend; only the optimization opts out. `--features gpu`
+compiles clean (`--all-targets`).

@@ -95,7 +95,12 @@ pub struct BatchedSplitFeature {
 }
 
 use crate::error::ComputeError;
-use crate::gain::{calculate_splitted_leaf_output, get_split_gains, GainConfig, SplitInfo};
+// The fast-path (`USE_MAX_OUTPUT=false, USE_SMOOTHING=false`) primitives are still
+// used by the `gpu`-only staged/official scan bodies below; the `*_full` pair is
+// what the shared `split_scan_body` and the native host scan call.
+#[cfg(feature = "gpu")]
+use crate::gain::{calculate_splitted_leaf_output, get_split_gains};
+use crate::gain::{calculate_splitted_leaf_output_full, get_split_gains_full, GainConfig, SplitInfo};
 use crate::runtime::ActiveRuntime;
 
 /// `Common::RoundInt(double x) = static_cast<int>(x + 0.5f)` (common.h:904).
@@ -151,6 +156,15 @@ pub fn split_scan_body(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    // The C++ `USE_MAX_OUTPUT` axis: `max_delta_step` clamps every computed leaf
+    // output, and `max_delta_step > 0` also selects the given-output gain FORM.
+    max_delta_step: f64,
+    // The C++ `USE_SMOOTHING` template bool as a 0|1 runtime flag — the host
+    // resolves `path_smooth > kEpsilon` once, mirroring `FuncForNumricalL2`.
+    use_smoothing: u32, // 0|1
+    path_smooth: f64,
+    // The leaf's `GetParentOutput`; read only when `use_smoothing != 0`.
+    parent_output: f64,
     min_gain_shift: f64,
     sum_gradient: f64,
     sum_hessian: f64,
@@ -165,6 +179,7 @@ pub fn split_scan_body(
     let l1 = lambda_l1;
     let l2 = lambda_l2;
     let use_l1_b = use_l1 != 0;
+    let use_smoothing_b = use_smoothing != 0;
     let skip_def = skip_default_bin != 0;
 
     // GET_GRAD(hist, i) = hist[i<<1]; GET_HESS(hist, i) = hist[(i<<1)+1]
@@ -180,12 +195,23 @@ pub fn split_scan_body(
     // terminate its parent block"). So all of these init from literals.
     let mut best_sum_left_gradient = 0.0f64;
     let mut best_sum_left_hessian = 0.0f64;
-    // best_gain sentinel = 0.0 (a LITERAL). C++ uses `kMinScore = -inf`, but every
-    // VALID candidate gain here is strictly > `min_gain_shift >= 0` (gains are
-    // `g²/(h+λ)` sums, non-negative), so 0.0 is an equally-valid sentinel: no
-    // valid candidate is ever rejected by it, and "no split found" is signaled by
-    // `is_splittable == 0` (NOT by best_gain), exactly as the host decodes below.
+    // C++ initializes `best_gain = kMinScore` (-inf). A `0.0` sentinel USED to stand
+    // in for that, justified by "every valid gain is non-negative because gains are
+    // `g²/(h+λ)` sums". That justification DIES under `max_delta_step` / `path_smooth`:
+    // both switch `GetLeafGain` to the given-output form `-(2·g·o + (h+λ)·o²)`, which
+    // is freely NEGATIVE once `o` is clamped or blended away from the unconstrained
+    // optimum. With a `0.0` sentinel a leaf whose every candidate had negative gain
+    // kept `best_gain = 0.0` and `best_threshold = 0` while `is_splittable` still went
+    // true, so the launcher reported a BOGUS split at bin 0 with net gain
+    // `0 - min_gain_shift` — a large POSITIVE number whenever `min_gain_shift` is
+    // negative, which then won the best-first race.
+    //
+    // cubecl-cpu's MLIR lowering requires loop-carried mutables to init from LITERALS,
+    // so -inf cannot be the initializer here. `has_best` (a 0.0/1.0 literal flag)
+    // reproduces it exactly instead: the FIRST valid candidate is always taken (C++
+    // `x > -inf`), and every later one needs a strict `>` (C++ `x > best_gain`).
     let mut best_gain = 0.0f64;
+    let mut has_best = 0.0f64;
     let mut best_left_count = 0i32;
     // threshold sentinel = 0 (LITERAL). The C++ "no split" threshold is `num_bin`,
     // but when `is_splittable == 0` the host returns `SplitInfo::none()`
@@ -266,7 +292,7 @@ pub fn split_scan_body(
             // Always COMPUTE the gain (no early-out in branchless form), then gate
             // it to the 0.0 sentinel unless this is a valid candidate beating
             // min_gain_shift (:913). The winner update is a chain of `select`s.
-            let current_gain = get_split_gains(
+            let current_gain = get_split_gains_full(
                 use_l1_b,
                 sum_left_gradient,
                 sum_left_hessian,
@@ -274,17 +300,26 @@ pub fn split_scan_body(
                 sum_right_hessian,
                 l1,
                 l2,
+                max_delta_step,
+                use_smoothing_b,
+                path_smooth,
+                left_count,
+                right_count,
+                parent_output,
             );
             let valid = consider && current_gain > min_gain_shift;
             is_splittable = select(valid, 1.0, is_splittable);
-            let cand_gain = select(valid, current_gain, 0.0); // 0.0 == sentinel (never beats best on invalid)
-            let take = cand_gain > best_gain; // strict `>` (:920) — keep first on tie
+            // C++ `if (current_gain > best_gain)` against a -inf init: the first
+            // valid candidate always wins, later ones need a strict `>` (keep
+            // first on tie).
+            let take = valid && (has_best == 0.0 || current_gain > best_gain);
+            has_best = select(take, 1.0, has_best);
             best_left_count = select(take, left_count, best_left_count);
             best_sum_left_gradient = select(take, sum_left_gradient, best_sum_left_gradient);
             best_sum_left_hessian = select(take, sum_left_hessian, best_sum_left_hessian);
             // left <= threshold, right > threshold => t-1 (:933)
             best_threshold = select(take, t - 1 + offset, best_threshold);
-            best_gain = select(take, cand_gain, best_gain);
+            best_gain = select(take, current_gain, best_gain);
             best_default_left = select(take, 1.0, best_default_left); // REVERSE
         }
     }
@@ -323,7 +358,7 @@ pub fn split_scan_body(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
 
-            let current_gain = get_split_gains(
+            let current_gain = get_split_gains_full(
                 use_l1_b,
                 sum_left_gradient,
                 sum_left_hessian,
@@ -331,17 +366,26 @@ pub fn split_scan_body(
                 sum_right_hessian,
                 l1,
                 l2,
+                max_delta_step,
+                use_smoothing_b,
+                path_smooth,
+                left_count,
+                right_count,
+                parent_output,
             );
             let valid = consider && current_gain > min_gain_shift;
             is_splittable = select(valid, 1.0, is_splittable);
-            let cand_gain = select(valid, current_gain, 0.0); // 0.0 == sentinel (never beats best on invalid)
-            let take = cand_gain > best_gain;
+            // C++ `if (current_gain > best_gain)` against a -inf init: the first
+            // valid candidate always wins, later ones need a strict `>` (keep
+            // first on tie).
+            let take = valid && (has_best == 0.0 || current_gain > best_gain);
+            has_best = select(take, 1.0, has_best);
             best_left_count = select(take, left_count, best_left_count);
             best_sum_left_gradient = select(take, sum_left_gradient, best_sum_left_gradient);
             best_sum_left_hessian = select(take, sum_left_hessian, best_sum_left_hessian);
             // forward records t+offset (NOT t-1+offset) (:1025)
             best_threshold = select(take, t + offset, best_threshold);
-            best_gain = select(take, cand_gain, best_gain);
+            best_gain = select(take, current_gain, best_gain);
             best_default_left = select(take, 0.0, best_default_left); // FORWARD
         }
     }
@@ -353,17 +397,34 @@ pub fn split_scan_body(
     // outputs + subtract kEpsilon back off the reported hessians (:1042/:1053)
     // so the launcher has the exact SplitInfo cells.
     let eps = f64::cast_from(K_EPSILON);
-    let left_output = calculate_splitted_leaf_output(
+    // Each side's smoothing weight uses that side's OWN row count (:1034-1049).
+    let best_right_count = num_data - best_left_count;
+    let left_output = calculate_splitted_leaf_output_full(
         use_l1_b,
         best_sum_left_gradient,
         best_sum_left_hessian,
         l1,
         l2,
+        max_delta_step,
+        use_smoothing_b,
+        path_smooth,
+        best_left_count,
+        parent_output,
     );
     let right_sum_gradient = sum_gradient - best_sum_left_gradient;
     let right_sum_hessian = sum_hessian - best_sum_left_hessian;
-    let right_output =
-        calculate_splitted_leaf_output(use_l1_b, right_sum_gradient, right_sum_hessian, l1, l2);
+    let right_output = calculate_splitted_leaf_output_full(
+        use_l1_b,
+        right_sum_gradient,
+        right_sum_hessian,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing_b,
+        path_smooth,
+        best_right_count,
+        parent_output,
+    );
 
     out[ob] = is_splittable; // already an f64 flag (0.0 / 1.0)
     out[ob + 1] = f64::cast_from(best_threshold);
@@ -400,6 +461,10 @@ pub fn find_best_split_kernel(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output: f64,
     min_gain_shift: f64,
     sum_gradient: f64,
     sum_hessian: f64,
@@ -421,6 +486,10 @@ pub fn find_best_split_kernel(
         min_sum_hessian_in_leaf,
         lambda_l1,
         lambda_l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        parent_output,
         min_gain_shift,
         sum_gradient,
         sum_hessian,
@@ -550,13 +619,6 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     // `GainConfig` (not a permissive proving slice), so a learner cfg carrying a
     // non-zero max_delta_step / path_smooth must keep ERRORING here rather than
     // silently enabling unimplemented semantics on device.
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_split: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
 
     // FindBestThreshold entry bump: sum_hessian + 2 * kEpsilon (:172). The 2 and
     // kEpsilon widen to f64 exactly as C++ does. C++ applies this bump at the
@@ -582,6 +644,9 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     // `min_gain_shift` by only a single f64 ULP. `min_gain_shift` computed from the
     // bumped sum_hessian is bit-exact to the reference implementation.
     let use_l1 = cfg.use_l1();
+    // The C++ `USE_SMOOTHING` template bool (`path_smooth > kEpsilon`),
+    // resolved once per launch exactly like `USE_L1` above.
+    let use_smoothing = cfg.use_smoothing();
     let gain_shift = crate::gain::get_leaf_gain(
         use_l1,
         sum_gradient,
@@ -645,6 +710,10 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
             cfg.min_sum_hessian_in_leaf,
             cfg.lambda_l1,
             cfg.lambda_l2,
+            cfg.max_delta_step,
+            if use_smoothing { 1u32 } else { 0u32 },
+            cfg.path_smooth,
+            cfg.parent_output,
             min_gain_shift,
             sum_gradient,
             sum_hessian_bumped,
@@ -793,6 +862,10 @@ fn launch_scan_at<R: cubecl::Runtime>(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output: f64,
     min_gain_shift: f64,
     sum_gradient: f64,
     sum_hessian: f64,
@@ -821,6 +894,10 @@ fn launch_scan_at<R: cubecl::Runtime>(
             min_sum_hessian_in_leaf,
             lambda_l1,
             lambda_l2,
+            max_delta_step,
+            use_smoothing,
+            path_smooth,
+            parent_output,
             min_gain_shift,
             sum_gradient,
             sum_hessian,
@@ -861,6 +938,10 @@ fn scan_wset_tunable_set<R: cubecl::Runtime>(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output: f64,
     min_gain_shift: f64,
     sum_gradient: f64,
     sum_hessian: f64,
@@ -890,6 +971,10 @@ fn scan_wset_tunable_set<R: cubecl::Runtime>(
                     min_sum_hessian_in_leaf,
                     lambda_l1,
                     lambda_l2,
+                    max_delta_step,
+                    use_smoothing,
+                    path_smooth,
+                    parent_output,
                     min_gain_shift,
                     sum_gradient,
                     sum_hessian,
@@ -922,6 +1007,11 @@ fn launch_scan_siblings_at<R: cubecl::Runtime>(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output_a: f64,
+    parent_output_b: f64,
     min_gain_shift_a: f64,
     sum_gradient_a: f64,
     sum_hessian_a: f64,
@@ -957,6 +1047,11 @@ fn launch_scan_siblings_at<R: cubecl::Runtime>(
             min_sum_hessian_in_leaf,
             lambda_l1,
             lambda_l2,
+            max_delta_step,
+            use_smoothing,
+            path_smooth,
+            parent_output_a,
+            parent_output_b,
             min_gain_shift_a,
             sum_gradient_a,
             sum_hessian_a,
@@ -989,6 +1084,11 @@ fn scan_wset_siblings_tunable_set<R: cubecl::Runtime>(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output_a: f64,
+    parent_output_b: f64,
     min_gain_shift_a: f64,
     sum_gradient_a: f64,
     sum_hessian_a: f64,
@@ -1022,6 +1122,11 @@ fn scan_wset_siblings_tunable_set<R: cubecl::Runtime>(
                     min_sum_hessian_in_leaf,
                     lambda_l1,
                     lambda_l2,
+                    max_delta_step,
+                    use_smoothing,
+                    path_smooth,
+                    parent_output_a,
+                    parent_output_b,
                     min_gain_shift_a,
                     sum_gradient_a,
                     sum_hessian_a,
@@ -1071,6 +1176,10 @@ pub fn find_best_splits_fused_kernel(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output: f64,
     min_gain_shift: f64,
     sum_gradient: f64,
     sum_hessian: f64,
@@ -1106,6 +1215,10 @@ pub fn find_best_splits_fused_kernel(
             min_sum_hessian_in_leaf,
             lambda_l1,
             lambda_l2,
+            max_delta_step,
+            use_smoothing,
+            path_smooth,
+            parent_output,
             min_gain_shift,
             sum_gradient,
             sum_hessian,
@@ -1179,6 +1292,10 @@ pub fn find_best_splits_fused_kernel_devcount(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output: f64,
     min_gain_shift: f64,
     sum_gradient: f64,
     sum_hessian: f64,
@@ -1210,6 +1327,10 @@ pub fn find_best_splits_fused_kernel_devcount(
             min_sum_hessian_in_leaf,
             lambda_l1,
             lambda_l2,
+            max_delta_step,
+            use_smoothing,
+            path_smooth,
+            parent_output,
             min_gain_shift,
             sum_gradient,
             sum_hessian,
@@ -1262,6 +1383,11 @@ pub fn find_best_splits_fused_siblings_kernel(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output_a: f64,
+    parent_output_b: f64,
     // PER-SIBLING leaf scalars (A = smaller, B = larger).
     min_gain_shift_a: f64,
     sum_gradient_a: f64,
@@ -1299,6 +1425,10 @@ pub fn find_best_splits_fused_siblings_kernel(
                 min_sum_hessian_in_leaf,
                 lambda_l1,
                 lambda_l2,
+                max_delta_step,
+                use_smoothing,
+                path_smooth,
+                parent_output_a,
                 min_gain_shift_a,
                 sum_gradient_a,
                 sum_hessian_a,
@@ -1321,6 +1451,10 @@ pub fn find_best_splits_fused_siblings_kernel(
                 min_sum_hessian_in_leaf,
                 lambda_l1,
                 lambda_l2,
+                max_delta_step,
+                use_smoothing,
+                path_smooth,
+                parent_output_b,
                 min_gain_shift_b,
                 sum_gradient_b,
                 sum_hessian_b,
@@ -1359,6 +1493,11 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
+    max_delta_step: f64,
+    use_smoothing: u32,
+    path_smooth: f64,
+    parent_output_a: f64,
+    parent_output_b: f64,
     // PER-SIBLING leaf scalars (A = smaller, B = larger) — num_data resolved on device below.
     min_gain_shift_a: f64,
     sum_gradient_a: f64,
@@ -1398,6 +1537,10 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
                 min_sum_hessian_in_leaf,
                 lambda_l1,
                 lambda_l2,
+                max_delta_step,
+                use_smoothing,
+                path_smooth,
+                parent_output_a,
                 min_gain_shift_a,
                 sum_gradient_a,
                 sum_hessian_a,
@@ -1420,6 +1563,10 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
                 min_sum_hessian_in_leaf,
                 lambda_l1,
                 lambda_l2,
+                max_delta_step,
+                use_smoothing,
+                path_smooth,
+                parent_output_b,
                 min_gain_shift_b,
                 sum_gradient_b,
                 sum_hessian_b,
@@ -1499,6 +1646,25 @@ const SCAN_STAGED_CUBE_DIM: u32 = 64;
 /// per-candidate parallel-gain + parallel-argmax redesign is the next scan
 /// lever, behind build (2.2s) and partition (1.65s).
 #[cfg(feature = "gpu")]
+/// Whether the LDS-staged / official / pargain / parprefix scan variants may run for
+/// this config.
+///
+/// Those variants are PERFORMANCE forks of [`split_scan_body`] — each re-transcribes
+/// the REVERSE/FORWARD scan against a shared-memory or plane-parallel layout, and each
+/// implements only the default `USE_MAX_OUTPUT=false, USE_SMOOTHING=false` gain. With
+/// `max_delta_step` or `path_smooth` active the gain switches to the given-output form
+/// (and needs the per-side row counts + the leaf's `parent_output`), which those bodies
+/// do not carry.
+///
+/// Rather than fork the semantics into five more scan bodies that no CI on a
+/// GPU-less machine can execute, the variants simply DECLINE for such a config and the
+/// launcher falls through to the shared `split_scan_body` path — which is the
+/// reference every variant is required to reproduce bit-for-bit anyway. The parameters
+/// therefore work on every backend; only the optimization opts out.
+fn scan_variants_applicable(cfg: &GainConfig) -> bool {
+    !cfg.use_max_output() && !cfg.use_smoothing()
+}
+
 fn scan_staged_enabled() -> bool {
     !matches!(std::env::var("LGBM_SCAN_STAGED").as_deref(), Ok("0"))
 }
@@ -5053,7 +5219,7 @@ unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_official_enabled(client) {
+    if scan_official_enabled(client) && scan_variants_applicable(cfg) {
         SCAN_OFFICIAL_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let plane_dim = client.properties().hardware.plane_size_max;
         // Official runs 256-wide (one lane per bin) with its own plane_dim arg — a
@@ -5084,10 +5250,14 @@ unsafe fn launch_staged_single_scan<R: cubecl::Runtime>(
                 plane_dim,
             );
         }
-    } else if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
+    } else if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
+        && scan_variants_applicable(cfg)
+    {
         SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_staged_parprefix_kernel);
-    } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
+    } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client))
+        && scan_variants_applicable(cfg)
+    {
         SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_staged_par_kernel);
     } else {
@@ -5159,7 +5329,7 @@ unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
             }
         };
     }
-    if scan_official_enabled(client) {
+    if scan_official_enabled(client) && scan_variants_applicable(cfg) {
         SCAN_OFFICIAL_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let plane_dim = client.properties().hardware.plane_size_max;
         unsafe {
@@ -5194,10 +5364,14 @@ unsafe fn launch_staged_siblings_scan<R: cubecl::Runtime>(
                 plane_dim,
             );
         }
-    } else if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client)) {
+    } else if scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
+        && scan_variants_applicable(cfg)
+    {
         SCAN_PARPREFIX_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_siblings_staged_parprefix_kernel);
-    } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client)) {
+    } else if scan_pargain_enabled(<R as cubecl::Runtime>::name(client))
+        && scan_variants_applicable(cfg)
+    {
         SCAN_PARGAIN_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         launch_with!(find_best_splits_fused_siblings_staged_par_kernel);
     } else {
@@ -5474,13 +5648,6 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
 
     // Leaf-level, checked once: only the default smoothing/clamp path is
     // transcribed. Reject non-default values rather than mis-compute.
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_splits_batched: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
     // Reject non-positive OR NaN sum_hessian once (leaf-level; cnt_factor divides
     // by the bumped sum_hessian). `!(x > 0.0)` is deliberately NaN-catching.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -5558,6 +5725,9 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let sum_hessian_bumped = sum_hessian + two_eps;
     let use_l1 = cfg.use_l1();
+    // The C++ `USE_SMOOTHING` template bool (`path_smooth > kEpsilon`),
+    // resolved once per launch exactly like `USE_L1` above.
+    let use_smoothing = cfg.use_smoothing();
     let gain_shift = crate::gain::get_leaf_gain(
         use_l1,
         sum_gradient,
@@ -5633,6 +5803,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     #[cfg(feature = "gpu")]
     let staged = !is_device
         && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
     #[cfg(not(feature = "gpu"))]
@@ -5680,6 +5851,7 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
     let device_parprefix = is_device
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
         && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
     #[cfg(not(feature = "gpu"))]
@@ -5777,6 +5949,10 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
             cfg.min_sum_hessian_in_leaf,
             cfg.lambda_l1,
             cfg.lambda_l2,
+            cfg.max_delta_step,
+            if use_smoothing { 1u32 } else { 0u32 },
+            cfg.path_smooth,
+            cfg.parent_output,
             min_gain_shift,
             sum_gradient,
             sum_hessian_bumped,
@@ -5826,6 +6002,10 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                     cfg.min_sum_hessian_in_leaf,
                     cfg.lambda_l1,
                     cfg.lambda_l2,
+                    cfg.max_delta_step,
+                    if use_smoothing { 1u32 } else { 0u32 },
+                    cfg.path_smooth,
+                    cfg.parent_output,
                     min_gain_shift,
                     sum_gradient,
                     sum_hessian_bumped,
@@ -5862,6 +6042,10 @@ fn find_best_splits_fused_inner<R: cubecl::Runtime>(
                     cfg.min_sum_hessian_in_leaf,
                     cfg.lambda_l1,
                     cfg.lambda_l2,
+                    cfg.max_delta_step,
+                    if use_smoothing { 1u32 } else { 0u32 },
+                    cfg.path_smooth,
+                    cfg.parent_output,
                     min_gain_shift,
                     sum_gradient,
                     sum_hessian_bumped,
@@ -5972,9 +6156,12 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     buf_len: usize,
     feats: &[BatchedSplitFeature],
     cfg: &GainConfig,
-    // (sum_gradient, sum_hessian, num_data) per sibling (A = smaller, B = larger).
-    a_totals: (f64, f64, i32),
-    b_totals: (f64, f64, i32),
+    // (sum_gradient, sum_hessian, num_data, parent_output) per sibling
+    // (A = smaller, B = larger). `parent_output` is per-LEAF — the two siblings get
+    // DIFFERENT values (their parent split's left_output / right_output), so it
+    // cannot ride along in the shared `cfg`.
+    a_totals: (f64, f64, i32, f64),
+    b_totals: (f64, f64, i32, f64),
 ) -> Result<(Vec<SplitInfo>, Vec<SplitInfo>), ComputeError> {
     // Empty batch: no launch (mirror the single-slot T-mc5-03 early return).
     if feats.is_empty() {
@@ -5987,15 +6174,8 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     let _scan_prof = crate::fusion_prof::scan_enabled();
 
     // Leaf-level, checked once on the shared cfg.
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_splits_siblings: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
-    let (sum_gradient_a, sum_hessian_a, num_data_a) = a_totals;
-    let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
+    let (sum_gradient_a, sum_hessian_a, num_data_a, parent_output_a) = a_totals;
+    let (sum_gradient_b, sum_hessian_b, num_data_b, parent_output_b) = b_totals;
     // Reject non-positive OR NaN sum_hessian once PER SIBLING (cnt_factor divides by
     // the bumped sum_hessian). `!(x > 0.0)` is deliberately NaN-catching.
     //
@@ -6082,6 +6262,9 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     // computes them once.
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let use_l1 = cfg.use_l1();
+    // The C++ `USE_SMOOTHING` template bool (`path_smooth > kEpsilon`),
+    // resolved once per launch exactly like `USE_L1` above.
+    let use_smoothing = cfg.use_smoothing();
     let sum_hessian_a_bumped = sum_hessian_a + two_eps;
     let min_gain_shift_a = crate::gain::get_leaf_gain(
         use_l1,
@@ -6133,6 +6316,7 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
     // both siblings; bit-identical output layout + values (staged-kernel note).
     #[cfg(feature = "gpu")]
     let staged = scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && num_bin_a.iter().all(|&nb| (nb as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
     #[cfg(not(feature = "gpu"))]
@@ -6207,6 +6391,11 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
             cfg.min_sum_hessian_in_leaf,
             cfg.lambda_l1,
             cfg.lambda_l2,
+            cfg.max_delta_step,
+            if use_smoothing { 1u32 } else { 0u32 },
+            cfg.path_smooth,
+            parent_output_a,
+            parent_output_b,
             min_gain_shift_a,
             sum_gradient_a,
             sum_hessian_a_bumped,
@@ -6250,6 +6439,11 @@ pub fn find_best_splits_fused_siblings_from_handles_on<R: cubecl::Runtime>(
                 cfg.min_sum_hessian_in_leaf,
                 cfg.lambda_l1,
                 cfg.lambda_l2,
+                cfg.max_delta_step,
+                if use_smoothing { 1u32 } else { 0u32 },
+                cfg.path_smooth,
+                parent_output_a,
+                parent_output_b,
                 min_gain_shift_a,
                 sum_gradient_a,
                 sum_hessian_a_bumped,
@@ -7009,13 +7203,6 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
         NumDataSrc::Device { .. } => 0,
     };
     // Leaf-level scope checks (identical to `find_best_splits_fused_inner`).
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_splits_reduce: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(sum_hessian > 0.0) {
         return Err(ComputeError::Runtime {
@@ -7046,6 +7233,9 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let sum_hessian_bumped = sum_hessian + two_eps;
     let use_l1 = cfg.use_l1();
+    // The C++ `USE_SMOOTHING` template bool (`path_smooth > kEpsilon`),
+    // resolved once per launch exactly like `USE_L1` above.
+    let use_smoothing = cfg.use_smoothing();
     let gain_shift = crate::gain::get_leaf_gain(
         use_l1,
         sum_gradient,
@@ -7075,6 +7265,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     #[cfg(feature = "gpu")]
     if !is_device
         && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && d.staged_capable
     {
@@ -7117,6 +7308,7 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
     if is_device
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
         && d.staged_capable
     {
@@ -7198,6 +7390,10 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
                 cfg.min_sum_hessian_in_leaf,
                 cfg.lambda_l1,
                 cfg.lambda_l2,
+                cfg.max_delta_step,
+                if use_smoothing { 1u32 } else { 0u32 },
+                cfg.path_smooth,
+                cfg.parent_output,
                 min_gain_shift,
                 sum_gradient,
                 sum_hessian_bumped,
@@ -7234,6 +7430,10 @@ fn fused_scan_to_raw_handle<R: cubecl::Runtime>(
                 cfg.min_sum_hessian_in_leaf,
                 cfg.lambda_l1,
                 cfg.lambda_l2,
+                cfg.max_delta_step,
+                if use_smoothing { 1u32 } else { 0u32 },
+                cfg.path_smooth,
+                cfg.parent_output,
                 min_gain_shift,
                 sum_gradient,
                 sum_hessian_bumped,
@@ -7439,8 +7639,8 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     buf_len: usize,
     feats: &[BatchedSplitFeature],
     cfg: &GainConfig,
-    a_totals: (f64, f64, i32),
-    b_totals: (f64, f64, i32),
+    a_totals: (f64, f64, i32, f64),
+    b_totals: (f64, f64, i32, f64),
     // SPEC-DRGL-13: `Host` ⇒ counts from a_totals/b_totals (byte-unchanged); `Device` ⇒ both
     // resolved on device in the scan kernel (parprefix siblings twin on hip, else legacy twin).
     num_data_src: SiblingNumDataSrc,
@@ -7450,17 +7650,10 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     if feats.is_empty() {
         return Ok(None);
     }
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_splits_siblings_reduce: max_delta_step / path_smooth are Phase-7+ \
-                     scope (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
     let is_device = matches!(num_data_src, SiblingNumDataSrc::Device { .. });
-    let (sum_gradient_a, sum_hessian_a, num_data_a) = a_totals;
-    let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
+    let (sum_gradient_a, sum_hessian_a, num_data_a, parent_output_a) = a_totals;
+    let (sum_gradient_b, sum_hessian_b, num_data_b, parent_output_b) = b_totals;
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(sum_hessian_a > 0.0) {
         return Err(ComputeError::Runtime {
@@ -7502,6 +7695,9 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // Per-sibling leaf scalars (the 2*kEpsilon bump + min_gain_shift) — IDENTICAL math.
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let use_l1 = cfg.use_l1();
+    // The C++ `USE_SMOOTHING` template bool (`path_smooth > kEpsilon`),
+    // resolved once per launch exactly like `USE_L1` above.
+    let use_smoothing = cfg.use_smoothing();
     let sum_hessian_a_bumped = sum_hessian_a + two_eps;
     let min_gain_shift_a = crate::gain::get_leaf_gain(
         use_l1,
@@ -7537,6 +7733,7 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     #[cfg(feature = "gpu")]
     if !is_device
         && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && d.staged_capable
     {
@@ -7578,6 +7775,7 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     if is_device
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && scan_parprefix_enabled(<R as cubecl::Runtime>::name(client))
         && d.staged_capable
     {
@@ -7667,6 +7865,11 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                 cfg.min_sum_hessian_in_leaf,
                 cfg.lambda_l1,
                 cfg.lambda_l2,
+                cfg.max_delta_step,
+                if use_smoothing { 1u32 } else { 0u32 },
+                cfg.path_smooth,
+                parent_output_a,
+                parent_output_b,
                 min_gain_shift_a,
                 sum_gradient_a,
                 sum_hessian_a_bumped,
@@ -7709,6 +7912,11 @@ fn fused_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                 cfg.min_sum_hessian_in_leaf,
                 cfg.lambda_l1,
                 cfg.lambda_l2,
+                cfg.max_delta_step,
+                if use_smoothing { 1u32 } else { 0u32 },
+                cfg.path_smooth,
+                parent_output_a,
+                parent_output_b,
                 min_gain_shift_a,
                 sum_gradient_a,
                 sum_hessian_a_bumped,
@@ -7762,8 +7970,8 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     buf_len: usize,
     feats: &[BatchedSplitFeature],
     cfg: &GainConfig,
-    a_totals: (f64, f64, i32),
-    b_totals: (f64, f64, i32),
+    a_totals: (f64, f64, i32, f64),
+    b_totals: (f64, f64, i32, f64),
     // Per-grow cached descriptor set (LGBM_DESC_HOIST) — see `fused_scan_to_raw_handle`.
     desc: Option<&ScanDescHandles>,
 ) -> Result<
@@ -7778,21 +7986,15 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // SERIAL-branch staged kernel only), every feature ≤ the LDS stage cap. When any
     // fails, signal fallback to the separate subtract + scan.
     let staged_capable = scan_staged_enabled()
+        && scan_variants_applicable(cfg)
         && !scan_pargain_enabled(<R as cubecl::Runtime>::name(client))
         && <R as cubecl::Runtime>::name(client) != "cpu"
         && feats.iter().all(|f| (f.num_bin as usize) * 2 <= SCAN_STAGE_MAX_CELLS);
     if !staged_capable {
         return Ok(None);
     }
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_splits_siblings_subtract: max_delta_step / path_smooth are \
-                     Phase-7+ scope (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
-    let (sum_gradient_a, sum_hessian_a, num_data_a) = a_totals;
-    let (sum_gradient_b, sum_hessian_b, num_data_b) = b_totals;
+    let (sum_gradient_a, sum_hessian_a, num_data_a, parent_output_a) = a_totals;
+    let (sum_gradient_b, sum_hessian_b, num_data_b, parent_output_b) = b_totals;
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(sum_hessian_a > 0.0) || !(sum_hessian_b > 0.0) {
         return Err(ComputeError::Runtime {
@@ -7855,7 +8057,7 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
     // `hist_smaller` at the same region; `h_out` is `2*n*12`; per-feature arrays sized `n`.
     // `larger_out` is a FRESH handle (never aliases `hist_parent`). All cubecl unsafe
     // confined here (CMP-01).
-    if scan_official_enabled(client) {
+    if scan_official_enabled(client) && scan_variants_applicable(cfg) {
         // OFFICIAL-SHAPE subtract twin (P1b) — same subtraction trick (sibling B
         // materializes `parent − smaller` into `larger_out`), but the branch scans
         // are the 256-wide block scans. 256 lanes + its own `plane_dim` arg.
@@ -7953,8 +8155,8 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_on<R: cubecl:
     feats: &[BatchedSplitFeature],
     real_feats: &[i32],
     cfg: &GainConfig,
-    a_totals: (f64, f64, i32),
-    b_totals: (f64, f64, i32),
+    a_totals: (f64, f64, i32, f64),
+    b_totals: (f64, f64, i32, f64),
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf_a: usize,
     out_leaf_b: usize,
@@ -8029,8 +8231,8 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_on<R: cubecl::Runtime>
     feats: &[BatchedSplitFeature],
     real_feats: &[i32],
     cfg: &GainConfig,
-    a_totals: (f64, f64, i32),
-    b_totals: (f64, f64, i32),
+    a_totals: (f64, f64, i32, f64),
+    b_totals: (f64, f64, i32, f64),
     out: &crate::kernels::best_split::SplitSoa,
     out_leaf_a: usize,
     out_leaf_b: usize,
@@ -8118,8 +8320,8 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl:
     cfg: &GainConfig,
     // (sum_gradient, sum_hessian, _num_data) per sibling — the num_data component is IGNORED
     // (resolved on device); the sums drive min_gain_shift + the child-output finalization.
-    a_totals: (f64, f64, i32),
-    b_totals: (f64, f64, i32),
+    a_totals: (f64, f64, i32, f64),
+    b_totals: (f64, f64, i32, f64),
     ranges: cubecl::server::Handle,
     ranges_len: usize,
     roles: cubecl::server::Handle,
@@ -8228,7 +8430,10 @@ pub fn find_best_split_cpu_native(
     sum_hessian: f64,
     num_data: i32,
 ) -> Result<SplitInfo, ComputeError> {
-    use crate::gain::{calculate_splitted_leaf_output as calc_out, get_leaf_gain, get_split_gains};
+    use crate::gain::{
+        calculate_splitted_leaf_output_full as calc_out, get_leaf_gain_full,
+        get_split_gains_full,
+    };
 
     // ---- V5 boundary validation (identical to find_best_split_cpu) ----
     if na_as_missing {
@@ -8261,24 +8466,31 @@ pub fn find_best_split_cpu_native(
                 .to_string(),
         });
     }
-    if cfg.max_delta_step != 0.0 || cfg.path_smooth != 0.0 {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_split: max_delta_step / path_smooth are Phase-7+ scope \
-                     (only the default 0.0 path is transcribed)"
-                .to_string(),
-        });
-    }
-
     // ---- host pre-step: 2*kEpsilon bump + min_gain_shift (verbatim) ----
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let sum_hessian_bumped = sum_hessian + two_eps;
     let use_l1 = cfg.use_l1();
-    let gain_shift = get_leaf_gain(
+    // The C++ `USE_MAX_OUTPUT` / `USE_SMOOTHING` template bools, resolved once per
+    // feature histogram from the config (feature_histogram.hpp:248-270).
+    let use_smoothing = cfg.use_smoothing();
+    let max_delta_step = cfg.max_delta_step;
+    let parent_output = cfg.parent_output;
+    // `BeforeNumerical` (feature_histogram.hpp:192-207) uses the SAME
+    // `GetLeafGain<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>` instantiation as the
+    // per-candidate scan, over the WHOLE-leaf sums and the leaf's own row count —
+    // so under smoothing the baseline is the smoothed whole-leaf gain, not the
+    // closed form.
+    let gain_shift = get_leaf_gain_full(
         use_l1,
         sum_gradient,
         sum_hessian_bumped,
         cfg.lambda_l1,
         cfg.lambda_l2,
+        max_delta_step,
+        use_smoothing,
+        cfg.path_smooth,
+        num_data,
+        parent_output,
     );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
@@ -8300,10 +8512,14 @@ pub fn find_best_split_cpu_native(
     let min_sum_hessian_in_leaf = cfg.min_sum_hessian_in_leaf;
     let min_data_in_leaf = cfg.min_data_in_leaf;
 
-    // Best-split running state — same literal inits as the kernel.
+    // Best-split running state. `best_gain` is C++ `kMinScore` (-inf), NOT 0.0: under
+    // `max_delta_step` / `path_smooth` the given-output gain form is freely negative,
+    // so a 0.0 sentinel silently discards every negative-gain candidate (see the
+    // matching note in `split_scan_body`). Plain Rust has no literal-init restriction,
+    // so -inf is used directly here.
     let mut best_sum_left_gradient = 0.0f64;
     let mut best_sum_left_hessian = 0.0f64;
-    let mut best_gain = 0.0f64;
+    let mut best_gain = f64::NEG_INFINITY;
     let mut best_left_count = 0i32;
     let mut best_threshold = 0i32;
     let mut is_splittable = false;
@@ -8339,7 +8555,7 @@ pub fn find_best_split_cpu_native(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
             if consider {
-                let current_gain = get_split_gains(
+                let current_gain = get_split_gains_full(
                     use_l1,
                     sum_left_gradient,
                     sum_left_hessian,
@@ -8347,6 +8563,12 @@ pub fn find_best_split_cpu_native(
                     sum_right_hessian,
                     l1,
                     l2,
+                    max_delta_step,
+                    use_smoothing,
+                    cfg.path_smooth,
+                    left_count,
+                    right_count,
+                    parent_output,
                 );
                 if current_gain > min_gain_shift {
                     is_splittable = true;
@@ -8387,7 +8609,7 @@ pub fn find_best_split_cpu_native(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
             if consider {
-                let current_gain = get_split_gains(
+                let current_gain = get_split_gains_full(
                     use_l1,
                     sum_left_gradient,
                     sum_left_hessian,
@@ -8395,6 +8617,12 @@ pub fn find_best_split_cpu_native(
                     sum_right_hessian,
                     l1,
                     l2,
+                    max_delta_step,
+                    use_smoothing,
+                    cfg.path_smooth,
+                    left_count,
+                    right_count,
+                    parent_output,
                 );
                 if current_gain > min_gain_shift {
                     is_splittable = true;
@@ -8413,10 +8641,35 @@ pub fn find_best_split_cpu_native(
 
     // ---- finalization (feature_histogram.hpp:1031-1056), same operand orders ----
     let eps = f64::from(K_EPSILON);
-    let left_output = calc_out(use_l1, best_sum_left_gradient, best_sum_left_hessian, l1, l2);
+    // The winner's per-side outputs use that side's OWN row count for the
+    // smoothing weight (feature_histogram.hpp:1034-1049).
+    let best_right_count = num_data - best_left_count;
+    let left_output = calc_out(
+        use_l1,
+        best_sum_left_gradient,
+        best_sum_left_hessian,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        cfg.path_smooth,
+        best_left_count,
+        parent_output,
+    );
     let right_sum_gradient = sum_gradient - best_sum_left_gradient;
     let right_sum_hessian = sum_hessian_bumped - best_sum_left_hessian;
-    let right_output = calc_out(use_l1, right_sum_gradient, right_sum_hessian, l1, l2);
+    let right_output = calc_out(
+        use_l1,
+        right_sum_gradient,
+        right_sum_hessian,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        cfg.path_smooth,
+        best_right_count,
+        parent_output,
+    );
 
     // Accept gate (:1031): is_splittable && best_gain > -inf (finite). Reported
     // gain is best_gain - min_gain_shift (penalty == 1).
@@ -8985,8 +9238,10 @@ mod tests {
         let (buf_b, sg_b, sh_b, nd_b) = batch_hist_b();
         assert_eq!(buf_a.len(), buf_b.len(), "co-pack siblings share the feature layout");
         let cfg = relaxed_cfg();
-        let a_totals = (sg_a, sh_a, nd_a);
-        let b_totals = (sg_b, sh_b, nd_b);
+        // The 4th tuple slot is the sibling's `parent_output`; 0.0 is inert here
+        // because `relaxed_cfg()` leaves `path_smooth` at its no-smoothing default.
+        let a_totals = (sg_a, sh_a, nd_a, 0.0);
+        let b_totals = (sg_b, sh_b, nd_b, 0.0);
 
         // Host: co-pack readback launcher → (vec_a, vec_b) → per-sibling host argmax.
         let h_a = client.create_from_slice(f64::as_bytes(&buf_a));
@@ -9122,7 +9377,9 @@ mod tests {
 
         let got = find_best_splits_fused_siblings_subtract_reduce_into_leaves_on(
             &client, h_smaller, h_parent, buf_a.len(), &feats, &real_feats, &cfg,
-            (sg_a, sh_a, nd_a), (sg_b, sh_b, nd_b), &out, 0, 1, None,
+            // 4th slot = the sibling's `parent_output`; inert at `relaxed_cfg()`'s
+            // no-smoothing default.
+            (sg_a, sh_a, nd_a, 0.0), (sg_b, sh_b, nd_b, 0.0), &out, 0, 1, None,
         )
         .expect("launcher must not error on the fallback path");
         assert!(
@@ -9210,7 +9467,7 @@ mod tests {
             let out = SplitSoa::zeroed(&client, 2);
             find_best_splits_fused_siblings_reduce_into_leaves_on(
                 &client, h_a, h_b, buf_a.len(), &feats, &real_feats, &cfg,
-                (sg_a, sh_a, nd_a), (sg_b, sh_b, nd_b), &out, 0, 1, desc,
+                (sg_a, sh_a, nd_a, 0.0), (sg_b, sh_b, nd_b, 0.0), &out, 0, 1, desc,
             )
             .expect("siblings reduce launcher");
             out

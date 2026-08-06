@@ -29,7 +29,7 @@
 //! into `f64` (`hist_t = double`) — the `+=` widens each `f32` term to `f64`
 //! before adding, exactly as the C++ `double tmp_sum += gradients[i]` does.
 
-use lgbm_compute::gain::{calculate_splitted_leaf_output, GainConfig};
+use lgbm_compute::gain::{calculate_splitted_leaf_output_full, GainConfig};
 
 /// Per-leaf split state — the C++ `LeafSplits` running totals (`leaf_splits.hpp`).
 ///
@@ -85,15 +85,44 @@ impl LeafSplits {
         self.num_data_in_leaf = indices.len() as i32;
         self.sum_gradients = sum_g;
         self.sum_hessians = sum_h;
-        // weight_ = CalculateSplittedLeafOutput(sum_g, sum_h, l1, l2)
-        // (the USE_L1 / no-smoothing / no-max-output path — gain.rs).
-        self.weight = calculate_splitted_leaf_output(
+        self.weight = Self::self_output(sum_g, sum_h, cfg);
+    }
+
+    /// The leaf's OWN output, as C++ `SerialTreeLearner::GetParentOutput` computes it
+    /// for the root (`serial_tree_learner.cpp:1007-1013`):
+    ///
+    /// ```cpp
+    /// CalculateSplittedLeafOutput<USE_MC=true, USE_L1=true, USE_MAX_OUTPUT=true,
+    ///                             USE_SMOOTHING=false>(
+    ///     sum_gradients, sum_hessians, lambda_l1, lambda_l2, max_delta_step,
+    ///     BasicConstraint(), path_smooth, num_data_in_leaf, 0);
+    /// ```
+    ///
+    /// Note the template axes: `max_delta_step` IS applied, smoothing is NOT ("we
+    /// don't apply any smoothing to the root"), and the default-constructed
+    /// `BasicConstraint()` is unbounded, so `USE_MC` clamps nothing.
+    ///
+    /// Seeding `weight` with this — rather than leaving it at C++'s literal `0` —
+    /// is what lets the learner read `parent_output` uniformly off `LeafSplits`:
+    /// a root leaf carries its own output here, and a CHILD leaf carries the
+    /// output its parent split assigned it (see
+    /// [`init_from_split`](Self::init_from_split)). That is exactly the two
+    /// branches of `GetParentOutput`, decided by which seeding path ran instead of
+    /// by an explicit `tree->num_leaves() == 1` test.
+    fn self_output(sum_g: f64, sum_h: f64, cfg: &GainConfig) -> f64 {
+        calculate_splitted_leaf_output_full(
             cfg.use_l1(),
             sum_g,
             sum_h,
             cfg.lambda_l1,
             cfg.lambda_l2,
-        );
+            cfg.max_delta_step,
+            // USE_SMOOTHING = false — the root is never smoothed.
+            false,
+            cfg.path_smooth,
+            0,
+            0.0,
+        )
     }
 
     /// `LeafSplits::Init(sum_gradient, sum_hessian)` (`leaf_splits.hpp`): seed the
@@ -112,13 +141,7 @@ impl LeafSplits {
         self.num_data_in_leaf = num_data_in_leaf;
         self.sum_gradients = sum_gradient;
         self.sum_hessians = sum_hessian;
-        self.weight = calculate_splitted_leaf_output(
-            cfg.use_l1(),
-            sum_gradient,
-            sum_hessian,
-            cfg.lambda_l1,
-            cfg.lambda_l2,
-        );
+        self.weight = Self::self_output(sum_gradient, sum_hessian, cfg);
     }
 
     /// `LeafSplits::Init(leaf, data_partition, sum_gradients, sum_hessians,

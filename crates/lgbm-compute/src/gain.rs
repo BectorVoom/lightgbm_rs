@@ -25,11 +25,14 @@
 //! `float` constant to `double`). We never redefine `1e-15` / `1e-35` locally.
 //!
 //! ## Scope
-//! Only the `USE_L1=false/true`, `USE_MAX_OUTPUT=false`, `USE_SMOOTHING=false`,
-//! `USE_MC=false` (no monotone constraints) template instantiation is
-//! transcribed — that is the default CPU path. `max_delta_step` (output
-//! clamping), `path_smooth` (smoothing), and monotone constraints are Phase-7+
-//! scope and are validated to be at their no-op defaults by the launcher.
+//! The `USE_L1`, `USE_MAX_OUTPUT` (`max_delta_step`) and `USE_SMOOTHING`
+//! (`path_smooth`) template axes are all transcribed. The two-axis `*_full`
+//! primitives ([`calculate_splitted_leaf_output_full`], [`get_leaf_gain_full`],
+//! [`get_split_gains_full`]) are the general form; the older
+//! `USE_MAX_OUTPUT=false, USE_SMOOTHING=false` fast-path fns are retained and are
+//! what `*_full` DELEGATES to on that axis, so the default path is byte-unchanged.
+//! `USE_MC` (monotone constraints) is layered on top in
+//! `lgbm_treelearner::monotone_constraints`.
 
 use cubecl::prelude::*;
 
@@ -229,6 +232,175 @@ pub fn get_leaf_gain_smoothed(
 }
 
 // ===========================================================================
+// The FULL two-axis (USE_MAX_OUTPUT x USE_SMOOTHING) gain path.
+//
+// VERBATIM transcription of `feature_histogram.hpp:715-829` — the general
+// template bodies the three fast-path fns above are the
+// `USE_MAX_OUTPUT=false, USE_SMOOTHING=false` corner of. `USE_MAX_OUTPUT` and
+// `USE_SMOOTHING` are C++ TEMPLATE bools resolved once per feature histogram
+// (`FuncForNumricalL1`/`L2`: `max_delta_step > 0` and `path_smooth > kEpsilon`),
+// so they arrive here as runtime flags derived from the SAME config predicates —
+// see [`GainConfig::use_max_output`] / [`GainConfig::use_smoothing`].
+//
+// The default (both off) path delegates to the fast-path fns and is therefore
+// BIT-UNCHANGED, which is what keeps the existing goldens valid.
+// ===========================================================================
+
+/// `CalculateSplittedLeafOutput<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>`
+/// (feature_histogram.hpp:715-737) — the general form, in the C++ statement order:
+///
+/// ```cpp
+/// ret = USE_L1 ? -ThresholdL1(g, l1) / (h + l2) : -g / (h + l2);
+/// if (USE_MAX_OUTPUT) {
+///   if (max_delta_step > 0 && std::fabs(ret) > max_delta_step) {
+///     ret = Common::Sign(ret) * max_delta_step;
+///   }
+/// }
+/// if (USE_SMOOTHING) {
+///   ret = ret * (num_data / smoothing) / (num_data / smoothing + 1)
+///       + parent_output / (num_data / smoothing + 1);
+/// }
+/// ```
+///
+/// The clamp order is load-bearing: C++ clamps the RAW output and THEN blends, so
+/// the blend pulls a CLAMPED value toward the parent, never the other way round.
+///
+/// `use_smoothing` gates the blend as a branchless `select`; when it is false the
+/// divisor is forced to `1.0` so `num_data / smoothing` cannot become `inf` (and
+/// the blend `NaN`) for the `path_smooth == 0` default. The discarded value never
+/// reaches the result either way — this only keeps intermediates finite.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_splitted_leaf_output_full(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    max_delta_step: f64,
+    use_smoothing: bool,
+    path_smooth: f64,
+    num_data: i32,
+    parent_output: f64,
+) -> f64 {
+    // USE_L1 base — the existing fast-path fn, so the default corner is bit-identical.
+    let base = calculate_splitted_leaf_output(use_l1, sum_gradients, sum_hessians, l1, l2);
+
+    // USE_MAX_OUTPUT: `ret = Sign(ret) * max_delta_step` when the guard fires.
+    // `Common::Sign(x) = (x > 0) - (x < 0)` — the same branchless encoding
+    // [`threshold_l1`] uses (the `if cond { 1.0 } else { 0.0 }` form mis-lowers on
+    // cubecl-cpu). The guard can only fire for `|base| > max_delta_step > 0`, so
+    // `base` is never 0 there and the sign is never the degenerate 0.
+    let clamp = max_delta_step > 0.0 && f64::abs(base) > max_delta_step;
+    let pos = select(base > 0.0, 1.0, 0.0);
+    let neg = select(base < 0.0, 1.0, 0.0);
+    let clamped = select(clamp, (pos - neg) * max_delta_step, base);
+
+    // USE_SMOOTHING: verbatim precedence — `ret * nps / (nps + 1)`, NOT
+    // `ret * (nps / (nps + 1))` (the two differ in the last bit).
+    let ps = select(use_smoothing, path_smooth, 1.0);
+    let n_over_ps = num_data as f64 / ps;
+    let blended = clamped * n_over_ps / (n_over_ps + 1.0) + parent_output / (n_over_ps + 1.0);
+    select(use_smoothing, blended, clamped)
+}
+
+/// `GetLeafGain<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>`
+/// (feature_histogram.hpp:798-810) — the general form:
+///
+/// ```cpp
+/// if (!USE_MAX_OUTPUT && !USE_SMOOTHING) {
+///   return USE_L1 ? sg_l1*sg_l1 / (h + l2) : g*g / (h + l2);   // closed form
+/// } else {
+///   double output = CalculateSplittedLeafOutput<...>(...);
+///   return GetLeafGainGivenOutput<USE_L1>(g, h, l1, l2, output);
+/// }
+/// ```
+///
+/// The branch is NOT a redundant optimisation: at the unconstrained output the two
+/// forms are mathematically equal but differ by ULPs in floating point, so which
+/// one runs is observable. C++ picks it from the TEMPLATE bools — i.e. purely from
+/// the config, never per candidate — and so does this `select`.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn get_leaf_gain_full(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    max_delta_step: f64,
+    use_smoothing: bool,
+    path_smooth: f64,
+    num_data: i32,
+    parent_output: f64,
+) -> f64 {
+    let closed = get_leaf_gain(use_l1, sum_gradients, sum_hessians, l1, l2);
+    let output = calculate_splitted_leaf_output_full(
+        use_l1,
+        sum_gradients,
+        sum_hessians,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        num_data,
+        parent_output,
+    );
+    let given = get_leaf_gain_given_output(use_l1, sum_gradients, sum_hessians, l1, l2, output);
+    // `USE_MAX_OUTPUT || USE_SMOOTHING` — both are config-level predicates.
+    let use_given = max_delta_step > 0.0 || use_smoothing;
+    select(use_given, given, closed)
+}
+
+/// `GetSplitGains<USE_MC=false, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>`
+/// (feature_histogram.hpp:757-772, the `!USE_MC` branch) — the general form.
+///
+/// Note the per-side `left_count` / `right_count`: smoothing weights each child's
+/// output by ITS OWN row count, so the two sides are NOT symmetric in `num_data`.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn get_split_gains_full(
+    use_l1: bool,
+    sum_left_gradients: f64,
+    sum_left_hessians: f64,
+    sum_right_gradients: f64,
+    sum_right_hessians: f64,
+    l1: f64,
+    l2: f64,
+    max_delta_step: f64,
+    use_smoothing: bool,
+    path_smooth: f64,
+    left_count: i32,
+    right_count: i32,
+    parent_output: f64,
+) -> f64 {
+    get_leaf_gain_full(
+        use_l1,
+        sum_left_gradients,
+        sum_left_hessians,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        left_count,
+        parent_output,
+    ) + get_leaf_gain_full(
+        use_l1,
+        sum_right_gradients,
+        sum_right_hessians,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        right_count,
+        parent_output,
+    )
+}
+
+// ===========================================================================
 // f32 mirrors of the gain primitives for the no-f64 hip device (CMP-04).
 //
 // IDENTICAL formula structure and gate ORDER as the f64 anchors above — the ONLY
@@ -365,21 +537,128 @@ pub fn get_leaf_gain_given_output_f32(
     }
 }
 
+/// f32 mirror of [`calculate_splitted_leaf_output_full`] (the no-f64 hip path).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_splitted_leaf_output_full_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+    max_delta_step: f32,
+    use_smoothing: bool,
+    path_smooth: f32,
+    num_data: i32,
+    parent_output: f32,
+) -> f32 {
+    // WR-05: every literal pinned f32 so cubecl cannot widen the clamp/blend to f64.
+    let base = calculate_splitted_leaf_output_f32(use_l1, sum_gradients, sum_hessians, l1, l2);
+    let clamp = max_delta_step > 0.0f32 && f32::abs(base) > max_delta_step;
+    let pos = select(base > 0.0f32, 1.0f32, 0.0f32);
+    let neg = select(base < 0.0f32, 1.0f32, 0.0f32);
+    let clamped = select(clamp, (pos - neg) * max_delta_step, base);
+    let ps = select(use_smoothing, path_smooth, 1.0f32);
+    let n_over_ps = num_data as f32 / ps;
+    let blended = clamped * n_over_ps / (n_over_ps + 1.0f32) + parent_output / (n_over_ps + 1.0f32);
+    select(use_smoothing, blended, clamped)
+}
+
+/// f32 mirror of [`get_leaf_gain_full`] (the no-f64 hip path).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn get_leaf_gain_full_f32(
+    use_l1: bool,
+    sum_gradients: f32,
+    sum_hessians: f32,
+    l1: f32,
+    l2: f32,
+    max_delta_step: f32,
+    use_smoothing: bool,
+    path_smooth: f32,
+    num_data: i32,
+    parent_output: f32,
+) -> f32 {
+    let closed = get_leaf_gain_f32(use_l1, sum_gradients, sum_hessians, l1, l2);
+    let output = calculate_splitted_leaf_output_full_f32(
+        use_l1,
+        sum_gradients,
+        sum_hessians,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        num_data,
+        parent_output,
+    );
+    let given = get_leaf_gain_given_output_f32(use_l1, sum_gradients, sum_hessians, l1, l2, output);
+    let use_given = max_delta_step > 0.0f32 || use_smoothing;
+    select(use_given, given, closed)
+}
+
+/// f32 mirror of [`get_split_gains_full`] (the no-f64 hip path).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn get_split_gains_full_f32(
+    use_l1: bool,
+    sum_left_gradients: f32,
+    sum_left_hessians: f32,
+    sum_right_gradients: f32,
+    sum_right_hessians: f32,
+    l1: f32,
+    l2: f32,
+    max_delta_step: f32,
+    use_smoothing: bool,
+    path_smooth: f32,
+    left_count: i32,
+    right_count: i32,
+    parent_output: f32,
+) -> f32 {
+    get_leaf_gain_full_f32(
+        use_l1,
+        sum_left_gradients,
+        sum_left_hessians,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        left_count,
+        parent_output,
+    ) + get_leaf_gain_full_f32(
+        use_l1,
+        sum_right_gradients,
+        sum_right_hessians,
+        l1,
+        l2,
+        max_delta_step,
+        use_smoothing,
+        path_smooth,
+        right_count,
+        parent_output,
+    )
+}
+
 /// The minimal gain-config surface passed into [`crate::Backend::find_best_split`]
 /// (extracted from `lgbm_core::Config`; we do NOT pass `&Config` into the
 /// kernel — keep it small and `Copy`).
 ///
-/// Fields map 1:1 to the `meta_->config->*` accesses in the scan. Only the
-/// default-path subset is honored at the kernel layer; `max_delta_step` /
-/// `path_smooth` are carried for completeness + validated no-op by the launcher
-/// (Phase-7+ scope).
+/// Fields map 1:1 to the `meta_->config->*` accesses in the scan, with ONE
+/// exception: [`parent_output`](Self::parent_output) is per-LEAF, not per-config.
+/// C++ threads it as a separate argument alongside `meta_->config` into every gain
+/// call (`FindBestThresholdSequentially(..., double parent_output)`); carrying it
+/// in the struct that is already threaded to every one of those call sites is the
+/// same information without a signature change at ~90 sites. See
+/// [`with_parent_output`](Self::with_parent_output).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GainConfig {
     /// `int min_data_in_leaf` (config default 20).
     pub min_data_in_leaf: i32,
     /// `double min_sum_hessian_in_leaf` (config default 1e-3).
     pub min_sum_hessian_in_leaf: f64,
-    /// `double max_delta_step` (config default 0.0 — output clamping, Phase-7+).
+    /// `double max_delta_step` (config default 0.0). `> 0` selects the C++
+    /// `USE_MAX_OUTPUT` template branch — see [`Self::use_max_output`].
     pub max_delta_step: f64,
     /// `double lambda_l1` (config default 0.0).
     pub lambda_l1: f64,
@@ -387,8 +666,20 @@ pub struct GainConfig {
     pub lambda_l2: f64,
     /// `double min_gain_to_split` (config default 0.0).
     pub min_gain_to_split: f64,
-    /// `double path_smooth` (config default 0.0 — smoothing, Phase-7+).
+    /// `double path_smooth` (config default 0.0). `> kEpsilon` selects the C++
+    /// `USE_SMOOTHING` template branch — see [`Self::use_smoothing`].
     pub path_smooth: f64,
+    /// The leaf's `parent_output` — C++ `SerialTreeLearner::GetParentOutput`
+    /// (serial_tree_learner.cpp:1005-1017): the ROOT's own (clamped, UN-smoothed)
+    /// output while `tree->num_leaves() == 1`, and `leaf_splits->weight()` (the
+    /// output the parent split assigned this leaf) thereafter.
+    ///
+    /// NOT a `Config` field: it is per-leaf state, seeded to `0.0` by
+    /// [`from_config`](Self::from_config) — which is exactly the literal `0` C++
+    /// passes when computing the root's own output — and set per leaf by the tree
+    /// learner via [`with_parent_output`](Self::with_parent_output). Read ONLY when
+    /// [`use_smoothing`](Self::use_smoothing) is true.
+    pub parent_output: f64,
     /// `int min_data_per_group` (config default 100) — categorical many-vs-many
     /// minimum rows per accumulated category group.
     pub min_data_per_group: i32,
@@ -427,6 +718,8 @@ impl GainConfig {
             lambda_l2: c.lambda_l2,
             min_gain_to_split: c.min_gain_to_split,
             path_smooth: c.path_smooth,
+            // Per-leaf, not config-derived: the tree learner overwrites this per leaf.
+            parent_output: 0.0,
             min_data_per_group: c.min_data_per_group,
             max_cat_threshold: c.max_cat_threshold,
             cat_l2: c.cat_l2,
@@ -440,6 +733,30 @@ impl GainConfig {
     /// (`feature_histogram.cpp` template dispatch); we mirror `> 0`.
     pub fn use_l1(&self) -> bool {
         self.lambda_l1 > 0.0
+    }
+
+    /// The C++ `USE_MAX_OUTPUT` template bool — `FuncForNumricalL1`
+    /// (feature_histogram.hpp:248-259) branches on `config->max_delta_step > 0`.
+    pub fn use_max_output(&self) -> bool {
+        self.max_delta_step > 0.0
+    }
+
+    /// The C++ `USE_SMOOTHING` template bool — `FuncForNumricalL2`
+    /// (feature_histogram.hpp:264-270) branches on
+    /// `config->path_smooth > kEpsilon`, NOT on `> 0`. `kEpsilon` is the `1e-15f`
+    /// FLOAT constant widened to double, so the threshold is reproduced exactly.
+    pub fn use_smoothing(&self) -> bool {
+        self.path_smooth > f64::from(lgbm_core::types::K_EPSILON)
+    }
+
+    /// This config with the per-leaf `parent_output` replaced — the C++
+    /// `GetParentOutput(tree, leaf_splits)` result threaded into the leaf's scan.
+    #[must_use]
+    pub fn with_parent_output(&self, parent_output: f64) -> Self {
+        Self {
+            parent_output,
+            ..*self
+        }
     }
 }
 

@@ -1523,8 +1523,8 @@ pub trait Backend {
         _slot_len: usize,
         _feats: &[BatchedSplitFeature],
         _cfg: &GainConfig,
-        _smaller_totals: (f64, f64, i32),
-        _larger_totals: (f64, f64, i32),
+        _smaller_totals: (f64, f64, i32, f64),
+        _larger_totals: (f64, f64, i32, f64),
     ) -> Result<(Vec<SplitInfo>, Vec<SplitInfo>), ComputeError> {
         Err(ComputeError::Runtime {
             detail: "scan_resident_siblings: device-resident pool not supported on this backend"
@@ -1589,8 +1589,8 @@ pub trait Backend {
         _feats: &[BatchedSplitFeature],
         _real_feats: &[i32],
         _cfg: &GainConfig,
-        _smaller_totals: (f64, f64, i32),
-        _larger_totals: (f64, f64, i32),
+        _smaller_totals: (f64, f64, i32, f64),
+        _larger_totals: (f64, f64, i32, f64),
     ) -> Result<(ResidentSplitWinner, ResidentSplitWinner), ComputeError> {
         Err(ComputeError::Runtime {
             detail: "scan_resident_siblings_argmax: device-resident pool not supported on this \
@@ -1822,8 +1822,8 @@ pub trait Backend {
         _feats: &[BatchedSplitFeature],
         _real_feats: &[i32],
         _cfg: &GainConfig,
-        _smaller_totals: (f64, f64, i32),
-        _larger_totals: (f64, f64, i32),
+        _smaller_totals: (f64, f64, i32, f64),
+        _larger_totals: (f64, f64, i32, f64),
         _frontier: &DeviceFrontier<Self::Runtime>,
         _out_leaf_smaller: usize,
         _out_leaf_larger: usize,
@@ -1862,8 +1862,8 @@ pub trait Backend {
         feats: &[BatchedSplitFeature],
         real_feats: &[i32],
         cfg: &GainConfig,
-        smaller_totals: (f64, f64, i32),
-        larger_totals: (f64, f64, i32),
+        smaller_totals: (f64, f64, i32, f64),
+        larger_totals: (f64, f64, i32, f64),
         frontier: &DeviceFrontier<Self::Runtime>,
         out_leaf_smaller: usize,
         out_leaf_larger: usize,
@@ -4069,8 +4069,8 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         slot_len: usize,
         feats: &[BatchedSplitFeature],
         cfg: &GainConfig,
-        smaller_totals: (f64, f64, i32),
-        larger_totals: (f64, f64, i32),
+        smaller_totals: (f64, f64, i32, f64),
+        larger_totals: (f64, f64, i32, f64),
     ) -> Result<(Vec<SplitInfo>, Vec<SplitInfo>), ComputeError> {
         let (smaller_h, larger_h) = {
             let mirror = self.resident_pool.borrow();
@@ -4143,8 +4143,8 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         feats: &[BatchedSplitFeature],
         real_feats: &[i32],
         cfg: &GainConfig,
-        smaller_totals: (f64, f64, i32),
-        larger_totals: (f64, f64, i32),
+        smaller_totals: (f64, f64, i32, f64),
+        larger_totals: (f64, f64, i32, f64),
     ) -> Result<(ResidentSplitWinner, ResidentSplitWinner), ComputeError> {
         let (smaller_splits, larger_splits) = self.scan_resident_siblings(
             client,
@@ -4386,8 +4386,8 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         feats: &[BatchedSplitFeature],
         real_feats: &[i32],
         cfg: &GainConfig,
-        smaller_totals: (f64, f64, i32),
-        larger_totals: (f64, f64, i32),
+        smaller_totals: (f64, f64, i32, f64),
+        larger_totals: (f64, f64, i32, f64),
         frontier: &DeviceFrontier<Self::Runtime>,
         out_leaf_smaller: usize,
         out_leaf_larger: usize,
@@ -4470,7 +4470,9 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         };
         let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
         // The num_data component of the totals is ignored on the device path (resolved on
-        // device); pass a placeholder 0 alongside the real sums.
+        // device); pass a placeholder 0 alongside the real sums. The 4th slot is that
+        // sibling's `parent_output`, taken from the shared `cfg` — this devcount path is
+        // reached only for the default-gain roster, where it is unread.
         kernels::split::find_best_splits_fused_siblings_reduce_into_leaves_devcount_on(
             client,
             smaller_h,
@@ -4479,8 +4481,8 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             feats,
             real_feats,
             cfg,
-            (smaller_sums.0, smaller_sums.1, 0),
-            (larger_sums.0, larger_sums.1, 0),
+            (smaller_sums.0, smaller_sums.1, 0, cfg.parent_output),
+            (larger_sums.0, larger_sums.1, 0, cfg.parent_output),
             leaf_splits.ranges_handle().clone(),
             kernels::partition::LEAF_SPLIT_STRIDE * leaf_splits.capacity(),
             leaf_splits.roles_handle().clone(),
@@ -4512,8 +4514,8 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         feats: &[BatchedSplitFeature],
         real_feats: &[i32],
         cfg: &GainConfig,
-        smaller_totals: (f64, f64, i32),
-        larger_totals: (f64, f64, i32),
+        smaller_totals: (f64, f64, i32, f64),
+        larger_totals: (f64, f64, i32, f64),
         frontier: &DeviceFrontier<Self::Runtime>,
         out_leaf_smaller: usize,
         out_leaf_larger: usize,

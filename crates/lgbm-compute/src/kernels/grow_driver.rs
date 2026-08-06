@@ -3008,7 +3008,11 @@ where
             time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
                 backend.subtract_scan_resident_siblings_into_frontier(
                     client, parent_slot, smaller_slot, larger_slot, slot_len, &feats, &real_feats,
-                    cfg, (s_g, s_h, s_n), (l_g, l_h, l_n),
+                    cfg,
+                    // 4th slot = that sibling's `parent_output`. The on-device grow
+                    // driver only runs for the default-gain roster (no
+                    // max_delta_step / path_smooth), where it is unread.
+                    (s_g, s_h, s_n, 0.0), (l_g, l_h, l_n, 0.0),
                     &frontier, smaller_leaf as usize, larger_leaf as usize,
                 )?;
                 grow_drain(client);

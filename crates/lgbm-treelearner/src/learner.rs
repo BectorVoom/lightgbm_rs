@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use lgbm_compute::error::ComputeError;
-use lgbm_compute::gain::{calculate_splitted_leaf_output, GainConfig};
+use lgbm_compute::gain::GainConfig;
 use lgbm_compute::{Backend, BatchedSplitFeature};
 pub use lgbm_compute::BinColumn;
 use lgbm_compute::ComputeClientReexport as ComputeClient;
@@ -1288,14 +1288,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             });
         }
 
-        // Seed the root leaf output (serial_tree_learner.cpp:205-208).
-        let root_output = calculate_splitted_leaf_output(
-            self.cfg.use_l1(),
-            smaller_leaf_splits.sum_gradients,
-            smaller_leaf_splits.sum_hessians,
-            self.cfg.lambda_l1,
-            self.cfg.lambda_l2,
-        );
+        // Seed the root leaf output (serial_tree_learner.cpp:204-208). The template
+        // axes there are `<USE_MC, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING> = <true,
+        // true, true, false>`: `max_delta_step` clamps, smoothing does NOT apply to
+        // the root, and the default `BasicConstraint()` bounds nothing. That is
+        // exactly `LeafSplits::weight` as seeded by `init` — reuse it rather than
+        // re-deriving, so the root output and the root's `parent_output` cannot drift.
+        let root_output = smaller_leaf_splits.weight;
         let mut tree = root_tree(root_output, num_data);
 
         // Time the per-tree scratch/constraint setup block (suspected
@@ -1691,6 +1690,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // `value <= bin_upper_bound[threshold]` left).
             let threshold_bin = bin_threshold(f, node.threshold);
             let split = self.gather_info_for_threshold(
+                &self.cfg.with_parent_output(leaf_splits.weight),
                 hist,
                 f,
                 threshold_bin,
@@ -2320,15 +2320,21 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 pool.hist_len(),
                 &feats,
                 &self.cfg,
+                // The 4th slot is each sibling's OWN `parent_output` — the output its
+                // parent split assigned it (`LeafSplits::weight`). The two siblings get
+                // DIFFERENT values, which is why it rides in the per-leaf totals rather
+                // than in the shared `cfg`.
                 (
                     smaller_splits.sum_gradients,
                     smaller_splits.sum_hessians,
                     smaller_splits.num_data_in_leaf,
+                    smaller_splits.weight,
                 ),
                 (
                     larger_splits.sum_gradients,
                     larger_splits.sum_hessians,
                     larger_splits.num_data_in_leaf,
+                    larger_splits.weight,
                 ),
             )?;
             (Some(vec_a), Some(vec_b))
@@ -2714,6 +2720,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let sum_h = leaf_splits.sum_hessians;
         let num_data_in_leaf = leaf_splits.num_data_in_leaf;
 
+        // C++ `SerialTreeLearner::GetParentOutput(tree, leaf_splits)`
+        // (serial_tree_learner.cpp:1005-1017), threaded into every gain call this
+        // leaf makes. `LeafSplits::weight` already encodes both branches: the root
+        // carries its own (clamped, un-smoothed) output from `LeafSplits::init`, a
+        // child carries the output its parent split assigned it via
+        // `init_from_split`. Read ONLY when `path_smooth > kEpsilon`, so this is a
+        // no-op copy on the default path.
+        let leaf_cfg = self.cfg.with_parent_output(leaf_splits.weight);
+
         let mut records: Vec<FeatureSplitRecord> = Vec::with_capacity(features.len());
         let mut leaf_best = SplitInfo::none();
         let mut leaf_best_feature: i32 = -1;
@@ -2899,7 +2914,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 buf,
                 &all_feats,
                 &scan_active,
-                &self.cfg,
+                &leaf_cfg,
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
@@ -2934,7 +2949,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 hessians,
                 &all_feats,
                 &scan_active,
-                &self.cfg,
+                &leaf_cfg,
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
@@ -2948,7 +2963,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 slot,
                 buf.len(),
                 &batched_feats,
-                &self.cfg,
+                &leaf_cfg,
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
@@ -2958,7 +2973,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 self.client,
                 &buf[..],
                 &batched_feats,
-                &self.cfg,
+                &leaf_cfg,
                 sum_g,
                 sum_h,
                 num_data_in_leaf,
@@ -3034,7 +3049,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                 let sum_h_bumped = sum_h + 2.0 * eps;
                 let cat = crate::feature_histogram_categorical::find_best_threshold_categorical(
                     hist,
-                    &self.cfg,
+                    &leaf_cfg,
                     f.num_bin as i32,
                     f.offset,
                     sum_g,
@@ -3123,7 +3138,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     .constraint_for(leaf);
                 crate::monotone_constraints::find_best_split_monotone(
                     hist,
-                    &self.cfg,
+                    &leaf_cfg,
                     f.num_bin as i32,
                     f.offset,
                     f.default_bin,
@@ -3138,7 +3153,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             } else if let Some(rt) = rand_threshold {
                 // Only the candidate at `rt` is admissible.
                 self.find_best_split_rand(
-                    hist, f, skip_default_bin, run_forward, sum_g, sum_h, num_data_in_leaf, rt,
+                    &leaf_cfg, hist, f, skip_default_bin, run_forward, sum_g, sum_h,
+                    num_data_in_leaf, rt,
                 )
             } else {
                 // SPINE: the bit-exact continuous finder is now run via
@@ -3216,7 +3232,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             // (`capture_snapshots == false`). The live split (`split` above) and the
             // splittability flag are already decided; the grown tree is identical.
             let (gains, rev_len) = if self.capture_snapshots {
-                self.per_bin_gains(hist, f, sum_g, sum_h, num_data_in_leaf)
+                self.per_bin_gains(&leaf_cfg, hist, f, sum_g, sum_h, num_data_in_leaf)
             } else {
                 (Vec::new(), 0)
             };
@@ -3306,6 +3322,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     #[allow(clippy::too_many_arguments)]
     fn find_best_split_rand(
         &self,
+        // The LEAF's gain config (`self.cfg` + this leaf's `parent_output`), not
+        // `self.cfg` — smoothing weights each candidate toward the leaf's parent.
+        cfg: &GainConfig,
         hist: &[f64],
         f: &FeatureColumn,
         skip_default_bin: bool,
@@ -3315,17 +3334,25 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         num_data: i32,
         rand_threshold: i32,
     ) -> SplitInfo {
-        use lgbm_compute::gain::{calculate_splitted_leaf_output, get_leaf_gain, get_split_gains};
-        let cfg = &self.cfg;
+        use lgbm_compute::gain::{
+            calculate_splitted_leaf_output_full, get_leaf_gain_full, get_split_gains_full,
+        };
         let eps = f64::from(lgbm_core::types::K_EPSILON);
         let sum_hessian = sum_h_raw + 2.0 * eps;
         let use_l1 = cfg.use_l1();
         let l1 = cfg.lambda_l1;
         let l2 = cfg.lambda_l2;
+        // The C++ USE_MAX_OUTPUT / USE_SMOOTHING template axes.
+        let mds = cfg.max_delta_step;
+        let smoothing = cfg.use_smoothing();
+        let ps = cfg.path_smooth;
+        let parent = cfg.parent_output;
         let offset = f.offset;
         let num_bin = f.num_bin as i32;
         let default_bin = f.default_bin as i32;
-        let gain_shift = get_leaf_gain(use_l1, sum_g, sum_hessian, l1, l2);
+        let gain_shift = get_leaf_gain_full(
+            use_l1, sum_g, sum_hessian, l1, l2, mds, smoothing, ps, num_data, parent,
+        );
         let min_gain_shift = gain_shift + cfg.min_gain_to_split;
         let cnt_factor = f64::from(num_data) / sum_hessian;
         let round_int = |x: f64| -> i32 { (x + f64::from(0.5f32)) as i32 };
@@ -3334,7 +3361,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
 
         let mut best = SplitInfo::none();
         let mut best_gain = f64::NEG_INFINITY;
-        let mk_output = |g: f64, h: f64| calculate_splitted_leaf_output(use_l1, g, h, l1, l2);
+        // Each side's smoothing weight uses that side's OWN row count.
+        let mk_output = |g: f64, h: f64, n: i32| {
+            calculate_splitted_leaf_output_full(use_l1, g, h, l1, l2, mds, smoothing, ps, n, parent)
+        };
 
         // REVERSE.
         {
@@ -3369,7 +3399,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     continue;
                 }
                 let sum_left_gradient = sum_g - sum_right_gradient;
-                let g = get_split_gains(use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient, sum_right_hessian, l1, l2);
+                let g = get_split_gains_full(
+                    use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient,
+                    sum_right_hessian, l1, l2, mds, smoothing, ps, left_count, right_count,
+                    parent,
+                );
                 if g > min_gain_shift && g > best_gain {
                     best_gain = g;
                     // C++ computes the child OUTPUTS from the RAW hessians
@@ -3388,8 +3422,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         left_sum_hessian: sum_left_hessian - eps,
                         right_sum_gradient: sum_right_gradient,
                         right_sum_hessian: right_h_raw - eps,
-                        left_output: mk_output(sum_left_gradient, sum_left_hessian),
-                        right_output: mk_output(right_g_out, right_h_raw),
+                        left_output: mk_output(sum_left_gradient, sum_left_hessian, left_count),
+                        right_output: mk_output(right_g_out, right_h_raw, right_count),
                         default_left: true,
                     };
                 }
@@ -3429,7 +3463,11 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     continue;
                 }
                 let sum_right_gradient = sum_g - sum_left_gradient;
-                let g = get_split_gains(use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient, sum_right_hessian, l1, l2);
+                let g = get_split_gains_full(
+                    use_l1, sum_left_gradient, sum_left_hessian, sum_right_gradient,
+                    sum_right_hessian, l1, l2, mds, smoothing, ps, left_count, right_count,
+                    parent,
+                );
                 if g > min_gain_shift && g > best_gain {
                     best_gain = g;
                     // RAW-hessian output operands (see REVERSE branch above).
@@ -3444,8 +3482,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         left_sum_hessian: sum_left_hessian - eps,
                         right_sum_gradient: sum_right_gradient,
                         right_sum_hessian: right_h_raw - eps,
-                        left_output: mk_output(sum_left_gradient, sum_left_hessian),
-                        right_output: mk_output(right_g_out, right_h_raw),
+                        left_output: mk_output(sum_left_gradient, sum_left_hessian, left_count),
+                        right_output: mk_output(right_g_out, right_h_raw, right_count),
                         default_left: false,
                     };
                 }
@@ -3459,11 +3497,22 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// compute the split at a SPECIFIC `threshold` bin (the forced threshold). The
     /// right side accumulates bins `> threshold`; left = total - right. Returns the
     /// [`SplitInfo`] (or `none()` when the forced gain is not better than no-split,
-    /// matching the C++ "Forced Split will be ignored" path). This is the default
-    /// (no path_smooth, no max_delta_step) instantiation — the matrix forced cells
-    /// use config defaults.
+    /// matching the C++ "Forced Split will be ignored" path).
+    ///
+    /// # `gain_shift` and `parent_output`
+    ///
+    /// C++ `GatherInfoForThresholdNumericalInner` (feature_histogram.hpp:501-509)
+    /// computes `gain_shift = GetLeafGainGivenOutput<true>(g, h, l1, l2,
+    /// parent_output)` UNCONDITIONALLY — not gated on `USE_SMOOTHING`. Without
+    /// smoothing a leaf's `parent_output` IS its own unconstrained output, at which
+    /// the given-output form equals the closed form, so the non-smoothing branch
+    /// below keeps the closed form that the committed forced-split golden was
+    /// validated against. Under smoothing the two genuinely differ and the C++ form
+    /// is used verbatim.
     fn gather_info_for_threshold(
         &self,
+        // The LEAF's gain config (carries this leaf's `parent_output`).
+        cfg: &GainConfig,
         hist: &[f64],
         f: &FeatureColumn,
         threshold: u32,
@@ -3471,8 +3520,10 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         sum_h_raw: f64,
         num_data: i32,
     ) -> SplitInfo {
-        use lgbm_compute::gain::{calculate_splitted_leaf_output, get_leaf_gain, get_split_gains};
-        let cfg = &self.cfg;
+        use lgbm_compute::gain::{
+            calculate_splitted_leaf_output_full, get_leaf_gain, get_leaf_gain_given_output,
+            get_split_gains_full,
+        };
         let eps = f64::from(lgbm_core::types::K_EPSILON);
         // C++ `GatherInfoForThresholdNumerical` (feature_histogram.hpp:486) uses the
         // leaf's RAW `sum_hessian` directly — it does NOT apply the `+2*kEpsilon`
@@ -3486,7 +3537,15 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let num_bin = f.num_bin as i32;
         let default_bin = f.default_bin as i32;
         let skip_default_bin = f.skip_default_bin();
-        let gain_shift = get_leaf_gain(use_l1, sum_g, sum_hessian, l1, l2);
+        let mds = cfg.max_delta_step;
+        let smoothing = cfg.use_smoothing();
+        let ps = cfg.path_smooth;
+        let parent = cfg.parent_output;
+        let gain_shift = if smoothing {
+            get_leaf_gain_given_output(use_l1, sum_g, sum_hessian, l1, l2, parent)
+        } else {
+            get_leaf_gain(use_l1, sum_g, sum_hessian, l1, l2)
+        };
         let min_gain_shift = gain_shift + cfg.min_gain_to_split;
         let cnt_factor = f64::from(num_data) / sum_hessian;
         let round_int = |x: f64| -> i32 { (x + f64::from(0.5f32)) as i32 };
@@ -3514,7 +3573,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let sum_left_gradient = sum_g - sum_right_gradient;
         let sum_left_hessian = sum_hessian - sum_right_hessian;
         let left_count = num_data - right_count;
-        let current_gain = get_split_gains(
+        let current_gain = get_split_gains_full(
             use_l1,
             sum_left_gradient,
             sum_left_hessian,
@@ -3522,12 +3581,20 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             sum_right_hessian,
             l1,
             l2,
+            mds,
+            smoothing,
+            ps,
+            left_count,
+            right_count,
+            parent,
         );
         if current_gain.is_nan() || current_gain <= min_gain_shift {
             // C++ "Forced Split will be ignored since the gain getting worse."
             return SplitInfo::none();
         }
-        let mk_output = |g: f64, h: f64| calculate_splitted_leaf_output(use_l1, g, h, l1, l2);
+        let mk_output = |g: f64, h: f64, n: i32| {
+            calculate_splitted_leaf_output_full(use_l1, g, h, l1, l2, mds, smoothing, ps, n, parent)
+        };
         // C++ `GatherInfoForThresholdNumericalInner`
         // (feature_histogram.hpp:579-590) computes the child OUTPUTS from the RAW
         // child hessians (`sum_left_hessian` and `sum_hessian - sum_left_hessian`),
@@ -3554,8 +3621,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             left_sum_hessian: sum_left_hessian - eps,
             right_sum_gradient: sum_right_gradient,
             right_sum_hessian: right_h_raw - eps,
-            left_output: mk_output(sum_left_gradient, sum_left_hessian),
-            right_output: mk_output(right_g_for_output, right_h_raw),
+            left_output: mk_output(sum_left_gradient, sum_left_hessian, left_count),
+            right_output: mk_output(right_g_for_output, right_h_raw, right_count),
             default_left: true,
         }
     }
@@ -3586,14 +3653,16 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
     /// learner emitter and kernel emitter agree. NaN marks a gated bin.
     fn per_bin_gains(
         &self,
+        // The LEAF's gain config (carries this leaf's `parent_output`), so the
+        // diagnostic re-scan stays identical to the live scan under smoothing too.
+        cfg: &GainConfig,
         hist: &[f64],
         f: &FeatureColumn,
         sum_gradient: f64,
         sum_hessian: f64,
         num_data: i32,
     ) -> (Vec<f64>, usize) {
-        use lgbm_compute::gain::get_split_gains;
-        let cfg = &self.cfg;
+        use lgbm_compute::gain::get_split_gains_full;
         let use_l1 = cfg.use_l1();
         let l1 = cfg.lambda_l1;
         let l2 = cfg.lambda_l2;
@@ -3610,8 +3679,22 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // re-scan stays bit-identical to the live kernel path.
         let eps = f64::from(lgbm_core::types::K_EPSILON);
         let sum_hessian_bumped = sum_hessian + 2.0 * eps;
-        let gain_shift =
-            lgbm_compute::gain::get_leaf_gain(use_l1, sum_gradient, sum_hessian_bumped, l1, l2);
+        let mds = cfg.max_delta_step;
+        let smoothing = cfg.use_smoothing();
+        let ps = cfg.path_smooth;
+        let parent = cfg.parent_output;
+        let gain_shift = lgbm_compute::gain::get_leaf_gain_full(
+            use_l1,
+            sum_gradient,
+            sum_hessian_bumped,
+            l1,
+            l2,
+            mds,
+            smoothing,
+            ps,
+            num_data,
+            parent,
+        );
         let min_gain_shift = gain_shift + cfg.min_gain_to_split;
         let cnt_factor = f64::from(num_data) / sum_hessian_bumped;
         let round_int = |x: f64| -> i32 { (x + f64::from(0.5f32)) as i32 };
@@ -3659,7 +3742,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     break;
                 }
                 let sum_left_gradient = sum_gradient - sum_right_gradient;
-                let g = get_split_gains(
+                let g = get_split_gains_full(
                     use_l1,
                     sum_left_gradient,
                     sum_left_hessian,
@@ -3667,6 +3750,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     sum_right_hessian,
                     l1,
                     l2,
+                    mds,
+                    smoothing,
+                    ps,
+                    left_count,
+                    right_count,
+                    parent,
                 );
                 if g <= min_gain_shift {
                     gains.push(qnan);
@@ -3712,7 +3801,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     break;
                 }
                 let sum_right_gradient = sum_gradient - sum_left_gradient;
-                let g = get_split_gains(
+                let g = get_split_gains_full(
                     use_l1,
                     sum_left_gradient,
                     sum_left_hessian,
@@ -3720,6 +3809,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                     sum_right_hessian,
                     l1,
                     l2,
+                    mds,
+                    smoothing,
+                    ps,
+                    left_count,
+                    right_count,
+                    parent,
                 );
                 if g <= min_gain_shift {
                     gains.push(qnan);
@@ -4563,7 +4658,7 @@ mod tests {
 
         // FixHistogram'd per-bin (sum_grad, sum_hess) for the 4 bins (2 rows each).
         let hist = vec![-10.0f64, 2.0, -8.0, 2.0, 8.0, 2.0, 10.0, 2.0];
-        let (gains, rev_len) = learner.per_bin_gains(&hist, &f, 0.0, 8.0, 8);
+        let (gains, rev_len) = learner.per_bin_gains(&learner.cfg.clone(), &hist, &f, 0.0, 8.0, 8);
 
         // REVERSE scans bins [num_bin-1 .. 1], FORWARD bins [0 .. num_bin-2]:
         // 3 candidates each for a 4-bin feature with no gating.
