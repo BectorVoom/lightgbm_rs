@@ -19,9 +19,11 @@
 //! Later plans add `tree`, `ensemble`, `model_text`, and `predict`; their
 //! `pub mod` declarations are added here as they land.
 
+pub mod codegen_cpp;
 pub mod ensemble;
 pub mod error;
 pub mod format;
+pub mod json;
 pub mod model_text;
 pub mod objective;
 pub mod predict;

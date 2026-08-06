@@ -879,6 +879,23 @@ impl Booster {
         lgbm_model::model_text::save(&self.model)
     }
 
+    /// Serialize the model to the LightGBM JSON dump (`GBDT::DumpModel`),
+    /// byte-compatible with `lib_lightgbm` 4.6's `LGBM_BoosterDumpModel`.
+    /// Every float uses `%.17g`; a presentation format (no training path).
+    /// Delegates to [`lgbm_model::json::dump_model`].
+    pub fn dump_model(&self) -> String {
+        lgbm_model::json::dump_model(&self.model)
+    }
+
+    /// Generate a standalone C++ if-else predict source (`GBDT::ModelToIfElse`
+    /// / `convert_model`), semantically mirroring [`GbdtModel::predict_raw`].
+    /// Pure in-memory string — **no file-writing side effect** (DEC-2; this
+    /// deliberately does NOT implement `Config.convert_model`'s file-path
+    /// semantics). Delegates to [`lgbm_model::codegen_cpp::model_to_cpp`].
+    pub fn model_to_cpp(&self) -> String {
+        lgbm_model::codegen_cpp::model_to_cpp(&self.model)
+    }
+
     /// Write the model text to `path`. An I/O failure is mapped to a typed
     /// [`LgbmError::Io`] so the caller never panics.
     ///
@@ -2474,6 +2491,34 @@ mod tests {
             .build()
             .unwrap();
         train(&cfg, &spine_corpus()).expect("train ok")
+    }
+
+    #[test]
+    fn dump_model_facade_matches_module() {
+        let booster = trained_spine();
+        // Pure orchestration: the facade returns exactly the module output over
+        // the booster's model (no recomputation), and is a well-formed JSON dump.
+        assert_eq!(
+            booster.dump_model(),
+            lgbm_model::json::dump_model(booster.model())
+        );
+        assert!(booster.dump_model().starts_with("{\"name\":\"tree\","));
+        assert!(booster.dump_model().contains("\"tree_info\":["));
+    }
+
+    /// SPEC-G1-3 / DEC-2: the facade is pure orchestration — no file side
+    /// effect, byte-identical to calling the module function directly.
+    #[test]
+    fn model_to_cpp_facade_matches_module() {
+        let booster = trained_spine();
+        assert_eq!(
+            booster.model_to_cpp(),
+            lgbm_model::codegen_cpp::model_to_cpp(booster.model())
+        );
+        assert!(booster.model_to_cpp().contains("double PredictTree0(const double* arr) {"));
+        assert!(booster
+            .model_to_cpp()
+            .contains("void PredictRaw(const double* arr, double* out) {"));
     }
 
     #[test]

@@ -322,6 +322,135 @@ pub fn get_leaf_gain_smoothed(
     get_leaf_gain_given_output(use_l1, sum_gradients, sum_hessians, l1, l2, output)
 }
 
+/// `GetSplitGains<false, USE_L1, false, true>` (feature_histogram.hpp:757-797,
+/// the `!USE_MC` branch at `USE_SMOOTHING=true`) — the per-candidate SCAN gain
+/// comparison used by [`crate::kernels::split::split_scan_body`] /
+/// `find_best_split_cpu_native` when `path_smooth != 0.0`. NOTE the per-side
+/// `num_data` argument (`left_count`/`right_count`) is that SIDE's own row
+/// count, NOT the parent leaf's `num_data` (`feature_histogram.hpp:772-778`
+/// threads `left_count`/`right_count` into each `GetLeafGain` call).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+pub fn get_split_gains_smoothed(
+    use_l1: bool,
+    sum_left_gradients: f64,
+    sum_left_hessians: f64,
+    sum_right_gradients: f64,
+    sum_right_hessians: f64,
+    l1: f64,
+    l2: f64,
+    path_smooth: f64,
+    left_count: i32,
+    right_count: i32,
+    parent_output: f64,
+) -> f64 {
+    get_leaf_gain_smoothed(
+        use_l1,
+        sum_left_gradients,
+        sum_left_hessians,
+        l1,
+        l2,
+        path_smooth,
+        left_count,
+        parent_output,
+    ) + get_leaf_gain_smoothed(
+        use_l1,
+        sum_right_gradients,
+        sum_right_hessians,
+        l1,
+        l2,
+        path_smooth,
+        right_count,
+        parent_output,
+    )
+}
+
+// ===========================================================================
+// Net-new USE_MAX_OUTPUT (max_delta_step) gain path — VERBATIM transcription of
+// `LightGBM/src/treelearner/feature_histogram.hpp:716-738` (`CalculateSplittedLeafOutput`
+// `USE_MAX_OUTPUT=true` branch) + `:799-815` (`GetLeafGain`'s given-output else
+// branch, selected whenever `USE_MAX_OUTPUT` OR `USE_SMOOTHING` is compile-time
+// true). ADDITIVE ONLY (D-09): the non-clamped fns above are byte-unchanged. G5-2.
+//
+// C++ selects `USE_MAX_OUTPUT=true` at a COMPILE-TIME template dispatch keyed on
+// `config->max_delta_step > 0` (`FuncForNumricalL1`, feature_histogram.hpp:246-261)
+// — i.e. whenever these `_clamped` fns are the live path, `max_delta_step` is a
+// per-CONFIG (not per-call) constant `> 0` for the whole scan. The caller
+// (`split.rs`) is responsible for the runtime `max_delta_step != 0.0` dispatch
+// gate between these fns and the non-clamped ones above — mirroring the C++
+// template selection at the call site rather than inside these fns.
+// ===========================================================================
+
+/// `CalculateSplittedLeafOutput<USE_L1, true, false>` (feature_histogram.hpp:716-738,
+/// the `USE_MAX_OUTPUT=true` branch, `USE_SMOOTHING=false`):
+///
+/// ```cpp
+/// if (max_delta_step > 0 && std::fabs(ret) > max_delta_step) {
+///   ret = Common::Sign(ret) * max_delta_step;
+/// }
+/// ```
+#[cube]
+pub fn calculate_splitted_leaf_output_clamped(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    max_delta_step: f64,
+) -> f64 {
+    let ret = calculate_splitted_leaf_output(use_l1, sum_gradients, sum_hessians, l1, l2);
+    let over = max_delta_step > 0.0 && f64::abs(ret) > max_delta_step;
+    // Common::Sign(ret) * max_delta_step, branch-free (mirrors threshold_l1's
+    // select-based Sign encoding — `if cond {1.0} else {0.0}` mis-lowers on
+    // cubecl-cpu, WR-05-adjacent).
+    let pos = select(ret > 0.0, 1.0, 0.0);
+    let neg = select(ret < 0.0, 1.0, 0.0);
+    let clamped = (pos - neg) * max_delta_step;
+    select(over, clamped, ret)
+}
+
+/// `GetLeafGain<USE_L1, true, false>` (feature_histogram.hpp:799-815, the
+/// given-output else-branch at `USE_MAX_OUTPUT=true`):
+///
+/// ```cpp
+/// double output = CalculateSplittedLeafOutput<USE_L1, true, false>(...);
+/// return GetLeafGainGivenOutput<USE_L1>(sum_gradients, sum_hessians, l1, l2, output);
+/// ```
+#[cube]
+pub fn get_leaf_gain_clamped(
+    use_l1: bool,
+    sum_gradients: f64,
+    sum_hessians: f64,
+    l1: f64,
+    l2: f64,
+    max_delta_step: f64,
+) -> f64 {
+    let output =
+        calculate_splitted_leaf_output_clamped(use_l1, sum_gradients, sum_hessians, l1, l2, max_delta_step);
+    get_leaf_gain_given_output(use_l1, sum_gradients, sum_hessians, l1, l2, output)
+}
+
+/// `GetSplitGains<false, USE_L1, true, false>` (feature_histogram.hpp:757-797,
+/// the `!USE_MC` branch at `USE_MAX_OUTPUT=true`) — the per-candidate SCAN gain
+/// comparison used by [`crate::kernels::split::split_scan_body`] /
+/// `find_best_split_cpu_native` when `max_delta_step != 0.0` (a candidate's gain
+/// is the SUM of each side's clamped-output gain, NOT the closed-form
+/// `sg²/(h+l2)` fast path, once `USE_MAX_OUTPUT` is compile-time true in C++).
+#[cube]
+pub fn get_split_gains_clamped(
+    use_l1: bool,
+    sum_left_gradients: f64,
+    sum_left_hessians: f64,
+    sum_right_gradients: f64,
+    sum_right_hessians: f64,
+    l1: f64,
+    l2: f64,
+    max_delta_step: f64,
+) -> f64 {
+    get_leaf_gain_clamped(use_l1, sum_left_gradients, sum_left_hessians, l1, l2, max_delta_step)
+        + get_leaf_gain_clamped(use_l1, sum_right_gradients, sum_right_hessians, l1, l2, max_delta_step)
+}
+
 // ===========================================================================
 // The FULL two-axis (USE_MAX_OUTPUT x USE_SMOOTHING) gain path.
 //
@@ -1027,6 +1156,73 @@ mod tests {
         assert_eq!(
             get_leaf_gain_smoothed_f32(use_l1, gf, hf, 0.0f32, l2f, psf, n, parentf),
             get_leaf_gain_given_output_f32(use_l1, gf, hf, 0.0f32, l2f, out_f32)
+        );
+    }
+
+    #[test]
+    fn leaf_output_clamped_at_max_delta_step() {
+        // G5-2 (SPEC-G5-2): CalculateSplittedLeafOutput<USE_L1,true,false>
+        // (feature_histogram.hpp:716-738, the USE_MAX_OUTPUT branch):
+        //   if (max_delta_step > 0 && fabs(ret) > max_delta_step) ret = sign(ret)*max_delta_step;
+        // unclamped ret = -g/(h+l2) = -8/2 = -4.0; |ret|=4.0 > max_delta_step=0.7 -> clamp to -0.7.
+        let (use_l1, g, h, l1, l2, mds) = (false, 8.0_f64, 2.0_f64, 0.0_f64, 0.0_f64, 0.7_f64);
+        let base = calculate_splitted_leaf_output(use_l1, g, h, l1, l2);
+        assert_eq!(base, -4.0);
+        assert_eq!(calculate_splitted_leaf_output_clamped(use_l1, g, h, l1, l2, mds), -0.7);
+
+        // Positive-sign mirror: ret=+4.0 clamps to +0.7.
+        let (g2,) = (-8.0_f64,);
+        assert_eq!(
+            calculate_splitted_leaf_output_clamped(use_l1, g2, h, l1, l2, mds),
+            0.7
+        );
+
+        // max_delta_step=0.0 -> no-op, bit-exact to the unclamped base (the C++
+        // `max_delta_step > 0` gate is false at 0.0, so the branch never fires).
+        assert_eq!(
+            calculate_splitted_leaf_output_clamped(use_l1, g, h, l1, l2, 0.0),
+            base
+        );
+
+        // |ret| <= max_delta_step -> no-op (inside the envelope, not clamped).
+        let (g3, mds3) = (1.0_f64, 0.7_f64); // ret = -0.5, |ret| < 0.7
+        let base3 = calculate_splitted_leaf_output(use_l1, g3, h, l1, l2);
+        assert_eq!(
+            calculate_splitted_leaf_output_clamped(use_l1, g3, h, l1, l2, mds3),
+            base3
+        );
+
+        // GetLeafGain<USE_L1,true,false>: GetLeafGainGivenOutput at the clamped output.
+        let expected_gain = get_leaf_gain_given_output(use_l1, g, h, l1, l2, -0.7);
+        assert_eq!(get_leaf_gain_clamped(use_l1, g, h, l1, l2, mds), expected_gain);
+
+        // max_delta_step=0.0 gain path is bit-exact to the closed-form fast path
+        // (matching the given_output_matches_closed_form invariant above).
+        assert_eq!(
+            get_leaf_gain_clamped(use_l1, g, h, l1, l2, 0.0),
+            get_leaf_gain(use_l1, g, h, l1, l2)
+        );
+    }
+
+    #[test]
+    fn split_gains_smoothed_sums_per_side_leaf_gains() {
+        // G5-3 (SPEC-G5-3): GetSplitGains<false, USE_L1, false, true>
+        // (feature_histogram.hpp:757-797, USE_SMOOTHING=true) — the per-candidate
+        // SCAN gain used once path_smooth != 0.0. NOTE: the per-side `num_data`
+        // argument is that side's OWN row count (left_count/right_count), NOT the
+        // parent leaf's num_data (GetSplitGains threads `left_count`/`right_count`
+        // into each GetLeafGain call — feature_histogram.hpp:772-778).
+        let (use_l1, l1, l2, ps, parent) = (false, 0.0_f64, 0.0_f64, 2.0_f64, 0.5_f64);
+        let (sum_left_g, sum_left_h, left_count) = (4.0_f64, 2.0_f64, 10_i32);
+        let (sum_right_g, sum_right_h, right_count) = (6.0_f64, 3.0_f64, 5_i32);
+        let expected = get_leaf_gain_smoothed(use_l1, sum_left_g, sum_left_h, l1, l2, ps, left_count, parent)
+            + get_leaf_gain_smoothed(use_l1, sum_right_g, sum_right_h, l1, l2, ps, right_count, parent);
+        assert_eq!(
+            get_split_gains_smoothed(
+                use_l1, sum_left_g, sum_left_h, sum_right_g, sum_right_h, l1, l2, ps, left_count,
+                right_count, parent,
+            ),
+            expected
         );
     }
 

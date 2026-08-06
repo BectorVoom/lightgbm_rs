@@ -1,3 +1,6 @@
+> **⚠ SUPERSEDED (2026-07-16)** by `.planning/plans/unimplemented-features/PLAN.md`.
+> Kept for history; implement from the successor plan.
+
 # TDD Implementation Plan — Parity Gap Closure (G2 · G1 · G4 · G5)
 
 Derived from `.planning/plans/parity-gap-closure/SPEC.md` (draft) and

@@ -140,6 +140,45 @@ fn round_int_f32(x: f32) -> i32 {
 /// it before launch). The loop-carried mutables MUST init from LITERALS (cubecl-cpu
 /// MLIR lowering constraint #1) and every conditional store MUST be branchless
 /// `select` (constraint #2) — both encodings are kept verbatim here.
+///
+/// `na_as_missing` (0|1) admits the C++ `NA_AS_MISSING=true` template arm
+/// (`feature_histogram.hpp:830-1057`, SPEC-G4-1/T-G4-1): REVERSE excludes the
+/// TOP bin (`num_bin-1`, the NaN sentinel bin `na_as_missing()` routes NaN rows
+/// into) from its sweep (`t_start -= na_as_missing`, `:859`) so that bin is
+/// implicitly folded into "left" for every REVERSE candidate; FORWARD, when
+/// `offset == 1` (the implicit most-frequent-bin optimization), pre-seeds its
+/// accumulators with the reconstructed bin-0 value (`:945-961`) via SEQUENTIAL
+/// subtraction of every explicit bin from the leaf totals (bit-exact operation
+/// order — NOT sum-then-subtract-once) and evaluates one extra "virtual `t=-1`"
+/// candidate (`left = {bin0}`, `threshold = offset-1`) before the normal `t=0..`
+/// sweep. Every caller OTHER than [`find_best_split_kernel`] passes `0u32`
+/// (`na_as_missing` is rejected upstream on those paths, P-4) — `0u32` is a
+/// true no-op here (every na_as_missing-gated term selects its "false" branch),
+/// so this extension does not perturb their existing behavior.
+///
+/// `max_delta_step` (G5-2, T-G5-2): the C++ `config->max_delta_step` leaf-output
+/// clamp (`CalculateSplittedLeafOutput`'s `USE_MAX_OUTPUT` branch,
+/// feature_histogram.hpp:716-738). When non-zero, BOTH the per-candidate scan
+/// gain (`GetSplitGains<..,USE_MAX_OUTPUT,..>`) AND the finalization leaf
+/// outputs dispatch to the clamped form ([`crate::gain::get_split_gains_clamped`]
+/// / [`crate::gain::calculate_splitted_leaf_output_clamped`]) instead of the
+/// closed-form fast path. Every caller OTHER than [`find_best_split_kernel`]
+/// passes `0.0f64` (`max_delta_step` is rejected upstream on those paths, P-4) —
+/// a true no-op (the `!= 0.0` dispatch below always selects the unchanged
+/// closed-form path), so this extension does not perturb their existing behavior.
+///
+/// `path_smooth` / `parent_output` (G5-3, T-G5-3): the C++ `config->path_smooth`
+/// leaf-output blend-toward-parent (`CalculateSplittedLeafOutput`'s
+/// `USE_SMOOTHING` branch, feature_histogram.hpp:733-736). When `path_smooth !=
+/// 0.0`, BOTH the per-candidate scan gain AND the finalization leaf outputs
+/// dispatch to the smoothed form ([`crate::gain::get_split_gains_smoothed`] /
+/// [`crate::gain::calculate_splitted_leaf_output_smoothed`]), using that SIDE's
+/// own row count (`left_count`/`right_count`) as the smoothing `num_data`
+/// (`feature_histogram.hpp:772-778`). `max_delta_step` and `path_smooth`
+/// non-default SIMULTANEOUSLY is rejected upstream (the composed clamp+smooth
+/// form is not transcribed). Every caller OTHER than [`find_best_split_kernel`]
+/// passes `0.0f64`/`0.0f64` — a true no-op, so this extension does not perturb
+/// their existing behavior.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 pub fn split_scan_body(
@@ -151,6 +190,7 @@ pub fn split_scan_body(
     offset: i32,
     default_bin: i32,
     skip_default_bin: u32, // 0|1
+    na_as_missing: u32,    // 0|1 (T-G4-1)
     use_l1: u32,           // 0|1
     min_data_in_leaf: i32,
     min_sum_hessian_in_leaf: f64,
@@ -169,8 +209,8 @@ pub fn split_scan_body(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
-    rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1)
-    fwd_count: i32, // host-computed FORWARD iteration count = max(0, num_bin-1-offset)
+    rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1-na_as_missing)
+    fwd_count: i32, // host-computed FORWARD iteration count = max(0, num_bin-1-offset [+1 iff na_as_missing&&offset==1])
 ) {
     // `hb`/`ob` are the feature's base offsets into the (concatenated) histogram and
     // the 12-cell `out` window. They are 0,0 for the single-feature kernel.
@@ -240,8 +280,12 @@ pub fn split_scan_body(
         let mut sum_right_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:856)
         let mut right_count = 0i32;
 
-        let t_start = num_bin - 1 - offset; // NA_AS_MISSING=0; t_end = 1 - offset
-        let count = rev_count; // host-computed = max(0, t_start - (1-offset) + 1) = num_bin-1
+        // t_start excludes the TOP bin (na_as_missing sentinel, `-1`) so it is
+        // never explicitly swept in REVERSE (feature_histogram.hpp:859);
+        // implicitly folded into "left" via `sum_left = sum_gradient -
+        // sum_right`. `na_as_missing == 0` reproduces `num_bin-1-offset` verbatim.
+        let t_start = num_bin - 1 - offset - i32::cast_from(na_as_missing); // t_end = 1 - offset
+        let count = rev_count; // host-computed = max(0, num_bin-1-na_as_missing)
         let mut done = false; // sticky flag emulating C++ `break` (monotone)
 
         // BRANCHLESS form: cubecl-cpu's MLIR lowering rejected the nested-`if`
@@ -330,22 +374,67 @@ pub fn split_scan_body(
     // side is too small / right hessian too small it stays so — `break`==`done`).
     {
         let mut sum_left_gradient = 0.0f64;
-        let mut sum_left_hessian = f64::cast_from(K_EPSILON); // kEpsilon (:939)
+        // Literal-init the accumulator at 0.0 (cubecl-cpu MLIR lowering
+        // constraint #1) and fold in the WHOLE desired initial value via ONE
+        // `select` + `+=`, rather than starting from the `kEpsilon` literal and
+        // separately adding an na_preamble delta: `0.0 + X == X` exactly for any
+        // finite `X` (no intermediate rounding), so this is bit-exact to a
+        // direct assignment in EITHER branch — matching
+        // [`find_best_split_cpu_native`]'s `sum_left_hessian = kEpsilon;` /
+        // `sum_left_hessian = sum_hessian - kEpsilon;` exactly (verified by
+        // `find_best_split_na_as_missing_native_matches_kernel`).
+        let mut sum_left_hessian = 0.0f64;
         let mut left_count = 0i32;
 
-        let count = fwd_count; // host-computed = max(0, num_bin - 1 - offset)
+        // NA_AS_MISSING FORWARD preamble (feature_histogram.hpp:945-961): ONLY
+        // when `offset == 1` (the implicit most-frequent-bin, bin 0, is NOT
+        // stored explicitly in `hist`). Reconstruct bin 0 by pre-seeding the
+        // accumulators with the FULL leaf totals, then subtracting every
+        // EXPLICIT bin in ascending order — bit-exact SEQUENTIAL subtraction
+        // (`sum_gradient - g0 - g1 - ... `), NOT a sum-then-subtract-once
+        // shortcut, matching C++'s loop-accumulated operation order exactly.
+        // `all_bins` is `select`-zeroed (a true 0-iteration loop) when the
+        // preamble is inactive, so this costs nothing on the (far more common)
+        // non-`na_as_missing` / `offset==0` paths.
+        let na_preamble = (na_as_missing != 0u32) && (offset == 1);
+        sum_left_gradient += select(na_preamble, sum_gradient, 0.0);
+        sum_left_hessian += select(
+            na_preamble,
+            sum_hessian - f64::cast_from(K_EPSILON),
+            f64::cast_from(K_EPSILON), // kEpsilon (:939), the non-na_preamble init
+        );
+        left_count += select(na_preamble, num_data, 0i32);
+        let all_bins = select(na_preamble, num_bin - offset, 0i32);
+        for i in 0..all_bins {
+            let bi2 = hb + (i as usize) * 2;
+            sum_left_gradient -= hist[bi2];
+            sum_left_hessian -= hist[bi2 + 1];
+            left_count -= round_int(hist[bi2 + 1] * cnt_factor);
+        }
+        // `fwd_start = -1` iff the preamble is active — the FIRST FORWARD
+        // candidate is the "virtual `t=-1`" one (`left = {bin0}` only, no bin
+        // add this iteration; `threshold = offset - 1`). Otherwise unchanged
+        // (`fwd_start = 0`, byte-identical to the pre-T-G4-1 body).
+        let fwd_start = select(na_preamble, -1i32, 0i32);
+
+        let count = fwd_count; // host-computed; +1 over the base count iff na_preamble
         let mut done = false;
 
-        for t in 0..count {
+        for k in 0..count {
+            let t = fwd_start + k;
             let skip = skip_def && (t + offset) == default_bin as i32;
             let active = !skip && !done;
-            // t >= 0 always here (range starts at 0; NA_AS_MISSING=0 path).
-            let bi = hb + (t as usize) * 2;
+            // C++ `if (t >= 0) { sum_left_gradient += ...; }` (:969) — the
+            // virtual `t=-1` preamble candidate adds nothing here (its
+            // contribution was already folded in above).
+            let do_add = active && (t >= 0);
+            let t_safe = select(t < 0, 0i32, t); // clamp so `t=-1` still reads a valid (unused) cell
+            let bi = hb + (t_safe as usize) * 2;
             let g = hist[bi];
             let h = hist[bi + 1];
-            sum_left_gradient += select(active, g, 0.0);
-            sum_left_hessian += select(active, h, 0.0);
-            left_count += select(active, round_int(h * cnt_factor), 0i32);
+            sum_left_gradient += select(do_add, g, 0.0);
+            sum_left_hessian += select(do_add, h, 0.0);
+            left_count += select(do_add, round_int(h * cnt_factor), 0i32);
 
             let right_count = num_data - left_count;
             let sum_right_hessian = sum_hessian - sum_left_hessian;
@@ -395,7 +484,8 @@ pub fn split_scan_body(
     // min_gain_shift` accept gate + the `- min_gain_shift` / `* penalty`
     // adjustments; here we emit the RAW winner state. We DO compute the f64
     // outputs + subtract kEpsilon back off the reported hessians (:1042/:1053)
-    // so the launcher has the exact SplitInfo cells.
+    // so the launcher has the exact SplitInfo cells. G5-2/G5-3: clamped/smoothed
+    // dispatch, same as the per-candidate scan gain above.
     let eps = f64::cast_from(K_EPSILON);
     // Each side's smoothing weight uses that side's OWN row count (:1034-1049).
     let best_right_count = num_data - best_left_count;
@@ -456,6 +546,7 @@ pub fn find_best_split_kernel(
     offset: i32,
     default_bin: i32,
     skip_default_bin: u32, // 0|1 (comptime-flavored runtime flag)
+    na_as_missing: u32,    // 0|1 (T-G4-1)
     use_l1: u32,           // 0|1
     min_data_in_leaf: i32,
     min_sum_hessian_in_leaf: f64,
@@ -469,8 +560,8 @@ pub fn find_best_split_kernel(
     sum_gradient: f64,
     sum_hessian: f64,
     num_data: i32,
-    rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1)
-    fwd_count: i32, // host-computed FORWARD iteration count = max(0, num_bin-1-offset)
+    rev_count: i32, // host-computed REVERSE iteration count = max(0, num_bin-1-na_as_missing)
+    fwd_count: i32, // host-computed FORWARD iteration count
 ) {
     split_scan_body(
         hist,
@@ -481,6 +572,7 @@ pub fn find_best_split_kernel(
         offset,
         default_bin,
         skip_default_bin,
+        na_as_missing,
         use_l1,
         min_data_in_leaf,
         min_sum_hessian_in_leaf,
@@ -575,18 +667,13 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     num_data: i32,
 ) -> Result<SplitInfo, ComputeError> {
     // --- V5 boundary validation (T-04-01) ---
-    // NA_AS_MISSING forward-branch (feature_histogram.hpp:945-961) is deferred —
-    // this layer threads the flag and validates it false on every captured case,
-    // but the NaN-missing forward preamble kernel body is NOT yet transcribed.
-    // Surface a TYPED error rather than silently mis-computing (T-05-01-01): the
-    // unimplemented branch can never produce a wrong SplitInfo.
-    if na_as_missing {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
-                     implemented"
-                .to_string(),
-        });
-    }
+    // NA_AS_MISSING (feature_histogram.hpp:945-961, T-G4-1) is now transcribed in
+    // `split_scan_body`'s shared REVERSE/FORWARD scan — see the `na_as_missing`
+    // doc comment there for the exact fold. The typed-error gate that used to
+    // live here has been removed for THIS host target only (P-4); the
+    // fused/batched/staged/resident-reduce kernel families keep rejecting
+    // upstream of the batch reaching `split_scan_body` (their own `if
+    // f.na_as_missing { return Err(...) }` checks).
     if num_bin == 0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_split: num_bin must be > 0".to_string(),
@@ -612,13 +699,8 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
                 .to_string(),
         });
     }
-    // Only the default no-op output-clamp / smoothing path is transcribed. Reject
-    // non-default values rather than silently mis-computing.
-    //
-    // This rejection is load-bearing: the on-device seam binds the learner's REAL
-    // `GainConfig` (not a permissive proving slice), so a learner cfg carrying a
-    // non-zero max_delta_step / path_smooth must keep ERRORING here rather than
-    // silently enabling unimplemented semantics on device.
+    // max_delta_step and path_smooth (individually or combined) are fully
+    // transcribed below via the two-axis gain primitives — no rejection needed.
 
     // FindBestThreshold entry bump: sum_hessian + 2 * kEpsilon (:172). The 2 and
     // kEpsilon widen to f64 exactly as C++ does. C++ applies this bump at the
@@ -647,33 +729,45 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
     // The C++ `USE_SMOOTHING` template bool (`path_smooth > kEpsilon`),
     // resolved once per launch exactly like `USE_L1` above.
     let use_smoothing = cfg.use_smoothing();
-    let gain_shift = crate::gain::get_leaf_gain(
+    let gain_shift = crate::gain::get_leaf_gain_full(
         use_l1,
         sum_gradient,
         sum_hessian_bumped,
         cfg.lambda_l1,
         cfg.lambda_l2,
+        cfg.max_delta_step,
+        use_smoothing,
+        cfg.path_smooth,
+        num_data,
+        cfg.parent_output,
     );
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     // Host-computed iteration counts (the loops are bounded RANGE loops on the
     // device; computing the bound on the host keeps the kernel control flow
     // simple for the cubecl-cpu MLIR lowering).
-    //   REVERSE: t = num_bin-1-offset .. 1-offset  ->  count = num_bin-1
-    //   FORWARD: t = 0 .. num_bin-2-offset          ->  count = num_bin-1-offset
+    //   REVERSE: t = num_bin-1-offset-na_as_missing .. 1-offset
+    //            -> count = num_bin-1-na_as_missing (feature_histogram.hpp:859)
+    //   FORWARD: t = 0 .. num_bin-2-offset          -> count = num_bin-1-offset
+    //            (+1, starting at t=-1, iff na_as_missing && offset==1 — the
+    //            NA_AS_MISSING preamble's virtual first candidate, :945-961)
     let num_bin_i = num_bin as i32;
-    let rev_count = (num_bin_i - 1).max(0);
-    // FORWARD branch dispatch (feature_histogram.hpp:420-429): LightGBM runs the
-    // FORWARD scan ONLY for `num_bin > 2 && missing_type != None` (Zero or NaN);
-    // for `missing_type == None` (and num_bin <= 2) it dispatches the REVERSE
-    // branch ONLY, so `FindBestThreshold:170`'s pre-set `default_left = true`
-    // survives (decision_type == 2). The caller passes `run_forward` as a verbatim
+    let rev_count = (num_bin_i - 1 - i32::from(na_as_missing)).max(0);
+    // NA_AS_MISSING FORWARD preamble applies ONLY when offset==1 (the implicit
+    // most-frequent-bin optimization) — see `split_scan_body`'s doc comment.
+    let na_preamble = na_as_missing && offset == 1;
+    // FORWARD branch dispatch (feature_histogram.hpp:396-441): LightGBM runs the
+    // FORWARD scan for `num_bin > 2 && missing_type != None` (Zero OR NaN); for
+    // `missing_type == None` (and num_bin <= 2) it dispatches the REVERSE branch
+    // ONLY, so `FindBestThreshold:170`'s pre-set `default_left = true` survives
+    // (decision_type == 2). The caller passes `run_forward` as a verbatim
     // transcription of that truth table; when it is false we drive `fwd_count = 0`
     // so the FORWARD loop iterates zero times and `best_default_left` keeps its
     // REVERSE/initial 1.0 — exactly mirroring C++ never invoking the FORWARD
     // FindBestThresholdSequentially for this missing_type.
     let fwd_count = if run_forward {
-        (num_bin_i - 1 - offset).max(0)
+        let base = (num_bin_i - 1 - offset).max(0);
+        if na_preamble { base + 1 } else { base }
     } else {
         0
     };
@@ -705,6 +799,7 @@ pub fn find_best_split_f64_on<R: cubecl::Runtime>(
             offset,
             default_bin as i32,
             if skip_default_bin { 1u32 } else { 0u32 },
+            if na_as_missing { 1u32 } else { 0u32 },
             if use_l1 { 1u32 } else { 0u32 },
             cfg.min_data_in_leaf,
             cfg.min_sum_hessian_in_leaf,
@@ -1210,6 +1305,7 @@ pub fn find_best_splits_fused_kernel(
             offset[fi],
             default_bin[fi],
             skip_default_bin[fi],
+            0u32, // na_as_missing: rejected upstream on this fused/batched path (P-4) — true no-op
             use_l1,
             min_data_in_leaf,
             min_sum_hessian_in_leaf,
@@ -1322,6 +1418,7 @@ pub fn find_best_splits_fused_kernel_devcount(
             offset[fi],
             default_bin[fi],
             skip_default_bin[fi],
+            0u32, // na_as_missing: rejected upstream on this fused/batched path (P-4) — true no-op
             use_l1,
             min_data_in_leaf,
             min_sum_hessian_in_leaf,
@@ -1420,6 +1517,7 @@ pub fn find_best_splits_fused_siblings_kernel(
                 offset[fi],
                 default_bin[fi],
                 skip_default_bin[fi],
+                0u32, // na_as_missing: rejected upstream on this fused/batched path (P-4) — true no-op
                 use_l1,
                 min_data_in_leaf,
                 min_sum_hessian_in_leaf,
@@ -1446,6 +1544,7 @@ pub fn find_best_splits_fused_siblings_kernel(
                 offset[fi],
                 default_bin[fi],
                 skip_default_bin[fi],
+                0u32, // na_as_missing: rejected upstream on this fused/batched path (P-4) — true no-op
                 use_l1,
                 min_data_in_leaf,
                 min_sum_hessian_in_leaf,
@@ -1532,6 +1631,7 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
                 offset[fi],
                 default_bin[fi],
                 skip_default_bin[fi],
+                0u32, // na_as_missing: rejected upstream on this fused/batched path (P-4) — true no-op
                 use_l1,
                 min_data_in_leaf,
                 min_sum_hessian_in_leaf,
@@ -1558,6 +1658,7 @@ pub fn find_best_splits_fused_siblings_kernel_devcount(
                 offset[fi],
                 default_bin[fi],
                 skip_default_bin[fi],
+                0u32, // na_as_missing: rejected upstream on this fused/batched path (P-4) — true no-op
                 use_l1,
                 min_data_in_leaf,
                 min_sum_hessian_in_leaf,
@@ -8413,8 +8514,10 @@ pub fn find_best_splits_fused_siblings_reduce_into_leaves_devcount_on<R: cubecl:
 /// the kernel-parity / ROCm-mirror tests; the f32 hip path is untouched.
 ///
 /// # Errors
-/// Same as [`find_best_split_cpu`] (V5 validation, deferred `na_as_missing`,
-/// non-default smoothing/clamp).
+/// Same as [`find_best_split_cpu`] (V5 validation; `na_as_missing` is admitted,
+/// see the REVERSE/FORWARD sections below; `max_delta_step`/`path_smooth`,
+/// individually or combined, are fully transcribed via the two-axis gain
+/// primitives).
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_split_cpu_native(
     hist: &[f64],
@@ -8436,13 +8539,10 @@ pub fn find_best_split_cpu_native(
     };
 
     // ---- V5 boundary validation (identical to find_best_split_cpu) ----
-    if na_as_missing {
-        return Err(ComputeError::Runtime {
-            detail: "find_best_split: na_as_missing (NA_AS_MISSING forward branch) not yet \
-                     implemented"
-                .to_string(),
-        });
-    }
+    // NA_AS_MISSING (feature_histogram.hpp:945-961, T-G4-1) is now transcribed
+    // below (REVERSE excludes the top/NaN-sentinel bin; FORWARD folds bin 0 in
+    // via the na_preamble when offset==1). The gate that used to reject it here
+    // has been removed for this host target only (P-4).
     if num_bin == 0 {
         return Err(ComputeError::Runtime {
             detail: "find_best_split: num_bin must be > 0".to_string(),
@@ -8466,6 +8566,8 @@ pub fn find_best_split_cpu_native(
                 .to_string(),
         });
     }
+    // max_delta_step and path_smooth (individually or combined) are fully
+    // transcribed below via the two-axis gain primitives — no rejection needed.
     // ---- host pre-step: 2*kEpsilon bump + min_gain_shift (verbatim) ----
     let two_eps = 2.0 * f64::from(K_EPSILON);
     let sum_hessian_bumped = sum_hessian + two_eps;
@@ -8495,9 +8597,13 @@ pub fn find_best_split_cpu_native(
     let min_gain_shift = gain_shift + cfg.min_gain_to_split;
 
     let num_bin_i = num_bin as i32;
-    let rev_count = (num_bin_i - 1).max(0);
+    // REVERSE excludes the top/NaN-sentinel bin when na_as_missing (:859).
+    let rev_count = (num_bin_i - 1 - i32::from(na_as_missing)).max(0);
+    // FORWARD preamble (:945-961) applies ONLY when offset==1.
+    let na_preamble = na_as_missing && offset == 1;
     let fwd_count = if run_forward {
-        (num_bin_i - 1 - offset).max(0)
+        let base = (num_bin_i - 1 - offset).max(0);
+        if na_preamble { base + 1 } else { base }
     } else {
         0
     };
@@ -8530,7 +8636,11 @@ pub fn find_best_split_cpu_native(
         let mut sum_right_gradient = 0.0f64;
         let mut sum_right_hessian = f64::from(K_EPSILON);
         let mut right_count = 0i32;
-        let t_start = num_bin_i - 1 - offset;
+        // Excludes the top bin (the NaN sentinel `na_as_missing()` routes NaN
+        // rows to) from the REVERSE sweep when na_as_missing — it is implicitly
+        // folded into "left" via `sum_left = sum_gradient - sum_right` for every
+        // REVERSE candidate (feature_histogram.hpp:859).
+        let t_start = num_bin_i - 1 - offset - i32::from(na_as_missing);
         let mut done = false;
         for k in 0..rev_count {
             let t = t_start - k;
@@ -8590,11 +8700,37 @@ pub fn find_best_split_cpu_native(
         let mut sum_left_gradient = 0.0f64;
         let mut sum_left_hessian = f64::from(K_EPSILON);
         let mut left_count = 0i32;
+
+        // NA_AS_MISSING FORWARD preamble (:945-961): ONLY when offset==1 (bin 0,
+        // the implicit most-frequent bin, is NOT stored explicitly in `hist`).
+        // Reconstruct bin 0 by pre-seeding the accumulators with the FULL leaf
+        // totals, then subtracting every EXPLICIT bin in ascending order — bit-
+        // exact SEQUENTIAL subtraction (`sum_gradient - g0 - g1 - ...`), NOT a
+        // sum-then-subtract-once shortcut, matching C++'s loop-accumulated
+        // operation order exactly.
+        let fwd_start = if na_preamble {
+            sum_left_gradient = sum_gradient;
+            sum_left_hessian = sum_hessian_bumped - f64::from(K_EPSILON);
+            left_count = num_data;
+            for i in 0..(num_bin_i - offset) {
+                let bi = (i as usize) * 2;
+                sum_left_gradient -= hist[bi];
+                sum_left_hessian -= hist[bi + 1];
+                left_count -= round_int(hist[bi + 1] * cnt_factor);
+            }
+            -1i32
+        } else {
+            0i32
+        };
+
         let mut done = false;
-        for t in 0..fwd_count {
+        for k in 0..fwd_count {
+            let t = fwd_start + k;
             let skip = skip_default_bin && (t + offset) == default_bin as i32;
             let active = !skip && !done;
-            if active {
+            // C++ `if (t >= 0) { sum_left_gradient += ...; }` (:969) — the virtual
+            // `t=-1` preamble candidate adds nothing here (already folded above).
+            if active && t >= 0 {
                 let bi = (t as usize) * 2;
                 sum_left_gradient += hist[bi];
                 sum_left_hessian += hist[bi + 1];
@@ -8706,6 +8842,22 @@ mod tests {
     use super::*;
     use crate::runtime::cpu_client;
 
+    /// Bit-compare two `SplitInfo`s: every f64 field by its raw bit pattern (so a
+    /// signed-zero or any ULP difference is caught), every integer/flag by `==`.
+    fn split_info_bit_eq(a: &SplitInfo, b: &SplitInfo) -> bool {
+        a.threshold == b.threshold
+            && a.gain.to_bits() == b.gain.to_bits()
+            && a.left_count == b.left_count
+            && a.right_count == b.right_count
+            && a.left_sum_gradient.to_bits() == b.left_sum_gradient.to_bits()
+            && a.left_sum_hessian.to_bits() == b.left_sum_hessian.to_bits()
+            && a.right_sum_gradient.to_bits() == b.right_sum_gradient.to_bits()
+            && a.right_sum_hessian.to_bits() == b.right_sum_hessian.to_bits()
+            && a.left_output.to_bits() == b.left_output.to_bits()
+            && a.right_output.to_bits() == b.right_output.to_bits()
+            && a.default_left == b.default_left
+    }
+
     /// Minimal smoke test: a clean separable two-region histogram with relaxed
     /// gates yields a finite-gain split. Verifies the kernel launches, the scan
     /// runs, and the launcher decodes a `SplitInfo`. (Bit-exact C++ parity is the
@@ -8816,12 +8968,281 @@ mod tests {
         assert!(matches!(err, ComputeError::LengthMismatch { .. }));
     }
 
-    /// `na_as_missing == true` is a TYPED error (the NA_AS_MISSING forward branch
-    /// is deferred) — never a panic, never a wrong SplitInfo (T-05-01-01). This is
-    /// asserted BEFORE any length/num_bin validation so the deferral is
-    /// unambiguous even on otherwise-valid input.
+    /// G5-2 (SPEC-G5-2): non-default `max_delta_step` must no longer be rejected
+    /// by [`find_best_split_cpu_native`], and the returned leaf outputs must
+    /// cross-check against [`crate::gain::calculate_splitted_leaf_output_clamped`]
+    /// computed independently from the returned per-side sums (the internal RAW
+    /// sums the scan used, i.e. the reported `left_sum_hessian`/`right_sum_hessian`
+    /// with `kEpsilon` added back, per the `:1042/:1053` doc note on
+    /// [`SplitInfo`]).
     #[test]
-    fn find_best_split_na_as_missing_is_typed_error() {
+    fn find_best_split_cpu_native_admits_max_delta_step() {
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.7,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let si = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data,
+        )
+        .expect("max_delta_step must no longer be rejected");
+        assert!(si.gain.is_finite(), "expected a finite-gain split, got {si:?}");
+        let use_l1 = cfg.use_l1();
+        let eps = f64::from(K_EPSILON);
+        let expected_left = crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1,
+            si.left_sum_gradient,
+            si.left_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+        );
+        let expected_right = crate::gain::calculate_splitted_leaf_output_clamped(
+            use_l1,
+            si.right_sum_gradient,
+            si.right_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+        );
+        assert_eq!(si.left_output, expected_left);
+        assert_eq!(si.right_output, expected_right);
+        // Sanity: the clamp is actually exercised (both leaf outputs are within
+        // the [-0.7, 0.7] envelope) for this fixture, not silently falling
+        // through to the unclamped base path.
+        assert!(si.left_output.abs() <= 0.7 + 1e-12, "{}", si.left_output);
+        assert!(si.right_output.abs() <= 0.7 + 1e-12, "{}", si.right_output);
+    }
+
+    /// G5-2 (SPEC-G5-2): the KERNEL host target ([`find_best_split_cpu`], which
+    /// dispatches to [`find_best_split_f64_on`]) must ALSO admit non-default
+    /// `max_delta_step`, and — being the SAME shared [`split_scan_body`] the
+    /// native fn's independent transcription is checked against — must produce
+    /// the IDENTICAL `SplitInfo` as [`find_best_split_cpu_native`] on the same
+    /// inputs (the existing kernel-vs-native parity idiom this file already uses
+    /// for na_as_missing).
+    #[test]
+    fn find_best_split_cpu_admits_max_delta_step_matches_native() {
+        let client = cpu_client();
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.7,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let si_kernel = find_best_split_cpu(
+            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient,
+            sum_hessian, num_data,
+        )
+        .expect("max_delta_step must no longer be rejected by the kernel host target");
+        let si_native = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data,
+        )
+        .expect("native");
+        assert_eq!(si_kernel, si_native, "kernel vs native must be bit-identical");
+        assert!(si_kernel.left_output.abs() <= 0.7 + 1e-12);
+        assert!(si_kernel.right_output.abs() <= 0.7 + 1e-12);
+    }
+
+    /// G5-3 (SPEC-G5-3): non-default `path_smooth` (+ a fixed `parent_output`)
+    /// must no longer be rejected by [`find_best_split_cpu_native`], and the
+    /// returned leaf outputs must cross-check against
+    /// [`crate::gain::calculate_splitted_leaf_output_smoothed`] computed
+    /// independently from the returned per-side sums + counts (the internal RAW
+    /// sums the scan used, i.e. the reported `left_sum_hessian`/`right_sum_hessian`
+    /// with `kEpsilon` added back) — the idiom the plan's Red step describes: "a
+    /// cross-check against the already-tested gain.rs function, not a fresh
+    /// hand-derivation".
+    #[test]
+    fn find_best_split_cpu_native_admits_path_smooth() {
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 2.0,
+            parent_output: 0.25,
+            ..Default::default()
+        };
+        let si = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data,
+        )
+        .expect("path_smooth must no longer be rejected");
+        assert!(si.gain.is_finite(), "expected a finite-gain split, got {si:?}");
+        let use_l1 = cfg.use_l1();
+        let eps = f64::from(K_EPSILON);
+        let expected_left = crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1,
+            si.left_sum_gradient,
+            si.left_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.path_smooth,
+            si.left_count,
+            cfg.parent_output,
+        );
+        let expected_right = crate::gain::calculate_splitted_leaf_output_smoothed(
+            use_l1,
+            si.right_sum_gradient,
+            si.right_sum_hessian + eps,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.path_smooth,
+            si.right_count,
+            cfg.parent_output,
+        );
+        assert_eq!(si.left_output, expected_left);
+        assert_eq!(si.right_output, expected_right);
+    }
+
+    /// G5-3: the KERNEL host target ([`find_best_split_cpu`]) must ALSO admit
+    /// non-default `path_smooth`, and must produce the IDENTICAL `SplitInfo` as
+    /// [`find_best_split_cpu_native`] on the same inputs.
+    #[test]
+    fn find_best_split_cpu_admits_path_smooth_matches_native() {
+        let client = cpu_client();
+        let num_bin = 4u32;
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 2.0,
+            parent_output: 0.25,
+            ..Default::default()
+        };
+        let si_kernel = find_best_split_cpu(
+            &client, &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient,
+            sum_hessian, num_data,
+        )
+        .expect("path_smooth must no longer be rejected by the kernel host target");
+        let si_native = find_best_split_cpu_native(
+            &hist, &cfg, num_bin, 0, num_bin, 0, false, false, true, sum_gradient, sum_hessian,
+            num_data,
+        )
+        .expect("native");
+        assert_eq!(si_kernel, si_native, "kernel vs native must be bit-identical");
+    }
+
+    /// `max_delta_step` and `path_smooth` non-default SIMULTANEOUSLY are BOTH
+    /// admitted and composed correctly (clamp first, THEN the smoothing blend —
+    /// `feature_histogram.hpp:715-737`), via the two-axis `*_full` gain
+    /// primitives — no rejection. Cross-checks the winner's leaf outputs against
+    /// `calculate_splitted_leaf_output_full` computed independently from the
+    /// returned per-side sums + counts, the SAME idiom the single-axis tests
+    /// above use.
+    #[test]
+    fn find_best_split_cpu_native_admits_combined_clamp_and_smooth() {
+        let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
+        let sum_gradient: f64 = -10.0 - 8.0 + 9.0 + 8.0;
+        let sum_hessian: f64 = 20.0;
+        let num_data = 20i32;
+        let cfg = GainConfig {
+            min_data_in_leaf: 1,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.5,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 2.0,
+            parent_output: 0.25,
+            ..Default::default()
+        };
+        let si = find_best_split_cpu_native(
+            &hist, &cfg, 4, 0, 4, 0, false, false, true, sum_gradient, sum_hessian, num_data,
+        )
+        .expect("max_delta_step and path_smooth combined must both be admitted");
+        assert!(si.gain.is_finite(), "expected a finite-gain split, got {si:?}");
+
+        let use_l1 = cfg.use_l1();
+        let use_smoothing = cfg.use_smoothing();
+        let expected_left = crate::gain::calculate_splitted_leaf_output_full(
+            use_l1,
+            si.left_sum_gradient,
+            si.left_sum_hessian,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+            use_smoothing,
+            cfg.path_smooth,
+            si.left_count,
+            cfg.parent_output,
+        );
+        let expected_right = crate::gain::calculate_splitted_leaf_output_full(
+            use_l1,
+            si.right_sum_gradient,
+            si.right_sum_hessian,
+            cfg.lambda_l1,
+            cfg.lambda_l2,
+            cfg.max_delta_step,
+            use_smoothing,
+            cfg.path_smooth,
+            si.right_count,
+            cfg.parent_output,
+        );
+        assert_eq!(si.left_output, expected_left);
+        assert_eq!(si.right_output, expected_right);
+        // The clamp must have ACTUALLY bound (`max_delta_step=0.5` on outputs
+        // that would otherwise exceed it) for this to be a real exercise of the
+        // composed path, not a no-op clamp with only smoothing doing anything.
+        assert!(
+            si.left_output.abs() <= 0.5 + 1e-9 && si.right_output.abs() <= 0.5 + 1e-9,
+            "expected both outputs clamped to ±0.5, got {si:?}"
+        );
+    }
+
+    /// UPDATED (T-G4-1, was `find_best_split_na_as_missing_is_typed_error`):
+    /// `na_as_missing == true` is now ADMITTED and COMPUTED by
+    /// [`find_best_split_cpu`] (the `find_best_split_f64_on`/kernel-parity host
+    /// target), not rejected — SPEC-G4-1. `offset == 0` here, so the FORWARD
+    /// preamble (`na_preamble`, T-G4-1) is inactive; only the REVERSE
+    /// top-bin-exclusion applies. Hand-computed from `feature_histogram.hpp:
+    /// 830-1057` against this histogram (bins 0..3, `offset=0`, bin 3 is the
+    /// `na_as_missing` sentinel bin):
+    ///   bin0 g=-10 h=5, bin1 g=-8 h=5, bin2 g=9 h=5, bin3(NaN) g=8 h=5.
+    /// REVERSE (excludes bin3 from its sweep, `t_start = num_bin-1-offset-1 =
+    /// 2`) best candidate is `t=1` (threshold=1, gain≈22.87); FORWARD (offset=0
+    /// ⇒ no preamble, unmodified `t=0..2` sweep) best candidate is `t=1`
+    /// (`left={bin0,bin1}`, `right={bin2,bin3(NaN)}`, gain≈61.3) — FORWARD wins,
+    /// so the winning split's `default_left == false` (NaN routes to the RIGHT
+    /// child, i.e. with `bin2`/`bin3`).
+    #[test]
+    fn find_best_split_na_as_missing_offset0_admits_and_computes() {
         let client = cpu_client();
         let num_bin = 4u32;
         let hist: Vec<f64> = vec![-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0];
@@ -8835,7 +9256,7 @@ mod tests {
             path_smooth: 0.0,
             ..Default::default()
         };
-        let err = find_best_split_cpu(
+        let split = find_best_split_cpu(
             &client,
             &hist,
             &cfg,
@@ -8844,21 +9265,188 @@ mod tests {
             num_bin,
             0,
             false, // skip_default_bin
-            true,  // na_as_missing -> deferred typed error
-            false, // run_forward (unreached: na_as_missing errors first)
+            true,  // na_as_missing -> now admitted (T-G4-1)
+            true,  // run_forward -> true for missing_type != None (checker Issue 2 fix)
             -1.0,
             20.0,
             20,
         )
-        .expect_err("na_as_missing must be a typed error, not a wrong split");
-        match err {
-            ComputeError::Runtime { detail } => {
-                assert!(
-                    detail.contains("na_as_missing"),
-                    "error must name na_as_missing, got: {detail}"
-                );
-            }
-            other => panic!("expected ComputeError::Runtime, got {other:?}"),
+        .expect("na_as_missing must now be admitted and computed, not a typed error");
+        assert_eq!(split.threshold, 1, "FORWARD t=1 wins over REVERSE t=1");
+        assert!(
+            !split.default_left,
+            "FORWARD branch wins => NaN routes RIGHT (default_left=false)"
+        );
+        assert_eq!(split.left_count, 10);
+        assert_eq!(split.right_count, 10);
+        assert_eq!(split.left_sum_gradient, -18.0);
+        assert_eq!(split.right_sum_gradient, 17.0);
+        assert!(
+            (split.left_sum_hessian - 10.0).abs() < 1e-6,
+            "left_sum_hessian: {}",
+            split.left_sum_hessian
+        );
+        assert!(
+            (split.right_sum_hessian - 10.0).abs() < 1e-6,
+            "right_sum_hessian: {}",
+            split.right_sum_hessian
+        );
+        assert!(
+            (split.gain - 61.25).abs() < 1e-2,
+            "gain: {} (expected ~61.25 = 61.3 - min_gain_shift(~0.05))",
+            split.gain
+        );
+    }
+
+    /// T-G4-1 Red: the NA_AS_MISSING FORWARD preamble (`feature_histogram.hpp:
+    /// 945-961`), exercised at `offset == 1` where bin 0 (the implicit
+    /// most-frequent bin) must be reconstructed via subtraction and folded into
+    /// the FIRST forward candidate. Checker Issue 2: this scenario is
+    /// constructed so the CORRECT winning split comes from the FORWARD branch
+    /// (and specifically from the preamble-seeded `t=0` candidate, which needs
+    /// bin 0 correctly reconstructed) — asserting merely `Ok(..)` would NOT
+    /// catch a reverse-only-scan regression, so this test also runs the SAME
+    /// histogram with `run_forward=false` (the pre-fix `run_forward()` truth
+    /// table for a NaN feature) and asserts it yields a DIFFERENT, WRONG
+    /// `default_left` — proving the forward branch is load-bearing for
+    /// correctness, not merely for coverage.
+    ///
+    /// Histogram (`num_bin=4, offset=1`; bin0 implicit/most-frequent, bin3 is
+    /// the `na_as_missing` sentinel): bin0 g=-1 h=1 (reconstructed via
+    /// subtraction), bin1(data_[0]) g=-1 h=1, bin2(data_[1]) g=1 h=1,
+    /// bin3/NaN(data_[2]) g=1 h=1. Hand-computed from `feature_histogram.hpp:
+    /// 830-1057`:
+    ///   - REVERSE (excludes bin3, `t_start=1`): best is `t=1`
+    ///     (threshold=1, left={bin0,bin1,bin3(NaN, implicit)}, gain≈1.333).
+    ///   - FORWARD (`na_preamble` seeds bin0 via subtraction, virtual `t=-1`
+    ///     then `t=0,1`): best is `t=0` (threshold=1, left={bin0,bin1},
+    ///     right={bin2,bin3(NaN)}, gain≈4.0) — FORWARD wins.
+    /// So the TRUE winner is `threshold=1, default_left=false, gain≈4.0`; a
+    /// buggy reverse-only scan (`run_forward=false`) would instead report
+    /// `threshold=1, default_left=true, gain≈1.333` — same nominal threshold,
+    /// OPPOSITE (wrong) NaN routing and a much lower gain.
+    #[test]
+    fn find_best_split_na_as_missing_offset1_forward_preamble_wins() {
+        let client = cpu_client();
+        let num_bin = 4u32;
+        // COMPACTED layout (`learner::compact_histogram`): cell `c` holds REAL
+        // bin `c+offset`'s data; the buffer keeps its full `2*num_bin` length
+        // with the dropped bin-0 slot ZEROED at the tail (never read directly —
+        // reconstructed via subtraction in the `na_preamble`).
+        // cell0=real bin1, cell1=real bin2, cell2=real bin3(NaN), cell3=padding.
+        let hist: Vec<f64> = vec![-1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0];
+        let cfg = GainConfig {
+            min_data_in_leaf: 0,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let correct = find_best_split_cpu(
+            &client,
+            &hist,
+            &cfg,
+            num_bin,
+            1, // offset=1 -> exercises the FORWARD na_preamble
+            0,
+            0,
+            false, // skip_default_bin
+            true,  // na_as_missing
+            true,  // run_forward=true -- the checker Issue 2 fix in action
+            0.0,
+            4.0,
+            4,
+        )
+        .expect("na_as_missing must be admitted and computed (T-G4-1)");
+        assert_eq!(correct.threshold, 1);
+        assert!(
+            !correct.default_left,
+            "FORWARD's preamble-seeded t=0 candidate must win: NaN routes RIGHT"
+        );
+        assert_eq!(correct.left_count, 2);
+        assert_eq!(correct.right_count, 2);
+        assert_eq!(correct.left_sum_gradient, -2.0);
+        assert_eq!(correct.right_sum_gradient, 2.0);
+        assert!(
+            (correct.gain - 4.0).abs() < 1e-6,
+            "gain: {} (expected ~4.0)",
+            correct.gain
+        );
+
+        // Companion: the PRE-FIX `run_forward()` truth table (Zero-only) would
+        // have passed `run_forward=false` for this NaN feature, running REVERSE
+        // ONLY. Prove that gives a DIFFERENT (wrong) answer — the same nominal
+        // threshold but the OPPOSITE `default_left` and a much lower gain —
+        // demonstrating why checker Issue 2's `run_forward()` fix is
+        // load-bearing, not cosmetic.
+        let reverse_only = find_best_split_cpu(
+            &client, &hist, &cfg, num_bin, 1, 0, 0, false, true,
+            false, // run_forward=false: the PRE-FIX (buggy) dispatch for NaN
+            0.0, 4.0, 4,
+        )
+        .expect("REVERSE-only must still succeed (it's a valid, just WRONG, split)");
+        assert_eq!(
+            reverse_only.threshold, 1,
+            "same nominal threshold as the correct answer"
+        );
+        assert!(
+            reverse_only.default_left,
+            "REVERSE-only wrongly folds NaN into LEFT (opposite of the true answer)"
+        );
+        assert!(
+            (reverse_only.gain - 1.333_333).abs() < 1e-3,
+            "gain: {} (expected ~1.333, well below the true 4.0)",
+            reverse_only.gain
+        );
+        assert_ne!(
+            correct.default_left, reverse_only.default_left,
+            "forward-branch inclusion changes the winning split's NaN routing"
+        );
+    }
+
+    /// T-G4-1 (P-4 dual-target requirement): [`find_best_split_cpu_native`] (the
+    /// `CpuBackend` production path) and [`find_best_split_cpu`] (the
+    /// `find_best_split_f64_on` cubecl-cpu kernel-parity/ROCm-mirror path) MUST
+    /// stay bit-identical for `na_as_missing == true` too, exactly as they
+    /// already are for every other parameter combination
+    /// (`split_2lane_equals_serial_matrix` sweeps the non-`na_as_missing` space).
+    /// Sweeps both `offset ∈ {0,1}` (only `offset==1` exercises the FORWARD
+    /// `na_preamble`) over the two hand-built histograms above.
+    #[test]
+    fn find_best_split_na_as_missing_native_matches_kernel() {
+        let client = cpu_client();
+        let cfg = GainConfig {
+            min_data_in_leaf: 0,
+            min_sum_hessian_in_leaf: 0.0,
+            max_delta_step: 0.0,
+            lambda_l1: 0.0,
+            lambda_l2: 0.0,
+            min_gain_to_split: 0.0,
+            path_smooth: 0.0,
+            ..Default::default()
+        };
+        let cases: [(u32, i32, &[f64], f64, f64, i32); 2] = [
+            (4, 0, &[-10.0, 5.0, -8.0, 5.0, 9.0, 5.0, 8.0, 5.0], -1.0, 20.0, 20),
+            (4, 1, &[-1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0], 0.0, 4.0, 4),
+        ];
+        for (num_bin, offset, hist, sum_gradient, sum_hessian, num_data) in cases {
+            let native = find_best_split_cpu_native(
+                hist, &cfg, num_bin, offset, 0, 0, false, true, true, sum_gradient, sum_hessian,
+                num_data,
+            )
+            .expect("native: na_as_missing must be admitted");
+            let kernel = find_best_split_cpu(
+                &client, hist, &cfg, num_bin, offset, 0, 0, false, true, true, sum_gradient,
+                sum_hessian, num_data,
+            )
+            .expect("kernel: na_as_missing must be admitted");
+            assert!(
+                split_info_bit_eq(&native, &kernel),
+                "native/kernel diverged at offset={offset}.\n native={native:?}\n kernel={kernel:?}"
+            );
         }
     }
 

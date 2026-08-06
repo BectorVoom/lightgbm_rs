@@ -191,6 +191,8 @@ impl DataPartition {
         max_bin: u32,
         threshold: u32,
         most_freq_bin: u32,
+        na_as_missing: bool,
+        default_left: bool,
     ) -> Result<(i32, i32), ComputeError> {
         let leaf_u = leaf as usize;
         let begin = self.leaf_begin[leaf_u] as usize;
@@ -201,8 +203,9 @@ impl DataPartition {
             // `self.indices[begin..begin+count]`. ONE random gather + a ¼-width u8
             // route scratch + ONE u32 scatter — no leaf_rows clone, no u32-widened
             // leaf_feature_bins, no local→row remap. Byte-identical [left | right]
-            // order to the materialize-then-op path below (same SplitInner
-            // MissingType::None decision as data_partition_cpu_native).
+            // order to the materialize-then-op path below. `na_as_missing`
+            // (T-G4-2, SPEC-G4-2) additionally routes the NA sentinel bin
+            // (`num_bin-1`) per `default_left` — see `split_fused_host_impl`.
             self.split_fused_host(
                 begin,
                 count,
@@ -212,6 +215,8 @@ impl DataPartition {
                 max_bin,
                 threshold,
                 most_freq_bin,
+                na_as_missing,
+                default_left,
             )?
         } else {
             // RocmBackend / any device backend: route the leaf's rows ON-DEVICE.
@@ -222,6 +227,22 @@ impl DataPartition {
             // upload count×native-width bytes (4× fewer on all-u8 data) — bit-exact to
             // the prior u32 widen (value-identical routing). The fused host path above
             // (`prefers_host_partition`) is untouched.
+            //
+            // `na_as_missing` (T-G4-2) is NOT yet threaded into `data_partition_native`
+            // — only the CPU host `split_fused_host` arm above routes the NA sentinel
+            // bin by `default_left`. Silently falling through here would route those
+            // rows by the ordinary numeric threshold instead, producing a WRONG model
+            // on any backend that does not prefer host partitioning (ROCm/CUDA/WGPU)
+            // with no error at all. Reject explicitly rather than mis-compute (V5).
+            if na_as_missing {
+                return Err(ComputeError::Runtime {
+                    detail: "data_partition: na_as_missing NaN-sentinel-bin routing is only \
+                             implemented on the CpuBackend host partition path \
+                             (prefers_host_partition); device backends (ROCm/CUDA/WGPU) do \
+                             not yet thread default_left into data_partition_native"
+                        .to_string(),
+                });
+            }
             let leaf_rows: Vec<u32> = self.indices[begin..begin + count].to_vec();
             let leaf_bins = feature_bins.gather(&leaf_rows);
 
@@ -299,6 +320,8 @@ impl DataPartition {
         max_bin: u32,
         threshold: u32,
         most_freq_bin: u32,
+        na_as_missing: bool,
+        default_left: bool,
     ) -> Result<(i32, i32), ComputeError> {
         // Production dispatch: read the leaf-row threshold ONCE (env
         // `LGBM_PAR_PARTITION_MIN`). Tests drive `split_fused_host_impl` directly to
@@ -312,6 +335,8 @@ impl DataPartition {
             max_bin,
             threshold,
             most_freq_bin,
+            na_as_missing,
+            default_left,
             par_partition_min(),
         )
     }
@@ -332,6 +357,8 @@ impl DataPartition {
         max_bin: u32,
         threshold: u32,
         most_freq_bin: u32,
+        na_as_missing: bool,
+        default_left: bool,
         par_min: usize,
     ) -> Result<(i32, i32), ComputeError> {
         // V5 boundary validation FIRST (matches the variants/fields the
@@ -357,8 +384,21 @@ impl DataPartition {
             th -= 1;
         }
         let default_to_right = most_freq_bin as i32 > thr;
+        // NA_AS_MISSING (T-G4-2, SPEC-G4-2): the NaN sentinel bin is ALWAYS
+        // `num_bin - 1` (`BinMapper::ValueToBin`'s NaN routing,
+        // `bin_mapper.rs:1091-1106`; the `na_as_missing()` gate already requires
+        // `num_bin > 2`, so `MFB_IS_NA` — the rare case where the most-frequent
+        // bin ALSO coincides with the NaN sentinel bin — is not covered here,
+        // matching T-G4-1's histogram-scan scope). C++ `SplitInner`
+        // (`dense_bin.hpp:340-345,350-352`) checks `MISS_IS_NA && !MFB_IS_NA &&
+        // bin == maxb` FIRST, before the out-of-range/threshold routing, and
+        // sends it to `lte_indices` iff `default_left`.
+        let na_sentinel_bin = num_bin as i32 - 1;
         let go_right = |b: u32| -> bool {
             let bin = b as i32;
+            if na_as_missing && bin == na_sentinel_bin {
+                return !default_left;
+            }
             if bin < min_b || bin > max_b {
                 default_to_right
             } else {
@@ -651,7 +691,7 @@ mod tests {
         // bins per row; threshold=3 -> bin<=3 left, bin>3 right (num_bin=8).
         let feature_bins = BinColumn::new(vec![1u32, 5, 3, 7, 0, 4, 2, 6], 8);
         let (left, right) = dp
-            .split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8)
+            .split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8, false, false)
             .expect("split ok");
         // left rows (bin<=3) in original order: 0(b1),2(b3),4(b0),6(b2)
         // right rows (bin>3): 1(b5),3(b7),5(b4),7(b6)
@@ -664,6 +704,50 @@ mod tests {
         assert_eq!(dp.indices_in_leaf(1), &[1, 3, 5, 7]);
     }
 
+    /// T-G4-2 (SPEC-G4-2) Red: on an `na_as_missing` feature, rows carrying the
+    /// NaN sentinel bin (`num_bin-1`, per `BinMapper::ValueToBin`'s NaN routing)
+    /// route down the winning split's `default_left` direction — REGARDLESS of
+    /// where `num_bin-1` sits relative to the numeric `threshold` (here it is
+    /// `> threshold`, so a non-NA row with that bin would normally go RIGHT;
+    /// `default_left=true` must override that to LEFT for the NaN rows only).
+    /// `most_freq_bin=5` (out of `[min_bin,max_bin]`) keeps the ordinary-bin `th`
+    /// unadjusted so the non-NA routing is easy to hand-verify:
+    /// bins = [0, 1, 2, 3(NaN), 3(NaN), 0], threshold=1 ⇒ non-NA rows with
+    /// bin<=1 go LEFT (rows 0,1,5), bin>1-and-not-NaN go RIGHT (row 2 only,
+    /// bin=2); rows 3,4 (bin=3=NaN) go LEFT because `default_left=true`.
+    #[test]
+    fn split_na_as_missing_routes_nan_bin_by_default_left() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let mut dp = DataPartition::new(6, 4);
+        let feature_bins = BinColumn::new(vec![0u32, 1, 2, 3, 3, 0], 4);
+        let (l, r) = dp
+            .split(&backend, &client, 0, 1, &feature_bins, 4, 0, 3, 1, 5, true, true)
+            .expect("split ok");
+        assert_eq!(l, 5, "left = non-NA bin<=1 rows {{0,1,5}} + NA rows {{3,4}}");
+        assert_eq!(r, 1, "right = the single non-NA bin=2 row {{2}}");
+        assert_eq!(dp.indices_in_leaf(0), &[0, 1, 3, 4, 5]);
+        assert_eq!(dp.indices_in_leaf(1), &[2]);
+    }
+
+    /// Companion: flipping `default_left=false` on the SAME histogram/threshold
+    /// sends the NaN rows to the OTHER child — proving the routing genuinely
+    /// reads `default_left` (not merely "NA always left").
+    #[test]
+    fn split_na_as_missing_default_left_false_routes_nan_right() {
+        let backend = CpuBackend;
+        let client = cpu_client();
+        let mut dp = DataPartition::new(6, 4);
+        let feature_bins = BinColumn::new(vec![0u32, 1, 2, 3, 3, 0], 4);
+        let (l, r) = dp
+            .split(&backend, &client, 0, 1, &feature_bins, 4, 0, 3, 1, 5, true, false)
+            .expect("split ok");
+        assert_eq!(l, 3, "left = non-NA bin<=1 rows only {{0,1,5}}");
+        assert_eq!(r, 3, "right = non-NA bin=2 row {{2}} + NA rows {{3,4}}");
+        assert_eq!(dp.indices_in_leaf(0), &[0, 1, 5]);
+        assert_eq!(dp.indices_in_leaf(1), &[2, 3, 4]);
+    }
+
     /// A second split on a non-root leaf must operate on that leaf's slice only,
     /// using the global row ids it currently holds.
     #[test]
@@ -672,12 +756,12 @@ mod tests {
         let client = cpu_client();
         let mut dp = DataPartition::new(8, 4);
         let feature_bins = BinColumn::new(vec![1u32, 5, 3, 7, 0, 4, 2, 6], 8);
-        dp.split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8)
+        dp.split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8, false, false)
             .unwrap();
         // Now split leaf 1 (rows 1,3,5,7 with bins 5,7,4,6) at threshold 5:
         // bin<=5 left (rows 1(b5),5(b4)), bin>5 right (rows 3(b7),7(b6)).
         let (l, r) = dp
-            .split(&backend, &client, 1, 2, &feature_bins, 8, 0, 7, 5, 8)
+            .split(&backend, &client, 1, 2, &feature_bins, 8, 0, 7, 5, 8, false, false)
             .unwrap();
         assert_eq!((l, r), (2, 2));
         assert_eq!(dp.indices_in_leaf(1), &[1, 5]);
@@ -736,7 +820,7 @@ mod tests {
         // leaf position ⇒ its bin (9) must be reported.
         let feature_bins = BinColumn::new(vec![1u32, 5, 3, 9, 0, 11, 2, 6], 16);
         let err = dp
-            .split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8)
+            .split(&backend, &client, 0, 1, &feature_bins, 8, 0, 7, 3, 8, false, false)
             .expect_err("out-of-range bin must error");
         match err {
             ComputeError::BinIndexOutOfRange { row, bin, num_bin } => {
@@ -823,6 +907,8 @@ mod tests {
                     max_bin,
                     threshold,
                     most_freq_bin,
+                    false,
+                    false,
                 )
                 .expect("fused split ok");
 
@@ -912,7 +998,7 @@ mod tests {
             dp_ser.indices.copy_from_slice(&scattered);
             let (ls, rs) = dp_ser
                 .split_fused_host_impl(
-                    0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, usize::MAX,
+                    0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, false, false, usize::MAX,
                 )
                 .expect("serial arm ok");
 
@@ -920,7 +1006,7 @@ mod tests {
             dp_par.indices.copy_from_slice(&scattered);
             let (lp, rp) = dp_par
                 .split_fused_host_impl(
-                    0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, 0,
+                    0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, false, false, 0,
                 )
                 .expect("parallel arm ok");
 
@@ -961,7 +1047,7 @@ mod tests {
         let mut dp_par = DataPartition::new(n as i32, 4);
         let (lp, _rp) = dp_par
             .split_fused_host_impl(
-                0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, 0,
+                0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, false, false, 0,
             )
             .expect("parallel ok");
 
@@ -984,10 +1070,50 @@ mod tests {
         };
         dp_ser
             .split_fused_host_impl(
-                0, n, &col2, num_bin, min_bin, max_bin, threshold, most_freq_bin, usize::MAX,
+                0, n, &col2, num_bin, min_bin, max_bin, threshold, most_freq_bin, false, false, usize::MAX,
             )
             .expect("serial ok");
         assert_eq!(dp_ser.indices(), dp_par.indices(), "parallel != serial (identity leaf)");
+    }
+
+    /// T-G4-2: the block-parallel arm's `go_right` closure is the SAME closure
+    /// the serial arm uses (captured, not re-derived per block), so `na_as_missing`
+    /// routing must stay byte-identical between the two arms on a large
+    /// (multi-block) leaf too — the same parity discipline as
+    /// `split_parallel_stable_identity_ordered`.
+    #[test]
+    fn split_parallel_equals_serial_na_as_missing() {
+        let n: usize = 50_000;
+        let num_bin = 64u32;
+        let (min_bin, max_bin, threshold, most_freq_bin) = (0u32, num_bin - 1, 31u32, 5u32);
+        let mut nextv = test_lcg(0x5EED);
+        let raw: Vec<u32> = (0..n).map(|_| nextv() % num_bin).collect();
+        let col = BinColumn::new(raw, num_bin);
+
+        for &default_left in &[true, false] {
+            let mut dp_ser = DataPartition::new(n as i32, 4);
+            let (ls, rs) = dp_ser
+                .split_fused_host_impl(
+                    0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, true,
+                    default_left, usize::MAX,
+                )
+                .expect("serial ok");
+
+            let mut dp_par = DataPartition::new(n as i32, 4);
+            let (lp, rp) = dp_par
+                .split_fused_host_impl(
+                    0, n, &col, num_bin, min_bin, max_bin, threshold, most_freq_bin, true,
+                    default_left, 0,
+                )
+                .expect("parallel ok");
+
+            assert_eq!((ls, rs), (lp, rp), "counts differ, default_left={default_left}");
+            assert_eq!(
+                dp_ser.indices(),
+                dp_par.indices(),
+                "parallel != serial for na_as_missing, default_left={default_left}"
+            );
+        }
     }
 
     /// Error semantics on the PARALLEL path: two out-of-range bins are planted
@@ -1009,7 +1135,7 @@ mod tests {
         let mut dp = DataPartition::new(n as i32, 4);
         let before = dp.indices().to_vec();
         let err = dp
-            .split_fused_host_impl(0, n, &col, num_bin, 0, num_bin - 1, 31, 5, 0)
+            .split_fused_host_impl(0, n, &col, num_bin, 0, num_bin - 1, 31, 5, false, false, 0)
             .expect_err("out-of-range bin must error on the parallel path");
         match err {
             ComputeError::BinIndexOutOfRange { row, bin, num_bin: nb } => {
