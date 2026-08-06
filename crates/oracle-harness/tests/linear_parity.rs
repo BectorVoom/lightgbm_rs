@@ -210,7 +210,11 @@ fn linear_fit_matches_cpp() {
             t.is_linear = false;
             t.linear = None;
             let partition = partition_from_tree(&t, &raw, n_rows, n_feat);
-            fit_linear_leaves(&mut t, &raw, n_feat, &grad, &hess, lam, &partition);
+            let raw_cols =
+                lgbm_treelearner::linear::RawFeatureColumns::from_fn(n_rows, n_feat, |r, c| {
+                    xr[r][c]
+                });
+            fit_linear_leaves(&mut t, &raw_cols, &grad, &hess, lam, &partition);
             t.shrinkage(lr);
 
             let fitted = t.linear.as_ref().unwrap();

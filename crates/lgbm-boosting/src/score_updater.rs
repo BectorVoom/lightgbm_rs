@@ -15,6 +15,7 @@
 //!     data-partition scatter (NOT a per-row tree walk) — the bit-exact hot path
 //!     (serial_tree_learner.h:100-118).
 
+use lgbm_treelearner::linear::RawFeatureColumns;
 use lgbm_treelearner::{DataPartition, SerialTreeLearner};
 use lgbm_compute::Backend;
 // Resident device score path. These are the kernel/type
@@ -382,26 +383,71 @@ impl ScoreUpdater {
     /// from growth) — NOT from re-routing through the real-value thresholds, which
     /// would disagree at bin boundaries and drift subsequent iterations' gradients
     /// (matches C++ `LinearTreeLearner`'s `AddPredictionToScore` over the partition).
-    /// `raw` is row-major `num_data * num_features`, indexed by original feature.
+    /// `raw` is the column-major f32 [`RawFeatureColumns`] store (C++
+    /// `Dataset::raw_data_`); values promote f32→f64 exactly like the C++ scorer.
+    ///
+    /// Leaves run in PARALLEL (crew): row sets are disjoint across leaves, and each
+    /// row's contribution is a per-row-independent add — thread-count deterministic.
     pub fn add_linear_tree_train_path(
         &mut self,
         tree: &Tree,
         partition: &DataPartition,
         cur_tree_id: i32,
-        raw: &[f64],
-        num_features: usize,
+        raw: &RawFeatureColumns,
     ) {
         if tree.num_leaves <= 1 {
             return;
         }
         let off = self.offset(cur_tree_id);
-        for leaf in 0..tree.num_leaves {
-            for &row in partition.indices_in_leaf(leaf) {
-                let base = row as usize * num_features;
-                let out = tree.linear_leaf_output(leaf as usize, &raw[base..base + num_features]);
-                self.score[off + row as usize] += out;
+        let nd = self.num_data as usize;
+        let score = &mut self.score[off..off + nd];
+
+        struct ScorePtr(*mut f64);
+        // SAFETY: leaves partition the rows — each row index is written by exactly
+        // one crew task (disjoint indexed writes).
+        unsafe impl Sync for ScorePtr {}
+        let ptr = ScorePtr(score.as_mut_ptr());
+        let ptr_ref = &ptr;
+
+        let lin = tree.linear.as_ref();
+        lgbm_compute::crew::Crew::global().run(tree.num_leaves as usize, &|leaf| {
+            let rows = partition.indices_in_leaf(leaf as i32);
+            let Some(lin) = lin else {
+                // `is_linear` without a model (e.g. the constant first tree scored
+                // through this path): plain constant leaf output.
+                let v = tree.leaf_value[leaf];
+                for &row in rows {
+                    // SAFETY: `row` belongs to exactly one leaf (see ScorePtr).
+                    unsafe { *ptr_ref.0.add(row as usize) += v };
+                }
+                return;
+            };
+            let cols: Vec<&[f32]> = lin.leaf_features[leaf]
+                .iter()
+                .map(|&fi| raw.column(fi as usize))
+                .collect();
+            let coeffs = &lin.leaf_coeff[leaf];
+            let konst = lin.leaf_const[leaf];
+            let fallback = tree.leaf_value[leaf];
+            for &row in rows {
+                let r = row as usize;
+                // `Tree::linear_leaf_output` semantics: any NaN model feature →
+                // the stored constant `leaf_value` fallback.
+                let mut out = konst;
+                let mut nan_found = false;
+                for (c, col) in coeffs.iter().zip(cols.iter()) {
+                    let v = col[r];
+                    if v.is_nan() {
+                        nan_found = true;
+                        break;
+                    }
+                    out += c * f64::from(v);
+                }
+                let add = if nan_found { fallback } else { out };
+                // SAFETY: `row` belongs to exactly one leaf (see ScorePtr).
+                unsafe { *ptr_ref.0.add(r) += add };
             }
-        }
+        });
     }
 
     /// C++ DART `train_score_updater_->AddScore(model, cur_tree_id)`

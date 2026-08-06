@@ -107,7 +107,43 @@ impl GradientDiscretizer {
         if n == 0 {
             return Vec::new();
         }
+        self.compute_scales(grad, hess);
+        let mut out = vec![0i8; 2 * n];
+        for i in 0..n {
+            let (qg, qh) = self.quantize_pair(grad[i], hess[i]);
+            out[2 * i + 1] = qg;
+            out[2 * i] = qh;
+        }
+        out
+    }
 
+    /// Fused [`Self::discretize`] + de-quantized write-back: replace each row's
+    /// grad/hess IN PLACE with `i8 × scale` (f32) — the value the unchanged exact
+    /// learner then builds histograms from. Row-for-row identical to
+    /// `discretize` followed by a `q[i] × scale` rewrite (same scale pass, same
+    /// per-row rounding and RNG draw order), but single-pass and allocation-free
+    /// — this is the per-iteration hot path of `use_quantized_grad`.
+    pub fn discretize_dequantize_in_place(&mut self, grad: &mut [f32], hess: &mut [f32]) {
+        debug_assert_eq!(grad.len(), hess.len(), "grad/hess length mismatch");
+        let n = grad.len();
+        if n == 0 {
+            return;
+        }
+        self.compute_scales(grad, hess);
+        let (gs, hs) = (self.grad_scale, self.hess_scale);
+        for i in 0..n {
+            let (qg, qh) = self.quantize_pair(grad[i], hess[i]);
+            grad[i] = (f64::from(qg) * gs) as f32;
+            hess[i] = (f64::from(qh) * hs) as f32;
+        }
+    }
+
+    /// The per-iteration scale computation (`DiscretizeGradients:72-114`):
+    /// max-abs over the buffers, then grad uses bins/2 (INTEGER division, as in
+    /// C++), hess the full bins unless constant (then hess_scale = max_hess,
+    /// quantized hess ≡ 1).
+    fn compute_scales(&mut self, grad: &[f32], hess: &[f32]) {
+        let n = grad.len();
         // max-abs over the iteration (f64 fabs, matching `DiscretizeGradients:72-99`).
         let mut max_grad = f64::from(grad[0]).abs();
         let mut max_hess = f64::from(hess[0]).abs();
@@ -117,9 +153,6 @@ impl GradientDiscretizer {
         }
         self.max_grad_abs = max_grad;
         self.max_hess_abs = max_hess;
-
-        // Scales (`:107-114`): grad uses bins/2 (INTEGER division, as in C++), hess uses
-        // the full bins unless constant (then hess_scale = max_hess, quantized hess ≡ 1).
         let half_bins = (self.num_grad_quant_bins / 2) as f64; // integer div then widen
         self.grad_scale = max_grad / half_bins;
         self.hess_scale = if self.is_constant_hessian {
@@ -129,26 +162,29 @@ impl GradientDiscretizer {
         };
         self.inv_grad_scale = 1.0 / self.grad_scale;
         self.inv_hess_scale = 1.0 / self.hess_scale;
+    }
 
-        let mut out = vec![0i8; 2 * n];
-        for i in 0..n {
-            // Rounding bias: deterministic 0.5, or a per-row random ∈ [0,1) for stochastic
-            // rounding (separate grad/hess draws, mirroring C++'s two random-value arrays).
-            let (bg, bh) = if self.stochastic {
-                (next_u01(&mut self.rng_state), next_u01(&mut self.rng_state))
-            } else {
-                (0.5, 0.5)
-            };
-            let g = f64::from(grad[i]) * self.inv_grad_scale;
-            out[2 * i + 1] = (if grad[i] >= 0.0 { g + bg } else { g - bg }) as i8;
-            out[2 * i] = if self.is_constant_hessian {
-                1
-            } else {
-                // hessian is non-negative; C++ adds the (positive) bias, no sign branch.
-                (f64::from(hess[i]) * self.inv_hess_scale + bh) as i8
-            };
-        }
-        out
+    /// Quantize one row to its `(grad_i8, hess_i8)` pair — the shared per-row core
+    /// of [`Self::discretize`] / [`Self::discretize_dequantize_in_place`].
+    /// Rounding bias: deterministic 0.5, or a per-row random ∈ [0,1) for stochastic
+    /// rounding (separate grad/hess draws, mirroring C++'s two random-value arrays
+    /// — the grad draw ALWAYS precedes the hess draw, fixing the RNG sequence).
+    #[inline]
+    fn quantize_pair(&mut self, grad: f32, hess: f32) -> (i8, i8) {
+        let (bg, bh) = if self.stochastic {
+            (next_u01(&mut self.rng_state), next_u01(&mut self.rng_state))
+        } else {
+            (0.5, 0.5)
+        };
+        let g = f64::from(grad) * self.inv_grad_scale;
+        let qg = (if grad >= 0.0 { g + bg } else { g - bg }) as i8;
+        let qh = if self.is_constant_hessian {
+            1
+        } else {
+            // hessian is non-negative; C++ adds the (positive) bias, no sign branch.
+            (f64::from(hess) * self.inv_hess_scale + bh) as i8
+        };
+        (qg, qh)
     }
 
     /// De-quantize an integer (grad-sum, hess-sum) bin cell back to f64 — `int_sum * scale`,

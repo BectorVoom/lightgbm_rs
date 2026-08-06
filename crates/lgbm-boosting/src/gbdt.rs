@@ -57,12 +57,9 @@ fn quantize_grad_hess_in_place(
     } else {
         GradientDiscretizer::new(num_grad_quant_bins, is_constant_hessian)
     };
-    let q = d.discretize(grad, hess); // i8 pairs [hess, grad]
-    let (gs, hs) = (d.grad_scale(), d.hess_scale());
-    for i in 0..grad.len() {
-        grad[i] = (f64::from(q[2 * i + 1]) * gs) as f32;
-        hess[i] = (f64::from(q[2 * i]) * hs) as f32;
-    }
+    // Fused quantize + de-quantized write-back (row-identical to `discretize`
+    // followed by a `q × scale` rewrite, minus the i8 buffer and second pass).
+    d.discretize_dequantize_in_place(grad, hess);
 }
 
 /// Soft-threshold for the L1-regularized leaf output (C++ `Common::ThresholdL1`): shrink the
@@ -331,10 +328,11 @@ pub struct Gbdt<'a> {
     linear_tree: bool,
     /// `config_->linear_lambda` — L2 penalty on the per-leaf linear coefficients.
     linear_lambda: f64,
-    /// Row-major raw feature matrix (`num_data * num_features`, `f64`), indexed by
-    /// ORIGINAL feature index — required by the linear-tree leaf fit. `None` ⇒ the
-    /// linear-tree path is inactive even if `linear_tree` is set.
-    raw_features: Option<Vec<f64>>,
+    /// Column-major f32 raw feature store
+    /// ([`lgbm_treelearner::linear::RawFeatureColumns`], the C++ `Dataset::raw_data_`
+    /// analog), indexed by ORIGINAL feature index — required by the linear-tree leaf
+    /// fit. `None` ⇒ the linear-tree path is inactive even if `linear_tree` is set.
+    raw_features: Option<lgbm_treelearner::linear::RawFeatureColumns>,
     /// The GBDT-owned, TRAIN-LIFETIME resident f64 score
     /// buffer ([`lgbm_compute::ResidentScore`]<`B::Runtime`>), type-erased because
     /// `Gbdt` is not `Backend`-generic (downcast inside the `B`-generic methods). Built
@@ -452,14 +450,15 @@ impl<'a> Gbdt<'a> {
 
     /// Enable linear-tree training: after each non-first tree's structure is grown,
     /// fit per-leaf linear models over the RAW features (C++ `LinearTreeLearner`).
-    /// `raw_features` is row-major `num_data * num_features` (`f64`), indexed by
-    /// ORIGINAL feature index. No-op unless `enabled`.
+    /// `raw_features` is the column-major f32
+    /// [`lgbm_treelearner::linear::RawFeatureColumns`] store, indexed by ORIGINAL
+    /// feature index. No-op unless `enabled`.
     #[must_use]
     pub fn with_linear_tree(
         mut self,
         enabled: bool,
         linear_lambda: f64,
-        raw_features: Vec<f64>,
+        raw_features: lgbm_treelearner::linear::RawFeatureColumns,
     ) -> Self {
         self.linear_tree = enabled;
         self.linear_lambda = linear_lambda;
@@ -1057,11 +1056,9 @@ impl<'a> Gbdt<'a> {
                         );
                         if !is_first_tree {
                             let raw = self.raw_features.as_ref().unwrap();
-                            let nfeat = raw.len() / nd.max(1);
                             lgbm_treelearner::linear::fit_linear_leaves(
                                 &mut tree,
                                 raw,
-                                nfeat,
                                 grad,
                                 hess,
                                 self.linear_lambda,
@@ -1079,13 +1076,9 @@ impl<'a> Gbdt<'a> {
                         // tree); OOB rows score predict-side over the RAW features
                         // (`Tree::predict` is linear-aware and routes on real thresholds).
                         let raw = self.raw_features.as_ref().unwrap();
-                        let nfeat = raw.len() / nd.max(1);
                         self.score_updater
-                            .add_linear_tree_train_path(&tree, fp, cur_tree_id, raw, nfeat);
-                        let raw_row = |row: i32| -> Vec<f64> {
-                            let b = row as usize * nfeat;
-                            raw[b..b + nfeat].to_vec()
-                        };
+                            .add_linear_tree_train_path(&tree, fp, cur_tree_id, raw);
+                        let raw_row = |row: i32| -> Vec<f64> { raw.row_f64(row as usize) };
                         self.score_updater
                             .add_tree_predict_path(&tree, &oob, cur_tree_id, &raw_row);
                     } else {
@@ -1217,11 +1210,9 @@ impl<'a> Gbdt<'a> {
                     self.linear_tree && !is_first_tree && self.raw_features.is_some();
                 if linear_active {
                     let raw = self.raw_features.as_ref().unwrap();
-                    let nfeat = raw.len() / nd.max(1);
                     lgbm_treelearner::linear::fit_linear_leaves(
                         &mut tree,
                         raw,
-                        nfeat,
                         grad,
                         hess,
                         self.linear_lambda,
@@ -1239,13 +1230,11 @@ impl<'a> Gbdt<'a> {
                 // training-path per-leaf scatter into score_.
                 if linear_active {
                     let raw = self.raw_features.as_ref().unwrap();
-                    let nfeat = raw.len() / nd.max(1);
                     self.score_updater.add_linear_tree_train_path(
                         &tree,
                         &partition,
                         cur_tree_id,
                         raw,
-                        nfeat,
                     );
                     let init = init_scores[cur_tree_id as usize];
                     if Objective::init_score_is_significant(init) {

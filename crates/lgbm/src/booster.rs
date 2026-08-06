@@ -41,6 +41,7 @@ use lgbm_objective::{
     Xentropy,
 };
 use lgbm_treelearner::learner::{FeatureColumn, LearnerConstraints};
+use lgbm_treelearner::linear::RawFeatureColumns;
 use lgbm_treelearner::BinColumn;
 use lgbm_treelearner::{offset_for_most_freq_bin, SerialTreeLearner};
 
@@ -1239,9 +1240,11 @@ fn train_inner_full(
     // Linear tree: the DenseCorpus is identity-binned (raw value == bin index), so
     // its row-major `features` ARE the raw feature matrix the linear fit needs.
     let raw_features = if config.linear_tree {
-        Some(build_raw_matrix(corpus.features.len(), num_features, |r, c| {
-            corpus.features[r][c]
-        }))
+        Some(RawFeatureColumns::from_fn(
+            corpus.features.len(),
+            num_features,
+            |r, c| corpus.features[r][c],
+        ))
     } else {
         None
     };
@@ -1274,7 +1277,7 @@ fn train_inner_columns(
     boost_obj: BoostObjective<'_>,
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
-    raw_features: Option<Vec<f64>>,
+    raw_features: Option<RawFeatureColumns>,
     train_query_boundaries: &[i32],
 ) -> Result<Booster, LgbmError> {
     train_inner_columns_full(
@@ -1292,35 +1295,18 @@ fn train_inner_columns(
     )
 }
 
-/// Gather a row-major (`num_data * num_features`) raw feature matrix for the
-/// linear-tree leaf fit via `value_at(row, col)`. Indexed by ORIGINAL feature
-/// index (the same space as `Tree::split_feature`) — shared by every corpus
-/// representation (`RawCorpus` is column-major internally; `DenseCorpus` is
-/// already row-major) so a future fix (e.g. NaN handling) only needs to land
-/// once.
-fn build_raw_matrix(
-    num_data: usize,
-    num_features: usize,
-    value_at: impl Fn(usize, usize) -> f64,
-) -> Vec<f64> {
-    let mut v = vec![0.0f64; num_data * num_features];
-    for r in 0..num_data {
-        for c in 0..num_features {
-            v[r * num_features + c] = value_at(r, c);
-        }
-    }
-    v
-}
-
-/// Row-major (`num_data * num_features`) raw feature matrix for the linear-tree
-/// leaf fit, or `None` when `linear_tree` is off.
-fn raw_matrix_from_columns(corpus: &RawCorpus, config: &Config) -> Option<Vec<f64>> {
+/// The column-major f32 [`RawFeatureColumns`] store for the linear-tree leaf fit
+/// (C++ `Dataset::raw_data_`), or `None` when `linear_tree` is off. Indexed by
+/// ORIGINAL feature index (the same space as `Tree::split_feature`).
+fn raw_matrix_from_columns(corpus: &RawCorpus, config: &Config) -> Option<RawFeatureColumns> {
     if !config.linear_tree {
         return None;
     }
-    Some(build_raw_matrix(corpus.num_data(), corpus.num_features(), |r, c| {
-        corpus.value(r, c)
-    }))
+    Some(RawFeatureColumns::from_fn(
+        corpus.num_data(),
+        corpus.num_features(),
+        |r, c| corpus.value(r, c),
+    ))
 }
 
 /// The full column-based training driver: takes `num_data` and the precomputed
@@ -1340,7 +1326,7 @@ fn train_inner_columns_full(
     boost_obj: BoostObjective<'_>,
     labels: Vec<f32>,
     metrics: Vec<EvalMetric>,
-    raw_features: Option<Vec<f64>>,
+    raw_features: Option<RawFeatureColumns>,
     train_query_boundaries: &[i32],
 ) -> Result<Booster, LgbmError> {
     use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};

@@ -122,8 +122,8 @@ cells are structurally worse and are the ranked optimization targets:
    iteration; the shape suggests an O(trees²) re-prediction rather than an
    incremental score update.
 
-4. **`linear_tree` is 2.7× the baseline (0.39×)** versus LightGBM's 1.3× — the
-   per-leaf least-squares fit is the suspect.
+4. ~~**`linear_tree` is 2.7× the baseline (0.39×)** versus LightGBM's 1.3× — the
+   per-leaf least-squares fit is the suspect.~~ **FIXED — see §10 (now 1.44×).**
 
 5. **`num_leaves=255` degrades to 0.68×** from 0.96× at `num_leaves=15`: the gap
    widens with leaf count, consistent with per-leaf fixed overhead (fork/join,
@@ -413,7 +413,8 @@ measurable: one extra multiply per row.
 
 `linear_tree` (0.39×) is now the only cell that is structurally worse, and it does
 NOT share the cause above — its cost is the per-leaf normal-equation accumulation in
-`fit_linear_leaves` (O(rows × dim²) with `dim = path features + 1`). Undiagnosed.
+`fit_linear_leaves` (O(rows × dim²) with `dim = path features + 1`).
+*(Later diagnosed and fixed — see §10; now 1.44×.)*
 
 For the ordinary tuning knobs the port sits at **0.77-0.95× of LightGBM**, i.e.
 5-23% slower. `LGBM_PHASE_PROF=1` on the baseline attributes that to:
@@ -809,3 +810,82 @@ pursued further here.
   dispatch, cross-thread dispatch, panic poisoning).
 - New dependency: `libc` (macOS-only, for the P-core `sysctlbyname`) — already a
   transitive dep of the cubecl lockfile; no new supply-chain surface.
+
+# 10. The last two slow cells: `linear_tree` and `use_quantized_grad` (2026-08-06)
+
+The §3 matrix left two opt-in cells losing to LightGBM: `linear_tree=true`
+(0.39×) and `use_quantized_grad=true` (0.67×). Both now win. Same corpus and
+protocol as §8/§9 (200k×50 binary, 100 iters, warm median of 3, LightGBM 4.6.0
+at its best `num_threads ∈ {1,4,8}`, engines interleaved in one session).
+
+## 10.1 `linear_tree` 0.39× → 1.44×: port the C++ fit SHAPE, not just its math
+
+`sample`-profiling the cell showed the wall was almost entirely
+`fit_linear_leaves` (~2s per run, single-threaded) plus the serial linear
+train-path scorer. The old fit reproduced the C++ *math* but none of its
+*mechanical shape*:
+
+| aspect | old Rust | C++ (`linear_tree_learner.cpp`) |
+|---|---|---|
+| raw feature store | row-major `f64` (80 MB; every leaf sweep streams ~the whole matrix) | **column-major `f32`** per-feature arrays (`Dataset::raw_data_`) — only the leaf's path columns are touched (~5 MB/tree) |
+| normal equations | full `dim×dim` matrix | **packed upper triangle** (`XTHX_`), mirrored at the solve — half the FLOPs |
+| design row | `[1, feat…]` (bias first) | `[feat…, 1]` (constant LAST, `curr_row[num_feat]=1.0`) |
+| tiny coefficients | kept | dropped at `|c| <= kZeroThreshold` together with their feature |
+| parallelism | none | OpenMP over row blocks + per-thread accumulator reduction |
+
+The rewrite (`lgbm-treelearner/src/linear.rs`) adopts all of it, with one
+deliberate deviation: C++'s per-thread-block reduction makes its result depend
+on `num_threads`, which would break this project's thread-count-deterministic
+model contract. Instead the crew (§9) parallelizes **across leaves** — each
+leaf's rows accumulate serially in ascending order, which is exactly the C++
+`num_threads=1` accumulation order and is independent of crew size. The
+train-path scorer (`add_linear_tree_train_path`) got the same treatment:
+column-gather per leaf, crew-parallel over leaves (row sets are disjoint).
+
+The `f32` store is a *fidelity* fix as much as a speed fix: C++ stores raw
+values as `static_cast<float>` and promotes per multiply; the old `f64` path
+was silently out-precisioning the reference. A `RawFeatureColumns` store now
+carries the columns plus per-feature NaN flags (C++ `contains_nan_`/`any_nan_`
+from `InitLinear`), so the no-NaN fast path skips the per-row NaN branch
+entirely and the NaN path reproduces C++'s `total_nonzero` gate semantics.
+
+| cell | lightgbm_rs (ms) | LightGBM best (ms) | speedup | was |
+|---|---:|---:|---:|---:|
+| `linear_tree=true` | **1446–1469** | 2091 (8t) | **1.44×** | 0.39× |
+
+Post-fix sampling: the fit is ~180 ms effective (was ~2000 serial), scoring
+~70 ms; the remaining wall is the ordinary histogram path shared with the
+baseline.
+
+## 10.2 `use_quantized_grad` 0.67× → 1.05×
+
+Two-thirds of this cell's gap was stale: the §9 crew work had already cut it
+from the recorded 2119 ms to ~1330 ms (the quantized path reuses the exact
+learner end-to-end, so it inherited every §8/§9 win). The remainder was the
+per-iteration `quantize_grad_hess_in_place`: max-abs pass, quantize pass into a
+freshly allocated `Vec<i8>`, then a third de-quantize rewrite pass. The new
+`GradientDiscretizer::discretize_dequantize_in_place` fuses the last two passes
+allocation-free — row-for-row the same arithmetic and RNG draw order, proven by
+a byte-identical quantized model dump vs the pre-change binary.
+
+| cell | lightgbm_rs (ms) | LightGBM best (ms) | speedup | was |
+|---|---:|---:|---:|---:|
+| `use_quantized_grad=true` | **1327–1332** | 1399 (4t) | **1.05×** | 0.67× |
+
+The margin is the thinnest of any cell (M1 noise is ±3-5%), but it held across
+two independent interleaved sessions (1312/1327 vs 1381; 1327/1332 vs 1399).
+The next real lever would be C++'s actual mechanism — int16/int32 histogram
+accumulation with i8 gradients — which is a learner-wide change, not pursued.
+
+## 10.3 Verification
+
+- `linear_parity` (all three layers: model-side byte-for-byte tree
+  re-serialization, isolated fit vs golden coefficients, end-to-end train)
+  green with the C++-faithful fit.
+- `quantized_pipeline` + `quantized_parity` + the discretizer unit gates green;
+  quantized model dump **byte-identical** to the pre-change binary (`cmp`).
+- Linear-cell model sha256 identical at `RAYON_NUM_THREADS=1/2/4/8` and
+  `LGBM_CREW_THREADS=1/4`.
+- Full workspace suite: 0 failures (exit 0). Clippy clean on the touched
+  crates. The default/exact path is untouched (all edits live inside
+  `linear_tree` / `use_quantized_grad` branches).
