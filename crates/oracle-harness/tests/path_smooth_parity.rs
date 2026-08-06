@@ -41,52 +41,29 @@ use std::path::PathBuf;
 use lgbm::{train_raw, Config, RawCorpus};
 use oracle_harness::comparator::{compare_within, ORACLE_TOL};
 
-/// The ONE cell that does not reach bit-parity, with the reason.
+/// # The `max_delta_step` ULP boundary, and why it is gone
 ///
-/// `max_delta_step = 0.05` on this corpus is mathematically DEGENERATE: it binds so
-/// tightly that at many candidate thresholds BOTH children clamp to the same output
-/// `-max_delta_step`, and then
+/// `max_delta_step = 0.05` with no smoothing is mathematically DEGENERATE on this
+/// corpus: it binds so tightly that at many candidate thresholds BOTH children clamp to
+/// the same output, and then
 ///
 /// ```text
 /// GetLeafGain(left) + GetLeafGain(right) == GetLeafGain(whole leaf) == gain_shift
 /// ```
 ///
-/// holds EXACTLY in real arithmetic. The split's net gain is therefore exactly zero,
-/// and `is_splittable_` turns on the strict `current_gain > min_gain_shift`
-/// comparison of two differently-associated floating-point sums —
-/// `(2·gₗ·o + hₗ·o²) + (2·gᵣ·o + hᵣ·o²)` versus `2·G·o + H·o²`. This port lands ONE
-/// ULP above (`net = 1.78e-15` on a gain of `8.85`); the C++ build lands exactly at
-/// zero. That flips one feature's splittability at a depth-1 leaf, and C++
-/// propagates non-splittability to both children (`serial_tree_learner.cpp:390-395`),
-/// so the feature disappears from the whole subtree and the models diverge visibly.
+/// holds EXACTLY in real arithmetic. The split's net gain is exactly zero, so
+/// `is_splittable_` turns on the strict `current_gain > min_gain_shift` comparison of
+/// two differently-associated floating-point sums — and C++ propagates
+/// non-splittability to BOTH children (`serial_tree_learner.cpp:390-395`), so a single
+/// ULP there deletes a feature from an entire subtree.
 ///
-/// This is a boundary artifact, not a formula error — DEMONSTRATED by perturbing the
-/// parameter by 2 parts per million:
-///
-/// | `max_delta_step` | C++ tree-0 splits | C++ 4th gain |
-/// |---|---|---|
-/// | 0.0499999  | 3 1 1 5 … | 0.533999 |
-/// | 0.05       | 3 1 1 5 … | 0.534    |
-/// | 0.0500001  | 3 1 1 **3** … | **1.334** |
-///
-/// At `0.0500001` C++ produces EXACTLY this port's answer (feature 3, gain 1.334),
-/// so both engines agree on the arithmetic and disagree only about which side of the
-/// tie they land on. The residual ULP is consistent with C++ being compiled with
-/// `-ffp-contract=on` (clang's default), which may fuse `a*b + c*d` into an FMA that
-/// Rust — which never auto-contracts — evaluates as separate rounded operations.
-///
-/// Kept as a cell rather than deleted so the divergence stays measured: the sweep
-/// below asserts it is the ONLY one.
-const KNOWN_ULP_BOUNDARY: &[(f64, f64, f64, i32)] = &[(0.0, 0.05, 0.0, 16)];
-
-fn is_known_boundary(cell: &Cell) -> bool {
-    KNOWN_ULP_BOUNDARY.iter().any(|&(ps, mds, l1, nl)| {
-        cell.path_smooth == ps
-            && cell.max_delta_step == mds
-            && cell.lambda_l1 == l1
-            && cell.num_leaves == nl
-    })
-}
+/// This cell originally diverged: the port landed one ULP ABOVE (`1.78e-15` on a gain
+/// of `8.85`) where the reference landed exactly at zero. The cause was
+/// `-ffp-contract`: the reference build fuses `2·g·o + (h+λ)·o²` into a single
+/// multiply-add, and Rust never auto-contracts. Reproducing the fusion
+/// (`gain::fused_mul_add`, and the note on [`lgbm_compute::gain::get_leaf_gain_given_output`]
+/// recording WHICH multiply is fused and how that was measured) makes this cell — and
+/// every other — bit-exact. All 13 cells now assert full parity with no exceptions.
 
 fn golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -304,7 +281,6 @@ fn path_smooth_and_max_delta_step_predictions_match_the_cpp_oracle() {
     // Report EVERY diverging cell, not just the first — with 13 cells across two
     // independent axes, "which cells fail" is the whole diagnostic.
     let mut failures: Vec<String> = Vec::new();
-    let mut boundary_diverged = 0usize;
     for cell in &g.cells {
         let config = config_for(&g, cell);
         let c = corpus(&g, &config);
@@ -316,15 +292,8 @@ fn path_smooth_and_max_delta_step_predictions_match_the_cpp_oracle() {
             .map(|r| booster.predict_row_raw(r, -1)[0] as f32)
             .collect();
         let cpp: Vec<f32> = cell.pred.iter().map(|&v| v as f32).collect();
-        match (compare_within(&rust, &cpp, ORACLE_TOL), is_known_boundary(cell)) {
-            (Ok(()), false) => {}
-            (Ok(()), true) => panic!(
-                "{} is listed in KNOWN_ULP_BOUNDARY but now matches — remove it \
-                 and assert real parity",
-                cell.label()
-            ),
-            (Err(_), true) => boundary_diverged += 1,
-            (Err(m), false) => failures.push(format!("{}: {m:?}", cell.label())),
+        if let Err(m) = compare_within(&rust, &cpp, ORACLE_TOL) {
+            failures.push(format!("{}: {m:?}", cell.label()));
         }
     }
     assert!(
@@ -333,11 +302,6 @@ fn path_smooth_and_max_delta_step_predictions_match_the_cpp_oracle() {
         failures.len(),
         g.cells.len(),
         failures.join("\n  ")
-    );
-    assert_eq!(
-        boundary_diverged,
-        KNOWN_ULP_BOUNDARY.len(),
-        "the documented ULP-boundary cell(s) must still be the ONLY divergence"
     );
 }
 
@@ -350,9 +314,6 @@ fn per_tree_leaf_values_match_the_cpp_oracle() {
         return;
     };
     for cell in &g.cells {
-        if is_known_boundary(cell) {
-            continue; // see KNOWN_ULP_BOUNDARY
-        }
         let config = config_for(&g, cell);
         let c = corpus(&g, &config);
         let booster = train_raw(&config, &c)

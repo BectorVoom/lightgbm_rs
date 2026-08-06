@@ -36,6 +36,65 @@
 
 use cubecl::prelude::*;
 
+/// Single-rounding `a * b + c` — a genuine FUSED multiply-add, usable from BOTH a
+/// `#[cube]` kernel and plain host code.
+///
+/// # Why this exists
+///
+/// C++ LightGBM is built by clang/gcc with `-ffp-contract=on` (the C++ default), so
+/// `a*b + c` in the source may be emitted as a single `fma` instruction — one rounding
+/// instead of two. Rust NEVER auto-contracts, so a verbatim transcription of an
+/// expression the C++ compiler contracted is off by up to one ULP.
+///
+/// That is invisible almost everywhere in this port because the hot gain formula,
+/// `GetLeafGain`'s closed form `sg²/(h+λ)`, is a multiply and a divide with no add to
+/// contract into. It becomes visible the moment `max_delta_step` / `path_smooth`
+/// switch the gain to [`get_leaf_gain_given_output`], whose body
+/// `-(2·g·o + (h+λ)·o²)` is exactly a multiply-then-add. See that function for the
+/// measurement that pins WHICH multiply the reference fuses.
+///
+/// Host: [`f64::mul_add`], which Rust guarantees rounds once. Device: cubecl's
+/// [`fma`] IR instruction, via the `expand` twin below — the same
+/// plain-fn + `mod ::expand` pairing cubecl uses for its own intrinsics, so the
+/// `#[cube]` macro rewrites a call here into the device op while ordinary Rust callers
+/// get the host body (cubecl's own `fma` would `unexpanded!()`-panic on the host).
+pub fn fused_mul_add(a: f64, b: f64, c: f64) -> f64 {
+    a.mul_add(b, c)
+}
+
+#[doc(hidden)]
+pub mod fused_mul_add {
+    use super::*;
+
+    pub fn expand(
+        scope: &mut Scope,
+        a: NativeExpand<f64>,
+        b: NativeExpand<f64>,
+        c: NativeExpand<f64>,
+    ) -> NativeExpand<f64> {
+        fma::expand(scope, a, b, c)
+    }
+}
+
+/// f32 mirror of [`fused_mul_add`] (the no-f64 hip path).
+pub fn fused_mul_add_f32(a: f32, b: f32, c: f32) -> f32 {
+    a.mul_add(b, c)
+}
+
+#[doc(hidden)]
+pub mod fused_mul_add_f32 {
+    use super::*;
+
+    pub fn expand(
+        scope: &mut Scope,
+        a: NativeExpand<f32>,
+        b: NativeExpand<f32>,
+        c: NativeExpand<f32>,
+    ) -> NativeExpand<f32> {
+        fma::expand(scope, a, b, c)
+    }
+}
+
 /// `static double ThresholdL1(double s, double l1)` (feature_histogram.hpp:711):
 ///
 /// ```cpp
@@ -110,6 +169,38 @@ pub fn get_split_gains(
 /// Promoted to `#[cube]` (17-02) so the smoothing gain path runs on device; a
 /// `#[cube]` fn is also a plain Rust `fn`, so the existing monotone host caller
 /// (`monotone_constraints.rs`) is byte-unchanged.
+///
+/// # The fused multiply-add is load-bearing
+///
+/// The body is written `-fma(2·g, o, (h+λ)·o²)`, NOT the literal
+/// `-(2·g·o + (h+λ)·o²)` of the C++ source, because the reference BUILD contracts
+/// that expression: with `-ffp-contract=on` (the C++ default) clang fuses the add
+/// with the FIRST multiply, rounding once instead of twice. Rust never
+/// auto-contracts, so the literal transcription is off by up to one ULP — see
+/// [`fused_mul_add`] for why this is the only place in the port where it shows.
+///
+/// WHICH multiply is fused was measured, not guessed. At a leaf where
+/// `max_delta_step` clamps BOTH children to the same output, the split gain equals
+/// the no-split gain exactly in real arithmetic, so the three candidate
+/// formulations are distinguishable by a single bit. Replaying the reference's own
+/// operands (`G=c056c1479e000000`, `H=40591d6d5a200000`,
+/// `gl=c05651479f000000`, `hl=40578d9650100000`, `gr=bffbffffc0000000`,
+/// `hr=4018fd70a1000001`, `max_delta_step=0.05`) through each:
+///
+/// | formulation | candidate − shift |
+/// |---|---|
+/// | `-(2·g·o + (h+λ)·o²)` — no contraction | +1 ULP |
+/// | `-fma((h+λ)·o, o, 2·g·o)` — fuse the SECOND multiply | +1 ULP |
+/// | `-fma(2·g, o, (h+λ)·o²)` — fuse the FIRST multiply | **0, matching the reference** |
+///
+/// Only the third reproduces the reference bit-for-bit, and adopting it turned the
+/// `path_smooth`/`max_delta_step` oracle sweep from 12/13 to 13/13 cells with no
+/// exceptions while leaving every pre-existing golden unchanged.
+///
+/// This does tie the port to a reference built with contraction ENABLED. That is the
+/// same reference every fixture in `oracle-harness` is captured from
+/// (`lightgbm==4.6.0`, PyPI), and `path_smooth_parity` fails loudly if it ever stops
+/// matching.
 #[cube]
 pub fn get_leaf_gain_given_output(
     use_l1: bool,
@@ -121,9 +212,9 @@ pub fn get_leaf_gain_given_output(
 ) -> f64 {
     if use_l1 {
         let sg_l1 = threshold_l1(sum_gradients, l1);
-        -(2.0 * sg_l1 * output + (sum_hessians + l2) * output * output)
+        -fused_mul_add(2.0 * sg_l1, output, (sum_hessians + l2) * output * output)
     } else {
-        -(2.0 * sum_gradients * output + (sum_hessians + l2) * output * output)
+        -fused_mul_add(2.0 * sum_gradients, output, (sum_hessians + l2) * output * output)
     }
 }
 
@@ -531,9 +622,9 @@ pub fn get_leaf_gain_given_output_f32(
     // f64 on the hip path (the f32 path exists precisely to avoid f64 on gfx1100).
     if use_l1 {
         let sg_l1 = threshold_l1_f32(sum_gradients, l1);
-        -(2.0f32 * sg_l1 * output + (sum_hessians + l2) * output * output)
+        -fused_mul_add_f32(2.0f32 * sg_l1, output, (sum_hessians + l2) * output * output)
     } else {
-        -(2.0f32 * sum_gradients * output + (sum_hessians + l2) * output * output)
+        -fused_mul_add_f32(2.0f32 * sum_gradients, output, (sum_hessians + l2) * output * output)
     }
 }
 

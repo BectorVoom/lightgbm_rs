@@ -542,36 +542,65 @@ predictions AND the per-tree leaf values, plus that every active cell's C++ mode
 differs from the all-defaults control (so the sweep cannot pass against an
 implementation that ignores the parameters).
 
-**12 of 13 cells reach parity within `ORACLE_TOL`; the whole pre-existing suite is
+**All 13 cells reach parity within `ORACLE_TOL`; the whole pre-existing suite is
 unchanged and green.**
 
-### The 13th cell
+### 7.4.1 The one cell that needed `-ffp-contract` parity
 
-`max_delta_step = 0.05` with no smoothing is mathematically DEGENERATE on this corpus:
-it binds so tightly that at many thresholds BOTH children clamp to the same output, and
-then `GetLeafGain(left) + GetLeafGain(right) == GetLeafGain(whole leaf) == gain_shift`
+One cell — `max_delta_step = 0.05`, no smoothing — initially diverged, and running it
+down produced the most interesting finding of this work.
+
+That setting is mathematically DEGENERATE on this corpus: it binds so tightly that at
+many candidate thresholds BOTH children clamp to the same output, and then
+
+```text
+GetLeafGain(left) + GetLeafGain(right) == GetLeafGain(whole leaf) == gain_shift
+```
+
 holds EXACTLY in real arithmetic. The split's net gain is exactly zero, so
 `is_splittable_` turns on a strict `>` between two differently-associated
-floating-point sums. This port lands ONE ULP above (`1.78e-15` on a gain of `8.85`);
-the C++ build lands exactly at zero. C++ then propagates non-splittability to both
-children (`serial_tree_learner.cpp:390-395`), so one feature vanishes from a whole
-subtree and the models diverge visibly (0.01 absolute).
+floating-point sums. The port landed ONE ULP above (`1.78e-15` on a gain of `8.85`);
+the reference landed exactly at zero. C++ then propagates non-splittability to BOTH
+children (`serial_tree_learner.cpp:390-395`), so that single bit deleted a feature from
+an entire subtree and moved predictions by 0.01.
 
-It is a boundary artifact, not a formula error — demonstrated by perturbing the
-parameter by 2 parts per million:
+**Cause: `-ffp-contract`.** The reference is built by clang/gcc with contraction ON
+(the C++ default), so `2·g·o + (h+λ)·o²` is emitted as a single fused multiply-add —
+one rounding, not two. Rust never auto-contracts. This is invisible everywhere else in
+the port because the default gain formula, `GetLeafGain`'s closed form `sg²/(h+λ)`, is
+a multiply and a divide with no add to contract into; it appears the moment
+`max_delta_step` / `path_smooth` switch the gain to `GetLeafGainGivenOutput`.
 
-| `max_delta_step` | C++ tree-0 split features | C++ 4th split gain |
-|---|---|---|
-| 0.0499999 | 3 1 1 5 … | 0.533999 |
-| 0.05 | 3 1 1 5 … | 0.534 |
-| 0.0500001 | 3 1 1 **3** … | **1.334** |
+**WHICH multiply is fused was measured, not guessed.** Because the degenerate cell
+makes the three candidate formulations differ by exactly one bit, replaying the
+reference's own operands through each is decisive:
 
-At `0.0500001` C++ produces EXACTLY this port's answer. Both engines agree on the
-arithmetic and disagree only about which side of a tie they land on. The residual ULP
-is consistent with C++ being built with clang's default `-ffp-contract=on`, which may
-fuse `a*b + c*d` into an FMA where Rust — which never auto-contracts — rounds twice.
-The cell is KEPT in the fixture and pinned in `KNOWN_ULP_BOUNDARY`, which asserts it
-stays the ONLY divergence and fails if it ever starts matching.
+| formulation | candidate − shift |
+|---|---|
+| `-(2·g·o + (h+λ)·o²)` — no contraction | +1 ULP |
+| `-fma((h+λ)·o, o, 2·g·o)` — fuse the SECOND multiply | +1 ULP |
+| `-fma(2·g, o, (h+λ)·o²)` — fuse the FIRST multiply | **0, matching the reference** |
+
+Adopting the third made the whole tree match node-for-node and gain-for-gain, took the
+sweep from 12/13 to 13/13, and left every pre-existing golden untouched — including the
+monotone-constraint goldens, which call the same `GetLeafGainGivenOutput`.
+
+**Mechanism.** `gain::fused_mul_add` is a genuine single-rounding multiply-add usable
+from BOTH a `#[cube]` kernel and host code: `f64::mul_add` on the host, cubecl's `fma`
+IR instruction on device, paired via the plain-fn + `mod ::expand` idiom cubecl uses
+for its own intrinsics (cubecl's `fma` alone would `unexpanded!()`-panic on the host,
+and `f64::mul_add` alone has no `__expand`).
+
+**Caveat, recorded deliberately.** This ties the port to a reference built with
+contraction ENABLED. A LightGBM built with `-ffp-contract=off`, or for a target without
+FMA, would not contract and the port would then be the one that is one ULP off. That is
+an accepted trade: contraction-on is the C++ default and `lightgbm==4.6.0` from PyPI is
+the reference every fixture in `oracle-harness` is captured against.
+`path_smooth_parity` fails loudly if that ever stops holding, and
+`lgbm-compute/tests/gain_full_probe.rs::the_given_output_gain_is_fused_exactly_as_the_reference_is`
+pins the fusion directly against the reference's own operand bits (verified to FAIL if
+the fusion is reverted), so a regression names its own cause instead of surfacing as a
+mismatched tree.
 
 ## 7.5 GPU scan variants
 
