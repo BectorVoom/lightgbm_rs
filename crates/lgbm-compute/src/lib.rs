@@ -1598,6 +1598,105 @@ pub trait Backend {
     ) {
     }
 
+    /// PIN this iteration's DEVICE-computed grad/hess handles for the next grow —
+    /// the P2.1 `LGBM_GRAD_DEVICE_PASSTHRU` seam (attacks the per-tree g/h H2D
+    /// round trip). The boosting loop's resident arm computes grad/hess ON DEVICE
+    /// (`get_gradients_resident_on`), reads them back for the host consumers, and
+    /// pins the SAME device handles here; the next
+    /// [`upload_resident_grad_hess`](Backend::upload_resident_grad_hess) (hatch ON,
+    /// length match) then consumes the pin instead of re-uploading the identical
+    /// bytes. ONE-SHOT: each grow consumes the pin; the loop re-arms it every
+    /// iteration, so a stale pin can never leak across trees or trains.
+    ///
+    /// DEFAULT: no-op ([`CpuBackend`] never takes the device-resident grow arm).
+    fn pin_resident_grad_hess(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        _grad: &cubecl::server::Handle,
+        _hess: &cubecl::server::Handle,
+        _num_data: usize,
+    ) {
+    }
+
+    /// Clear any pinned grad/hess handles (the boosting loop calls this on every
+    /// iteration that does NOT produce device-resident grad/hess, so the pin state
+    /// always reflects the CURRENT iteration). DEFAULT: no-op.
+    fn clear_resident_grad_hess_pin(&self) {}
+
+    // ---- P2.2 `LGBM_GROW_POOL`: per-tree device-struct pool ----
+    //
+    // The on-device grow allocates four device structs FRESH every tree. The
+    // acquire/release seam lets a pooling backend (GpuBackend, hatch ON) reuse a
+    // geometry-matched cached struct, re-seeded with the SAME device kernels a
+    // fresh construction runs — bit-exact by construction. The DEFAULTS construct
+    // fresh / drop, which is byte-identical to the pre-seam driver.
+
+    /// Acquire the per-grow resident-perm partition state (P2.2).
+    /// DEFAULT: construct fresh.
+    ///
+    /// # Errors
+    /// [`ComputeError`] from construction (`num_data == 0`).
+    fn acquire_grow_perm(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        num_data: usize,
+    ) -> Result<kernels::partition::ResidentPermPartition<Self::Runtime>, ComputeError> {
+        kernels::partition::ResidentPermPartition::new(client, num_data)
+    }
+
+    /// Return the per-grow resident-perm partition state to the pool (P2.2).
+    /// DEFAULT: drop.
+    fn release_grow_perm(&self, _state: kernels::partition::ResidentPermPartition<Self::Runtime>) {}
+
+    /// Acquire the per-grow device flat tree (P2.2). DEFAULT: construct fresh.
+    ///
+    /// # Errors
+    /// [`ComputeError`] from construction (`max_leaves == 0` / slab overflow).
+    fn acquire_grow_tree(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        max_leaves: usize,
+        root_count: i32,
+    ) -> Result<kernels::tree::DeviceCudaTree<Self::Runtime>, ComputeError> {
+        kernels::tree::DeviceCudaTree::new(client, max_leaves, root_count)
+    }
+
+    /// Return the per-grow device tree to the pool (P2.2). DEFAULT: drop.
+    fn release_grow_tree(&self, _tree: kernels::tree::DeviceCudaTree<Self::Runtime>) {}
+
+    /// Acquire the per-grow device frontier (P2.2). DEFAULT: construct fresh.
+    fn acquire_grow_frontier(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        num_leaves: usize,
+    ) -> DeviceFrontier<Self::Runtime> {
+        DeviceFrontier::new(client, num_leaves)
+    }
+
+    /// Return the per-grow device frontier to the pool (P2.2). DEFAULT: drop.
+    fn release_grow_frontier(&self, _frontier: DeviceFrontier<Self::Runtime>) {}
+
+    /// Acquire the per-grow device child-range buffer (P2.2).
+    /// DEFAULT: construct fresh.
+    ///
+    /// # Errors
+    /// [`ComputeError`] from construction (`capacity == 0`).
+    fn acquire_grow_leaf_splits(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        capacity: usize,
+    ) -> Result<kernels::partition::DeviceLeafSplits<Self::Runtime>, ComputeError> {
+        kernels::partition::DeviceLeafSplits::new(client, capacity)
+    }
+
+    /// Return the per-grow device child-range buffer to the pool (P2.2).
+    /// DEFAULT: drop.
+    fn release_grow_leaf_splits(
+        &self,
+        _splits: kernels::partition::DeviceLeafSplits<Self::Runtime>,
+    ) {
+    }
+
     /// A cheap VIEW of the device-resident concatenated bin buffer uploaded by
     /// [`upload_resident_bins`](Backend::upload_resident_bins):
     /// `(handle, width, num_features, num_data)`, with feature `f`'s row `r` at
@@ -3552,6 +3651,28 @@ struct ResidentGradHess {
 }
 
 
+/// The P2.2 (`LGBM_GROW_POOL`) per-tree device-struct pool: the four structs the
+/// on-device grow otherwise allocates fresh every tree, cached across grows on
+/// the backend. Acquire re-seeds a geometry-matched entry with the SAME device
+/// kernels a fresh construction runs; release stores the struct back. A geometry
+/// mismatch (different corpus / num_leaves) simply falls back to a fresh
+/// construction, and release replaces the stale entry.
+#[cfg(feature = "gpu")]
+struct GrowStructPool<R: cubecl::Runtime> {
+    perm: Option<kernels::partition::ResidentPermPartition<R>>,
+    tree: Option<kernels::tree::DeviceCudaTree<R>>,
+    frontier: Option<DeviceFrontier<R>>,
+    leaf_splits: Option<kernels::partition::DeviceLeafSplits<R>>,
+}
+
+// Hand-written (not derived) so `R` needs no `Default` bound.
+#[cfg(feature = "gpu")]
+impl<R: cubecl::Runtime> Default for GrowStructPool<R> {
+    fn default() -> Self {
+        Self { perm: None, tree: None, frontier: None, leaf_splits: None }
+    }
+}
+
 /// The generic GPU backend — dispatches every hot-path op to the
 /// runtime-generic f64/f32 CubeCL kernels, carrying the on-device resident histogram
 /// pool. Parameterized by the CubeCL [`Runtime`](cubecl::Runtime) `R` so ONE
@@ -3600,6 +3721,15 @@ pub struct GpuBackend<R: cubecl::Runtime> {
     /// grad/hess can never leak into the next grow. Interior-mutable for the same
     /// single-threaded-train reason as `resident_bins`/`resident_pool`.
     resident_grad_hess: std::cell::RefCell<Option<ResidentGradHess>>,
+    /// The ONE-SHOT grad/hess device-handle PIN (`LGBM_GRAD_DEVICE_PASSTHRU`,
+    /// P2.1): the boosting loop's resident arm pins the objective's device-written
+    /// `GradResidency` handles here each iteration
+    /// ([`pin_resident_grad_hess`](Backend::pin_resident_grad_hess)); the next
+    /// grow's `upload_resident_grad_hess` CONSUMES it (hatch ON + length match)
+    /// instead of re-uploading the identical bytes it read back. Distinct from
+    /// `resident_grad_hess` (which `reset_resident_pool` clears at grow START —
+    /// the pin is installed BEFORE the grow begins and must survive that reset).
+    resident_grad_hess_pin: std::cell::RefCell<Option<ResidentGradHess>>,
     /// The per-grow cached scan-descriptor handle set (`LGBM_DESC_HOIST` hoist):
     /// the 7 per-feature arrays + the reduce `rf` array every fused-scan launch
     /// consumes, ALL derived from the per-grow-constant `feats`/`real_feats`,
@@ -3617,6 +3747,10 @@ pub struct GpuBackend<R: cubecl::Runtime> {
     /// zero-fill upload swapped for an uninitialized alloc). Same reset/borrow
     /// discipline as `resident_scan_desc`.
     resident_build_desc: std::cell::RefCell<Option<kernels::histogram::BuildDescHandles>>,
+    /// The P2.2 `LGBM_GROW_POOL` per-tree device-struct pool (see
+    /// [`GrowStructPool`]). Same single-threaded-train RefCell discipline as the
+    /// other resident caches; empty (never populated) with the hatch OFF.
+    grow_pool: std::cell::RefCell<GrowStructPool<R>>,
     /// Test-only toggle to FORCE the host path on RocmBackend (so the
     /// resident==host tree-equivalence test can grow the SAME f32-atomic-built tree
     /// through the host read-back/subtract/scan chain). `true` (the default) reports
@@ -3647,8 +3781,10 @@ impl<R: cubecl::Runtime> Default for GpuBackend<R> {
             resident_bins_pin: std::cell::Cell::new(false),
             resident_pool: std::cell::RefCell::new(Vec::new()),
             resident_grad_hess: std::cell::RefCell::new(None),
+            resident_grad_hess_pin: std::cell::RefCell::new(None),
             resident_scan_desc: std::cell::RefCell::new(None),
             resident_build_desc: std::cell::RefCell::new(None),
+            grow_pool: std::cell::RefCell::new(GrowStructPool::default()),
             // Production default: the device-resident pool is enabled.
             resident_enabled: true,
             _runtime: std::marker::PhantomData,
@@ -3672,8 +3808,10 @@ impl<R: cubecl::Runtime> GpuBackend<R> {
             resident_bins_pin: std::cell::Cell::new(false),
             resident_pool: std::cell::RefCell::new(Vec::new()),
             resident_grad_hess: std::cell::RefCell::new(None),
+            resident_grad_hess_pin: std::cell::RefCell::new(None),
             resident_scan_desc: std::cell::RefCell::new(None),
             resident_build_desc: std::cell::RefCell::new(None),
+            grow_pool: std::cell::RefCell::new(GrowStructPool::default()),
             resident_enabled: enabled,
             _runtime: std::marker::PhantomData,
         }
@@ -4122,6 +4260,21 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             *self.resident_grad_hess.borrow_mut() = None;
             return;
         }
+        // P2.1 `LGBM_GRAD_DEVICE_PASSTHRU`: consume the ONE-SHOT pin installed by
+        // the boosting loop's resident arm — the pinned handles are the exact
+        // device buffers `gradients`/`hessians` were read back FROM, so installing
+        // them instead of re-uploading is bit-exact by construction. Length
+        // mismatch (a caller other than the pinning loop) falls through to the
+        // byte-unchanged upload; the stale pin is dropped either way (one-shot).
+        if kernels::grow_driver::grad_passthru_enabled() {
+            if let Some(pin) = self.resident_grad_hess_pin.borrow_mut().take() {
+                if pin.num_data == gradients.len() {
+                    kernels::grow_driver::bump_grad_passthru();
+                    *self.resident_grad_hess.borrow_mut() = Some(pin);
+                    return;
+                }
+            }
+        }
         let grad = client.create_from_slice(f32::as_bytes(gradients));
         let hess = client.create_from_slice(f32::as_bytes(hessians));
         *self.resident_grad_hess.borrow_mut() = Some(ResidentGradHess {
@@ -4129,6 +4282,133 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
             hess,
             num_data: gradients.len(),
         });
+    }
+
+    /// GPU override: install the boosting loop's device grad/hess handles as the
+    /// ONE-SHOT passthrough pin (`Handle` clones are ref-counted — no device work).
+    fn pin_resident_grad_hess(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        grad: &cubecl::server::Handle,
+        hess: &cubecl::server::Handle,
+        num_data: usize,
+    ) {
+        if num_data == 0 {
+            *self.resident_grad_hess_pin.borrow_mut() = None;
+            return;
+        }
+        *self.resident_grad_hess_pin.borrow_mut() = Some(ResidentGradHess {
+            grad: grad.clone(),
+            hess: hess.clone(),
+            num_data,
+        });
+    }
+
+    /// GPU override: drop any pinned grad/hess handles (the pin state must always
+    /// reflect the CURRENT boosting iteration).
+    fn clear_resident_grad_hess_pin(&self) {
+        *self.resident_grad_hess_pin.borrow_mut() = None;
+    }
+
+    // ---- P2.2 `LGBM_GROW_POOL` overrides: geometry-matched reuse, re-seeded with
+    // the SAME kernels a fresh construction runs (bit-exact by construction). ----
+
+    fn acquire_grow_perm(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        num_data: usize,
+    ) -> Result<kernels::partition::ResidentPermPartition<Self::Runtime>, ComputeError> {
+        if kernels::grow_driver::grow_pool_enabled() {
+            if let Some(state) = self.grow_pool.borrow_mut().perm.take() {
+                if state.num_data() == num_data {
+                    kernels::grow_driver::bump_grow_pool();
+                    state.reseed_identity(client);
+                    return Ok(state);
+                }
+            }
+        }
+        kernels::partition::ResidentPermPartition::new(client, num_data)
+    }
+
+    fn release_grow_perm(&self, state: kernels::partition::ResidentPermPartition<Self::Runtime>) {
+        if kernels::grow_driver::grow_pool_enabled() {
+            self.grow_pool.borrow_mut().perm = Some(state);
+        }
+    }
+
+    fn acquire_grow_tree(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        max_leaves: usize,
+        root_count: i32,
+    ) -> Result<kernels::tree::DeviceCudaTree<Self::Runtime>, ComputeError> {
+        if kernels::grow_driver::grow_pool_enabled() {
+            if let Some(mut tree) = self.grow_pool.borrow_mut().tree.take() {
+                if tree.max_leaves() == max_leaves {
+                    kernels::grow_driver::bump_grow_pool();
+                    tree.reset_for_grow(client, root_count);
+                    return Ok(tree);
+                }
+            }
+        }
+        kernels::tree::DeviceCudaTree::new(client, max_leaves, root_count)
+    }
+
+    fn release_grow_tree(&self, tree: kernels::tree::DeviceCudaTree<Self::Runtime>) {
+        if kernels::grow_driver::grow_pool_enabled() {
+            self.grow_pool.borrow_mut().tree = Some(tree);
+        }
+    }
+
+    fn acquire_grow_frontier(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        num_leaves: usize,
+    ) -> DeviceFrontier<Self::Runtime> {
+        if kernels::grow_driver::grow_pool_enabled() {
+            if let Some(frontier) = self.grow_pool.borrow_mut().frontier.take() {
+                if frontier.num_leaves() == num_leaves {
+                    kernels::grow_driver::bump_grow_pool();
+                    // No device reset needed: every frontier slot `< cur_num_leaves`
+                    // is written this grow before the bounded §8.2/§8.3 reads see it,
+                    // and `best_leaf`/`stop` are written by each pick before export.
+                    return frontier;
+                }
+            }
+        }
+        DeviceFrontier::new(client, num_leaves)
+    }
+
+    fn release_grow_frontier(&self, frontier: DeviceFrontier<Self::Runtime>) {
+        if kernels::grow_driver::grow_pool_enabled() {
+            self.grow_pool.borrow_mut().frontier = Some(frontier);
+        }
+    }
+
+    fn acquire_grow_leaf_splits(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        capacity: usize,
+    ) -> Result<kernels::partition::DeviceLeafSplits<Self::Runtime>, ComputeError> {
+        if kernels::grow_driver::grow_pool_enabled() {
+            if let Some(mut splits) = self.grow_pool.borrow_mut().leaf_splits.take() {
+                if splits.capacity() == capacity {
+                    kernels::grow_driver::bump_grow_pool();
+                    splits.reset_cursor();
+                    return Ok(splits);
+                }
+            }
+        }
+        kernels::partition::DeviceLeafSplits::new(client, capacity)
+    }
+
+    fn release_grow_leaf_splits(
+        &self,
+        splits: kernels::partition::DeviceLeafSplits<Self::Runtime>,
+    ) {
+        if kernels::grow_driver::grow_pool_enabled() {
+            self.grow_pool.borrow_mut().leaf_splits = Some(splits);
+        }
     }
 
     // The old non-resident GPU `build_leaf_histograms_raw` and

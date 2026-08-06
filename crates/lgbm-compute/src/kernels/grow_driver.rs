@@ -429,6 +429,135 @@ pub fn on_device_partition_resident_count_take() -> u64 {
     ON_DEVICE_PARTITION_RESIDENT_CNT.swap(0, Ordering::Relaxed)
 }
 
+/// `LGBM_GRAD_DEVICE_PASSTHRU != "0"` — DEFAULT ON (validated 1.03× on real
+/// CUDA P100, kernel `lgb-rs-p2-host-residency` 2026-08-06: order-rotated
+/// warm-median-3 base 6.128s → passthru 5.949s, preds BYTE-IDENTICAL
+/// max_abs=0.0, counts proof grad_passthru=100/100 grows, drained `upload`
+/// bucket 330→23 ms; `=0` restores the per-grow re-upload for A/B/rollback).
+/// P2.1, attacks H1: the boosting loop's device-computed grad/hess handles (the
+/// `GradResidency` buffers the objective kernel wrote) are PINNED on the backend
+/// ([`crate::Backend::pin_resident_grad_hess`]) and the driver's once-per-grow
+/// `upload_resident_grad_hess` CONSUMES the pin instead of re-uploading the
+/// 2×`num_data` f32 host slices it just read back — retiring the H2D half of
+/// the per-tree g/h round trip (~4 MB/tree). Bit-exact by construction: the
+/// pinned device buffers are the EXACT buffers the host slices were read back
+/// FROM (same bytes reach the same kernels). The pin is ONE-SHOT (consumed by
+/// the first grow) and re-armed by the boosting loop every iteration, so a
+/// stale pin can never leak across trees or trains. Same-session A/B override
+/// wins over the env (mirrors `set_partition_resident_override`).
+#[must_use]
+pub fn grad_passthru_enabled() -> bool {
+    match GRAD_PASSTHRU_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LGBM_GRAD_DEVICE_PASSTHRU").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// Same-session A/B override for [`grad_passthru_enabled`].
+/// 0 = unset (defer to `LGBM_GRAD_DEVICE_PASSTHRU`), 1 = force ON, 2 = force OFF.
+static GRAD_PASSTHRU_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Harness/test hook: force the grad-passthrough arm ON (`Some(true)`), OFF
+/// (`Some(false)`), or defer to the `LGBM_GRAD_DEVICE_PASSTHRU` env gate (`None`).
+/// Same contract as [`set_partition_resident_override`].
+pub fn set_grad_passthru_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    GRAD_PASSTHRU_OVERRIDE.store(code, Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire — bumped once per grow whose `upload_resident_grad_hess`
+/// consumed the PINNED device handles (the bench-protocol counts proof, folded
+/// into the COUNTS ledger as `grad_passthru=`). Inert unless `LGBM_PHASE_PROF==1`.
+pub static GRAD_PASSTHRU_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the grad-passthrough tripwire (see [`GRAD_PASSTHRU_CNT`]).
+/// Called only from the `gpu`-gated GpuBackend override.
+#[inline]
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn bump_grad_passthru() {
+    if launch_prof_enabled() {
+        GRAD_PASSTHRU_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the grad-passthrough tripwire to zero and return the prior value
+/// (consumed by `phase_prof::dump`).
+pub fn grad_passthru_count_take() -> u64 {
+    GRAD_PASSTHRU_CNT.swap(0, Ordering::Relaxed)
+}
+
+/// `LGBM_GROW_POOL == "1"` — DEFAULT OFF: measured a WASH on real CUDA P100
+/// (kernel `lgb-rs-p2-host-residency` 2026-08-06: base 6.128s vs pool 6.148s
+/// warm-median, preds byte-identical, counts proof grow_pool=396 — cubecl's
+/// memory-pool alloc/free is cheap on the current image, so there is nothing
+/// for the pool to save; drained `setup` bucket unchanged 269→268 ms). Hatch
+/// KEPT for other GPU/image generations where pool reserves may cost more.
+/// (P2.2, attacks H2): when ON, the four per-tree device structs the on-device
+/// grow allocates fresh every tree (`ResidentPermPartition` 5 buffers + iota,
+/// `DeviceCudaTree` 18 buffers + init sweep, `DeviceFrontier` SoA + 2 seeds,
+/// `DeviceLeafSplits` 2 zeroed uploads) are POOLED on the backend across grows:
+/// acquire re-seeds a geometry-matched cached struct with the SAME device
+/// kernels a fresh construction runs (iota / init sweep), release returns it.
+/// Bit-exact by construction: every consumer writes each cell/slot before
+/// reading it (the same invariant that already lets the buffers be reused
+/// split-to-split WITHIN a grow), so a re-seeded pooled struct is
+/// indistinguishable from a fresh one. Same-session A/B override wins over env.
+#[must_use]
+pub fn grow_pool_enabled() -> bool {
+    match GROW_POOL_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_GROW_POOL").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Same-session A/B override for [`grow_pool_enabled`].
+/// 0 = unset (defer to `LGBM_GROW_POOL`), 1 = force ON, 2 = force OFF.
+static GROW_POOL_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Harness/test hook: force the grow-struct pool ON (`Some(true)`), OFF
+/// (`Some(false)`), or defer to the `LGBM_GROW_POOL` env gate (`None`).
+pub fn set_grow_pool_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    GROW_POOL_OVERRIDE.store(code, Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire — bumped once per pooled-struct REUSE (an acquire that hit
+/// the cache instead of allocating fresh). Folded into the COUNTS ledger as
+/// `grow_pool=`. Inert unless `LGBM_PHASE_PROF==1`.
+pub static GROW_POOL_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the grow-pool tripwire (see [`GROW_POOL_CNT`]).
+/// Called only from the `gpu`-gated GpuBackend overrides.
+#[inline]
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn bump_grow_pool() {
+    if launch_prof_enabled() {
+        GROW_POOL_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the grow-pool tripwire to zero and return the prior value
+/// (consumed by `phase_prof::dump`).
+pub fn grow_pool_count_take() -> u64 {
+    GROW_POOL_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// Read-once `LGBM_SUBTRACT_FUSE != "0"` — DEFAULT ON (validated 1.043× on real
 /// CUDA, spike097: warm-median 8.19s→7.85s, preds bit-identical, drained scan
 /// 2149→1813ms; `=0` restores the separate subtract launch for A/B/rollback):
@@ -1640,7 +1769,34 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         layout: &LeafPartitionLayout,
         leaf_values: &[f64],
     ) -> Result<(), ComputeError> {
-        let num_data = layout.num_data as usize;
+        self.add_tree_on_device_parts(
+            client,
+            layout.num_data as usize,
+            &layout.indices,
+            &layout.leaf_begin,
+            &layout.leaf_count,
+            leaf_values,
+        )
+    }
+
+    /// Borrowed-parts twin of [`add_tree_on_device`] (P2.4): identical checks and
+    /// kernel launch, taking the layout's three arrays as SLICES so a caller that
+    /// already holds them (the GBDT resident-score seam holds the partition's
+    /// `indices()` borrow) needs no owned `LeafPartitionLayout` — retiring the
+    /// per-tree 4·num_data-byte `indices.to_vec()` copy that existed only to
+    /// satisfy the struct-taking signature.
+    ///
+    /// # Errors
+    /// As [`add_tree_on_device`].
+    pub fn add_tree_on_device_parts(
+        &mut self,
+        client: &cubecl::prelude::ComputeClient<R>,
+        num_data: usize,
+        indices: &[u32],
+        leaf_begin: &[i32],
+        leaf_count: &[i32],
+        leaf_values: &[f64],
+    ) -> Result<(), ComputeError> {
         if num_data != self.num_data {
             return Err(ComputeError::LengthMismatch {
                 expected: self.num_data,
@@ -1649,9 +1805,9 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         }
         // The device leaf map writes leaf ids in `[0, leaf_begin.len())`; the resident
         // scatter reads `leaf_value[leaf]`, so every leaf id must index `leaf_values`.
-        if layout.leaf_begin.len() > leaf_values.len() {
+        if leaf_begin.len() > leaf_values.len() {
             return Err(ComputeError::LengthMismatch {
-                expected: layout.leaf_begin.len(),
+                expected: leaf_begin.len(),
                 actual: leaf_values.len(),
             });
         }
@@ -1666,9 +1822,9 @@ impl<R: cubecl::Runtime> ResidentScore<R> {
         // same f64 `+=` of the same value (see the kernel doc).
         crate::kernels::predict::add_leaf_values_by_ranges_to_resident_score(
             client,
-            &layout.indices,
-            &layout.leaf_begin,
-            &layout.leaf_count,
+            indices,
+            leaf_begin,
+            leaf_count,
             &self.score,
             leaf_values,
             num_data,
@@ -2381,7 +2537,9 @@ where
         match backend.resident_bins_view() {
             Some(view) if view.2 == features.len() && view.3 == num_data => {
                 let state = time_phase(&GROW_SETUP_NS, || {
-                    crate::kernels::partition::ResidentPermPartition::<R>::new(client, num_data)
+                    // P2.2 `LGBM_GROW_POOL`: a pooled, geometry-matched state is
+                    // re-seeded with the same iota launch a fresh one runs.
+                    backend.acquire_grow_perm(client, num_data)
                 })?;
                 bump_launch(); // the once-per-grow identity (iota) seed dispatch
                 let grow_max_abs = time_phase(&GROW_SETUP_NS, || {
@@ -2412,8 +2570,16 @@ where
     // + root grad/hess fold below are the identical ascending order). Every split partitions a
     // leaf's sub-range of THIS buffer in place (`partition_resident_range`); the buffer is never
     // reallocated and no per-leaf `rows: Vec<u32>` is ever cloned.
-    let mut perm: Vec<u32> =
-        time_phase(&GROW_SETUP_NS, || (0..num_data as u32).collect());
+    // P2.4: on the RESIDENT-PERM arm the host perm is never read before the tail
+    // reassignment (`perm = rp.read_perm(client)`) — the device perm is
+    // authoritative and every build/partition consumes device views. Skip the
+    // dead 4·num_data-byte iota alloc+fill there (provably-unused-value
+    // elimination, not a behavior change); the legacy arm keeps it.
+    let mut perm: Vec<u32> = if resident_perm.is_some() {
+        Vec::new()
+    } else {
+        time_phase(&GROW_SETUP_NS, || (0..num_data as u32).collect())
+    };
     // ROOTFOLD: this is the bit-exact HOST anchor fold; its own bucket keeps the
     // root-fold cost visible if a device fold is ever introduced here.
     let (root_sum_g, root_sum_h) =
@@ -2506,7 +2672,9 @@ where
     // ---- The device flat tree, pre-allocated once. ----
     // Once-per-grow device-struct allocations are SETUP.
     let mut tree = time_phase(&GROW_SETUP_NS, || {
-        DeviceCudaTree::<R>::new(client, num_leaves as usize, num_data as i32)
+        // P2.2 `LGBM_GROW_POOL`: a pooled tree is re-initialized with the same
+        // init-sweep kernel a fresh construction runs.
+        backend.acquire_grow_tree(client, num_leaves as usize, num_data as i32)
     })?;
     // Seed the root leaf value so a never-split root still matches the anchor.
     let root_output = calculate_splitted_leaf_output(
@@ -2531,8 +2699,11 @@ where
     // (`reduce_winner_into_frontier` folds `real_feat_of(...)` into it), so the device pick and
     // the anchor agree on ties, keeping the resident tree bit-exact to the anchor even when the
     // corpus DOES tie (the hard merge gate). ----
-    let frontier =
-        time_phase(&GROW_SETUP_NS, || crate::DeviceFrontier::<R>::new(client, num_leaves as usize));
+    let frontier = time_phase(&GROW_SETUP_NS, || {
+        // P2.2 `LGBM_GROW_POOL`: pooled reuse needs no device reset (every slot
+        // `< cur_num_leaves` is written this grow before the bounded reads).
+        backend.acquire_grow_frontier(client, num_leaves as usize)
+    });
     // Seed the ROOT's winning split into frontier slot 0 so the first device pick sees it.
     reduce_winner_into_frontier(
         backend,
@@ -2556,7 +2727,9 @@ where
     // deferred read (Wave 2) relies on. Allocated once, like the frontier. ----
     let leaf_splits_capacity = (2 * (num_leaves as usize).saturating_sub(1)).max(1);
     let leaf_splits_dev = time_phase(&GROW_SETUP_NS, || {
-        crate::kernels::partition::DeviceLeafSplits::<R>::new(client, leaf_splits_capacity)
+        // P2.2 `LGBM_GROW_POOL`: pooled reuse resets only the host cursor (each
+        // per-split slot is written before anything reads it).
+        backend.acquire_grow_leaf_splits(client, leaf_splits_capacity)
     })?;
 
     // ---- A real_feature_index -> feature-position (`fpos`) reverse
@@ -3093,6 +3266,15 @@ where
         perm = rp.read_perm(client);
     }
     let host_tree = tree.to_host_tree(client);
+    // P2.2 `LGBM_GROW_POOL`: return the per-tree device structs to the backend's
+    // pool for the next grow (no-op drops with the hatch OFF). Error paths above
+    // skip this — the next acquire then simply constructs fresh.
+    if let Some((_, rp, _)) = resident_perm {
+        backend.release_grow_perm(rp);
+    }
+    backend.release_grow_tree(tree);
+    backend.release_grow_frontier(frontier);
+    backend.release_grow_leaf_splits(leaf_splits_dev);
     let final_leaves = host_tree.num_leaves as usize;
     let mut indices = Vec::with_capacity(num_data);
     let mut leaf_begin = Vec::with_capacity(final_leaves);

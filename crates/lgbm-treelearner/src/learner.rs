@@ -716,6 +716,31 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         &self.features[..]
     }
 
+    /// Forward the boosting loop's device grad/hess handle PIN to the backend —
+    /// the P2.1 `LGBM_GRAD_DEVICE_PASSTHRU` seam
+    /// ([`lgbm_compute::Backend::pin_resident_grad_hess`]). A ONE-SHOT pin the next
+    /// on-device grow's `upload_resident_grad_hess` consumes instead of
+    /// re-uploading the identical bytes; a no-op on backends without a resident
+    /// pool (the CpuBackend anchor). Additive — no behavior change with the hatch
+    /// OFF (the pin is simply never consumed).
+    #[inline]
+    pub fn pin_resident_grad_hess(
+        &self,
+        grad: &lgbm_compute::Handle,
+        hess: &lgbm_compute::Handle,
+        num_data: usize,
+    ) {
+        self.backend.pin_resident_grad_hess(self.client, grad, hess, num_data);
+    }
+
+    /// Clear any pinned grad/hess handles (called by the boosting loop on every
+    /// iteration that does NOT produce device-resident grad/hess, so the pin state
+    /// always reflects the current iteration). No-op on the CpuBackend anchor.
+    #[inline]
+    pub fn clear_resident_grad_hess_pin(&self) {
+        self.backend.clear_resident_grad_hess_pin();
+    }
+
     /// Take-and-clear the one-shot signal that the
     /// most recently grown tree came from the ON-DEVICE grow path. When `true`, the
     /// `boosting_on_cuda_` resident-score seam must apply the tree's per-leaf `AddScore`

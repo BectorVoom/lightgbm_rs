@@ -30,7 +30,6 @@ use lgbm_compute::Backend;
 // `ResidentScore<B::Runtime>` inside the already-`B`-generic methods (one `B` per train).
 // This names lgbm-compute TYPES only — never a GPU compute runtime.
 use lgbm_compute::ResidentScore;
-use lgbm_dataset::LeafPartitionLayout;
 use std::any::Any;
 use lgbm_core::random::Random;
 use lgbm_model::{GbdtModel, Tree};
@@ -819,6 +818,12 @@ impl<'a> Gbdt<'a> {
                             )
                         },
                     );
+                    // P2.1 `LGBM_GRAD_DEVICE_PASSTHRU`: pin the device handles the
+                    // host slices were just read back FROM, so the on-device grow's
+                    // `upload_resident_grad_hess` can consume them instead of
+                    // re-uploading the identical bytes (one-shot, re-armed every
+                    // iteration). Inert with the hatch OFF or on the host grow path.
+                    learner.pin_resident_grad_hess(&g_handle, &h_handle, g.len());
                     gradients = g;
                     hessians = h;
                 }
@@ -826,6 +831,9 @@ impl<'a> Gbdt<'a> {
                 // score stays maintained, but grad/hess falls back to the host path so the
                 // bit-exact contract is never traded for a within-tol device kernel.
                 None => {
+                    // Host-computed grad/hess: no device handles exist for this
+                    // iteration — drop any stale passthrough pin.
+                    learner.clear_resident_grad_hess_pin();
                     gradients = vec![0.0f32; total];
                     hessians = vec![0.0f32; total];
                     lgbm_treelearner::phase_prof::time(
@@ -842,6 +850,9 @@ impl<'a> Gbdt<'a> {
                 }
             }
         } else {
+            // Host grad/hess arm: keep the passthrough pin state in lockstep with
+            // the CURRENT iteration (no device grad/hess were produced).
+            learner.clear_resident_grad_hess_pin();
             gradients = vec![0.0f32; total];
             hessians = vec![0.0f32; total];
             lgbm_treelearner::phase_prof::time(&lgbm_treelearner::phase_prof::GRAD_NS, || {
@@ -891,10 +902,21 @@ impl<'a> Gbdt<'a> {
         // `label[i] - score_ptr[i]`). RenewTreeOutput runs BEFORE UpdateScore, so
         // it must see the pre-update score; snapshot it once (it is unchanged across
         // the K=1 single-output loop here).
-        let train_score_pre = lgbm_treelearner::phase_prof::time(
-            &lgbm_treelearner::phase_prof::SNAPSHOT_NS,
-            || self.score_updater.scores().to_vec(),
-        );
+        // P2.4: the snapshot's ONLY consumers are the two RenewTreeOutput
+        // closures, both gated on `is_renew_tree_output()` (true only for
+        // regression_l1/quantile/mape-family) — C++ never copies here at all
+        // (its `residual_getter` closes over the live score POINTER, and
+        // RenewTreeOutput runs before UpdateScore mutates it). Skip the
+        // 8·num_data-byte clone for non-renew objectives (provably-unused-value
+        // elimination; the empty Vec is never indexed on that arm).
+        let train_score_pre = if self.objective.is_renew_tree_output() {
+            lgbm_treelearner::phase_prof::time(
+                &lgbm_treelearner::phase_prof::SNAPSHOT_NS,
+                || self.score_updater.scores().to_vec(),
+            )
+        } else {
+            Vec::new()
+        };
 
         // The per-tree shrinkage for THIS iteration's new tree. For the GBDT spine
         // this is `learning_rate`; for DART it is the DART-modified `shrinkage_rate_`
@@ -1805,18 +1827,23 @@ impl<'a> Gbdt<'a> {
             let leaf_count: Vec<i32> = (0..num_leaves)
                 .map(|l| partition.leaf_count(l as i32))
                 .collect();
-            let layout = LeafPartitionLayout {
-                num_data: num_data_i32,
-                indices: partition.indices().to_vec(),
-                leaf_begin,
-                leaf_count,
-            };
             let client = learner.client();
             let rs = boxed
                 .downcast_mut::<ResidentScore<B::Runtime>>()
                 .expect("resident_score is ResidentScore<B::Runtime> for this train's backend");
-            rs.add_tree_on_device(client, &layout, &tree.leaf_value)
-                .map_err(|e| BoostingError::TreeLearner(e.into()))?;
+            // P2.4: the borrowed-parts twin — same checks, same kernel launch —
+            // consumes the partition's `indices()` borrow directly, retiring the
+            // per-tree 4·num_data-byte `indices.to_vec()` copy that existed only
+            // to build a throwaway owned `LeafPartitionLayout`.
+            rs.add_tree_on_device_parts(
+                client,
+                num_data_i32 as usize,
+                partition.indices(),
+                &leaf_begin,
+                &leaf_count,
+                &tree.leaf_value,
+            )
+            .map_err(|e| BoostingError::TreeLearner(e.into()))?;
         }
 
         if learner.take_resident_score_pending() {

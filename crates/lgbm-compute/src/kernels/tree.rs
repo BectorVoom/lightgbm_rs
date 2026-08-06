@@ -633,6 +633,26 @@ impl<R: cubecl::Runtime> DeviceCudaTree<R> {
         self.num_leaves
     }
 
+    /// The leaf capacity the device buffers were allocated for.
+    #[must_use]
+    pub fn max_leaves(&self) -> usize {
+        self.max_leaves
+    }
+
+    /// Re-initialize a POOLED tree for a fresh grow (`LGBM_GROW_POOL`, P2.2):
+    /// reset the host bookkeeping to a single-leaf root and re-run the SAME
+    /// [`init_tree_kernel`] sweep `new` runs — the device buffers are reused, not
+    /// reallocated. Equivalent to a fresh [`DeviceCudaTree::new`] by construction:
+    /// `new` itself allocates UNINITIALIZED buffers (`client.empty`) and relies on
+    /// this exact init sweep to write every cell, so a reused buffer after the
+    /// sweep is byte-identical to a fresh one after the sweep.
+    pub fn reset_for_grow(&mut self, client: &ComputeClient<R>, root_count: i32) {
+        self.num_leaves = 1;
+        self.num_cat = 0;
+        self.cat_threshold_host.clear();
+        self.launch_init(client, root_count);
+    }
+
     /// Current categorical-split count.
     #[must_use]
     pub fn num_cat(&self) -> i32 {

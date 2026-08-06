@@ -435,6 +435,15 @@ impl<R: cubecl::Runtime> DeviceLeafSplits<R> {
         self.capacity
     }
 
+    /// Reset the host-side sequential-write cursor for a POOLED reuse
+    /// (`LGBM_GROW_POOL`, P2.2). The device ranges/roles buffers need no reset:
+    /// the driver writes each per-split slot (`record_split` / the role kernel)
+    /// before anything reads it, so stale prior-grow cells are never observed —
+    /// the same invariant that already holds for slot reuse within a grow.
+    pub fn reset_cursor(&mut self) {
+        self.next_split_idx = 0;
+    }
+
     /// A borrow of the device child-range i32 buffer handle (read on device by the grow loop).
     #[must_use]
     pub fn ranges_handle(&self) -> &Handle {
@@ -1080,6 +1089,32 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
         let local_excl = client.empty(bytes);
         let block_totals =
             client.empty((MAX_SCAN_BLOCKS + 1) * core::mem::size_of::<u32>());
+        let state = Self {
+            perm,
+            snap,
+            to_left,
+            local_excl,
+            block_totals,
+            num_data,
+            _runtime: PhantomData,
+        };
+        state.reseed_identity(client);
+        Ok(state)
+    }
+
+    /// The row count the buffers were allocated for.
+    #[must_use]
+    pub fn num_data(&self) -> usize {
+        self.num_data
+    }
+
+    /// Seed (or RE-seed, for a POOLED reuse — `LGBM_GROW_POOL`, P2.2) the resident
+    /// permutation with the identity `0..num_data` via the same one-launch iota
+    /// `new` performs. The scratch buffers need no reset: every partition writes
+    /// its whole working range before reading it (the same invariant that already
+    /// lets them be reused split-to-split within a grow).
+    pub fn reseed_identity(&self, client: &ComputeClient<R>) {
+        let num_data = self.num_data;
         let cube_dim = 256u32;
         let cube_count = (num_data as u32).div_ceil(cube_dim);
         // SAFETY: `perm` is sized exactly `num_data` u32 cells and outlives the
@@ -1089,19 +1124,10 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
                 client,
                 CubeCount::Static(cube_count, 1, 1),
                 CubeDim::new_1d(cube_dim),
-                ArrayArg::from_raw_parts(perm.clone(), num_data),
+                ArrayArg::from_raw_parts(self.perm.clone(), num_data),
                 num_data as u32,
             );
         }
-        Ok(Self {
-            perm,
-            snap,
-            to_left,
-            local_excl,
-            block_totals,
-            num_data,
-            _runtime: PhantomData,
-        })
     }
 
     /// An offset Handle VIEW of the resident permutation starting at row-slot
