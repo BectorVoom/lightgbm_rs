@@ -206,8 +206,11 @@ impl MulticlassSoftmax {
 pub struct MulticlassOva {
     /// `num_class_`.
     num_class: i32,
-    /// The shared `sigmoid_` for every per-class binary.
-    binary: Binary,
+    /// C++ `binary_loss_` — ONE [`Binary`] per class
+    /// (`multiclass_objective.hpp:190-193`). They share `sigmoid_` but each carries
+    /// its OWN `label_weights_`, because `is_unbalance` derives them from that
+    /// class's own `is_pos = (int)label == i` counts.
+    binary: Vec<Binary>,
     /// Per-row integer labels (`(int)label`), used to derive each class's
     /// `is_pos` mapping at grad time. Validated `>= 0` (a negative label would map
     /// to no positive class — C++ `static_cast<int>` keeps it but it is never a
@@ -224,12 +227,36 @@ impl MulticlassOva {
     /// # Errors
     /// [`ObjectiveError::Unsupported`] when `num_class < 1` or `sigmoid <= 0`.
     pub fn new(num_class: i32, sigmoid: f64, labels: &[f32]) -> Result<Self, ObjectiveError> {
+        Self::with_class_weights(num_class, sigmoid, false, 1.0, labels)
+    }
+
+    /// As [`new`](Self::new) but honouring `is_unbalance` / `scale_pos_weight`.
+    /// C++ constructs each per-class `BinaryLogloss` from the SAME `Config`
+    /// (`multiclass_objective.hpp:190-193`), so both parameters apply per class,
+    /// with that class's own `is_pos = (int)label == i` counts.
+    ///
+    /// # Errors
+    /// [`ObjectiveError::Unsupported`] when `num_class < 1`, `sigmoid <= 0`, or
+    /// `is_unbalance` is combined with `scale_pos_weight != 1`.
+    pub fn with_class_weights(
+        num_class: i32,
+        sigmoid: f64,
+        is_unbalance: bool,
+        scale_pos_weight: f64,
+        labels: &[f32],
+    ) -> Result<Self, ObjectiveError> {
         if num_class < 1 {
             return Err(ObjectiveError::Unsupported {
                 name: format!("multiclassova num_class {num_class} must be >= 1"),
             });
         }
-        let binary = Binary::new(sigmoid)?;
+        let binary = (0..num_class)
+            .map(|k| {
+                Binary::with_class_weights(sigmoid, is_unbalance, scale_pos_weight, labels, |l| {
+                    l as i32 == k
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let label_int = labels.iter().map(|&l| l as i32).collect();
         Ok(Self {
             num_class,
@@ -286,7 +313,7 @@ impl MulticlassOva {
         for i in 0..k_classes {
             let offset = num_data * i;
             let cls_labels = self.class_labels(i as i32);
-            self.binary.get_gradients(
+            self.binary[i].get_gradients(
                 &score[offset..offset + num_data],
                 &cls_labels,
                 &mut gradients[offset..offset + num_data],
@@ -300,7 +327,7 @@ impl MulticlassOva {
     /// 261-263): the per-class binary's `BoostFromScore` over its one-vs-all labels.
     pub fn boost_from_score(&self, class_id: i32) -> f64 {
         let cls_labels = self.class_labels(class_id);
-        self.binary.boost_from_score(&cls_labels)
+        self.binary[class_id as usize].boost_from_score(&cls_labels)
     }
 
     /// C++ `MulticlassOVA::ClassNeedTrain(class_id)` (multiclass_objective.hpp:
@@ -308,7 +335,7 @@ impl MulticlassOva {
     /// absent across the one-vs-all split).
     pub fn class_need_train(&self, class_id: i32) -> bool {
         let cls_labels = self.class_labels(class_id);
-        self.binary.class_need_train(&cls_labels)
+        self.binary[class_id as usize].class_need_train(&cls_labels)
     }
 }
 

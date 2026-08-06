@@ -101,11 +101,16 @@ fn resident_toggle_mirrors_host_accumulation() {
     compare_exact_f64_bits(resident.scores(), host.scores())
         .unwrap_or_else(|m| panic!("resident mirror != pure-host accumulation: {m:?}"));
 
-    // The env-unset default `ScoreUpdater` reports the on-device path (resolved default).
+    // A default-constructed `ScoreUpdater` must adopt the LIBRARY-resolved on-device
+    // default — `cuda_on_device_enabled()`, i.e. the `LGBM_CUDA_ON_DEVICE` override
+    // falling back to the build's `on_device_default()`. Asserting a hard-coded ON
+    // here encoded a default that has since changed, so this cell failed on any
+    // env-unset CPU-only build even though `ScoreUpdater` was behaving correctly.
     let default_su = ScoreUpdater::new(num_data, num_class, None);
-    assert!(
+    assert_eq!(
         default_su.boosting_on_cuda(),
-        "LGBM_CUDA_ON_DEVICE unset ⇒ boosting_on_cuda must default ON (resolved default)"
+        lgbm_compute::cuda_on_device_enabled(),
+        "a default ScoreUpdater must adopt the resolved on-device default"
     );
 }
 

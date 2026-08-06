@@ -325,3 +325,150 @@ because it was skipping work C++ does.
 
 The golden now spans 9 cells (5 bytree + 4 bynode) × 8 trees. Re-introducing the
 scan-skip makes 2 of the 3 tests fail with `abs_diff: 0.256` — verified, not assumed.
+
+---
+
+# 5. Structural fixes: bagging / GOSS / DART (2026-08-06)
+
+§3 ranked five cells as "structurally worse". Three of them — bagging, GOSS and
+DART — turned out to share a **single** root cause, and one more (`feature_fraction`)
+was already fixed in §4. This section reports the cause, the fix and the re-measured
+matrix.
+
+## 5.1 The cause: per-row `Vec` materialization on every predict-side re-score
+
+Every path that scores rows through `Tree::predict` (rather than the training-path
+partition scatter) went through a closure typed `Fn(i32) -> Vec<f64>`. Each call
+allocated a fresh row vector:
+
+| Path | Allocations per iteration |
+|---|---|
+| bagging / GOSS OOB + in-bag scoring | one `Vec<f64>` per scored row (= `num_data`) |
+| DART `DroppingTrees` | `num_data` for the snapshot **plus** `num_data` per dropped tree (the `.clone()` in the closure) |
+| DART `Normalize` | same again |
+| RF `rf_update_score` | `num_data` |
+
+On the 200k-row workload DART allocated on the order of 10⁷ `Vec<f64>` **per
+iteration**. That is the whole of its 5.6× penalty — not, as §3 guessed, an
+O(trees²) re-prediction.
+
+**Fix:** `Gbdt` now holds one lazily-built ROW-MAJOR `(Vec<f64>, usize)` dense view
+of the feature columns (`Gbdt::dense_rows`), built at most once per train because
+`features` is immutable after construction. `ScoreUpdater` gained
+`add_tree_predict_path_dense` / `add_tree_scaled_all_dense`, which borrow
+`dense[row*width .. (row+1)*width]` instead of receiving an owned vector. Same
+values, same order, same arithmetic — a representation change only.
+
+## 5.2 A second cause, bagging-only: the subset gather
+
+`SerialTreeLearner::train_on_subset{,_returning_partition}` rebuilds the C++
+`tmp_subset_` each iteration. Two defects:
+
+1. The `in_bag` → `u32` row-id widening sat **inside the per-feature closure**, so a
+   `bag_size`-long `Vec<u32>` was allocated and refilled once **per feature** — 50×
+   the necessary work on a 50-feature corpus.
+2. The gather ran serially, though each feature's gather is independent.
+
+Both are fixed in the new shared `gather_subset_features`, which hoists the widening
+and parallelizes over features above a 4096-cell threshold. Result-neutral: each
+column's gather is a pure elementwise permutation, and `map` is order-preserving.
+
+## 5.3 Re-measured matrix
+
+Same machine, corpus and method as §3. `before` / `after` are the same binary built
+either side of §5.1-5.2; LightGBM is re-timed in the same session at its best
+`num_threads ∈ {1,4,8}`.
+
+| Parameter setting | before (ms) | after (ms) | LightGBM (ms) | ratio before | ratio after |
+|---|---:|---:|---:|---:|---:|
+| baseline (`num_leaves=31 max_bin=255`) | 2136 | 2038 | 1791 | 0.84× | 0.88× |
+| `bagging_freq=1 bagging_fraction=0.5` | 4548 | **2605** | 1700 | 0.37× | **0.65×** |
+| `boosting=dart` | 11305 | **3853** | 2795 | 0.25× | **0.73×** |
+| `boosting=goss` | 3981 | **2452** | 1606 | 0.40× | **0.65×** |
+| `num_leaves=15` | 1369 | 1463 | 1294 | — | 0.88× |
+| `num_leaves=63` | 3105 | 3121 | 2549 | — | 0.82× |
+| `num_leaves=255` | 7915 | 8110 | 5340 | — | 0.66× |
+| `max_bin=15` | 1623 | 1623 | 1255 | — | 0.77× |
+| `max_bin=63` | 1704 | 1695 | 1323 | — | 0.78× |
+| `max_bin=511` | 3081 | 2959 | 2382 | — | 0.80× |
+| `max_depth=6` | 1737 | 1759 | 1596 | — | 0.91× |
+| `min_data_in_leaf=100` | 2102 | 2031 | 1789 | — | 0.88× |
+| `feature_fraction=0.5` | 1482 | 1479 | 1344 | — | 0.91× |
+| `feature_fraction_bynode=0.5` | 2038 | 2039 | 1793 | — | 0.88× |
+| `extra_trees=true` | 1814 | 1826 | 1736 | — | 0.95× |
+| `linear_tree=true` | 5499 | 5478 | 2140 | — | **0.39×** |
+| `use_quantized_grad=true` | 2147 | 2145 | 1439 | — | 0.67× |
+| `lambda_l1=0.1` | 2206 | 2225 | 1858 | — | 0.84× |
+| `lambda_l2=1.0` | 2067 | 2083 | 1781 | — | 0.85× |
+| `min_gain_to_split=0.1` | 2063 | 2086 | 1820 | — | 0.87× |
+| `is_unbalance=true` | — | 2077 | — | — | — |
+| `scale_pos_weight=3` | — | 2033 | — | — | — |
+
+Speedups: **DART 2.9×, bagging 1.75×, GOSS 1.6×.** Untouched cells move by ±5%,
+which is this box's run-to-run noise — read those columns as unchanged, not as
+regressions. `is_unbalance` / `scale_pos_weight` (newly wired, §6) cost nothing
+measurable: one extra multiply per row.
+
+## 5.4 What is left
+
+`linear_tree` (0.39×) is now the only cell that is structurally worse, and it does
+NOT share the cause above — its cost is the per-leaf normal-equation accumulation in
+`fit_linear_leaves` (O(rows × dim²) with `dim = path features + 1`). Undiagnosed.
+
+For the ordinary tuning knobs the port sits at **0.77-0.95× of LightGBM**, i.e.
+5-23% slower. `LGBM_PHASE_PROF=1` on the baseline attributes that to:
+
+```
+build=1087ms (59%)   scan=328ms (18%)   partition=379ms (21%)
+```
+
+The histogram BUILD is the whole gap and the §3 "structural note" still names the
+fix: LightGBM's dense path uses a **row-major multi-value bin**, so one row's bins
+for all features are contiguous; `build_histograms_into` instead does one scattered
+gather per feature per leaf. On a leaf of ~6.5k rows scattered over 200k, the
+column-wise form touches ~50 cache lines per row where a row-major form touches ~1.
+This is memory-latency-bound, which is consistent with the measured ~1.7 ns per
+histogram cell.
+
+The row-major mirror stays **bit-exact** provided each thread owns a disjoint
+*feature* block and walks rows in ascending `leaf_rows` order — the per-(feature,bin)
+accumulation sequence is then unchanged. It was not attempted here: it is a
+layout change to the dataset representation, not a local edit, and needs its own
+parity gate.
+
+Re-tuning `par_build_threshold` is exhausted as a lever — re-swept on the current
+tree, `0 / 256 / 1024` give `2032 / 2057 / 2033` ms. The default stays 1024.
+
+---
+
+# 6. Parameter implementation status (2026-08-06)
+
+An audit of all 130 `Config` fields for reads outside `lgbm-core` found four
+parameters that parsed, validated, and then did nothing. All four are now wired and
+gated by tests.
+
+| Parameter | Was | Now |
+|---|---|---|
+| `is_unbalance` | `Binary` hard-coded `label_weight = 1.0` — the parameter trained the balanced model | `Binary::with_class_weights` derives C++ `label_weights_` (`binary_objective.hpp:85-100`); `MulticlassOva` builds one weighted `Binary` per class, as C++ does. Gate: `oracle-harness/tests/class_weight_parity.rs` (8 cells vs `lightgbm==4.6.0`) |
+| `scale_pos_weight` | same | same; the C++ "cannot set is_unbalance and scale_pos_weight at the same time" fatal is a typed error |
+| `categorical_feature` | only `RawCorpus::categorical_features` was honoured; the PARAMETER binned every column numeric | parsed per `dataset_loader.cpp:168-189`; the `name:` form is an explicit error (an in-memory corpus has no column names). Gate: `lgbm/tests/param_wiring.rs` |
+| `bagging_by_query` | rejected outright — the facade dropped the corpus's query boundaries | forwards them and selects the query-grouped draw; still a typed error for an ungrouped corpus. Gate: `lgbm/tests/param_wiring.rs` |
+
+Also wired: `objective=lambdarank` / `objective=rank_xendcg`, which the boosting
+layer implemented but `lgbm::booster::resolve_objective` had no arm for. This
+removes all 15 `UNSUPPORTED` entries from the string-parameter oracle sweep
+(`string_param_parity.rs`), which now reports **0 documented-unsupported** across
+129 cells.
+
+## Still not implemented
+
+`max_delta_step` and `path_smooth` return a typed `ComputeError` from the split
+kernels ("only the default 0.0 path is transcribed") rather than a wrong model. The
+gain math for both already exists in `lgbm_compute::gain`; what is missing is
+threading the per-candidate `num_data` and `parent_output` through the five
+`find_best_split*` CubeCL kernel signatures. Not attempted here.
+
+The remaining out-of-scope parameters are unchanged and documented in
+`lgbm_core::config::scope` (distributed learning, OpenCL device tuning) or are
+CLI / dataset-loader-layer file and column specs, enumerated with their reason in
+the string-param golden's `skipped` map.

@@ -237,6 +237,12 @@ impl BaggingSampleStrategy {
     /// `bagging_fraction == 1`), no rows are dropped; the indices buffer is the
     /// trivial full range (still drawn so the RNG advances identically).
     pub fn bagging(&mut self, iter: i32, labels: &[f32]) -> bool {
+        // C++ `BaggingSampleStrategy::Bagging` branches on `bagging_by_query` INSIDE
+        // the "need bagging" gate (`bagging.hpp:36`), so the query-grouped draw is
+        // reached through this same entry point — the caller never picks a variant.
+        if self.config.bagging_by_query {
+            return self.bagging_by_query(iter);
+        }
         if !self.should_bag(iter) {
             return false;
         }

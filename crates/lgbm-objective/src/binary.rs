@@ -16,10 +16,12 @@
 //! - `binary_objective.hpp:175-177` — `ConvertOutput`: `1/(1+exp(-sigmoid_*x))`
 //!   (reused from [`lgbm_model::ObjectiveKind::convert`], not re-ported here).
 //!
-//! The spine corpora are unweighted and use the balanced default
-//! (`label_weights_ = [1.0, 1.0]`, `scale_pos_weight = 1.0`, `is_unbalance =
-//! false`), so `label_weight == 1.0` for both classes. `is_unbalance` /
-//! `scale_pos_weight` weighting is recorded in the formula but not yet exercised.
+//! - `binary_objective.hpp:85-100` — `Init`'s `label_weights_` derivation:
+//!   `[1.0, 1.0]` by default; under `is_unbalance` the MAJORITY class keeps `1.0`
+//!   and the minority takes `majority_count / minority_count`; finally
+//!   `label_weights_[1] *= scale_pos_weight_` UNCONDITIONALLY. See
+//!   [`Binary::with_class_weights`].
+//!
 //! Labels outside `{0,1}` are treated as `label > 0`
 //! (verbatim C++ — no array is indexed by the label, so no OOB risk).
 
@@ -33,11 +35,18 @@ use crate::error::ObjectiveError;
 pub struct Binary {
     /// `sigmoid_` (C++ `config.sigmoid`, default 1.0; must be `> 0`).
     pub sigmoid: f64,
+    /// C++ `label_weights_[2]`, indexed by `is_pos` — `[negative, positive]`.
+    /// `[1.0, 1.0]` on the balanced default; derived from `is_unbalance` /
+    /// `scale_pos_weight` by [`Binary::with_class_weights`].
+    pub label_weights: [f64; 2],
 }
 
 impl Binary {
     /// Construct with a validated `sigmoid` (`> 0`, mirroring the C++ `Log::Fatal`
-    /// gate `binary_objective.hpp:27-29` → typed error here, never a panic).
+    /// gate `binary_objective.hpp:27-29` → typed error here, never a panic) and the
+    /// BALANCED default class weights (`is_unbalance = false`,
+    /// `scale_pos_weight = 1.0`). Use [`with_class_weights`](Self::with_class_weights)
+    /// to honour those two config parameters.
     ///
     /// # Errors
     /// [`ObjectiveError::Unsupported`] when `sigmoid <= 0` (the C++ fatal-check
@@ -48,7 +57,65 @@ impl Binary {
                 name: format!("binary sigmoid {sigmoid} must be > 0"),
             });
         }
-        Ok(Self { sigmoid })
+        Ok(Self { sigmoid, label_weights: [1.0, 1.0] })
+    }
+
+    /// C++ `BinaryLogloss::Init`'s `label_weights_` derivation
+    /// (`binary_objective.hpp:85-100`), run over the TRAINING labels:
+    ///
+    /// ```text
+    /// label_weights_ = [1.0, 1.0]
+    /// if is_unbalance_ && cnt_pos > 0 && cnt_neg > 0:
+    ///     if cnt_pos > cnt_neg: label_weights_[0] = cnt_pos / cnt_neg   // [1] stays 1
+    ///     else:                 label_weights_[1] = cnt_neg / cnt_pos   // [0] stays 1
+    /// label_weights_[1] *= scale_pos_weight_                             // ALWAYS
+    /// ```
+    ///
+    /// `is_pos` is the class predicate — `|l| l > 0.0` for the plain `binary`
+    /// objective, and `|l| l as i32 == k` for class `k` of `multiclassova`
+    /// (`multiclass_objective.hpp:190-193` builds one `BinaryLogloss` per class with
+    /// exactly that lambda).
+    ///
+    /// # Errors
+    /// - [`ObjectiveError::Unsupported`] when `sigmoid <= 0`.
+    /// - [`ObjectiveError::Unsupported`] when `is_unbalance` is set together with a
+    ///   `scale_pos_weight != 1` — the C++ `Log::Fatal` "Cannot set is_unbalance and
+    ///   scale_pos_weight at the same time" (`binary_objective.hpp:31-33`), surfaced
+    ///   as a typed error rather than a process abort.
+    pub fn with_class_weights(
+        sigmoid: f64,
+        is_unbalance: bool,
+        scale_pos_weight: f64,
+        label: &[f32],
+        is_pos: impl Fn(f32) -> bool,
+    ) -> Result<Self, ObjectiveError> {
+        let mut obj = Self::new(sigmoid)?;
+        // C++ compares against the FLOAT literal 1.0f with a 1e-6 tolerance.
+        if is_unbalance && (scale_pos_weight - 1.0f32 as f64).abs() > 1e-6 {
+            return Err(ObjectiveError::Unsupported {
+                name: "cannot set is_unbalance and scale_pos_weight at the same time".to_string(),
+            });
+        }
+        if is_unbalance {
+            let mut cnt_positive: i64 = 0;
+            let mut cnt_negative: i64 = 0;
+            for &l in label {
+                if is_pos(l) {
+                    cnt_positive += 1;
+                } else {
+                    cnt_negative += 1;
+                }
+            }
+            if cnt_positive > 0 && cnt_negative > 0 {
+                if cnt_positive > cnt_negative {
+                    obj.label_weights[0] = cnt_positive as f64 / cnt_negative as f64;
+                } else {
+                    obj.label_weights[1] = cnt_negative as f64 / cnt_positive as f64;
+                }
+            }
+        }
+        obj.label_weights[1] *= scale_pos_weight;
+        Ok(obj)
     }
 
     /// C++ `BinaryLogloss::GetGradients` (no-weights, balanced default).
@@ -82,8 +149,9 @@ impl Binary {
             return Err(ObjectiveError::LengthMismatch { expected: n, actual: hessians.len() });
         }
         let sigmoid = self.sigmoid;
-        // Balanced default: label_weight = 1.0 for both classes.
-        let label_weight = 1.0f64;
+        // C++ `label_weight = label_weights_[is_pos]` — [1.0, 1.0] on the balanced
+        // default, otherwise the is_unbalance / scale_pos_weight derivation.
+        let label_weights = self.label_weights;
         // The per-row body is a pure function of (score[i], label[i]) written
         // to disjoint gradients[i]/hessians[i] — no reduction, no cross-row order — so
         // partitioning the row range is bit-exact. `apply_grad_hess` runs rayon above
@@ -92,6 +160,7 @@ impl Binary {
         apply_grad_hess(score, label, gradients, hessians, |s, l| {
             let is_pos = l > 0.0;
             let label_val: f64 = if is_pos { 1.0 } else { -1.0 };
+            let label_weight = label_weights[usize::from(is_pos)];
             let response = -label_val * sigmoid / (1.0 + (label_val * sigmoid * s).exp());
             let abs_response = response.abs();
             (

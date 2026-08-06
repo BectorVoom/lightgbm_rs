@@ -2262,7 +2262,12 @@ fn learner_parity_on_device_seam_gate() {
     let (features, g, h, cfg, num_leaves, max_depth) = corpus();
     let grow_features = grow_features_of(&features, &cfg);
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+    // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
 
     // (a) the seam grows (Ok(Some)) when the resolved flag is on (default, or "1") and
     // defers (Ok(None)) only when explicitly forced off ("0"). The structure gate
@@ -2514,7 +2519,12 @@ fn learner_parity_on_device_structure_gate() {
     );
 
     // The cfg-less trait seam is env-gated: ON by default, "0" forces defer.
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+    // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
@@ -2669,7 +2679,12 @@ fn learner_parity_on_device_deep_multileaf_gate() {
         "layout leaf_count partitions all rows"
     );
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+    // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
@@ -2759,7 +2774,12 @@ fn learner_parity_on_device_nosplit_gate() {
         "layout leaf_count partitions all rows (single root leaf)"
     );
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+    // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
     let grown = backend
         .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
         .expect("grow_tree_on_device seam ok");
@@ -2923,7 +2943,12 @@ fn learner_parity_on_device_mindata_gate() {
         "layout leaf_count partitions all rows"
     );
 
-    let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+    // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
 
     if env_on {
         // The trait seam is LIVE and grows on-device with the cfg-less
@@ -3263,7 +3288,12 @@ mod hip {
         let cfg = lgbm_compute::kernels::grow_driver::proving_slice_config();
         let grow_features = grow_features_of(&features, &cfg);
 
-        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+        // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
         let grown = backend
             .grow_tree_on_device(&g, &h, &grow_features, num_leaves, max_depth)
             .expect("grow_tree_on_device seam ok");
@@ -3297,7 +3327,12 @@ mod hip {
         let gpu_backend = RocmBackend::with_resident(false);
 
         // (a) GATED discriminator invariant on BOTH backends.
-        let env_on = std::env::var("LGBM_CUDA_ON_DEVICE").as_deref() != Ok("0");
+        // The RESOLVED on-device default, asked of the library rather than re-derived
+    // here: `cuda_on_device_enabled()` is the env override (`"1"`/`"0"`) falling back
+    // to the build's `on_device_default()`. Re-deriving it as `env != "0"` hard-codes
+    // a default that has since changed, so an env-unset CPU-only build asserted the
+    // seam must GROW while the library correctly defers.
+    let env_on = lgbm_compute::cuda_on_device_enabled();
         assert_eq!(
             cpu_backend.on_device_growth_supported(),
             env_on,

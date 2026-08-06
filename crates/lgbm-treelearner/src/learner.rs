@@ -755,6 +755,44 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         Ok((tree, snaps))
     }
 
+    /// Materialize the C++ `tmp_subset_` — the in-bag rows' bin columns, in in-bag
+    /// order. Every other [`FeatureColumn`] field
+    /// (`num_bin`/`offset`/`min_bin`/`max_bin`/`most_freq_bin`/…) is a per-feature
+    /// property independent of the row subset, so only `bins` is re-gathered.
+    ///
+    /// This runs once per iteration on every bagging/GOSS/RF train, over
+    /// `num_features * bag_size` cells, and used to be the dominant cost of those
+    /// paths for two reasons, both fixed here:
+    ///
+    /// 1. The `in_bag` → `u32` row-id widening was INSIDE the per-feature closure, so
+    ///    a `bag_size`-long `Vec<u32>` was allocated and refilled once PER FEATURE
+    ///    (50x the necessary work on a 50-feature corpus). It is hoisted out.
+    /// 2. The gather was serial. Each feature's gather is independent and writes its
+    ///    own column, so it parallelizes over features exactly like the histogram
+    ///    build.
+    ///
+    /// RESULT-NEUTRAL: `columns[j]` is still feature `j` (order-preserving `map`),
+    /// and each column's gather is a pure elementwise permutation — no accumulation,
+    /// no cross-feature state. The grown tree is bit-identical.
+    fn gather_subset_features(features: &[FeatureColumn], in_bag: &[i32]) -> Vec<FeatureColumn> {
+        // Widen ONCE (was: once per feature).
+        let rows: Vec<u32> = in_bag.iter().map(|&r| r as u32).collect();
+        let gather = |f: &FeatureColumn| FeatureColumn {
+            bins: f.bins.gather(&rows),
+            ..f.clone()
+        };
+        // The rayon dispatch only pays off once the gather is more than a few
+        // thousand cells; below that the serial map is faster (same reasoning, and
+        // the same order of magnitude, as `par_build_threshold`).
+        const PAR_GATHER_CELLS: usize = 4096;
+        if features.len() * rows.len() >= PAR_GATHER_CELLS {
+            use rayon::prelude::*;
+            features.par_iter().map(gather).collect()
+        } else {
+            features.iter().map(gather).collect()
+        }
+    }
+
     /// Train one tree over a ROW SUBSET (the C++ `tmp_subset_` bagging path,
     /// bagging.hpp `is_use_subset_`). `in_bag` is the in-bag GLOBAL row indices (the
     /// strategy's `bag_data_indices_[..bag_data_cnt]`, ascending); `gradients` /
@@ -779,25 +817,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<Tree, TreeLearnerError> {
-        // Build subset feature columns (in-bag rows, in in-bag order) — every other
-        // FeatureColumn field (num_bin/offset/min_bin/max_bin/most_freq_bin/...) is
-        // a per-feature property independent of the row subset, so only `bins` is
-        // re-gathered.
-        let subset_features: Vec<FeatureColumn> = self
-            .features
-            .iter()
-            .map(|f| {
-                // Re-gather the in-bag rows PRESERVING the narrow width (the subset
-                // column keeps the same BinColumn variant). `in_bag` is `&[i32]`;
-                // widen to u32 for the gather row ids.
-                let rows: Vec<u32> = in_bag.iter().map(|&r| r as u32).collect();
-                let bins = f.bins.gather(&rows);
-                FeatureColumn {
-                    bins,
-                    ..f.clone()
-                }
-            })
-            .collect();
+        let subset_features = Self::gather_subset_features(&self.features, in_bag);
         let sub_grad: Vec<f32> = in_bag.iter().map(|&r| gradients[r as usize]).collect();
         let sub_hess: Vec<f32> = in_bag.iter().map(|&r| hessians[r as usize]).collect();
 
@@ -840,24 +860,7 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         hessians: &[f32],
         is_first_tree: bool,
     ) -> Result<(Tree, DataPartition), TreeLearnerError> {
-        // Build subset feature columns (in-bag rows, in in-bag order) — identical to
-        // `train_on_subset`; only `bins` is re-gathered (every other FeatureColumn
-        // field is a per-feature property independent of the row subset).
-        let subset_features: Vec<FeatureColumn> = self
-            .features
-            .iter()
-            .map(|f| {
-                // Re-gather the in-bag rows PRESERVING the narrow width (the subset
-                // column keeps the same BinColumn variant). `in_bag` is `&[i32]`;
-                // widen to u32 for the gather row ids.
-                let rows: Vec<u32> = in_bag.iter().map(|&r| r as u32).collect();
-                let bins = f.bins.gather(&rows);
-                FeatureColumn {
-                    bins,
-                    ..f.clone()
-                }
-            })
-            .collect();
+        let subset_features = Self::gather_subset_features(&self.features, in_bag);
         let sub_grad: Vec<f32> = in_bag.iter().map(|&r| gradients[r as usize]).collect();
         let sub_hess: Vec<f32> = in_bag.iter().map(|&r| hessians[r as usize]).collect();
 

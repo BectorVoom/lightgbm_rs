@@ -37,7 +37,8 @@ use lgbm_dataset::bin_mapper::{BinMapper, MissingType};
 use lgbm_metric::Metric;
 use lgbm_model::{GbdtModel, ObjectiveKind};
 use lgbm_objective::{
-    Binary, CustomObjective, MulticlassOva, MulticlassSoftmax, Objective, Xentropy,
+    Binary, CustomObjective, Lambdarank, MulticlassOva, MulticlassSoftmax, Objective, RankXendcg,
+    Xentropy,
 };
 use lgbm_treelearner::learner::{FeatureColumn, LearnerConstraints};
 use lgbm_treelearner::BinColumn;
@@ -425,6 +426,10 @@ pub fn build_feature_columns_from_raw_with_config(
     }
 
     let cfg = bin_config;
+    // The `categorical_feature=` PARAMETER (dataset_loader.cpp:168-189), unioned with
+    // the corpus-level `categorical_features` the typed ingest paths set. Without
+    // this the parameter parses, validates, and then bins every column as numeric.
+    let cat_from_param = parse_categorical_feature(&cfg.categorical_feature, num_features)?;
     // `max_bin_by_feature` must cover every feature when set (dataset_loader.cpp:615
     // `CHECK_EQ(num_col, max_bin_by_feature.size())`); a short vector would
     // silently fall back to the global `max_bin` for the tail features.
@@ -460,7 +465,9 @@ pub fn build_feature_columns_from_raw_with_config(
             .unwrap_or(cfg.max_bin);
 
         // Build the per-column BinMapper (Route A).
-        let mapper: BinMapper = if corpus.categorical_features.contains(&j) {
+        let mapper: BinMapper = if corpus.categorical_features.contains(&j)
+            || cat_from_param.contains(&j)
+        {
             BinMapper::find_bin_categorical(
                 column.to_vec(),
                 feature_max_bin,
@@ -523,6 +530,53 @@ pub fn build_feature_columns_from_raw_with_config(
     Ok(columns)
 }
 
+/// Parse the `categorical_feature=` parameter into feature INDICES
+/// (`dataset_loader.cpp:168-189`).
+///
+/// C++ accepts two forms: a comma-separated index list, or `name:a,b,c` naming
+/// columns. Only the index form is supported here — the in-memory corpora this
+/// facade trains on carry no column names, so the `name:` form is a typed error
+/// rather than a silent no-op. A non-integer token and an out-of-range index are
+/// likewise typed errors (C++ `Log::Fatal`s on the former; the latter would index
+/// past the feature array).
+fn parse_categorical_feature(
+    spec: &str,
+    num_features: usize,
+) -> Result<Vec<usize>, LgbmError> {
+    if spec.is_empty() {
+        return Ok(Vec::new());
+    }
+    if spec.starts_with("name:") {
+        return Err(LgbmError::Unsupported {
+            name: "categorical_feature=name:... requires named columns, which an \
+                   in-memory corpus does not carry — pass feature INDICES instead"
+                .to_string(),
+        });
+    }
+    let mut out = Vec::new();
+    // `Common::Split` drops empty segments, so `0,,2` is `[0, 2]`.
+    for token in spec.split(',').filter(|t| !t.is_empty()) {
+        let idx: i64 = token.trim().parse().map_err(|_| LgbmError::InvalidCorpus {
+            detail: format!(
+                "categorical_feature token `{token}` is not a number; to use a column \
+                 name add the `name:` prefix"
+            ),
+        })?;
+        if idx < 0 || idx as usize >= num_features {
+            return Err(LgbmError::InvalidCorpus {
+                detail: format!(
+                    "categorical_feature index {idx} out of range (num_features {num_features})"
+                ),
+            });
+        }
+        let idx = idx as usize;
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    Ok(out)
+}
+
 /// Train a [`Booster`] from a RAW corpus (the raw→bin→train entry point).
 /// Bins each feature with the bit-exact [`BinMapper`] via
 /// [`build_feature_columns_from_raw`], then drives the SAME `train_inner_full`
@@ -532,13 +586,14 @@ pub fn build_feature_columns_from_raw_with_config(
 /// [`LgbmError`] for an invalid corpus, an unsupported objective/metric, or a
 /// loop/learner failure — never a panic.
 pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmError> {
-    // Resolve the objective over a thin DenseCorpus view (labels only are used by
-    // resolve_objective's label guards; the features are NOT read there, so the
-    // view carries an empty feature matrix — no col→row transpose).
+    // Resolve the objective over a thin DenseCorpus view (labels + query boundaries
+    // are the only fields resolve_objective reads — the label guards and the ranking
+    // objectives' `Init`; the features are NOT read there, so the view carries an
+    // empty feature matrix — no col→row transpose).
     let label_view = DenseCorpus {
         features: Vec::new(),
         labels: corpus.labels.clone(),
-        query_boundaries: Vec::new(),
+        query_boundaries: corpus.query_boundaries.clone(),
     };
     let (boost_obj, transformed_labels) = resolve_objective(config, &label_view)?;
     let metrics = create_metrics(config);
@@ -894,7 +949,17 @@ fn resolve_objective(
     let first = config.objective.split_whitespace().next().unwrap_or("");
     Ok(match first {
         "binary" => {
-            let b = Binary::new(config.sigmoid).map_err(LgbmError::Objective)?;
+            // `is_unbalance` / `scale_pos_weight` derive the C++ `label_weights_`
+            // from the training labels (binary_objective.hpp:85-100). Passing them
+            // here is what makes the two parameters affect the model at all.
+            let b = Binary::with_class_weights(
+                config.sigmoid,
+                config.is_unbalance,
+                config.scale_pos_weight,
+                &corpus.labels,
+                |l| l > 0.0,
+            )
+            .map_err(LgbmError::Objective)?;
             (BoostObjective::Binary(b), corpus.labels.clone())
         }
         "multiclass" | "softmax" => {
@@ -905,8 +970,16 @@ fn resolve_objective(
             (BoostObjective::Multiclass(m), corpus.labels.clone())
         }
         "multiclassova" | "multiclass_ova" | "ova" | "ovr" => {
-            let o = MulticlassOva::new(config.num_class, config.sigmoid, &corpus.labels)
-                .map_err(LgbmError::Objective)?;
+            // C++ builds one `BinaryLogloss` per class from the SAME Config, so
+            // `is_unbalance` / `scale_pos_weight` apply per one-vs-all split.
+            let o = MulticlassOva::with_class_weights(
+                config.num_class,
+                config.sigmoid,
+                config.is_unbalance,
+                config.scale_pos_weight,
+                &corpus.labels,
+            )
+            .map_err(LgbmError::Objective)?;
             (BoostObjective::MulticlassOva(o), corpus.labels.clone())
         }
         // cross_entropy / cross_entropy_lambda: single-output xentropy with
@@ -915,6 +988,29 @@ fn resolve_objective(
             let x = Xentropy::parse(&config.objective).map_err(LgbmError::Objective)?;
             x.check_labels(&corpus.labels).map_err(LgbmError::Objective)?;
             (BoostObjective::Xentropy(x), corpus.labels.clone())
+        }
+        // The two query-grouped ranking objectives. Both capture the labels AND the
+        // query boundaries at construction (C++ `Init(metadata, num_data)` reads
+        // `metadata.query_boundaries()`), so a corpus with no boundaries is a typed
+        // error here rather than a silently-pointwise mistrain.
+        "lambdarank" => {
+            let qb = rank_query_boundaries(config, corpus)?;
+            let l = Lambdarank::new(
+                config.sigmoid,
+                config.lambdarank_norm,
+                config.lambdarank_truncation_level,
+                &config.label_gain,
+                &corpus.labels,
+                qb,
+            )
+            .map_err(LgbmError::Objective)?;
+            (BoostObjective::Lambdarank(l), corpus.labels.clone())
+        }
+        "rank_xendcg" => {
+            let qb = rank_query_boundaries(config, corpus)?;
+            let r = RankXendcg::new(config.objective_seed, &corpus.labels, qb)
+                .map_err(LgbmError::Objective)?;
+            (BoostObjective::rank_xendcg(r), corpus.labels.clone())
         }
         _ => {
             // regression / regression_l1 / huber / fair / quantile / mape / poisson /
@@ -926,6 +1022,30 @@ fn resolve_objective(
             (BoostObjective::Builtin(o), lbl)
         }
     })
+}
+
+/// The query/group boundaries a ranking objective needs, or a typed error when the
+/// corpus carries none.
+///
+/// C++ `RankingObjective::Init` (`rank_objective.hpp:36-45`) reads
+/// `metadata.query_boundaries()` and `Log::Fatal`s on a null pointer ("Ranking tasks
+/// require query information"). Surfacing the same condition as a typed
+/// [`LgbmError::Unsupported`] keeps an ungrouped corpus from training a
+/// silently-pointwise ranking model.
+fn rank_query_boundaries<'a>(
+    config: &Config,
+    corpus: &'a DenseCorpus,
+) -> Result<&'a [i32], LgbmError> {
+    if corpus.query_boundaries.is_empty() {
+        return Err(LgbmError::Unsupported {
+            name: format!(
+                "objective `{}` is query-grouped and requires query/group boundaries, \
+                 which this corpus does not carry",
+                config.objective
+            ),
+        });
+    }
+    Ok(&corpus.query_boundaries)
 }
 
 /// Train a [`Booster`] with an optional validation set, enabling early stopping
@@ -1436,20 +1556,19 @@ fn train_inner_columns_full(
         .map_err(LgbmError::Boosting)?;
         gbdt = gbdt.with_goss(goss, features.clone());
     } else if bagging_on {
-        // bagging_by_query: the query-grouped draw + expansion is implemented
-        // in BaggingSampleStrategy::bagging_by_query and proven by the rank_parity
-        // RNG-replay golden, but it requires query/group boundaries to bag by. The
-        // `DenseCorpus` facade carries no query metadata yet (ranking end-to-end
-        // training over the facade is a later surface), so a `bagging_by_query=true`
-        // request here is rejected with an honest typed error (mirroring the C++
-        // `Log::Fatal("Ranking tasks require query information")`) rather than silently
-        // falling through to ROW bagging.
-        if config.bagging_by_query {
+        // `bagging_by_query` makes the draw's minimal unit a whole QUERY. The
+        // query-grouped draw + row expansion lives in
+        // `BaggingSampleStrategy::reset_sample_config_with_queries` /
+        // `bagging_by_query` (RNG-replay tested in `rank_parity`); it needs the
+        // corpus's query boundaries, which the facade now carries. A corpus WITHOUT
+        // boundaries still cannot bag by query, and mirrors the C++
+        // `Log::Fatal("Ranking tasks require query information")` as a typed error
+        // rather than silently falling through to ROW bagging.
+        if config.bagging_by_query && train_query_boundaries.is_none_or(<[i32]>::is_empty) {
             return Err(LgbmError::Boosting(lgbm_boosting::BoostingError::Objective(
                 lgbm_objective::ObjectiveError::Unsupported {
-                    name: "bagging_by_query requires query/group boundaries, which the \
-                           DenseCorpus training facade does not carry yet (the query-grouped \
-                           draw itself is implemented + RNG-replay tested in rank_parity)"
+                    name: "bagging_by_query requires query/group boundaries, which this \
+                           corpus does not carry"
                         .to_string(),
                 },
             )));
@@ -1463,7 +1582,15 @@ fn train_inner_columns_full(
             config.bagging_by_query,
         )
         .map_err(LgbmError::Boosting)?;
-        let strat = BaggingSampleStrategy::reset_sample_config(bag_cfg, num_data, &labels);
+        let strat = if config.bagging_by_query {
+            BaggingSampleStrategy::reset_sample_config_with_queries(
+                bag_cfg,
+                num_data,
+                train_query_boundaries.unwrap_or_default(),
+            )
+        } else {
+            BaggingSampleStrategy::reset_sample_config(bag_cfg, num_data, &labels)
+        };
         gbdt = gbdt.with_bagging(strat, features.clone());
     }
 

@@ -87,6 +87,17 @@ use crate::score_updater::ScoreUpdater;
 // `*_on` methods (no GPU runtime pulled in).
 use lgbm_compute::kernels::predict::PredictTree;
 
+/// The per-row width of the dense feature view: `max(real_feature_index) + 1`, so a
+/// row vector can be indexed by ORIGINAL feature index (which is what
+/// [`lgbm_model::Tree::predict`] expects). `0` for an empty feature set.
+fn dense_width(features: &[FeatureColumn]) -> usize {
+    features
+        .iter()
+        .map(|f| f.real_feature_index)
+        .max()
+        .map_or(0, |m| (m + 1) as usize)
+}
+
 /// The resolved Random Forest `Boosting()` output: the per-class init scores plus
 /// the ONCE-derived class-major gradients and hessians (`rf.hpp:90-109`
 /// `init_scores_`/`gradients_`/`hessians_`). Factored into a type alias to keep the
@@ -285,6 +296,18 @@ pub struct Gbdt<'a> {
     /// (`Tree::predict` over each row's real feature values). Empty when bagging is
     /// off (the caller drives the learner's features directly).
     features: Vec<FeatureColumn>,
+    /// Lazily-built ROW-MAJOR dense view of [`Self::features`] —
+    /// `(matrix, width)` with `matrix[row * width + real_feature_index]` holding the
+    /// identity-binned real feature value. `features` is immutable for the whole
+    /// train, so this is built at most ONCE and reused by every predict-side scoring
+    /// call (bagging OOB, DART drop/normalize, RF).
+    ///
+    /// It replaces a `Vec<Vec<f64>>` that those paths materialized FRESH on every
+    /// call — one heap allocation per row (200k allocations per call, twice per DART
+    /// iteration) plus one more per row per scored tree from the `.clone()` in the
+    /// row closure. Purely a representation change: the values, and the order they
+    /// are consumed in, are unchanged.
+    dense_rows: Option<(Vec<f64>, usize)>,
     /// `config_->use_quantized_grad`. When true, each iteration's gradients
     /// and hessians are quantized in-place (deterministic int8) before the learner — the
     /// opt-in APPROXIMATE mode. Default false → the exact path is untouched.
@@ -412,6 +435,7 @@ impl<'a> Gbdt<'a> {
             dart: None,
             rf: None,
             features: Vec::new(),
+            dense_rows: None,
             use_quantized_grad: false,
             num_grad_quant_bins: 4,
             quant_stochastic: false,
@@ -1072,32 +1096,25 @@ impl<'a> Gbdt<'a> {
                         // 0..K-1); Tree::predict traverses the real-value thresholds (the
                         // bin upper bounds) so feeding the bin index as the real value
                         // reproduces the same leaf assignment as the train-path scatter.
-                        let features = &self.features;
-                        let feature_row = |row: i32| -> Vec<f64> {
-                            let width = features
-                                .iter()
-                                .map(|f| f.real_feature_index)
-                                .max()
-                                .map(|m| (m + 1) as usize)
-                                .unwrap_or(0);
-                            let mut v = vec![0.0f64; width];
-                            for f in features {
-                                v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
-                            }
-                            v
-                        };
-                        self.score_updater.add_tree_predict_path(
+                        // The cached row-major dense view (built once per train) —
+                        // the old per-row closure allocated a fresh `Vec<f64>` for
+                        // EVERY scored row of EVERY iteration.
+                        let (dense, width) = self.take_dense_rows();
+                        self.score_updater.add_tree_predict_path_dense(
                             &tree,
                             &in_bag,
                             cur_tree_id,
-                            &feature_row,
+                            &dense,
+                            width,
                         );
-                        self.score_updater.add_tree_predict_path(
+                        self.score_updater.add_tree_predict_path_dense(
                             &tree,
                             &oob,
                             cur_tree_id,
-                            &feature_row,
+                            &dense,
+                            width,
                         );
+                        self.put_dense_rows((dense, width));
                     }
                     let init = init_scores[cur_tree_id as usize];
                     if Objective::init_score_is_significant(init) {
@@ -1600,24 +1617,12 @@ impl<'a> Gbdt<'a> {
         // AddScore(tree) over the full corpus (predict-side, every row). Use the
         // running-average helper with multiply=1.0 (raw add). The identity-binned bin
         // index IS the real feature value (the L2 predict-vs-scatter contract).
-        let features = &self.features;
-        let feature_row = |row: i32| -> Vec<f64> {
-            let width = features
-                .iter()
-                .map(|f| f.real_feature_index)
-                .max()
-                .map(|m| (m + 1) as usize)
-                .unwrap_or(0);
-            let mut v = vec![0.0f64; width];
-            for f in features {
-                v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
-            }
-            v
-        };
         // A constant (num_leaves<=1) tree still contributes its leaf value to every
-        // row — add_tree_scaled_all handles both grown and constant trees.
+        // row — add_tree_scaled_all_dense handles both grown and constant trees.
+        let (dense, width) = self.take_dense_rows();
         self.score_updater
-            .add_tree_scaled_all(tree, cur_tree_id, 1.0, feature_row);
+            .add_tree_scaled_all_dense(tree, cur_tree_id, 1.0, &dense, width);
+        self.put_dense_rows((dense, width));
         // MultiplyScore(cur_tree_id, 1/(iter+1)) — re-average over `iter+1` trees.
         self.score_updater.multiply_score(1.0 / (iter + 1.0), cur_tree_id);
     }
@@ -1931,23 +1936,36 @@ impl<'a> Gbdt<'a> {
         self.iter
     }
 
-    /// Build a row's real feature-value vector from the stored full-corpus
-    /// [`FeatureColumn`]s (the identity-binned bin index IS the real value — the L2
-    /// predict-vs-scatter contract). Width is `max real_feature_index + 1`. Used by
-    /// the DART DroppingTrees / Normalize full-corpus predict-side re-scoring.
-    fn feature_row(&self, row: i32) -> Vec<f64> {
-        let width = self
-            .features
-            .iter()
-            .map(|f| f.real_feature_index)
-            .max()
-            .map(|m| (m + 1) as usize)
-            .unwrap_or(0);
-        let mut v = vec![0.0f64; width];
-        for f in &self.features {
-            v[f.real_feature_index as usize] = f.bins.bin(row as usize) as f64;
+    /// TAKE the cached row-major dense feature matrix (see [`Self::dense_rows`]),
+    /// building it on first use. Ownership is moved out so the caller can hold it
+    /// while mutably borrowing `self.score_updater` / `self.trees`; the caller MUST
+    /// return it via [`Self::put_dense_rows`], exactly like the DART state is drained
+    /// and restored in `dropping_trees`.
+    ///
+    /// Row `r`'s values occupy `matrix[r * width .. (r + 1) * width]` — byte-for-byte
+    /// what the old per-row `feature_row(r)` produced.
+    fn take_dense_rows(&mut self) -> (Vec<f64>, usize) {
+        if let Some(cached) = self.dense_rows.take() {
+            return cached;
         }
-        v
+        let width = dense_width(&self.features);
+        let nd = self.num_data as usize;
+        let mut matrix = vec![0.0f64; nd * width];
+        // Column-outer / row-inner: each feature's bin column is walked contiguously
+        // and scattered with a fixed `width` stride, which is far friendlier than
+        // rebuilding a row at a time. Values and layout are unchanged either way.
+        for f in &self.features {
+            let col = f.real_feature_index as usize;
+            for row in 0..nd {
+                matrix[row * width + col] = f.bins.bin(row) as f64;
+            }
+        }
+        (matrix, width)
+    }
+
+    /// Return the matrix taken by [`Self::take_dense_rows`] to the cache.
+    fn put_dense_rows(&mut self, rows: (Vec<f64>, usize)) {
+        self.dense_rows = Some(rows);
     }
 
     /// C++ `DART::DroppingTrees` (`dart.hpp:97-147`). Runs at the START of each DART
@@ -2028,7 +2046,7 @@ impl<'a> Gbdt<'a> {
         // over the FULL corpus (predict-side, bit-exact to the partition scatter on
         // the identity-binned corpus). Per-class over `cur_tree_id` (K=1 spine).
         // Snapshot the per-row feature vectors once (disjoint from score_updater).
-        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        let (dense, width) = self.take_dense_rows();
         let drop_index = dart.drop_index.clone();
         for &i in &drop_index {
             for cur_tree_id in 0..k {
@@ -2036,9 +2054,11 @@ impl<'a> Gbdt<'a> {
                 self.trees[curr_tree].shrinkage(-1.0);
                 let tree = self.trees[curr_tree].clone();
                 self.score_updater
-                    .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                    .add_tree_scaled_all_dense(&tree, cur_tree_id, 1.0, &dense, width);
             }
         }
+
+        self.put_dense_rows((dense, width));
 
         // shrinkage_rate_ for the new tree (dart.hpp:138-146).
         let kk = dart.drop_index.len() as f64;
@@ -2064,7 +2084,7 @@ impl<'a> Gbdt<'a> {
         let lr = self.learning_rate;
         let k = dart.drop_index.len() as f64;
         let drop_index = dart.drop_index.clone();
-        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        let (dense, width) = self.take_dense_rows();
 
         for &i in &drop_index {
             for cur_tree_id in 0..k_trees_per_iter {
@@ -2079,13 +2099,13 @@ impl<'a> Gbdt<'a> {
                     self.trees[curr_tree].shrinkage(-k);
                     let tree = self.trees[curr_tree].clone();
                     self.score_updater
-                        .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                        .add_tree_scaled_all_dense(&tree, cur_tree_id, 1.0, &dense, width);
                 } else {
                     self.trees[curr_tree].shrinkage(dart.shrinkage_rate);
                     self.trees[curr_tree].shrinkage(-k / lr);
                     let tree = self.trees[curr_tree].clone();
                     self.score_updater
-                        .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                        .add_tree_scaled_all_dense(&tree, cur_tree_id, 1.0, &dense, width);
                 }
             }
             if !cfg.uniform_drop {
@@ -2099,6 +2119,7 @@ impl<'a> Gbdt<'a> {
                 }
             }
         }
+        self.put_dense_rows((dense, width));
         self.dart = Some(dart);
     }
 
@@ -2155,7 +2176,7 @@ impl<'a> Gbdt<'a> {
 
         // Snapshot the per-row feature vectors once (the C++ data_partition_ row→leaf
         // map, here re-derived by routing each row through each tree's structure).
-        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        let (dense, width) = self.take_dense_rows();
         let decay = refit_decay_rate;
 
         // C++ RefitTree re-scores from the refit trees; reset the accumulation.
@@ -2181,13 +2202,16 @@ impl<'a> Gbdt<'a> {
                 // FitByExistingTree on the existing structure (in-place leaf refit).
                 // We refit a single tree (`model_index`) — feed only this tree's
                 // class-slice grad/hess (the C++ gradients_pointer_ + offset).
-                self.refit_one_tree_inplace(model_index, &rows, grad, hess, decay, use_l1, l1, l2);
+                self.refit_one_tree_inplace(
+                    model_index, &dense, width, grad, hess, decay, use_l1, l1, l2,
+                );
                 // AddScore(new_tree) to the refit score (predict-side, full corpus).
                 let tree = self.trees[model_index].clone();
                 self.score_updater
-                    .add_tree_scaled_all(&tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                    .add_tree_scaled_all_dense(&tree, cur_tree_id, 1.0, &dense, width);
             }
         }
+        self.put_dense_rows((dense, width));
         Ok(())
     }
 
@@ -2198,7 +2222,8 @@ impl<'a> Gbdt<'a> {
     fn refit_one_tree_inplace(
         &mut self,
         tree_index: usize,
-        rows: &[Vec<f64>],
+        dense: &[f64],
+        width: usize,
         gradients: &[f32],
         hessians: &[f32],
         decay: f64,
@@ -2209,7 +2234,8 @@ impl<'a> Gbdt<'a> {
         let num_leaves = self.trees[tree_index].num_leaves.max(1) as usize;
         let mut sum_grad = vec![0.0f64; num_leaves];
         let mut sum_hess = vec![0.0f64; num_leaves];
-        for (r, row) in rows.iter().enumerate() {
+        for r in 0..gradients.len() {
+            let row = &dense[r * width..(r + 1) * width];
             let leaf = if self.trees[tree_index].num_leaves > 1 {
                 self.trees[tree_index].get_leaf(row) as usize
             } else {
@@ -2250,12 +2276,13 @@ impl<'a> Gbdt<'a> {
         // IS the real feature value (the L2 predict-vs-scatter contract). Snapshot the
         // per-row feature vectors once (like the DART/RF re-score paths) so the
         // per-tree closure is a cheap index into the shared buffer.
-        let rows: Vec<Vec<f64>> = (0..self.num_data).map(|r| self.feature_row(r)).collect();
+        let (dense, width) = self.take_dense_rows();
         for (i, tree) in loaded_trees.iter().enumerate() {
             let cur_tree_id = (i as i32) % k;
             self.score_updater
-                .add_tree_scaled_all(tree, cur_tree_id, 1.0, |r| rows[r as usize].clone());
+                .add_tree_scaled_all_dense(tree, cur_tree_id, 1.0, &dense, width);
         }
+        self.put_dense_rows((dense, width));
         let num_loaded = loaded_trees.len();
         self.trees = loaded_trees;
         // num_init_iteration_ = models_.size() / num_tree_per_iteration_.

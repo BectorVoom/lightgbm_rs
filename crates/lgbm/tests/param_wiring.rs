@@ -194,3 +194,116 @@ fn a_wrong_length_feature_contri_is_a_typed_error_not_a_silent_partial_penalty()
         "expected a length error naming feature_contri, got: {msg}"
     );
 }
+
+// --- `categorical_feature` (the PARAMETER, not the corpus field) -------------
+//
+// `RawCorpus::categorical_features` is set by the typed ingest paths (polars/Arrow),
+// but real LightGBM also accepts `params={"categorical_feature": "0,2"}` at the
+// Dataset level (`dataset_loader.cpp:168-189`). That parameter parsed and then did
+// nothing here: every column was binned NUMERIC regardless.
+
+/// The parameter must select the same categorical binning the corpus field does.
+/// Equivalence is the strongest available assertion — it pins the parameter to the
+/// already-oracle-tested `find_bin_categorical` path rather than to a plumbing detail.
+#[test]
+fn categorical_feature_param_matches_setting_the_corpus_field() {
+    let via_param = cfg(&[("categorical_feature", "0")]);
+    let by_param = train_raw(&via_param, &corpus(&via_param))
+        .expect("train ok")
+        .model_to_string();
+
+    let plain = cfg(&[]);
+    let mut c = corpus(&plain);
+    c.categorical_features = vec![0];
+    let by_field = train_raw(&plain, &c).expect("train ok").model_to_string();
+
+    assert_eq!(
+        by_param, by_field,
+        "categorical_feature=0 must bin feature 0 exactly as corpus.categorical_features=[0]"
+    );
+    // …and both must differ from the all-numeric model, so the assertion has teeth.
+    let numeric = train_raw(&plain, &corpus(&plain))
+        .expect("train ok")
+        .model_to_string();
+    assert_ne!(
+        by_param, numeric,
+        "categorical binning must change the grown trees"
+    );
+}
+
+#[test]
+fn an_out_of_range_categorical_feature_index_is_a_typed_error() {
+    let config = cfg(&[("categorical_feature", "7")]); // only 2 features
+    let err = train_raw(&config, &corpus(&config)).expect_err("must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("categorical_feature") && msg.contains('7'),
+        "expected an out-of-range error naming categorical_feature, got: {msg}"
+    );
+}
+
+/// C++ accepts `categorical_feature=name:a,b`; an in-memory corpus carries no column
+/// names, so the port must SAY SO rather than silently train an all-numeric model.
+#[test]
+fn the_name_prefixed_categorical_feature_form_is_an_explicit_error() {
+    let config = cfg(&[("categorical_feature", "name:f0")]);
+    let err = train_raw(&config, &corpus(&config)).expect_err("must be rejected");
+    assert!(
+        err.to_string().contains("name:"),
+        "expected an explicit unsupported error, got: {err}"
+    );
+}
+
+// --- `bagging_by_query` -------------------------------------------------------
+//
+// The query-grouped draw (`BaggingSampleStrategy::bagging_by_query`, RNG-replay
+// tested in `oracle-harness/tests/rank_parity.rs`) was unreachable from the facade:
+// `train_raw` rejected `bagging_by_query=true` outright because the facade used to
+// drop the corpus's query boundaries. It now forwards them, so the parameter selects
+// the query-grouped draw for any grouped corpus.
+
+/// A grouped corpus: 200 rows in 10 queries of 20.
+fn grouped_corpus(config: &Config) -> RawCorpus {
+    let mut c = corpus(config);
+    c.query_boundaries = (0..=10).map(|q| q * 20).collect();
+    c
+}
+
+#[test]
+fn bagging_by_query_draws_a_different_bag_than_row_bagging() {
+    let row = cfg(&[("bagging_freq", "1"), ("bagging_fraction", "0.5")]);
+    let by_row = train_raw(&row, &grouped_corpus(&row))
+        .expect("row bagging trains")
+        .model_to_string();
+
+    let query = cfg(&[
+        ("bagging_freq", "1"),
+        ("bagging_fraction", "0.5"),
+        ("bagging_by_query", "true"),
+    ]);
+    let by_query = train_raw(&query, &grouped_corpus(&query))
+        .expect("query bagging trains")
+        .model_to_string();
+
+    assert_ne!(
+        by_row, by_query,
+        "bagging_by_query must select whole QUERIES, producing a different bag \
+         (and therefore a different model) than the per-row draw"
+    );
+}
+
+/// C++ `Log::Fatal("Ranking tasks require query information")`. An UNGROUPED corpus
+/// must be a typed error, never a silent fall-through to row bagging.
+#[test]
+fn bagging_by_query_without_query_boundaries_is_a_typed_error() {
+    let config = cfg(&[
+        ("bagging_freq", "1"),
+        ("bagging_fraction", "0.5"),
+        ("bagging_by_query", "true"),
+    ]);
+    let err = train_raw(&config, &corpus(&config)).expect_err("must be rejected");
+    assert!(
+        err.to_string().contains("query/group boundaries"),
+        "expected a query-boundary error, got: {err}"
+    );
+}

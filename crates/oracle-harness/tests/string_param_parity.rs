@@ -46,30 +46,13 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     // `CheckParamConflict` resets `tree_learner` to "serial" whenever
     // `num_machines <= 1` (config.cpp:341-347), so on a single machine every value
     // trains the SAME serial model — which is real trained parity, asserted below.
-    // The ranking objectives need query/group boundaries, which the RawCorpus
-    // training facade does not carry (booster.rs documents the same gap for
-    // `bagging_by_query`).
-    ("objective=lambdarank", "ranking objective needs query boundaries in the training facade"),
-    ("objective=rank_xendcg", "ranking objective needs query boundaries in the training facade"),
-    ("objective=xendcg", "ranking objective needs query boundaries in the training facade"),
-    ("objective=xe_ndcg", "ranking objective needs query boundaries in the training facade"),
-    ("objective=xe_ndcg_mart", "ranking objective needs query boundaries in the training facade"),
-    ("objective=xendcg_mart", "ranking objective needs query boundaries in the training facade"),
-    // The ranking METRIC cells are blocked by the same facade gap, not by the
-    // metric factory: the capture pairs a ranking metric with the `lambdarank`
-    // OBJECTIVE (C++ rejects the multiclass/ranking metric-vs-objective mismatch
-    // otherwise), so training cannot start. The metric objects themselves are
-    // built and named correctly — see `lgbm::eval_metric`'s
-    // `rank_metrics_expand_one_output_per_sorted_eval_at`.
-    ("metric=ndcg", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=map", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=mean_average_precision", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=lambdarank", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=rank_xendcg", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=xendcg", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=xe_ndcg", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=xe_ndcg_mart", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
-    ("metric=xendcg_mart", "ranking metric requires a ranking objective (facade lacks query boundaries)"),
+    //
+    // The ranking objectives (`lambdarank`, `rank_xendcg` + aliases) and the
+    // ranking metrics (`ndcg`, `map` + aliases) WERE listed here while the
+    // training facade dropped the corpus's query boundaries before objective
+    // resolution. They are now wired end-to-end (`lgbm::booster::resolve_objective`
+    // reads `corpus.query_boundaries`) and every one of those cells is asserted at
+    // full trained parity below.
 ];
 
 /// Cells whose parity is a CONFIG-level agreement rather than a trained-model
@@ -96,8 +79,25 @@ struct Golden {
     labels: HashMap<String, Vec<f64>>,
     num_rows: usize,
     num_cols: usize,
+    /// The capture's `group` — LightGBM per-query row COUNTS (`Dataset(group=...)`).
+    /// Converted to `Metadata::query_boundaries` (cumulative offsets) by
+    /// [`query_boundaries`].
+    group: Vec<i32>,
     skipped: Vec<String>,
     cells: Vec<Cell>,
+}
+
+/// The capture's group SIZES as C++ `Metadata::query_boundaries` — `num_queries + 1`
+/// cumulative offsets starting at 0 (`metadata.cpp::SetQuery`'s prefix sum).
+fn query_boundaries(group: &[i32]) -> Vec<i32> {
+    let mut out = Vec::with_capacity(group.len() + 1);
+    let mut acc = 0i32;
+    out.push(0);
+    for &g in group {
+        acc += g;
+        out.push(acc);
+    }
+    out
 }
 
 struct Cell {
@@ -128,8 +128,9 @@ fn load_golden() -> Option<Golden> {
     let num_rows = int_field(&raw, "\"num_rows\"")? as usize;
     let num_cols = int_field(&raw, "\"num_cols\"")? as usize;
     let skipped = object_keys(&raw, "\"skipped\"");
+    let group: Vec<i32> = number_array(&raw, "\"group\"").iter().map(|&v| v as i32).collect();
     let cells = parse_cells(&raw);
-    Some(Golden { features, labels, num_rows, num_cols, skipped, cells })
+    Some(Golden { features, labels, num_rows, num_cols, group, skipped, cells })
 }
 
 /// Read `"<name>": [ "<hex>", ... ]` as f64s decoded from their IEEE-754 bits.
@@ -277,6 +278,13 @@ fn corpus_for(g: &Golden, cell: &Cell, config: &Config) -> RawCorpus {
         .collect();
     let labels: Vec<f32> = g.labels[&cell.labels].iter().map(|&v| v as f32).collect();
     let mut raw = RawCorpus::from_columns(columns, labels);
+    // The capture passed `group=GROUP` to `lgb.Dataset` for exactly the cells that
+    // used the `rank` label vector (`capture.py::family_for`), so the replay must
+    // carry the same query grouping — otherwise the ranking objective/metric sees a
+    // different problem than the oracle did.
+    if cell.labels == "rank" {
+        raw.query_boundaries = query_boundaries(&g.group);
+    }
     raw.config = config.clone();
     raw
 }

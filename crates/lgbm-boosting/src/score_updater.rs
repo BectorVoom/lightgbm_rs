@@ -326,6 +326,56 @@ impl ScoreUpdater {
         }
     }
 
+    /// [`add_tree_predict_path`](Self::add_tree_predict_path) over a ROW-MAJOR dense
+    /// feature matrix (`dense[row * width + feature]`) instead of a per-row closure.
+    ///
+    /// Identical arithmetic, identical order — the only difference is that the row's
+    /// value vector is BORROWED from `dense` rather than freshly allocated per row.
+    /// The closure form allocated one `Vec<f64>` per row per tree, which on the
+    /// bagging / DART / RF paths meant tens of millions of allocations per train.
+    pub fn add_tree_predict_path_dense(
+        &mut self,
+        tree: &Tree,
+        rows: &[i32],
+        cur_tree_id: i32,
+        dense: &[f64],
+        width: usize,
+    ) {
+        if tree.num_leaves <= 1 || width == 0 {
+            return;
+        }
+        let off = self.offset(cur_tree_id);
+        for &row in rows {
+            let start = row as usize * width;
+            let out = tree.predict(&dense[start..start + width]);
+            self.score[off + row as usize] += out;
+        }
+    }
+
+    /// [`add_tree_scaled_all`](Self::add_tree_scaled_all) over a ROW-MAJOR dense
+    /// feature matrix. Same arithmetic and order as the closure form; see
+    /// [`add_tree_predict_path_dense`](Self::add_tree_predict_path_dense) for why the
+    /// borrowed form exists.
+    pub fn add_tree_scaled_all_dense(
+        &mut self,
+        tree: &Tree,
+        cur_tree_id: i32,
+        multiply: f64,
+        dense: &[f64],
+        width: usize,
+    ) {
+        let off = self.offset(cur_tree_id);
+        let nd = self.num_data as usize;
+        if width == 0 {
+            return;
+        }
+        for row in 0..nd {
+            let start = row * width;
+            let out = tree.predict(&dense[start..start + width]) * multiply;
+            self.score[off + row] += out;
+        }
+    }
+
     /// LINEAR-tree training-score update: each row's contribution is its leaf's
     /// per-leaf linear model (`leaf_const + Σ coeff·x`) evaluated on the RAW
     /// features. Leaf membership comes from the tree's data `partition` (BIN-based,
