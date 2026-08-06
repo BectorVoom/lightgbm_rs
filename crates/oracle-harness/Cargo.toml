@@ -11,9 +11,14 @@ anyhow.workspace = true
 # Opt-in ROCm/HIP parity gate: forwards to `lgbm-compute/rocm` so
 # `cargo test -p oracle-harness --features rocm` brings up the hip runtime and
 # runs the SEPARATE ~1e-6 hip-vs-cpu-anchor parity layer in `kernel_parity.rs`.
-# A default (CPU-only) build never enables this — the cpu bit-exact layers are
-# the hard gate (SC#1, D-03a).
-rocm = ["lgbm-compute/rocm"]
+# Also forwards to `lgbm/rocm` so `dev-dependencies`-driven tests that train via
+# the `lgbm` facade (e.g. `string_param_parity.rs`, which calls `lgbm::train_raw`)
+# actually route training through the HIP backend instead of silently staying on
+# `lgbm`'s default CpuBackend — `lgbm`'s backend cascade in `booster.rs` is keyed
+# on `lgbm`'s OWN `rocm` feature, which is a separate Cargo flag from
+# `lgbm-compute`'s. A default (CPU-only) build never enables either — the cpu
+# bit-exact layers are the hard gate (SC#1, D-03a).
+rocm = ["lgbm-compute/rocm", "lgbm/rocm"]
 
 [dev-dependencies]
 lgbm-core = { path = "../lgbm-core" }
