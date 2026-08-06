@@ -160,11 +160,6 @@ A pure-Rust rewrite of Microsoft's LightGBM gradient-boosting library, built as 
 - **Optional dependencies** are guarded with `try/except ImportError` and `*_INSTALLED` flags in
 - isort first-party = `lightgbm` (`[tool.ruff.lint.isort]`). `py.typed` marker present
 
-## R Binding Conventions
-
-- Package at `LightGBM/R-package/`. R sources in `R-package/R/`, C++ glue in `R-package/src/`,
-- Linted by `lintr` via `LightGBM/.ci/lint-r-code.R`, which enforces an opinionated linter set,
-- The core builds with `-DLGB_R_BUILD` so logging and error output route through R's I/O
 
 ## Function & Module Design
 
