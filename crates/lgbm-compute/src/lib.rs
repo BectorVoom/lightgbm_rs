@@ -253,65 +253,412 @@ fn fold_one_feature(bins: &BinColumn, leaf_rows: &[u32], ord_g: &[f32], ord_h: &
 /// and write disjoint `out` regions, so the result is BYTE-IDENTICAL regardless of
 /// `parallel` or thread scheduling (proven by `build_histograms_parallel_equals_serial`)
 /// — the bit-exact merge gate holds for the multi-threaded anchor.
+/// Build the concatenated stride-2 per-feature histogram buffer IN PLACE into
+/// `out` (which this function ZEROES first — callers hand it a reusable slot, no
+/// per-build allocation). Feature `f` occupies `[slot_off[f], slot_off[f] +
+/// 2*num_bins[f])`; regions are ascending and disjoint by construction.
+#[allow(clippy::too_many_arguments)]
 fn build_histograms_into(
     feature_bins: &[&BinColumn],
     num_bins: &[u32],
     slot_off: &[usize],
-    slot_len: usize,
     leaf_rows: &[u32],
     ord_g: &[f32],
     ord_h: &[f32],
     parallel: bool,
     used: Option<&[bool]>,
-) -> Vec<f64> {
+    row_major: Option<&RowMajorBins>,
+    out: &mut [f64],
+) {
     // `used` is the C++ `is_feature_used` build mask (`serial_tree_learner.cpp:387-397`
     // = `is_feature_used_bytree` ∧ parent-splittable). A masked-out feature's region is
     // left ZEROED — never folded and never read: every consumer (both siblings' scans,
     // and the subtract-derived larger child) gates on a SUBSET of this same mask.
     // `None` ⇒ build every feature (the spine default, byte-unchanged).
     let is_used = |fpos: usize| used.is_none_or(|m| m.get(fpos).copied().unwrap_or(true));
-    let mut out = vec![0.0f64; slot_len];
-    if parallel {
-        use rayon::prelude::*;
-        // NOTE: this per-feature `Vec<f64>` intermediate looks like a flattenable
-        // `Vec<Vec<f64>>` wart, but it is LOAD-BEARING. Each rayon task folds into its
-        // OWN cache-hot private buffer, then a single sequential `copy_from_slice`
-        // assembles `out`. A scatter variant (threads folding directly into disjoint
-        // sub-slices of one shared `out`) measured worse due to cache-coherence /
-        // false-sharing traffic exceeding the alloc+copy it would remove. Keep the
-        // private accumulators.
-        //
-        // Masked-out features are filtered BEFORE the par_iter so they cost no rayon
-        // task at all (the point of the mask is to not do the work).
-        let hists: Vec<(usize, Vec<f64>)> = (0..feature_bins.len())
-            .filter(|&fpos| is_used(fpos))
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|fpos| {
-                let mut h = vec![0.0f64; 2 * num_bins[fpos] as usize];
-                fold_one_feature(feature_bins[fpos], leaf_rows, ord_g, ord_h, &mut h);
-                (fpos, h)
-            })
-            .collect();
-        for (fpos, h) in hists {
-            out[slot_off[fpos]..slot_off[fpos] + h.len()].copy_from_slice(&h);
-        }
-    } else {
-        let max_cells = num_bins.iter().copied().max().map_or(0, |m| 2 * m as usize);
-        let mut scratch = vec![0.0f64; max_cells];
-        for (fpos, &bins) in feature_bins.iter().enumerate() {
+    out.fill(0.0);
+
+    // ROW-MAJOR route: for a SCATTERED leaf (density <= 1/2 — the root and near-full
+    // leaves keep the column-wise fold, whose per-column reads stream sequentially),
+    // fold the u8-packed features from the row-major mirror: ~1 cache line per row
+    // instead of ~1 per row per feature. Byte-identical per-feature accumulation
+    // order (ascending `leaf_rows`); any non-packed (u16/u32) feature falls through
+    // to the column-wise fold below.
+    if let Some(rm) = row_major
+        && rm.num_data() == feature_bins.first().map_or(0, |b| b.len())
+        && leaf_rows.len() * 2 <= rm.num_data()
+    {
+        let mut active: Vec<RmActive> = Vec::with_capacity(feature_bins.len());
+        let mut rest: Vec<usize> = Vec::new();
+        for fpos in 0..feature_bins.len() {
             if !is_used(fpos) {
                 continue;
             }
-            let cells = 2 * num_bins[fpos] as usize;
-            for c in scratch[..cells].iter_mut() {
-                *c = 0.0;
+            let j = rm.slot_of_fpos[fpos];
+            if j != u32::MAX {
+                active.push((j, slot_off[fpos], 2 * num_bins[fpos] as usize));
+            } else {
+                rest.push(fpos);
             }
-            fold_one_feature(bins, leaf_rows, ord_g, ord_h, &mut scratch[..cells]);
-            out[slot_off[fpos]..slot_off[fpos] + cells].copy_from_slice(&scratch[..cells]);
+        }
+        if !active.is_empty() {
+            if parallel && active.len() > 1 {
+                fold_rowmajor_parallel(rm, &active, leaf_rows, ord_g, ord_h, out);
+            } else {
+                fold_rowmajor(rm, &active, leaf_rows, ord_g, ord_h, out);
+            }
+        }
+        // Non-packed leftovers: the existing per-column fold (usually empty).
+        for fpos in rest {
+            let cells = 2 * num_bins[fpos] as usize;
+            fold_one_feature(
+                feature_bins[fpos],
+                leaf_rows,
+                ord_g,
+                ord_h,
+                &mut out[slot_off[fpos]..slot_off[fpos] + cells],
+            );
+        }
+        return;
+    }
+
+    // Masked-out features are filtered BEFORE the fold so they cost no work at all
+    // (the point of the mask). Features are then folded in GROUPS of 4: the fused
+    // multi-feature u8 walk ([`fold_u8_x4`]) interleaves four INDEPENDENT f64
+    // accumulation chains in one `leaf_rows` walk — the single-feature fold is bound
+    // by the serial same-bin add dependency chain, not memory, and grouping breaks
+    // that bound while reading `leaf_rows`/`ord_g`/`ord_h` once per group instead of
+    // once per feature. Per-feature accumulation order is UNCHANGED (ascending
+    // `leaf_rows` into its own private histogram) ⇒ byte-identical results, in both
+    // arms, regardless of thread count (`build_histograms_parallel_equals_serial` +
+    // `grouped_fold_is_bit_identical_to_single`).
+    //
+    // Each group folds DIRECTLY into its features' final `out` regions — carved
+    // below into provably-disjoint `&mut` sub-slices (ascending `slot_off`). This
+    // eliminated the per-build private `Vec` allocations + the sequential assembly
+    // copy an earlier design paid (~600KB of pure overhead traffic per leaf build);
+    // group regions are ≥multi-KB so false sharing exists only at region boundaries.
+    let act: Vec<usize> = (0..feature_bins.len()).filter(|&f| is_used(f)).collect();
+    // Carve one disjoint output region per active feature (regions ascend).
+    let mut items: Vec<(usize, &mut [f64])> = Vec::with_capacity(act.len());
+    {
+        let mut rest: &mut [f64] = out;
+        let mut consumed = 0usize;
+        for &fpos in &act {
+            let start = slot_off[fpos];
+            let cells = 2 * num_bins[fpos] as usize;
+            let (_gap, r) = rest.split_at_mut(start - consumed);
+            let (region, r2) = r.split_at_mut(cells);
+            items.push((fpos, region));
+            rest = r2;
+            consumed = start + cells;
         }
     }
-    out
+    // Group into runs of ≤4 for the fused multi-feature walk.
+    let mut groups: Vec<Vec<(usize, &mut [f64])>> = Vec::with_capacity(items.len().div_ceil(4));
+    let mut it = items.into_iter();
+    loop {
+        let grp: Vec<(usize, &mut [f64])> = it.by_ref().take(4).collect();
+        if grp.is_empty() {
+            break;
+        }
+        groups.push(grp);
+    }
+    if parallel {
+        use rayon::prelude::*;
+        groups.par_iter_mut().for_each(|grp| {
+            fold_feature_group_into(feature_bins, leaf_rows, ord_g, ord_h, grp);
+        });
+    } else {
+        for grp in &mut groups {
+            fold_feature_group_into(feature_bins, leaf_rows, ord_g, ord_h, grp);
+        }
+    }
+}
+
+/// A ROW-MAJOR mirror of the u8-width bin columns: row `r`'s bins for every packed
+/// feature are CONTIGUOUS (`data[r * stride + j]`), so a scattered-leaf histogram
+/// build touches ~1 cache line per row instead of ~1 line per row PER FEATURE (the
+/// column-wise gather's cost — the memory-latency wall the per-parameter perf doc
+/// names as the whole remaining build gap vs C++'s multi-value bin).
+///
+/// Only `BinColumn::U8` columns are packed (the `max_bin<=256` default covers every
+/// feature); wider columns keep the column-wise [`fold_one_feature`] path. The
+/// mirror is a pure LAYOUT change: the per-(feature,bin) f64 accumulation order in
+/// the fold stays ascending `leaf_rows`, so the built histograms are BYTE-IDENTICAL
+/// to the column-wise fold (the bit-exact CPU anchor gate holds).
+#[derive(Debug, Clone)]
+pub struct RowMajorBins {
+    /// `data[r * stride + j]` = packed feature `j`'s bin at row `r`.
+    data: Vec<u8>,
+    /// Bytes per row = number of packed features.
+    stride: usize,
+    /// Rows.
+    num_data: usize,
+    /// Feature POSITION (index into the caller's feature array) → packed slot `j`,
+    /// or `u32::MAX` when the feature is not packed (non-u8 width).
+    slot_of_fpos: Vec<u32>,
+}
+
+impl RowMajorBins {
+    /// Build the mirror by block-transposing the u8 columns (parallel over row
+    /// blocks — pure disjoint writes, deterministic). Returns `None` when fewer
+    /// than 2 columns are u8-width (nothing to gain) or there are no rows.
+    #[must_use]
+    pub fn build(feature_bins: &[&BinColumn]) -> Option<Self> {
+        use rayon::prelude::*;
+        let num_data = feature_bins.first()?.len();
+        if num_data == 0 {
+            return None;
+        }
+        let mut slot_of_fpos = vec![u32::MAX; feature_bins.len()];
+        let mut cols: Vec<&[u8]> = Vec::new();
+        for (fpos, b) in feature_bins.iter().enumerate() {
+            if let BinColumn::U8(v) = b {
+                debug_assert_eq!(v.len(), num_data);
+                slot_of_fpos[fpos] = cols.len() as u32;
+                cols.push(v.as_slice());
+            }
+        }
+        if cols.len() < 2 {
+            return None;
+        }
+        let stride = cols.len();
+        let mut data = vec![0u8; num_data * stride];
+        // Block transpose: each block's destination (~BLOCK*stride bytes) stays
+        // cache-resident across the per-column passes; column reads are sequential.
+        const BLOCK: usize = 1024;
+        data.par_chunks_mut(BLOCK * stride)
+            .enumerate()
+            .for_each(|(bi, block)| {
+                let r0 = bi * BLOCK;
+                let rows = block.len() / stride;
+                for (j, col) in cols.iter().enumerate() {
+                    for r in 0..rows {
+                        block[r * stride + j] = col[r0 + r];
+                    }
+                }
+            });
+        Some(Self {
+            data,
+            stride,
+            num_data,
+            slot_of_fpos,
+        })
+    }
+
+    /// Rows in the mirror (must equal the leaf build's column length to be used).
+    #[must_use]
+    pub fn num_data(&self) -> usize {
+        self.num_data
+    }
+}
+
+/// One packed-feature descriptor for the row-major fold: `(packed slot j,
+/// output cell offset, cells = 2*num_bin)`.
+type RmActive = (u32, usize, usize);
+
+/// Fold up to FOUR u8-width features in ONE walk of `leaf_rows` — each feature
+/// accumulates into its OWN histogram in ascending `leaf_rows` order (byte-identical
+/// per-feature result to [`fold_one_feature`]), but the four independent f64
+/// accumulation chains give the out-of-order core real ILP: the single-feature fold
+/// is bound by the serial `same-bin add` dependency chain (~1.7ns/cell measured),
+/// not by memory, and interleaving independent chains breaks that bound. The walk
+/// also reads `leaf_rows`/`ord_g`/`ord_h` ONCE for all four features instead of
+/// once per feature.
+///
+/// Precondition (caller-established once per train): every `col[row] < num_bin`.
+macro_rules! fold_u8_multi {
+    ($name:ident, $n:literal) => {
+        #[inline]
+        fn $name(
+            cols: [&[u8]; $n],
+            leaf_rows: &[u32],
+            ord_g: &[f32],
+            ord_h: &[f32],
+            hists: [&mut [f64]; $n],
+        ) {
+            // SAFETY: `row < num_data` by partition construction; `bin < num_bin`
+            // by the once-per-train upstream gate (same contract as
+            // `fold_one_feature`); `k < leaf_rows.len()` by the iterator.
+            unsafe {
+                for (k, &row) in leaf_rows.iter().enumerate() {
+                    let r = row as usize;
+                    let g = f64::from(*ord_g.get_unchecked(k));
+                    let h = f64::from(*ord_h.get_unchecked(k));
+                    // The per-feature updates are fully independent chains; each
+                    // feature's own (bin) cell order is ascending `leaf_rows`.
+                    let mut i = 0;
+                    while i < $n {
+                        let bin = *cols[i].get_unchecked(r) as usize;
+                        debug_assert!(bin * 2 + 1 < hists[i].len());
+                        *hists[i].get_unchecked_mut(bin * 2) += g;
+                        *hists[i].get_unchecked_mut(bin * 2 + 1) += h;
+                        i += 1;
+                    }
+                }
+            }
+        }
+    };
+}
+fold_u8_multi!(fold_u8_x4, 4);
+fold_u8_multi!(fold_u8_x3, 3);
+fold_u8_multi!(fold_u8_x2, 2);
+
+/// Fold a GROUP of feature positions (≤4) directly into their (pre-zeroed,
+/// disjoint) output regions, using the fused multi-feature u8 walk when the whole
+/// group is u8-width, else the per-feature fold. Byte-identical to folding each
+/// feature alone (same per-feature ascending-row accumulation) — grouping only
+/// adds ILP + shared row-walks.
+fn fold_feature_group_into(
+    feature_bins: &[&BinColumn],
+    leaf_rows: &[u32],
+    ord_g: &[f32],
+    ord_h: &[f32],
+    grp: &mut [(usize, &mut [f64])],
+) {
+    let u8_col = |fpos: usize| match feature_bins[fpos] {
+        BinColumn::U8(v) => Some(v.as_slice()),
+        _ => None,
+    };
+    let all_u8: Option<Vec<&[u8]>> = grp.iter().map(|(f, _)| u8_col(*f)).collect();
+    match (all_u8, grp) {
+        (Some(c), [(_, h0), (_, h1), (_, h2), (_, h3)]) => {
+            fold_u8_x4(
+                [c[0], c[1], c[2], c[3]],
+                leaf_rows,
+                ord_g,
+                ord_h,
+                [&mut **h0, &mut **h1, &mut **h2, &mut **h3],
+            );
+        }
+        (Some(c), [(_, h0), (_, h1), (_, h2)]) => {
+            fold_u8_x3(
+                [c[0], c[1], c[2]],
+                leaf_rows,
+                ord_g,
+                ord_h,
+                [&mut **h0, &mut **h1, &mut **h2],
+            );
+        }
+        (Some(c), [(_, h0), (_, h1)]) => {
+            fold_u8_x2(
+                [c[0], c[1]],
+                leaf_rows,
+                ord_g,
+                ord_h,
+                [&mut **h0, &mut **h1],
+            );
+        }
+        (_, grp) => {
+            for (fpos, h) in grp.iter_mut() {
+                fold_one_feature(feature_bins[*fpos], leaf_rows, ord_g, ord_h, h);
+            }
+        }
+    }
+}
+
+/// Row-major serial fold: ONE pass over `leaf_rows`; for each row, accumulate
+/// every active feature's (grad, hess) into its own `out` region. Per feature the
+/// accumulation order is ascending `leaf_rows` — identical to
+/// [`fold_one_feature`] — so the result is byte-identical to the column-wise fold.
+fn fold_rowmajor(
+    rm: &RowMajorBins,
+    active: &[RmActive],
+    leaf_rows: &[u32],
+    ord_g: &[f32],
+    ord_h: &[f32],
+    out: &mut [f64],
+) {
+    let stride = rm.stride;
+    let data = &rm.data[..];
+    for (k, &row) in leaf_rows.iter().enumerate() {
+        let base = row as usize * stride;
+        // One narrow slice per row: the row's bins are contiguous (the point).
+        let row_bins = &data[base..base + stride];
+        let g = f64::from(ord_g[k]);
+        let h = f64::from(ord_h[k]);
+        for &(j, off, _cells) in active {
+            let bin = row_bins[j as usize] as usize;
+            debug_assert!(off + bin * 2 + 1 < out.len(), "bin out of range — caller must establish bin < num_bin once per train");
+            // SAFETY: `bin < num_bin` is established once per train (the same
+            // upstream gate `fold_one_feature` relies on), and `off + 2*num_bin
+            // <= out.len()` by slot construction.
+            unsafe {
+                *out.get_unchecked_mut(off + bin * 2) += g;
+                *out.get_unchecked_mut(off + bin * 2 + 1) += h;
+            }
+        }
+    }
+}
+
+/// Row-major PARALLEL fold: contiguous chunks of the active features, one rayon
+/// task per chunk, each folding into its OWN private buffer over all `leaf_rows`
+/// (ascending), then a sequential copy assembles `out`. Each feature's cells are
+/// touched by exactly ONE task in ascending-row order ⇒ byte-identical to the
+/// serial fold regardless of thread count or chunking.
+fn fold_rowmajor_parallel(
+    rm: &RowMajorBins,
+    active: &[RmActive],
+    leaf_rows: &[u32],
+    ord_g: &[f32],
+    ord_h: &[f32],
+    out: &mut [f64],
+) {
+    use rayon::prelude::*;
+    let threads = rayon::current_num_threads().max(1);
+    let chunk_len = active.len().div_ceil(threads);
+    let chunks: Vec<&[RmActive]> = active.chunks(chunk_len).collect();
+    let stride = rm.stride;
+    let data = &rm.data[..];
+    let parts: Vec<Vec<f64>> = chunks
+        .par_iter()
+        .map(|feats| {
+            let total: usize = feats.iter().map(|f| f.2).sum();
+            let mut buf = vec![0.0f64; total];
+            for (k, &row) in leaf_rows.iter().enumerate() {
+                let base = row as usize * stride;
+                let row_bins = &data[base..base + stride];
+                let g = f64::from(ord_g[k]);
+                let h = f64::from(ord_h[k]);
+                let mut lo = 0usize;
+                for &(j, _off, cells) in *feats {
+                    let bin = row_bins[j as usize] as usize;
+                    debug_assert!(lo + bin * 2 + 1 < buf.len());
+                    // SAFETY: same per-train `bin < num_bin` gate as fold_rowmajor;
+                    // `lo + cells <= buf.len()` by construction.
+                    unsafe {
+                        *buf.get_unchecked_mut(lo + bin * 2) += g;
+                        *buf.get_unchecked_mut(lo + bin * 2 + 1) += h;
+                    }
+                    lo += cells;
+                }
+            }
+            buf
+        })
+        .collect();
+    for (feats, part) in chunks.iter().zip(parts) {
+        let mut lo = 0usize;
+        for &(_j, off, cells) in *feats {
+            out[off..off + cells].copy_from_slice(&part[lo..lo + cells]);
+            lo += cells;
+        }
+    }
+}
+
+/// Opt-in switch for the row-major build path (`LGBM_ROWMAJOR=1`). Default OFF.
+/// Public so the learner's lazy mirror construction can consult the same gate.
+///
+/// Measured 2026-08-06 (200k×50 u8 bins, binary, 100 iters, M1 8-thread):
+/// row-major ON = 2245ms vs column-wise 2052ms — SLOWER, despite the ~50× fewer
+/// cache-line touches on paper. Cause: the whole 10MB bin matrix is L2-resident on
+/// this workload, so the column-wise scattered reads were already L2 hits and the
+/// mirror's per-row loop overhead (×`num_threads` row walks in the parallel fold)
+/// outweighs the locality win. The path is kept (byte-identical output, proven by
+/// `rowmajor_fold_is_bit_identical_to_columnwise`) for corpora whose bin matrix
+/// spills L2/L3 — opt in with `LGBM_ROWMAJOR=1` and re-measure there.
+pub fn rowmajor_enabled() -> bool {
+    std::env::var("LGBM_ROWMAJOR").map(|v| v == "1").unwrap_or(false)
 }
 
 /// The leaf-row count at/above which a per-leaf build parallelizes over features
@@ -999,7 +1346,46 @@ pub trait Backend {
         gradients: &[f32],
         hessians: &[f32],
         used: Option<&[bool]>,
+        row_major: Option<&RowMajorBins>,
     ) -> Result<Vec<f64>, ComputeError> {
+        // Allocating wrapper around
+        // [`build_leaf_histograms_raw_into`](Backend::build_leaf_histograms_raw_into)
+        // (kept for callers without a reusable slot; the learner's hot path hands
+        // its pool slot to the `_into` variant directly — no per-build allocation).
+        let mut out = vec![0.0f64; slot_len];
+        self.build_leaf_histograms_raw_into(
+            _client,
+            feature_bins,
+            num_bins,
+            slot_off,
+            leaf_rows,
+            gradients,
+            hessians,
+            used,
+            row_major,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// [`build_leaf_histograms_raw`](Backend::build_leaf_histograms_raw), folding
+    /// IN PLACE into the caller's reusable `out` slot (zeroed here first) — the
+    /// learner's histogram-pool slot on the hot path, eliminating the per-build
+    /// buffer allocation + copy-back the allocating variant pays.
+    #[allow(clippy::too_many_arguments)]
+    fn build_leaf_histograms_raw_into(
+        &self,
+        _client: &ComputeClient<Self::Runtime>,
+        feature_bins: &[&BinColumn],
+        num_bins: &[u32],
+        slot_off: &[usize],
+        leaf_rows: &[u32],
+        gradients: &[f32],
+        hessians: &[f32],
+        used: Option<&[bool]>,
+        row_major: Option<&RowMajorBins>,
+        out: &mut [f64],
+    ) -> Result<(), ComputeError> {
         // Gather the ordered gradients/hessians ONCE per leaf — they are
         // identical across every feature (only the bin column differs), so a
         // per-feature re-gather would repeat this work `num_features` times. Mirrors
@@ -1012,34 +1398,28 @@ pub trait Backend {
             ord_g.push(gradients[row as usize]);
             ord_h.push(hessians[row as usize]);
         }
-        // The per-feature bin gather is FUSED into the fold. Read `bins[row]`
-        // inline and fold directly into a REUSED per-feature hot scratch (sized to the
-        // widest feature, <= 2*max_num_bin) — NOT `ord_bins` materialization, NOT a
-        // per-feature alloc, and NOT a fold into the big multi-feature `out` buffer
-        // (folding into `out` directly cache-scatters and regresses large leaves). The
-        // fold is BRANCHLESS: no per-element bin check (see the precondition doc above),
+        // The per-feature bin gather is FUSED into the fold: read `bins[row]`
+        // inline and fold directly into each feature's DISJOINT region of `out`
+        // (carved via `split_at_mut` inside `build_histograms_into`). The fold is
+        // BRANCHLESS: no per-element bin check (see the precondition doc above),
         // only a `debug_assert!`. The f64 fold ORDER is byte-identical to
-        // `construct_histograms_cpu_native` — ascending `leaf_rows`, grad at `bin<<1`,
-        // hess at `+1`, f32-read -> f64-accumulate — so the bit-exact gate holds.
+        // `construct_histograms_cpu_native` — ascending `leaf_rows`, grad at
+        // `bin<<1`, hess at `+1`, f32-read -> f64-accumulate — so the bit-exact
+        // gate holds.
         //
-        // The bin column is NARROW ([`BinColumn`], u8/u16/u32). Dispatch
-        // on the width ONCE per feature (OUTSIDE the row loop) so each arm is a
-        // MONOMORPHIC tight loop reading the narrow element directly — the
-        // cache-density win lives here (no per-element width branch / accessor in the
-        // hot loop). The fold ORDER and the `bin as usize * 2` index arithmetic are
-        // IDENTICAL across arms and identical to the prior u32 path ⇒ bit-exact.
-        // Build each feature's histogram in parallel across rayon WHEN the
-        // leaf is big enough to amortize task dispatch (>= par_build_threshold), else the
-        // serial reused-scratch path. Both call the SAME `fold_one_feature` body with the
-        // SAME ascending order into disjoint `out` regions ⇒ byte-identical result; the
-        // per-feature independence makes it thread-count-deterministic (bit-exact gate
-        // holds). The threshold protects small/medium leaves — unconditional parallel
-        // regressed small trains significantly on rayon dispatch overhead.
+        // The bin column is NARROW ([`BinColumn`], u8/u16/u32); the width dispatch
+        // happens ONCE per feature GROUP (outside the row loop), and all-u8 groups
+        // of ≤4 features fold FUSED in one row-walk (independent per-feature f64
+        // chains ⇒ ILP; per-feature order unchanged ⇒ bit-exact). Groups run in
+        // parallel across rayon WHEN the leaf is big enough to amortize dispatch
+        // (>= par_build_threshold); the serial path folds the same groups in
+        // order. Byte-identical either way ⇒ thread-count-deterministic.
         let parallel = r >= par_build_threshold();
-        let out = build_histograms_into(
-            feature_bins, num_bins, slot_off, slot_len, leaf_rows, &ord_g, &ord_h, parallel, used,
+        build_histograms_into(
+            feature_bins, num_bins, slot_off, leaf_rows, &ord_g, &ord_h, parallel, used,
+            row_major, out,
         );
-        Ok(out)
+        Ok(())
     }
 
     /// Find the best split for EVERY spine feature of ONE leaf in a single batched
@@ -4591,7 +4971,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
 
 #[cfg(test)]
 mod par_build_tests {
-    use super::{build_histograms_into, BinColumn};
+    use super::{build_histograms_into, fold_one_feature, BinColumn, RowMajorBins};
 
     /// Bit-exact guard: the rayon-parallel per-feature build MUST
     /// produce a byte-identical (f64::to_bits) `out` to the serial path — the
@@ -4627,8 +5007,10 @@ mod par_build_tests {
         let ord_h: Vec<f32> = (0..rows).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
         let refs: Vec<&BinColumn> = cols.iter().collect();
 
-        let serial = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, false, None);
-        let parallel = build_histograms_into(&refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, true, None);
+        let mut serial = vec![0.0f64; slot_len];
+        build_histograms_into(&refs, &num_bins, &slot_off, &leaf_rows, &ord_g, &ord_h, false, None, None, &mut serial);
+        let mut parallel = vec![0.0f64; slot_len];
+        build_histograms_into(&refs, &num_bins, &slot_off, &leaf_rows, &ord_g, &ord_h, true, None, None, &mut parallel);
         assert_eq!(serial.len(), parallel.len());
         for (i, (s, p)) in serial.iter().zip(&parallel).enumerate() {
             assert_eq!(s.to_bits(), p.to_bits(), "cell {i}: serial {s} != parallel {p} (not bit-identical)");
@@ -4642,8 +5024,10 @@ mod par_build_tests {
         // regions this build actually wrote.
         let used: Vec<bool> = (0..refs.len()).map(|f| f % 2 == 0).collect();
         for &par in &[false, true] {
-            let masked = build_histograms_into(
-                &refs, &num_bins, &slot_off, slot_len, &leaf_rows, &ord_g, &ord_h, par, Some(&used),
+            let mut masked = vec![0.0f64; slot_len];
+            build_histograms_into(
+                &refs, &num_bins, &slot_off, &leaf_rows, &ord_g, &ord_h, par, Some(&used),
+                None, &mut masked,
             );
             for fpos in 0..refs.len() {
                 let cells = 2 * num_bins[fpos] as usize;
@@ -4664,6 +5048,134 @@ mod par_build_tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The grouped (≤4-feature fused) fold must be BIT-IDENTICAL, cell for cell,
+    /// to folding every feature alone via `fold_one_feature` — in both the serial
+    /// and the parallel arm, with and without a build mask. This is the drift gate
+    /// for the ILP grouping: per-feature accumulation order (ascending
+    /// `leaf_rows`) is the contract, grouping may only add instruction-level
+    /// parallelism.
+    #[test]
+    fn grouped_fold_is_bit_identical_to_single() {
+        let rows: u32 = 4000;
+        // 7 all-u8 features → groups of 4+3 (x4 and x3 kernels); masking one off
+        // below exercises 4+2 (x2). num_bins vary to catch offset mix-ups.
+        let num_bins: Vec<u32> = vec![255, 32, 200, 64, 255, 16, 100];
+        let cols: Vec<BinColumn> = num_bins
+            .iter()
+            .enumerate()
+            .map(|(f, &nb)| {
+                let v: Vec<u32> = (0..rows)
+                    .map(|r| {
+                        let h = (r as u64).wrapping_mul(2_654_435_761).wrapping_add(f as u64 * 131);
+                        (h % nb as u64) as u32
+                    })
+                    .collect();
+                BinColumn::new(v, nb)
+            })
+            .collect();
+        let mut slot_off = Vec::new();
+        let mut off = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(off);
+            off += 2 * nb as usize;
+        }
+        let slot_len = off;
+        let leaf_rows: Vec<u32> = (0..rows).map(|i| (i.wrapping_mul(2_654_435_761)) % rows).collect();
+        let ord_g: Vec<f32> = (0..rows).map(|i| (i % 17) as f32 * 0.07 - 0.5).collect();
+        let ord_h: Vec<f32> = (0..rows).map(|i| 0.9 + (i % 5) as f32 * 0.02).collect();
+        let refs: Vec<&BinColumn> = cols.iter().collect();
+
+        for used in [None, Some((0..7).map(|f| f != 3).collect::<Vec<bool>>())] {
+            // Reference: independent single-feature folds (the pre-grouping body).
+            let mut want = vec![0.0f64; slot_len];
+            for fpos in 0..refs.len() {
+                if used.as_ref().is_some_and(|m| !m[fpos]) {
+                    continue;
+                }
+                let cells = 2 * num_bins[fpos] as usize;
+                fold_one_feature(
+                    refs[fpos],
+                    &leaf_rows,
+                    &ord_g,
+                    &ord_h,
+                    &mut want[slot_off[fpos]..slot_off[fpos] + cells],
+                );
+            }
+            for par in [false, true] {
+                let mut got = vec![0.0f64; slot_len];
+                build_histograms_into(
+                    &refs, &num_bins, &slot_off, &leaf_rows, &ord_g, &ord_h, par,
+                    used.as_deref(), None, &mut got,
+                );
+                for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+                    assert_eq!(
+                        w.to_bits(),
+                        g.to_bits(),
+                        "cell {i} (parallel={par}, masked={}): grouped fold diverged",
+                        used.is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The opt-in row-major mirror fold (`LGBM_ROWMAJOR=1` path) must be
+    /// BIT-IDENTICAL to the column-wise fold in both arms — layout change only.
+    #[test]
+    fn rowmajor_fold_is_bit_identical_to_columnwise() {
+        let rows: u32 = 4000;
+        // Mixed widths: the u16 feature stays column-wise inside the row-major
+        // route (the `rest` leg), the u8 features go through the mirror.
+        let num_bins: Vec<u32> = vec![255, 64, 300, 128, 20];
+        let cols: Vec<BinColumn> = num_bins
+            .iter()
+            .enumerate()
+            .map(|(f, &nb)| {
+                let v: Vec<u32> = (0..rows)
+                    .map(|r| {
+                        let h = (r as u64).wrapping_mul(2_654_435_761).wrapping_add(f as u64 * 977);
+                        (h % nb as u64) as u32
+                    })
+                    .collect();
+                BinColumn::new(v, nb)
+            })
+            .collect();
+        let mut slot_off = Vec::new();
+        let mut off = 0usize;
+        for &nb in &num_bins {
+            slot_off.push(off);
+            off += 2 * nb as usize;
+        }
+        let slot_len = off;
+        // Sparse ascending leaf (density < 1/2 so the row-major route engages).
+        let leaf_rows: Vec<u32> = (0..rows).filter(|r| r % 3 == 0).collect();
+        let n = leaf_rows.len();
+        let ord_g: Vec<f32> = (0..n).map(|i| (i % 11) as f32 * 0.13 - 0.6).collect();
+        let ord_h: Vec<f32> = (0..n).map(|i| 1.0 + (i % 3) as f32 * 0.05).collect();
+        let refs: Vec<&BinColumn> = cols.iter().collect();
+        let rm = RowMajorBins::build(&refs).expect("at least 2 u8 columns, so the mirror builds");
+
+        for par in [false, true] {
+            let mut want = vec![0.0f64; slot_len];
+            build_histograms_into(
+                &refs, &num_bins, &slot_off, &leaf_rows, &ord_g, &ord_h, par, None, None,
+                &mut want,
+            );
+            let mut got = vec![0.0f64; slot_len];
+            build_histograms_into(
+                &refs, &num_bins, &slot_off, &leaf_rows, &ord_g, &ord_h, par, None, Some(&rm),
+                &mut got,
+            );
+            for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    w.to_bits(),
+                    g.to_bits(),
+                    "cell {i} (parallel={par}): row-major fold diverged from column-wise"
+                );
             }
         }
     }
@@ -4954,6 +5466,7 @@ mod build_fix_scan_tests {
         let mut want_buf = backend
             .build_leaf_histograms_raw(
                 &client, &refs, &num_bins, &slot_off, slot_len, &leaf_rows, &grads, &hess, None,
+                None,
             )
             .expect("raw build");
         for (fpos, f) in feats.iter().enumerate() {

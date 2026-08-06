@@ -612,3 +612,93 @@ via `scan_variants_applicable(cfg)` when either axis is active, and the launcher
 through to the shared body — the reference every variant must reproduce anyway. So the
 parameters work on every backend; only the optimization opts out. `--features gpu`
 compiles clean (`--all-targets`).
+
+---
+
+# 8. Beating LightGBM CPU on the baseline workload (2026-08-06)
+
+Goal: make the Rust engine FASTER than `lightgbm==4.6.0` (best thread count) on the
+standard 200k×50 binary workload, with every change proven **bit-exact** (model-dump
+`cmp` against the pre-change binary, full oracle suite green, model sha identical at
+`RAYON_NUM_THREADS=1/2/4/8`).
+
+## 8.1 A fresh regression found first: §7 made the default scan ~7× slower
+
+The morning-of baseline measured **4022 ms** — not the ~2050 ms this document
+records. `LGBM_PHASE_PROF` attributed it: `scan=2242ms` (was ~330). Cause: the
+§7 (`max_delta_step`/`path_smooth`) conversion routed the DEFAULT scan through
+`get_split_gains_full`, whose branchless-select body (required for the `#[cube]`
+device twin) computes the whole clamp+smooth chain — ~5 extra f64 divides per side
+per candidate — and then discards it when both axes are off.
+
+**Fix:** `find_best_split_cpu_native` resolves `use_full = use_smoothing ||
+max_delta_step > 0` ONCE per scan (exactly the C++ template dispatch) and calls the
+closed-form `get_split_gains` on the default path. Bit-identical by construction:
+`get_leaf_gain_full` returns exactly the closed form when both axes are off.
+4022 → 2052 ms.
+
+## 8.2 The optimization ladder (each step bit-identical, measured same-session)
+
+| change | train wall (ms) |
+|---|---:|
+| morning baseline (scan regression live) | 4022 |
+| scan `use_full` config-level dispatch (§8.1) | 2052 |
+| quad-fold + `LGBM_PAR_PARTITION_MIN` 65536→8192 | 1969 |
+| fold directly into the pool slot (no alloc / no copy-back) | 1881 |
+| branchless partition scatter | 1833 |
+| in-place sibling subtract + unchecked scan reads | **1817** |
+
+- **Quad-fold** (`fold_u8_x4/x3/x2`): the single-feature fold is bound by the serial
+  same-bin f64-add dependency chain (~1.7 ns/cell), not memory. Folding 4 u8
+  features per `leaf_rows` walk interleaves 4 independent chains (ILP) and reads
+  `leaf_rows`/`ord_g`/`ord_h` once per group. Per-feature accumulation order is
+  unchanged (ascending rows) ⇒ byte-identical (`grouped_fold_is_bit_identical_to_single`).
+- **Direct fold into the pool slot** (`build_leaf_histograms_raw_into`): the old
+  path paid, per leaf build, a 204KB `vec![0.0]` alloc + a 204KB copy off the
+  private accumulators + a 204KB copy into the pool slot (~3.6 GB of pure overhead
+  traffic per train). Output regions are carved into provably-disjoint `&mut`
+  sub-slices (`split_at_mut`), groups fold straight into them.
+- **Branchless partition scatter**: the route loop's `go_right` on near-random bins
+  was a ~50% mispredicted branch per row. Both scratch heads are written and only
+  the taken side's counter advances — identical routing values, identical
+  `[left | right]` output bits. Applied to both the serial and the block-parallel arm.
+- **`LGBM_PAR_PARTITION_MIN` 65536 → 8192** (swept: 65536→2072, 16384→2009,
+  **8192→1981**, 4096→2008, 2048→2023).
+- **In-place sibling subtract** (`HistogramPool::subtract_into`): `larger = parent −
+  smaller` element-wise in the pool arena (parent slot == larger slot) — no owned
+  intermediate, no copy-back. Element-wise with each cell read before written ⇒
+  bit-exact.
+
+## 8.3 A negative result, kept opt-in: the row-major multi-value bin
+
+§5.4 predicted the column-wise scattered gather was the remaining build gap and a
+row-major mirror the fix. Implemented (`RowMajorBins`, transpose once per train,
+fold walks each row's contiguous bin group) and proven bit-identical
+(`rowmajor_fold_is_bit_identical_to_columnwise`) — and it is **slower** here:
+2245 ms vs 2052 ms. On this workload the whole bin matrix is 10 MB — L2-resident on
+the M1 — so the "scattered" column reads were already L2 hits, and the mirror's
+per-row loop overhead (× N thread row-walks in the parallel fold) loses to it.
+Default OFF (`LGBM_ROWMAJOR=1` to opt in); re-evaluate on corpora whose bin matrix
+spills cache. The §5.4 prediction is hereby corrected: the build was
+**dependency-chain-bound**, not latency-bound, which is why the quad-fold (ILP) won
+where the layout change lost.
+
+## 8.4 Where it landed (same-session, interleaved A/B)
+
+| workload | lightgbm_rs | LightGBM 4.6 (best nthread) | ratio |
+|---|---:|---:|---:|
+| 200k×50, full pool / 8t, round 1 | **1773** | 1862 (8t) | **1.05× faster** |
+| 200k×50, full pool / 8t, round 2 | **1786** | 1831 (8t) | **1.03× faster** |
+| 200k×50, single-thread | **3083** | 4462 (1t) | **1.45× faster** |
+| 7k×28 | 181 (4t) | 149 (1t) | 0.82× (pre-existing) |
+
+Rounds are back-to-back interleaved (LightGBM then Rust, twice, same session);
+Rust walls are reproducible within ±1% across reps. The small-corpus cell is
+scan-dominated (56% of wall; a fixed per-(leaf,feature) cost already at ~1.2 ns per
+candidate step) — a fixed-overhead gap unrelated to today's changes.
+
+Verification: the full suite (lgbm-compute, lgbm-treelearner, oracle-harness, lgbm,
+lgbm-boosting, lgbm-dataset) is green; model dumps are byte-identical to the
+pre-change binary at every step; the model sha256 is identical at 1/2/4/8 rayon
+threads. Two new drift gates pin the fold refactor:
+`grouped_fold_is_bit_identical_to_single`, `rowmajor_fold_is_bit_identical_to_columnwise`.

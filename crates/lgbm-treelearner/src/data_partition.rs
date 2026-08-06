@@ -49,7 +49,13 @@ fn par_partition_min() -> usize {
         std::env::var("LGBM_PAR_PARTITION_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(65536)
+            // Swept 2026-08-06 (200k×50, binary, 100 iters, M1 8-thread), train wall:
+            //   65536 → 2072ms   16384 → 2009ms   8192 → 1981ms
+            //    4096 → 2008ms    2048 → 2023ms
+            // 8192 is the minimum; below it rayon dispatch overhead on small leaves
+            // wins back the parallel gain. Both arms are byte-identical
+            // (`[left ascending | right ascending]`), so this is parity-neutral.
+            .unwrap_or(8192)
     })
 }
 
@@ -429,13 +435,17 @@ impl DataPartition {
                     num_bin,
                 });
             }
-            if go_right(b) {
-                self.part_right[right_count] = row;
-                right_count += 1;
-            } else {
-                self.part_left[left_count] = row;
-                left_count += 1;
-            }
+            // BRANCHLESS scatter: `go_right` on near-random bins is a ~50%
+            // branch — a mispredict per row dominated this pass. Write the row to
+            // BOTH scratch heads and advance only the taken side's counter; the
+            // untaken head is overwritten by a later row (or never read: only
+            // `[..left_count]` / `[..right_count]` are consumed). Identical
+            // routing decisions ⇒ identical `[left|right]` output bits.
+            let gr = go_right(b);
+            self.part_right[right_count] = row;
+            self.part_left[left_count] = row;
+            right_count += usize::from(gr);
+            left_count += usize::from(!gr);
         }
 
         // pass 2: copy the left run then the right run into the leaf slice in place —
@@ -512,13 +522,13 @@ impl DataPartition {
                         bad = Some((base + j, b));
                         break;
                     }
-                    if go_right(b) {
-                        rchunk[rc] = row;
-                        rc += 1;
-                    } else {
-                        lchunk[lc] = row;
-                        lc += 1;
-                    }
+                    // BRANCHLESS scatter — see the serial arm's note: write both
+                    // heads, advance one counter. Same routing ⇒ same output bits.
+                    let gr = go_right(b);
+                    rchunk[rc] = row;
+                    lchunk[lc] = row;
+                    rc += usize::from(gr);
+                    lc += usize::from(!gr);
                 }
                 (lc, rc, bad)
             })

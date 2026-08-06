@@ -8534,7 +8534,7 @@ pub fn find_best_split_cpu_native(
     num_data: i32,
 ) -> Result<SplitInfo, ComputeError> {
     use crate::gain::{
-        calculate_splitted_leaf_output_full as calc_out, get_leaf_gain_full,
+        calculate_splitted_leaf_output_full as calc_out, get_leaf_gain_full, get_split_gains,
         get_split_gains_full,
     };
 
@@ -8577,6 +8577,14 @@ pub fn find_best_split_cpu_native(
     let use_smoothing = cfg.use_smoothing();
     let max_delta_step = cfg.max_delta_step;
     let parent_output = cfg.parent_output;
+    // C++ resolves USE_MAX_OUTPUT/USE_SMOOTHING as TEMPLATE bools — the default
+    // instantiation never touches the clamp/smooth chain. `get_split_gains_full`'s
+    // branchless select-form (required for the `#[cube]` device twin) computes that
+    // whole chain (~5 extra f64 divides per side) and discards it on the default
+    // path, which regressed the host scan ~7x. Dispatch ONCE per scan instead:
+    // `get_leaf_gain_full` returns exactly `get_leaf_gain`'s closed form when both
+    // axes are off, so the fast-path call is bit-identical.
+    let use_full = use_smoothing || max_delta_step > 0.0;
     // `BeforeNumerical` (feature_histogram.hpp:192-207) uses the SAME
     // `GetLeafGain<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>` instantiation as the
     // per-candidate scan, over the WHOLE-leaf sums and the leaf's own row count —
@@ -8643,6 +8651,12 @@ pub fn find_best_split_cpu_native(
         let t_start = num_bin_i - 1 - offset - i32::from(na_as_missing);
         let mut done = false;
         for k in 0..rev_count {
+            // `done` is sticky and every later iteration is fully inert (sums
+            // untouched, no candidate considered) — breaking out is behaviorally
+            // identical and matches the C++ loop's `break` (:c++ feature_histogram).
+            if done {
+                break;
+            }
             let t = t_start - k;
             let in_range = t >= (1 - offset);
             let skip = skip_default_bin && (t + offset) == default_bin as i32;
@@ -8650,9 +8664,13 @@ pub fn find_best_split_cpu_native(
             if active {
                 // `active` implies `in_range` (t >= 1-offset >= 0 for offset∈{0,1}).
                 let bi = (t as usize) * 2;
-                sum_right_gradient += hist[bi];
-                sum_right_hessian += hist[bi + 1];
-                right_count += round_int(hist[bi + 1] * cnt_factor);
+                // SAFETY: `t <= num_bin - 1 - offset` by `t_start` construction, so
+                // `bi + 1 <= 2*num_bin - 1 < hist.len()` (validated above).
+                debug_assert!(bi + 1 < hist.len());
+                let (hg, hh) = unsafe { (*hist.get_unchecked(bi), *hist.get_unchecked(bi + 1)) };
+                sum_right_gradient += hg;
+                sum_right_hessian += hh;
+                right_count += round_int(hh * cnt_factor);
             }
             // Gates computed EVERY iteration (the running sums are unchanged when
             // inactive); `done` is sticky and gates later iterations.
@@ -8665,21 +8683,34 @@ pub fn find_best_split_cpu_native(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
             if consider {
-                let current_gain = get_split_gains_full(
-                    use_l1,
-                    sum_left_gradient,
-                    sum_left_hessian,
-                    sum_right_gradient,
-                    sum_right_hessian,
-                    l1,
-                    l2,
-                    max_delta_step,
-                    use_smoothing,
-                    cfg.path_smooth,
-                    left_count,
-                    right_count,
-                    parent_output,
-                );
+                let current_gain = if use_full {
+                    get_split_gains_full(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                        max_delta_step,
+                        use_smoothing,
+                        cfg.path_smooth,
+                        left_count,
+                        right_count,
+                        parent_output,
+                    )
+                } else {
+                    // Default axes off — bit-identical closed form (see `use_full`).
+                    get_split_gains(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                    )
+                };
                 if current_gain > min_gain_shift {
                     is_splittable = true;
                     if current_gain > best_gain {
@@ -8725,6 +8756,10 @@ pub fn find_best_split_cpu_native(
 
         let mut done = false;
         for k in 0..fwd_count {
+            // Sticky-`done` early exit — see the REVERSE branch note.
+            if done {
+                break;
+            }
             let t = fwd_start + k;
             let skip = skip_default_bin && (t + offset) == default_bin as i32;
             let active = !skip && !done;
@@ -8732,9 +8767,13 @@ pub fn find_best_split_cpu_native(
             // `t=-1` preamble candidate adds nothing here (already folded above).
             if active && t >= 0 {
                 let bi = (t as usize) * 2;
-                sum_left_gradient += hist[bi];
-                sum_left_hessian += hist[bi + 1];
-                left_count += round_int(hist[bi + 1] * cnt_factor);
+                // SAFETY: `t <= fwd_start + fwd_count - 1 <= num_bin - 1 - offset`,
+                // so `bi + 1 < 2*num_bin == hist.len()` (validated above).
+                debug_assert!(bi + 1 < hist.len());
+                let (hg, hh) = unsafe { (*hist.get_unchecked(bi), *hist.get_unchecked(bi + 1)) };
+                sum_left_gradient += hg;
+                sum_left_hessian += hh;
+                left_count += round_int(hh * cnt_factor);
             }
             let right_count = num_data - left_count;
             let sum_right_hessian = sum_hessian_bumped - sum_left_hessian;
@@ -8745,21 +8784,34 @@ pub fn find_best_split_cpu_native(
             done = done || (active && !cont && brk);
             let consider = active && !cont && !done;
             if consider {
-                let current_gain = get_split_gains_full(
-                    use_l1,
-                    sum_left_gradient,
-                    sum_left_hessian,
-                    sum_right_gradient,
-                    sum_right_hessian,
-                    l1,
-                    l2,
-                    max_delta_step,
-                    use_smoothing,
-                    cfg.path_smooth,
-                    left_count,
-                    right_count,
-                    parent_output,
-                );
+                let current_gain = if use_full {
+                    get_split_gains_full(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                        max_delta_step,
+                        use_smoothing,
+                        cfg.path_smooth,
+                        left_count,
+                        right_count,
+                        parent_output,
+                    )
+                } else {
+                    // Default axes off — bit-identical closed form (see `use_full`).
+                    get_split_gains(
+                        use_l1,
+                        sum_left_gradient,
+                        sum_left_hessian,
+                        sum_right_gradient,
+                        sum_right_hessian,
+                        l1,
+                        l2,
+                    )
+                };
                 if current_gain > min_gain_shift {
                     is_splittable = true;
                     if current_gain > best_gain {

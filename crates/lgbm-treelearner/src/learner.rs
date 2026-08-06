@@ -393,6 +393,16 @@ pub struct SerialTreeLearner<'b, B: Backend> {
     /// parameter lifetime and cannot be stored behind `&self` without infecting the
     /// struct with a lifetime param (an architectural change the plan defers).
     build_num_bins: std::cell::RefCell<Vec<u32>>,
+    /// Lazily-built ROW-MAJOR mirror of the u8-width bin columns
+    /// ([`lgbm_compute::RowMajorBins`]) — the scattered-leaf histogram build reads
+    /// one contiguous row-group per leaf row (~1 cache line) instead of one line
+    /// per row PER FEATURE. Outer `None` = not yet attempted for the CURRENT
+    /// feature set; `Some(None)` = attempted, not worthwhile (small corpus / <2 u8
+    /// columns / `LGBM_ROWMAJOR=0`). RESET alongside `bins_validated` at EVERY
+    /// `self.features` (re)assignment (with_features + the bagging swap sites) so a
+    /// stale mirror can never serve a different feature set. Layout-only: the fold
+    /// order is unchanged, so built histograms are byte-identical (bit-exact gate).
+    row_major_cache: std::cell::RefCell<Option<Option<lgbm_compute::RowMajorBins>>>,
     /// The leaf→histogram buffer pool, REUSED across every tree in
     /// this train instead of reallocated per tree at the top of `train_inner`. The
     /// feature set + `num_leaves` are fixed per train, so `cache_size`/`hist_len` are
@@ -672,6 +682,9 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             grow_features_cache: None,
             // Filled lazily on the first leaf-histogram build.
             build_num_bins: std::cell::RefCell::new(Vec::new()),
+            // Built lazily on the first host leaf-histogram build (None = not yet
+            // attempted; Some(None) = attempted, mirror not worthwhile).
+            row_major_cache: std::cell::RefCell::new(None),
             // Built lazily on the first tree, reused across all trees.
             hist_pool: None,
             col_sampler_cache: None,
@@ -836,6 +849,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // The subset feature set makes the memoized on-device
         // `Vec<GrowFeature>` stale — re-arm so it rebuilds over the subset columns.
         self.grow_features_cache = None;
+        // The row-major bin mirror is a pure function of `self.features` — re-arm it too.
+        self.row_major_cache = std::cell::RefCell::new(None);
         let result = self.train(&sub_grad, &sub_hess, is_first_tree);
         self.features = saved;
         // Restoring the full-corpus feature set changes `self.features`
@@ -844,6 +859,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self.bins_validated = false;
         // Restoring the full-corpus feature set re-arms the on-device memo.
         self.grow_features_cache = None;
+        // The row-major bin mirror is a pure function of `self.features` — re-arm it too.
+        self.row_major_cache = std::cell::RefCell::new(None);
         result
     }
 
@@ -876,6 +893,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // The subset feature set makes the memoized on-device
         // `Vec<GrowFeature>` stale — re-arm so it rebuilds over the subset columns.
         self.grow_features_cache = None;
+        // The row-major bin mirror is a pure function of `self.features` — re-arm it too.
+        self.row_major_cache = std::cell::RefCell::new(None);
         let result = self.train_returning_partition(&sub_grad, &sub_hess, is_first_tree);
         self.features = saved;
         // Restoring the full-corpus feature set re-arms the memo (the
@@ -883,6 +902,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         self.bins_validated = false;
         // Restoring the full-corpus feature set re-arms the on-device memo.
         self.grow_features_cache = None;
+        // The row-major bin mirror is a pure function of `self.features` — re-arm it too.
+        self.row_major_cache = std::cell::RefCell::new(None);
         result
     }
 
@@ -2175,42 +2196,38 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
                         pool.buffer(parent_slot).to_vec(),
                         pool.buffer(smaller_slot).to_vec(),
                     ));
-                } else {
-                    // Pass the pool slots directly — `subtract_histograms`
-                    // only READS parent/child and returns a fresh owned buffer, so the two
-                    // per-split `.to_vec()` scratch clones were redundant. `parent_slot ==
-                    // larger_slot`, but `derived` is fully materialized (owns its data) before
-                    // the `buffer_mut(larger_slot)` write below, so there is no aliasing. Same
-                    // f64 cells, same op, same order → parity-neutral; one fewer Vec clone per
-                    // use_subtract larger-child derivation (every split that retains a parent).
+                } else if let Some(audit) = self.subtract_audit.as_ref() {
+                    // TEST audit path (diagnostic only): keep the owned `derived`
+                    // materialization so the audit can record (derived, direct).
                     let derived = self.backend.subtract_histograms(
                         self.client,
                         pool.buffer(parent_slot),
                         pool.buffer(smaller_slot),
                     )?;
-                    // TEST audit hook: record (derived, direct) so a parity
-                    // test can assert the subtracted larger child == a direct build of its
-                    // own rows, cell-for-cell, in the LIVE growth path. Host-path only (the
-                    // resident eligible path is inert here — audit is a non-spine diagnostic).
-                    if let Some(audit) = self.subtract_audit.as_ref() {
-                        let mut direct = vec![0.0f64; derived.len()];
-                        self.build_leaf_histogram_into(
-                            features,
-                            gradients,
-                            hessians,
-                            data_partition,
-                            slot_off,
-                            larger_leaf,
-                            larger_splits,
-                            &mut direct,
-                            // Same mask as the smaller build the subtraction used,
-                            // or the audit would diff a masked build against an
-                            // unmasked derivation and report a phantom residue.
-                            build_used.as_deref(),
-                        );
-                        audit.borrow_mut().push((derived.clone(), direct));
-                    }
+                    let mut direct = vec![0.0f64; derived.len()];
+                    self.build_leaf_histogram_into(
+                        features,
+                        gradients,
+                        hessians,
+                        data_partition,
+                        slot_off,
+                        larger_leaf,
+                        larger_splits,
+                        &mut direct,
+                        // Same mask as the smaller build the subtraction used,
+                        // or the audit would diff a masked build against an
+                        // unmasked derivation and report a phantom residue.
+                        build_used.as_deref(),
+                    );
+                    audit.borrow_mut().push((derived.clone(), direct));
                     pool.buffer_mut(larger_slot).copy_from_slice(&derived);
+                } else {
+                    // Production: derive `larger = parent − smaller` DIRECTLY in the
+                    // pool arena (`parent_slot == larger_slot` ⇒ in place) — the same
+                    // element-wise cells in the same order as `subtract_histograms` +
+                    // `copy_from_slice` (pure element-wise, no accumulation ⇒
+                    // bit-exact), minus one hist_len-cell alloc + copy per split.
+                    pool.subtract_into(larger_slot, parent_slot, smaller_slot);
                 }
                 None
             } else {
@@ -2435,12 +2452,12 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         let sum_g = leaf_splits.sum_gradients;
         let sum_h = leaf_splits.sum_hessians;
         // Empty / no-hessian leaf: leave the slot zeroed (it will not be scanned).
+        // The buildable path does NOT pre-zero here — `build_leaf_histograms_raw_into`
+        // zeroes the slot itself before folding (one pass, not two).
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
         let buildable = sum_h > 0.0 && leaf_splits.num_data_in_leaf > 0;
-        for c in buf.iter_mut() {
-            *c = 0.0;
-        }
         if !buildable {
+            buf.fill(0.0);
             return;
         }
         let leaf_rows = data_partition.indices_in_leaf(leaf);
@@ -2465,23 +2482,45 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             num_bins_ref.extend(features.iter().map(|f| f.num_bin));
         }
         let num_bins: &[u32] = &num_bins_ref;
-        let mut raw = self
-            .backend
-            .build_leaf_histograms_raw(
+        // Lazily build the ROW-MAJOR u8 bin mirror ONCE per feature set (this is
+        // the host build path — resident/GPU builds never reach here, so they never
+        // pay the transpose). Small corpora skip it: the column-wise fold is already
+        // cache-resident there and the transpose would be pure overhead. Layout-only
+        // change — the fold order is unchanged ⇒ byte-identical histograms.
+        {
+            let mut rm = self.row_major_cache.borrow_mut();
+            if rm.is_none() {
+                let num_data = feature_bins.first().map_or(0, |b| b.len());
+                *rm = Some(
+                    (lgbm_compute::rowmajor_enabled() && num_data >= 8192)
+                        .then(|| lgbm_compute::RowMajorBins::build(&feature_bins))
+                        .flatten(),
+                );
+            }
+        }
+        let rm_ref = self.row_major_cache.borrow();
+        let row_major = rm_ref.as_ref().and_then(|o| o.as_ref());
+        // Fold DIRECTLY into the pool slot `buf` (the `_into` variant zeroes it
+        // first) — no intermediate `raw` buffer, no per-build allocation, and no
+        // copy-back: ~600KB less pure-overhead memory traffic per leaf build.
+        // Same fold, same order, same cells ⇒ bit-exact.
+        self.backend
+            .build_leaf_histograms_raw_into(
                 self.client,
                 &feature_bins,
                 num_bins,
                 slot_off,
-                buf.len(),
                 leaf_rows,
                 gradients,
                 hessians,
                 used,
+                row_major,
+                buf,
             )
-            .expect("build_leaf_histograms_raw on a validated leaf cannot fail");
+            .expect("build_leaf_histograms_raw_into on a validated leaf cannot fail");
         // Host-side FixHistogram + compaction per feature (they read this leaf's
         // sums + the per-feature compaction offset — kept in the learner, byte-for-
-        // byte the same ops in the same order as before).
+        // byte the same ops in the same order as before), IN PLACE on the slot.
         for (fpos, f) in features.iter().enumerate() {
             // A masked-out feature was never folded (its region is zeroed), so
             // FixHistogram + compaction would only shuffle zeros. Skip it: the
@@ -2491,19 +2530,13 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
             }
             let cells = 2 * f.num_bin as usize;
             let range = slot_off[fpos]..slot_off[fpos] + cells;
-            // Run FixHistogram + compaction IN PLACE on a &mut sub-slice of the
-            // learner-owned `raw` buffer (no per-feature clone). Same f64 cells,
-            // same op order, same storage type — only the intermediate Vec is gone.
-            {
-                let hist = &mut raw[range.clone()];
-                // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
-                // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
-                crate::fix_histogram::fix_histogram(hist, f.most_freq_bin, sum_g, sum_h);
-                // COMPACTED layout: shift real-bin `c+offset` into cell `c`,
-                // zero the dropped tail. No-op for offset==0.
-                compact_histogram(hist, f.offset);
-            }
-            buf[range.clone()].copy_from_slice(&raw[range]);
+            let hist = &mut buf[range];
+            // FixHistogram on the RAW leaf sums (Pitfall 2). No-op for offset==1
+            // (most_freq_bin==0), exactly as C++ `if (most_freq_bin > 0)`.
+            crate::fix_histogram::fix_histogram(hist, f.most_freq_bin, sum_g, sum_h);
+            // COMPACTED layout: shift real-bin `c+offset` into cell `c`,
+            // zero the dropped tail. No-op for offset==0.
+            compact_histogram(hist, f.offset);
         }
     }
 
@@ -4190,6 +4223,8 @@ impl<'b, B: Backend> SerialTreeLearner<'b, B> {
         // `Vec<GrowFeature>` stale — re-arm so the next on-device train rebuilds it
         // (co-located with the `resident_bins_uploaded`/`bins_validated` resets).
         self.grow_features_cache = None;
+        // The row-major bin mirror is a pure function of `self.features` — re-arm it too.
+        self.row_major_cache = std::cell::RefCell::new(None);
         // The feature set determines `has_categorical_feature`, so re-apply the
         // categorical+quantized host-fallback gate now that the columns are known.
         self.refresh_on_device_eligibility();

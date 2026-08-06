@@ -240,6 +240,33 @@ impl HistogramPool {
         &mut self.buffers[base..base + self.hist_len]
     }
 
+    /// Derive `dst = parent − sub` element-wise over whole slots WITHOUT an owned
+    /// intermediate: bit-identical cells in bit-identical order to
+    /// `subtract_histograms_cpu_native(parent, sub)` + `copy_from_slice` into `dst`
+    /// (pure element-wise, no accumulation — each cell is read before it is
+    /// written, so `parent == dst` subtracts in place safely), minus one
+    /// `hist_len`-cell alloc + copy per use_subtract derivation.
+    pub fn subtract_into(&mut self, dst: usize, parent: usize, sub: usize) {
+        assert_ne!(dst, sub, "subtract_into: dst and sub slots must differ");
+        assert_ne!(parent, sub, "subtract_into: parent and sub slots must differ");
+        let n = self.hist_len;
+        let (d_base, s_base) = (dst * n, sub * n);
+        if parent != dst {
+            let p_base = parent * n;
+            self.buffers.copy_within(p_base..p_base + n, d_base);
+        }
+        let (d, s) = if d_base < s_base {
+            let (lo, hi) = self.buffers.split_at_mut(s_base);
+            (&mut lo[d_base..d_base + n], &hi[..n])
+        } else {
+            let (lo, hi) = self.buffers.split_at_mut(d_base);
+            (&mut hi[..n], &lo[s_base..s_base + n])
+        };
+        for (dc, sc) in d.iter_mut().zip(s) {
+            *dc -= *sc;
+        }
+    }
+
     /// The fixed per-slot histogram length (`2 * num_bin`).
     pub fn hist_len(&self) -> usize {
         self.hist_len
