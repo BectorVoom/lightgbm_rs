@@ -642,7 +642,15 @@ impl CudaServer {
         mode: ExecutionMode,
         stream_id: StreamId,
     ) -> Result<(), ServerError> {
+        // LIGHTGBM_RS FORK (round 3c): time the KernelId construction too — it clones
+        // the comptime state and was previously excluded from every segment.
+        let prof_id = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
         let mut kernel_id = kernel.id();
+        if let Some(start) = prof_id {
+            use core::sync::atomic::Ordering;
+            crate::compute::arena::KID_NS
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         let logger = self.streams.logger.clone();
         kernel_id.mode(mode);
         let grid_constants = self

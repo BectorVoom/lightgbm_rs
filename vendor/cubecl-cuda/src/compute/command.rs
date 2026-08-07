@@ -491,14 +491,33 @@ impl<'a> Command<'a> {
                 kernel_id.cube_dim.z,
             )
         };
+        // Round-3c sub-timers: the ~95µs resolve window was INSENSITIVE to whether it
+        // did two hashed lookups, one, or a bucket find — split it to localize the
+        // stall (key build / map get / bucket find), with ctx-switch counts in the
+        // dump discriminating scheduler preemption.
+        let prof_key_done = prof_lookup.map(|_| std::time::Instant::now());
         let mut resolved_fast = None;
+        let mut prof_get_done = prof_key_done;
         if crate::compute::arena::fast_resolve_enabled() {
             if let Some(bucket) = self.ctx.fast_modules.get(&fast_key) {
+                prof_get_done = prof_key_done.map(|_| std::time::Instant::now());
                 resolved_fast = bucket
                     .iter()
                     .find(|(id, _)| *id == kernel_id)
                     .map(|(_, r)| *r);
+            } else {
+                prof_get_done = prof_key_done.map(|_| std::time::Instant::now());
             }
+        }
+        if let (Some(t0), Some(t1), Some(t2)) = (prof_lookup, prof_key_done, prof_get_done) {
+            use core::sync::atomic::Ordering;
+            let now = std::time::Instant::now();
+            crate::compute::arena::KKEY_NS
+                .fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+            crate::compute::arena::KGET_NS
+                .fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+            crate::compute::arena::KFIND_NS
+                .fetch_add((now - t2).as_nanos() as u64, Ordering::Relaxed);
         }
         let resolved = match resolved_fast {
             Some(r) => {

@@ -87,6 +87,12 @@ pub static KATTR_NS: AtomicU64 = AtomicU64::new(0);
 pub static KLAUNCH_NS: AtomicU64 = AtomicU64::new(0);
 /// Fast-resolve (two-level module cache) hits.
 pub static KFASTHIT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Round-3c teardown of the resolve window: `kernel.id()` construction,
+/// fast-key build (incl. `kernel.name()`), bucket map get, bucket find/eq.
+pub static KID_NS: AtomicU64 = AtomicU64::new(0);
+pub static KKEY_NS: AtomicU64 = AtomicU64::new(0);
+pub static KGET_NS: AtomicU64 = AtomicU64::new(0);
+pub static KFIND_NS: AtomicU64 = AtomicU64::new(0);
 
 /// `CUBECL_CUDA_FAST_RESOLVE=0` restores the single hashed full-KernelId lookup
 /// (default ON: two-level bucket resolve — the full-id hash measured ~86µs/launch).
@@ -136,6 +142,23 @@ fn dump(n: u64) {
         ms(&KATTR_NS),
         ms(&KLAUNCH_NS),
         KFASTHIT_COUNT.load(Ordering::Relaxed),
+    );
+    let ctx_switches = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter(|l| l.contains("ctxt_switches"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "cubecl-launch-prof-resolve: id_ms={:.1} key_ms={:.1} get_ms={:.1} find_ms={:.1} | {}",
+        ms(&KID_NS),
+        ms(&KKEY_NS),
+        ms(&KGET_NS),
+        ms(&KFIND_NS),
+        ctx_switches,
     );
 }
 
