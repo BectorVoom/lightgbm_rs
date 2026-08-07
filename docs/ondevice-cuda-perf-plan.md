@@ -673,3 +673,21 @@ is committed as `scripts/kaggle/lgb-rs-p3-transport.py` (+ a Colab wrapper at
 `scripts/colab/p3_transport_bench.ipynb`; Colab is sm_75+ — functional
 validation only).
 
+
+### Round 3a — CP3→CP4 teardown (2026-08-07, P100, kernel v2)
+
+Wheel = main @ round-3 commit (inline default ON, single-lookup resolve,
+funcattr-once). Walls (warm-median-3): official 2.857 | **rs 5.484** | rs_chan
+(`CUBECL_DEVICE_INLINE=0`) 5.843 | rs_attr_every 5.517. Preds byte-identical
+across rs arms; 100 trees every run. Inline win RE-CONFIRMED on-wheel (1.065×
+here); single-lookup + trivia moved rs 5.635 → 5.484.
+
+**Sub-segment split of the 97µs/launch (prof, 20k launches): lookup_ms=1710 of
+kernel_ms=1787.** The ONE remaining full-`KernelId` map lookup — i.e. hashing
+the kernel's comptime `Info` payload — IS the dispatch storm (~85µs/launch,
+~1.6s/train). Everything else is noise: `cuLaunchKernel` 3.1µs, marshal 0.1µs,
+attr 0.03µs, drop-flush 3ms total. Verdict: the launch-count structure (§11
+lever 1) was never the problem — the per-launch HASH was. Round 3b ships the
+two-level fast resolve (bucket by type-name ptr/mode/cube-dim + full-id
+EQUALITY inside, no hashing; `CUBECL_CUDA_FAST_RESOLVE=0` kill switch) — if
+bucket equality is cheap, projected rs ≈ 3.8–4.0s.
