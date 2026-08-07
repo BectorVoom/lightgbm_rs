@@ -189,8 +189,17 @@ def main():
             "lgb.LGBMRegressor(device_type=\"cuda\", num_leaves=2, n_estimators=1)"
             ".fit(np.zeros((10,2)), np.zeros(10))'", shell=True, check=True)
     except subprocess.CalledProcessError:
-        run("pip uninstall -y lightgbm")
-        run("pip install --no-binary lightgbm 'lightgbm==4.6.0' -C cmake.define.USE_CUDA=ON")
+        run("pip uninstall -y lightgbm", check=False)
+        run("pip install --no-binary lightgbm 'lightgbm==4.6.0' -C cmake.define.USE_CUDA=ON",
+            check=False)
+        smoke = subprocess.run(
+            "python3 -c 'import lightgbm as lgb; import numpy as np; "
+            "lgb.LGBMRegressor(device_type=\"cuda\", num_leaves=2, n_estimators=1)"
+            ".fit(np.zeros((10,2)), np.zeros(10))'", shell=True)
+        if smoke.returncode != 0:
+            print("OFFICIAL_UNAVAILABLE: CUDA source build failed on this host — "
+                  "skipping the official arm; rs arms still run.", flush=True)
+            ARM_ORDER.remove("official")
 
     import numpy as np
     from sklearn.datasets import make_regression
