@@ -36,12 +36,21 @@ impl<S: DeviceService> DeviceHandleSpec<S> for ReentrantMutexDeviceHandle<S> {
     }
 
     fn utilities(&self) -> ServerUtilitiesHandle {
+        // LIGHTGBM_RS FORK: lazily initialize the service exactly as `with_lock` does.
+        // Upstream panics here when `utilities()` is called before the first submit —
+        // which is the normal cubecl-runtime client construction order on
+        // multi_threading targets (the channel handle lazy-inits, this one didn't).
         let state = self.lock.lock.lock();
-        state
-            .map
-            .borrow()
-            .get(&TypeId::of::<S>())
-            .expect("Service not yet initialized — call init() before load()")
+        let mut map = state.map.borrow_mut();
+        map.entry(TypeId::of::<S>())
+            .or_insert_with(|| {
+                let service = S::init(self.device_id);
+                let utilities = service.utilities();
+                ReentrantMutexDeviceState {
+                    service: Cell::new(Some(Box::new(service))),
+                    utilities,
+                }
+            })
             .utilities
             .clone()
     }
