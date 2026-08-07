@@ -768,3 +768,42 @@ round: standalone `Dataset.construct()` under CUDA params segfaults (empty
 worker output) — the construct/train split is reverted; round 4b answers the
 binning-share question with 1-tree walls (≈ construct + fixed overhead) for
 both implementations instead.
+
+### Round 4b — the binning question answered: we BEAT official on fixed cost;
+### the whole remaining gap is per-tree grow compute
+
+Kernel v7, same-session (P100): official 2.87 / 2.83 / 2.87 → **2.87 s**;
+rs 6.35 (cold) / 3.72 / 3.82 → **3.77 s** = **1.31×**. Envelope 3.05e-5, 100
+trees everywhere.
+
+**1-tree walls (≈ Dataset construct + fixed init + 1 tree): official 1.665 s,
+rs 1.190 s.** Binning is NOT a deficit — our fixed pipeline is ~0.48 s FASTER
+than official's. The ledger flips to per-tree marginals:
+
+| | fixed (1-tree) | per-tree marginal ((100t − 1t)/99) |
+|---|---|---|
+| official | 1.665 s | **12.2 ms/tree** |
+| rs | 1.190 s | **26.1 ms/tree** |
+
+The ENTIRE remaining gap (plus our fixed-cost lead) is per-tree grow compute:
+drained per tree = build 9.1 ms + partition 3.9 + setup 2.7 + scan 1.8 + pick
+1.8 + treesplit 0.9 + tail 1.2 (+ grad 1.3 + score 1.9 outside grow). Next
+campaign = device-kernel shape: (1) the u64 LDS build (9.1 ms/tree vs
+official's f32-atomic builder — the bit-exactness premium is paid here; a
+measured comparison of official's ConstructHistogram device time on this image
+would size it), (2) partition micro-shape (3.9 ms/tree, P2.5), (3) per-tree
+setup residue (2.7 ms/tree). The transport layer is DONE: launch path 0.5 µs,
+sync waits ~0.5 s total, compile amortized.
+
+### P3 final scorecard (all same-session P100, byte-identity gated)
+
+| milestone | rs wall | official | gap |
+|---|---|---|---|
+| campaign start (§11) | 5.72 s | 2.79 s | 2.05× |
+| + inline handle (default ON) | 5.48 s | 2.86 s | 1.92× |
+| + PTX cache (default ON) | 4.05 s | 3.16 s | 1.28× |
+| round 4b re-measure | **3.77 s** | 2.87 s | **1.31×** |
+
+(Cross-session absolute walls vary ±10% with the Kaggle box; the same-session
+gap is the metric. Cold first-process still pays ~2.6 s NVRTC once per
+machine/cache — an install/import-time warmup would hide it.)
