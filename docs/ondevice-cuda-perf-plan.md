@@ -726,3 +726,33 @@ the PTX disk cache ON (Global root, persists across processes;
 the per-process residue (driver SASS cache applies). Compile-path prof line
 added (compiles/ptxcache_hits/nvrtc_ms/modload_ms). Arms: official / rs /
 rs_nocache.
+
+### Round 3d RESULTS — PTX cache default ON (kernel v5, P100, 2026-08-07)
+
+| arm | walls (r0/r1/r2) | warm-median |
+|---|---|---|
+| official 4.6.0 | 3.19 / 3.16 / 3.09 | **3.16 s** (this session's box is ~10% slower — same-session compare only) |
+| rs (cache ON) | 7.23 (cold: compiles+seeds cache) / 4.06 / 4.04 | **4.05 s** |
+| rs_nocache | 6.10 / 6.06 / 6.15 | 6.11 s (recompiles every process) |
+
+Gates: 100 trees all runs; rs_nocache preds byte-identical to rs (0.0).
+Compile prof: warm process = `compiles=17 ptxcache_hits=17 nvrtc_ms=0.0
+modload_ms=4.2` — NVRTC eliminated, PTX→SASS module load 4ms total (driver
+SASS cache). Cold/nocache process = `nvrtc_ms=1794 modload_ms=227`. Drain rs
+wall 4.23 s.
+
+**Position: rs 4.05 s vs official 3.16 s SAME-SESSION = 1.28× — from 2.05× at
+the start of the P3 campaign.** Cumulative levers: inline device handle
+(1.045×, default ON) + PTX cache (1.39× warm, default ON) + single-lookup
+resolve/trivia. The cold-start (first process on a box) still pays ~2s NVRTC —
+amortized like any JIT; an install/import-time warmup could hide even that
+(official amortizes at pip-install compile time).
+
+### Remaining gap (~0.9 s) — next campaign, in order
+
+1. Blocking fence waits ~0.5 s/train (5 586 × ~90µs — partly genuine device
+   wait; the §11 sync-deferral machinery is still in-tree).
+2. Binning ~0.85 s inside our wall (official pays a similar CPU cost — parity,
+   not deficit; only worth attacking if its share differs).
+3. Device compute deltas (build 1.14 s + scan 1.09 s drained; official's
+   equivalents unmeasured on this image).
