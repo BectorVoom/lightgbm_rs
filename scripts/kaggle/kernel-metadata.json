@@ -1,0 +1,19 @@
+{
+  "id": "yensen2/lgb-rs-p3-transport",
+  "title": "lgb-rs-p3-transport",
+  "code_file": "lgb-rs-p3-transport.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "Gpu"
+}
