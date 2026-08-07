@@ -69,9 +69,15 @@ try:
     if cfg["backend"] == "official":
         import lightgbm as lgb
         train_set = lgb.Dataset(X, y)
+        t0 = time.time()
+        train_set.construct()
+        construct_s = time.time() - t0
         start = time.time()
         booster = lgb.train(params, train_set, num_boost_round=cfg["num_boost_round"])
-        wall = time.time() - start
+        train_s = time.time() - start
+        wall = construct_s + train_s
+        print(f"OFFICIAL_CONSTRUCT={construct_s}")
+        print(f"OFFICIAL_TRAIN={train_s}")
         num_trees = booster.num_trees()
         preds = booster.predict(X[:n_pred])
     else:
@@ -93,6 +99,9 @@ print(f"WALLCLOCK={wall}")
 '''
 
 NUM_TREES_RE = re.compile(r"^NUM_TREES=(-?\d+)$", re.MULTILINE)
+CONSTRUCT_RE = re.compile(r"^OFFICIAL_CONSTRUCT=([0-9.]+)$", re.MULTILINE)
+TRAIN_RE = re.compile(r"^OFFICIAL_TRAIN=([0-9.]+)$", re.MULTILINE)
+BINNING_RE = re.compile(r"binning=([0-9.]+)ms")
 ARM_ERROR_RE = re.compile(r"^ARM_ERROR=(.*)$", re.MULTILINE)
 COUNTS_RE = re.compile(r"COUNTS: .*grad_passthru=(\d+) grow_pool=(\d+)")
 LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
@@ -103,9 +112,9 @@ LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 ARMS = {
     "official": {"backend": "official", "env": {}},
     "rs": {"backend": "rs", "env": {}},
-    "rs_nocache": {"backend": "rs", "env": {"CUBECL_CUDA_PTX_CACHE": "0"}},
+    "rs_pool": {"backend": "rs", "env": {"LGBM_GROW_POOL": "1"}},
 }
-ARM_ORDER = ["official", "rs", "rs_nocache"]
+ARM_ORDER = ["official", "rs", "rs_pool"]
 
 
 def run(cmd, check=True):
@@ -145,6 +154,9 @@ def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None):
         if line.startswith("WALLCLOCK="):
             wall = float(line.split("=", 1)[1])
     m = NUM_TREES_RE.search(proc.stdout)
+    m_con = CONSTRUCT_RE.search(proc.stdout)
+    m_tr = TRAIN_RE.search(proc.stdout)
+    binnings = BINNING_RE.findall(proc.stderr)
     e = ARM_ERROR_RE.search(proc.stdout)
     counts = COUNTS_RE.findall(proc.stderr)
     passthru = int(counts[-1][0]) if counts else None
@@ -158,6 +170,9 @@ def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None):
         "arm_error": e.group(1) if e else None,
         "grad_passthru": passthru,
         "launch_prof_last": prof_lines[-1] if prof_lines else None,
+        "official_construct": float(m_con.group(1)) if m_con else None,
+        "official_train": float(m_tr.group(1)) if m_tr else None,
+        "rs_binning_ms": float(binnings[-1]) if binnings else None,
         "launch_prof_all": prof_lines[-2:] if prof_lines else None,
         "stderr_tail": proc.stderr[-6000:],
     }
@@ -234,7 +249,8 @@ def main():
             pred_path = os.path.join(out_dir, f"pred_{arm_name}_r{r}.npy")
             res = run_worker(worker_path, data_path, arm, params, pred_path)
             print(f"  r={r} {arm_name:16s} wall={res['wall']} trees={res['num_trees']} "
-                  f"err={res['arm_error']}", flush=True)
+                  f"construct={res['official_construct']} train={res['official_train']} "
+                  f"rs_binning_ms={res['rs_binning_ms']} err={res['arm_error']}", flush=True)
             walls[arm_name].append(res["wall"])
             if res["wall"] is not None and res["num_trees"] != N_ESTIMATORS:
                 trees_ok[arm_name] = False
@@ -244,7 +260,7 @@ def main():
     identity = {}
     if "rs" in pred_paths:
         base = np.load(pred_paths["rs"])
-        for a in ("rs_nocache",):
+        for a in ("rs_pool",):
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None
@@ -254,7 +270,7 @@ def main():
 
     print("\n=== launch-prof diagnostics (not timed) ===")
     prof_summary = {}
-    for arm_name in ("rs", "rs_nocache"):
+    for arm_name in ("rs", "rs_pool"):
         arm = ARMS[arm_name]
         pred_path = os.path.join(out_dir, f"pred_{arm_name}_prof.npy")
         res = run_worker(worker_path, data_path, arm, params, pred_path,
