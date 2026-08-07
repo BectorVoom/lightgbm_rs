@@ -93,6 +93,13 @@ pub static KID_NS: AtomicU64 = AtomicU64::new(0);
 pub static KKEY_NS: AtomicU64 = AtomicU64::new(0);
 pub static KGET_NS: AtomicU64 = AtomicU64::new(0);
 pub static KFIND_NS: AtomicU64 = AtomicU64::new(0);
+/// Round-3d compile-path split: NVRTC source→PTX, `cuModuleLoadData` PTX→SASS,
+/// per-process compile count and PTX-disk-cache hits — the cost round 3c unmasked
+/// (the "97µs/launch" was ~1.7s of per-process compilation on cache misses).
+pub static COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static NVRTC_NS: AtomicU64 = AtomicU64::new(0);
+pub static MODLOAD_NS: AtomicU64 = AtomicU64::new(0);
+pub static PTXCACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// `CUBECL_CUDA_FAST_RESOLVE=0` restores the single hashed full-KernelId lookup
 /// (default ON: two-level bucket resolve — the full-id hash measured ~86µs/launch).
@@ -159,6 +166,13 @@ fn dump(n: u64) {
         ms(&KGET_NS),
         ms(&KFIND_NS),
         ctx_switches,
+    );
+    eprintln!(
+        "cubecl-launch-prof-compile: compiles={} ptxcache_hits={} nvrtc_ms={:.1} modload_ms={:.1}",
+        COMPILE_COUNT.load(Ordering::Relaxed),
+        PTXCACHE_HIT_COUNT.load(Ordering::Relaxed),
+        ms(&NVRTC_NS),
+        ms(&MODLOAD_NS),
     );
 }
 

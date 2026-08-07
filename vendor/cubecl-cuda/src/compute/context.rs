@@ -108,6 +108,19 @@ impl CudaContext {
                         "ptx",
                         CacheOption::default().name("cuda").root(root),
                     ))
+                } else if std::env::var("CUBECL_CUDA_PTX_CACHE").map(|v| v != "0").unwrap_or(true) {
+                    // LIGHTGBM_RS FORK (§12 round 3d): upstream's default is NO ptx cache
+                    // (`CompilationConfig::default().cache == None`), so every fresh
+                    // process NVRTC-compiles every kernel INSIDE the first train (~1.7s
+                    // per process on the P100 bench — the cost round 3c unmasked).
+                    // Default the cache ON at the global root (persists across
+                    // processes); a user cubecl.toml still takes precedence above, and
+                    // `CUBECL_CUDA_PTX_CACHE=0` restores upstream behavior.
+                    let root = cubecl_runtime::config::cache::CacheConfig::Global.root();
+                    Some(CompilationCache::new(
+                        "ptx",
+                        CacheOption::default().name("cuda").root(root),
+                    ))
                 } else {
                     None
                 }
@@ -133,11 +146,19 @@ impl CudaContext {
         mode: ExecutionMode,
         logger: Arc<ServerLogger>,
     ) -> Result<(), LaunchError> {
+        if crate::compute::arena::prof_enabled() {
+            crate::compute::arena::COMPILE_COUNT
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         let hash = if let Some(cache) = &self.ptx_cache {
             let hash = kernel_id.stable_hash();
 
             if let Some(entry) = cache.get(&hash) {
                 log::trace!("Using PTX cache");
+                if crate::compute::arena::prof_enabled() {
+                    crate::compute::arena::PTXCACHE_HIT_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
 
                 self.load_ptx(
                     entry.ptx.clone(),
@@ -154,6 +175,7 @@ impl CudaContext {
         };
 
         log::trace!("Compiling kernel");
+        let prof_nvrtc = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
 
         validate_cube_dim(&self.properties, kernel_id)?;
         validate_units(&self.properties, kernel_id)?;
@@ -258,6 +280,10 @@ impl CudaContext {
             }
         }
 
+        if let Some(start) = prof_nvrtc {
+            crate::compute::arena::NVRTC_NS
+                .fetch_add(start.elapsed().as_nanos() as u64, core::sync::atomic::Ordering::Relaxed);
+        }
         self.load_ptx(
             ptx,
             kernel_id.clone(),
@@ -276,6 +302,7 @@ impl CudaContext {
         cube_dim: CubeDim,
         shared_mem_bytes: usize,
     ) -> Result<(), CompilationError> {
+        let prof_load = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
         let func_name = CString::new(entrypoint_name).unwrap();
         // SAFETY: `ptx` is a valid null-terminated PTX binary from NVRTC. `func_name` is a
         // null-terminated `CString` matching the kernel entry point in the compiled module.
@@ -320,6 +347,10 @@ impl CudaContext {
                 func,
             },
         );
+        if let Some(start) = prof_load {
+            crate::compute::arena::MODLOAD_NS
+                .fetch_add(start.elapsed().as_nanos() as u64, core::sync::atomic::Ordering::Relaxed);
+        }
 
         Ok(())
     }

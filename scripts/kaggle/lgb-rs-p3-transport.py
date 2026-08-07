@@ -103,9 +103,9 @@ LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 ARMS = {
     "official": {"backend": "official", "env": {}},
     "rs": {"backend": "rs", "env": {}},
-    "rs_slow": {"backend": "rs", "env": {"CUBECL_CUDA_FAST_RESOLVE": "0"}},
+    "rs_nocache": {"backend": "rs", "env": {"CUBECL_CUDA_PTX_CACHE": "0"}},
 }
-ARM_ORDER = ["official", "rs", "rs_slow"]
+ARM_ORDER = ["official", "rs", "rs_nocache"]
 
 
 def run(cmd, check=True):
@@ -244,7 +244,7 @@ def main():
     identity = {}
     if "rs" in pred_paths:
         base = np.load(pred_paths["rs"])
-        for a in ("rs_slow",):
+        for a in ("rs_nocache",):
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None
@@ -254,7 +254,7 @@ def main():
 
     print("\n=== launch-prof diagnostics (not timed) ===")
     prof_summary = {}
-    for arm_name in ("rs", "rs_slow"):
+    for arm_name in ("rs", "rs_nocache"):
         arm = ARMS[arm_name]
         pred_path = os.path.join(out_dir, f"pred_{arm_name}_prof.npy")
         res = run_worker(worker_path, data_path, arm, params, pred_path,
