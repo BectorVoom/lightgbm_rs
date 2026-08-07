@@ -97,15 +97,15 @@ ARM_ERROR_RE = re.compile(r"^ARM_ERROR=(.*)$", re.MULTILINE)
 COUNTS_RE = re.compile(r"COUNTS: .*grad_passthru=(\d+) grow_pool=(\d+)")
 LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 
-# Round 3 (CP3->CP4 teardown): wheel defaults now SHIP inline handle (app flip) +
-# funcattr-once + single-lookup module resolve. Arms isolate each lever backwards.
+# Round 3b (fast resolve): wheel defaults ship inline + funcattr-once + the
+# two-level module cache (bucket by type-name ptr/mode/cube-dim, full-KernelId
+# EQUALITY inside — skips the ~85us/launch full-id hash). rs_slow isolates it.
 ARMS = {
     "official": {"backend": "official", "env": {}},
     "rs": {"backend": "rs", "env": {}},
-    "rs_chan": {"backend": "rs", "env": {"CUBECL_DEVICE_INLINE": "0"}},
-    "rs_attr_every": {"backend": "rs", "env": {"CUBECL_CUDA_FUNCATTR_EVERY": "1"}},
+    "rs_slow": {"backend": "rs", "env": {"CUBECL_CUDA_FAST_RESOLVE": "0"}},
 }
-ARM_ORDER = ["official", "rs", "rs_chan", "rs_attr_every"]
+ARM_ORDER = ["official", "rs", "rs_slow"]
 
 
 def run(cmd, check=True):
@@ -244,7 +244,7 @@ def main():
     identity = {}
     if "rs" in pred_paths:
         base = np.load(pred_paths["rs"])
-        for a in ("rs_chan", "rs_attr_every"):
+        for a in ("rs_slow",):
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None
@@ -254,7 +254,7 @@ def main():
 
     print("\n=== launch-prof diagnostics (not timed) ===")
     prof_summary = {}
-    for arm_name in ("rs", "rs_chan"):
+    for arm_name in ("rs", "rs_slow"):
         arm = ARMS[arm_name]
         pred_path = os.path.join(out_dir, f"pred_{arm_name}_prof.npy")
         res = run_worker(worker_path, data_path, arm, params, pred_path,

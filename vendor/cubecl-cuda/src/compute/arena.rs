@@ -85,6 +85,15 @@ pub static KMARSHAL_NS: AtomicU64 = AtomicU64::new(0);
 pub static KATTR_NS: AtomicU64 = AtomicU64::new(0);
 /// CP3→CP4 teardown: the `cuLaunchKernel` driver call itself.
 pub static KLAUNCH_NS: AtomicU64 = AtomicU64::new(0);
+/// Fast-resolve (two-level module cache) hits.
+pub static KFASTHIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// `CUBECL_CUDA_FAST_RESOLVE=0` restores the single hashed full-KernelId lookup
+/// (default ON: two-level bucket resolve — the full-id hash measured ~86µs/launch).
+pub fn fast_resolve_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_CUDA_FAST_RESOLVE").map(|v| v != "0").unwrap_or(true))
+}
 
 const DUMP_EVERY: u64 = 20_000;
 
@@ -121,11 +130,12 @@ fn dump(n: u64) {
         ARENA_WRAP_COUNT.load(Ordering::Relaxed),
     );
     eprintln!(
-        "cubecl-launch-prof-kernel: lookup_ms={:.1} marshal_ms={:.1} attr_ms={:.1} culaunch_ms={:.1}",
+        "cubecl-launch-prof-kernel: lookup_ms={:.1} marshal_ms={:.1} attr_ms={:.1} culaunch_ms={:.1} fast_hits={}",
         ms(&KLOOKUP_NS),
         ms(&KMARSHAL_NS),
         ms(&KATTR_NS),
         ms(&KLAUNCH_NS),
+        KFASTHIT_COUNT.load(Ordering::Relaxed),
     );
 }
 

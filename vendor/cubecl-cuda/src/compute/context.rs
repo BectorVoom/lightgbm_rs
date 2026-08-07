@@ -32,10 +32,22 @@ use std::{ffi::CStr, os::raw::c_void};
 
 use cubecl_common::cache::CacheOption;
 
+/// LIGHTGBM_RS FORK: cheap two-level module-cache key (§12 round 3). The full
+/// `KernelId` hash costs ~86µs/launch on the bench profile (the comptime `Info`
+/// payload), so the hot resolve buckets by (kernel type-name ptr+len, execution
+/// mode, cube dim) — all `Copy`, hashed in nanoseconds — and disambiguates inside
+/// the bucket with the full `KernelId` EQUALITY (field compares, no hashing). A
+/// name-pointer collision across types is impossible (`&'static str` per
+/// monomorphization); a same-type pointer SPLIT (theoretical, multi-codegen-unit)
+/// only causes duplicate buckets — correctness is carried by the full-id equality.
+pub(crate) type FastKernelKey = (usize, usize, ExecutionMode, u32, u32, u32);
+
 #[derive(Debug)]
 pub(crate) struct CudaContext {
     pub context: *mut CUctx_st,
     pub module_names: HashMap<KernelId, CompiledKernel>,
+    /// LIGHTGBM_RS FORK: two-level fast resolve (see [`FastKernelKey`]).
+    pub fast_modules: HashMap<FastKernelKey, Vec<(KernelId, ResolvedKernel)>>,
     ptx_cache: Option<CompilationCache<StableHash, PtxCacheEntry>>,
     pub timestamps: TimestampProfiler,
     pub arch: CudaArchitecture,
@@ -86,6 +98,7 @@ impl CudaContext {
         Self {
             context,
             module_names: HashMap::new(),
+            fast_modules: HashMap::new(),
             ptx_cache: {
                 use cubecl_runtime::config::RuntimeConfig;
                 let config = cubecl_runtime::config::CubeClRuntimeConfig::get();

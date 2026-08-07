@@ -474,17 +474,58 @@ impl<'a> Command<'a> {
         const_info: Option<*mut c_void>,
         logger: Arc<ServerLogger>,
     ) -> Result<(), LaunchError> {
-        // LIGHTGBM_RS FORK: ONE KernelId map lookup per launch. Upstream hashed the
-        // full KernelId twice (contains_key here + get in execute_task); the resolved
-        // `Copy` launch data now flows through instead.
+        // LIGHTGBM_RS FORK (§12 round 3): the full-KernelId hash measured ~86µs/launch
+        // (the comptime Info payload dominates it), so the hot path resolves through a
+        // two-level cache — nanosecond bucket key (type-name ptr+len, mode, cube dim),
+        // then full-KernelId EQUALITY inside the bucket (field compares, no hashing).
+        // `CUBECL_CUDA_FAST_RESOLVE=0` restores the single hashed lookup for A/B.
         let prof_lookup = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
-        let resolved = match self.ctx.resolve_kernel(&kernel_id) {
-            Some(r) => r,
+        let fast_key: crate::compute::context::FastKernelKey = {
+            let name = kernel.name();
+            (
+                name.as_ptr() as usize,
+                name.len(),
+                mode,
+                kernel_id.cube_dim.x,
+                kernel_id.cube_dim.y,
+                kernel_id.cube_dim.z,
+            )
+        };
+        let mut resolved_fast = None;
+        if crate::compute::arena::fast_resolve_enabled() {
+            if let Some(bucket) = self.ctx.fast_modules.get(&fast_key) {
+                resolved_fast = bucket
+                    .iter()
+                    .find(|(id, _)| *id == kernel_id)
+                    .map(|(_, r)| *r);
+            }
+        }
+        let resolved = match resolved_fast {
+            Some(r) => {
+                if prof_lookup.is_some() {
+                    crate::compute::arena::KFASTHIT_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                r
+            }
             None => {
-                self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
-                self.ctx
-                    .resolve_kernel(&kernel_id)
-                    .expect("just compiled and inserted")
+                let r = match self.ctx.resolve_kernel(&kernel_id) {
+                    Some(r) => r,
+                    None => {
+                        self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
+                        self.ctx
+                            .resolve_kernel(&kernel_id)
+                            .expect("just compiled and inserted")
+                    }
+                };
+                if crate::compute::arena::fast_resolve_enabled() {
+                    self.ctx
+                        .fast_modules
+                        .entry(fast_key)
+                        .or_default()
+                        .push((kernel_id.clone(), r));
+                }
+                r
             }
         };
         if let Some(start) = prof_lookup {
