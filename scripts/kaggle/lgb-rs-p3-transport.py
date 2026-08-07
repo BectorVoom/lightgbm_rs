@@ -95,17 +95,17 @@ print(f"WALLCLOCK={wall}")
 NUM_TREES_RE = re.compile(r"^NUM_TREES=(-?\d+)$", re.MULTILINE)
 ARM_ERROR_RE = re.compile(r"^ARM_ERROR=(.*)$", re.MULTILINE)
 COUNTS_RE = re.compile(r"COUNTS: .*grad_passthru=(\d+) grow_pool=(\d+)")
-LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof: .*$", re.MULTILINE)
+LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 
+# Round 3 (CP3->CP4 teardown): wheel defaults now SHIP inline handle (app flip) +
+# funcattr-once + single-lookup module resolve. Arms isolate each lever backwards.
 ARMS = {
     "official": {"backend": "official", "env": {}},
-    "rs_base": {"backend": "rs", "env": {}},
-    "rs_arena": {"backend": "rs", "env": {"CUBECL_CUDA_INFO_ARENA": "1"}},
-    "rs_inline": {"backend": "rs", "env": {"CUBECL_DEVICE_INLINE": "1"}},
-    "rs_inline_arena": {"backend": "rs", "env": {"CUBECL_DEVICE_INLINE": "1",
-                                                  "CUBECL_CUDA_INFO_ARENA": "1"}},
+    "rs": {"backend": "rs", "env": {}},
+    "rs_chan": {"backend": "rs", "env": {"CUBECL_DEVICE_INLINE": "0"}},
+    "rs_attr_every": {"backend": "rs", "env": {"CUBECL_CUDA_FUNCATTR_EVERY": "1"}},
 }
-ARM_ORDER = ["official", "rs_base", "rs_arena", "rs_inline", "rs_inline_arena"]
+ARM_ORDER = ["official", "rs", "rs_chan", "rs_attr_every"]
 
 
 def run(cmd, check=True):
@@ -158,6 +158,7 @@ def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None):
         "arm_error": e.group(1) if e else None,
         "grad_passthru": passthru,
         "launch_prof_last": prof_lines[-1] if prof_lines else None,
+        "launch_prof_all": prof_lines[-2:] if prof_lines else None,
         "stderr_tail": proc.stderr[-6000:],
     }
 
@@ -241,9 +242,9 @@ def main():
                 pred_paths[arm_name] = pred_path
 
     identity = {}
-    if "rs_base" in pred_paths:
-        base = np.load(pred_paths["rs_base"])
-        for a in ("rs_arena", "rs_inline", "rs_inline_arena"):
+    if "rs" in pred_paths:
+        base = np.load(pred_paths["rs"])
+        for a in ("rs_chan", "rs_attr_every"):
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None
@@ -253,17 +254,18 @@ def main():
 
     print("\n=== launch-prof diagnostics (not timed) ===")
     prof_summary = {}
-    for arm_name in ("rs_base", "rs_inline", "rs_inline_arena"):
+    for arm_name in ("rs", "rs_chan"):
         arm = ARMS[arm_name]
         pred_path = os.path.join(out_dir, f"pred_{arm_name}_prof.npy")
         res = run_worker(worker_path, data_path, arm, params, pred_path,
                           extra_env={"CUBECL_CUDA_LAUNCH_PROF": "1"})
-        prof_summary[arm_name] = res["launch_prof_last"]
+        prof_summary[arm_name] = res["launch_prof_all"]
         print(f"  prof {arm_name} wall={res['wall']}")
-        print(f"    {res['launch_prof_last']}")
+        for ln in (res["launch_prof_all"] or [])[-2:]:
+            print(f"    {ln}")
 
     print("\n=== drain-mode ledgers ===")
-    for arm_name in ("rs_base", "rs_inline_arena"):
+    for arm_name in ("rs",):
         arm = ARMS[arm_name]
         pred_path = os.path.join(out_dir, f"pred_{arm_name}_drain.npy")
         res = run_worker(worker_path, data_path, arm, params, pred_path,

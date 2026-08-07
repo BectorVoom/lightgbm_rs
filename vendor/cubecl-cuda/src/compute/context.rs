@@ -50,6 +50,25 @@ pub struct CompiledKernel {
     func: *mut CUfunc_st,
 }
 
+/// LIGHTGBM_RS FORK: the `Copy` launch data of a compiled kernel, resolved with a
+/// single `module_names` lookup (see [`CudaContext::resolve_kernel`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedKernel {
+    pub(crate) func: *mut CUfunc_st,
+    pub(crate) cube_dim: CubeDim,
+    pub(crate) shared_mem_bytes: usize,
+}
+
+/// LIGHTGBM_RS FORK: restore upstream's per-launch `cuFuncSetAttribute` call
+/// (`CUBECL_CUDA_FUNCATTR_EVERY=1`); default OFF — the attribute is set once at
+/// module load.
+fn funcattr_every() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CUBECL_CUDA_FUNCATTR_EVERY").is_ok_and(|v| v == "1")
+    })
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone)]
 pub struct PtxCacheEntry {
     entrypoint_name: String,
@@ -262,6 +281,24 @@ impl CudaContext {
             })?
         };
 
+        // LIGHTGBM_RS FORK: the max-dynamic-shared-memory attribute is a property of the
+        // function, not of a launch — set it ONCE here instead of on every
+        // `cuFuncSetAttribute` in `execute_task` (upstream re-set it per launch, one
+        // extra driver call × ~18.5k launches/train). `CUBECL_CUDA_FUNCATTR_EVERY=1`
+        // restores the per-launch call (execute_task also sets it then).
+        // SAFETY: `func` is the valid function handle just loaded above.
+        unsafe {
+            cudarc::driver::result::function::set_function_attribute(
+                func,
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_mem_bytes as i32,
+            )
+            .map_err(|err| CompilationError::Generic {
+                reason: format!("Unable to set the shared-memory attribute: {err:?}"),
+                backtrace: BackTrace::capture(),
+            })?;
+        }
+
         self.module_names.insert(
             kernel_id.clone(),
             CompiledKernel {
@@ -274,15 +311,30 @@ impl CudaContext {
         Ok(())
     }
 
+    /// LIGHTGBM_RS FORK: resolve a compiled kernel's launch data with ONE map lookup.
+    /// Upstream hashed the full `KernelId` twice per launch (`contains_key` in
+    /// `Command::kernel`, then `get` in `execute_task`); callers now resolve once and
+    /// pass the `Copy` data through.
+    pub fn resolve_kernel(&self, kernel_id: &KernelId) -> Option<ResolvedKernel> {
+        self.module_names.get(kernel_id).map(|k| ResolvedKernel {
+            func: k.func,
+            cube_dim: k.cube_dim,
+            shared_mem_bytes: k.shared_mem_bytes,
+        })
+    }
+
     pub fn execute_task(
         &mut self,
         stream: &mut Stream,
-        kernel_id: KernelId,
+        kernel: ResolvedKernel,
         dispatch_count: (u32, u32, u32),
         tensor_maps: &[CUtensorMap],
         resources: &[GpuResource],
         const_info: Option<*mut c_void>,
     ) -> Result<(), LaunchError> {
+        // LIGHTGBM_RS FORK: sub-segment timers for the CP3→CP4 teardown (§12 lever 2).
+        let prof = crate::compute::arena::prof_enabled();
+        let t0 = prof.then(std::time::Instant::now);
         let mut bindings = tensor_maps
             .iter()
             .map(|map| map as *const _ as *mut c_void)
@@ -290,22 +342,28 @@ impl CudaContext {
         bindings.extend(resources.iter().map(|memory| memory.binding));
         bindings.extend(const_info);
 
-        let kernel = self.module_names.get(&kernel_id).unwrap();
         let cube_dim = kernel.cube_dim;
+        let t1 = prof.then(std::time::Instant::now);
         // SAFETY: `kernel.func` is a valid function handle from a loaded module.
         // `stream.sys` is a valid CUDA stream. `bindings` contains valid device pointers
         // for all kernel arguments. The dispatch and cube dimensions are validated by
         // the caller.
         unsafe {
-            cudarc::driver::result::function::set_function_attribute(
-                kernel.func,
-                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                kernel.shared_mem_bytes as i32,
-            )
-            .map_err(|err| LaunchError::Unknown {
-                reason: format!("{err:?}"),
-                backtrace: BackTrace::capture(),
-            })?;
+            // Upstream set the shared-memory attribute on EVERY launch; the fork sets it
+            // once at module load (`load_ptx`). `CUBECL_CUDA_FUNCATTR_EVERY=1` restores
+            // the per-launch call for A/B.
+            if funcattr_every() {
+                cudarc::driver::result::function::set_function_attribute(
+                    kernel.func,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    kernel.shared_mem_bytes as i32,
+                )
+                .map_err(|err| LaunchError::Unknown {
+                    reason: format!("{err:?}"),
+                    backtrace: BackTrace::capture(),
+                })?;
+            }
+            let t2 = prof.then(std::time::Instant::now);
             cudarc::driver::result::launch_kernel(
                 kernel.func,
                 dispatch_count,
@@ -320,6 +378,16 @@ impl CudaContext {
                 reason: format!("{err:?}"),
                 backtrace: BackTrace::capture(),
             })?;
+            if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                use core::sync::atomic::Ordering;
+                let now = std::time::Instant::now();
+                crate::compute::arena::KMARSHAL_NS
+                    .fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+                crate::compute::arena::KATTR_NS
+                    .fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+                crate::compute::arena::KLAUNCH_NS
+                    .fetch_add((now - t2).as_nanos() as u64, Ordering::Relaxed);
+            }
         };
 
         Ok(())

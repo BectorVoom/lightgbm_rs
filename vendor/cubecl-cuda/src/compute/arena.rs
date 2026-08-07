@@ -77,6 +77,14 @@ pub static CREATE_DATA_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static CREATE_DATA_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ARENA_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static ARENA_WRAP_COUNT: AtomicU64 = AtomicU64::new(0);
+/// CP3→CP4 teardown (§12 lever 2): KernelId map lookup(s) in `Command::kernel`.
+pub static KLOOKUP_NS: AtomicU64 = AtomicU64::new(0);
+/// CP3→CP4 teardown: kernel-arg pointer-vec marshaling in `execute_task`.
+pub static KMARSHAL_NS: AtomicU64 = AtomicU64::new(0);
+/// CP3→CP4 teardown: the (hatched, default-skipped) per-launch `cuFuncSetAttribute`.
+pub static KATTR_NS: AtomicU64 = AtomicU64::new(0);
+/// CP3→CP4 teardown: the `cuLaunchKernel` driver call itself.
+pub static KLAUNCH_NS: AtomicU64 = AtomicU64::new(0);
 
 const DUMP_EVERY: u64 = 20_000;
 
@@ -111,6 +119,13 @@ fn dump(n: u64) {
         CREATE_DATA_BYTES.load(Ordering::Relaxed),
         ARENA_HIT_COUNT.load(Ordering::Relaxed),
         ARENA_WRAP_COUNT.load(Ordering::Relaxed),
+    );
+    eprintln!(
+        "cubecl-launch-prof-kernel: lookup_ms={:.1} marshal_ms={:.1} attr_ms={:.1} culaunch_ms={:.1}",
+        ms(&KLOOKUP_NS),
+        ms(&KMARSHAL_NS),
+        ms(&KATTR_NS),
+        ms(&KLAUNCH_NS),
     );
 }
 

@@ -474,15 +474,30 @@ impl<'a> Command<'a> {
         const_info: Option<*mut c_void>,
         logger: Arc<ServerLogger>,
     ) -> Result<(), LaunchError> {
-        if !self.ctx.module_names.contains_key(&kernel_id) {
-            self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
+        // LIGHTGBM_RS FORK: ONE KernelId map lookup per launch. Upstream hashed the
+        // full KernelId twice (contains_key here + get in execute_task); the resolved
+        // `Copy` launch data now flows through instead.
+        let prof_lookup = crate::compute::arena::prof_enabled().then(std::time::Instant::now);
+        let resolved = match self.ctx.resolve_kernel(&kernel_id) {
+            Some(r) => r,
+            None => {
+                self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
+                self.ctx
+                    .resolve_kernel(&kernel_id)
+                    .expect("just compiled and inserted")
+            }
+        };
+        if let Some(start) = prof_lookup {
+            use core::sync::atomic::Ordering;
+            crate::compute::arena::KLOOKUP_NS
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         let stream = self.streams.current();
 
         let result = self.ctx.execute_task(
             stream,
-            kernel_id,
+            resolved,
             dispatch_count,
             tensor_maps,
             resources,
