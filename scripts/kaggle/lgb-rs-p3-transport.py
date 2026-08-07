@@ -40,6 +40,8 @@ import statistics
 import subprocess
 import sys
 
+BENCH_ROOT = os.environ.get("BENCH_ROOT", "/kaggle/working")
+
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -174,8 +176,8 @@ def main():
 
     run("git clone --depth 1 -b main https://github.com/BectorVoom/lightgbm_rs.git")
     run("cd lightgbm_rs && git rev-parse HEAD")
-    run("cd lightgbm_rs/crates/lgbm-python && maturin build --release --features cuda -j 2 -o /kaggle/working/wheels")
-    run("pip install $(ls /kaggle/working/wheels/*.whl | head -n 1) --force-reinstall --no-deps -q")
+    run(f"cd lightgbm_rs/crates/lgbm-python && maturin build --release --features cuda -j 2 -o {BENCH_ROOT}/wheels")
+    run(f"pip install $(ls {BENCH_ROOT}/wheels/*.whl | head -n 1) --force-reinstall --no-deps -q")
 
     # official LightGBM with CUDA — PINNED to 4.6.0 (the baseline every prior
     # session measured; v1's unpinned install resolved 4.7.0 whose first CUDA
@@ -197,7 +199,7 @@ def main():
         n_samples=N_SAMPLES, n_features=N_FEATURES, n_informative=20,
         noise=5.0, random_state=SEED,
     )
-    out_dir = "/kaggle/working/p3"
+    out_dir = f"{BENCH_ROOT}/p3"
     os.makedirs(out_dir, exist_ok=True)
     data_path = os.path.join(out_dir, "corpus.npz")
     np.savez(data_path, X=X.astype(np.float64), y=y.astype(np.float64))
