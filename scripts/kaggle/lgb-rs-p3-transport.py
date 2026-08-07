@@ -69,15 +69,9 @@ try:
     if cfg["backend"] == "official":
         import lightgbm as lgb
         train_set = lgb.Dataset(X, y)
-        t0 = time.time()
-        train_set.construct()
-        construct_s = time.time() - t0
         start = time.time()
         booster = lgb.train(params, train_set, num_boost_round=cfg["num_boost_round"])
-        train_s = time.time() - start
-        wall = construct_s + train_s
-        print(f"OFFICIAL_CONSTRUCT={construct_s}")
-        print(f"OFFICIAL_TRAIN={train_s}")
+        wall = time.time() - start
         num_trees = booster.num_trees()
         preds = booster.predict(X[:n_pred])
     else:
@@ -112,9 +106,8 @@ LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 ARMS = {
     "official": {"backend": "official", "env": {}},
     "rs": {"backend": "rs", "env": {}},
-    "rs_pool": {"backend": "rs", "env": {"LGBM_GROW_POOL": "1"}},
 }
-ARM_ORDER = ["official", "rs", "rs_pool"]
+ARM_ORDER = ["official", "rs"]
 
 
 def run(cmd, check=True):
@@ -122,7 +115,7 @@ def run(cmd, check=True):
     subprocess.run(cmd, shell=True, check=check)
 
 
-def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None):
+def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None, n_rounds=None):
     env = dict(os.environ)
     if arm["backend"] != "official":
         env["LGBM_PHASE_PROF"] = "1"
@@ -134,7 +127,7 @@ def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None):
         "data_path": data_path,
         "backend": arm["backend"],
         "params": params,
-        "num_boost_round": N_ESTIMATORS,
+        "num_boost_round": n_rounds if n_rounds is not None else N_ESTIMATORS,
         "pred_path": pred_path,
         "n_pred": N_PRED,
     }
@@ -260,7 +253,7 @@ def main():
     identity = {}
     if "rs" in pred_paths:
         base = np.load(pred_paths["rs"])
-        for a in ("rs_pool",):
+        for a in ():
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None
@@ -268,9 +261,18 @@ def main():
             off = np.load(pred_paths["official"])
             identity["official_envelope"] = float(np.max(np.abs(off - base)))
 
+    print("\n=== 1-tree diagnostics (construct + fixed overhead) ===")
+    one_tree = {}
+    for arm_name in ("official", "rs"):
+        arm = ARMS[arm_name]
+        pred_path = os.path.join(out_dir, f"pred_{arm_name}_1tree.npy")
+        res = run_worker(worker_path, data_path, arm, params, pred_path, n_rounds=1)
+        one_tree[arm_name] = res["wall"]
+        print(f"  1tree {arm_name} wall={res['wall']} rs_binning_ms={res['rs_binning_ms']}")
+
     print("\n=== launch-prof diagnostics (not timed) ===")
     prof_summary = {}
-    for arm_name in ("rs", "rs_pool"):
+    for arm_name in ("rs",):
         arm = ARMS[arm_name]
         pred_path = os.path.join(out_dir, f"pred_{arm_name}_prof.npy")
         res = run_worker(worker_path, data_path, arm, params, pred_path,
@@ -297,6 +299,7 @@ def main():
         "tree_count_ok": trees_ok,
         "pred_identity_max_abs_vs_rs_base": identity,
         "launch_prof": prof_summary,
+        "one_tree_walls": one_tree,
     }
     print("\n=== RESULTS_JSON ===")
     print(json.dumps(results, indent=2))
