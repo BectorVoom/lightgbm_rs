@@ -756,3 +756,15 @@ amortized like any JIT; an install/import-time warmup could hide even that
    not deficit; only worth attacking if its share differs).
 3. Device compute deltas (build 1.14 s + scan 1.09 s drained; official's
    equivalents unmeasured on this image).
+
+### Round 4 (partial) — rs at 3.79s; grow-pool is still a wash
+
+Kernel v6: rs warm-median **3.79s** (box faster this session; r0 cold 6.25
+seeds the PTX cache), rs_pool 3.78 — P2.2 pooling stays a WASH even with the
+compile noise gone → hatch kept, default OFF. Cache-warm drain: grow 2256ms =
+build 911 + partition 392 + setup 271 + scan 180 + pick 175 + treesplit 91 +
+tail 122; binning 857, grad 137, score 189. The official arm FAILED this
+round: standalone `Dataset.construct()` under CUDA params segfaults (empty
+worker output) — the construct/train split is reverted; round 4b answers the
+binning-share question with 1-tree walls (≈ construct + fixed overhead) for
+both implementations instead.
