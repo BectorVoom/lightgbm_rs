@@ -197,6 +197,12 @@ pub type CudaRuntime = cubecl::cuda::CudaRuntime;
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn cuda_client() -> ComputeClient<cubecl::cuda::CudaRuntime> {
+    // Flip the cubecl device-handle default to INLINE for CUDA trains (P100-measured
+    // 1.045× wall win, preds byte-identical — plan doc §12). The env var stays the
+    // user override in both directions (`CUBECL_DEVICE_INLINE=0` restores the
+    // upstream channel handle); the choice latches process-globally on the first
+    // client, so this must run before it — which is exactly this call site.
+    cubecl_common::device::set_device_inline_default(true);
     cubecl::cuda::CudaRuntime::client(&cubecl::cuda::CudaDevice::new(0))
 }
 

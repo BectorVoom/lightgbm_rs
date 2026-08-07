@@ -22,6 +22,11 @@ rayon = "1.10"
 # DIRECT optional dep gated on `rocm` keeps the default cpu build from compiling or
 # linking it (SC#1). Its own build.rs auto-selects the right ROCm bindings.
 cubecl-hip-sys = { version = "7", optional = true }
+# cuda-only, optional: direct handle on the (workspace-patched, vendored) cubecl-common
+# to flip the inline-device-handle DEFAULT for CUDA trains (measured 1.045x on P100,
+# byte-identical; plan doc §12). Same version the cubecl facade already pulls — no new
+# supply-chain surface; [patch.crates-io] points it at vendor/cubecl-common.
+cubecl-common = { version = "0.10.0", optional = true }
 # rocm-only, optional: serde now SHIPS (rocm-gated), no longer dev-only. The cubecl
 # `AutotuneKey` trait alias (used by `kernels::autotune::LaunchKey`) requires
 # `serde::{Serialize, DeserializeOwned}` whenever the persistent disk cache is active
@@ -57,7 +62,7 @@ rocm = ["cubecl/hip", "dep:cubecl-hip-sys", "gpu"]
 # CUDA backend (cubecl-cuda / `cubecl::cuda::CudaRuntime`). `cuda`/`wgpu` are
 # sub-features of the already-vetted `cubecl 0.10.0` workspace dep — NO new
 # `[dependencies]` entry is added (no package-legitimacy gate applies).
-cuda = ["cubecl/cuda", "gpu"]
+cuda = ["cubecl/cuda", "gpu", "dep:cubecl-common"]
 # WGPU backend (cubecl-wgpu / `cubecl::wgpu::WgpuRuntime`). NOTE (locked decision
 # #3): the f32-atomic LDS histogram kernel may not compile for the WGSL target
 # (WGSL has no f32 atomics); a `--features wgpu` check failure there is an accepted

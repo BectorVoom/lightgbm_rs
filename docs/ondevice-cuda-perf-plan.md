@@ -612,7 +612,64 @@ gate = all rs arms' preds identical to rs_base.
   (refresh 2026-08-08T00:00Z). Hardened v2 (900s per-arm timeout) queued for the
   refresh window.
 
-### Results
+### Results (run 2, `boomvector/lgb-rs-p3-transport`, Tesla P100, 2026-08-07)
 
-RESULTS PENDING (P100 rerun scheduled after quota refresh).
+Protocol §8 (500k×50, 100 trees, nl=31, order-rotated warm-median-3, one wheel,
+fresh process per run; wheel = main incl. 686e212, built in 11m45s). Gates ALL
+green: 100 trees every run; rs_arena / rs_inline / rs_inline_arena preds
+**byte-identical to rs_base (max_abs = 0.0)**; official envelope 3.065e-5
+(identical to §10/§11 — same corpus, same baseline).
+
+| arm | warm-median | verdict |
+|---|---|---|
+| official (4.6.0 pinned) | **2.886 s** | stable (2.79–2.89 across sessions) |
+| rs_base | 5.889 s | post-P2 baseline reproduced |
+| rs_arena | 5.995 s | **−1.8% LOSS → default stays OFF**, hatch kept |
+| rs_inline | **5.635 s** | **WIN 1.045×**, byte-identical → flip candidate |
+| rs_inline_arena | 5.676 s | ≈ inline alone (arena adds nothing on top) |
+
+Drain walls: rs_base 6.149 s, rs_inline_arena 5.920 s.
+
+**THE LOAD-BEARING FINDING — first per-launch host-cost decomposition (prof
+runs, cumulative at 20 000 launches ≈ 1.08 trains):**
+
+| segment | rs_base | per launch |
+|---|---|---|
+| command/stream-resolve (entry→CP1) | 12.9 ms | 0.6 µs |
+| count+info upload (CP1→CP2) | 113.8 ms | 5.7 µs |
+| resource resolution (CP2→CP3) | 19.1 ms | 1.0 µs |
+| **kernel segment (CP3→CP4)** | **1 948 ms** | **97 µs** |
+| drop-queue flush (n=420) | 4.2 ms | — |
+| blocking fence waits (n=5 586) | 492.7 ms | 88 µs/wait |
+
+The per-launch tax is NOT the info upload (5.7 µs), NOT pool churn, NOT the
+drop-queue (4 ms total — its blocking-flush role was overestimated): **~97 µs
+per launch sits inside CP3→CP4** — `command.kernel()`: two full `KernelId`
+hash/eq lookups (module_names contains_key + execute_task get), param
+marshaling, `cuLaunchKernel`, logger. ×18.5k launches ≈ **1.8 s/train — the
+single biggest addressable chunk of the remaining 1.95× gap.** The arena's
+hypothesized targets (info upload + drop-flush stalls) measured small, which is
+exactly why rs_arena is a wash; the inline win (~0.25 s) matches the removed
+client-side channel hops (which the server-side segments never contained).
+
+### Verdicts & next levers (ranked by measured evidence)
+
+1. **`CUBECL_DEVICE_INLINE` → flip default ON for cuda** (app-side env default
+   at booster init unless user-set): 1.045×, byte-identical, locally validated
+   on cpu + real ROCm GPU (bit-exact gates), P100-validated.
+2. **CP3→CP4 teardown (next fork round):** add sub-checkpoints inside
+   `command.kernel()` to split KernelId-hash / marshal / cuLaunchKernel /
+   logger, then memoize module resolution behind a cheap key (pointer-identity
+   or precomputed u64) — prize is a large share of ~1.8 s/train.
+3. **Fence-wait shape (0.5 s/train, 88 µs/wait × 5.6k):** partly genuine
+   device-wait; re-rank after lever 2 lands.
+4. Arena: keep hatch, default OFF (falsified hypothesis, documented).
+
+Incident notes: run 1 (v1 script) hung 8 h — the UNPINNED official install
+resolved lightgbm 4.7.0 whose first CUDA worker hung on the P100 (not an rs
+arm); weekly GPU quota exhausted on the yensen2 account → run 2 executed on
+boomvector. v2 hardening (4.6.0 pin + 900 s/arm timeout + official-optional)
+is committed as `scripts/kaggle/lgb-rs-p3-transport.py` (+ a Colab wrapper at
+`scripts/colab/p3_transport_bench.ipynb`; Colab is sm_75+ — functional
+validation only).
 

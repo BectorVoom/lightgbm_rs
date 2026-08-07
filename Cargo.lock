@@ -2136,6 +2136,7 @@ name = "lgbm-compute"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "cubecl-common",
  "cubecl-hip-sys",
  "lgbm-core",
  "lgbm-dataset",

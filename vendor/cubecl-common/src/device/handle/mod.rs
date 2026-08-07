@@ -37,12 +37,29 @@ type Inner<S> = mutex::MutexDeviceHandle<S>;
 /// agrees. `is_blocking()` (upstream `const fn`) becomes a plain `fn`; its only callers
 /// gate multi-device collectives, which the inline mode does not support (they panic,
 /// exactly as upstream's non-channel configurations would).
+/// Programmatic default for the inline device handle, consulted only when the
+/// `CUBECL_DEVICE_INLINE` env var is UNSET. Lets an embedding application (e.g. the
+/// lightgbm_rs CUDA backend, where the inline handle measured a byte-identical win)
+/// flip the default without touching the process environment — the env var remains
+/// the user-facing override in BOTH directions (`0` forces channel, `1` forces
+/// inline). Must be called before the first `DeviceHandle` use; the choice latches
+/// process-globally on first use.
+#[cfg(multi_threading)]
+static INLINE_DEFAULT_ON: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// See [`INLINE_DEFAULT_ON`]. No-op after the first `DeviceHandle` use has latched.
+#[cfg(multi_threading)]
+pub fn set_device_inline_default(on: bool) {
+    INLINE_DEFAULT_ON.store(on, core::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(multi_threading)]
 fn inline_enabled() -> bool {
     static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *INLINE.get_or_init(|| {
-        std::env::var("CUBECL_DEVICE_INLINE")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    *INLINE.get_or_init(|| match std::env::var("CUBECL_DEVICE_INLINE") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => INLINE_DEFAULT_ON.load(core::sync::atomic::Ordering::SeqCst),
     })
 }
 
