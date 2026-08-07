@@ -691,3 +691,17 @@ lever 1) was never the problem — the per-launch HASH was. Round 3b ships the
 two-level fast resolve (bucket by type-name ptr/mode/cube-dim + full-id
 EQUALITY inside, no hashing; `CUBECL_CUDA_FAST_RESOLVE=0` kill switch) — if
 bucket equality is cheap, projected rs ≈ 3.8–4.0s.
+
+### Round 3b — fast resolve is a WASH; the window is content-insensitive
+
+Kernel v3 (fast resolve default ON): official 3.02 | rs 5.93 | rs_slow
+(`CUBECL_CUDA_FAST_RESOLVE=0`) 6.00 (session ~5% slower than 3a overall —
+box variance). Prof: `fast_hits=19983/20000` (cache engaged) yet
+`lookup_ms=1909` vs hashed `1946` — NO change. Combined with 3a/round-2 data:
+the resolve window costs ~85–95µs whether it does TWO full-KernelId hashed
+lookups, ONE, or a bucket-get + full-id equality. The kernels' comptime Info
+is tiny (no `#[comptime]` params on the hot kernels), so neither hash nor eq
+can honestly cost that. Conclusion: an EXTERNAL stall pinned to the window
+(scheduler preemption / driver-internal locking), not lookup mechanics. Round
+3c sub-instruments the window (key/get/find + `kernel.id()` + ctx-switch
+counts) to localize it.
