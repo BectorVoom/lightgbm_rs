@@ -569,3 +569,50 @@ far harder than official's fused-kernel CUDA path).
 3. **Binning 0.84–0.96 s** — rayon-parallel already; official pays a similar
    CPU cost inside its wall, so this is parity, not deficit.
 4. cubecl-upstream (dispatch cost, multi-stream) — tracked, out of our tree.
+
+## 12. P3 transport levers (2026-08-07, Kaggle P100, `lgb-rs-p3-transport`)
+
+Attacks lever 1/2/4 of §11 at their COMMON root: the per-launch/per-sync
+transport tax in the cubecl 0.10 dispatch layer, via two vendored forks wired
+with `[patch.crates-io]` (commit 7f97ee5). Both are env-gated and default to
+byte-for-byte upstream behavior:
+
+- **`CUBECL_DEVICE_INLINE=1`** (vendor/cubecl-common): cubecl 0.10 runs the
+  ComputeServer on a dedicated server thread — EVERY launch is a cross-thread
+  channel hop and every blocking readback a 2-way thread ping-pong (~18.5k +
+  6.2k per train). The lever swaps in the upstream reentrant-mutex handle:
+  tasks run inline on the caller thread, zero hops.
+- **`CUBECL_CUDA_INFO_ARENA=1`** (vendor/cubecl-cuda): P100 is sm_60 — no
+  `grid_constants` — so every launch uploads an info/metadata+scalars buffer
+  through pinned-pool reserve → staging `Bytes` → GPU-pool reserve →
+  `cuMemcpyHtoDAsync` → handle drop → drop-queue. The drop-queue flushes every
+  64 staged buffers with a BLOCKING fence sync — a hidden serializer that
+  explains §11's "free-run ≈ drain". The arena replaces all of it with a
+  persistent pinned+device ring (one async H2D per launch, one stream-sync per
+  32MB wrap).
+- **`CUBECL_CUDA_LAUNCH_PROF=1`**: first hard per-launch host-cost
+  decomposition (command/info/resource/kernel segments + drop-flush + blocking
+  fence-wait totals).
+
+Protocol unchanged (§8): 500k×50, 100 trees, nl=31, order-rotated
+warm-median-3, fresh process per run, one wheel, env-toggled arms; byte-identity
+gate = all rs arms' preds identical to rs_base.
+
+### Interim status (2026-08-07, session 1)
+
+- Implementation SHIPPED (commits `7f97ee5`, `686e212`), local gates green:
+  cpu suite 183/183 with the inline handle ON and OFF; REAL-GPU (local ROCm
+  gfx1152) `rocm_backend_parity` 5/5 + `cuda_on_device` 7/7 — including
+  `resident_tree_bit_exact_to_u64_integer_path` — under `CUBECL_DEVICE_INLINE=1`.
+- Fix found by the local gates: upstream's reentrant handle panics when
+  `utilities()` is called before the first submit (the normal client-ctor order);
+  686e212 lazy-inits there, mirroring `with_lock`.
+- Kaggle run 1 (`lgb-rs-p3-transport` v1, built pre-fix): the rs_inline arm hit
+  that panic path and the session hung 4h+, exhausting the weekly GPU quota
+  (refresh 2026-08-08T00:00Z). Hardened v2 (900s per-arm timeout) queued for the
+  refresh window.
+
+### Results
+
+RESULTS PENDING (P100 rerun scheduled after quota refresh).
+
