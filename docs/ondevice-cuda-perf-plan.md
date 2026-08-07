@@ -705,3 +705,24 @@ can honestly cost that. Conclusion: an EXTERNAL stall pinned to the window
 (scheduler preemption / driver-internal locking), not lookup mechanics. Round
 3c sub-instruments the window (key/get/find + `kernel.id()` + ctx-switch
 counts) to localize it.
+
+### Round 3c — THE UNMASKING: it was never a per-launch tax
+
+Kernel v4 sub-timers: the resolve window's interior (id 2.1 + key 1.1 + get
+2.5 + find 4.1 = **~10ms**) vs the window total (**1750ms**); ctx switches 19
+vol/93 nonvol (no preemption). The missing ~1.74s sits in the window TAIL —
+which on the ~17 cache-MISS launches contains `compile_kernel`: **the "97µs/
+launch dispatch tax" of rounds 2–3b was ~1.7s of ONE-TIME, PER-PROCESS kernel
+compilation (NVRTC source→PTX + `cuModuleLoadData` PTX→SASS), smeared across
+the 20k-launch average.** The actual launch path costs ~0.5µs/launch. This
+also retro-explains: content-insensitivity (3b), arena/fast-resolve washes
+(they optimized noise), and the July→August "image regression" (same compile
+burst, different CPU speed). The inline-handle win (1.045×) is real and
+independent. Official LightGBM ships AOT-compiled kernels — it pays zero.
+
+Round 3d: cubecl 0.10 defaults `compilation.cache = None` → the fork defaults
+the PTX disk cache ON (Global root, persists across processes;
+`CUBECL_CUDA_PTX_CACHE=0` restores upstream), leaving `cuModuleLoadData` as
+the per-process residue (driver SASS cache applies). Compile-path prof line
+added (compiles/ptxcache_hits/nvrtc_ms/modload_ms). Arms: official / rs /
+rs_nocache.
