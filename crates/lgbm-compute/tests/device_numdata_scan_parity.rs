@@ -388,7 +388,7 @@ fn run_copack_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
         let hb = upload_f64_buffer(client, &hist_b);
         find_best_splits_fused_siblings_reduce_into_leaves_on(
             client, ha, hb, hist_a.len(), &feats, &real_feats, &cfg,
-            (sg_a, sh_a, smaller_count), (sg_b, sh_b, larger_count), &soa, 0, 1, None,
+            (sg_a, sh_a, smaller_count, 0.0), (sg_b, sh_b, larger_count, 0.0), &soa, 0, 1, None,
         )
         .expect("host co-pack");
 
@@ -397,7 +397,7 @@ fn run_copack_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
         let hb2 = upload_f64_buffer(client, &hist_b);
         find_best_splits_fused_siblings_reduce_into_leaves_devcount_on(
             client, ha2, hb2, hist_a.len(), &feats, &real_feats, &cfg,
-            (sg_a, sh_a, 0), (sg_b, sh_b, 0),
+            (sg_a, sh_a, 0, 0.0), (sg_b, sh_b, 0, 0.0),
             ls.ranges_handle().clone(), LEAF_SPLIT_STRIDE * ls.capacity(),
             ls.roles_handle().clone(), ROLE_STRIDE * ls.capacity(),
             0, 2u32, 3u32, p_count, &soa, 2, 3, None, // which_a=Smaller, which_b=Larger
