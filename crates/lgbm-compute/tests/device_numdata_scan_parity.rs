@@ -69,6 +69,10 @@ fn force_scan_variant(staged: &str, parprefix: &str) {
     }
 }
 
+/// The tests in this binary mutate shared process env (LGBM_SCAN_*) — serialize
+/// them (cargo's default harness runs #[test] fns concurrently).
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Deterministic LCG (no rand dep) — the spike corpus generator pattern.
 struct Lcg(u64);
 impl Lcg {
@@ -220,6 +224,7 @@ fn run_parity_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
 /// variant (the live hip path). This is what makes the deferral's build-LEFT arm possible.
 #[test]
 fn device_numdata_left_right_scan_byte_identical_to_host() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     pin_autotune_off();
     force_scan_variant("1", "1"); // live hip parprefix on both sides
     let client = gpu_client();
@@ -268,6 +273,7 @@ fn device_numdata_left_right_scan_byte_identical_to_host() {
 /// deferral must reproduce byte-for-byte to keep the deferred tree == the flag-OFF tree.
 #[test]
 fn device_numdata_scan_byte_identical_to_host_numdata_scan() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     pin_autotune_off();
     let client = gpu_client();
     // LIVE hip default: staged + parprefix on both sides.
@@ -351,6 +357,7 @@ fn run_reduce_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
 /// fold, on BOTH the live parprefix variant and the legacy fallback.
 #[test]
 fn device_numdata_reduce_into_leaf_byte_identical_to_host() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     pin_autotune_off();
     let client = gpu_client();
     force_scan_variant("1", "1");
@@ -435,10 +442,117 @@ fn run_copack_sweep(client: &cubecl::prelude::ComputeClient<GpuRt>, variant: &st
 /// co-pack fold, on BOTH the live parprefix variant and the legacy fallback.
 #[test]
 fn device_numdata_copack_reduce_byte_identical_to_host() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     pin_autotune_off();
     let client = gpu_client();
     force_scan_variant("1", "1");
     run_copack_sweep(&client, "parprefix");
     force_scan_variant("0", "0");
     run_copack_sweep(&client, "legacy");
+}
+
+/// §12 final-mile lever 1 (SPEC-DRGL-05 deferral, OFFICIAL variant): the
+/// FUSED-SUBTRACT co-pack scan with device-resolved counts
+/// (`find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on` —
+/// what `Backend::subtract_scan_resident_siblings_into_frontier_devcount`
+/// launches on the live cuda config) is byte-identical to the host-count
+/// subtract-fused scan: both SoA records AND the materialized derived-larger
+/// histogram buffer.
+#[test]
+fn device_numdata_subtract_official_reduce_byte_identical_to_host() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use lgbm_compute::kernels::split::{
+        find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on,
+        find_best_splits_fused_siblings_subtract_reduce_into_leaves_on, read_f64_handle,
+        set_scan_official_override,
+    };
+    pin_autotune_off();
+    let client = gpu_client();
+    // Staged ON (official rides the staged gates), parprefix OFF, pargain OFF (hip
+    // defaults it ON, which disqualifies the fused-subtract staged path), official
+    // FORCED ON — the live cuda configuration.
+    force_scan_variant("1", "0");
+    // SAFETY: test-only, sequential.
+    unsafe { std::env::set_var("LGBM_SCAN_PARGAIN", "0") };
+    set_scan_official_override(Some(true));
+
+    let num_bins = [16usize, 8];
+    let (hist_small, slot_off, sg_a, sh_a) = synth_hist(0x5b_7ac7_01, num_bins);
+    let (hist_delta, _, sg_b, sh_b) = synth_hist(0x5b_7ac7_02, num_bins);
+    // parent = smaller + delta (elementwise); both arms derive larger = parent − smaller
+    // from the SAME bytes, so their derived buffers must match bit-for-bit.
+    let hist_parent: Vec<f64> =
+        hist_small.iter().zip(&hist_delta).map(|(a, b)| a + b).collect();
+    let feats = feats_of(slot_off, num_bins);
+    let real_feats = [0i32, 1i32];
+    let cfg = GainConfig::default();
+    let (p_begin, p_count) = (0i32, 251i32);
+
+    for split_point in [100i32, 200i32] {
+        let left = split_point;
+        let right = p_count - split_point;
+        let smaller_is_left = left < right;
+        let smaller_count = if smaller_is_left { left } else { right };
+        let larger_count = if smaller_is_left { right } else { left };
+        let mut ls = DeviceLeafSplits::new(&client, 1).expect("alloc");
+        ls.record_split(&client, split_point, p_begin, p_count);
+        assign_smaller_larger_roles_device(&client, &ls, 0, 99, 98).expect("roles");
+        let soa = SplitSoa::zeroed(&client, 4);
+        let ctx = format!("split_point={split_point}");
+
+        // HOST-count subtract-fused: smaller → slot 0, larger → slot 1.
+        let hs = upload_f64_buffer(&client, &hist_small);
+        let hp = upload_f64_buffer(&client, &hist_parent);
+        let larger_host = find_best_splits_fused_siblings_subtract_reduce_into_leaves_on(
+            &client, hs, hp, hist_small.len(), &feats, &real_feats, &cfg,
+            (sg_a, sh_a, smaller_count, 0.0), (sg_b, sh_b, larger_count, 0.0),
+            &soa, 0, 1, None,
+        )
+        .expect("host subtract-fused")
+        .expect("official staged path must be taken (forced ON)");
+
+        // DEVICE-count subtract-fused: smaller → slot 2, larger → slot 3.
+        let hs2 = upload_f64_buffer(&client, &hist_small);
+        let hp2 = upload_f64_buffer(&client, &hist_parent);
+        let larger_dev = find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on(
+            &client, hs2, hp2, hist_small.len(), &feats, &real_feats, &cfg,
+            (sg_a, sh_a, 0, 0.0), (sg_b, sh_b, 0, 0.0),
+            ls.ranges_handle().clone(), LEAF_SPLIT_STRIDE * ls.capacity(),
+            ls.roles_handle().clone(), ROLE_STRIDE * ls.capacity(),
+            0, 2u32, 3u32, p_count, &soa, 2, 3, None,
+        )
+        .expect("device subtract-fused")
+        .expect("official devcount staged path must be taken (forced ON)");
+
+        // Derived-larger buffers byte-identical.
+        let lh = read_f64_handle(&client, larger_host, hist_small.len());
+        let ld = read_f64_handle(&client, larger_dev, hist_small.len());
+        for (i, (x, y)) in lh.iter().zip(&ld).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{ctx}: larger_out[{i}] ({x} vs {y})");
+        }
+
+        // Records byte-identical (smaller 0==2, larger 1==3).
+        for (host_slot, dev_slot, side) in [(0usize, 2usize, "smaller"), (1, 3, "larger")] {
+            let a = soa.read_record(&client, host_slot);
+            let b = soa.read_record(&client, dev_slot);
+            let c = format!("{ctx} side={side}");
+            assert_eq!(a.is_valid, b.is_valid, "{c}: is_valid");
+            assert_eq!(a.inner_feature_index, b.inner_feature_index, "{c}: feat");
+            assert_eq!(a.threshold, b.threshold, "{c}: threshold");
+            assert_eq!(a.default_left, b.default_left, "{c}: default_left");
+            for (name, x, y) in [
+                ("gain", a.gain, b.gain),
+                ("l_sum_g", a.left_sum_gradients, b.left_sum_gradients),
+                ("l_sum_h", a.left_sum_hessians, b.left_sum_hessians),
+                ("r_sum_g", a.right_sum_gradients, b.right_sum_gradients),
+                ("r_sum_h", a.right_sum_hessians, b.right_sum_hessians),
+                ("l_val", a.left_value, b.left_value),
+                ("r_val", a.right_value, b.right_value),
+            ] {
+                assert_eq!(x.to_bits(), y.to_bits(), "{c}: {name} ({x} vs {y})");
+            }
+            assert!(a.is_valid, "{c}: host subtract fold found no valid split");
+        }
+    }
+    set_scan_official_override(None);
 }

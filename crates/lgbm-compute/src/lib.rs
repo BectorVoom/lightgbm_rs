@@ -5280,6 +5280,109 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         }
     }
 
+    /// GpuBackend override (SPEC-DRGL-05 deferral): the FUSED subtract+co-scan with both
+    /// children's counts resolved ON DEVICE — the deferred loop's per-split scan. Uses the
+    /// OFFICIAL-shape devcount twin (the live cuda variant) so the deferred fold is
+    /// bit-identical to the eager arm's; when the fused/official gates don't hold, falls
+    /// back to the trait default (separate subtract + devcount co-scan), which under those
+    /// same gates is variant-consistent with the eager arm too.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan_resident_siblings_into_frontier_devcount(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent_slot: usize,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        smaller_sums: (f64, f64),
+        larger_sums: (f64, f64),
+        leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        split_idx: usize,
+        which_a: u32,
+        which_b: u32,
+        parent_count: i32,
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf_smaller: usize,
+        out_leaf_larger: usize,
+    ) -> Result<(), ComputeError> {
+        if kernels::grow_driver::subtract_fuse_enabled() {
+            let (parent_h, smaller_h) = {
+                let mirror = self.resident_pool.borrow();
+                let parent_h = mirror.get(parent_slot).and_then(|h| h.clone()).ok_or_else(
+                    || ComputeError::Runtime {
+                        detail: "subtract_scan_siblings_devcount: parent slot is empty"
+                            .to_string(),
+                    },
+                )?;
+                let smaller_h = mirror.get(smaller_slot).and_then(|h| h.clone()).ok_or_else(
+                    || ComputeError::Runtime {
+                        detail: "subtract_scan_siblings_devcount: smaller slot is empty"
+                            .to_string(),
+                    },
+                )?;
+                (parent_h, smaller_h)
+            };
+            let desc = self.scan_desc_cached(client, feats, real_feats, slot_len);
+            let fused =
+                kernels::split::find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on(
+                    client,
+                    smaller_h,
+                    parent_h,
+                    slot_len,
+                    feats,
+                    real_feats,
+                    cfg,
+                    (smaller_sums.0, smaller_sums.1, 0, cfg.parent_output),
+                    (larger_sums.0, larger_sums.1, 0, cfg.parent_output),
+                    leaf_splits.ranges_handle().clone(),
+                    kernels::partition::LEAF_SPLIT_STRIDE * leaf_splits.capacity(),
+                    leaf_splits.roles_handle().clone(),
+                    kernels::partition::ROLE_STRIDE * leaf_splits.capacity(),
+                    split_idx as u32,
+                    which_a,
+                    which_b,
+                    parent_count,
+                    frontier.records(),
+                    out_leaf_smaller,
+                    out_leaf_larger,
+                    desc.as_ref(),
+                )?;
+            if let Some(larger_out) = fused {
+                kernels::grow_driver::bump_subtract_fused();
+                let mut mirror = self.resident_pool.borrow_mut();
+                if larger_slot >= mirror.len() {
+                    mirror.resize_with(larger_slot + 1, || None);
+                }
+                mirror[larger_slot] = Some(larger_out);
+                return Ok(());
+            }
+        }
+        // Trait-default two-step (variant-consistent with the eager arm under the same gates).
+        self.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
+        self.scan_resident_siblings_into_frontier_devcount(
+            client,
+            smaller_slot,
+            larger_slot,
+            slot_len,
+            feats,
+            real_feats,
+            cfg,
+            smaller_sums,
+            larger_sums,
+            leaf_splits,
+            split_idx,
+            which_a,
+            which_b,
+            parent_count,
+            frontier,
+            out_leaf_smaller,
+            out_leaf_larger,
+        )
+    }
+
 }
 
 #[cfg(test)]
