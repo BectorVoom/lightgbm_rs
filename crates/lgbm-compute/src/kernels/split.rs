@@ -3483,17 +3483,19 @@ pub fn find_best_splits_fused_siblings_subtract_staged_official_kernel_devcount(
     min_sum_hessian_in_leaf: f64,
     lambda_l1: f64,
     lambda_l2: f64,
-    min_gain_shift_a: f64,
-    sum_gradient_a: f64,
-    sum_hessian_a: f64,
-    min_gain_shift_b: f64,
-    sum_gradient_b: f64,
-    sum_hessian_b: f64,
+    // LEFT/RIGHT per-branch scalars (host-known from the pick export even under the
+    // read_split deferral); the kernel selects the SMALLER child's set for branch A and
+    // the LARGER's for branch B via the resident role record — the exact values the
+    // eager arm passes as `_a`/`_b`, so the scan is bit-identical.
+    min_gain_shift_left: f64,
+    sum_gradient_left: f64,
+    sum_hessian_left: f64,
+    min_gain_shift_right: f64,
+    sum_gradient_right: f64,
+    sum_hessian_right: f64,
     ranges: &Array<i32>,
     roles: &Array<i32>,
     split_slot: u32,
-    which_a: u32,
-    which_b: u32,
     parent_count: i32,
     n_feats: u32,
     plane_dim: u32,
@@ -3505,12 +3507,23 @@ pub fn find_best_splits_fused_siblings_subtract_staged_official_kernel_devcount(
     let mut state_rev = SharedMemory::<f64>::new(8usize);
     let mut state_fwd = SharedMemory::<f64>::new(8usize);
 
-    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, which_a, parent_count);
-    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, which_b, parent_count);
+    // A = smaller child, B = larger child (the hist buffers are physically
+    // smaller/derived-larger); counts via the shared resolver (which=2/3), scalars
+    // via the same role bit.
+    let num_data_a = resolve_child_num_data(ranges, roles, split_slot, 2u32, parent_count);
+    let num_data_b = resolve_child_num_data(ranges, roles, split_slot, 3u32, parent_count);
+    let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
 
-    let min_gain_shift = select(is_b, min_gain_shift_b, min_gain_shift_a);
-    let sum_gradient = select(is_b, sum_gradient_b, sum_gradient_a);
-    let sum_hessian = select(is_b, sum_hessian_b, sum_hessian_a);
+    let mgs_a = select(smaller_is_left, min_gain_shift_left, min_gain_shift_right);
+    let sg_a = select(smaller_is_left, sum_gradient_left, sum_gradient_right);
+    let sh_a = select(smaller_is_left, sum_hessian_left, sum_hessian_right);
+    let mgs_b = select(smaller_is_left, min_gain_shift_right, min_gain_shift_left);
+    let sg_b = select(smaller_is_left, sum_gradient_right, sum_gradient_left);
+    let sh_b = select(smaller_is_left, sum_hessian_right, sum_hessian_left);
+
+    let min_gain_shift = select(is_b, mgs_b, mgs_a);
+    let sum_gradient = select(is_b, sg_b, sg_a);
+    let sum_hessian = select(is_b, sh_b, sh_a);
     let num_data = select(is_b, num_data_b, num_data_a);
 
     let base = slot_off[fi] as usize;
@@ -7018,6 +7031,56 @@ fn reduce_scan_output_into_two_leaves_par_kernel(
     );
 }
 
+/// SPEC-DRGL-05 deferral: DEVICE-TARGET twin of
+/// [`reduce_scan_output_into_two_leaves_par_kernel`]. Under the read_split deferral the
+/// host does not know which child leaf is the SMALLER sibling (window A) — this twin
+/// resolves the fold TARGETS and per-branch `min_gain_shift` from the resident role
+/// record: A → `select(smaller_is_left, left, right)` of the two host-known child leaf
+/// slots/scalars, B → the other. Same fold body — bit-identical winners.
+#[cfg(feature = "gpu")]
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn reduce_scan_output_into_two_leaves_par_device_target_kernel(
+    raw: &Array<f64>,
+    real_feats: &Array<f64>,
+    out_valid: &mut Array<f64>,
+    out_gain: &mut Array<f64>,
+    out_feat: &mut Array<f64>,
+    out_thr: &mut Array<f64>,
+    out_dleft: &mut Array<f64>,
+    out_ncat: &mut Array<f64>,
+    out_lsum_g: &mut Array<f64>,
+    out_lsum_h: &mut Array<f64>,
+    out_rsum_g: &mut Array<f64>,
+    out_rsum_h: &mut Array<f64>,
+    out_lval: &mut Array<f64>,
+    out_rval: &mut Array<f64>,
+    roles: &Array<i32>,
+    split_slot: u32,
+    n_feats: u32,
+    out_slot_left: u32,
+    out_slot_right: u32,
+    min_gain_shift_left: f64,
+    min_gain_shift_right: f64,
+    penalty: f64,
+    neg_inf: f64,
+) {
+    let task = CUBE_POS_X;
+    let smaller_is_left = roles[(split_slot * 3) as usize] != 0;
+    let slot_a = select(smaller_is_left, out_slot_left, out_slot_right);
+    let slot_b = select(smaller_is_left, out_slot_right, out_slot_left);
+    let mgs_a = select(smaller_is_left, min_gain_shift_left, min_gain_shift_right);
+    let mgs_b = select(smaller_is_left, min_gain_shift_right, min_gain_shift_left);
+    let rb = select(task == 0, 0u32, n_feats * 12u32);
+    let slot = select(task == 0, slot_a, slot_b);
+    let min_gain_shift = select(task == 0, mgs_a, mgs_b);
+    reduce_window_par_body(
+        raw, real_feats, out_valid, out_gain, out_feat, out_thr, out_dleft, out_ncat,
+        out_lsum_g, out_lsum_h, out_rsum_g, out_rsum_h, out_lval, out_rval, rb, n_feats, slot,
+        min_gain_shift, penalty, neg_inf,
+    );
+}
+
 /// Cross-FEATURE reduce BODY. Decodes one leaf's raw `n*12`-cell scan
 /// window (`find_best_splits_fused_kernel` / `find_best_splits_fused_siblings_kernel`
 /// / `build_fix_scan_fused_kernel` all emit the SAME layout) with the SAME
@@ -7401,6 +7464,77 @@ pub fn launch_reduce_into_two_leaves<R: cubecl::Runtime>(
             f64::NEG_INFINITY,
         );
     }
+}
+
+/// SPEC-DRGL-05 deferral: DEVICE-TARGET two-leaf reduce launcher — fold targets and
+/// per-branch `min_gain_shift` resolved on device from the resident role record
+/// ([`reduce_scan_output_into_two_leaves_par_device_target_kernel`]). PAR-ONLY, real
+/// device only (the deferred arm requires the cuda-default `reduce_par` config); a
+/// non-par/cpu client is a typed error so the deferral gate can surface it once.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_reduce_into_two_leaves_device_target<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    h_raw: cubecl::server::Handle,
+    raw_len: usize,
+    real_feats: &[i32],
+    n_feats: usize,
+    out: &crate::kernels::best_split::SplitSoa,
+    roles: cubecl::server::Handle,
+    roles_len: usize,
+    split_slot: u32,
+    out_slot_left: usize,
+    out_slot_right: usize,
+    min_gain_shift_left: f64,
+    min_gain_shift_right: f64,
+    h_rf_cached: Option<cubecl::server::Handle>,
+) -> Result<(), ComputeError> {
+    if !reduce_par_enabled(client) || <R as cubecl::Runtime>::name(client) == "cpu" {
+        return Err(ComputeError::Runtime {
+            detail: "launch_reduce_into_two_leaves_device_target: the deferred arm requires \
+                     the par reduce on a real device (LGBM_REDUCE_PAR)"
+                .to_string(),
+        });
+    }
+    let h_rf = h_rf_cached.unwrap_or_else(|| {
+        let rf: Vec<f64> = real_feats.iter().take(n_feats).map(|&r| f64::from(r)).collect();
+        client.create_from_slice(f64::as_bytes(&rf))
+    });
+    let pd = client.properties().hardware.plane_size_max;
+    REDUCE_PAR_CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: identical bounds contract to `launch_reduce_into_two_leaves`'s par arm;
+    // additionally reads `roles[3*split_slot]` (caller-validated within `roles_len`).
+    unsafe {
+        reduce_scan_output_into_two_leaves_par_device_target_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(2, 1, 1),
+            CubeDim::new_1d(pd),
+            ArrayArg::from_raw_parts(h_raw, raw_len),
+            ArrayArg::from_raw_parts(h_rf, n_feats),
+            ArrayArg::from_raw_parts(out.valid.clone(), out.len),
+            ArrayArg::from_raw_parts(out.gain.clone(), out.len),
+            ArrayArg::from_raw_parts(out.feat.clone(), out.len),
+            ArrayArg::from_raw_parts(out.thr.clone(), out.len),
+            ArrayArg::from_raw_parts(out.dleft.clone(), out.len),
+            ArrayArg::from_raw_parts(out.ncat.clone(), out.len),
+            ArrayArg::from_raw_parts(out.left_sum_gradients.clone(), out.len),
+            ArrayArg::from_raw_parts(out.left_sum_hessians.clone(), out.len),
+            ArrayArg::from_raw_parts(out.right_sum_gradients.clone(), out.len),
+            ArrayArg::from_raw_parts(out.right_sum_hessians.clone(), out.len),
+            ArrayArg::from_raw_parts(out.left_output.clone(), out.len),
+            ArrayArg::from_raw_parts(out.right_output.clone(), out.len),
+            ArrayArg::from_raw_parts(roles, roles_len),
+            split_slot,
+            n_feats as u32,
+            out_slot_left as u32,
+            out_slot_right as u32,
+            min_gain_shift_left,
+            min_gain_shift_right,
+            1.0f64,
+            f64::NEG_INFINITY,
+        );
+    }
+    Ok(())
 }
 
 /// Shared V5 validation + `min_gain_shift` pre-step + fused-scan launch for the
@@ -8344,6 +8478,9 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                     cfg.min_sum_hessian_in_leaf,
                     cfg.lambda_l1,
                     cfg.lambda_l2,
+                    // Under the deferral, `a_totals`/`b_totals` are the LEFT/RIGHT
+                    // children's totals (host-known from the pick export); the kernel
+                    // role-selects the smaller/larger branch scalars on device.
                     min_gain_shift_a,
                     sum_gradient_a,
                     sum_hessian_a_bumped,
@@ -8353,8 +8490,6 @@ fn fused_subtract_scan_siblings_to_raw_handle<R: cubecl::Runtime>(
                     ArrayArg::from_raw_parts(ranges.clone(), *ranges_len),
                     ArrayArg::from_raw_parts(roles.clone(), *roles_len),
                     *split_slot,
-                    *which_a,
-                    *which_b,
                     *parent_count,
                     n as u32,
                     plane_dim,
@@ -8538,19 +8673,19 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on<
     feats: &[BatchedSplitFeature],
     real_feats: &[i32],
     cfg: &GainConfig,
-    a_totals: (f64, f64, i32, f64),
-    b_totals: (f64, f64, i32, f64),
+    // LEFT/RIGHT children's totals (host-known from the pick export); the kernel
+    // role-selects the smaller/larger branch on device.
+    left_totals: (f64, f64, i32, f64),
+    right_totals: (f64, f64, i32, f64),
     ranges: cubecl::server::Handle,
     ranges_len: usize,
     roles: cubecl::server::Handle,
     roles_len: usize,
     split_slot: u32,
-    which_a: u32,
-    which_b: u32,
     parent_count: i32,
     out: &crate::kernels::best_split::SplitSoa,
-    out_leaf_a: usize,
-    out_leaf_b: usize,
+    out_leaf_left: usize,
+    out_leaf_right: usize,
     desc: Option<&ScanDescHandles>,
 ) -> Result<Option<cubecl::server::Handle>, ComputeError> {
     if real_feats.len() != feats.len() {
@@ -8559,11 +8694,11 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on<
             actual: real_feats.len(),
         });
     }
-    if !feats.is_empty() && (out_leaf_a >= out.len || out_leaf_b >= out.len) {
+    if !feats.is_empty() && (out_leaf_left >= out.len || out_leaf_right >= out.len) {
         return Err(ComputeError::Runtime {
             detail: format!(
-                "subtract_reduce_devcount: out_leaf_a {out_leaf_a} / out_leaf_b {out_leaf_b} \
-                 out of range [0, {})",
+                "subtract_reduce_devcount: out_leaf_left {out_leaf_left} / out_leaf_right \
+                 {out_leaf_right} out of range [0, {})",
                 out.len
             ),
         });
@@ -8576,28 +8711,31 @@ pub fn find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on<
         buf_len,
         feats,
         cfg,
-        a_totals,
-        b_totals,
+        left_totals,
+        right_totals,
         SiblingNumDataSrc::Device {
             ranges,
             ranges_len,
-            roles,
+            roles: roles.clone(),
             roles_len,
             split_slot,
-            which_a,
-            which_b,
+            // which fields are unused by the official which-aware twin (it
+            // role-selects internally) but keep the Smaller/Larger convention.
+            which_a: 2,
+            which_b: 3,
             parent_count,
         },
         desc_ok,
     )?;
-    let Some((h_out, out_len, n, min_gain_shift_a, min_gain_shift_b, larger_out)) = scanned else {
+    let Some((h_out, out_len, n, min_gain_shift_left, min_gain_shift_right, larger_out)) = scanned
+    else {
         return Ok(None);
     };
     let h_rf_cached = desc_ok.and_then(|d| d.h_rf.clone());
-    launch_reduce_into_two_leaves(
-        client, h_out, out_len, real_feats, n, out, out_leaf_a, out_leaf_b,
-        min_gain_shift_a, min_gain_shift_b, h_rf_cached,
-    );
+    launch_reduce_into_two_leaves_device_target(
+        client, h_out, out_len, real_feats, n, out, roles, roles_len, split_slot,
+        out_leaf_left, out_leaf_right, min_gain_shift_left, min_gain_shift_right, h_rf_cached,
+    )?;
     Ok(Some(larger_out))
 }
 

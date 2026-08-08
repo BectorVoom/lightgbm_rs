@@ -511,15 +511,25 @@ fn device_numdata_subtract_official_reduce_byte_identical_to_host() {
         .expect("host subtract-fused")
         .expect("official staged path must be taken (forced ON)");
 
-        // DEVICE-count subtract-fused: smaller → slot 2, larger → slot 3.
+        // DEVICE-count subtract-fused (DEFERRED semantics: LEFT/RIGHT scalars +
+        // device-resolved smaller). Pick the left/right leaf targets so the
+        // role-resolved fold lands smaller → slot 2, larger → slot 3 (matching the
+        // host arm's smaller→0/larger→1 for the comparison below).
+        // SAFETY: test-only env, serialized by ENV_LOCK.
+        unsafe { std::env::set_var("LGBM_REDUCE_PAR", "1") };
+        let (left_tot, right_tot, leaf_left, leaf_right) = if smaller_is_left {
+            ((sg_a, sh_a, 0, 0.0), (sg_b, sh_b, 0, 0.0), 2usize, 3usize)
+        } else {
+            ((sg_b, sh_b, 0, 0.0), (sg_a, sh_a, 0, 0.0), 3usize, 2usize)
+        };
         let hs2 = upload_f64_buffer(&client, &hist_small);
         let hp2 = upload_f64_buffer(&client, &hist_parent);
         let larger_dev = find_best_splits_fused_siblings_subtract_reduce_into_leaves_devcount_on(
             &client, hs2, hp2, hist_small.len(), &feats, &real_feats, &cfg,
-            (sg_a, sh_a, 0, 0.0), (sg_b, sh_b, 0, 0.0),
+            left_tot, right_tot,
             ls.ranges_handle().clone(), LEAF_SPLIT_STRIDE * ls.capacity(),
             ls.roles_handle().clone(), ROLE_STRIDE * ls.capacity(),
-            0, 2u32, 3u32, p_count, &soa, 2, 3, None,
+            0, p_count, &soa, leaf_left, leaf_right, None,
         )
         .expect("device subtract-fused")
         .expect("official devcount staged path must be taken (forced ON)");

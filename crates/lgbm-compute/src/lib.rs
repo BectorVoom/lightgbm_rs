@@ -2489,6 +2489,47 @@ pub trait Backend {
         )
     }
 
+    /// SPEC-DRGL-05 deferral: the FUSED subtract+co-scan for the DEFERRED grow loop —
+    /// LEFT/RIGHT semantics (the host does not yet know which child is smaller):
+    /// counts, per-branch scalars AND frontier fold targets are role-resolved ON
+    /// DEVICE from the resident `ranges`/`roles` record. Only the GPU backend on the
+    /// cuda-default fused config implements this; the default is a typed error the
+    /// deferral gate surfaces (the eager loop remains the fallback).
+    ///
+    /// # Errors
+    /// Backends/configs without the deferred fused path.
+    #[allow(clippy::too_many_arguments)]
+    fn subtract_scan_resident_siblings_into_frontier_deferred(
+        &self,
+        client: &ComputeClient<Self::Runtime>,
+        parent_slot: usize,
+        smaller_slot: usize,
+        larger_slot: usize,
+        slot_len: usize,
+        feats: &[BatchedSplitFeature],
+        real_feats: &[i32],
+        cfg: &GainConfig,
+        left_sums: (f64, f64),
+        right_sums: (f64, f64),
+        leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
+        split_idx: usize,
+        parent_count: i32,
+        frontier: &DeviceFrontier<Self::Runtime>,
+        out_leaf_left: usize,
+        out_leaf_right: usize,
+    ) -> Result<(), ComputeError> {
+        let _ = (
+            client, parent_slot, smaller_slot, larger_slot, slot_len, feats, real_feats, cfg,
+            left_sums, right_sums, leaf_splits, split_idx, parent_count, frontier,
+            out_leaf_left, out_leaf_right,
+        );
+        Err(ComputeError::Runtime {
+            detail: "subtract_scan_resident_siblings_into_frontier_deferred: not supported \
+                     by this backend (deferred grow requires the GPU backend's fused config)"
+                .to_string(),
+        })
+    }
+
     /// UNIFIED host per-feature `{build → fix → compact → scan}` for
     /// the directly-built (smaller/root) leaf, run inside ONE rayon region — the host f64
     /// analog of the GPU resident fused build+scan.
@@ -5280,14 +5321,16 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         }
     }
 
-    /// GpuBackend override (SPEC-DRGL-05 deferral): the FUSED subtract+co-scan with both
-    /// children's counts resolved ON DEVICE — the deferred loop's per-split scan. Uses the
-    /// OFFICIAL-shape devcount twin (the live cuda variant) so the deferred fold is
-    /// bit-identical to the eager arm's; when the fused/official gates don't hold, falls
-    /// back to the trait default (separate subtract + devcount co-scan), which under those
-    /// same gates is variant-consistent with the eager arm too.
+    /// GpuBackend impl (SPEC-DRGL-05 deferral): the FUSED subtract+co-scan for the
+    /// DEFERRED loop — LEFT/RIGHT semantics (the host doesn't know which child is
+    /// smaller until the batched read): counts, branch scalars AND fold targets are
+    /// role-resolved ON DEVICE. Uses the which-aware OFFICIAL-shape twin + the
+    /// device-target par reduce, so the deferred fold is bit-identical to the eager
+    /// arm's on the cuda-default config. The gates (subtract_fuse + official + staged
+    /// + par-reduce, real device) are REQUIRED — any miss is a typed error the
+    /// deferral gate surfaces once per grow (no silent variant change).
     #[allow(clippy::too_many_arguments)]
-    fn subtract_scan_resident_siblings_into_frontier_devcount(
+    fn subtract_scan_resident_siblings_into_frontier_deferred(
         &self,
         client: &ComputeClient<Self::Runtime>,
         parent_slot: usize,
@@ -5297,18 +5340,16 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         feats: &[BatchedSplitFeature],
         real_feats: &[i32],
         cfg: &GainConfig,
-        smaller_sums: (f64, f64),
-        larger_sums: (f64, f64),
+        left_sums: (f64, f64),
+        right_sums: (f64, f64),
         leaf_splits: &kernels::partition::DeviceLeafSplits<Self::Runtime>,
         split_idx: usize,
-        which_a: u32,
-        which_b: u32,
         parent_count: i32,
         frontier: &DeviceFrontier<Self::Runtime>,
-        out_leaf_smaller: usize,
-        out_leaf_larger: usize,
+        out_leaf_left: usize,
+        out_leaf_right: usize,
     ) -> Result<(), ComputeError> {
-        if kernels::grow_driver::subtract_fuse_enabled() {
+        {
             let (parent_h, smaller_h) = {
                 let mirror = self.resident_pool.borrow();
                 let parent_h = mirror.get(parent_slot).and_then(|h| h.clone()).ok_or_else(
@@ -5335,19 +5376,17 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
                     feats,
                     real_feats,
                     cfg,
-                    (smaller_sums.0, smaller_sums.1, 0, cfg.parent_output),
-                    (larger_sums.0, larger_sums.1, 0, cfg.parent_output),
+                    (left_sums.0, left_sums.1, 0, cfg.parent_output),
+                    (right_sums.0, right_sums.1, 0, cfg.parent_output),
                     leaf_splits.ranges_handle().clone(),
                     kernels::partition::LEAF_SPLIT_STRIDE * leaf_splits.capacity(),
                     leaf_splits.roles_handle().clone(),
                     kernels::partition::ROLE_STRIDE * leaf_splits.capacity(),
                     split_idx as u32,
-                    which_a,
-                    which_b,
                     parent_count,
                     frontier.records(),
-                    out_leaf_smaller,
-                    out_leaf_larger,
+                    out_leaf_left,
+                    out_leaf_right,
                     desc.as_ref(),
                 )?;
             if let Some(larger_out) = fused {
@@ -5360,27 +5399,13 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
                 return Ok(());
             }
         }
-        // Trait-default two-step (variant-consistent with the eager arm under the same gates).
-        self.subtract_resident(client, parent_slot, smaller_slot, larger_slot, slot_len)?;
-        self.scan_resident_siblings_into_frontier_devcount(
-            client,
-            smaller_slot,
-            larger_slot,
-            slot_len,
-            feats,
-            real_feats,
-            cfg,
-            smaller_sums,
-            larger_sums,
-            leaf_splits,
-            split_idx,
-            which_a,
-            which_b,
-            parent_count,
-            frontier,
-            out_leaf_smaller,
-            out_leaf_larger,
-        )
+        let _ = parent_slot;
+        Err(ComputeError::Runtime {
+            detail: "subtract_scan_resident_siblings_into_frontier_deferred: the deferred \
+                     arm requires the cuda-default fused config (subtract_fuse + official \
+                     staged scan + par reduce on a real device)"
+                .to_string(),
+        })
     }
 
 }
