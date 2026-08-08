@@ -889,3 +889,26 @@ Default FLIPPED ON behind `deferred_scan_config_applies` (cuda-default fused
 config only; hip's pargain default and any non-conforming config silently
 keep the byte-identical eager loop; `LGBM_GROW_DEFER_SYNC=0` restores eager).
 Round 8 confirms the flipped default (official / rs / rs_eager).
+
+### Round 8 — default CONFIRMED: gap 1.13×
+
+Kernel v12 (P100, same session): official 3.033 | **rs (deferred default
+engaged) 3.422** | rs_eager (`LGBM_GROW_DEFER_SYNC=0`) 3.560. Preds
+byte-identical (rs_eager 0.0; envelope 3.06e-5); 100 trees; 1-tree fixed-cost
+lead holds (rs 1.24 vs official 1.70).
+
+### P3 final scorecard (same-session P100 gaps)
+
+| milestone | rs | official | gap |
+|---|---|---|---|
+| campaign start (§11) | 5.72 | 2.79 | 2.05× |
+| inline handle default ON | 5.48 | 2.86 | 1.92× |
+| PTX cache default ON | 4.05 | 3.16 | 1.28× |
+| parscan partition twins | 3.80 | 3.12 | 1.22× |
+| single-sync deferral default ON | **3.42** | 3.03 | **1.13×** |
+
+Every lever byte-identical to the anchor; all shipped as defaults with kill
+switches. Remaining ~0.4 s, ranked: pageable→pinned small uploads
+(~1.2 ms/tree), pick kernel shape (~0.4 ms/tree), then re-profile — at 1.13×
+the next decomposition needs fresh CUPTI evidence (the serialization tail has
+shrunk under the deferral; unknown residual shape).
