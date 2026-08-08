@@ -127,9 +127,9 @@ LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 ARMS = {
     "official": {"backend": "official", "env": {}},
     "rs": {"backend": "rs", "env": {}},
-    "rs_serscan": {"backend": "rs", "env": {"LGBM_PARTITION_PARSCAN": "0"}},
+    "rs_defer": {"backend": "rs", "env": {"LGBM_GROW_DEFER_SYNC": "1"}},
 }
-ARM_ORDER = ["official", "rs", "rs_serscan"]
+ARM_ORDER = ["official", "rs", "rs_defer"]
 
 
 def run(cmd, check=True):
@@ -276,7 +276,7 @@ def main():
     identity = {}
     if "rs" in pred_paths:
         base = np.load(pred_paths["rs"])
-        for a in ("rs_serscan",):
+        for a in ("rs_defer",):
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None
