@@ -847,3 +847,22 @@ enqueue — launch count was never the problem either.
 4. pick kernel shape (−7.7ms/20t).
 
 Transport, compile, build-kernel, binning: all CLOSED (parity or better).
+
+### Round 6 — parscan partition twins: WIN 1.066×, gap now 1.22×
+
+Both resident-partition kernels had SINGLE-OWNER SERIAL scans (thread 0 walking
+up to `block_size` dependent global reads with 255 units idle in the mark; per-
+block serial sums over up to 1024 block totals in the fused scatter). The
+parscan twins (chunk-per-unit + 8-step Hillis-Steele smem exclusive scan; strided
+accumulate + smem tree reduction) are integer-exact by construction, proven
+byte-identical on real GPU (`parscan_partition_byte_identical_to_serial`) and
+on the P100 harness (preds 0.0 vs serial).
+
+Kernel v10 (P100, same session): official 3.12 s | **rs (parscan ON) 3.80 s** |
+rs_serscan 4.05 s → parscan = **1.066×**. CUPTI per-kernel: mark 49 → **14.1 µs**,
+scatter 34 → **10.6 µs** — the partition chain now BEATS official's analog sum.
+1-tree walls: official 1.78 vs rs 1.30 (fixed-cost lead holds).
+
+**Scorecard: gap 2.05× (campaign start) → 1.22×.** Remaining ~0.7 s, ranked:
+host serialization bubbles (~10 ms/tree, single-sync/split deferral), pageable
+small uploads (~1.2 ms/tree), pick kernel shape (~0.4 ms/tree).
