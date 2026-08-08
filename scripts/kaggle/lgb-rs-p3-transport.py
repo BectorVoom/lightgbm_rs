@@ -261,6 +261,46 @@ def main():
             off = np.load(pred_paths["official"])
             identity["official_envelope"] = float(np.max(np.abs(off - base)))
 
+    print("\n=== nsys device-kernel head-to-head (20 trees) ===")
+    import shutil
+    nsys = shutil.which("nsys")
+    if not nsys:
+        run("ls /opt/nvidia 2>/dev/null || true", check=False)
+        run("apt-get update -qq 2>/dev/null; apt-get install -y -qq nsight-systems-cli 2>&1 | tail -1 || true", check=False)
+        nsys = shutil.which("nsys")
+    if not nsys:
+        cand = subprocess.run("ls /opt/nvidia/nsight-systems*/bin/nsys 2>/dev/null | head -1",
+                              shell=True, capture_output=True, text=True).stdout.strip()
+        nsys = cand or None
+    if nsys:
+        for arm_name in ("official", "rs"):
+            arm = ARMS[arm_name]
+            env = dict(os.environ)
+            if arm["backend"] != "official":
+                env["LGBM_PHASE_PROF"] = "0"
+                env["LGBM_AUTOTUNE"] = "0"
+                env.update(arm["env"])
+            cfg = {"data_path": data_path, "backend": arm["backend"], "params": params,
+                   "num_boost_round": 20, "pred_path": os.path.join(out_dir, f"pred_{arm_name}_nsys.npy"),
+                   "n_pred": 1000}
+            rep = os.path.join(out_dir, f"prof_{arm_name}")
+            try:
+                subprocess.run([nsys, "profile", "-o", rep, "--trace=cuda", "-f", "true",
+                                sys.executable, worker_path, json.dumps(cfg)],
+                               env=env, capture_output=True, text=True, timeout=900)
+                st = subprocess.run([nsys, "stats", "--report", "cuda_gpu_kern_sum", rep + ".nsys-rep"],
+                                    capture_output=True, text=True, timeout=600)
+                print(f"--- nsys cuda_gpu_kern_sum {arm_name} (top) ---")
+                for i, ln in enumerate(st.stdout.splitlines()):
+                    if i > 45:
+                        break
+                    if ln.strip():
+                        print(ln)
+            except Exception as e:
+                print(f"  nsys {arm_name} failed: {type(e).__name__}: {e}")
+    else:
+        print("NSYS_UNAVAILABLE (not in image, apt install failed)")
+
     print("\n=== 1-tree diagnostics (construct + fixed overhead) ===")
     one_tree = {}
     for arm_name in ("official", "rs"):
