@@ -643,6 +643,121 @@ mod real_gpu_gated {
         assert_eq!(layout_off.leaf_count, layout_on.leaf_count, "leaf_count drift");
     }
 
+    /// SPEC-DRGL-05 (REAL GPU): the DEFERRED grow loop (`LGBM_GROW_DEFER_SYNC` — one
+    /// batched [ranges, pick] crossing per split, which-aware devcount scan, fixed-grid
+    /// build, device-target reduce) grows a tree + layout BYTE-IDENTICAL to the eager
+    /// loop, on the cuda-default fused config (official staged scan + subtract-fuse +
+    /// par reduce, forced identically for BOTH arms), for full growth AND a depth-capped
+    /// grow (the sentinel arm).
+    #[test]
+    fn deferred_sync_arm_grows_byte_identical_tree() {
+        use lgbm_compute::kernels::grow_driver::{
+            grow_tree_on_device_driver, on_device_deferred_read_fused_count_take,
+            set_grow_defer_sync_override,
+        };
+        use lgbm_compute::kernels::split::set_scan_official_override;
+        use lgbm_compute::{GpuBackend, GrowFeature};
+        use lgbm_dataset::bin_mapper::{BinType, MissingType};
+
+        pin_autotune_off();
+        // Identical scan config for BOTH arms: official staged scan, no pargain, no
+        // parprefix, par reduce, subtract-fuse (its default is ON), phase-prof so the
+        // deferred tripwire counts.
+        // SAFETY: test-only env, sequential within this test binary.
+        unsafe {
+            std::env::set_var("LGBM_SCAN_STAGED", "1");
+            std::env::set_var("LGBM_SCAN_PARGAIN", "0");
+            std::env::set_var("LGBM_SCAN_PARPREFIX", "0");
+            std::env::set_var("LGBM_REDUCE_PAR", "1");
+            std::env::set_var("LGBM_PHASE_PROF", "1");
+        }
+        set_scan_official_override(Some(true));
+
+        let num_data = 900usize;
+        let num_bins = [12u32, 7, 9];
+        let missing = [MissingType::None, MissingType::Zero, MissingType::None];
+        let cols: Vec<Vec<u32>> =
+            (0..3).map(|f| column(0xdef3 + f as u64, num_data, num_bins[f])).collect();
+        let features: Vec<GrowFeature> = (0..3)
+            .map(|f| GrowFeature {
+                bins: BinColumn::new(cols[f].clone(), num_bins[f]),
+                num_bin: num_bins[f],
+                offset: 1,
+                min_bin: 0,
+                max_bin: num_bins[f] - 1,
+                default_bin: num_bins[f],
+                most_freq_bin: 0,
+                missing_type: missing[f],
+                bin_upper_bound: (0..num_bins[f]).map(|b| b as f64 + 0.5).collect(),
+                real_feature_index: f as i32,
+                bin_type: BinType::Numerical,
+                bin_to_category: Vec::new(),
+                cat_smooth: 10.0,
+                cat_l2: 10.0,
+                max_cat_threshold: 32,
+                max_cat_to_onehot: 4,
+                min_data_per_group: 100,
+            })
+            .collect();
+        let mut lcg = Lcg(0x0defe44a);
+        let gradients: Vec<f32> =
+            (0..num_data).map(|_| (lcg.next_u32() % 21) as f32 - 10.0).collect();
+        let hessians: Vec<f32> = vec![1.0f32; num_data];
+
+        let backend = GpuBackend::<GpuRt>::default();
+        let client = gpu_client();
+        for (num_leaves, max_depth, label) in [(8, -1, "full"), (16, 3, "depth-capped")] {
+            let grow = || {
+                grow_tree_on_device_driver(
+                    &backend, &client, &gradients, &hessians, &features, num_leaves, max_depth,
+                )
+                .expect("resident driver grow")
+            };
+            set_grow_defer_sync_override(Some(false));
+            let (tree_off, layout_off) = grow();
+            let _ = on_device_deferred_read_fused_count_take();
+            set_grow_defer_sync_override(Some(true));
+            let (tree_on, layout_on) = grow();
+            set_grow_defer_sync_override(None);
+            let deferred_reads = on_device_deferred_read_fused_count_take();
+            assert!(
+                deferred_reads > 0,
+                "{label}: deferred tripwire must fire (deferred_read_fused={deferred_reads})"
+            );
+            assert!(
+                tree_off.num_leaves > 2,
+                "{label}: corpus must split multiple times (non-vacuous)"
+            );
+            assert_eq!(tree_off.num_leaves, tree_on.num_leaves, "{label}: num_leaves drift");
+            assert_eq!(
+                tree_off.split_feature, tree_on.split_feature,
+                "{label}: split_feature drift"
+            );
+            assert_eq!(tree_off.left_child, tree_on.left_child, "{label}: left_child drift");
+            assert_eq!(tree_off.right_child, tree_on.right_child, "{label}: right_child drift");
+            let bits = |xs: &[f64]| xs.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&tree_off.threshold),
+                bits(&tree_on.threshold),
+                "{label}: threshold drift"
+            );
+            assert_eq!(
+                bits(&tree_off.leaf_value),
+                bits(&tree_on.leaf_value),
+                "{label}: leaf_value drift"
+            );
+            assert_eq!(
+                bits(&tree_off.internal_value),
+                bits(&tree_on.internal_value),
+                "{label}: internal_value drift"
+            );
+            assert_eq!(layout_off.indices, layout_on.indices, "{label}: layout indices drift");
+            assert_eq!(layout_off.leaf_begin, layout_on.leaf_begin, "{label}: leaf_begin drift");
+            assert_eq!(layout_off.leaf_count, layout_on.leaf_count, "{label}: leaf_count drift");
+        }
+        set_scan_official_override(None);
+    }
+
 }
 
 /// §12 final-mile lever 2 (REAL GPU): the PARSCAN mark/scatter twins (parallel

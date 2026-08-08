@@ -599,6 +599,53 @@ pub fn on_device_subtract_fused_count_take() -> u64 {
     ON_DEVICE_SUBTRACT_FUSED_CNT.swap(0, Ordering::Relaxed)
 }
 
+/// SPEC-DRGL-05: the DEFERRED grow loop (`LGBM_GROW_DEFER_SYNC`, default OFF) — ONE
+/// blocking read per split (the batched [ranges, pick-export] crossing) instead of the
+/// eager loop's two (pick export + read_split). Requires the resident-perm arm AND the
+/// cuda-default fused scan config (subtract_fuse + official staged scan + par reduce on
+/// a real device — the deferred Backend seam errors otherwise and the grow fails typed,
+/// so the flag is strictly opt-in until the P100 verdict).
+#[must_use]
+pub fn grow_defer_sync_enabled() -> bool {
+    match GROW_DEFER_SYNC_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_GROW_DEFER_SYNC").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Same-session A/B override for [`grow_defer_sync_enabled`]. 0 = unset, 1 = ON, 2 = OFF.
+static GROW_DEFER_SYNC_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Set (or clear) the [`grow_defer_sync_enabled`] override — test/A-B seam.
+pub fn set_grow_defer_sync_override(v: Option<bool>) {
+    let raw = match v {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    };
+    GROW_DEFER_SYNC_OVERRIDE.store(raw, Ordering::Relaxed);
+}
+
+/// POSITIVE tripwire — bumped once per deferred-loop batched read (the fused
+/// pick+ranges crossing). NONZERO proves the deferred arm ran; 0 on the eager loop.
+pub static ON_DEVICE_DEFERRED_READ_FUSED_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the deferred-read tripwire (inert unless `LGBM_PHASE_PROF=1`).
+#[inline]
+fn bump_deferred_read_fused() {
+    if launch_prof_enabled() {
+        ON_DEVICE_DEFERRED_READ_FUSED_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Swap the deferred-read tripwire to zero and return the prior value.
+pub fn on_device_deferred_read_fused_count_take() -> u64 {
+    ON_DEVICE_DEFERRED_READ_FUSED_CNT.swap(0, Ordering::Relaxed)
+}
+
 /// POSITIVE tripwire — bumped once per split that took the SharedMemory partition
 /// BC-fusion arm (`partition_fuse_bc_smem_enabled` on a real device). NONZERO in the
 /// COUNTS ledger (`partition_bc_smem=`) is the bench-protocol proof the 2-launch SMEM
@@ -2745,10 +2792,362 @@ where
         .map(|(fpos, f)| (f.real_feature_index, fpos as i32))
         .collect();
 
+    // ---- SPEC-DRGL-05 DEFERRED LOOP (`LGBM_GROW_DEFER_SYNC`, default OFF): ONE
+    // blocking crossing per split. Split i's `read_split` is BATCHED with pick(i+1)
+    // into a single `client.read`; split i's host bookkeeping (row ranges, slot
+    // mapping, device tree mutation) is applied at the TOP of iteration i+1 from the
+    // decoded ranges. The per-split device chain (partition → role kernel →
+    // fixed-grid build-SMALLER → fused subtract+co-scan with role-resolved counts/
+    // scalars/fold-targets) runs WITHOUT the host knowing the split point — the
+    // which-aware official devcount twins keep every kernel variant identical to the
+    // eager arm, so the grown tree is byte-identical (the local + P100 gates prove
+    // it). Requires the resident-perm arm; the deferred Backend seam requires the
+    // cuda-default fused config and errors typed otherwise. ----
+    let use_deferred = grow_defer_sync_enabled() && resident_perm.is_some();
+    if use_deferred {
+        struct PendingSplit {
+            split_idx: usize,
+            best_leaf: i32,
+            new_right: i32,
+            best: SplitInfo,
+            parent_depth: i32,
+            parent_slot: usize,
+            smaller_slot: usize,
+            larger_slot: usize,
+            p_begin: usize,
+            p_count: usize,
+            real_threshold: f64,
+            missing_type_code: i32,
+            real_feature_index: i32,
+        }
+        let mut pend: Option<PendingSplit> = None;
+        // Apply a completed split's deferred host bookkeeping from the decoded child
+        // ranges — byte-for-byte the eager loop's post-`read_split` sequence.
+        macro_rules! apply_pending {
+            ($p:expr, $ranges_bytes:expr) => {{
+                let p = $p;
+                let cr = crate::kernels::partition::DeviceLeafSplits::<R>::decode_split(
+                    $ranges_bytes,
+                    p.split_idx,
+                );
+                let split_point = cr.left_count as usize;
+                let left_count = split_point as i32;
+                let right_count = (p.p_count - split_point) as i32;
+                let scalars = SplitScalars {
+                    is_valid: true,
+                    leaf_index: p.best_leaf,
+                    gain: p.best.gain + cfg.min_gain_to_split,
+                    inner_feature_index: p.real_feature_index,
+                    threshold: p.best.threshold,
+                    default_left: p.best.default_left,
+                    left_sum_gradients: p.best.left_sum_gradient,
+                    left_sum_hessians: p.best.left_sum_hessian,
+                    left_sum_gh_quant: 0,
+                    left_count,
+                    left_gain: 0.0,
+                    left_value: p.best.left_output,
+                    right_sum_gradients: p.best.right_sum_gradient,
+                    right_sum_hessians: p.best.right_sum_hessian,
+                    right_sum_gh_quant: 0,
+                    right_count,
+                    right_gain: 0.0,
+                    right_value: p.best.right_output,
+                    num_cat_threshold: 0,
+                };
+                time_phase(&GROW_TREESPLIT_NS, || -> Result<(), ComputeError> {
+                    backend.split_tree_scheduled(
+                        client,
+                        &mut tree,
+                        p.best_leaf,
+                        p.new_right,
+                        p.real_feature_index,
+                        p.real_threshold,
+                        p.missing_type_code,
+                        &scalars,
+                    )?;
+                    grow_drain(client);
+                    Ok(())
+                })?;
+                let child_depth = p.parent_depth + 1;
+                let smaller_is_left = crate::kernels::partition::role_assignment(
+                    left_count,
+                    right_count,
+                    p.smaller_slot as i32,
+                    p.larger_slot as i32,
+                )
+                .smaller_is_left;
+                let left_slot = if smaller_is_left { p.smaller_slot } else { p.larger_slot };
+                let right_slot = if smaller_is_left { p.larger_slot } else { p.smaller_slot };
+                {
+                    let l = &mut leaves[p.best_leaf as usize];
+                    l.row_begin = p.p_begin;
+                    l.row_count = split_point;
+                    l.sum_g = p.best.left_sum_gradient;
+                    l.sum_h = p.best.left_sum_hessian;
+                    l.slot = left_slot;
+                    l.depth = child_depth;
+                    l.best = SplitInfo::none();
+                    l.best_fpos = -1;
+                }
+                leaves.push(ResidentDriverLeaf {
+                    row_begin: p.p_begin + split_point,
+                    row_count: p.p_count - split_point,
+                    sum_g: p.best.right_sum_gradient,
+                    sum_h: p.best.right_sum_hessian,
+                    slot: right_slot,
+                    best: SplitInfo::none(),
+                    best_fpos: -1,
+                    depth: child_depth,
+                });
+            }};
+        }
+        for split_idx in 0..(num_leaves - 1) {
+            // Pending children occupy frontier slots {best_leaf, leaves.len()} — the
+            // pick range must include the not-yet-pushed right child.
+            let cur_num_leaves = leaves.len() + usize::from(pend.is_some());
+            bump_launch();
+            bump_sync(); // THE one blocking crossing this iteration (batched read below).
+            let pick_h = time_phase(&GROW_PICK_NS, || {
+                backend.frontier_pick_best_leaf_device_launch(
+                    client,
+                    &frontier,
+                    prev_smaller,
+                    prev_larger,
+                    cur_num_leaves,
+                )
+            })?;
+            let reads = time_phase(&GROW_PICK_NS, || {
+                if pend.is_some() {
+                    backend.read_batched(
+                        client,
+                        vec![leaf_splits_dev.ranges_handle().clone(), pick_h],
+                    )
+                } else {
+                    backend.read_batched(client, vec![pick_h])
+                }
+            });
+            bump_deferred_read_fused();
+            if let Some(p) = pend.take() {
+                apply_pending!(p, &reads[0]);
+            }
+            let export =
+                crate::kernels::best_split::decode_pick_export(reads.last().expect("pick bytes"));
+            let best_leaf = export.cells[6] as i32;
+            if best_leaf < 0 {
+                break;
+            }
+            let w = export.winner;
+            let best_real_feat = w[0] as i32;
+            let best_fpos = *real_feat_to_fpos.get(&best_real_feat).ok_or_else(|| {
+                ComputeError::Runtime {
+                    detail: format!(
+                        "grow_tree_on_device_resident(deferred): picked real feature index                          {best_real_feat} has no feature-position in the grow feature set"
+                    ),
+                }
+            })?;
+            let best = SplitInfo {
+                threshold: w[1] as u32,
+                default_left: w[2] > 0.5,
+                left_sum_gradient: w[3],
+                left_sum_hessian: w[4],
+                right_sum_gradient: w[5],
+                right_sum_hessian: w[6],
+                gain: w[7],
+                left_output: w[8],
+                right_output: w[9],
+                left_count: 0,
+                right_count: 0,
+            };
+            if best_fpos < 0 || !(best.gain > 0.0) {
+                break;
+            }
+            let f = &features[best_fpos as usize];
+            let parent_depth = leaves[best_leaf as usize].depth;
+            let parent_slot = leaves[best_leaf as usize].slot;
+            let missing_type_u8 = match f.missing_type {
+                MissingType::None => 0u8,
+                MissingType::Zero => 1,
+                MissingType::NaN => 2,
+            };
+            let missing_type_code = i32::from(missing_type_u8);
+            let new_left = best_leaf;
+            let partition_min_bin = f.min_bin + f.offset.max(0) as u32;
+            let p_begin = leaves[best_leaf as usize].row_begin;
+            let p_count = leaves[best_leaf as usize].row_count;
+            let real_threshold =
+                *f.bin_upper_bound.get(best.threshold as usize).ok_or_else(|| {
+                    ComputeError::Runtime {
+                        detail: format!(
+                            "grow_tree_on_device_resident(deferred): split threshold bin index                              {} out of range for feature {} bin_upper_bound (len {})",
+                            best.threshold,
+                            f.real_feature_index,
+                            f.bin_upper_bound.len()
+                        ),
+                    }
+                })?;
+            // PARTITION (resident arm, NO split-point readback — the ranges record
+            // stays on device for the batched read + every devcount consumer).
+            let Some((view, rp, grow_max_abs)) = &resident_perm else {
+                unreachable!("use_deferred requires the resident-perm arm");
+            };
+            time_phase(&GROW_PARTITION_NS, || -> Result<(), ComputeError> {
+                bump_launch();
+                bump_launch();
+                if !crate::kernels::partition::partition_bc_fused(client) {
+                    bump_launch();
+                }
+                bump_partition_resident();
+                if crate::kernels::partition::partition_fuse_bc_smem_enabled()
+                    && <R as cubecl::Runtime>::name(client) != "cpu"
+                {
+                    bump_partition_bc_smem();
+                }
+                rp.partition_leaf(
+                    client,
+                    &view.0,
+                    view.1,
+                    best_fpos as usize * num_data,
+                    view.2 * view.3,
+                    f.num_bin,
+                    partition_min_bin,
+                    f.max_bin,
+                    f.default_bin,
+                    f.most_freq_bin,
+                    missing_type_u8,
+                    best.default_left,
+                    best.threshold,
+                    &leaf_splits_dev,
+                    split_idx as usize,
+                    p_begin as i32,
+                    p_count as i32,
+                )?;
+                grow_drain(client);
+                Ok(())
+            })?;
+            // Pend was applied at the top of this iteration, so `leaves` is complete
+            // through split i-1 — the right child id is the eager loop's `leaves.len()`.
+            let new_right = leaves.len() as i32;
+            // Child pool slots (count-independent): SMALLER fresh, LARGER = parent.
+            let smaller_slot = next_slot;
+            next_slot += 1;
+            let larger_slot = parent_slot;
+            // Role record ON DEVICE (consumed by the fixed-grid build + devcount scan
+            // + device-target reduce; the host mirror happens at apply time).
+            crate::kernels::partition::assign_smaller_larger_roles_device(
+                client,
+                &leaf_splits_dev,
+                split_idx as usize,
+                smaller_slot as i32,
+                larger_slot as i32,
+            )?;
+            let child_depth = parent_depth + 1;
+            let depth_ok = !(max_depth > 0 && child_depth >= max_depth);
+            if depth_ok {
+                // Fixed-grid build of the SMALLER child (which=2, count resolved on
+                // device); fix-tail sums args are inert (`_sum_*` unused by the fix).
+                bump_launch();
+                time_phase(&GROW_BUILD_NS, || -> Result<(), ComputeError> {
+                    backend.build_resident_leaf_rows_handle_fixed_grid(
+                        client,
+                        smaller_slot,
+                        &slot_off,
+                        slot_len,
+                        rp.rows_view(p_begin),
+                        p_count,
+                        &leaf_splits_dev,
+                        split_idx as usize,
+                        2u32,
+                        &fix_feats,
+                        0.0,
+                        0.0,
+                        *grow_max_abs,
+                    )?;
+                    grow_drain(client);
+                    Ok(())
+                })?;
+                // Fused subtract + co-scan, LEFT/RIGHT scalars role-resolved on device;
+                // folds both children into frontier slots {new_left, new_right}
+                // (targets role-resolved by the device-target reduce). Size gates fall
+                // out of the scan's own min_data rejects (tree-identical).
+                bump_launch();
+                bump_launch();
+                time_phase(&GROW_SCAN_NS, || -> Result<(), ComputeError> {
+                    backend.subtract_scan_resident_siblings_into_frontier_deferred(
+                        client,
+                        parent_slot,
+                        smaller_slot,
+                        larger_slot,
+                        slot_len,
+                        &feats,
+                        &real_feats,
+                        cfg,
+                        (best.left_sum_gradient, best.left_sum_hessian),
+                        (best.right_sum_gradient, best.right_sum_hessian),
+                        &leaf_splits_dev,
+                        split_idx as usize,
+                        p_count as i32,
+                        &frontier,
+                        new_left as usize,
+                        new_right as usize,
+                    )?;
+                    grow_drain(client);
+                    Ok(())
+                })?;
+            } else {
+                // Depth-capped children: unscannable — seed no-split sentinels (the
+                // eager arm's `reduce_winner_into_frontier(none)` twin). The build +
+                // subtract are SKIPPED: these leaves are never scanned nor used as a
+                // subtraction parent, so the histogram slots are dead (tree-identical).
+                reduce_winner_into_frontier(
+                    backend,
+                    client,
+                    &frontier,
+                    new_left as usize,
+                    &SplitInfo::none(),
+                    -1,
+                )?;
+                reduce_winner_into_frontier(
+                    backend,
+                    client,
+                    &frontier,
+                    new_right as usize,
+                    &SplitInfo::none(),
+                    -1,
+                )?;
+            }
+            pend = Some(PendingSplit {
+                split_idx: split_idx as usize,
+                best_leaf,
+                new_right,
+                best,
+                parent_depth,
+                parent_slot,
+                smaller_slot,
+                larger_slot,
+                p_begin,
+                p_count,
+                real_threshold,
+                missing_type_code,
+                real_feature_index: f.real_feature_index,
+            });
+            prev_smaller = new_left;
+            prev_larger = new_right;
+        }
+        // Flush the final pending split (its ranges read is the loop's +1 crossing;
+        // the tail perm readback below remains the per-grow +1).
+        if let Some(p) = pend.take() {
+            bump_sync();
+            let reads =
+                backend.read_batched(client, vec![leaf_splits_dev.ranges_handle().clone()]);
+            apply_pending!(p, &reads[0]);
+        }
+    }
+
     // ---- The best-first leaf-wise loop (serial_tree_learner.cpp:218-236): a FIXED
     // `num_leaves - 1` device schedule, broken early by the device stop signal
     // (`best_leaf == -1`) — no host argmax drives which leaf grows next. `split_idx`
     // is the per-split slot into `leaf_splits_dev` (fresh, never-recycled per split). ----
+    if !use_deferred {
     for split_idx in 0..(num_leaves - 1) {
         // (§8.3): pick `best_leaf` ON DEVICE from the resident frontier — the ONLY
         // host-visible crossing this iteration is the ~8-int export (cell [6] = best_leaf, `-1`
@@ -3250,6 +3649,7 @@ where
         // The next iteration's §8.3 self-invalidation targets (this split's children).
         prev_smaller = smaller_leaf;
         prev_larger = larger_leaf;
+    }
     }
 
     // ---- Reconstruct the host tree (to_host_tree) + the row→leaf layout. ----
