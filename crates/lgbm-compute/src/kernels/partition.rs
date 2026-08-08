@@ -891,6 +891,122 @@ fn resident_mark_block_scan_kernel<B: Int>(
     }
 }
 
+/// PARSCAN twin of [`resident_mark_block_scan_kernel`] (§12 final-mile lever 2):
+/// identical mark/snapshot phase, but the per-block exclusive scan is PARALLEL —
+/// chunk-per-unit local sums → 8-step Hillis-Steele exclusive scan of the 256
+/// chunk sums in shared memory → per-unit chunk prefix write. The serial
+/// single-owner scan (up to `block_size` dependent global round-trips with 255
+/// units idle) was the measured 49µs/call cost of the partition chain. u32 sums —
+/// the SAME exact values the serial scan produced, so `local_excl`/`block_totals`
+/// and every downstream consumer are byte-identical.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn resident_mark_block_scan_parscan_kernel<B: Int>(
+    bins: &Array<B>,
+    perm: &Array<u32>,
+    snap: &mut Array<u32>,
+    to_left: &mut Array<u32>,
+    local_excl: &mut Array<u32>,
+    block_totals: &mut Array<u32>,
+    col_off: u32,
+    p_begin: u32,
+    n: u32,
+    block_size: u32,
+    min_bin: i32,
+    max_bin: i32,
+    default_bin: i32,
+    most_freq_bin: i32,
+    threshold: i32,
+    #[comptime] miss_is_zero: bool,
+    #[comptime] miss_is_na: bool,
+    #[comptime] mfb_is_zero: bool,
+    #[comptime] mfb_is_na: bool,
+    #[comptime] min_is_max: bool,
+    #[comptime] default_left: bool,
+) {
+    let b = CUBE_POS_X as usize;
+    let bs = block_size as usize;
+    let nn = n as usize;
+    let start = b * bs;
+    let end = start + bs;
+    let lim = if end < nn { end } else { nn };
+
+    // Mark + snapshot phase — verbatim from the serial kernel.
+    let mut i = start + UNIT_POS as usize;
+    while i < lim {
+        let di = perm[p_begin as usize + i];
+        snap[i] = di;
+        let bin = u32::cast_from(bins[col_off as usize + di as usize]) as i32;
+        to_left[i] = route_to_left(
+            bin,
+            min_bin,
+            max_bin,
+            default_bin,
+            most_freq_bin,
+            threshold,
+            miss_is_zero,
+            miss_is_na,
+            mfb_is_zero,
+            mfb_is_na,
+            min_is_max,
+            default_left,
+        );
+        i += CUBE_DIM as usize;
+    }
+    sync_cube();
+
+    // Parallel exclusive scan: contiguous chunk per unit.
+    let cd = CUBE_DIM as usize;
+    let t = UNIT_POS as usize;
+    let chunk = (bs + cd - 1) / cd;
+    let cstart_raw = start + t * chunk;
+    let cstart = if cstart_raw < lim { cstart_raw } else { lim };
+    let cend_raw = cstart_raw + chunk;
+    let cend = if cend_raw < lim { cend_raw } else { lim };
+
+    // Pass 1: per-chunk local sum.
+    let mut lsum = 0u32;
+    let mut j = cstart;
+    while j < cend {
+        lsum += to_left[j];
+        j += 1;
+    }
+    let mut sums = SharedMemory::<u32>::new(256usize);
+    sums[t] = lsum;
+    sync_cube();
+    // Hillis-Steele INCLUSIVE scan over the 256 chunk sums (integer adds — the
+    // prefix VALUES are exact regardless of the combining order).
+    let mut offset = 1usize;
+    while offset < cd {
+        let mut carry = 0u32;
+        if t >= offset {
+            carry = sums[t - offset];
+        }
+        sync_cube();
+        if t >= offset {
+            sums[t] += carry;
+        }
+        sync_cube();
+        offset *= 2;
+    }
+    // Exclusive chunk base = inclusive[t-1]; block total = inclusive[cd-1].
+    let mut base = 0u32;
+    if t > 0 {
+        base = sums[t - 1];
+    }
+    if t == 0 {
+        block_totals[b] = sums[cd - 1];
+    }
+    // Pass 2: per-chunk exclusive prefix write.
+    let mut acc = base;
+    let mut j2 = cstart;
+    while j2 < cend {
+        local_excl[j2] = acc;
+        acc += to_left[j2];
+        j2 += 1;
+    }
+}
+
 /// Stage B: single-owner exclusive scan of the `num_blocks` block totals IN PLACE
 /// (after this, `block_totals[b]` = left rows strictly before block `b`), the left
 /// TOTAL (= split point) stashed into the sentinel cell `block_totals[num_blocks]`,
@@ -1039,6 +1155,123 @@ fn resident_scatter_fused_bc_smem_kernel(
         perm[p_begin as usize + dest as usize] = snap[i];
         i += CUBE_DIM as usize;
     }
+}
+
+/// PARSCAN twin of [`resident_scatter_fused_bc_smem_kernel`] (§12 final-mile
+/// lever 2): identical scatter + ranges write, but the per-block exclusive base
+/// (`Σ block_totals[0..b]`) and left TOTAL (`Σ block_totals[0..num_blocks]`) are
+/// computed by a PARALLEL strided accumulate + 8-step shared-memory tree
+/// reduction instead of unit 0 serially walking up to `num_blocks` global cells
+/// per block (the measured 34µs/call cost). u32 adds are order-free, so both
+/// values — and every byte written — are identical to the serial twin.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn resident_scatter_fused_bc_smem_parscan_kernel(
+    snap: &Array<u32>,
+    to_left: &Array<u32>,
+    local_excl: &Array<u32>,
+    block_totals: &Array<u32>,
+    perm: &mut Array<u32>,
+    ranges: &mut Array<i32>,
+    p_begin: u32,
+    n: u32,
+    block_size: u32,
+    num_blocks: u32,
+    leaf_id: u32,
+    p_count: i32,
+) {
+    let b = CUBE_POS_X;
+    let cd = CUBE_DIM as usize;
+    let t = UNIT_POS as usize;
+
+    // Strided parallel partials: prefix (blocks before b) and grand total.
+    let mut part_prefix = 0u32;
+    let mut part_total = 0u32;
+    let mut k = t;
+    while k < num_blocks as usize {
+        let v = block_totals[k];
+        part_total += v;
+        if u32::cast_from(k) < b {
+            part_prefix += v;
+        }
+        k += cd;
+    }
+    let mut sp = SharedMemory::<u32>::new(512usize);
+    sp[t] = part_prefix;
+    sp[t + cd] = part_total;
+    sync_cube();
+    let mut off = cd / 2;
+    while off >= 1usize {
+        if t < off {
+            sp[t] += sp[t + off];
+            sp[t + cd] += sp[t + cd + off];
+        }
+        sync_cube();
+        off /= 2;
+    }
+    let base_b = sp[0];
+    let total = sp[cd];
+
+    // Cube 0's unit 0 writes the six child-range fields — verbatim from the twin.
+    if b == 0 && UNIT_POS == 0 {
+        let sp_i = i32::cast_from(total);
+        let pb = i32::cast_from(p_begin);
+        let base_idx = (leaf_id * 6) as usize;
+        ranges[base_idx] = pb;
+        ranges[base_idx + 1] = pb + sp_i;
+        ranges[base_idx + 2] = sp_i;
+        ranges[base_idx + 3] = pb + sp_i;
+        ranges[base_idx + 4] = pb + p_count;
+        ranges[base_idx + 5] = p_count - sp_i;
+    }
+    // Scatter — verbatim from the twin.
+    let start = (b * block_size) as usize;
+    let nn = n as usize;
+    let end_raw = start + block_size as usize;
+    let end = if end_raw < nn { end_raw } else { nn };
+    let mut i = start + UNIT_POS as usize;
+    while i < end {
+        let excl = base_b + local_excl[i];
+        let go_left = to_left[i] == 1u32;
+        let iu = u32::cast_from(i);
+        let right_dest = total + (iu - excl);
+        let dest = select(go_left, excl, right_dest);
+        perm[p_begin as usize + dest as usize] = snap[i];
+        i += CUBE_DIM as usize;
+    }
+}
+
+/// `LGBM_PARTITION_PARSCAN` (default ON): dispatch the parallel-scan twins of the
+/// resident-partition mark/scatter kernels (§12 final-mile lever 2). REAL-DEVICE
+/// only (like the BC-smem fusion — cubecl-cpu does not share plain SharedMemory
+/// across units, and the cpu anchor keeps its byte-unchanged serial kernels).
+/// `=0` restores the single-owner serial-scan kernels for A/B. Byte-identical
+/// either way (u32 integer scans — same values), proven on real GPU by
+/// `parscan_partition_byte_identical_to_serial`.
+#[must_use]
+pub fn partition_parscan_enabled() -> bool {
+    match PARTITION_PARSCAN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("LGBM_PARTITION_PARSCAN").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Same-session A/B override for [`partition_parscan_enabled`].
+/// 0 = unset, 1 = force ON, 2 = force OFF.
+static PARTITION_PARSCAN_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Set (or clear) the [`partition_parscan_enabled`] override — test/A-B seam.
+pub fn set_partition_parscan_override(v: Option<bool>) {
+    let raw = match v {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    };
+    PARTITION_PARSCAN_OVERRIDE.store(raw, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The device-resident row permutation for one tree grow (the `cuda_data_indices_`
@@ -1244,8 +1477,17 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
         }
         macro_rules! launch_mark {
             ($w:ty) => {
+                if partition_parscan_enabled() && <R as cubecl::Runtime>::name(client) != "cpu" {
+                    launch_mark_inner!($w, resident_mark_block_scan_parscan_kernel)
+                } else {
+                    launch_mark_inner!($w, resident_mark_block_scan_kernel)
+                }
+            };
+        }
+        macro_rules! launch_mark_inner {
+            ($w:ty, $kernel:ident) => {
                 unsafe {
-                    resident_mark_block_scan_kernel::launch::<$w, R>(
+                    $kernel::launch::<$w, R>(
                         client,
                         CubeCount::Static(num_blocks as u32, 1, 1),
                         CubeDim::new_1d(256),
@@ -1291,24 +1533,33 @@ impl<R: cubecl::Runtime> ResidentPermPartition<R> {
             // `b < num_blocks` reads `block_totals[0..num_blocks]` (⊂ `MAX_SCAN_BLOCKS+1`),
             // scatters strided into `perm[p_begin..p_begin+n) ⊂ [0, num_data)`, cube 0
             // writes `ranges[6*leaf_id .. +6)` (`leaf_id < num_leaves`). cubecl unsafe here.
-            unsafe {
-                resident_scatter_fused_bc_smem_kernel::launch::<R>(
-                    client,
-                    CubeCount::Static(num_blocks as u32, 1, 1),
-                    CubeDim::new_1d(256),
-                    ArrayArg::from_raw_parts(self.snap.clone(), self.num_data),
-                    ArrayArg::from_raw_parts(self.to_left.clone(), self.num_data),
-                    ArrayArg::from_raw_parts(self.local_excl.clone(), self.num_data),
-                    ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
-                    ArrayArg::from_raw_parts(self.perm.clone(), self.num_data),
-                    ArrayArg::from_raw_parts(leaf_splits.ranges.clone(), ranges_len),
-                    p_begin as u32,
-                    n as u32,
-                    block_size,
-                    num_blocks as u32,
-                    leaf_id as u32,
-                    p_count,
-                );
+            macro_rules! launch_scatter_bc {
+                ($kernel:ident) => {
+                    unsafe {
+                        $kernel::launch::<R>(
+                            client,
+                            CubeCount::Static(num_blocks as u32, 1, 1),
+                            CubeDim::new_1d(256),
+                            ArrayArg::from_raw_parts(self.snap.clone(), self.num_data),
+                            ArrayArg::from_raw_parts(self.to_left.clone(), self.num_data),
+                            ArrayArg::from_raw_parts(self.local_excl.clone(), self.num_data),
+                            ArrayArg::from_raw_parts(self.block_totals.clone(), MAX_SCAN_BLOCKS + 1),
+                            ArrayArg::from_raw_parts(self.perm.clone(), self.num_data),
+                            ArrayArg::from_raw_parts(leaf_splits.ranges.clone(), ranges_len),
+                            p_begin as u32,
+                            n as u32,
+                            block_size,
+                            num_blocks as u32,
+                            leaf_id as u32,
+                            p_count,
+                        );
+                    }
+                };
+            }
+            if partition_parscan_enabled() {
+                launch_scatter_bc!(resident_scatter_fused_bc_smem_parscan_kernel);
+            } else {
+                launch_scatter_bc!(resident_scatter_fused_bc_smem_kernel);
             }
             return Ok(());
         }

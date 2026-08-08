@@ -122,11 +122,14 @@ LAUNCH_PROF_RE = re.compile(r"^cubecl-launch-prof.*$", re.MULTILINE)
 # Round 3b (fast resolve): wheel defaults ship inline + funcattr-once + the
 # two-level module cache (bucket by type-name ptr/mode/cube-dim, full-KernelId
 # EQUALITY inside — skips the ~85us/launch full-id hash). rs_slow isolates it.
+# Round 6: parscan partition twins (parallel per-block scan + parallel block
+# prefix) default ON; rs_serscan restores the serial single-owner kernels.
 ARMS = {
     "official": {"backend": "official", "env": {}},
     "rs": {"backend": "rs", "env": {}},
+    "rs_serscan": {"backend": "rs", "env": {"LGBM_PARTITION_PARSCAN": "0"}},
 }
-ARM_ORDER = ["official", "rs"]
+ARM_ORDER = ["official", "rs", "rs_serscan"]
 
 
 def run(cmd, check=True):
@@ -273,7 +276,7 @@ def main():
     identity = {}
     if "rs" in pred_paths:
         base = np.load(pred_paths["rs"])
-        for a in ():
+        for a in ("rs_serscan",):
             if a in pred_paths:
                 other = np.load(pred_paths[a])
                 identity[a] = float(np.max(np.abs(other - base))) if other.shape == base.shape else None

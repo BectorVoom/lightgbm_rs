@@ -644,3 +644,103 @@ mod real_gpu_gated {
     }
 
 }
+
+/// §12 final-mile lever 2 (REAL GPU): the PARSCAN mark/scatter twins (parallel
+/// per-block exclusive scan + parallel block-prefix reduction) produce a perm,
+/// child ranges and split points BYTE-IDENTICAL to the serial single-owner
+/// kernels over a multi-split walk — u32 integer sums are order-free, so any
+/// difference is a bug. Runs the same step walk twice (override OFF then ON)
+/// from a fresh identity perm, comparing full perm bytes + all six range fields
+/// per step, and both against the host stable-partition anchor.
+#[cfg(any(feature = "rocm", feature = "cuda"))]
+mod parscan_gate {
+    use super::*;
+    use lgbm_compute::kernels::partition::set_partition_parscan_override;
+
+    #[cfg(feature = "cuda")]
+    type GpuRt = lgbm_compute::runtime::CudaRuntime;
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    type GpuRt = lgbm_compute::runtime::RocmRuntime;
+
+    #[cfg(feature = "cuda")]
+    fn gpu_client() -> cubecl::prelude::ComputeClient<GpuRt> {
+        lgbm_compute::runtime::cuda_client()
+    }
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    fn gpu_client() -> cubecl::prelude::ComputeClient<GpuRt> {
+        lgbm_compute::runtime::rocm_client()
+    }
+
+    fn run_walk(parscan: Option<bool>) -> (Vec<u32>, Vec<[i32; 6]>) {
+        set_partition_parscan_override(parscan);
+        let client = gpu_client();
+        let num_data = 700usize;
+        let num_bins = [16u32, 8, 11];
+        let cols: Vec<Vec<u32>> =
+            (0..3).map(|f| column(0x5eed + f as u64, num_data, num_bins[f])).collect();
+        let mut concat_u8: Vec<u8> = Vec::with_capacity(3 * num_data);
+        for col in &cols {
+            concat_u8.extend(col.iter().map(|&b| b as u8));
+        }
+        use cubecl::prelude::CubeElement;
+        let bins_handle = client.create_from_slice(u8::as_bytes(&concat_u8));
+        let rp = ResidentPermPartition::new(&client, num_data).expect("state alloc");
+        let leaf_splits = DeviceLeafSplits::new(&client, 8).expect("ranges alloc");
+
+        let steps = [
+            Step { feature: 0, begin: 0, count: 700, leaf_id: 0, min_bin: 1, max_bin: 15, default_bin: 16, most_freq_bin: 0, missing_type: 0, default_left: false, threshold: 7 },
+            Step { feature: 1, begin: 0, count: 350, leaf_id: 1, min_bin: 1, max_bin: 7, default_bin: 2, most_freq_bin: 0, missing_type: 1, default_left: true, threshold: 3 },
+            Step { feature: 2, begin: 350, count: 350, leaf_id: 2, min_bin: 0, max_bin: 10, default_bin: 0, most_freq_bin: 3, missing_type: 2, default_left: false, threshold: 5 },
+            Step { feature: 0, begin: 100, count: 400, leaf_id: 3, min_bin: 1, max_bin: 15, default_bin: 4, most_freq_bin: 4, missing_type: 1, default_left: false, threshold: 11 },
+            Step { feature: 1, begin: 620, count: 80, leaf_id: 4, min_bin: 1, max_bin: 7, default_bin: 0, most_freq_bin: 2, missing_type: 2, default_left: true, threshold: 1 },
+        ];
+        let mut ranges_out = Vec::new();
+        for (si, s) in steps.iter().enumerate() {
+            rp.partition_leaf(
+                &client,
+                &bins_handle,
+                ResidentBinWidth::U8,
+                s.feature * num_data,
+                3 * num_data,
+                num_bins[s.feature],
+                s.min_bin,
+                s.max_bin,
+                s.default_bin,
+                s.most_freq_bin,
+                s.missing_type,
+                s.default_left,
+                s.threshold,
+                &leaf_splits,
+                s.leaf_id,
+                s.begin as i32,
+                s.count as i32,
+            )
+            .unwrap_or_else(|e| panic!("step {si} (parscan={parscan:?}): {e:?}"));
+            let cr = leaf_splits.read_split(&client, s.leaf_id);
+            ranges_out.push([
+                cr.left_start,
+                cr.left_end,
+                cr.left_count,
+                cr.right_start,
+                cr.right_end,
+                cr.right_count,
+            ]);
+        }
+        let perm = rp.read_perm(&client);
+        set_partition_parscan_override(None);
+        (perm, ranges_out)
+    }
+
+    #[test]
+    fn parscan_partition_byte_identical_to_serial() {
+        let (perm_serial, ranges_serial) = run_walk(Some(false));
+        let (perm_par, ranges_par) = run_walk(Some(true));
+        assert_eq!(perm_par, perm_serial, "parscan perm diverged from serial");
+        assert_eq!(ranges_par, ranges_serial, "parscan child ranges diverged");
+        // Non-vacuous: the root split must route rows both ways.
+        assert!(
+            ranges_serial[0][2] > 0 && ranges_serial[0][5] > 0,
+            "root split must be non-trivial"
+        );
+    }
+}
