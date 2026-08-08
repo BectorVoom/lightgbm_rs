@@ -1770,6 +1770,24 @@ fn scan_staged_enabled() -> bool {
     !matches!(std::env::var("LGBM_SCAN_STAGED").as_deref(), Ok("0"))
 }
 
+/// SPEC-DRGL-05: whether the DEFERRED grow loop's required scan configuration holds on
+/// this client — the fused-subtract OFFICIAL staged co-scan (no pargain) + the par
+/// reduce on a real device. The deferred driver arm consults this so a default-ON
+/// deferral silently falls back to the byte-identical eager loop on any other config
+/// (instead of the Backend seam's typed error).
+#[cfg(feature = "gpu")]
+pub fn deferred_scan_config_applies<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    cfg: &GainConfig,
+) -> bool {
+    <R as cubecl::Runtime>::name(client) != "cpu"
+        && scan_staged_enabled()
+        && scan_variants_applicable(cfg)
+        && !scan_pargain_enabled(<R as cubecl::Runtime>::name(client))
+        && scan_official_enabled(client)
+        && reduce_par_enabled(client)
+}
+
 /// REVERSE-branch scan reading a STAGED (LDS) histogram — a VERBATIM
 /// transcription of [`split_scan_body`]'s REVERSE block (`feature_histogram.hpp
 /// :854-936`): same literal-init state, same gate order, same monotone `done`,

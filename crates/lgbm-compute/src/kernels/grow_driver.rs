@@ -612,8 +612,12 @@ pub fn grow_defer_sync_enabled() -> bool {
         2 => return false,
         _ => {}
     }
+    // DEFAULT ON since the P100 verdict (rs_defer 3.494 vs rs 3.651 = 1.045x,
+    // preds byte-identical — plan doc §12 round 7). `=0` restores the eager loop.
+    // The driver additionally gates on `deferred_scan_config_applies`, so a
+    // non-conforming config silently keeps the byte-identical eager loop.
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("LGBM_GROW_DEFER_SYNC").map(|v| v == "1").unwrap_or(false))
+    *E.get_or_init(|| std::env::var("LGBM_GROW_DEFER_SYNC").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Same-session A/B override for [`grow_defer_sync_enabled`]. 0 = unset, 1 = ON, 2 = OFF.
@@ -2803,7 +2807,14 @@ where
     // eager arm, so the grown tree is byte-identical (the local + P100 gates prove
     // it). Requires the resident-perm arm; the deferred Backend seam requires the
     // cuda-default fused config and errors typed otherwise. ----
-    let use_deferred = grow_defer_sync_enabled() && resident_perm.is_some();
+    #[cfg(feature = "gpu")]
+    let defer_cfg_ok = crate::kernels::split::deferred_scan_config_applies(client, cfg);
+    #[cfg(not(feature = "gpu"))]
+    let defer_cfg_ok = false;
+    let use_deferred = grow_defer_sync_enabled()
+        && resident_perm.is_some()
+        && defer_cfg_ok
+        && subtract_fuse_enabled();
     if use_deferred {
         struct PendingSplit {
             split_idx: usize,
