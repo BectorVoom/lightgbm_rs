@@ -912,3 +912,22 @@ switches. Remaining ~0.4 s, ranked: pageable→pinned small uploads
 (~1.2 ms/tree), pick kernel shape (~0.4 ms/tree), then re-profile — at 1.13×
 the next decomposition needs fresh CUPTI evidence (the serialization tail has
 shrunk under the deferral; unknown residual shape).
+
+### Round 9 — pin-uploads WINS 1.050×: gap 1.12×
+
+Kernel v13 (P100, same session): official 2.817 | **rs 3.149** | rs_pageable
+(`CUBECL_CUDA_PIN_UPLOADS=0`) 3.308. Preds byte-identical (0.0); envelope
+3.07e-5. CUPTI: the 2 283 pageable HtoD copies collapsed to 1 (the >4MB
+resident-bins upload, deliberately direct); all small uploads now pinned at
+3.5µs avg. Free-run (3.15) now BEATS drain (3.42) — overlap finally works.
+
+**Updated scorecard: gap 2.05× → 1.92× → 1.28× → 1.22× → 1.13× → 1.12×.**
+Cache-warm drained ledger: binning 898 + grow 1734 (build 697, setup 265,
+scan 171, pick 169, partition 153, treesplit 83, tail 87) + score 167 +
+grad 80. Device kernels/20t: child build 53.3ms (88.8µs — 2.7× faster than
+official's ConstructHistogram), pinned HtoD 29.7ms/8 462, fix_compact 12.5,
+subtract-scan 11.9, pick 10.1. The remaining ~0.33s is flat: ~10-30ms device
+items + host-side binning/score parity — no single dominant lever remains;
+next session should re-rank with these tables (candidates: fix_compact
+geometry 20µs/call, pick kernel 17µs/call, info-upload count via the arena
+revisited on TOP of pin-uploads, host binning micro-profile).
