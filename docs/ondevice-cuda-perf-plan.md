@@ -866,3 +866,26 @@ scatter 34 → **10.6 µs** — the partition chain now BEATS official's analog 
 **Scorecard: gap 2.05× (campaign start) → 1.22×.** Remaining ~0.7 s, ranked:
 host serialization bubbles (~10 ms/tree, single-sync/split deferral), pageable
 small uploads (~1.2 ms/tree), pick kernel shape (~0.4 ms/tree).
+
+### Round 7 — THE DEFERRAL WINS: single-sync/split lands 1.045×, gap 1.17×
+
+The shape-preserving deferred grow loop (`LGBM_GROW_DEFER_SYNC`): ONE batched
+[ranges, pick-export] read per split (was 2 blocking crossings), with split
+i's host bookkeeping applied at the top of iteration i+1. The per-split device
+chain runs without the host knowing the split point: partition → role kernel →
+FIXED-GRID build-SMALLER (which=2 — first driver wiring of the T-04 kernel) →
+which-aware fused subtract+co-scan (LEFT/RIGHT scalars role-selected on
+device) → device-target par reduce. Every kernel variant identical to the
+eager arm ⇒ byte-identical trees (proven real-GPU + P100 preds 0.0).
+
+Kernel v11 (P100, same session): official 2.978 | rs (eager) 3.651 |
+**rs_defer 3.494** = **1.045×**, preds 0.0, 100 trees. **Gap: 1.17× — the
+first time under 1.2.** Drained grow 2032ms (partition bucket 392→175 after
+round-6 parscan). This REVERSES T-11's 0.836× (2026-07-15): the old deferred
+arm changed compute shape (build-LEFT, split scans, legacy kernel); keeping
+the variants identical was the missing ingredient.
+
+Default FLIPPED ON behind `deferred_scan_config_applies` (cuda-default fused
+config only; hip's pargain default and any non-conforming config silently
+keep the byte-identical eager loop; `LGBM_GROW_DEFER_SYNC=0` restores eager).
+Round 8 confirms the flipped default (official / rs / rs_eager).
