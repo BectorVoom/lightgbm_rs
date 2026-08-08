@@ -60,6 +60,14 @@ cfg = json.loads(sys.argv[1])
 data = np.load(cfg["data_path"])
 X = data["X"]; y = data["y"]
 
+_torch_prof = os.environ.get("TORCH_PROF") == "1"
+_prof_ctx = None
+if _torch_prof:
+    import torch
+    from torch.profiler import profile, ProfilerActivity
+    torch.cuda.init()
+    _prof_ctx = profile(activities=[ProfilerActivity.CUDA])
+
 params = dict(cfg["params"])
 params.setdefault("verbosity", -1)
 params.setdefault("num_threads", 0)
@@ -69,17 +77,25 @@ try:
     if cfg["backend"] == "official":
         import lightgbm as lgb
         train_set = lgb.Dataset(X, y)
+        if _prof_ctx is not None:
+            _prof_ctx.__enter__()
         start = time.time()
         booster = lgb.train(params, train_set, num_boost_round=cfg["num_boost_round"])
         wall = time.time() - start
+        if _prof_ctx is not None:
+            _prof_ctx.__exit__(None, None, None)
         num_trees = booster.num_trees()
         preds = booster.predict(X[:n_pred])
     else:
         import lightgbm_rs as lgb_rs
         train_set = lgb_rs.Dataset(X, y)
+        if _prof_ctx is not None:
+            _prof_ctx.__enter__()
         start = time.time()
         booster = lgb_rs.train(params, train_set, num_boost_round=cfg["num_boost_round"])
         wall = time.time() - start
+        if _prof_ctx is not None:
+            _prof_ctx.__exit__(None, None, None)
         num_trees = booster.num_trees()
         preds = booster.predict(X[:n_pred])
 except Exception as e:
@@ -90,6 +106,9 @@ except Exception as e:
 np.save(cfg["pred_path"], np.asarray(preds, dtype=np.float64))
 print(f"NUM_TREES={num_trees}")
 print(f"WALLCLOCK={wall}")
+if _prof_ctx is not None:
+    print("=== TORCH_PROF cuda kernel table ===")
+    print(_prof_ctx.key_averages().table(sort_by="self_cuda_time_total", row_limit=25))
 '''
 
 NUM_TREES_RE = re.compile(r"^NUM_TREES=(-?\d+)$", re.MULTILINE)
@@ -168,6 +187,7 @@ def run_worker(worker_path, data_path, arm, params, pred_path, extra_env=None, n
         "rs_binning_ms": float(binnings[-1]) if binnings else None,
         "launch_prof_all": prof_lines[-2:] if prof_lines else None,
         "stderr_tail": proc.stderr[-6000:],
+        "stdout_tail": proc.stdout[-6000:],
     }
 
 
@@ -261,45 +281,15 @@ def main():
             off = np.load(pred_paths["official"])
             identity["official_envelope"] = float(np.max(np.abs(off - base)))
 
-    print("\n=== nsys device-kernel head-to-head (20 trees) ===")
-    import shutil
-    nsys = shutil.which("nsys")
-    if not nsys:
-        run("ls /opt/nvidia 2>/dev/null || true", check=False)
-        run("apt-get update -qq 2>/dev/null; apt-get install -y -qq nsight-systems-cli 2>&1 | tail -1 || true", check=False)
-        nsys = shutil.which("nsys")
-    if not nsys:
-        cand = subprocess.run("ls /opt/nvidia/nsight-systems*/bin/nsys 2>/dev/null | head -1",
-                              shell=True, capture_output=True, text=True).stdout.strip()
-        nsys = cand or None
-    if nsys:
-        for arm_name in ("official", "rs"):
-            arm = ARMS[arm_name]
-            env = dict(os.environ)
-            if arm["backend"] != "official":
-                env["LGBM_PHASE_PROF"] = "0"
-                env["LGBM_AUTOTUNE"] = "0"
-                env.update(arm["env"])
-            cfg = {"data_path": data_path, "backend": arm["backend"], "params": params,
-                   "num_boost_round": 20, "pred_path": os.path.join(out_dir, f"pred_{arm_name}_nsys.npy"),
-                   "n_pred": 1000}
-            rep = os.path.join(out_dir, f"prof_{arm_name}")
-            try:
-                subprocess.run([nsys, "profile", "-o", rep, "--trace=cuda", "-f", "true",
-                                sys.executable, worker_path, json.dumps(cfg)],
-                               env=env, capture_output=True, text=True, timeout=900)
-                st = subprocess.run([nsys, "stats", "--report", "cuda_gpu_kern_sum", rep + ".nsys-rep"],
-                                    capture_output=True, text=True, timeout=600)
-                print(f"--- nsys cuda_gpu_kern_sum {arm_name} (top) ---")
-                for i, ln in enumerate(st.stdout.splitlines()):
-                    if i > 45:
-                        break
-                    if ln.strip():
-                        print(ln)
-            except Exception as e:
-                print(f"  nsys {arm_name} failed: {type(e).__name__}: {e}")
-    else:
-        print("NSYS_UNAVAILABLE (not in image, apt install failed)")
+    print("\n=== torch-profiler device-kernel head-to-head (20 trees) ===")
+    for arm_name in ("official", "rs"):
+        arm = ARMS[arm_name]
+        pred_path = os.path.join(out_dir, f"pred_{arm_name}_tprof.npy")
+        res = run_worker(worker_path, data_path, arm, params, pred_path,
+                          extra_env={"TORCH_PROF": "1"}, n_rounds=20)
+        print(f"  tprof {arm_name} wall={res['wall']} err={res['arm_error']}")
+        # the kernel table is on the worker stdout; surface it
+        print(res["stdout_tail"])
 
     print("\n=== 1-tree diagnostics (construct + fixed overhead) ===")
     one_tree = {}
