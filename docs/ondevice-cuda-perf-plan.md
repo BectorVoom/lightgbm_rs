@@ -807,3 +807,43 @@ sync waits ~0.5 s total, compile amortized.
 (Cross-session absolute walls vary ±10% with the Kaggle box; the same-session
 gap is the metric. Cold first-process still pays ~2.6 s NVRTC once per
 machine/cache — an install/import-time warmup would hide it.)
+
+### Round 5b — device-kernel head-to-head (torch/CUPTI, 20 trees, same corpus)
+
+nsys is not installable on the Kaggle image; torch.profiler's CUPTI activity
+tracing captures ALL in-process CUDA kernels (both implementations share the
+primary context). Device totals: **official 207.4ms (10.4ms/tree) vs rs
+222.1ms (11.1ms/tree) — device compute is essentially PARITY.** The 14ms/tree
+wall-marginal gap (26.1 vs 12.2) is ~93% host/serialization, NOT device work.
+
+Per-kernel (ms / 20 trees):
+
+| stage | official | rs | delta |
+|---|---|---|---|
+| histogram build | **144.0** (ConstructHistogramDense, 240µs×600) | **77.4** (u64 LDS, 125µs×620) | **rs WINS +67** |
+| scan+subtract+fix | 24.6 | 13.9 | rs wins +11 |
+| partition chain | 20.1 | **66.9** (mark_block_scan 29.4 + scatter_bc_smem 20.4 + fix_compact 12.5 + split 4.6) | **rs LOSES −47** |
+| memcpys | 10.0 | **48.0** (incl. 2 283 PAGEABLE HtoD × 11.2µs = 25.5) | rs loses −38 |
+| pick | 2.4 | 10.1 | rs loses −7.7 |
+
+**The u64 bit-exact build kernel BEATS official's builder by 1.9×** — the
+"bit-exactness premium" worry was unfounded; no numerics trade-off is needed.
+Official launches MORE kernels/tree than we do (~390 vs 185) at ~5µs raw-CUDA
+enqueue — launch count was never the problem either.
+
+### Final-mile levers (evidence-ranked)
+
+1. **Serialization bubbles + sync round-trips (~10–14 ms/tree):** 62 blocking
+   readbacks/tree nearly serialize the loop (host decodes + re-enqueues while
+   the device idles). Levers: batched pick+ranges read (ONE sync/split — the
+   §11 deferral, shape-preserving devcount variant, machinery in-tree), and
+   shrinking host decode/enqueue latency between dependent launches.
+2. **Partition device chain (−47ms/20t = 2.3 ms/tree):** mark_block_scan at
+   49µs/call and the 34µs scatter are 3.3× official's equivalents (P2.5
+   micro-shape: geometry/width, u32 marks).
+3. **Pageable→pinned small uploads (−25ms/20t):** 2 283 pageable HtoD/20t at
+   11.2µs vs 1.8µs pinned — route stragglers through pinned staging (the
+   arena's device-side benefit, revisited with correct attribution).
+4. pick kernel shape (−7.7ms/20t).
+
+Transport, compile, build-kernel, binning: all CLOSED (parity or better).
