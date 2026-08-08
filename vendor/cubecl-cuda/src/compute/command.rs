@@ -33,6 +33,13 @@ use cudarc::driver::sys::{
 };
 use std::{ffi::c_void, ops::DerefMut, sync::Arc};
 
+/// LIGHTGBM_RS FORK: `CUBECL_CUDA_PIN_UPLOADS=0` restores upstream's direct
+/// pageable upload for Native/Other Bytes (default ON: stage ≤4MB through pinned).
+fn pin_uploads_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_CUDA_PIN_UPLOADS").map(|v| v != "0").unwrap_or(true))
+}
+
 #[derive(new)]
 /// The `Command` struct encapsulates a CUDA context and a set of resolved CUDA streams, providing an
 /// interface for executing GPU-related operations such as memory allocation, data transfers, kernel
@@ -371,6 +378,26 @@ impl<'a> Command<'a> {
                 let mut buffer = self.reserve_pinned(size, None).unwrap();
                 data.copy_into(&mut buffer);
                 buffer
+            }
+            // LIGHTGBM_RS FORK (§12): `client.create_from_slice` produces NATIVE
+            // (pageable) Bytes — the CUPTI profile shows 2 283 pageable HtoD copies
+            // per 20-tree train at 11.5µs each vs 1.9µs pinned (and pageable async
+            // copies stage synchronously in the driver). Stage small pageable
+            // uploads through the pinned pool; large ones (> 4 MB) keep the direct
+            // path (the pool shouldn't absorb bulk one-off uploads). Fallback to the
+            // direct pageable copy when the pinned pool can't serve. Content
+            // byte-identical either way. `CUBECL_CUDA_PIN_UPLOADS=0` restores
+            // upstream behavior.
+            AllocationProperty::Native | AllocationProperty::Other
+                if size <= 4 * MB && pin_uploads_enabled() =>
+            {
+                match self.reserve_pinned(size, None) {
+                    Some(mut buffer) => {
+                        data.copy_into(&mut buffer);
+                        buffer
+                    }
+                    None => data,
+                }
             }
             _ => data,
         };
