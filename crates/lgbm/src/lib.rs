@@ -27,6 +27,9 @@ pub use eval_metric::{create_metrics, EvalMetric};
 pub use error::LgbmError;
 
 // --- core config (the single source of truth, D-02) ---
+// `DeviceKind` rides along: it is the typed reading of `Config::device_type` that
+// the runtime backend dispatch matches on, so callers selecting a device need it.
+pub use lgbm_core::config::DeviceKind;
 pub use lgbm_core::Config;
 
 // --- dataset surface ---

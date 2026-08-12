@@ -9,6 +9,7 @@ in-scope APIs.
 
 try:
     from ._core import Booster, Dataset, LightGBMError
+    from ._core import get_device_capabilities as get_device_capabilities
     from ._core import train as _core_train
 except ImportError as _exc:
     if "cannot allocate memory in static TLS block" in str(_exc):
@@ -112,6 +113,7 @@ __all__ = [
     "Booster",
     "Dataset",
     "LightGBMError",
+    "get_device_capabilities",
     "train",
     "cv",
     "CVBooster",

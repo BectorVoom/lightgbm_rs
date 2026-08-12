@@ -167,7 +167,31 @@ pub fn cpu_client() -> ComputeClient<cubecl::cpu::CpuRuntime> {
 #[cfg(feature = "rocm")]
 #[must_use]
 pub fn rocm_client() -> ComputeClient<cubecl::hip::HipRuntime> {
-    cubecl::hip::HipRuntime::client(&cubecl::hip::AmdDevice::new(0))
+    rocm_client_for(&rocm_device(0))
+}
+
+/// The ROCm/HIP device at `index` — the `gpu_device_id` hyperparameter's
+/// mapping onto CubeCL device selection.
+///
+/// Index `0` reproduces the historical hardcoded `AmdDevice::new(0)`, so the
+/// default config selects exactly the device every prior build used.
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn rocm_device(index: u32) -> cubecl::hip::AmdDevice {
+    // Both `AmdDevice::new` and `CudaDevice::new` take a `usize` index in cubecl
+    // 0.10; the seam takes `u32` because that is what `Config::gpu_device_index`
+    // yields (a non-negative `gpu_device_id`).
+    cubecl::hip::AmdDevice::new(index as usize)
+}
+
+/// Construct a ROCm/HIP client bound to an EXPLICIT device (see [`rocm_device`]).
+///
+/// Split out from [`rocm_client`] so the facade can honor `gpu_device_id`
+/// without re-spelling the cubecl device type outside this module (CMP-01).
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn rocm_client_for(device: &cubecl::hip::AmdDevice) -> ComputeClient<cubecl::hip::HipRuntime> {
+    cubecl::hip::HipRuntime::client(device)
 }
 
 /// The active CubeCL runtime type for the `rocm` feature build (gfx-class GPUs).
@@ -197,13 +221,36 @@ pub type CudaRuntime = cubecl::cuda::CudaRuntime;
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn cuda_client() -> ComputeClient<cubecl::cuda::CudaRuntime> {
+    cuda_client_for(&cuda_device(0))
+}
+
+/// The CUDA device at `index` — the `gpu_device_id` hyperparameter's mapping
+/// onto CubeCL device selection.
+///
+/// Index `0` reproduces the historical hardcoded `CudaDevice::new(0)`, so the
+/// default config selects exactly the device every prior build used.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_device(index: u32) -> cubecl::cuda::CudaDevice {
+    cubecl::cuda::CudaDevice::new(index as usize)
+}
+
+/// Construct a CUDA client bound to an EXPLICIT device (see [`cuda_device`]).
+///
+/// Split out from [`cuda_client`] so the facade can honor `gpu_device_id`
+/// without re-spelling the cubecl device type outside this module (CMP-01).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_client_for(
+    device: &cubecl::cuda::CudaDevice,
+) -> ComputeClient<cubecl::cuda::CudaRuntime> {
     // Flip the cubecl device-handle default to INLINE for CUDA trains (P100-measured
     // 1.045× wall win, preds byte-identical — plan doc §12). The env var stays the
     // user override in both directions (`CUBECL_DEVICE_INLINE=0` restores the
     // upstream channel handle); the choice latches process-globally on the first
     // client, so this must run before it — which is exactly this call site.
     cubecl_common::device::set_device_inline_default(true);
-    cubecl::cuda::CudaRuntime::client(&cubecl::cuda::CudaDevice::new(0))
+    cubecl::cuda::CudaRuntime::client(device)
 }
 
 /// The active CubeCL runtime type for the `wgpu` feature build (WebGPU/WGSL).
@@ -228,5 +275,27 @@ pub type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 #[cfg(feature = "wgpu")]
 #[must_use]
 pub fn wgpu_client() -> ComputeClient<cubecl::wgpu::WgpuRuntime> {
-    cubecl::wgpu::WgpuRuntime::client(&cubecl::wgpu::WgpuDevice::default())
+    wgpu_client_for(&wgpu_device(0))
+}
+
+/// The WGPU device for `index`.
+///
+/// WGPU addresses adapters through `WgpuDevice` variants rather than a flat
+/// index, so any `index` other than `0` cannot be honored; this returns the
+/// default adapter in every case and the facade reports the unhonored
+/// `gpu_device_id` via `Config::device_warnings` rather than silently binding a
+/// different device than the user asked for.
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub fn wgpu_device(_index: u32) -> cubecl::wgpu::WgpuDevice {
+    cubecl::wgpu::WgpuDevice::default()
+}
+
+/// Construct a WGPU client bound to an EXPLICIT device (see [`wgpu_device`]).
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub fn wgpu_client_for(
+    device: &cubecl::wgpu::WgpuDevice,
+) -> ComputeClient<cubecl::wgpu::WgpuRuntime> {
+    cubecl::wgpu::WgpuRuntime::client(device)
 }

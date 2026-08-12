@@ -66,6 +66,18 @@ fn bool_defaults_match_cpp() {
 }
 
 #[test]
+fn device_knob_defaults_match_cpp() {
+    // config.h: num_gpu = 1, gpu_platform_id = -1, gpu_device_id = -1,
+    // gpu_use_dp = false. These moved from OUT_OF_SCOPE to parsed members, so
+    // their defaults are now part of the parity contract.
+    let c = Config::default();
+    assert_eq!(c.num_gpu, 1);
+    assert_eq!(c.gpu_platform_id, -1);
+    assert_eq!(c.gpu_device_id, -1);
+    assert!(!c.gpu_use_dp);
+}
+
+#[test]
 fn numeric_spread_defaults_match_cpp() {
     let c = Config::default();
     assert_eq!(c.num_threads, 0);

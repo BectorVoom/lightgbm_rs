@@ -387,6 +387,82 @@ fn min_data_zero_and_zero_hessian_sets_one() {
     assert_eq!(c.min_data_in_leaf, 1);
 }
 
+// ---------------------------------------------------------------------------
+// CPU / GPU device knobs (now in-scope: parsed, validated, and consumed by the
+// facade's runtime backend dispatch).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gpu_device_knobs_parse_and_round_trip() {
+    let c = Config::from_params(&params(&[
+        ("device_type", "cuda"),
+        ("num_gpu", "1"),
+        ("gpu_platform_id", "2"),
+        ("gpu_device_id", "3"),
+        ("gpu_use_dp", "true"),
+    ]))
+    .unwrap();
+    assert_eq!(c.device_type, "cuda");
+    assert_eq!(c.num_gpu, 1);
+    assert_eq!(c.gpu_platform_id, 2);
+    assert_eq!(c.gpu_device_id, 3);
+    assert!(c.gpu_use_dp);
+}
+
+#[test]
+fn num_gpu_below_one_is_rejected() {
+    // C++ CHECK_GT(num_gpu, 0).
+    assert!(matches!(
+        Config::from_params(&params(&[("num_gpu", "0")])),
+        Err(ConfigError::OutOfRange { .. })
+    ));
+}
+
+#[test]
+fn multi_gpu_is_rejected_not_silently_single_device() {
+    // The Rust port trains on ONE device; asking for several must be a typed
+    // error rather than a silent single-device train.
+    assert!(matches!(
+        Config::from_params(&params(&[("num_gpu", "2")])),
+        Err(ConfigError::OutOfRange { .. })
+    ));
+}
+
+#[test]
+fn device_kind_and_index_derive_from_the_parsed_knobs() {
+    use lgbm_core::config::DeviceKind;
+
+    let c = Config::from_params(&params(&[("device_type", "gpu"), ("gpu_device_id", "2")])).unwrap();
+    assert_eq!(c.device_kind(), DeviceKind::Gpu);
+    assert_eq!(c.gpu_device_index(), 2);
+
+    // The `device` alias reaches device_type, and the -1 default maps to index 0.
+    let c = Config::from_params(&params(&[("device", "cuda")])).unwrap();
+    assert_eq!(c.device_kind(), DeviceKind::Cuda);
+    assert_eq!(c.gpu_device_index(), 0);
+
+    assert_eq!(Config::default().device_kind(), DeviceKind::Cpu);
+}
+
+#[test]
+fn inapplicable_gpu_knobs_warn_instead_of_failing() {
+    // gpu_platform_id / gpu_use_dp have no CubeCL analog: accepted (so official
+    // param dicts port unchanged) but reported, never silently honored.
+    let c = Config::from_params(&params(&[
+        ("device_type", "cuda"),
+        ("gpu_platform_id", "0"),
+        ("gpu_use_dp", "true"),
+    ]))
+    .unwrap();
+    let warnings = c.device_warnings();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings.iter().any(|w| w.contains("gpu_platform_id")));
+    assert!(warnings.iter().any(|w| w.contains("gpu_use_dp")));
+
+    // The defaults must stay silent.
+    assert!(Config::default().device_warnings().is_empty());
+}
+
 #[test]
 fn cuda_forces_row_wise() {
     let c = Config::from_params(&params(&[("device_type", "cuda")])).unwrap();

@@ -17,9 +17,12 @@
 //!    for `interaction_constraints`).
 //! 2. **Reject unimplemented (D-07)** — [`reject_unimplemented`] raises a clear
 //!    Python `ValueError` for any key (alias-resolved) in
-//!    [`lgbm_core::config::scope::OUT_OF_SCOPE_PARAMS`], or `device_type=gpu/cuda`
-//!    on a CPU-only wheel (accepted when a matching GPU backend is compiled in),
-//!    so a recognized-but-unported param NEVER silently trains a divergent model.
+//!    [`lgbm_core::config::scope::OUT_OF_SCOPE_PARAMS`] (distributed learning), or
+//!    a `device_type` outside this wheel's capability set
+//!    ([`crate::device`]), so a recognized-but-unported param NEVER silently
+//!    trains a divergent model. The device half is a capability test rather than a
+//!    blanket GPU rejection: backend selection is a RUNTIME choice keyed on
+//!    `device_type`, so a GPU wheel accepts both its GPU device and `cpu`.
 //! 3. **Build (D-06)** — `Config::from_params` does the full alias resolution +
 //!    CHECK validation; truly-unknown keys (typos) pass through and only warn,
 //!    preserving C++ fidelity (`set.rs:9-10`).
@@ -135,47 +138,65 @@ pub fn coerce_params_dict(params: &Bound<'_, PyDict>) -> PyResult<HashMap<String
 /// unported knob NEVER silently trains a divergent model (T-08-05-01).
 ///
 /// A key is rejected when its alias-resolved canonical name is in
-/// [`OUT_OF_SCOPE_PARAMS`] (distributed / GPU-OpenCL —
-/// referenced from the single source of truth in `lgbm_core`, not
-/// re-typed here), OR it is `device_type` set to `gpu`/`cuda` while this wheel is
-/// CPU-only (a matching GPU backend compiled in via `--features cuda`/`rocm`/`wgpu`
-/// makes the corresponding `device_type` accepted).
+/// [`OUT_OF_SCOPE_PARAMS`] (distributed learning — referenced from the single
+/// source of truth in `lgbm_core`, not re-typed here), OR it is `device_type`
+/// naming a device outside this wheel's capability set
+/// ([`crate::device::supported_devices`]).
+///
+/// The device half is a CAPABILITY test, not a blanket GPU rejection: backend
+/// selection is now a runtime choice keyed on `device_type`, so a wheel built
+/// with `--features cuda` accepts `device_type=cuda` AND `device_type=cpu` and
+/// dispatches each to its own backend. The same capability set is reported to
+/// Python by `lightgbm_rs.get_device_capabilities()`, so what the gate enforces
+/// and what introspection advertises cannot drift apart.
+///
+/// The GPU tuning knobs (`gpu_device_id`, `num_gpu`, `gpu_platform_id`,
+/// `gpu_use_dp`) are no longer rejected at all — they left `OUT_OF_SCOPE_PARAMS`
+/// when `Config::from_params` began parsing and validating them. `gpu_device_id`
+/// selects the CubeCL device; the two with no CubeCL analog are accepted and
+/// reported through `Config::device_warnings` rather than refused, so an official
+/// LightGBM param dict ports over unchanged.
 ///
 /// Truly-unknown keys (typos) are deliberately NOT rejected — they pass through
 /// to `Config::from_params`, which only warns, preserving C++ fidelity
 /// (D-06 unknown-warn-never-fatal).
 ///
 /// # Errors
-/// `ValueError` naming the unimplemented param.
+/// `ValueError` naming the unimplemented param or the unavailable device.
 pub fn reject_unimplemented(map: &HashMap<String, String>) -> PyResult<()> {
     for (key, value) in map {
         let canonical = resolve_alias(key);
         if OUT_OF_SCOPE_PARAMS.contains(&canonical) {
             return Err(PyValueError::new_err(format!(
                 "parameter `{key}` is recognized by LightGBM but not implemented in \
-                 lightgbm_rs (out-of-scope for v1: distributed / GPU-OpenCL). \
+                 lightgbm_rs (out-of-scope for v1: distributed learning). \
                  Remove it to train, or use the C++ LightGBM for this feature."
             )));
         }
         if canonical == "device_type" {
             let dev = value.trim().to_ascii_lowercase();
-            // A GPU device_type ("gpu"/"cuda") is accepted ONLY when this wheel was
-            // built with a matching CubeCL backend (cascade rocm > cuda > wgpu; see
-            // booster.rs). Backend selection is compile-time, so a GPU device_type on
-            // a GPU wheel dispatches to whichever backend was compiled in. The default
-            // CPU-only wheel rejects every GPU device_type, exactly as before — the
-            // feature gap was that lgbm-python never forwarded the GPU cargo features,
-            // so the extension module was permanently CPU-only.
-            let gpu_backend_built =
-                cfg!(feature = "rocm") || cfg!(feature = "cuda") || cfg!(feature = "wgpu");
-            let is_gpu_device = dev == "gpu" || dev == "cuda";
-            if is_gpu_device && !gpu_backend_built {
+            // An EMPTY value keeps the default (`Config::from_params` treats empty as
+            // absent), and an unknown spelling is `from_params`' typed error to raise
+            // — not this gate's, which only decides whether a VALID device is
+            // reachable from this wheel.
+            if dev.is_empty() {
+                continue;
+            }
+            if crate::device::supported_devices().contains(&dev.as_str()) {
+                continue;
+            }
+            if crate::device::device_is_known(&dev) {
                 return Err(PyValueError::new_err(format!(
-                    "device_type=`{value}` is recognized by LightGBM but this lightgbm_rs \
-                     wheel is CPU-only (no GPU backend compiled in). Rebuild with \
-                     `maturin --features cuda` (or rocm/wgpu) to enable the GPU backend."
+                    "device_type=`{value}` is supported by lightgbm_rs but no backend for \
+                     it was compiled into this wheel (available: {available:?}). Rebuild \
+                     with `maturin build --features {feature}` to enable it.",
+                    available = crate::device::supported_devices(),
+                    feature = crate::device::feature_for_device(&dev),
                 )));
             }
+            // Not a device lightgbm_rs knows at all — let `Config::from_params`
+            // raise its canonical `UnknownValue` error so the message matches the
+            // pure-Rust path exactly.
         }
     }
     Ok(())
@@ -269,6 +290,76 @@ mod tests {
         });
     }
 
+    /// The GPU device-tuning knobs left `OUT_OF_SCOPE_PARAMS` when
+    /// `Config::from_params` began parsing them, so the D-07 gate must no longer
+    /// reject them -- an official LightGBM param dict has to port over unchanged.
+    #[test]
+    fn gpu_tuning_knobs_pass_the_gate() {
+        for (key, value) in [
+            ("gpu_device_id", "1"),
+            ("num_gpu", "1"),
+            ("gpu_platform_id", "0"),
+            ("gpu_use_dp", "true"),
+        ] {
+            let mut m = HashMap::new();
+            m.insert(key.to_string(), value.to_string());
+            assert!(
+                reject_unimplemented(&m).is_ok(),
+                "{key} must no longer be rejected by the D-07 gate"
+            );
+        }
+    }
+
+    /// The knobs must reach `Config` with their values intact -- passing the gate
+    /// is worthless if the pipeline then drops them.
+    #[test]
+    fn gpu_tuning_knobs_reach_the_config() {
+        Python::attach(|py| {
+            let params = PyDict::new(py);
+            params.set_item("objective", "regression").unwrap();
+            params.set_item("gpu_device_id", 2i64).unwrap();
+            params.set_item("gpu_use_dp", true).unwrap();
+            params.set_item("num_threads", 3i64).unwrap();
+
+            let cfg = build_config(&params).unwrap();
+            assert_eq!(cfg.gpu_device_id, 2);
+            assert_eq!(cfg.gpu_device_index(), 2);
+            assert!(cfg.gpu_use_dp);
+            assert_eq!(cfg.num_threads, 3);
+            // The inapplicable knob is accepted but reported, never silently honored.
+            assert!(cfg.device_warnings().iter().any(|w| w.contains("gpu_use_dp")));
+        });
+    }
+
+    /// Multi-device training is not implemented, so `num_gpu > 1` must surface as a
+    /// `ValueError` rather than silently training on one device.
+    #[test]
+    fn multi_gpu_is_rejected_by_the_config() {
+        Python::attach(|py| {
+            let params = PyDict::new(py);
+            params.set_item("objective", "regression").unwrap();
+            params.set_item("num_gpu", 2i64).unwrap();
+            assert!(build_config(&params).is_err());
+        });
+    }
+
+    /// The gate and the introspection helper must agree: every device
+    /// `get_device_capabilities` advertises has to pass the gate, and every device
+    /// it omits has to fail it.
+    #[test]
+    fn gate_agrees_with_reported_capabilities() {
+        for device in ["cpu", "gpu", "cuda"] {
+            let mut m = HashMap::new();
+            m.insert("device_type".to_string(), device.to_string());
+            let accepted = reject_unimplemented(&m).is_ok();
+            assert_eq!(
+                accepted,
+                crate::device::supported_devices().contains(&device),
+                "gate and get_device_capabilities disagree about `{device}`"
+            );
+        }
+    }
+
     /// Full pipeline: coerce → gate → from_params, with an alias resolving and
     /// a bool/int/float mix producing a valid Config.
     #[test]
@@ -335,16 +426,37 @@ mod tests {
         m.insert("num_machines".to_string(), "2".to_string());
         assert!(reject_unimplemented(&m).is_err());
 
-        let mut m = HashMap::new();
-        m.insert("device_type".to_string(), "gpu".to_string());
-        assert!(reject_unimplemented(&m).is_err());
-        let mut m = HashMap::new();
-        m.insert("device_type".to_string(), "CUDA".to_string());
-        assert!(reject_unimplemented(&m).is_err());
+        // A GPU device_type is rejected only when its backend is absent from THIS
+        // build; the assertions are cfg-guarded so they pin the build they describe
+        // instead of failing on a legitimately GPU-capable wheel.
+        #[cfg(not(any(feature = "rocm", feature = "wgpu")))]
+        {
+            let mut m = HashMap::new();
+            m.insert("device_type".to_string(), "gpu".to_string());
+            assert!(reject_unimplemented(&m).is_err());
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let mut m = HashMap::new();
+            m.insert("device_type".to_string(), "CUDA".to_string());
+            assert!(reject_unimplemented(&m).is_err());
+        }
 
-        // CPU device is fine.
+        // CPU device is fine on EVERY build -- including a GPU wheel, which now
+        // dispatches cpu/gpu at runtime rather than being locked to one backend.
         let mut m = HashMap::new();
         m.insert("device_type".to_string(), "cpu".to_string());
+        assert!(reject_unimplemented(&m).is_ok());
+
+        // An empty device_type keeps the default and must not trip the gate.
+        let mut m = HashMap::new();
+        m.insert("device_type".to_string(), String::new());
+        assert!(reject_unimplemented(&m).is_ok());
+
+        // An unknown spelling is `Config::from_params`' UnknownValue to raise, not
+        // this gate's -- so the message matches the pure-Rust path exactly.
+        let mut m = HashMap::new();
+        m.insert("device_type".to_string(), "opencl".to_string());
         assert!(reject_unimplemented(&m).is_ok());
 
         // An alias of an OUT_OF_SCOPE param is also rejected (resolved canonical).

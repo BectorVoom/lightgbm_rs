@@ -20,8 +20,13 @@ pyo3::create_exception!(
 
 /// Map a facade [`LgbmError`] to a Python exception per the Pattern-6 taxonomy:
 ///
-/// - `Config` / `InvalidCorpus` / `InvalidConstraintLength` -> `ValueError`
-///   (these are caller-input defects — bad params or malformed data).
+/// - `Config` / `InvalidCorpus` / `InvalidConstraintLength` / `UnsupportedDevice`
+///   -> `ValueError` (these are caller-input defects — bad params or malformed
+///   data). `UnsupportedDevice` joins them because it is raised for a
+///   `device_type` this wheel has no backend for: a params problem the caller
+///   fixes by changing `device_type` or installing a GPU wheel, and the same
+///   exception type the pre-runtime-dispatch `reject_unimplemented` gate raised
+///   for that case.
 /// - `Objective` / `Metric` / `Model` / `Boosting` / `Io` / `CustomMetric` /
 ///   `Unsupported` -> `lightgbm_rs.LightGBMError` (engine-side failures,
 ///   mirroring the official package's `LightGBMError`). `Unsupported` reports a
@@ -33,7 +38,8 @@ pub fn from_lgbm_error(err: LgbmError) -> PyErr {
     match err {
         LgbmError::Config(_)
         | LgbmError::InvalidCorpus { .. }
-        | LgbmError::InvalidConstraintLength { .. } => PyValueError::new_err(msg),
+        | LgbmError::InvalidConstraintLength { .. }
+        | LgbmError::UnsupportedDevice { .. } => PyValueError::new_err(msg),
         LgbmError::Objective(_)
         | LgbmError::Metric(_)
         | LgbmError::Model(_)

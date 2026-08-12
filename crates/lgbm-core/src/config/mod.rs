@@ -17,10 +17,12 @@
 //! gradients/scores, not configuration scalars).
 
 pub mod alias;
+pub mod device;
 pub mod scope;
 pub mod set;
 
 pub use alias::resolve_alias;
+pub use device::DeviceKind;
 pub use scope::IN_SCOPE_PARAMS;
 
 /// Flat configuration struct mirroring C++ `LightGBM::Config` 1:1.
@@ -56,7 +58,42 @@ pub struct Config {
     /// `int num_threads`. config.h default: 0.
     pub num_threads: i32,
     /// `std::string device_type`. config.h default: "cpu".
+    ///
+    /// Consumed at runtime by the `lgbm` facade's backend dispatch (see
+    /// [`Config::device_kind`]): `cpu` runs the native/cubecl-cpu f64 anchor,
+    /// `gpu` the ROCm/HIP backend, `cuda` the CUDA backend. A device whose
+    /// backend was not compiled into the build is a typed error at train time,
+    /// never a silent fallback to a different device.
     pub device_type: String,
+    /// `int num_gpu`. config.h default: 1. `CHECK_GT(num_gpu, 0)`.
+    ///
+    /// The v1 Rust port trains on exactly ONE device; a value `> 1` is rejected
+    /// by `from_params` rather than silently training single-GPU (multi-GPU is
+    /// out of scope — see `scope::IN_SCOPE_PARAMS`).
+    pub num_gpu: i32,
+    /// `int gpu_platform_id`. config.h default: -1 (OpenCL platform, "system default").
+    ///
+    /// The CubeCL backends (HIP / CUDA / WGPU) address devices by index within a
+    /// single runtime and have NO OpenCL-style platform dimension, so this knob
+    /// has no analog. It is accepted for official-package compatibility and
+    /// validated; any value other than the `-1` default is reported as
+    /// inapplicable by [`Config::device_warnings`].
+    pub gpu_platform_id: i32,
+    /// `int gpu_device_id`. config.h default: -1 ("device 0" in the C++ default).
+    ///
+    /// Mapped to the CubeCL device INDEX passed to the runtime client
+    /// (`AmdDevice::new(id)` / `CudaDevice::new(id)`). `-1` means "device 0",
+    /// matching the C++ default resolution.
+    pub gpu_device_id: i32,
+    /// `bool gpu_use_dp`. config.h default: false.
+    ///
+    /// In the C++ OpenCL backend this selects double-precision GPU math. The Rust
+    /// port's precision is FIXED per kernel (f32 LDS histogram cells; f64 gain,
+    /// split-scan and subtract) because that split is what the ~1e-6 parity
+    /// contract was validated against — so this knob does not switch kernels. It
+    /// is accepted, validated, and reported by [`Config::device_warnings`]; see
+    /// `docs/04-ROCM-GAPS.md` for the documented f32-vs-f64 residuals.
+    pub gpu_use_dp: bool,
     /// `int seed`. config.h default: 0.
     pub seed: i32,
     /// `bool deterministic`. config.h default: false.
@@ -414,6 +451,10 @@ impl Default for Config {
             tree_learner: "serial".to_string(),
             num_threads: 0,
             device_type: "cpu".to_string(),
+            num_gpu: 1,
+            gpu_platform_id: -1,
+            gpu_device_id: -1,
+            gpu_use_dp: false,
             seed: 0,
             deterministic: false,
 

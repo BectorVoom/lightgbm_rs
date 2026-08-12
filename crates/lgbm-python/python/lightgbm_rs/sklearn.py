@@ -122,9 +122,27 @@ class LGBMModel(BaseEstimator):
         reg_lambda: float = 0.0,
         random_state: Optional[int] = None,
         n_jobs: Optional[int] = None,
+        device: Optional[str] = None,
+        gpu_device_id: Optional[int] = None,
         importance_type: str = "split",
         **kwargs: Any,
     ) -> None:
+        """Construct the estimator.
+
+        ``n_jobs``, ``device`` and ``gpu_device_id`` are the compute knobs:
+
+        - ``n_jobs`` -> ``num_threads``. ``None`` leaves LightGBM's default (one
+          worker per core). Because the underlying thread pool is process-global
+          (mirroring C++ ``omp_set_num_threads``), the FIRST value used in a
+          process wins; a later, different value warns rather than silently
+          training on the wrong worker count.
+        - ``device`` -> ``device_type``: ``"cpu"`` (default), ``"gpu"`` or
+          ``"cuda"``. Selects the compute backend at fit time. A device whose
+          backend was not compiled into this wheel raises ``ValueError``; call
+          :func:`lightgbm_rs.get_device_capabilities` to see what is available.
+        - ``gpu_device_id`` -> the CubeCL device index when training on a GPU.
+          Ignored on ``device="cpu"``.
+        """
         self.boosting_type = boosting_type
         self.num_leaves = num_leaves
         self.max_depth = max_depth
@@ -138,6 +156,8 @@ class LGBMModel(BaseEstimator):
         self.reg_lambda = reg_lambda
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.device = device
+        self.gpu_device_id = gpu_device_id
         self.importance_type = importance_type
         self._other_params: Dict[str, Any] = dict(kwargs)
         self._objective: Optional[Union[str, Callable]] = objective
@@ -162,6 +182,8 @@ class LGBMModel(BaseEstimator):
             "reg_lambda": self.reg_lambda,
             "random_state": self.random_state,
             "n_jobs": self.n_jobs,
+            "device": self.device,
+            "gpu_device_id": self.gpu_device_id,
             "importance_type": self.importance_type,
         }
         params.update(self._other_params)
@@ -196,6 +218,14 @@ class LGBMModel(BaseEstimator):
             params["seed"] = int(self.random_state)
         if self.n_jobs is not None:
             params["num_threads"] = int(self.n_jobs)
+        # Device selection. `device_type` picks the backend at fit time and
+        # `gpu_device_id` the CubeCL device index; both are left absent (not
+        # defaulted here) when unset, so the core's own defaults apply and a
+        # `device_type` passed through **kwargs is not overwritten.
+        if self.device is not None:
+            params["device_type"] = str(self.device)
+        if self.gpu_device_id is not None:
+            params["gpu_device_id"] = int(self.gpu_device_id)
         params.update(self._other_params)
         params.setdefault("verbosity", -1)
         return params

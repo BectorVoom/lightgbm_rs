@@ -15,21 +15,26 @@
 //!   `time_out`, `machine_list_filename`, `machines`. The v1 port targets
 //!   single-machine training only (CLAUDE.md: CPU/ROCm single-node parity);
 //!   the C++ `Network` layer / `is_parallel` paths are out of scope.
-//! - **GPU/OpenCL device tuning** (deferred): `num_gpu`, `gpu_platform_id`,
-//!   `gpu_device_id`, `gpu_use_dp`. The Rust compute backend uses CubeCL (ROCm),
-//!   not the C++ OpenCL `gpu` device knobs; these have no Rust analog in v1.
 //!
 //! (Linear-tree params `linear_tree` / `linear_lambda` are now IN scope — the
 //! per-leaf linear leaf fitting is implemented and C++-oracle-verified, see
 //! `lgbm_treelearner::linear::fit_linear_leaves`.)
+//!
+//! (The GPU device-tuning params `num_gpu` / `gpu_platform_id` /
+//! `gpu_device_id` / `gpu_use_dp` are now IN scope — `Config::from_params`
+//! parses and validates all four, `device_type` selects the CubeCL backend at
+//! RUNTIME, and `gpu_device_id` selects the CubeCL device index. The two knobs
+//! with no CubeCL analog (`gpu_platform_id`, `gpu_use_dp`) are accepted and
+//! reported via `Config::device_warnings` rather than rejected, so official
+//! LightGBM param dicts port over unchanged. See
+//! [`crate::config::device`].)
 
 /// Canonical in-scope single-machine parameter names (Open Question 1).
 ///
 /// Every name here corresponds to a canonical member in
 /// `config_auto.cpp::GetMembersFromString`. The list deliberately EXCLUDES the
-/// distributed / GPU-OpenCL / linear-tree groups (see the
-/// module docs). The drift-checker asserts this set covers every in-scope
-/// canonical the C++ source declares.
+/// distributed group (see the module docs). The drift-checker asserts this set
+/// covers every in-scope canonical the C++ source declares.
 pub const IN_SCOPE_PARAMS: &[&str] = &[
     // --- core / objective ---
     "config",
@@ -46,6 +51,10 @@ pub const IN_SCOPE_PARAMS: &[&str] = &[
     "tree_learner",
     "num_threads",
     "device_type",
+    "num_gpu",
+    "gpu_platform_id",
+    "gpu_device_id",
+    "gpu_use_dp",
     "seed",
     "deterministic",
     // --- learning control ---
@@ -175,7 +184,8 @@ pub const IN_SCOPE_PARAMS: &[&str] = &[
 /// Canonical parameter names explicitly OUT of v1 scope (documented for the
 /// drift-checker so it skips — rather than fails on — these).
 ///
-/// Grouped exactly as in the module docs: distributed, GPU-OpenCL.
+/// Grouped exactly as in the module docs: distributed only. (The GPU device
+/// knobs moved to [`IN_SCOPE_PARAMS`] — see the module docs.)
 pub const OUT_OF_SCOPE_PARAMS: &[&str] = &[
     // distributed
     "num_machines",
@@ -183,9 +193,4 @@ pub const OUT_OF_SCOPE_PARAMS: &[&str] = &[
     "time_out",
     "machine_list_filename",
     "machines",
-    // GPU / OpenCL
-    "num_gpu",
-    "gpu_platform_id",
-    "gpu_device_id",
-    "gpu_use_dp",
 ];

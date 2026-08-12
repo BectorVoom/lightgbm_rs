@@ -2786,6 +2786,75 @@ pub trait Backend {
 /// Binds [`runtime::ActiveRuntime`] (cubecl-cpu under the default `cpu` feature)
 /// and dispatches [`construct_histograms`](Backend::construct_histograms) to the
 /// single-owner ordered f64 fold in [`kernels::histogram`].
+/// What [`configure_threads`] did with a `num_threads` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadPoolOutcome {
+    /// `num_threads <= 0` — left at rayon's default (one worker per logical core),
+    /// which is the C++ `num_threads = 0` "OpenMP default" behavior.
+    Default,
+    /// The global pool runs with this many workers, as requested.
+    Configured(usize),
+    /// The global pool was ALREADY running when `requested` arrived, and rayon
+    /// cannot resize a live pool. Training proceeds on `active` workers.
+    AlreadyConfigured {
+        /// The worker count this config asked for.
+        requested: usize,
+        /// The worker count the live pool actually has.
+        active: usize,
+    },
+}
+
+/// Apply the `num_threads` hyperparameter to the rayon pool every CPU-side loop
+/// (binning, histogram folds, partition scatter) runs on.
+///
+/// # Why the GLOBAL pool
+///
+/// The C++ reference implements `num_threads` as `omp_set_num_threads`, which is
+/// itself process-global — so a process-global rayon pool is the faithful mapping,
+/// not a compromise. The alternative (`ThreadPool::install` around each train)
+/// would additionally move training onto a rayon worker thread, which the GPU
+/// backends' `RefCell` device state and the Python bindings' GIL re-attach pattern
+/// both observe; and it cannot compile anyway, because a custom objective is a
+/// `Box<dyn Fn>` with no `Send` bound while `install` requires one.
+///
+/// Rayon's global pool can only be built ONCE per process and cannot be resized,
+/// so a second, different `num_threads` in the same process reports
+/// [`ThreadPoolOutcome::AlreadyConfigured`] rather than silently training on the
+/// wrong worker count. `num_threads <= 0` never touches the pool at all.
+pub fn configure_threads(num_threads: i32) -> ThreadPoolOutcome {
+    use std::sync::OnceLock;
+    /// The worker count this process settled on, latched by the first
+    /// `num_threads > 0` request (whether or not it won the race to build).
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+
+    if num_threads <= 0 {
+        return ThreadPoolOutcome::Default;
+    }
+    let requested = num_threads as usize;
+    if let Some(&active) = CONFIGURED.get() {
+        return if active == requested {
+            ThreadPoolOutcome::Configured(requested)
+        } else {
+            ThreadPoolOutcome::AlreadyConfigured { requested, active }
+        };
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(requested)
+        .build_global()
+    {
+        Ok(()) => {
+            let _ = CONFIGURED.set(requested);
+            ThreadPoolOutcome::Configured(requested)
+        }
+        // The global pool already existed (some earlier parallel op built it).
+        Err(_) => {
+            let active = rayon::current_num_threads().max(1);
+            let _ = CONFIGURED.set(active);
+            ThreadPoolOutcome::AlreadyConfigured { requested, active }
+        }
+    }
+}
+
 /// THE production seam gate for the on-device histogram/tree path.
 ///
 /// `LGBM_CUDA_ON_DEVICE` is a TRI-STATE toggle, read ONCE (OnceLock-cached):
@@ -2805,7 +2874,25 @@ pub trait Backend {
 /// directly by the anchor tests.
 #[must_use]
 pub fn cuda_on_device_enabled() -> bool {
-    cuda_on_device_override().unwrap_or_else(on_device_default)
+    on_device_enabled_for(on_device_default())
+}
+
+/// Resolve the on-device seam for a backend whose OWN default is `device_default`:
+/// the `LGBM_CUDA_ON_DEVICE` override wins in either direction, otherwise the
+/// caller's default stands.
+///
+/// This exists because the on-device decision is a property of the backend that
+/// is actually TRAINING, not of the crate's feature set. [`on_device_default`]
+/// reads `cfg!(feature = "cuda")`, which was only a correct proxy while backend
+/// selection was compile-time and a cuda build could never instantiate
+/// [`CpuBackend`]. The `lgbm` facade now dispatches on `Config::device_type` at
+/// RUNTIME, so a cuda-featured build CAN train on `CpuBackend` — and routing that
+/// CPU train through the cubecl-cpu on-device driver was measured at 30–130×
+/// slower (see [`on_device_default`]). Each backend therefore resolves through
+/// this function with its own default: `false` for CPU/ROCm/WGPU, `true` for CUDA.
+#[must_use]
+pub fn on_device_enabled_for(device_default: bool) -> bool {
+    cuda_on_device_override().unwrap_or(device_default)
 }
 
 /// Pure tri-state MAPPING for `LGBM_CUDA_ON_DEVICE` (V5 exact-match closed enum).
@@ -2876,16 +2963,23 @@ pub struct CpuBackend;
 impl Backend for CpuBackend {
     type Runtime = runtime::ActiveRuntime;
 
-    // GATED on-device-growth discriminator. Returns
-    // [`cuda_on_device_enabled`] — `false` when `LGBM_CUDA_ON_DEVICE` is unset, so
-    // the learner's eligibility AND-gate is dead and the byte-unchanged host/per-leaf
-    // cpu-f64 anchor path runs (the hard merge gate). The gated flip lands on
-    // CpuBackend (not only GpuBackend) so the structural gate grows the
-    // on-device tree on the cubecl-cpu runtime, INSIDE the default merge gate. The
-    // `grow_tree_on_device` body still returns `Ok(None)` for now (trait default),
-    // so even with the env SET the fork falls through to the byte-identical host path.
+    // GATED on-device-growth discriminator: `false` unless
+    // `LGBM_CUDA_ON_DEVICE="1"` explicitly opts in, so the learner's eligibility
+    // AND-gate is dead and the byte-unchanged host/per-leaf cpu-f64 anchor path runs
+    // (the hard merge gate). The gated flip lands on CpuBackend (not only GpuBackend)
+    // so the structural gate grows the on-device tree on the cubecl-cpu runtime,
+    // INSIDE the default merge gate.
+    //
+    // The default is a hardcoded `false`, NOT `cuda_on_device_enabled()`: that helper
+    // resolves `cfg!(feature = "cuda")`, which is a property of the BUILD, not of the
+    // backend that is training. Now that the `lgbm` facade dispatches on
+    // `Config::device_type` at runtime, a `--features cuda` build training with
+    // `device_type=cpu` instantiates THIS backend — and the cubecl-cpu on-device driver
+    // is 30–130× slower than the native host path (see `on_device_default`). The CPU
+    // anchor therefore always defaults OFF; `LGBM_CUDA_ON_DEVICE` still forces it either
+    // way, which is what the on-device anchor tests use.
     fn on_device_growth_supported(&self) -> bool {
-        cuda_on_device_enabled()
+        on_device_enabled_for(false)
     }
 
     // The ACTIVATED on-device grow seam. When the discriminator is
@@ -2905,7 +2999,9 @@ impl Backend for CpuBackend {
         num_leaves: i32,
         max_depth: i32,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
-        if !cuda_on_device_enabled() {
+        // Same backend-owned default as `on_device_growth_supported` above — never
+        // the build-wide `cuda_on_device_enabled()`.
+        if !self.on_device_growth_supported() {
             return Ok(None);
         }
         let client = crate::runtime::cpu_client();
@@ -2931,7 +3027,9 @@ impl Backend for CpuBackend {
         max_depth: i32,
         cfg: crate::gain::GainConfig,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
-        if !cuda_on_device_enabled() {
+        // Same backend-owned default as `on_device_growth_supported` above — never
+        // the build-wide `cuda_on_device_enabled()`.
+        if !self.on_device_growth_supported() {
             return Ok(None);
         }
         let client = crate::runtime::cpu_client();
@@ -3812,6 +3910,23 @@ pub struct GpuBackend<R: cubecl::Runtime> {
     /// `resident_pool_supported() == true`; `false` forces the host path. Set only by
     /// the test-only [`with_resident`](GpuBackend::with_resident) constructor.
     resident_enabled: bool,
+    /// Whether this backend INSTANCE grows trees on-device
+    /// ([`Backend::on_device_growth_supported`]).
+    ///
+    /// Per-INSTANCE, not per-build: the `lgbm` facade selects the backend from
+    /// `Config::device_type` at runtime, so one process can hold a CUDA backend
+    /// (on-device ON — the measured-faster path) and a CPU backend (OFF) at the
+    /// same time. [`Default`] resolves it from [`cuda_on_device_enabled`] to keep
+    /// every pre-existing `::default()` call site byte-identical; the facade sets
+    /// it explicitly via [`with_on_device_growth`](GpuBackend::with_on_device_growth).
+    on_device: bool,
+    /// The CubeCL device this backend's clients bind to — the `gpu_device_id`
+    /// hyperparameter, resolved to an index by `Config::gpu_device_index`.
+    ///
+    /// Stored (rather than re-derived) because the on-device grow seams build
+    /// their own client and must reach the SAME device the facade trained on;
+    /// `R::Device::default()` (device 0) reproduces the historical behavior.
+    device: R::Device,
     /// Ties the backend to its CubeCL runtime `R` without storing one (the client is
     /// passed per-call). `fn() -> R` keeps the type `Send`/`Sync`/`Copy`-agnostic and
     /// imposes no `R: …` auto-trait bound on the struct.
@@ -3842,6 +3957,11 @@ impl<R: cubecl::Runtime> Default for GpuBackend<R> {
             grow_pool: std::cell::RefCell::new(GrowStructPool::default()),
             // Production default: the device-resident pool is enabled.
             resident_enabled: true,
+            // Preserves the pre-runtime-dispatch behavior for every existing
+            // `::default()` call site (tests, benches): the build-wide gate. The
+            // facade overrides it per instance via `with_on_device_growth`.
+            on_device: cuda_on_device_enabled(),
+            device: R::Device::default(),
             _runtime: std::marker::PhantomData,
         }
     }
@@ -3868,8 +3988,35 @@ impl<R: cubecl::Runtime> GpuBackend<R> {
             resident_build_desc: std::cell::RefCell::new(None),
             grow_pool: std::cell::RefCell::new(GrowStructPool::default()),
             resident_enabled: enabled,
+            on_device: cuda_on_device_enabled(),
+            device: R::Device::default(),
             _runtime: std::marker::PhantomData,
         }
+    }
+
+    /// Bind this backend to an EXPLICIT CubeCL device — the `gpu_device_id`
+    /// hyperparameter, resolved to an index by `Config::gpu_device_index` and
+    /// turned into a device by `runtime::cuda_device` / `runtime::rocm_device`.
+    ///
+    /// The device matters beyond the client the facade passes per call: the
+    /// on-device grow seams construct their OWN client, and without this they
+    /// would silently run on device 0 while the rest of the train ran elsewhere.
+    #[must_use]
+    pub fn with_device(mut self, device: R::Device) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Set whether THIS backend instance grows trees on-device.
+    ///
+    /// The facade calls this with the device's own default resolved through
+    /// [`on_device_enabled_for`] (CUDA: `true`; ROCm/WGPU: `false`), so the
+    /// decision follows the backend that is actually training rather than the
+    /// build's feature set. See the `on_device` field docs.
+    #[must_use]
+    pub fn with_on_device_growth(mut self, on: bool) -> Self {
+        self.on_device = on;
+        self
     }
 
     /// Fetch (or build on first use) the per-grow cached scan-descriptor set for
@@ -3974,7 +4121,7 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
     // ROCm/CUDA/WGPU; the env gate (not a per-runtime `true`) is what keeps the flip
     // safe until the driver body is wired in (which still returns `Ok(None)` here).
     fn on_device_growth_supported(&self) -> bool {
-        cuda_on_device_enabled()
+        self.on_device
     }
 
     // The ACTIVATED on-device
@@ -3995,10 +4142,13 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         num_leaves: i32,
         max_depth: i32,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
-        if !cuda_on_device_enabled() {
+        // Per-INSTANCE gate + the facade-selected device — never the build-wide
+        // `cuda_on_device_enabled()` / device 0, which would ignore `device_type`
+        // and `gpu_device_id` respectively.
+        if !self.on_device {
             return Ok(None);
         }
-        let client = R::client(&Default::default());
+        let client = R::client(&self.device);
         let (tree, layout) = kernels::grow_driver::grow_tree_on_device_driver(
             self, &client, gradients, hessians, features, num_leaves, max_depth,
         )?;
@@ -4020,10 +4170,13 @@ impl<R: cubecl::Runtime> Backend for GpuBackend<R> {
         max_depth: i32,
         cfg: crate::gain::GainConfig,
     ) -> Result<Option<(lgbm_model::Tree, lgbm_dataset::LeafPartitionLayout)>, ComputeError> {
-        if !cuda_on_device_enabled() {
+        // Per-INSTANCE gate + the facade-selected device — never the build-wide
+        // `cuda_on_device_enabled()` / device 0, which would ignore `device_type`
+        // and `gpu_device_id` respectively.
+        if !self.on_device {
             return Ok(None);
         }
-        let client = R::client(&Default::default());
+        let client = R::client(&self.device);
         let (tree, layout) = kernels::grow_driver::grow_tree_on_device_driver_with_cfg(
             self, &client, gradients, hessians, features, num_leaves, max_depth, cfg,
         )?;

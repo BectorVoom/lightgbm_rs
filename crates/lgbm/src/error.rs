@@ -86,6 +86,23 @@ pub enum LgbmError {
         name: String,
     },
 
+    /// `device_type` names a device whose compute backend was not compiled into
+    /// this build (e.g. `device_type=cuda` on a default CPU-only build).
+    ///
+    /// Backend selection is a RUNTIME choice keyed on `device_type`, but each GPU
+    /// backend is still compiled in behind a cargo feature (`cuda` / `rocm` /
+    /// `wgpu`) so a CPU-only build needs no GPU toolchain. Asking for a device
+    /// this binary cannot reach is therefore a typed error naming the feature to
+    /// rebuild with — NEVER a silent fallback to a different device, which would
+    /// train a model the caller did not ask for on hardware they did not choose.
+    #[error("unsupported device_type `{device}`: {detail}")]
+    UnsupportedDevice {
+        /// The requested canonical `device_type` (`cpu` / `gpu` / `cuda`).
+        device: String,
+        /// What is missing and how to enable it.
+        detail: String,
+    },
+
     /// A per-feature constraint/penalty vector (`monotone_constraints`,
     /// `cegb_penalty_feature_coupled`, or `cegb_penalty_feature_lazy`) was
     /// non-empty but its length did not equal `num_features` (T-07-11-02).

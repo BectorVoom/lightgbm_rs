@@ -136,6 +136,30 @@ pub fn from_params(params: &HashMap<String, String>) -> Result<Config, ConfigErr
 
     get_int(&resolved, "num_threads", &mut cfg.num_threads)?;
 
+    // --- device / GPU selection knobs -------------------------------------
+    // Extracted here (right after num_threads) to mirror the config_auto.cpp
+    // member order. `device_type` itself was resolved in Stage 2 above, because
+    // the conflict pass below keys off it.
+    //
+    // `CHECK_GT(num_gpu, 0)` is the C++ constraint (config_auto.cpp). The Rust
+    // port additionally rejects `num_gpu > 1`: multi-device training is out of
+    // scope, and silently training on ONE device while the user asked for
+    // several is exactly the silent divergence the config gate exists to stop.
+    get_int(&resolved, "num_gpu", &mut cfg.num_gpu)?;
+    check_gt("num_gpu", cfg.num_gpu, 0)?;
+    if cfg.num_gpu > 1 {
+        return Err(ConfigError::OutOfRange {
+            param: "num_gpu".to_string(),
+            value: cfg.num_gpu.to_string(),
+            bound: "== 1 (multi-device training is not implemented; the CubeCL \
+                    backends train on a single device selected by gpu_device_id)"
+                .to_string(),
+        });
+    }
+    get_int(&resolved, "gpu_platform_id", &mut cfg.gpu_platform_id)?;
+    get_int(&resolved, "gpu_device_id", &mut cfg.gpu_device_id)?;
+    get_bool(&resolved, "gpu_use_dp", &mut cfg.gpu_use_dp)?;
+
     get_bool(&resolved, "deterministic", &mut cfg.deterministic)?;
     get_bool(&resolved, "force_col_wise", &mut cfg.force_col_wise)?;
     get_bool(&resolved, "force_row_wise", &mut cfg.force_row_wise)?;

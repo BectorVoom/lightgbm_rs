@@ -10,28 +10,27 @@
 use lgbm_boosting::objective::BoostObjective;
 use lgbm_boosting::{Gbdt, IterSnapshot};
 use lgbm_compute::gain::GainConfig;
-// Backend dispatch (feature-switched). Default: the native-f64 CpuBackend (the
-// bit-exact anchor). With `--features rocm`: RocmBackend (SAME f64 kernels on the
-// local gfx1100 GPU). With `--features cuda`/`wgpu`: CudaBackend/WgpuBackend, which
-// dispatch the SAME runtime-generic GPU kernels. The cascade priority is
-// rocm > cuda > wgpu > cpu, so any combination of enabled features selects exactly
-// one backend (the `not(...)` guards make the arms mutually exclusive).
+// Backend dispatch is RUNTIME, keyed on `Config::device_type` (see
+// `dispatch_device_backend`). The CPU anchor is unconditional -- `lgbm-compute`
+// keeps its `cpu` feature on in every build -- while each GPU backend is compiled
+// in only when its cargo feature is enabled. A `device_type` whose backend was not
+// compiled into this build is a typed `LgbmError::UnsupportedDevice`, never a
+// silent fallback to a different device.
+use lgbm_compute::runtime::cpu_client;
+#[cfg(feature = "cuda")]
+use lgbm_compute::runtime::{cuda_client_for, cuda_device};
 #[cfg(feature = "rocm")]
-use lgbm_compute::runtime::rocm_client;
+use lgbm_compute::runtime::{rocm_client_for, rocm_device};
+#[cfg(all(feature = "wgpu", not(feature = "rocm")))]
+use lgbm_compute::runtime::{wgpu_client_for, wgpu_device};
+#[cfg(feature = "cuda")]
+use lgbm_compute::CudaBackend;
 #[cfg(feature = "rocm")]
 use lgbm_compute::RocmBackend;
-#[cfg(all(feature = "cuda", not(feature = "rocm")))]
-use lgbm_compute::runtime::cuda_client;
-#[cfg(all(feature = "cuda", not(feature = "rocm")))]
-use lgbm_compute::CudaBackend;
-#[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
-use lgbm_compute::runtime::wgpu_client;
-#[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
+#[cfg(all(feature = "wgpu", not(feature = "rocm")))]
 use lgbm_compute::WgpuBackend;
-#[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
-use lgbm_compute::runtime::cpu_client;
-#[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
-use lgbm_compute::CpuBackend;
+use lgbm_compute::{Backend, ComputeClientReexport as ComputeClient, CpuBackend};
+use lgbm_core::config::DeviceKind;
 use lgbm_core::Config;
 use lgbm_dataset::bin_mapper::{BinMapper, MissingType};
 use lgbm_metric::Metric;
@@ -587,6 +586,11 @@ fn parse_categorical_feature(
 /// [`LgbmError`] for an invalid corpus, an unsupported objective/metric, or a
 /// loop/learner failure — never a panic.
 pub fn train_raw(config: &Config, corpus: &RawCorpus) -> Result<Booster, LgbmError> {
+    // Size the thread pool BEFORE the raw->bin step, which is itself rayon-parallel
+    // (feature-parallel BinMapper build + bin assignment). `dispatch_device_backend`
+    // applies it again for the training loop; `configure_threads` latches once per
+    // process, so the repeat call is a no-op that keeps every entry point covered.
+    apply_num_threads(config);
     // Resolve the objective over a thin DenseCorpus view (labels + query boundaries
     // are the only fields resolve_objective reads — the label guards and the ranking
     // objectives' `Init`; the features are NOT read there, so the view carries an
@@ -1175,6 +1179,11 @@ pub fn train_custom_raw_with_metric<'a, F>(
 where
     F: Fn(&[f64]) -> (Vec<f32>, Vec<f32>) + 'a,
 {
+    // Size the thread pool BEFORE the raw->bin step, which is itself rayon-parallel
+    // (feature-parallel BinMapper build + bin assignment). `dispatch_device_backend`
+    // applies it again for the training loop; `configure_threads` latches once per
+    // process, so the repeat call is a no-op that keeps every entry point covered.
+    apply_num_threads(config);
     let custom = CustomObjective::new(closure);
     let metrics = match feval {
         Some(f) => vec![EvalMetric::Custom(f)],
@@ -1329,7 +1338,6 @@ fn train_inner_columns_full(
     raw_features: Option<RawFeatureColumns>,
     train_query_boundaries: &[i32],
 ) -> Result<Booster, LgbmError> {
-    use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};
 
     // Query/group boundaries for the ranking METRICS. `&[]` means "not
     // query-grouped": the pointwise metrics ignore it and `EvalMetric::eval`
@@ -1386,38 +1394,91 @@ fn train_inner_columns_full(
         }
     }
 
-    // ---- the learner ----
-    // Backend dispatch is feature-switched (see the gated imports above): the
-    // default build trains on the native-f64 CpuBackend; `--features rocm` trains on
-    // the gfx1100 GPU via RocmBackend (same f64 kernels, bit-exact); `--features
-    // cuda`/`wgpu` train via CudaBackend/WgpuBackend (the SAME runtime-generic GPU
-    // kernels). Priority rocm > cuda > wgpu > cpu — the `not(...)` cfg guards make the
-    // arms mutually exclusive so exactly one backend is selected for any feature
-    // combination. The learner + GBDT loop below are generic over `B: Backend`, so
-    // only this construction site differs.
-    #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
-    let backend = CpuBackend;
-    #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "wgpu")))]
-    let client = cpu_client();
-    // RocmBackend carries interior-mutable device-resident state, so it
-    // is constructed via Default (no longer a unit struct). One instance per train()
-    // call (outside the GBDT iter loop) ⇒ the resident-bin cache persists across all
-    // trees in the train.
-    #[cfg(feature = "rocm")]
-    let backend = RocmBackend::default();
-    #[cfg(feature = "rocm")]
-    let client = rocm_client();
-    // CudaBackend/WgpuBackend are `GpuBackend<R>` aliases carrying
-    // the SAME on-device resident histogram pool RocmBackend uses — `::default()`
-    // enables residency, reaching ROCm-parity speed.
-    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
-    let backend = CudaBackend::default();
-    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
-    let client = cuda_client();
-    #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
-    let backend = WgpuBackend::default();
-    #[cfg(all(feature = "wgpu", not(feature = "rocm"), not(feature = "cuda")))]
-    let client = wgpu_client();
+    // ---- device dispatch ----
+    // Everything above is device-independent (config validation, objective/metric
+    // setup); everything below is generic over `B: Backend`. `dispatch_device_backend`
+    // is the ONE place that turns `device_type` + `gpu_device_id` into a concrete
+    // backend + client.
+    dispatch_device_backend(TrainPlan {
+        config,
+        num_data,
+        feature_infos,
+        corpus_labels,
+        valid,
+        features,
+        boost_obj,
+        labels,
+        metrics,
+        raw_features,
+        train_query_boundaries,
+        valid_query_boundaries,
+        objective_string,
+        objective_kind,
+        num_class,
+        num_features,
+        max_feature_idx,
+    })
+}
+
+/// The device-independent inputs `train_inner_columns_full` has finished preparing,
+/// handed on to whichever backend `device_type` selects.
+///
+/// A struct rather than a 19-argument signature: every field is consumed once, by
+/// name, in [`run_train_on_backend`]'s destructuring `let`, so adding a field cannot
+/// silently shift a positional argument.
+struct TrainPlan<'a> {
+    config: &'a Config,
+    num_data: i32,
+    feature_infos: String,
+    corpus_labels: &'a [f32],
+    valid: Option<&'a DenseCorpus>,
+    features: Vec<FeatureColumn>,
+    boost_obj: BoostObjective<'a>,
+    labels: Vec<f32>,
+    metrics: Vec<EvalMetric>,
+    raw_features: Option<RawFeatureColumns>,
+    train_query_boundaries: Option<&'a [i32]>,
+    valid_query_boundaries: Option<&'a [i32]>,
+    objective_string: String,
+    objective_kind: ObjectiveKind,
+    num_class: i32,
+    num_features: usize,
+    max_feature_idx: i32,
+}
+
+/// Grow the ensemble on `backend`/`client` -- the constraint bundle, the learner,
+/// and the whole GBDT loop, generic over the compute backend.
+///
+/// This was the tail of `train_inner_columns_full` back when the backend was chosen
+/// by `#[cfg]`. The learner and boosting loop were ALREADY generic over
+/// `B: Backend`, so making the choice a runtime one only required lifting the
+/// construction site out; the body below is otherwise unchanged.
+fn run_train_on_backend<B: Backend>(
+    backend: &B,
+    client: &ComputeClient<B::Runtime>,
+    plan: TrainPlan<'_>,
+) -> Result<Booster, LgbmError> {
+    let TrainPlan {
+        config,
+        num_data,
+        feature_infos,
+        corpus_labels,
+        valid,
+        features,
+        boost_obj,
+        labels,
+        metrics,
+        raw_features,
+        train_query_boundaries,
+        valid_query_boundaries,
+        objective_string,
+        objective_kind,
+        num_class,
+        num_features,
+        max_feature_idx,
+    } = plan;
+    use lgbm_boosting::{BaggingConfig, BaggingSampleStrategy, EarlyStopping, EvalSnapshot, MetricSpec};
+
     let gain = GainConfig::from_config(config);
     // The per-feature constraint/penalty bundle. Everything in it (monotone
     // constraints, interaction constraints, CEGB, extra-trees, feature_contri) is
@@ -1447,8 +1508,8 @@ fn train_inner_columns_full(
                 })?;
     }
     let mut learner = SerialTreeLearner::new(
-        &backend,
-        &client,
+        backend,
+        client,
         gain,
         config.num_leaves,
         config.max_depth,
@@ -1488,6 +1549,14 @@ fn train_inner_columns_full(
         config.boost_from_average,
         None,
     );
+    // Pin the `boosting_on_cuda_` resident-score seam to the backend that is
+    // ACTUALLY training. `ScoreUpdater::new` defaults it from the build-wide
+    // `cuda_on_device_enabled()`, which on a `--features cuda` build resolves `true`
+    // even when THIS train was routed to `CpuBackend` by `device_type=cpu` -- the
+    // host score updates would then go stale against a device buffer no kernel
+    // writes. Keying it on the backend's own on-device support is byte-identical for
+    // every pre-existing single-backend build and correct under runtime dispatch.
+    gbdt.set_boosting_on_cuda(backend.on_device_growth_supported());
     // Opt-in `use_quantized_grad` APPROXIMATE mode: quantizes grad/hess each iter
     // before the learner. No-op when false (the default) — the exact path is untouched.
     gbdt = gbdt
@@ -1822,6 +1891,140 @@ fn train_inner_columns_full(
         iter_grad_hess,
     })
 }
+
+/// Turn `device_type` + `gpu_device_id` into a concrete backend + client, then run
+/// the backend-generic training loop on it.
+///
+/// This is the SINGLE runtime backend-selection site (the former `#[cfg]` cascade).
+/// `cpu` is always available -- `lgbm-compute` keeps its `cpu` feature on in every
+/// build -- and each GPU arm exists only when its cargo feature compiled that
+/// backend in. A GPU `device_type` on a build without the matching backend raises
+/// [`LgbmError::UnsupportedDevice`] naming the feature to rebuild with; it never
+/// silently trains somewhere else.
+///
+/// # On-device growth defaults
+///
+/// Each backend is handed its OWN on-device-growth default rather than inheriting
+/// the build-wide `cfg!(feature = "cuda")` proxy: CUDA defaults ON (the measured
+/// win, `docs/ondevice-cuda-perf-plan.md`), ROCm/WGPU/CPU default OFF.
+/// `LGBM_CUDA_ON_DEVICE` still overrides either way. Without this a
+/// `--features cuda` build training with `device_type=cpu` would route the CPU
+/// train through the cubecl-cpu on-device driver, measured 30-130x slower.
+fn dispatch_device_backend(plan: TrainPlan<'_>) -> Result<Booster, LgbmError> {
+    let config = plan.config;
+    apply_num_threads(config);
+    warn_inapplicable_device_knobs(config);
+    match config.device_kind() {
+        // The f64 deterministic anchor -- the project's hard merge gate.
+        DeviceKind::Cpu => run_train_on_backend(&CpuBackend, &cpu_client(), plan),
+
+        #[cfg(feature = "rocm")]
+        DeviceKind::Gpu => {
+            let device = rocm_device(config.gpu_device_index());
+            let client = rocm_client_for(&device);
+            let backend = RocmBackend::default()
+                .with_device(device)
+                .with_on_device_growth(lgbm_compute::on_device_enabled_for(false));
+            run_train_on_backend(&backend, &client, plan)
+        }
+        // WGPU fills the generic `gpu` slot only when ROCm is not also compiled in
+        // (the historical rocm > wgpu precedence).
+        #[cfg(all(feature = "wgpu", not(feature = "rocm")))]
+        DeviceKind::Gpu => {
+            if config.gpu_device_index() != 0 {
+                warn(config, &format!(
+                    "gpu_device_id={} is ignored on the WGPU backend, which selects its \
+                     adapter through WgpuDevice rather than a flat index; training on the \
+                     default adapter.",
+                    config.gpu_device_index()
+                ));
+            }
+            let device = wgpu_device(config.gpu_device_index());
+            let client = wgpu_client_for(&device);
+            let backend = WgpuBackend::default()
+                .with_device(device)
+                .with_on_device_growth(lgbm_compute::on_device_enabled_for(false));
+            run_train_on_backend(&backend, &client, plan)
+        }
+        #[cfg(not(any(feature = "rocm", feature = "wgpu")))]
+        DeviceKind::Gpu => Err(unsupported_device(DeviceKind::Gpu)),
+
+        #[cfg(feature = "cuda")]
+        DeviceKind::Cuda => {
+            let device = cuda_device(config.gpu_device_index());
+            let client = cuda_client_for(&device);
+            let backend = CudaBackend::default()
+                .with_device(device)
+                .with_on_device_growth(lgbm_compute::on_device_enabled_for(true));
+            run_train_on_backend(&backend, &client, plan)
+        }
+        #[cfg(not(feature = "cuda"))]
+        DeviceKind::Cuda => Err(unsupported_device(DeviceKind::Cuda)),
+    }
+}
+
+/// The typed error for a `device_type` whose backend this build does not contain,
+/// naming the cargo feature that would provide it.
+#[cfg(not(all(feature = "cuda", any(feature = "rocm", feature = "wgpu"))))]
+fn unsupported_device(kind: DeviceKind) -> LgbmError {
+    let feature = match kind {
+        DeviceKind::Cuda => "cuda",
+        // `gpu` is served by ROCm first, WGPU otherwise.
+        DeviceKind::Gpu => "rocm (or wgpu)",
+        DeviceKind::Cpu => "cpu",
+    };
+    LgbmError::UnsupportedDevice {
+        device: kind.as_str().to_string(),
+        detail: format!(
+            "no backend for this device was compiled into this build; rebuild with \
+             `--features {feature}` to enable it"
+        ),
+    }
+}
+
+/// Apply the `num_threads` CPU hyperparameter to the rayon pool that every
+/// host-side loop runs on (`lgbm_compute::configure_threads`).
+///
+/// `num_threads <= 0` is the C++ default ("use the OpenMP default"), which leaves
+/// rayon at one worker per logical core. A positive value sizes the process-global
+/// pool, mirroring the C++ `omp_set_num_threads`. Rayon cannot resize a live pool,
+/// so a second, DIFFERENT value in the same process is warned about rather than
+/// silently ignored — the user otherwise has no way to tell that their
+/// `num_threads` did nothing.
+fn apply_num_threads(config: &Config) {
+    match lgbm_compute::configure_threads(config.num_threads) {
+        lgbm_compute::ThreadPoolOutcome::Default
+        | lgbm_compute::ThreadPoolOutcome::Configured(_) => {}
+        lgbm_compute::ThreadPoolOutcome::AlreadyConfigured { requested, active } => warn(
+            config,
+            &format!(
+                "num_threads={requested} could not be applied: this process's thread pool \
+                 is already running with {active} threads and cannot be resized. Training \
+                 will use {active} threads. Set num_threads consistently, or set it before \
+                 the first train in the process."
+            ),
+        ),
+    }
+}
+
+/// Report device knobs that were accepted for official-package compatibility but
+/// have no effect on the CubeCL backends (`Config::device_warnings`).
+fn warn_inapplicable_device_knobs(config: &Config) {
+    for w in config.device_warnings() {
+        warn(config, &w);
+    }
+}
+
+/// Emit one `Log::Warning`-shaped line, honoring `verbosity`.
+///
+/// C++ `Log::Warning` prints at `verbosity >= 0` and is silenced by
+/// `verbosity=-1`; mirror that threshold so a quiet config stays quiet.
+fn warn(config: &Config, message: &str) {
+    if config.verbosity >= 0 {
+        eprintln!("[LightGBM] [Warning] {message}");
+    }
+}
+
 
 /// Build the canonical LightGBM `objective=` model line from the config. The
 /// multiclass objectives append the `num_class:`/`sigmoid:` tokens exactly as the

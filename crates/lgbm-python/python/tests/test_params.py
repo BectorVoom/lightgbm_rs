@@ -9,8 +9,11 @@ Exercises the full Python ``params`` → ``Config`` pipeline end-to-end through
 - **list/tuple join** — list-valued params (``monotone_constraints``,
   ``eval_at``, ``interaction_constraints``) are accepted as Python lists.
 - **D-07 unimplemented gate** — recognized-but-unported params
-  (``device_type='gpu'``, ``linear_tree``, ``num_machines``,
-  ``use_quantized_grad``) raise a Python ``ValueError`` (never a panic).
+  (``num_machines``) and a ``device_type`` with no backend in this wheel raise a
+  Python ``ValueError`` (never a panic).
+- **device params** — the CPU/GPU knobs (``device_type``, ``num_threads``,
+  ``gpu_device_id``, ``gpu_platform_id``, ``gpu_use_dp``) are accepted and take
+  effect, and ``get_device_capabilities`` agrees with the gate.
 - **D-06 unknown-warn** — a truly-unknown (typo) key trains without raising.
 - **alias resolution** — ``n_estimators`` controls the iteration count.
 
@@ -102,10 +105,10 @@ def test_list_params_join(list_param):
 @pytest.mark.parametrize(
     "bad",
     [
-        {"device_type": "gpu"},
-        {"linear_tree": True},
         {"num_machines": 2},
-        {"use_quantized_grad": True},
+        # Multi-device training is not implemented; asking for it must fail loudly
+        # rather than silently train on one device.
+        {"num_gpu": 2},
     ],
 )
 def test_unimplemented_raises(bad):
@@ -115,6 +118,92 @@ def test_unimplemented_raises(bad):
     params = _base_params(num_leaves=7, **bad)
     with pytest.raises(ValueError):
         lightgbm_rs.train(params, ds, num_boost_round=2)
+
+
+# --- CPU / GPU device params -------------------------------------------------
+
+
+def test_device_capabilities_shape():
+    """``get_device_capabilities`` reports what this wheel can train on."""
+    caps = lightgbm_rs.get_device_capabilities()
+    assert set(caps) == {
+        "devices",
+        "gpu_backend",
+        "default_device",
+        "gpu_device_id",
+        "inapplicable_params",
+    }
+    # The CPU f64 anchor is always reachable and is the default.
+    assert "cpu" in caps["devices"]
+    assert caps["default_device"] == "cpu"
+    assert set(caps["inapplicable_params"]) == {"gpu_platform_id", "gpu_use_dp"}
+    # A GPU backend name is reported exactly when a GPU device is available.
+    assert (caps["gpu_backend"] is not None) == (len(caps["devices"]) > 1)
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu", "cuda"])
+def test_device_type_matches_reported_capabilities(device):
+    """A device the wheel advertises trains; one it does not raises ValueError.
+
+    Backend selection is a RUNTIME choice, so a GPU wheel must accept BOTH its GPU
+    device and ``cpu`` — this asserts against the reported capability set rather
+    than hardcoding "GPU always fails", which would be wrong on a GPU wheel.
+    """
+    X, y = _xy()
+    ds = lightgbm_rs.Dataset(X, y)
+    params = _base_params(num_leaves=7, device_type=device)
+    supported = device in lightgbm_rs.get_device_capabilities()["devices"]
+    if supported:
+        model = lightgbm_rs.train(params, ds, num_boost_round=3)
+        assert model.num_iteration() == 3
+    else:
+        with pytest.raises(ValueError):
+            lightgbm_rs.train(params, ds, num_boost_round=2)
+
+
+def test_unknown_device_type_raises():
+    """A device_type outside the C++ closed enum is a ValueError, not a fallback."""
+    X, y = _xy()
+    ds = lightgbm_rs.Dataset(X, y)
+    with pytest.raises(ValueError):
+        lightgbm_rs.train(_base_params(num_leaves=7, device_type="opencl"), ds, num_boost_round=2)
+
+
+def test_gpu_tuning_knobs_are_accepted():
+    """The GPU device knobs are accepted on a CPU train (they left OUT_OF_SCOPE).
+
+    ``gpu_platform_id``/``gpu_use_dp`` have no CubeCL analog and are reported by
+    ``get_device_capabilities()["inapplicable_params"]`` rather than rejected, so
+    an official LightGBM param dict ports over unchanged.
+    """
+    X, y = _xy()
+    ds = lightgbm_rs.Dataset(X, y)
+    params = _base_params(
+        num_leaves=7,
+        num_gpu=1,
+        gpu_device_id=0,
+        gpu_platform_id=0,
+        gpu_use_dp=True,
+    )
+    model = lightgbm_rs.train(params, ds, num_boost_round=3)
+    assert model.num_iteration() == 3
+
+
+def test_num_threads_is_accepted_and_deterministic():
+    """``num_threads`` (alias ``n_jobs``) is honored and does not change results.
+
+    The thread count controls parallelism only — the folds are order-stable — so a
+    1-thread and a default-thread train of the same corpus must agree exactly.
+    """
+    X, y = _xy()
+    ds = lightgbm_rs.Dataset(X, y)
+    single = lightgbm_rs.train(_base_params(num_leaves=7, num_threads=1), ds, num_boost_round=5)
+    default = lightgbm_rs.train(_base_params(num_leaves=7), ds, num_boost_round=5)
+    np.testing.assert_allclose(single.predict(X), default.predict(X), rtol=0, atol=0)
+
+    # `n_jobs` resolves to the same canonical param.
+    aliased = lightgbm_rs.train(_base_params(num_leaves=7, n_jobs=1), ds, num_boost_round=5)
+    np.testing.assert_allclose(aliased.predict(X), single.predict(X), rtol=0, atol=0)
 
 
 def test_unknown_typo_warns_not_raises():
@@ -141,3 +230,65 @@ def test_alias_resolves():
     # to it so the effective count is unambiguous.
     model2 = lightgbm_rs.train(_base_params(num_leaves=7, n_estimators=4), ds, num_boost_round=4)
     assert model2.num_iteration() == 4
+
+
+# --- sklearn device kwargs ---------------------------------------------------
+
+
+def test_sklearn_device_kwargs_round_trip_through_get_params():
+    """``device``/``gpu_device_id``/``n_jobs`` are first-class estimator params.
+
+    They must appear in ``get_params`` (so sklearn clone/GridSearchCV carry them)
+    and survive ``set_params``, rather than living only in ``**kwargs``.
+    """
+    est = lightgbm_rs.LGBMRegressor(n_jobs=1, device="cpu", gpu_device_id=0)
+    params = est.get_params()
+    assert params["n_jobs"] == 1
+    assert params["device"] == "cpu"
+    assert params["gpu_device_id"] == 0
+
+    est.set_params(device="cpu", gpu_device_id=1)
+    assert est.get_params()["gpu_device_id"] == 1
+
+    # Defaults are None (absent), so the core's own defaults apply.
+    default = lightgbm_rs.LGBMRegressor()
+    assert default.get_params()["device"] is None
+    assert default.get_params()["gpu_device_id"] is None
+
+
+def test_sklearn_device_kwargs_translate_to_core_params():
+    """The kwargs reach the ``_core`` params dict under their canonical names."""
+    est = lightgbm_rs.LGBMRegressor(n_jobs=2, device="cpu", gpu_device_id=1)
+    core = est._build_core_params()
+    assert core["num_threads"] == 2
+    assert core["device_type"] == "cpu"
+    assert core["gpu_device_id"] == 1
+
+    # Unset knobs must not be injected at all (so they cannot shadow a
+    # device_type passed through **kwargs).
+    bare = lightgbm_rs.LGBMRegressor()._build_core_params()
+    assert "device_type" not in bare
+    assert "gpu_device_id" not in bare
+    assert "num_threads" not in bare
+
+
+def test_sklearn_fits_on_the_default_device():
+    """An estimator carrying the CPU device knobs trains and predicts."""
+    X, y = _xy()
+    est = lightgbm_rs.LGBMRegressor(
+        n_estimators=5, num_leaves=7, n_jobs=1, device="cpu", gpu_device_id=0
+    )
+    est.fit(X, y)
+    assert est.predict(X).shape == (X.shape[0],)
+
+
+def test_sklearn_unavailable_device_raises():
+    """A device with no backend in this wheel fails at fit, not silently."""
+    caps = lightgbm_rs.get_device_capabilities()
+    missing = [d for d in ("gpu", "cuda") if d not in caps["devices"]]
+    if not missing:
+        pytest.skip("this wheel has every GPU backend compiled in")
+    X, y = _xy()
+    est = lightgbm_rs.LGBMRegressor(n_estimators=3, num_leaves=7, device=missing[0])
+    with pytest.raises(ValueError):
+        est.fit(X, y)
