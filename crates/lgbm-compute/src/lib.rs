@@ -848,26 +848,43 @@ fn core_scaled_threshold(anchor_at_16: usize, cores: usize) -> usize {
 /// fewer-core / up on more-core machines per the measured curve. The
 /// `LGBM_UNIFIED_BFS_THRESHOLD` env var still takes ULTIMATE precedence.
 pub fn unified_bfs_threshold() -> usize {
-    std::env::var("LGBM_UNIFIED_BFS_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        // DISABLED BY DEFAULT — the fused path is INCORRECT, not merely slower.
-        //
-        // Measured 2026-08-05 on 200k x 50 continuous features, binary objective,
-        // 100 iterations: with the fusion engaged the run produces SIX trees
-        // instead of 100, first-tree split gains of ~4.9e8 instead of ~1.0e4, and
-        // predictions that overflow to ~3.4e38. The two-step path on the same
-        // inputs produces the correct 100-tree model. Because the old default was
-        // `core_scaled_threshold(100, cores)` the gate FIRED only on machines with
-        // few rayon threads (<= 2 cores ⇒ threshold 32..49), so the same build
-        // silently trained a BROKEN model on a small box and a correct one on a
-        // large box — a thread-count-dependent model.
-        //
-        // `usize::MAX` keeps the path env-reachable (`LGBM_UNIFIED_BFS_THRESHOLD=0`)
-        // for debugging the defect, but never selects it. Re-enable ONLY once a
-        // parity test pins the fused output against the two-step output; see the
-        // regression test `unified_fusion_defaults_are_disabled`.
-        .unwrap_or(usize::MAX)
+    // DISABLED BY DEFAULT — the fused path is INCORRECT, not merely slower.
+    //
+    // Measured 2026-08-05 on 200k x 50 continuous features, binary objective,
+    // 100 iterations: with the fusion engaged the run produces SIX trees
+    // instead of 100, first-tree split gains of ~4.9e8 instead of ~1.0e4, and
+    // predictions that overflow to ~3.4e38. The two-step path on the same
+    // inputs produces the correct 100-tree model. Because the old default was
+    // `core_scaled_threshold(100, cores)` the gate FIRED only on machines with
+    // few rayon threads (<= 2 cores ⇒ threshold 32..49), so the same build
+    // silently trained a BROKEN model on a small box and a correct one on a
+    // large box — a thread-count-dependent model.
+    //
+    // `usize::MAX` (the `unified_threshold_from` fallback) keeps the path
+    // env-reachable (`LGBM_UNIFIED_BFS_THRESHOLD=0`) for debugging the defect, but
+    // never selects it. Re-enable ONLY once a parity test pins the fused output
+    // against the two-step output; see `unified_fusion_defaults_are_disabled`.
+    unified_threshold_from(std::env::var("LGBM_UNIFIED_BFS_THRESHOLD").ok().as_deref())
+}
+
+/// Pure MAPPING for the two `LGBM_UNIFIED_*_THRESHOLD` env vars: a parseable value
+/// wins, anything else (absent / empty / malformed) yields the disabled default.
+///
+/// This is the testable core of [`unified_bfs_threshold`] /
+/// [`unified_subscan_threshold`], mirroring [`cuda_on_device_override_from`]: it does
+/// NOT touch the process env, so unit tests can exercise every branch without
+/// mutating global state.
+///
+/// That matters beyond tidiness. The env-override and default-disabled tests used to
+/// `set_var`/`remove_var` the SAME two vars and `cargo test` runs them concurrently in
+/// one process, so they raced: one test's `remove_var` landed between the other's
+/// `set_var` and its assert, failing whichever lost. Worse, while `777` was briefly
+/// set ANY concurrently-running test that consulted the gate could have engaged the
+/// known-DEFECTIVE fused path. Testing this pure fn removes both hazards.
+#[doc(hidden)]
+#[must_use]
+pub fn unified_threshold_from(s: Option<&str>) -> usize {
+    s.and_then(|v| v.parse().ok()).unwrap_or(usize::MAX)
 }
 
 /// The feature-count at/above which the subtract-derived (larger / use_subtract) child's
@@ -899,14 +916,11 @@ pub fn unified_bfs_threshold() -> usize {
 /// child's higher anchor). The `LGBM_UNIFIED_SUBSCAN_THRESHOLD` env var still takes
 /// ULTIMATE precedence.
 pub fn unified_subscan_threshold() -> usize {
-    std::env::var("LGBM_UNIFIED_SUBSCAN_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        // DISABLED BY DEFAULT for the same reason as [`unified_bfs_threshold`] —
-        // the two fusions were measured together and the broken output could not be
-        // attributed to one of them alone, so both are off until the defect is
-        // isolated. Env-reachable for that investigation.
-        .unwrap_or(usize::MAX)
+    // DISABLED BY DEFAULT for the same reason as [`unified_bfs_threshold`] — the two
+    // fusions were measured together and the broken output could not be attributed to
+    // one of them alone, so both are off until the defect is isolated. Env-reachable
+    // for that investigation.
+    unified_threshold_from(std::env::var("LGBM_UNIFIED_SUBSCAN_THRESHOLD").ok().as_deref())
 }
 
 /// The compute backend seam.
@@ -6199,6 +6213,7 @@ mod bin_column_tests {
 mod core_scaled_threshold_tests {
     use super::{
         core_scaled_threshold, unified_bfs_threshold, unified_subscan_threshold,
+        unified_threshold_from,
         THRESHOLD_CEILING, THRESHOLD_FLOOR,
     };
 
@@ -6262,26 +6277,34 @@ mod core_scaled_threshold_tests {
         assert_eq!(core_scaled_threshold(100, 0), core_scaled_threshold(100, 1));
     }
 
-    /// Env override still wins with ULTIMATE precedence — the derived default is only
+    /// Env override still wins with ULTIMATE precedence — the default is only
     /// consulted when the env var is absent/unparseable.
+    ///
+    /// Exercised through the PURE mapping rather than by mutating the process env:
+    /// `cargo test` runs this concurrently with
+    /// [`unified_fusion_defaults_are_disabled`], which reads the same two vars, so
+    /// the previous `set_var`/`remove_var` version raced against it (whichever test
+    /// lost the interleaving failed). See [`unified_threshold_from`].
     #[test]
     fn env_override_takes_ultimate_precedence() {
-        // Serialize env mutation; these two vars are only read here. Edition-2024 env
-        // mutation is `unsafe` (process-global) — safe here: single-threaded test, vars
-        // set then immediately removed, exercised by no other test.
-        unsafe {
-            std::env::set_var("LGBM_UNIFIED_BFS_THRESHOLD", "777");
-            std::env::set_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD", "888");
+        assert_eq!(unified_threshold_from(Some("777")), 777);
+        assert_eq!(unified_threshold_from(Some("888")), 888);
+        // `0` must survive as a real override (it is how the defective fused path is
+        // forced ON for debugging) rather than being treated as "unset".
+        assert_eq!(unified_threshold_from(Some("0")), 0);
+    }
+
+    /// Absent / empty / malformed all fall back to the disabled default — the
+    /// `.parse().ok()` arm the override test above does not cover.
+    #[test]
+    fn unparseable_env_falls_back_to_the_disabled_default() {
+        for s in [None, Some(""), Some("abc"), Some("-1"), Some("12x")] {
+            assert_eq!(
+                unified_threshold_from(s),
+                usize::MAX,
+                "{s:?} must fall back to the disabled default"
+            );
         }
-        assert_eq!(unified_bfs_threshold(), 777);
-        assert_eq!(unified_subscan_threshold(), 888);
-        unsafe {
-            std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
-            std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
-        }
-        // With env cleared, BOTH fusions are DISABLED (see below).
-        assert_eq!(unified_bfs_threshold(), usize::MAX);
-        assert_eq!(unified_subscan_threshold(), usize::MAX);
     }
 
     /// REGRESSION GATE for the unified-fusion defect (found 2026-08-05).
@@ -6298,11 +6321,9 @@ mod core_scaled_threshold_tests {
     /// this assertion is what forces that conversation.
     #[test]
     fn unified_fusion_defaults_are_disabled() {
-        // Guard against a stale env leaking in from another test in this binary.
-        unsafe {
-            std::env::remove_var("LGBM_UNIFIED_BFS_THRESHOLD");
-            std::env::remove_var("LGBM_UNIFIED_SUBSCAN_THRESHOLD");
-        }
+        // Reads the REAL env-backed entry points (that is the point of this gate),
+        // but no longer removes the vars first: nothing in this binary sets them any
+        // more, so there is no stale value to guard against and no race to lose.
         assert_eq!(
             unified_bfs_threshold(),
             usize::MAX,
