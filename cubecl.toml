@@ -1,0 +1,50 @@
+# CubeCL runtime configuration for the lightgbm_rs workspace.
+#
+# Found by `cubecl_common::config::from_current_dir()`, which walks UP from the
+# process's working directory. `cargo test -p <pkg>` / `cargo run -p <pkg>` set the
+# cwd to the PACKAGE directory (e.g. `crates/lgbm-compute/`), so every workspace
+# member's test binary walks up to this file. A binary launched from outside the
+# repo will not see it and silently falls back to CubeCL defaults.
+
+[compilation]
+# The ON-DISK compiled-kernel cache. `CompilationConfig::cache` is an
+# `Option<CacheConfig>` that defaults to `None` — i.e. OFF — so without this line
+# every kernel is re-JITted in every process. (The AUTOTUNE cache is a separate
+# field that is NOT an Option and is already on by default; having `target/autotune`
+# appear is not evidence that kernels are cached.)
+#
+# Which backends honour it (cubecl 0.10):
+#   cubecl-hip  -> <root>/hip/<ver>/hip-kernel/  (device binaries)   [the ROCm win]
+#   cubecl-cuda -> <root>/cuda/<ver>/ptx/        (PTX)
+#   cubecl-wgpu -> only with the `spirv` feature
+#   cubecl-cpu  -> never (in-memory HashMap only; the f64 anchor is unaffected)
+#
+# WHY "global" AND NOT "target" (the usual recommendation) — this is a WORKSPACE.
+# `CacheConfig::Target::root()` walks up to the NEAREST `Cargo.toml` and appends
+# `target`. Because cargo runs each test binary with cwd = the package directory,
+# "target" would resolve to `crates/lgbm-compute/target`, `crates/oracle-harness/target`,
+# ... — one fragmented, never-shared cache per crate, none of them the real workspace
+# target dir. "global" is `dirs::config_local_dir()` (Linux: `~/.config`, so the HIP
+# cache lands in `~/.config/hip/<cubecl-ver>/hip-kernel/`); it gives every workspace
+# member ONE shared cache and is also the root the vendored cubecl-cuda fork already
+# defaults its PTX cache to (`vendor/cubecl-cuda/src/compute/context.rs`), so the
+# benchmarked CUDA transport path keeps the exact cache location it was measured with.
+#
+# MEASURED on the local gfx1151 (ROCm 7.1.5), the 19 `--features rocm` test binaries
+# run back to back:
+#     cache off (no this file)  41.1 s
+#     cache on, cold            25.9 s   (already faster: the 19 processes share it)
+#     cache on, warm            12.9 s   -> 3.2x
+#
+# Safe to enable: the key is `KernelId::stable_hash()` — the same identity that already
+# separates `#[comptime]` specialisations in the in-memory cache — and the directory is
+# versioned per CubeCL release, so an upgrade starts cold rather than loading stale code.
+#
+# CAVEAT (see docs/rocm-setup.md): the key does NOT cover the hipRTC/NVRTC compile
+# ENVIRONMENT. Changing `HIPRTC_COMPILE_OPTIONS_APPEND` does not invalidate an entry.
+# Clear the cache when you change a device compiler flag.
+cache = "global"
+
+# `check_mode` is deliberately left at its default (`auto`), which honours
+# `launch_unchecked` on the hot histogram/scan launches. Do NOT set "validate" here:
+# it re-enables bounds-check codegen on every unchecked launch workspace-wide.

@@ -1413,8 +1413,12 @@ mod hip {
     /// VERBATIM copy of the learner's private `compact_histogram`
     /// (`lgbm-treelearner/src/learner.rs:2838-2864`) — replicated here (rather than
     /// exposing the private fn) so the host reference path stays byte-for-byte the
-    /// production op while keeping `learner.rs` UNCHANGED. Pairs with the
-    /// real exported `lgbm_treelearner::fix_histogram`.
+    /// production op while keeping `learner.rs` UNCHANGED.
+    ///
+    /// NOTE: no `fix_histogram` companion call here (see the test doc below) — the
+    /// on-device `fix_compact_kernel` this test pins against no longer runs a
+    /// FixHistogram reconstruction step (OCX-03 / 29-03, `histogram.rs:1774-1791`),
+    /// so the host reference is compact-only.
     fn host_compact_histogram(hist: &mut [f64], offset: i32) {
         if offset <= 0 {
             return;
@@ -1440,34 +1444,54 @@ mod hip {
 
     /// The BIT-EXACT oracle: the on-GPU `fix_compact_kernel`
     /// (via `fix_compact_f64_on`) must produce, for a leaf's concatenated RAW f64
-    /// histogram, the SAME buffer that applying the host `fix_histogram` then
-    /// `compact_histogram` PER FEATURE produces — BIT-IDENTICAL via
-    /// `compare_exact_f64_bits`. The numerical insight: reading the SAME f64-widened
-    /// cells and folding in the SAME ascending order yields a bit-identical result;
-    /// the only ~1e-6 difference (the f32-atomic RAW build) is NOT exercised here —
-    /// the RAW buffer is supplied directly as f64.
+    /// histogram, the SAME buffer that applying the host `compact_histogram` PER
+    /// FEATURE produces — BIT-IDENTICAL via `compare_exact_f64_bits`. The numerical
+    /// insight: reading the SAME f64-widened cells and folding in the SAME ascending
+    /// order yields a bit-identical result; the only ~1e-6 difference (the
+    /// f32-atomic RAW build) is NOT exercised here — the RAW buffer is supplied
+    /// directly as f64 (well, f32-losslessly-widened; see below).
+    ///
+    /// # No FixHistogram reconstruction (OCX-03 / 29-03)
+    ///
+    /// An earlier version of this test also called `fix_histogram` (host) and
+    /// expected `fix_compact_kernel` to reconstruct the most-frequent-bin (mfb) cell
+    /// as `seed − Σ_other_bins`, mirroring transcribed C++ `Dataset::FixHistogram`.
+    /// That reconstruction was REMOVED from the kernel by the OCX-03 fix: unlike the
+    /// C++ dense build (which skips the mfb bin for speed and therefore needs the
+    /// reconstruction), this port's resident u64 build scatters EVERY row, mfb
+    /// included, so the dequantized mfb cell already holds the exact built mass —
+    /// reconstructing from an external leaf seed only injected f64 non-associativity
+    /// residue (row-order fold vs. bin-grouped fold) into it, up to fabricating a
+    /// non-zero mass in a globally-EMPTY bin (see `on_device_subtract_residue.rs`
+    /// and `on_device_tripwire_canary.rs::zero_bin_canary_rocm_resident`, which pin
+    /// the CURRENT contract — mfb cell PRESERVED, not reconstructed — directly).
+    /// This test therefore only exercises WIDEN (dequant) + COMPACT; the mfb cells
+    /// below hold plausible DENSE-BUILT masses, not garbage-to-be-overwritten.
     ///
     /// Covers a MIXED-feature leaf concatenating:
-    ///  - Test A: mfb > 0, offset == 0  — fix RECONSTRUCTS the mfb cell, compact no-op.
-    ///  - Test B: mfb == 0, offset == 1 — fix NO-OP, compact DROPS bin 0.
-    ///  - Test C: mfb >= num_bin        — fix no-op (defensive), offset 0 ⇒ compact no-op.
+    ///  - Test A: mfb > 0, offset == 0  — mfb cell preserved as-is, compact no-op.
+    ///  - Test B: mfb == 0, offset == 1 — compact DROPS bin 0.
+    ///  - Test C: mfb >= num_bin        — offset 0 ⇒ compact no-op (defensive shape).
     ///  - Test D: offset >= num_bin     — compact ZEROS the whole feature region.
-    /// Plus an extra mfb > 0 feature so the mixed concatenation exercises >1 fix.
+    /// Plus an extra mfb > 0 feature so the mixed concatenation exercises >1 such cell.
     #[test]
     fn kernel_parity_fix_compact_equals_host_on_hip() {
         use lgbm_compute::kernels::histogram::fix_compact_f64_on;
-        use lgbm_treelearner::fix_histogram;
 
         let hip = rocm_client();
 
-        // RAW leaf totals (un-bumped). Chosen so the reconstructs land
-        // on exactly-representable f64 values for an unambiguous bit-exact assert.
+        // RAW leaf totals (un-bumped). No longer consumed by the host reference (no
+        // FixHistogram call — see the doc above); still threaded through to
+        // `fix_compact_f64_on` because the launcher's signature retains them as
+        // positional args (unused by the kernel, `_sum_gradient`/`_sum_hessian`).
         let sum_g = 100.0f64;
         let sum_h = 250.0f64;
 
         // Per-feature (num_bin, offset, most_freq_bin) + a RAW stride-2 region.
-        // Region layouts pulled from realistic bin counts; the mfb cell content is
-        // GARBAGE before fix (it is reconstructed) where mfb > 0.
+        // Region layouts pulled from realistic bin counts. Where mfb > 0 the mfb
+        // cell holds a plausible DENSE-BUILT mass (the resident build scatters every
+        // row, mfb included) — it must be PRESERVED bit-for-bit by both sides, not
+        // reconstructed.
         struct Feat {
             num_bin: u32,
             offset: i32,
@@ -1475,21 +1499,22 @@ mod hip {
             region: Vec<f64>, // 2*num_bin RAW cells
         }
         let feats = vec![
-            // Test A — mfb=2 (>0), offset=0, num_bin=4: reconstruct bin2, compact no-op.
+            // Test A — mfb=2 (>0), offset=0, num_bin=4: mfb2 cell preserved, compact no-op.
             Feat {
                 num_bin: 4,
                 offset: 0,
                 mfb: 2,
-                region: vec![1.0, 2.0, 3.0, 4.0, /*mfb2 garbage*/ 99.0, 88.0, 5.0, 6.0],
+                region: vec![1.0, 2.0, 3.0, 4.0, /*mfb2 built mass*/ 99.0, 88.0, 5.0, 6.0],
             },
-            // Test B — mfb=0, offset=1, num_bin=3: fix no-op, compact drops bin0.
+            // Test B — mfb=0, offset=1, num_bin=3: no mfb cell, compact drops bin0.
             Feat {
                 num_bin: 3,
                 offset: 1,
                 mfb: 0,
                 region: vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
             },
-            // Test C — mfb=9 (>=num_bin), offset=0, num_bin=4: fix no-op, compact no-op.
+            // Test C — mfb=9 (>=num_bin), offset=0, num_bin=4: defensive out-of-range
+            // mfb (never dereferenced — `_mfb` is unused in the kernel), compact no-op.
             Feat {
                 num_bin: 4,
                 offset: 0,
@@ -1503,12 +1528,12 @@ mod hip {
                 mfb: 0,
                 region: vec![7.0, 7.0, 8.0, 8.0, 9.0, 9.0],
             },
-            // Extra — mfb=1 (>0), offset=0, num_bin=2: a second reconstruct in the mix.
+            // Extra — mfb=1 (>0), offset=0, num_bin=2: a second preserved mfb cell.
             Feat {
                 num_bin: 2,
                 offset: 0,
                 mfb: 1,
-                region: vec![3.0, 9.0, /*mfb1 garbage*/ 77.0, 66.0],
+                region: vec![3.0, 9.0, /*mfb1 built mass*/ 77.0, 66.0],
             },
         ];
 
@@ -1527,24 +1552,23 @@ mod hip {
         }
 
         // HOST reference: widen the SAME f32 RAW to f64 (the folded kernel's inline
-        // cast), then fix_histogram (the exported op) + compact, per feature.
+        // cast), then compact per feature. No `fix_histogram` call — see the doc above.
         let mut host: Vec<f64> = raw32.iter().map(|&x| f64::from(x)).collect();
-        for (&(slot_off, num_bin, offset, mfb), _f) in params.iter().zip(feats.iter()) {
+        for &(slot_off, num_bin, offset, _mfb) in &params {
             let cells = 2 * num_bin as usize;
             let region = &mut host[slot_off..slot_off + cells];
-            fix_histogram(region, mfb, sum_g, sum_h);
             host_compact_histogram(region, offset);
         }
 
-        // GPU path: the on-device FOLDED widen+fix+compact kernel over the f32 RAW.
+        // GPU path: the on-device FOLDED widen+compact kernel over the f32 RAW.
         let gpu = fix_compact_f64_on(&hip, &raw32, &params, sum_g, sum_h)
             .expect("fix_compact_f64_on");
 
         assert_eq!(gpu.len(), host.len(), "fix_compact length");
         // BIT-EXACT: same inline widen cast, same f64 cells, same ascending fold
-        // order ⇒ identical bits (the folded kernel == host fix+compact).
+        // order ⇒ identical bits (the folded kernel == host compact, mfb preserved).
         if let Err(m) = compare_exact_f64_bits(&gpu, &host) {
-            panic!("GPU fix_compact != host fix+compact (NOT bit-exact): {m}");
+            panic!("GPU fix_compact != host compact (NOT bit-exact): {m}");
         }
     }
 
@@ -2089,7 +2113,12 @@ mod hip {
                 si.right_output as f32,
             ]
         };
-        let pin = |label: &str, co: &[lgbm_compute::SplitInfo], totals: (f64, f64, i32)| {
+        // `totals` is the 4-slot sibling tuple `(sum_gradient, sum_hessian, num_data,
+        // parent_output)` the siblings API now takes; the CPU f64 anchor
+        // (`find_best_split_cpu_native`) still consumes only the first three — the 4th
+        // slot is `parent_output`, inert at the default `path_smooth` this fixture uses
+        // (same note as the `a_totals`/`b_totals` definitions above).
+        let pin = |label: &str, co: &[lgbm_compute::SplitInfo], totals: (f64, f64, i32, f64)| {
             for (i, c) in co.iter().enumerate() {
                 let f = &feats[i];
                 let base = f.slot_off;

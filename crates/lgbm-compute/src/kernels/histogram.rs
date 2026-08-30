@@ -541,8 +541,108 @@ fn partition_from_target(num_features: usize, target: u32) -> u32 {
     (target / nf).clamp(1, ROWPART_P_MAX)
 }
 
+// ===================== BUILD cube WIDTH (`CubeDim`) =====================
+//
+// The row-partition machinery above tunes the build grid's *cube COUNT*
+// (`CubeCount(num_features, P)`). Its companion axis — the cube's *WIDTH*
+// (`CubeDim`) — was a hardcoded `CubeDim::new_1d(256)` at every LDS-build launch
+// site: a discrete-GPU assumption that silently encodes "8 wavefronts" only on a
+// 32-lane plane. On a 64-lane plane (CDNA/MI-class) the same literal is 4
+// wavefronts — half the intended occupancy — and the launch is never re-derived
+// from the device that is actually running it.
+//
+// WIDTH IS THE CHEAPER PARALLELISM LEVER OF THE TWO. Raising `P` adds a whole extra
+// global-atomic LDS→global merge per partition (`2*num_bin` cells per cube); raising
+// the width adds row-level parallelism inside the SAME cube, so the merge traffic is
+// unchanged and only LDS-atomic contention grows. That matters most exactly where the
+// `P` heuristic gives up: `partition_from_target` returns `P = 1` whenever
+// `num_features >= num_cu * CUBES_PER_CU` (e.g. 50 features on an 8-CU APU ⇒ target 64
+// ⇒ P=1), leaving the width as the ONLY remaining occupancy knob on that shape.
+//
+// PARITY. The width is a free tunable ONLY on the u64 fixed-point build: it accumulates
+// through `Atomic<u64>::fetch_add`, i.e. two's-complement integer addition, which is
+// associative and exact, so the per-bin totals are IDENTICAL for every width — the same
+// order-independence argument that already licenses sweeping `P` and `W` on the
+// (bit-exact) fixed-point path and the scan (`SCAN_WSET`). The f32-atomic build is NOT
+// width-invariant, so [`build_cube_dim`] pins it at the historical 256 and every f32
+// launch stays byte-identical.
 
+/// Planes (wavefronts/warps) per BUILD cube — the occupancy intent the hardcoded
+/// `CubeDim::new_1d(256)` encoded on a 32-lane plane (`256 == 8 * 32`). Keeping the
+/// PLANE COUNT fixed rather than the unit count is what makes the default portable:
+/// it reproduces 256 byte-for-byte on every 32-lane device the port has benchmarked
+/// (the local gfx1151 APU, the P100 CUDA arm) while giving a 64-lane CDNA part the 8
+/// wavefronts the literal was always meant to express.
+#[cfg(feature = "gpu")]
+const BUILD_PLANES_PER_CUBE: u32 = 8;
 
+/// Hard ceiling on the derived build width. 1024 is the universal
+/// `max_units_per_cube` floor across HIP/CUDA/Vulkan; the device's own reported
+/// `max_units_per_cube` clamps below this whenever it is smaller.
+#[cfg(feature = "gpu")]
+const BUILD_CUBE_DIM_MAX: u32 = 1024;
+
+/// The historical fixed build width, kept as the plane-less / f32 fallback so those
+/// paths are byte-unchanged.
+#[cfg(feature = "gpu")]
+const BUILD_CUBE_DIM_FALLBACK: u32 = 256;
+
+/// Pure resolution of the build cube width, factored out so the plane-alignment and
+/// clamping logic is unit-testable without a device or an env var (mirrors the
+/// "pure CPU logic, no device handle" property of [`resolve_target_cubes`] /
+/// [`partition_from_target`]).
+///
+/// * `plane_size` — `client.properties().hardware.plane_size_max`. `0` or `1` means
+///   the runtime has no hardware planes (the cubecl-cpu anchor shape); there is no
+///   alignment to derive, so the historical constant is returned unchanged.
+/// * `max_units` — `client.properties().hardware.max_units_per_cube`.
+/// * `env_override` — `LGBM_BUILD_CUBEDIM`, the A/B benching knob. Rounded DOWN to a
+///   whole number of planes (never below one plane) so an override can never produce a
+///   partially-populated wavefront, then clamped like the derived value.
+#[cfg(feature = "gpu")]
+fn resolve_build_cube_dim(env_override: Option<u32>, plane_size: u32, max_units: u32) -> u32 {
+    if plane_size <= 1 {
+        return BUILD_CUBE_DIM_FALLBACK;
+    }
+    // Never exceed what the device accepts, and never fall below one whole plane.
+    let hi = max_units.min(BUILD_CUBE_DIM_MAX).max(plane_size);
+    let planes = match env_override {
+        Some(w) if w > 0 => (w / plane_size).max(1),
+        _ => BUILD_PLANES_PER_CUBE,
+    };
+    (planes.saturating_mul(plane_size)).clamp(plane_size, hi)
+}
+
+/// `LGBM_BUILD_CUBEDIM` — the explicit build-width pin (the A/B benching knob,
+/// mirroring `LGBM_SCAN_CUBEDIM` on the scan side). Parse failures and `0` fall
+/// through to the hardware-derived width — never a no-launch.
+#[cfg(feature = "gpu")]
+fn force_build_cube_dim() -> Option<u32> {
+    std::env::var("LGBM_BUILD_CUBEDIM")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&w| w > 0)
+}
+
+/// The BUILD cube width for one launch, derived from the device that is actually
+/// running it.
+///
+/// `fixed_point == false` (the f32-atomic build — the readback oracle / parity path)
+/// returns [`BUILD_CUBE_DIM_FALLBACK`] unconditionally: f32 atomic accumulation is
+/// order-dependent, so its width is NOT a free tunable and those launches must stay
+/// byte-identical. Only the order-independent u64 fixed-point build takes the derived
+/// width. See the module note above for the full parity argument.
+#[cfg(feature = "gpu")]
+fn build_cube_dim<R: cubecl::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    fixed_point: bool,
+) -> u32 {
+    if !fixed_point {
+        return BUILD_CUBE_DIM_FALLBACK;
+    }
+    let hw = &client.properties().hardware;
+    resolve_build_cube_dim(force_build_cube_dim(), hw.plane_size_max, hw.max_units_per_cube)
+}
 
 
 /// DEVICE-RESIDENT batched per-leaf histogram kernel. Identical
@@ -1061,13 +1161,20 @@ fn launch_build_at<R: cubecl::Runtime>(
     inputs: &[cubecl::server::Handle],
     p: u32,
 ) {
+    // Hardware-derived build width (§ BUILD cube WIDTH). Computed ONCE for the whole
+    // dispatch: `build_cube_dim` returns the historical 256 for `fixed_point == false`,
+    // so the f32 arm below is byte-unchanged while the u64 arm gets the plane-aligned
+    // width. The autotune `LaunchKey` deliberately does NOT carry it — it is constant for
+    // a given (device, env) so every variant in one sweep is benchmarked at the same
+    // width, exactly as `P` was swept at the fixed 256.
+    let cd = build_cube_dim(client, fixed_point);
     macro_rules! at_p_u64 {
         ($w:ty) => {
             unsafe {
                 construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
                     client,
                     CubeCount::Static(num_features as u32, p, 1),
-                    CubeDim::new_1d(256),
+                    CubeDim::new_1d(cd),
                     ArrayArg::from_raw_parts(inputs[0].clone(), num_features * num_data),
                     ArrayArg::from_raw_parts(inputs[1].clone(), rows),
                     ArrayArg::from_raw_parts(inputs[2].clone(), rows),
@@ -1089,7 +1196,7 @@ fn launch_build_at<R: cubecl::Runtime>(
                 construct_leaf_hist_resident_lds_kernel::launch_unchecked::<$w, R>(
                     client,
                     CubeCount::Static(num_features as u32, p, 1),
-                    CubeDim::new_1d(256),
+                    CubeDim::new_1d(cd),
                     ArrayArg::from_raw_parts(inputs[0].clone(), num_features * num_data),
                     ArrayArg::from_raw_parts(inputs[1].clone(), rows),
                     ArrayArg::from_raw_parts(inputs[2].clone(), rows),
@@ -1299,6 +1406,11 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // always `fixed_point`, order-independent across P). No autotune (see above).
         let p =
             force_row_partition().unwrap_or_else(|| row_partition_count_u64(num_features, rows));
+        // Hardware-derived build width. This arm is unconditionally `fixed_point` (asserted
+        // above), i.e. the order-independent u64 integer accumulate, so the width is a free
+        // tunable here — and it is the ONLY occupancy knob left on the common shape where
+        // `row_partition_count_u64` returns P = 1 (num_features >= num_cu * CUBES_PER_CU).
+        let cd = build_cube_dim(client, true);
         // SAFETY: identical bounds contract to `launch_lds_u64` PLUS the grad/hess gather:
         // `grad_h`/`hess_h` are sized `gh_num_data` (the full train row count) and indexed by
         // `leaf_rows[k] < num_data == gh_num_data` (the caller's resident row contract), so the
@@ -1309,7 +1421,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
                     construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
                         client,
                         CubeCount::Static(num_features as u32, p, 1),
-                        CubeDim::new_1d(256),
+                        CubeDim::new_1d(cd),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(h_rows.clone(), rows),
                         ArrayArg::from_raw_parts(grad_h.clone(), gh_num_data),
@@ -1350,6 +1462,10 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // `launch_lds_*` macros below take the partition `$p` explicitly so the FORCE_P /
         // fallback DIRECT launches stay byte-identical to the prior heuristic launch.
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
+        // Hardware-derived build width, resolved ONCE for both macros below. `fixed_point`
+        // selects which one actually launches, and `build_cube_dim` returns the historical
+        // 256 whenever it is false — so the f32 (`launch_lds_f32`) arm is byte-unchanged.
+        let cd = build_cube_dim(client, fixed_point);
         // SAFETY: resident_bins sized num_features*num_data; h_rows/h_g/h_h sized rows;
         // h_slot sized num_features+1; h_out sized slot_len. Cube (f,p) reads only its
         // feature's column + slot region; bin < num_bin <= 256 keeps LDS/out indices
@@ -1391,7 +1507,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
                     construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
                         client,
                         CubeCount::Static(num_features as u32, $p, 1),
-                        CubeDim::new_1d(256),
+                        CubeDim::new_1d(cd),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(h_rows.clone(), rows),
                         ArrayArg::from_raw_parts(h_g.clone(), rows),
@@ -1412,7 +1528,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
                     construct_leaf_hist_resident_lds_kernel::launch_unchecked::<$w, R>(
                         client,
                         CubeCount::Static(num_features as u32, $p, 1),
-                        CubeDim::new_1d(256),
+                        CubeDim::new_1d(cd),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(h_rows.clone(), rows),
                         ArrayArg::from_raw_parts(h_g.clone(), rows),
@@ -2544,6 +2660,8 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
         // u64 fixed-point, order-independent across P).
         let p = force_row_partition()
             .unwrap_or_else(|| row_partition_count_u64(num_features, rows_count));
+        // Always the u64 fixed-point build here ⇒ width is order-free (see § BUILD cube WIDTH).
+        let cd = build_cube_dim(client, true);
         // SAFETY: identical bounds contract to the resident-gh branch of
         // `resident_raw_build_into` — `rows_handle` views `rows_count` u32 row ids each
         // `< num_data == gh_num_data` (the resident perm's invariant: it is a permutation
@@ -2556,7 +2674,7 @@ pub fn build_fix_compact_resident_rows_handle_f64_on<R: cubecl::Runtime>(
                     construct_leaf_hist_resident_lds_kernel_u64::launch_unchecked::<$w, R>(
                         client,
                         CubeCount::Static(num_features as u32, p, 1),
-                        CubeDim::new_1d(256),
+                        CubeDim::new_1d(cd),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(rows_handle.clone(), rows_count),
                         ArrayArg::from_raw_parts(grad_h.clone(), gh_num_data),
@@ -2647,6 +2765,8 @@ pub fn build_fix_compact_resident_rows_handle_f64_fixed_grid_on<R: cubecl::Runti
         // exact-grid build's child-count-sized P.
         let p = force_row_partition()
             .unwrap_or_else(|| row_partition_count_u64(num_features, parent_row_count));
+        // Always the u64 fixed-point build here ⇒ width is order-free (see § BUILD cube WIDTH).
+        let cd = build_cube_dim(client, true);
         // SAFETY: identical bounds contract to `build_fix_compact_resident_rows_handle_f64_on`,
         // plus: `parent_rows` views `parent_row_count` u32 row ids each < num_data; the kernel
         // reads `parent_rows[begin_off + k]` with `begin_off + k < parent_row_count` (the child
@@ -2659,7 +2779,7 @@ pub fn build_fix_compact_resident_rows_handle_f64_fixed_grid_on<R: cubecl::Runti
                     construct_leaf_hist_resident_lds_kernel_u64_fixed_grid::launch_unchecked::<$w, R>(
                         client,
                         CubeCount::Static(num_features as u32, p, 1),
-                        CubeDim::new_1d(256),
+                        CubeDim::new_1d(cd),
                         ArrayArg::from_raw_parts(resident_bins.clone(), num_features * num_data),
                         ArrayArg::from_raw_parts(parent_rows_handle.clone(), parent_row_count),
                         ArrayArg::from_raw_parts(grad_h.clone(), gh_num_data),
@@ -2788,6 +2908,46 @@ mod tests {
                 if expected == 8 && actual == 4),
             "expected LengthMismatch{{8,4}}, got {err:?}"
         );
+    }
+
+    /// The pure plane-alignment → build-`CubeDim` formula
+    /// ([`super::resolve_build_cube_dim`]). No env/OnceLock/GPU.
+    ///
+    /// The load-bearing property is the FIRST assertion: on every 32-lane device this
+    /// port has benchmarked (the local gfx1151 APU, the P100 CUDA arm) the derived
+    /// width is EXACTLY the 256 that was hardcoded before, so enabling the lever is a
+    /// no-op there and only a 64-lane (CDNA/MI-class) part sees a change — up from 4
+    /// wavefronts per cube to the 8 the literal always meant.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn resolve_build_cube_dim_is_plane_aligned() {
+        use super::{
+            resolve_build_cube_dim, BUILD_CUBE_DIM_FALLBACK, BUILD_CUBE_DIM_MAX,
+            BUILD_PLANES_PER_CUBE,
+        };
+        // 32-lane plane (NVIDIA warp, RDNA wave32) with the usual 1024-unit cube cap →
+        // byte-identical to the previous hardcoded literal.
+        assert_eq!(resolve_build_cube_dim(None, 32, 1024), 256);
+        // 64-lane plane (CDNA wavefront): 8 whole wavefronts, not 4.
+        assert_eq!(resolve_build_cube_dim(None, 64, 1024), 512);
+        // The device's own cube cap always wins over the plane target.
+        assert_eq!(resolve_build_cube_dim(None, 64, 256), 256);
+        // A cap below one plane still yields one whole plane (never a 0-unit CubeDim).
+        assert_eq!(resolve_build_cube_dim(None, 64, 16), 64);
+        // No hardware planes (the cubecl-cpu anchor shape) → the historical constant,
+        // so nothing plane-derived leaks into a plane-less runtime.
+        assert_eq!(resolve_build_cube_dim(None, 1, 1024), BUILD_CUBE_DIM_FALLBACK);
+        assert_eq!(resolve_build_cube_dim(None, 0, 1024), BUILD_CUBE_DIM_FALLBACK);
+        // Env override: rounded DOWN to whole planes, so it can never launch a
+        // partially-populated wavefront.
+        assert_eq!(resolve_build_cube_dim(Some(1024), 32, 1024), 1024);
+        assert_eq!(resolve_build_cube_dim(Some(100), 32, 1024), 96); // 3 planes, not 100
+        assert_eq!(resolve_build_cube_dim(Some(8), 32, 1024), 32); // floors at one plane
+        // …and is still clamped by the device cap and the absolute ceiling.
+        assert_eq!(resolve_build_cube_dim(Some(4096), 32, 512), 512);
+        assert_eq!(resolve_build_cube_dim(Some(4096), 32, 65_536), BUILD_CUBE_DIM_MAX);
+        // The default really is BUILD_PLANES_PER_CUBE planes, not a coincidence of 256.
+        assert_eq!(resolve_build_cube_dim(None, 16, 1024), 16 * BUILD_PLANES_PER_CUBE);
     }
 
     /// The pure CU-target → `P` formula ([`super::partition_from_target`]) + the
