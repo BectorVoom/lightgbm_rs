@@ -477,9 +477,7 @@ fn query_num_cu() -> Option<u32> {
 fn rowpart_target_cubes() -> u32 {
     static TARGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *TARGET.get_or_init(|| {
-        let env_override = std::env::var("LGBM_ROWPART_TARGET_CUBES")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
+        let env_override = crate::kernels::parse_positive_u32_env("LGBM_ROWPART_TARGET_CUBES");
         resolve_target_cubes(env_override, query_num_cu())
     })
 }
@@ -573,6 +571,17 @@ fn partition_from_target(num_features: usize, target: u32) -> u32 {
 /// it reproduces 256 byte-for-byte on every 32-lane device the port has benchmarked
 /// (the local gfx1151 APU, the P100 CUDA arm) while giving a 64-lane CDNA part the 8
 /// wavefronts the literal was always meant to express.
+///
+/// UNVERIFIED on real 64-lane CDNA/MI-class hardware: this project's only real ROCm
+/// device is the 32-lane gfx1151/1152 APU noted above, where `BUILD_PLANES_PER_CUBE`
+/// is a no-op (reproduces the historical 256 exactly) — so, unlike `P`
+/// ([`BUILD_PSET`] / `BUILD_TUNER`) and the scan side's `W`
+/// (`SCAN_TUNER`/`SCAN_WSET`), this constant has never actually been measured
+/// against competing widths on a plane_size=64 device; it is an asserted formula,
+/// not a benchmarked default. Bench and correct via `LGBM_BUILD_CUBEDIM` (a
+/// literal-width override, not planes) before trusting it on new CDNA hardware;
+/// folding width into the existing `BUILD_TUNER` autotune sweep (like `P`) is the
+/// tracked follow-up if/when such hardware is available.
 #[cfg(feature = "gpu")]
 const BUILD_PLANES_PER_CUBE: u32 = 8;
 
@@ -595,22 +604,29 @@ const BUILD_CUBE_DIM_FALLBACK: u32 = 256;
 /// * `plane_size` — `client.properties().hardware.plane_size_max`. `0` or `1` means
 ///   the runtime has no hardware planes (the cubecl-cpu anchor shape); there is no
 ///   alignment to derive, so the historical constant is returned unchanged.
-/// * `max_units` — `client.properties().hardware.max_units_per_cube`.
+/// * `max_units` — `client.properties().hardware.max_units_per_cube`. `0` means the
+///   query returned no usable ceiling; there is nothing to derive from, so the
+///   historical constant is returned unchanged (never a zero-width launch).
 /// * `env_override` — `LGBM_BUILD_CUBEDIM`, the A/B benching knob. Rounded DOWN to a
-///   whole number of planes (never below one plane) so an override can never produce a
-///   partially-populated wavefront, then clamped like the derived value.
+///   whole number of planes (never below one plane) before clamping to `[lo, hi]`; when
+///   the device ceiling itself falls below one whole plane, the ceiling still wins and
+///   the result can end up a partially-populated wavefront (harmless: the u64 build this
+///   width feeds is order-independent).
 #[cfg(feature = "gpu")]
 fn resolve_build_cube_dim(env_override: Option<u32>, plane_size: u32, max_units: u32) -> u32 {
-    if plane_size <= 1 {
+    if plane_size <= 1 || max_units == 0 {
         return BUILD_CUBE_DIM_FALLBACK;
     }
-    // Never exceed what the device accepts, and never fall below one whole plane.
-    let hi = max_units.min(BUILD_CUBE_DIM_MAX).max(plane_size);
+    // The device's reported ceiling always wins; the "at least one whole plane" floor
+    // can never push the result above it (that would launch a CubeDim the device
+    // itself rejects, e.g. `max_units_per_cube < plane_size_max`).
+    let hi = max_units.min(BUILD_CUBE_DIM_MAX);
+    let lo = plane_size.min(hi);
     let planes = match env_override {
         Some(w) if w > 0 => (w / plane_size).max(1),
         _ => BUILD_PLANES_PER_CUBE,
     };
-    (planes.saturating_mul(plane_size)).clamp(plane_size, hi)
+    (planes.saturating_mul(plane_size)).clamp(lo, hi)
 }
 
 /// `LGBM_BUILD_CUBEDIM` — the explicit build-width pin (the A/B benching knob,
@@ -618,10 +634,7 @@ fn resolve_build_cube_dim(env_override: Option<u32>, plane_size: u32, max_units:
 /// through to the hardware-derived width — never a no-launch.
 #[cfg(feature = "gpu")]
 fn force_build_cube_dim() -> Option<u32> {
-    std::env::var("LGBM_BUILD_CUBEDIM")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&w| w > 0)
+    crate::kernels::parse_positive_u32_env("LGBM_BUILD_CUBEDIM")
 }
 
 /// The BUILD cube width for one launch, derived from the device that is actually
@@ -1124,11 +1137,7 @@ static BUILD_TUNER: LocalTuner<LaunchKey, String> = local_tuner!("build");
 /// (fall through to autotune, then the heuristic) — NEVER a no-launch.
 #[cfg(feature = "gpu")]
 fn force_row_partition() -> Option<u32> {
-    std::env::var("LGBM_AUTOTUNE_FORCE_P")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&k| k > 0)
-        .map(|k| k.clamp(1, ROWPART_P_MAX))
+    crate::kernels::parse_positive_u32_env("LGBM_AUTOTUNE_FORCE_P").map(|k| k.clamp(1, ROWPART_P_MAX))
 }
 
 /// Launch the EXISTING resident LDS build once at a fixed `P`, reading the ordered
@@ -1406,11 +1415,12 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // always `fixed_point`, order-independent across P). No autotune (see above).
         let p =
             force_row_partition().unwrap_or_else(|| row_partition_count_u64(num_features, rows));
-        // Hardware-derived build width. This arm is unconditionally `fixed_point` (asserted
-        // above), i.e. the order-independent u64 integer accumulate, so the width is a free
-        // tunable here — and it is the ONLY occupancy knob left on the common shape where
-        // `row_partition_count_u64` returns P = 1 (num_features >= num_cu * CUBES_PER_CU).
-        let cd = build_cube_dim(client, true);
+        // Hardware-derived build width — the order-independent u64 integer accumulate's
+        // width is a free tunable here, and the ONLY occupancy knob left on the common
+        // shape where `row_partition_count_u64` returns P = 1 (num_features >= num_cu *
+        // CUBES_PER_CU). This arm is unconditionally `fixed_point`, so `build_cube_dim`
+        // never falls through to the 256 fallback here.
+        let cd = build_cube_dim(client, fixed_point);
         // SAFETY: identical bounds contract to `launch_lds_u64` PLUS the grad/hess gather:
         // `grad_h`/`hess_h` are sized `gh_num_data` (the full train row count) and indexed by
         // `leaf_rows[k] < num_data == gh_num_data` (the caller's resident row contract), so the
@@ -1462,9 +1472,9 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         // `launch_lds_*` macros below take the partition `$p` explicitly so the FORCE_P /
         // fallback DIRECT launches stay byte-identical to the prior heuristic launch.
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_s));
-        // Hardware-derived build width, resolved ONCE for both macros below. `fixed_point`
-        // selects which one actually launches, and `build_cube_dim` returns the historical
-        // 256 whenever it is false — so the f32 (`launch_lds_f32`) arm is byte-unchanged.
+        // Hardware-derived build width, resolved ONCE for both macros below. `build_cube_dim`
+        // returns the historical 256 whenever `fixed_point` is false, so the f32
+        // (`launch_lds_f32`) arm stays byte-unchanged.
         let cd = build_cube_dim(client, fixed_point);
         // SAFETY: resident_bins sized num_features*num_data; h_rows/h_g/h_h sized rows;
         // h_slot sized num_features+1; h_out sized slot_len. Cube (f,p) reads only its
@@ -1649,7 +1659,7 @@ fn resident_raw_build_into<R: cubecl::Runtime>(
         let slot_off_u32: Vec<u32> = slot_off.iter().map(|&o| o as u32).collect();
         let h_slot = client.create_from_slice(u32::as_bytes(&slot_off_u32));
         let total = num_features * rows;
-        let cube_dim = 256u32;
+        let cube_dim = BUILD_CUBE_DIM_FALLBACK;
         let cube_count = (total as u32).div_ceil(cube_dim);
         // SAFETY: identical to the prior in-place naive launch (idx<total bound,
         // resident read in range, slot write in range). cubecl unsafe confined.
@@ -2932,12 +2942,17 @@ mod tests {
         assert_eq!(resolve_build_cube_dim(None, 64, 1024), 512);
         // The device's own cube cap always wins over the plane target.
         assert_eq!(resolve_build_cube_dim(None, 64, 256), 256);
-        // A cap below one plane still yields one whole plane (never a 0-unit CubeDim).
-        assert_eq!(resolve_build_cube_dim(None, 64, 16), 64);
+        // A device cap below one plane is a hardware ceiling that still wins: never
+        // launch above what the device reports, even if that means a partial plane.
+        assert_eq!(resolve_build_cube_dim(None, 64, 16), 16);
         // No hardware planes (the cubecl-cpu anchor shape) → the historical constant,
         // so nothing plane-derived leaks into a plane-less runtime.
         assert_eq!(resolve_build_cube_dim(None, 1, 1024), BUILD_CUBE_DIM_FALLBACK);
         assert_eq!(resolve_build_cube_dim(None, 0, 1024), BUILD_CUBE_DIM_FALLBACK);
+        // A device cap of 0 (a query that returned no usable ceiling) must never
+        // clamp the result down to a zero-width, no-launch CubeDim.
+        assert_eq!(resolve_build_cube_dim(None, 64, 0), BUILD_CUBE_DIM_FALLBACK);
+        assert_eq!(resolve_build_cube_dim(Some(128), 64, 0), BUILD_CUBE_DIM_FALLBACK);
         // Env override: rounded DOWN to whole planes, so it can never launch a
         // partially-populated wavefront.
         assert_eq!(resolve_build_cube_dim(Some(1024), 32, 1024), 1024);

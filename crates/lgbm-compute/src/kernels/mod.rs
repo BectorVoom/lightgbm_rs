@@ -12,6 +12,21 @@
 /// (rocm/cuda/wgpu) reuses the runtime-generic `cubecl::tune` plumbing.
 #[cfg(feature = "gpu")]
 pub mod autotune;
+
+/// Shared front end for the `LGBM_*` launch-config env knobs (`LGBM_BUILD_CUBEDIM`,
+/// `LGBM_AUTOTUNE_FORCE_P`, `LGBM_SCAN_CUBEDIM`, `LGBM_ROWPART_TARGET_CUBES`, ...):
+/// read the var, parse as `u32`, keep only strictly-positive values. Every knob
+/// layers its own clamp/default on top (the "positive" contract is the only part
+/// they all share) so parse failures, `0`, and unset all fall through the same way
+/// — NEVER a no-launch, only the caller's documented fallback.
+#[cfg(feature = "gpu")]
+pub(crate) fn parse_positive_u32_env(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&w| w > 0)
+}
+
 pub mod histogram;
 pub mod partition;
 // Phase-14 foundation (additive, behind the OFF-by-default `LGBM_CUDA_ON_DEVICE`

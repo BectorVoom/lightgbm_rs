@@ -1584,9 +1584,17 @@ mod hip {
     /// with NO deterministic anchor — never pin two nondeterministic GPU paths to
     /// each other. This test instead builds the reference from the bit-exact CPU
     /// f64 fold `construct_histograms_cpu` (per feature, over the leaf's gathered
-    /// `(bin, grad, hess)`), then applies the SAME host `fix_histogram` +
-    /// `host_compact_histogram` the test already runs — so the GPU u64 path is pinned
-    /// to the CPU f64 anchor, never to another GPU launcher.
+    /// `(bin, grad, hess)`), then applies the SAME host `host_compact_histogram` the
+    /// test already runs — so the GPU u64 path is pinned to the CPU f64 anchor,
+    /// never to another GPU launcher.
+    ///
+    /// No `fix_histogram` reconstruction (OCX-03 / 29-03, same contract as
+    /// `kernel_parity_fix_compact_equals_host_on_hip` above): the resident u64 build
+    /// scatters EVERY row, mfb included — same as `construct_histograms_cpu`'s dense
+    /// per-row fold — so the mfb cell already holds the exact built mass on both
+    /// sides. `sum_g`/`sum_h` are still threaded through as positional args to the
+    /// GPU launcher (unused by the kernel) so the resident chain's signature stays
+    /// unchanged.
     ///
     /// ## Tightened fixed-point gate
     /// The resident LDS sub-hist accumulates in u64 fixed-point, so the residual
@@ -1610,7 +1618,6 @@ mod hip {
             build_fix_compact_resident_readback_f64_on, construct_histograms_cpu,
             upload_resident_columns,
         };
-        use lgbm_treelearner::fix_histogram;
 
         let hip = rocm_client();
         let cpu = cpu_client();
@@ -1643,9 +1650,11 @@ mod hip {
         // ---- CPU f64 ANCHOR (the reference is the bit-exact CPU fold,
         //      NOT a second GPU launcher). Per feature: gather the leaf rows'
         //      (bin, grad, hess), fold with `construct_histograms_cpu` (the bit-exact
-        //      CPU f64 path), then apply the SAME host fix + compact the GPU chain
-        //      runs on device. This is the `cpu_anchor` gather idiom from
-        //      rocm_cuda_mirror.rs reused here for the resident leaf.
+        //      CPU f64 path), then apply the SAME host compact the GPU chain runs on
+        //      device (no fix/reconstruction on either side — see the "No
+        //      `fix_histogram` reconstruction" note on this test above). This is the
+        //      `cpu_anchor` gather idiom from rocm_cuda_mirror.rs reused here for the
+        //      resident leaf.
         let mut anchor: Vec<f64> = vec![0.0; slot_len];
         for fpos in 0..num_bins.len() {
             let nb = num_bins[fpos];
@@ -1660,8 +1669,8 @@ mod hip {
                 .expect("cpu f64 anchor fold");
             let region = &mut anchor[slot_off[fpos]..slot_off[fpos] + cells];
             region.copy_from_slice(&raw);
-            // SAME host fix + compact the on-device chain applies.
-            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
+            // Compact only — no `fix_histogram` (see the doc above): the mfb cell
+            // already holds the exact built mass on both sides.
             host_compact_histogram(region, offsets[fpos]);
         }
 
@@ -1756,7 +1765,6 @@ mod hip {
             build_fix_compact_resident_readback_f64_on, construct_histograms_cpu,
             row_partition_count, upload_resident_columns,
         };
-        use lgbm_treelearner::fix_histogram;
 
         let hip = rocm_client();
         let cpu = cpu_client();
@@ -1815,8 +1823,12 @@ mod hip {
 
         // ---- CPU f64 ANCHOR (the reference is the bit-exact CPU fold, NOT a
         //      second GPU launcher). Per feature: gather the leaf rows' (bin, grad, hess),
-        //      fold with `construct_histograms_cpu`, then apply the SAME host fix + compact
-        //      the GPU chain runs on device.
+        //      fold with `construct_histograms_cpu`, then apply the SAME host compact
+        //      the GPU chain runs on device. No `fix_histogram` (OCX-03 / 29-03): the
+        //      resident u64 build scatters EVERY row, mfb included, same as
+        //      `construct_histograms_cpu`'s dense per-row fold, so the mfb cell already
+        //      holds the exact built mass on both sides — see the doc above
+        //      `kernel_parity_resident_build_fix_compact_equals_host_on_hip`.
         let mut anchor: Vec<f64> = vec![0.0; slot_len];
         for fpos in 0..num_bins.len() {
             let nb = num_bins[fpos];
@@ -1831,8 +1843,7 @@ mod hip {
                 .expect("cpu f64 anchor fold");
             let region = &mut anchor[slot_off[fpos]..slot_off[fpos] + cells];
             region.copy_from_slice(&raw);
-            // SAME host fix + compact the on-device chain applies.
-            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
+            // Compact only — no `fix_histogram` (see the doc above).
             host_compact_histogram(region, offsets[fpos]);
         }
 
@@ -2228,7 +2239,11 @@ mod hip {
     /// GPU-vs-GPU). This pins the u64 fixed-point resident build at EACH forced
     /// `P` (`LGBM_AUTOTUNE_FORCE_P=P`, which short-circuits the tuner) to the SAME CPU f64
     /// anchor as the multi-cube P>1 resident-build parity test — `construct_histograms_cpu`
-    /// (the bit-exact CPU fold) + the exported host `fix_histogram` + compact, built ONCE.
+    /// (the bit-exact CPU fold) + host compact, built ONCE. No `fix_histogram`
+    /// reconstruction (OCX-03 / 29-03): the resident u64 build scatters EVERY row, mfb
+    /// included, same as `construct_histograms_cpu`'s dense per-row fold, so the mfb
+    /// cell already holds the exact built mass on both sides — see the doc on
+    /// `kernel_parity_resident_build_fix_compact_equals_host_on_hip`.
     /// The u64 fixed-point merge is integer-additive (order-independent across the P
     /// cubes) ⇒ bit-identical across `P`, gated at the tightened `FIXEDPOINT_REL_GATE = 1e-7`.
     ///
@@ -2245,7 +2260,6 @@ mod hip {
             build_fix_compact_resident_readback_f64_on, construct_histograms_cpu,
             upload_resident_columns,
         };
-        use lgbm_treelearner::fix_histogram;
 
         // ---- PSET shape guards (acceptance): the sweep must be non-empty AND exercise
         // at least one multi-cube (P>1) row-partitioned merge, else the test is vacuous.
@@ -2287,7 +2301,8 @@ mod hip {
 
         // ---- CPU f64 ANCHOR built ONCE: per feature gather the leaf rows'
         //      (bin, grad, hess), fold with `construct_histograms_cpu`, apply the SAME
-        //      host fix + compact the GPU chain runs on device. NOT a second GPU launch.
+        //      host compact the GPU chain runs on device. NOT a second GPU launch.
+        //      No `fix_histogram` (see the doc above).
         let mut anchor: Vec<f64> = vec![0.0; slot_len];
         for fpos in 0..num_bins.len() {
             let nb = num_bins[fpos];
@@ -2302,7 +2317,6 @@ mod hip {
                 .expect("cpu f64 anchor fold");
             let region = &mut anchor[slot_off[fpos]..slot_off[fpos] + cells];
             region.copy_from_slice(&raw);
-            fix_histogram(region, mfbs[fpos], sum_g, sum_h);
             host_compact_histogram(region, offsets[fpos]);
         }
 

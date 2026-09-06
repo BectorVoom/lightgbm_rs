@@ -877,10 +877,7 @@ const SCAN_CUBE_DIM_DEFAULT: u32 = 64;
 /// failures or 0 fall back to the default — never a no-launch.
 #[cfg(feature = "gpu")]
 fn scan_cube_dim() -> u32 {
-    std::env::var("LGBM_SCAN_CUBEDIM")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&w| w > 0)
+    crate::kernels::parse_positive_u32_env("LGBM_SCAN_CUBEDIM")
         .map(|w| w.clamp(1, 256))
         .unwrap_or(SCAN_CUBE_DIM_DEFAULT)
 }
